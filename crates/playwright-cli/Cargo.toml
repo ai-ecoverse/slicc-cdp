@@ -1,0 +1,18 @@
+[package]
+name = "playwright-cli"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "CDP playwright-cli for macOS and the SLICC kernel"
+publish = false
+
+[[bin]]
+name = "playwright-cli"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+image = { version = "0.25.8", default-features = false, features = ["png"] }
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+native-tls = "0.2"

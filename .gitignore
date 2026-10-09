@@ -3,3 +3,5 @@ dist/
 coverage/
 artifacts/
 test/unit/
+target/
+bin/*.wasm

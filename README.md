@@ -1,9 +1,13 @@
 # slicc-cdp
 
-Empty package for SLICC's CDP layer (today in `packages/webapp/src/cdp/`): client, browser API, transports, HAR, and ARIA snapshot.
+Node package for SLICC's CDP layer. The JavaScript entry is still empty:
 
 ```js
 import {} from '@ai-ecoverse/slicc-cdp';
 ```
+
+`playwright-cli` is the Rust binary in `crates/playwright-cli`. It speaks Chrome CDP JSON. Connect with `--cdp`, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:9222/json/version`. It does not launch Chrome and does not invent a debugger path.
+
+The kernel command is the `wasm32-wasip1` build at `bin/playwright-cli.wasm`, declared as `slicc.commands.playwright-cli` with `slicc.abi` `wasi`. `npm run build:wasm` produces it, and the release workflow runs that before publish.
 
 Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on `main`.

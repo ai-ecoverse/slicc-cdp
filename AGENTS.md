@@ -1,3 +1,9 @@
 # slicc-cdp
 
-Empty `@ai-ecoverse/slicc-cdp` package. Node ≥ 24, ESM. Lint with `slicc-lint`. No comments in any file. Agent guidance lives only in this AGENTS.md (≤1000 characters). Do not add CLAUDE.md. Unit tests stay in gitignored `test/unit/`. Publish from `main` with semantic-release and fledgling trusted publishing (`release.yml`).
+`@ai-ecoverse/slicc-cdp`. Node ≥ 24, ESM. `src/index.js` stays `export {}`. Lint with `slicc-lint`. No comments in any file. Notes only here. No CLAUDE.md. Rejected unit tests stay in gitignored `test/unit/`. `#[cfg(test)]` in Rust is allowed. Publish from `main` with semantic-release.
+
+CLI: `crates/playwright-cli`. One browser WebSocket. `Target.attachToTarget` uses `flatten: true` and a top-level `sessionId`. No `/devtools/page/<id>` socket.
+
+Connect: `--cdp`, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:9222/json/version` and dial `webSocketDebuggerUrl`. `ws://` and `wss://` dial directly. `http://` is discovery. The path is opaque. `--runtime` is a query on the opened URL. Non-2xx prints status and body and exits non-zero. Does not launch Chrome. WASI has no `native-tls`, so `wss` and `https` error.
+
+Kernel command: `slicc.abi` `wasi`, wasm `bin/playwright-cli.wasm`. `npm run build:wasm` writes it. Release builds it before publish. Do not commit the wasm.
