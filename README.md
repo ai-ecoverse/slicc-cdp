@@ -1,6 +1,6 @@
 # slicc-cdp
 
-`@ai-ecoverse/slicc-cdp` publishes `playwright-cli`, a Rust client for an already-running Chrome. It speaks Chrome DevTools Protocol JSON. The JavaScript CDP layer from SLICC is not in this package yet (`src/index.js` is `export {}`).
+`@ai-ecoverse/slicc-cdp` publishes `playwright-cli` and `curlwright`, Rust clients for an already-running Chrome. They speak Chrome DevTools Protocol JSON. The JavaScript CDP layer from SLICC is not in this package yet (`src/index.js` is `export {}`).
 
 ## playwright-cli
 
@@ -14,14 +14,16 @@ Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `typ
 
 A non-2xx discovery response prints the status and the body and exits non-zero. A server close frame prints `websocket closed <code> <reason>` and exits non-zero. After that frame is visible, the client does not write to the socket again. `--version` and `-V` print `playwright-cli` plus the `package.json` version.
 
-## Kernel command
+## curlwright
 
-`slicc.abi` is `wasi`. The command is `playwright-cli` and the module is `bin/playwright-cli.wasm`. `npm run build:wasm` builds `wasm32-wasip1` and copies it there. The release workflow runs that before publish. Do not commit the wasm. On that target, TCP comes from the vendored homescoop `wasix-net` crate (`vendor/wasix-net`, pin recorded in `UPSTREAM`).
+`curlwright` is the Rust binary in `crates/curlwright`. It runs curl-style requests as a page-context `fetch()` in an already-open tab, so that tab's cookies, origin, and service worker apply. It uses the same connect order. The shared CDP client is `crates/cdp-client`.
+
+## Kernel commands
+
+`slicc.abi` is `wasi`. The commands are `playwright-cli` (`bin/playwright-cli.wasm`) and `curlwright` (`bin/curlwright.wasm`). `npm run build:wasm` builds both for `wasm32-wasip1` and copies them there. The release workflow runs that before publish. Do not commit the wasm. On that target, TCP comes from the vendored homescoop `wasix-net` crate (`vendor/wasix-net`, pin recorded in `UPSTREAM`).
 
 Inside the kernel the browser socket is `SLICC_CDP_URL`: `ws://127.0.0.1:9222/devtools/browser/<id>` from slicc-kernel. Port 9222 accepts connections only from inside the kernel.
 
 ## Package
 
 Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on `main`. Git `package.json` stays `0.0.0`. The published version is the release tag.
-
-`curlwright` is not in this package yet.

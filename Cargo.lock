@@ -43,6 +43,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdp-client"
+version = "0.0.0"
+dependencies = [
+ "native-tls",
+ "serde_json",
+ "wasix-net",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -71,6 +80,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "curlwright"
+version = "0.0.0"
+dependencies = [
+ "cdp-client",
+ "serde_json",
 ]
 
 [[package]]
@@ -299,10 +316,9 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "playwright-cli"
 version = "0.0.0"
 dependencies = [
+ "cdp-client",
  "image",
- "native-tls",
  "serde_json",
- "wasix-net",
 ]
 
 [[package]]

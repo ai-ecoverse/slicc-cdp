@@ -11,9 +11,6 @@ name = "playwright-cli"
 path = "src/main.rs"
 
 [dependencies]
+cdp-client = { path = "../cdp-client" }
 serde_json = "1"
 image = { version = "0.25.8", default-features = false, features = ["png"] }
-wasix-net = { path = "../../vendor/wasix-net" }
-
-[target.'cfg(not(target_os = "wasi"))'.dependencies]
-native-tls = "0.2"

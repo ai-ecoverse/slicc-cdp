@@ -1,0 +1,15 @@
+[package]
+name = "curlwright"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "curl-style requests inside an already-open browser tab"
+publish = false
+
+[[bin]]
+name = "curlwright"
+path = "src/main.rs"
+
+[dependencies]
+cdp-client = { path = "../cdp-client" }
+serde_json = "1"
