@@ -119,10 +119,8 @@ fn probe_is_settled(outcome: Result<Option<&str>, &str>) -> Result<bool, String>
     match outcome {
         Ok(Some("loading")) | Ok(Some("interactive")) => Ok(false),
         Ok(_) => Ok(true),
-        Err(err) if err.starts_with("websocket closed") || err.starts_with("websocket read failed") => {
-            Err(err.to_string())
-        }
-        Err(_) => Ok(true),
+        Err(err) if err.starts_with("Runtime.evaluate timed out") || err.starts_with("Runtime.evaluate:") => Ok(true),
+        Err(err) => Err(err.to_string()),
     }
 }
 
@@ -206,7 +204,15 @@ mod tests {
 
     #[test]
     fn a_closed_socket_is_not_treated_as_loaded() {
-        let err = probe_is_settled(Err("websocket closed 1011 the browser went away\n")).unwrap_err();
-        assert!(err.contains("websocket closed 1011"));
+        for err in [
+            "websocket closed 1011 the browser went away\n",
+            "websocket connection closed\n",
+            "websocket write failed: broken pipe\n",
+            "websocket read failed: connection reset\n",
+            "CDP response was not JSON: eof\n",
+        ] {
+            let reported = probe_is_settled(Err(err)).unwrap_err();
+            assert_eq!(reported, err);
+        }
     }
 }
