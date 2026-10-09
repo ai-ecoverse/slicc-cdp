@@ -1,6 +1,7 @@
 use crate::parse::Stop;
 use cdp_client::cdp::Cdp;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::fs;
 
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -85,15 +86,25 @@ fn format_candidates(pages: &[&Page]) -> String {
     pages.iter().map(|page| format!("  --tab={}  {}", page.target_id, page.url)).collect::<Vec<_>>().join("\n")
 }
 
-pub fn resolve_tab(cdp: &mut Cdp, url: &str, explicit: Option<&str>) -> Result<String, Stop> {
+fn session_current() -> Option<String> {
+    let text = fs::read_to_string(".playwright-cli/session.json").ok()?;
+    current_target(&text)
+}
+
+pub fn current_target(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value.get("current").and_then(|item| item.as_str()).filter(|tab| !tab.is_empty()).map(str::to_string)
+}
+
+pub fn choose_tab(pages: &[Page], url: &str, explicit: Option<&str>, current: Option<&str>) -> Result<String, Stop> {
     if let Some(tab) = explicit.filter(|tab| !tab.is_empty()) {
         return Ok(tab.to_string());
     }
-    let pages = list_pages(cdp).map_err(|err| {
-        Stop::new(format!("curlwright: cannot list tabs: {}", err.trim_end_matches('\n')), 2)
-    })?;
     if pages.is_empty() {
         return Err(Stop::usage("curlwright: no open tabs — open one with `playwright-cli open <url>`"));
+    }
+    if let Some(tab) = current.filter(|tab| pages.iter().any(|page| page.target_id == *tab)) {
+        return Ok(tab.to_string());
     }
     let wanted = origin_of(url);
     let same: Vec<&Page> = match &wanted {
@@ -111,16 +122,63 @@ pub fn resolve_tab(cdp: &mut Cdp, url: &str, explicit: Option<&str>) -> Result<S
             format_candidates(&same)
         )));
     }
-    if pages.len() == 1 {
-        return Ok(pages[0].target_id.clone());
-    }
     let reason = match &wanted {
         Some(origin) => format!("no open tab is on {origin}"),
         None => "a relative URL needs an explicit tab".to_string(),
     };
     let refs: Vec<&Page> = pages.iter().collect();
     Err(Stop::usage(format!(
-        "curlwright: {reason}, and several tabs are open — pass --tab.\n{}\n",
+        "curlwright: {reason} — pass --tab.\n{}\n",
         format_candidates(&refs)
     )))
+}
+
+pub fn resolve_tab(cdp: &mut Cdp, url: &str, explicit: Option<&str>) -> Result<String, Stop> {
+    if let Some(tab) = explicit.filter(|tab| !tab.is_empty()) {
+        return Ok(tab.to_string());
+    }
+    let pages = list_pages(cdp).map_err(|err| {
+        Stop::new(format!("curlwright: cannot list tabs: {}", err.trim_end_matches('\n')), 2)
+    })?;
+    choose_tab(&pages, url, None, session_current().as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_tab, current_target, Page};
+
+    fn page(id: &str, url: &str) -> Page {
+        Page { target_id: id.to_string(), url: url.to_string() }
+    }
+
+    #[test]
+    fn session_current_wins_after_an_explicit_tab() {
+        let pages = vec![
+            page("A", "https://app.example/home"),
+            page("B", "https://other.example/"),
+        ];
+        let chosen = choose_tab(&pages, "https://app.example/api", Some("B"), Some("A")).unwrap();
+        assert_eq!(chosen, "B");
+        let current = choose_tab(&pages, "https://app.example/api", None, Some("B")).unwrap();
+        assert_eq!(current, "B");
+    }
+
+    #[test]
+    fn one_same_origin_tab_is_used_and_a_foreign_tab_is_not() {
+        let foreign = vec![page("ONLY", "https://other.example/dash")];
+        let missed = choose_tab(&foreign, "https://app.example/api", None, None).unwrap_err();
+        assert_eq!(missed.code, 2);
+        assert!(missed.message.contains("--tab=ONLY"));
+        assert!(missed.message.contains("no open tab is on https://app.example"));
+        let same = vec![page("ONLY", "https://app.example/home")];
+        assert_eq!(choose_tab(&same, "https://app.example/api", None, None).unwrap(), "ONLY");
+    }
+
+    #[test]
+    fn a_stale_session_falls_through_to_the_origin_tab() {
+        let pages = vec![page("ONLY", "https://app.example/home")];
+        assert_eq!(choose_tab(&pages, "https://app.example/api", None, Some("GONE")).unwrap(), "ONLY");
+        assert_eq!(current_target(r#"{"current":"ABC"}"#).as_deref(), Some("ABC"));
+        assert_eq!(current_target("{}"), None);
+    }
 }

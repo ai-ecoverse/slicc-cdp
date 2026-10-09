@@ -24,9 +24,10 @@ Request:
       --no-credentials       Do not send cookies (they are sent by default)
 
 Tab selection:
-      --tab <targetId>       Tab to run in. Without it: the tab on the URL's
-                             origin when EXACTLY ONE matches, else the only
-                             open tab. Two candidates is an error listing them
+      --tab <targetId>       Tab to run in. Without it: the current tab in
+                             .playwright-cli/session.json when that tab is
+                             still open, else the one open tab on the URL's
+                             origin. Any other case exits 2 and lists --tab
       --frame <frameId>      Run in a child frame of that tab
 
 Output:

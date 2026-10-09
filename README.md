@@ -16,7 +16,7 @@ A non-2xx discovery response prints the status and the body and exits non-zero. 
 
 ## curlwright
 
-`curlwright` is the Rust binary in `crates/curlwright`. It runs curl-style requests as a page-context `fetch()` in an already-open tab, so that tab's cookies, origin, and service worker apply. It uses the same connect order. The shared CDP client is `crates/cdp-client`.
+`curlwright` is the Rust binary in `crates/curlwright`. It runs curl-style requests as a page-context `fetch()` in an already-open tab, so that tab's cookies, origin, and service worker apply. It uses the same connect order. The shared CDP client is `crates/cdp-client`. Without `--tab`, it uses the `current` target in `.playwright-cli/session.json` when that tab is still open, otherwise the single open tab on the request URL's origin. Any other case exits 2 and lists `--tab` choices. A tab on a different origin is not used unless `--tab` or that session names it.
 
 ## Kernel commands
 
