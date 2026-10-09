@@ -459,3 +459,19 @@ fn tab_and_frame_selection() {
     let eval = running.shared.log.lock().unwrap().iter().rev().find(|call| call.method == "Runtime.evaluate").unwrap().params.clone();
     assert_eq!(eval.get("contextId").and_then(|value| value.as_i64()), Some(9));
 }
+
+#[test]
+fn a_single_foreign_tab_is_not_a_guess() {
+    let pages = vec![PageSpec {
+        target_id: "OTHER".into(),
+        url: "https://other.example/dash".into(),
+        title: "Other".into(),
+        frames: vec![],
+    }];
+    let running = serve(pages);
+    let output = run_at(running.port, &["https://app.example/api"]);
+    assert_eq!(output.code, 2, "{}", output.stderr);
+    assert!(output.stderr.contains("--tab=OTHER"));
+    assert!(output.stderr.contains("https://other.example/dash"));
+    assert!(running.shared.log.lock().unwrap().iter().all(|call| call.method != "Runtime.evaluate"));
+}

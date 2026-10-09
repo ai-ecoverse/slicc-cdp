@@ -73,6 +73,25 @@ impl Cdp {
     }
 
     pub fn wait_load(&mut self, session_id: &str) -> Result<(), String> {
+        if self.events.iter().any(|event| is_load(event, session_id)) {
+            return Ok(());
+        }
+        let probe = self.call_for(
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.readyState",
+                "returnByValue": true,
+            }),
+            Some(session_id),
+            Duration::from_secs(1),
+        );
+        let settled = match &probe {
+            Ok(result) => probe_is_settled(Ok(result.pointer("/result/value").and_then(|value| value.as_str())))?,
+            Err(err) => probe_is_settled(Err(err.as_str()))?,
+        };
+        if settled {
+            return Ok(());
+        }
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if self.events.iter().any(|event| is_load(event, session_id)) {
@@ -94,6 +113,15 @@ impl Cdp {
         }
     }
 
+}
+
+fn probe_is_settled(outcome: Result<Option<&str>, &str>) -> Result<bool, String> {
+    match outcome {
+        Ok(Some("loading")) | Ok(Some("interactive")) => Ok(false),
+        Ok(_) => Ok(true),
+        Err(err) if err.starts_with("Runtime.evaluate timed out") || err.starts_with("Runtime.evaluate:") => Ok(true),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn is_load(event: &Value, session_id: &str) -> bool {
@@ -154,4 +182,37 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
     };
     let socket = crate::connect::append_runtime(&socket, runtime);
     Cdp::connect(&socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_is_settled;
+
+    #[test]
+    fn a_finished_document_does_not_wait_for_load() {
+        assert_eq!(probe_is_settled(Ok(Some("complete"))).unwrap(), true);
+        assert_eq!(probe_is_settled(Ok(None)).unwrap(), true);
+        assert_eq!(probe_is_settled(Err("Runtime.evaluate timed out\n")).unwrap(), true);
+        assert_eq!(probe_is_settled(Err("Runtime.evaluate: 'Runtime.evaluate' wasn't found\n")).unwrap(), true);
+    }
+
+    #[test]
+    fn a_loading_document_still_waits() {
+        assert_eq!(probe_is_settled(Ok(Some("loading"))).unwrap(), false);
+        assert_eq!(probe_is_settled(Ok(Some("interactive"))).unwrap(), false);
+    }
+
+    #[test]
+    fn a_closed_socket_is_not_treated_as_loaded() {
+        for err in [
+            "websocket closed 1011 the browser went away\n",
+            "websocket connection closed\n",
+            "websocket write failed: broken pipe\n",
+            "websocket read failed: connection reset\n",
+            "CDP response was not JSON: eof\n",
+        ] {
+            let reported = probe_is_settled(Err(err)).unwrap_err();
+            assert_eq!(reported, err);
+        }
+    }
 }
