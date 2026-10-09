@@ -41,6 +41,7 @@ pub fn global_help() -> String {
     lines.push(row("--cdp <url>", "WebSocket URL, or an http URL used for /json/version"));
     lines.push(row("--runtime <name>", "query parameter on the URL that is opened"));
     lines.push(row("-h, --help", "show help"));
+    lines.push(row("-V, --version", "print the version"));
     lines.join("\n")
 }
 

@@ -1,9 +1,9 @@
 # slicc-cdp
 
-`@ai-ecoverse/slicc-cdp`. Node ≥ 24, ESM. `src/index.js` stays `export {}`. Lint with `slicc-lint`. No comments in any file. Notes only here. No CLAUDE.md. Rejected unit tests stay in gitignored `test/unit/`. `#[cfg(test)]` in Rust is allowed. Publish from `main` with semantic-release.
+`@ai-ecoverse/slicc-cdp`. Node ≥ 24, ESM. `src/index.js` stays `export {}`. `slicc-lint`. No comments in files we write. No CLAUDE.md. Rejected tests stay in `test/unit/`. `#[cfg(test)]` is allowed. Publish from `main` with semantic-release. `vendor/wasix-net` is homescoop `86df95d`, copied as-is.
 
-CLI: `crates/playwright-cli`. One browser WebSocket. `Target.attachToTarget` uses `flatten: true` and a top-level `sessionId`. No `/devtools/page/<id>` socket.
+CLI: `crates/playwright-cli`. `Target.attachToTarget` uses `flatten: true` and a top-level `sessionId`. No `/devtools/page/<id>` socket. `--version` prints the `package.json` version.
 
-Connect: `--cdp`, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:9222/json/version` and dial `webSocketDebuggerUrl`. `ws://` and `wss://` dial directly. `http://` is discovery. The path is opaque. `--runtime` is a query on the opened URL. Non-2xx prints status and body and exits non-zero. Does not launch Chrome. WASI has no `native-tls`, so `wss` and `https` error.
+Connect: `--cdp`, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:9222/json/version` and dial `webSocketDebuggerUrl`. `ws` and `wss` dial directly. `http` is discovery. `--runtime` is a query on the opened URL. Non-2xx prints status and body, then exits non-zero. Does not launch Chrome. No `native-tls` on WASI, so `wss` and `https` error. TCP is `wasix_net::TcpStream`.
 
-Kernel command: `slicc.abi` `wasi`, wasm `bin/playwright-cli.wasm`. `npm run build:wasm` writes it. Release builds it before publish. Do not commit the wasm.
+Kernel command: `slicc.abi` `wasi`, wasm `bin/playwright-cli.wasm`. `npm run build:wasm` writes it. Do not commit the wasm.

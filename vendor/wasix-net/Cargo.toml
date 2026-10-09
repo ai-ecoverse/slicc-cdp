@@ -1,0 +1,16 @@
+[package]
+name = "wasix-net"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+description = "Loopback TCP sockets and a blocking HTTP/1.1 client for WASI programs in slicc's kernel"
+publish = false
+
+[features]
+# Response::into_json and Request::send_json.
+json = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }

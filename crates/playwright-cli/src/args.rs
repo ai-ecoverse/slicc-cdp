@@ -11,6 +11,7 @@ pub struct Invocation {
     pub runtime: Option<String>,
     pub help: bool,
     pub command_help: bool,
+    pub version: bool,
 }
 
 #[derive(Debug)]
@@ -47,12 +48,18 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     let mut cdp = None;
     let mut runtime = None;
     let mut help = false;
+    let mut version = false;
     let mut index = 0;
     while index < args.len() {
         let token = &args[index];
         if token == "--" {
             rest.extend(args[index + 1..].iter().cloned());
             break;
+        }
+        if token == "--version" || token == "-V" {
+            version = true;
+            index += 1;
+            continue;
         }
         if token == "-h" || token == "--help" {
             help = true;
@@ -114,6 +121,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             runtime,
             help: help || command.is_none(),
             command_help: false,
+            version,
         });
     }
     let spec = spec::lookup(command.as_deref().unwrap());
@@ -131,6 +139,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             runtime,
             help,
             command_help,
+            version,
         });
     }
     while index < after.len() {
@@ -138,6 +147,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         if token == "--" {
             positionals.extend(after[index + 1..].iter().cloned());
             break;
+        }
+        if token == "--version" || token == "-V" {
+            version = true;
+            index += 1;
+            continue;
         }
         if token == "-h" || token == "--help" {
             command_help = true;
@@ -187,6 +201,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         runtime,
         help,
         command_help,
+        version,
     })
 }
 
