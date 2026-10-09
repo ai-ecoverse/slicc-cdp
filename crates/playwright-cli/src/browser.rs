@@ -72,10 +72,22 @@ pub fn create_target(cdp: &mut Cdp, url: &str, foreground: bool) -> Result<Strin
         let _ = cdp.call("Target.activateTarget", json!({ "targetId": target_id }), None);
     }
     let session = cdp::attach(cdp, &target_id)?;
-    let _ = cdp.call("Page.enable", json!({}), Some(&session));
+    enable_page(cdp, &session)?;
     cdp.wait_load(&session)?;
     cdp::detach(cdp, &session);
     Ok(target_id)
+}
+
+fn enable_page(cdp: &mut Cdp, session: &str) -> Result<(), String> {
+    match cdp.call("Page.enable", json!({}), Some(session)) {
+        Ok(_) => Ok(()),
+        Err(err) if cdp_error_response("Page.enable", &err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn cdp_error_response(method: &str, err: &str) -> bool {
+    err.starts_with(&format!("{method}:"))
 }
 
 pub fn activate(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
@@ -573,4 +585,19 @@ pub fn lookup_ref<'a>(
         let available = refs.keys().take(10).cloned().collect::<Vec<_>>().join(", ");
         format!("Unknown ref \"{id}\". Available: {available}\n")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cdp_error_response;
+
+    #[test]
+    fn page_enable_ignores_only_a_cdp_error_response() {
+        assert!(cdp_error_response("Page.enable", "Page.enable: 'Page.enable' wasn't found\n"));
+        assert!(!cdp_error_response("Page.enable", "CDP response was not JSON: expected value\n"));
+        assert!(!cdp_error_response("Page.enable", "websocket connection closed\n"));
+        assert!(!cdp_error_response("Page.enable", "websocket write failed: broken pipe\n"));
+        assert!(!cdp_error_response("Page.enable", "websocket read failed: reset\n"));
+        assert!(!cdp_error_response("Page.enable", "Page.enable timed out\n"));
+    }
 }
