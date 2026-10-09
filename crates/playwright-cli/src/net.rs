@@ -126,7 +126,7 @@ impl Ws {
                         ));
                     }
                 }
-                0x8 => return Err("websocket closed\n".to_string()),
+                0x8 => return Err(close_message(&frame.payload)),
                 0x9 => {
                     let pong = encode_client_frame(0xA, &frame.payload, mask_key(frame.payload.len()));
                     self.stream
@@ -245,6 +245,19 @@ pub fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8>
         out.push(byte ^ mask[i % 4]);
     }
     out
+}
+
+fn close_message(payload: &[u8]) -> String {
+    if payload.len() < 2 {
+        return "websocket closed\n".to_string();
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    let reason = String::from_utf8_lossy(&payload[2..]);
+    if reason.is_empty() {
+        format!("websocket closed {code}\n")
+    } else {
+        format!("websocket closed {code} {reason}\n")
+    }
 }
 
 fn mask_key(seed: usize) -> [u8; 4] {
@@ -629,6 +642,20 @@ mod tests {
     fn base64_round_trip() {
         assert_eq!(base64_decode(&base64_encode(b"hi")).unwrap(), b"hi");
         assert_eq!(base64_decode(&base64_encode(&[0, 1, 2, 3, 4])).unwrap(), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn close_frame_reports_code_and_reason() {
+        assert_eq!(
+            close_message(b"\x03\xf3the CDP host is gone"),
+            "websocket closed 1011 the CDP host is gone\n"
+        );
+        assert_eq!(
+            close_message(b"\x03\xf1a message is over 268435456 bytes"),
+            "websocket closed 1009 a message is over 268435456 bytes\n"
+        );
+        assert_eq!(close_message(&[]), "websocket closed\n");
+        assert_eq!(close_message(&[0x03, 0xf3]), "websocket closed 1011\n");
     }
 
     #[test]
