@@ -1,7 +1,8 @@
 use crate::connect::format_http_error;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::time::Duration;
+use wasix_net::TcpStream;
 
 pub struct HttpResponse {
     pub body: Vec<u8>,
@@ -433,13 +434,9 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
 }
 
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-    let mut addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|err| format!("could not resolve {host}: {err}\n"))?;
-    addrs
+    wasix_net::resolve(host, port)
+        .map_err(|err| format!("could not resolve {host}: {err}\n"))?
+        .into_iter()
         .next()
         .ok_or_else(|| format!("could not resolve {host}\n"))
 }
@@ -664,5 +661,54 @@ mod tests {
         assert_eq!(parts.host, "127.0.0.1");
         assert_eq!(parts.port, 9222);
         assert_eq!(parts.path, "/devtools/browser/abc-def?x=1");
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    fn accept_headers(listener: std::net::TcpListener) -> std::net::TcpStream {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut tmp).unwrap();
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        sock
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn http_get_uses_the_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let body = http_get(&format!("http://{addr}/json/version")).unwrap();
+        assert_eq!(body.body, b"{}");
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn websocket_uses_the_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            sock.write_all(&[0x81, 5, b'h', b'e', b'l', b'l', b'o']).unwrap();
+        });
+        let mut ws = ws_connect(&format!("ws://{addr}/devtools/browser/abc")).unwrap();
+        let text = ws
+            .recv_text(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("hello"));
+        server.join().unwrap();
     }
 }

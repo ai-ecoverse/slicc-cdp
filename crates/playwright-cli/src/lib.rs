@@ -16,6 +16,12 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(invocation) => invocation,
         Err(output) => return output,
     };
+    if invocation.version {
+        return Output::ok(format!(
+            "playwright-cli {}\n",
+            env!("PLAYWRIGHT_CLI_VERSION")
+        ));
+    }
     if invocation.help && invocation.command.is_none() {
         return Output::ok(format!("{}\n", help::global_help()));
     }
@@ -69,5 +75,19 @@ mod tests {
         assert!(!output.stdout.contains("cdp.slicc.internal"));
         assert!(!output.stdout.contains("cdp.kernel.localhost"));
         assert!(!output.stdout.contains("/devtools/browser/slicc"));
+    }
+
+    #[test]
+    fn version_prints_package_version() {
+        let output = execute(&["--version".to_string()], None);
+        assert_eq!(output.code, 0);
+        assert_eq!(output.stderr, "");
+        assert_eq!(
+            output.stdout,
+            format!("playwright-cli {}\n", env!("PLAYWRIGHT_CLI_VERSION"))
+        );
+        let short = execute(&["-V".to_string()], None);
+        assert_eq!(short.stdout, output.stdout);
+        assert_eq!(short.code, 0);
     }
 }
