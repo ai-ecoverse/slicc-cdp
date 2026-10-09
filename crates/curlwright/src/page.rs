@@ -169,8 +169,8 @@ pub fn run_fetch(
 ) -> Result<FetchResult, String> {
     let script = fetch_script(request);
     let timeout = match request.timeout_ms {
-        Some(ms) => Duration::from_millis(ms.saturating_add(5_000)).max(Duration::from_secs(30)),
-        None => Duration::from_secs(30),
+        Some(ms) if ms > 0 => Duration::from_millis(ms.saturating_add(1_000)),
+        _ => Duration::from_secs(30),
     };
     let value = evaluate(cdp, session, &script, context_id, timeout)?;
     parse_fetch_result(&value)

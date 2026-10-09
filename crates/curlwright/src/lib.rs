@@ -17,22 +17,30 @@ use write_out::{format_write_out, WriteOut};
 const HELP: &str = include_str!("help.txt");
 
 pub struct Output {
-    pub stdout: String,
+    pub stdout: Vec<u8>,
     pub stderr: String,
     pub code: i32,
 }
 
 impl Output {
+    pub fn as_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).into_owned()
+    }
+
     fn from_stop(stop: Stop) -> Self {
         Self {
-            stdout: String::new(),
+            stdout: Vec::new(),
             stderr: format!("{}\n", stop.message),
             code: stop.code,
         }
     }
 
     fn plain(stderr: String, code: i32) -> Self {
-        Self { stdout: String::new(), stderr, code }
+        Self { stdout: Vec::new(), stderr, code }
+    }
+
+    fn text(stdout: String) -> Self {
+        Self { stdout: stdout.into_bytes(), stderr: String::new(), code: 0 }
     }
 }
 
@@ -46,8 +54,11 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(opts) => opts,
         Err(stop) => return Output::from_stop(stop),
     };
+    if opts.version {
+        return Output::text(format!("curlwright {}\n", env!("CURLWRIGHT_VERSION")));
+    }
     if opts.help {
-        return Output { stdout: HELP.to_string(), stderr: String::new(), code: 0 };
+        return Output::text(HELP.to_string());
     }
     if opts.url.is_none() {
         return Output::from_stop(Stop::usage("curlwright: no URL specified"));
@@ -143,10 +154,10 @@ fn failed_write_out(request: &PreparedRequest, elapsed: f64, exit_code: i32, err
     }
 }
 
-fn append_write_out(opts: &Options, stdout: &mut String, messages: &mut String, ctx: &WriteOut) {
+fn append_write_out(opts: &Options, stdout: &mut Vec<u8>, messages: &mut String, ctx: &WriteOut) {
     let Some(format) = &opts.write_out else { return };
     let (text, warnings) = format_write_out(format, ctx);
-    stdout.push_str(&text);
+    stdout.extend_from_slice(text.as_bytes());
     for warning in warnings {
         messages.push_str(&warning);
         messages.push('\n');
@@ -156,7 +167,10 @@ fn append_write_out(opts: &Options, stdout: &mut String, messages: &mut String, 
 fn classify(raw: &str) -> (String, String, i32) {
     let raw = raw.trim_end_matches(['\n', '\r']);
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("timeouterror") || lower.contains("signal timed out") || lower.contains("aborted") {
+    if lower.contains("timeouterror")
+        || lower.contains("timed out")
+        || lower.contains("aborted")
+    {
         let error_msg = "Operation timed out".to_string();
         return (format!("curlwright: (28) {error_msg}"), error_msg, 28);
     }
@@ -169,7 +183,7 @@ fn classify(raw: &str) -> (String, String, i32) {
 
 fn render_failure(opts: &Options, request: &PreparedRequest, err: &str, elapsed: f64, trace: &str) -> Output {
     let (message, error_msg, code) = classify(err);
-    let mut stdout = String::new();
+    let mut stdout = Vec::new();
     let mut messages = format!("{message}\n");
     append_write_out(opts, &mut stdout, &mut messages, &failed_write_out(request, elapsed, code, &error_msg));
     let quiet = opts.silent && !opts.show_error;
@@ -208,7 +222,7 @@ fn write_file(target: &str, bytes: &[u8]) -> Result<(), String> {
         .map_err(|err| format!("curlwright: (23) failed writing {target}: {err}"))
 }
 
-fn emit_body(opts: &Options, messages: &mut String, stdout: &mut String, bytes: &[u8], url: &str) -> i32 {
+fn emit_body(opts: &Options, messages: &mut String, stdout: &mut Vec<u8>, bytes: &[u8], url: &str) -> i32 {
     match output_dest(opts, url) {
         Dest::Error(error) => {
             messages.push_str(&error);
@@ -228,14 +242,14 @@ fn emit_body(opts: &Options, messages: &mut String, stdout: &mut String, bytes: 
             0
         }
         Dest::ImpliedStdout | Dest::ForcedStdout => {
-            stdout.push_str(&String::from_utf8_lossy(bytes));
+            stdout.extend_from_slice(bytes);
             0
         }
     }
 }
 
 fn render(opts: &Options, request: &PreparedRequest, result: &FetchResult, elapsed: f64, trace: &str) -> Output {
-    let mut stdout = String::new();
+    let mut stdout = Vec::new();
     let mut messages = String::new();
     let mut response_trace = String::new();
     let line = status_line(result.status, &result.status_text);
@@ -243,7 +257,9 @@ fn render(opts: &Options, request: &PreparedRequest, result: &FetchResult, elaps
         response_trace = format_response_trace(&line, &result.headers);
     }
     if opts.include || opts.head {
-        stdout.push_str(&format_header_block(result.status, &result.status_text, &result.headers));
+        stdout.extend_from_slice(
+            format_header_block(result.status, &result.status_text, &result.headers).as_bytes(),
+        );
     }
     let mut dump_code = 0;
     if let Some(path) = &opts.dump_header {
@@ -290,7 +306,7 @@ mod tests {
         let output = run(&["--help"]);
         assert_eq!(output.code, 0);
         assert_eq!(output.stderr, "");
-        assert_eq!(output.stdout, HELP);
+        assert_eq!(output.as_text(), HELP);
         for flag in [
             "-X, --request", "-H, --header", "-d, --data", "--data-raw", "--data-binary",
             "--data-urlencode", "--json", "-F, --form", "--form-string", "-G, --get",
@@ -299,8 +315,38 @@ mod tests {
             "-D, --dump-header", "-w, --write-out", "-s, --silent", "-S, --show-error",
             "-v, --verbose", "-f, --fail", "-m, --max-time",
         ] {
-            assert!(output.stdout.contains(flag), "{flag}");
+            assert!(output.as_text().contains(flag), "{flag}");
         }
+    }
+
+    #[test]
+    fn version_prints_package_version_without_a_url() {
+        let long = run(&["--version"]);
+        let short = run(&["-V"]);
+        let expected = format!("curlwright {}\n", env!("CURLWRIGHT_VERSION"));
+        assert_eq!(long.code, 0);
+        assert_eq!(long.stderr, "");
+        assert_eq!(long.as_text(), expected);
+        assert_eq!(short.as_text(), expected);
+        assert_eq!(short.code, 0);
+    }
+
+    #[test]
+    fn dash_output_keeps_raw_bytes() {
+        let opts = parse(&["-o".into(), "-".into(), "https://app.example/x".into()]).unwrap();
+        let mut messages = String::new();
+        let mut stdout = Vec::new();
+        let bytes = [0xff, 0xfe, b'A'];
+        let code = emit_body(&opts, &mut messages, &mut stdout, &bytes, "https://app.example/x");
+        assert_eq!(code, 0);
+        assert!(messages.is_empty());
+        assert_eq!(stdout, bytes);
+    }
+
+    #[test]
+    fn a_cdp_deadline_is_a_timeout() {
+        let (_, _, code) = classify("Runtime.evaluate timed out\n");
+        assert_eq!(code, 28);
     }
 
     #[test]

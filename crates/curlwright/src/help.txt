@@ -41,6 +41,7 @@ Output:
   -v, --verbose              Trace the request and response to stderr
   -f, --fail                 No body on HTTP >= 400; exit 22
   -m, --max-time <seconds>   Abort the request after this long; exit 28
+  -V, --version              Print the package version
 
 --write-out variables:
   %{url_effective} %{http_code} %{content_type} %{size_download} %{size_header}

@@ -369,7 +369,7 @@ fn get_shows_tab_cookies_over_discovered_browser_socket() {
     let running = serve(one_page());
     let output = run_at(running.port, &["https://app.example/api/me"]);
     assert_eq!(output.code, 0, "{}", output.stderr);
-    assert_eq!(output.stdout, "session=from-tab");
+    assert_eq!(output.as_text(), "session=from-tab");
     assert!(running.shared.discovery_path.lock().unwrap().contains("/json/version"));
     let ws = running.shared.ws_path.lock().unwrap().clone();
     assert!(ws.contains("/devtools/browser/"));
@@ -388,25 +388,25 @@ fn json_post_form_upload_headers_write_out_fail_and_timeout() {
     let running = serve(one_page());
     let json_out = run_at(running.port, &["--json", r#"{"a":1}"#, "https://app.example/json-post"]);
     assert_eq!(json_out.code, 0, "{}", json_out.stderr);
-    assert_eq!(json_out.stdout, r#"{"ok":true}"#);
+    assert_eq!(json_out.as_text(), r#"{"ok":true}"#);
 
     let path = std::env::temp_dir().join(format!("curlwright-upload-{}", std::process::id()));
     std::fs::write(&path, b"hello-bytes").unwrap();
     let upload = run_at(running.port, &["-F", &format!("up=@{};filename=up.bin", path.display()), "https://app.example/upload"]);
     let _ = std::fs::remove_file(&path);
     assert_eq!(upload.code, 0, "{}", upload.stderr);
-    assert_eq!(upload.stdout, "uploaded");
+    assert_eq!(upload.as_text(), "uploaded");
 
     let shown = run_at(running.port, &["-i", "https://app.example/show"]);
     assert_eq!(shown.code, 0, "{}", shown.stderr);
-    assert!(shown.stdout.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(shown.stdout.contains("x-test: yes\r\n"));
-    assert!(shown.stdout.ends_with("\r\n\r\nhi"));
+    assert!(shown.as_text().starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(shown.as_text().contains("x-test: yes\r\n"));
+    assert!(shown.as_text().ends_with("\r\n\r\nhi"));
 
     let head = run_at(running.port, &["-I", "https://app.example/only-head"]);
     assert_eq!(head.code, 0, "{}", head.stderr);
-    assert!(head.stdout.contains("HTTP/1.1 200 OK"));
-    assert!(!head.stdout.contains("SECRET"));
+    assert!(head.as_text().contains("HTTP/1.1 200 OK"));
+    assert!(!head.as_text().contains("SECRET"));
     assert!(expr_of(&running.shared).contains("\"method\":\"HEAD\""));
 
     let dump_path = std::env::temp_dir().join(format!("curlwright-dump-{}", std::process::id()));
@@ -414,23 +414,23 @@ fn json_post_form_upload_headers_write_out_fail_and_timeout() {
     let dumped_file = std::fs::read_to_string(&dump_path).unwrap_or_default();
     let _ = std::fs::remove_file(&dump_path);
     assert_eq!(dumped.code, 0, "{}", dumped.stderr);
-    assert_eq!(dumped.stdout, "body-text");
+    assert_eq!(dumped.as_text(), "body-text");
     assert!(dumped_file.contains("HTTP/1.1 200 OK\r\n"));
     assert!(dumped_file.contains("x-dump: 1\r\n"));
 
     let code = run_at(running.port, &["-w", "%{http_code}", "https://app.example/code"]);
     assert_eq!(code.code, 0, "{}", code.stderr);
-    assert_eq!(code.stdout, "201");
+    assert_eq!(code.as_text(), "201");
 
     let failed = run_at(running.port, &["-f", "https://app.example/nope"]);
     assert_eq!(failed.code, 22, "{}", failed.stderr);
-    assert_eq!(failed.stdout, "");
+    assert_eq!(failed.as_text(), "");
     assert!(failed.stderr.contains("curlwright: (22) The requested URL returned error: 500"));
 
     let timed = run_at(running.port, &["-m", "1", "-w", "%{http_code}", "https://app.example/slow"]);
     assert_eq!(timed.code, 28, "{}", timed.stderr);
     assert!(timed.stderr.contains("curlwright: (28) Operation timed out"));
-    assert_eq!(timed.stdout, "0");
+    assert_eq!(timed.as_text(), "0");
 }
 
 #[test]
@@ -449,13 +449,13 @@ fn tab_and_frame_selection() {
 
     let picked = run_at(running.port, &["--tab", "B", "https://app.example/picked"]);
     assert_eq!(picked.code, 0, "{}", picked.stderr);
-    assert_eq!(picked.stdout, "picked");
+    assert_eq!(picked.as_text(), "picked");
     let session = running.shared.log.lock().unwrap().iter().rev().find(|call| call.method == "Runtime.evaluate").unwrap().session_id.clone();
     assert_eq!(session.as_deref(), Some("s-B"));
 
     let framed = run_at(running.port, &["--tab", "B", "--frame", "FCHILD", "https://app.example/frame-child"]);
     assert_eq!(framed.code, 0, "{}", framed.stderr);
-    assert_eq!(framed.stdout, "frame-ok");
+    assert_eq!(framed.as_text(), "frame-ok");
     let eval = running.shared.log.lock().unwrap().iter().rev().find(|call| call.method == "Runtime.evaluate").unwrap().params.clone();
     assert_eq!(eval.get("contextId").and_then(|value| value.as_i64()), Some(9));
 }

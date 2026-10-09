@@ -52,6 +52,7 @@ pub struct Options {
     pub referer: Option<String>,
     pub range: Option<String>,
     pub help: bool,
+    pub version: bool,
     pub cdp: Option<String>,
     pub runtime: Option<String>,
 }
@@ -104,6 +105,7 @@ fn empty_options() -> Options {
         referer: None,
         range: None,
         help: false,
+        version: false,
         cdp: None,
         runtime: None,
     }
@@ -194,6 +196,7 @@ fn is_bool(name: &str) -> bool {
             | "get"
             | "no-credentials"
             | "help"
+            | "version"
     )
 }
 
@@ -226,6 +229,7 @@ fn short_bool(letter: char) -> Option<&'static str> {
         'O' => "remote-name",
         'G' => "get",
         'h' => "help",
+        'V' => "version",
         _ => return None,
     })
 }
@@ -341,6 +345,7 @@ fn apply_option(
         "get" => opts.get = true,
         "no-credentials" => opts.credentials = "omit".to_string(),
         "help" => opts.help = true,
+        "version" => opts.version = true,
         _ => return Err(unknown(token)),
     }
     Ok(())
