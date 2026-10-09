@@ -13,8 +13,22 @@ pub struct Ws {
     buf: Vec<u8>,
 }
 
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+trait ReadWrite: Read + Write {
+    fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()>;
+}
+
+impl ReadWrite for TcpStream {
+    fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()> {
+        TcpStream::set_nonblocking(self, on)
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+impl ReadWrite for native_tls::TlsStream<TcpStream> {
+    fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()> {
+        self.get_mut().set_nonblocking(on)
+    }
+}
 
 struct Parts {
     scheme: String,
@@ -80,6 +94,7 @@ pub fn ws_connect(url: &str) -> Result<Ws, String> {
 
 impl Ws {
     pub fn send_text(&mut self, text: &str) -> Result<(), String> {
+        self.note_server_close()?;
         let frame = encode_client_frame(0x1, text.as_bytes(), mask_key(text.len()));
         self.stream
             .write_all(&frame)
@@ -87,6 +102,49 @@ impl Ws {
         self.stream
             .flush()
             .map_err(|err| format!("websocket write failed: {err}\n"))?;
+        Ok(())
+    }
+
+    fn note_server_close(&mut self) -> Result<(), String> {
+        if let Some(message) = buffered_close(&self.buf) {
+            return Err(message);
+        }
+        let _ = self.stream.set_nonblocking(true);
+        let mut tmp = [0u8; 8192];
+        let mut failed = None;
+        loop {
+            match self.stream.read(&mut tmp) {
+                Ok(0) => {
+                    failed = Some(
+                        buffered_close(&self.buf)
+                            .unwrap_or_else(|| "websocket connection closed\n".to_string()),
+                    );
+                    break;
+                }
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut
+                        || err.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    break;
+                }
+                Err(err) => {
+                    failed = Some(
+                        buffered_close(&self.buf)
+                            .unwrap_or_else(|| format!("websocket read failed: {err}\n")),
+                    );
+                    break;
+                }
+            }
+        }
+        let _ = self.stream.set_nonblocking(false);
+        if let Some(message) = failed {
+            return Err(message);
+        }
+        if let Some(message) = buffered_close(&self.buf) {
+            return Err(message);
+        }
         Ok(())
     }
 
@@ -129,6 +187,7 @@ impl Ws {
                 }
                 0x8 => return Err(close_message(&frame.payload)),
                 0x9 => {
+                    self.note_server_close()?;
                     let pong = encode_client_frame(0xA, &frame.payload, mask_key(frame.payload.len()));
                     self.stream
                         .write_all(&pong)
@@ -246,6 +305,22 @@ pub fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8>
         out.push(byte ^ mask[i % 4]);
     }
     out
+}
+
+fn buffered_close(buf: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match try_decode(&buf[offset..]) {
+            Ok(Some((consumed, frame))) => {
+                if frame.opcode == 0x8 {
+                    return Some(close_message(&frame.payload));
+                }
+                offset += consumed;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn close_message(payload: &[u8]) -> String {
@@ -710,5 +785,41 @@ mod tests {
             .unwrap();
         assert_eq!(text.as_deref(), Some("hello"));
         server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn server_close_is_reported_and_not_answered() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            let reason = b"the CDP host is gone";
+            let mut message = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_vec();
+            message.extend_from_slice(&[0x81, 5, b'h', b'e', b'l', b'l', b'o']);
+            message.extend_from_slice(&[0x88, (2 + reason.len()) as u8, 0x03, 0xf3]);
+            message.extend_from_slice(reason);
+            sock.write_all(&message).unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let mut tmp = [0u8; 64];
+            match sock.read(&mut tmp) {
+                Ok(n) => n,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    0
+                }
+                Err(_) => 0,
+            }
+        });
+        let mut ws = ws_connect(&format!("ws://{addr}/devtools/browser/abc")).unwrap();
+        let text = ws
+            .recv_text(std::time::Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("hello"));
+        let err = ws.send_text("{}").unwrap_err();
+        assert_eq!(err, "websocket closed 1011 the CDP host is gone\n");
+        assert_eq!(server.join().unwrap(), 0);
     }
 }
