@@ -26,19 +26,23 @@
   },
   "files": [
     "src",
-    "bin/playwright-cli.wasm"
+    "bin/playwright-cli.wasm",
+    "bin/curlwright.wasm"
   ],
   "slicc": {
     "abi": "wasi",
     "commands": {
       "playwright-cli": {
         "wasm": "bin/playwright-cli.wasm"
+      },
+      "curlwright": {
+        "wasm": "bin/curlwright.wasm"
       }
     }
   },
   "scripts": {
     "prepare": "lefthook install",
-    "build:wasm": "cargo build --release --target wasm32-wasip1 --bin playwright-cli && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm",
+    "build:wasm": "cargo build --release --target wasm32-wasip1 -p playwright-cli -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
     "prepublishOnly": "npm run build:wasm",
     "lint": "slicc-lint",
     "format": "biome check --write .",

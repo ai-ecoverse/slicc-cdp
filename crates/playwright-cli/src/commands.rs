@@ -1,7 +1,7 @@
 use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
-use crate::connect::{self, Start};
+use crate::connect;
 use crate::session::{self, Session};
 use crate::snapshot::{self, RefRec};
 use std::collections::BTreeMap;
@@ -24,7 +24,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = deferred_flag(invocation) {
         return Output::err(message);
     }
-    let connected = match open_cdp(start, runtime.as_deref()) {
+    let connected = match cdp::open(start, runtime.as_deref()) {
         Ok(cdp) => cdp,
         Err(message) => return Output::err(message),
     };
@@ -70,29 +70,6 @@ fn deferred_flag(invocation: &Invocation) -> Option<String> {
         }
     }
     None
-}
-
-fn open_cdp(start: Start, runtime: Option<&str>) -> Result<Cdp, String> {
-    let socket = match start {
-        Start::Direct(url) => url,
-        Start::Discover(url) => {
-            let response = match crate::net::http_get(&url) {
-                Ok(response) => response,
-                Err(message) => {
-                    if message.starts_with("HTTP ") || message.contains("does not launch Chrome") {
-                        return Err(message);
-                    }
-                    return Err(format!(
-                        "{message}This CLI does not launch Chrome. Pass --cdp or set SLICC_CDP_URL.\n"
-                    ));
-                }
-            };
-            let body = String::from_utf8_lossy(&response.body).to_string();
-            connect::websocket_url_from_version(&body)?
-        }
-    };
-    let socket = connect::append_runtime(&socket, runtime);
-    Cdp::connect(&socket)
 }
 
 fn cmd_open(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
