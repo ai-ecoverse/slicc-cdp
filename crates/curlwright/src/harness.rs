@@ -17,6 +17,7 @@ struct PageSpec {
     frames: Vec<(String, i64)>,
 }
 
+#[derive(Clone)]
 struct Call {
     method: String,
     session_id: Option<String>,
@@ -557,4 +558,51 @@ fn a_missing_action_reply_does_not_change_the_response() {
         assert!(expression.contains("c2VjcmV0LXRleHQ="));
         assert!(expression.contains("secret-token"));
     }
+}
+
+#[test]
+fn a_verbose_failure_reports_the_error_line_not_the_trace() {
+    let running = serve_mode(one_page(), SliccReply::NotFound);
+    let output = run_at(
+        running.port,
+        &[
+            "-v",
+            "-f",
+            "-H",
+            "Authorization: secret-token",
+            "https://app.example/nope",
+        ],
+    );
+    assert_eq!(output.code, 22, "{}", output.stderr);
+    assert!(output.stderr.starts_with("> GET https://app.example/nope\n"));
+    assert!(output.stderr.contains("> Authorization: secret-token\n"));
+    assert!(output.stderr.contains("curlwright: (22) The requested URL returned error: 500\n"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        let ready = running
+            .shared
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.method == "Slicc.action")
+            .count()
+            >= 2;
+        if ready {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let log = running.shared.log.lock().unwrap().clone();
+    let actions: Vec<&Call> = log.iter().filter(|call| call.method == "Slicc.action").collect();
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[1].params["ok"], false);
+    assert_eq!(
+        actions[1].params["error"],
+        "curlwright: (22) The requested URL returned error: 500"
+    );
+    let rendered = actions.iter().map(|call| call.params.to_string()).collect::<String>();
+    assert!(!rendered.contains("secret-token"));
+    assert!(!rendered.contains("Authorization"));
+    assert!(!rendered.contains("> GET"));
 }
