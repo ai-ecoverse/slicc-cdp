@@ -9,6 +9,7 @@ mod net;
 mod session;
 mod snapshot;
 mod spec;
+mod trace;
 
 pub use args::Output;
 
@@ -92,6 +93,14 @@ mod tests {
         }
         assert!(output.stdout.contains("Not implemented yet"));
         assert!(output.stdout.contains("console"));
+        assert!(output.stdout.contains("requests"));
+        let pending = output
+            .stdout
+            .split("Not implemented yet:")
+            .nth(1)
+            .unwrap_or("");
+        assert!(!pending.contains("console"));
+        assert!(pending.contains("dblclick"));
         assert!(!output.stdout.contains("cdp.slicc.internal"));
         assert!(!output.stdout.contains("cdp.kernel.localhost"));
         assert!(!output.stdout.contains("/devtools/browser/slicc"));
@@ -166,7 +175,21 @@ mod tests {
         ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
-        for name in ["console", "requests", "dblclick", "go-back", "pdf"] {
+        for line in [
+            "  console [min-level]         list console messages",
+            "  requests                    list network requests",
+            "  request <index>             show one network request",
+            "  request-headers <index>     print request headers",
+            "  request-body <index>        print the request body",
+            "  response-headers <index>    print response headers",
+            "  response-body <index>       print the response body",
+        ] {
+            assert!(stdout.contains(line), "{line}");
+        }
+        for name in ["console", "requests", "request", "request-headers", "request-body", "response-headers", "response-body"] {
+            assert!(!pending_names.contains(&name), "{name} listed as pending");
+        }
+        for name in ["dblclick", "go-back", "pdf"] {
             assert!(pending_names.contains(&name), "{name}");
         }
 
@@ -304,21 +327,41 @@ mod tests {
             &[],
         );
 
-        assert_eq!(
-            execute(&["console".into(), "--help".into()], None).stdout,
-            "playwright-cli console <min-level>\n\nNot implemented yet.\n"
+        assert_page(
+            "console",
+            "playwright-cli console [min-level]\n\nList console messages\n",
+            &[
+                "Levels: error, warning, info, debug. Defaults to info. Each level includes more severe levels.",
+                "  [min-level]                 minimum level to show",
+                "  --clear                     drop the stored console list for the tab",
+                "  --tab <targetId>            tab to read",
+            ],
+            &["Not implemented yet"],
         );
-        assert_eq!(
-            execute(&["requests".into(), "--help".into()], None).stdout,
-            "playwright-cli requests\n\nNot implemented yet.\n"
+        assert_page(
+            "requests",
+            "playwright-cli requests\n\nList network requests captured for the tab. Each line is numbered for request.\n",
+            &[
+                "  --static                    include successful static resources",
+                "  --filter <text>             substring of the request URL",
+                "  --clear                     drop the stored network list for the tab",
+                "  --tab <targetId>            tab to read",
+            ],
+            &["Not implemented yet"],
+        );
+        assert_page(
+            "request",
+            "playwright-cli request <index>\n\nShow one network request by its number from requests.\n",
+            &[
+                "  <index>                     1-based request number from requests",
+                "  --filename <path>           write the text to a file",
+            ],
+            &["Not implemented yet"],
         );
         assert_eq!(
             execute(&["dblclick".into(), "--help".into()], None).stdout,
             "playwright-cli dblclick <ref> <button>\n\nNot implemented yet.\n"
         );
-        let ran = execute(&["console".into()], None);
-        assert_eq!(ran.code, 1);
-        assert_eq!(ran.stderr, "playwright-cli console: not implemented yet\n");
 
         for args in [
             vec!["open", "--headed"],
@@ -397,5 +440,23 @@ mod tests {
         let short = execute(&["-V".to_string()], None);
         assert_eq!(short.stdout, output.stdout);
         assert_eq!(short.code, 0);
+    }
+
+    #[test]
+    fn console_rejects_an_unknown_level_before_connect() {
+        let output = execute(&["console".to_string(), "verbose".to_string()], None);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("min-level"));
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn request_requires_a_positive_index_before_connect() {
+        let missing = execute(&["request".to_string()], None);
+        assert_eq!(missing.code, 1);
+        assert!(missing.stderr.contains("index"));
+        let zero = execute(&["response-body".to_string(), "0".to_string()], None);
+        assert_eq!(zero.code, 1);
+        assert!(zero.stderr.contains("positive"));
     }
 }

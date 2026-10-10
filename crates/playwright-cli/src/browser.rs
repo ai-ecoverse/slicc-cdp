@@ -1,6 +1,8 @@
 use crate::cdp::{self, Cdp};
 use crate::net::base64_decode;
+use crate::session::{self, Session};
 use crate::snapshot::{self, AxNode, FrameRec, RefRec};
+use crate::trace;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -57,7 +59,12 @@ pub fn is_internal(url: &str, title: &str) -> bool {
         || (url.is_empty() && title.to_ascii_lowercase().ends_with("popup"))
 }
 
-pub fn create_target(cdp: &mut Cdp, url: &str, foreground: bool) -> Result<String, String> {
+pub fn create_target(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    url: &str,
+    foreground: bool,
+) -> Result<String, String> {
     let result = cdp.call(
         "Target.createTarget",
         json!({ "url": url, "background": !foreground }),
@@ -73,9 +80,39 @@ pub fn create_target(cdp: &mut Cdp, url: &str, foreground: bool) -> Result<Strin
     }
     let session = cdp::attach(cdp, &target_id)?;
     enable_page(cdp, &session)?;
-    cdp.wait_load(&session)?;
+    if let Err(message) = trace::enable(cdp, &session) {
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
+    let loaded = cdp.wait_load(&session);
+    let traced = trace::absorb(cdp, &session);
     cdp::detach(cdp, &session);
+    loaded?;
+    let (console, requests) = traced?;
+    session::push_trace(state, &target_id, console, requests);
     Ok(target_id)
+}
+
+pub fn watch_attach(cdp: &mut Cdp, target_id: &str) -> Result<String, String> {
+    let session = cdp::attach(cdp, target_id)?;
+    if let Err(message) = trace::enable(cdp, &session) {
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
+    Ok(session)
+}
+
+pub fn watch_detach(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    target_id: &str,
+    session: &str,
+) -> Result<(), String> {
+    let traced = trace::absorb(cdp, session);
+    cdp::detach(cdp, session);
+    let (console, requests) = traced?;
+    session::push_trace(state, target_id, console, requests);
+    Ok(())
 }
 
 fn enable_page(cdp: &mut Cdp, session: &str) -> Result<(), String> {
@@ -104,10 +141,16 @@ pub fn close_target(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn navigate(cdp: &mut Cdp, target_id: &str, url: &str) -> Result<(), String> {
+pub fn navigate(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    target_id: &str,
+    url: &str,
+) -> Result<(), String> {
     let session = cdp::attach(cdp, target_id)?;
     let result = (|| {
         cdp.call("Page.enable", json!({}), Some(&session))?;
+        trace::enable(cdp, &session)?;
         let result = cdp.call("Page.navigate", json!({ "url": url }), Some(&session))?;
         if let Some(error) = result.get("errorText").and_then(|v| v.as_str()) {
             return Err(format!("navigate: {error}\n"));
@@ -115,8 +158,12 @@ pub fn navigate(cdp: &mut Cdp, target_id: &str, url: &str) -> Result<(), String>
         cdp.wait_load(&session)?;
         Ok(())
     })();
+    let traced = trace::absorb(cdp, &session);
     cdp::detach(cdp, &session);
-    result
+    result?;
+    let (console, requests) = traced?;
+    session::push_trace(state, target_id, console, requests);
+    Ok(())
 }
 
 pub struct EvalValue {

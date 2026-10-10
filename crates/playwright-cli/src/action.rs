@@ -119,6 +119,17 @@ mod tests {
         assert_eq!(Report::for_command("press").kind(), Some("press"));
         assert_eq!(Report::for_command("tab-list").kind(), None);
         assert_eq!(Report::for_command("nope").kind(), None);
+        for name in [
+            "console",
+            "requests",
+            "request",
+            "request-headers",
+            "request-body",
+            "response-headers",
+            "response-body",
+        ] {
+            assert_eq!(Report::for_command(name).kind(), None, "{name}");
+        }
     }
 
     #[cfg(not(target_os = "wasi"))]
