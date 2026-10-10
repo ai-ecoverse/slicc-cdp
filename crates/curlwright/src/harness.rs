@@ -661,6 +661,30 @@ fn a_foreign_tab_reports_not_allowed_without_the_secret_url() {
     }
 }
 
+#[test]
+fn a_scheme_relative_url_drops_userinfo_on_the_action() {
+    let running = serve_mode(one_page(), SliccReply::Silent);
+    let _output = run_at(
+        running.port,
+        &[
+            "--tab",
+            "T1",
+            "//user:pass@app.example/form?q=QUERYSECRET&tok=x#FRAGSECRET",
+        ],
+    );
+    let actions = wait_actions(&running, 2);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].params["url"], "//app.example/form");
+    assert_eq!(actions[0].params["method"], "GET");
+    let rendered = actions
+        .iter()
+        .map(|call| call.params.to_string())
+        .collect::<String>();
+    for needle in ["QUERYSECRET", "FRAGSECRET", "user:pass", "tok=x"] {
+        assert!(!rendered.contains(needle), "{rendered}");
+    }
+}
+
 fn wait_actions(running: &Running, count: usize) -> Vec<Call> {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while std::time::Instant::now() < deadline {

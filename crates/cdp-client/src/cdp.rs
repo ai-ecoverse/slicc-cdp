@@ -246,12 +246,21 @@ fn public_url(raw: &str) -> Option<String> {
     if without_query.is_empty() {
         return None;
     }
+    if let Some(rest) = without_query.strip_prefix("//") {
+        let (host, path) = host_and_path(rest)?;
+        return Some(format!("//{host}{path}"));
+    }
     let Some((scheme, rest)) = without_query.split_once("://") else {
         return Some(strip_userinfo(without_query));
     };
     if scheme.is_empty() || rest.is_empty() {
         return None;
     }
+    let (host, path) = host_and_path(rest)?;
+    Some(format!("{scheme}://{host}{path}"))
+}
+
+fn host_and_path(rest: &str) -> Option<(&str, &str)> {
     let (authority, path) = match rest.find('/') {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, ""),
@@ -260,10 +269,7 @@ fn public_url(raw: &str) -> Option<String> {
         Some(index) => &authority[index + 1..],
         None => authority,
     };
-    if host.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{host}{path}"))
+    if host.is_empty() { None } else { Some((host, path)) }
 }
 
 fn strip_userinfo(url: &str) -> String {
@@ -534,6 +540,15 @@ mod tests {
             ..ActionNote::default()
         };
         assert_eq!(gotten.start_params()["url"], "http://[::1]:8443/a/b");
+        let relative = ActionNote {
+            kind: "request".to_string(),
+            method: Some("GET".to_string()),
+            url: Some("//user:pass@app.example/path?q=QUERYSECRET#FRAGSECRET".to_string()),
+            ..ActionNote::default()
+        };
+        let relative_params = relative.start_params();
+        assert_eq!(relative_params["url"], "//app.example/path");
+        assert_clean(&relative_params);
         assert_eq!(
             ActionNote {
                 kind: "open".to_string(),
