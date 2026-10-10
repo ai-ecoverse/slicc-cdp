@@ -59,7 +59,7 @@
   },
   "devDependencies": {
     "@ai-ecoverse/slicc-kernel": "1.47.1",
-    "@ai-ecoverse/slicc-shared-web": "1.12.0",
+    "@ai-ecoverse/slicc-shared-web": "1.12.1",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.1.16",
     "playwright-core": "1.63.0",
