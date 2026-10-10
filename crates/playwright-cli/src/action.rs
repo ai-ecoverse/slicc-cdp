@@ -795,6 +795,82 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
+        #[test]
+        fn opaque_urls_keep_only_the_scheme_on_the_action() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "slicc-action-opaque-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let cases = [
+                (
+                    "open",
+                    "data:text/html,<title>DATASECRET</title>",
+                    Some("data:"),
+                    "DATASECRET",
+                ),
+                (
+                    "goto",
+                    "data:text/html,DATASECRET2",
+                    Some("data:"),
+                    "DATASECRET2",
+                ),
+                (
+                    "open",
+                    "javascript:void('JSSECRET')",
+                    Some("javascript:"),
+                    "JSSECRET",
+                ),
+                (
+                    "goto",
+                    "blob:https://example.com/BLOBSECRET",
+                    Some("blob:"),
+                    "BLOBSECRET",
+                ),
+                ("open", "about:blank", Some("about:blank"), ""),
+                (
+                    "goto",
+                    "ABOUT:blank?q=BLANKSECRET",
+                    Some("about:blank"),
+                    "BLANKSECRET",
+                ),
+                (
+                    "goto",
+                    "about:srcdoc,ABOUTSECRET",
+                    Some("about:"),
+                    "ABOUTSECRET",
+                ),
+                ("open", "example.com/PATHSECRET", None, "PATHSECRET"),
+            ];
+            let peer = Peer::start(SliccReply::Silent, true);
+            let mut seen = 0usize;
+            for (command, url, expect, secret) in cases {
+                let output = {
+                    let _dir = DirGuard::enter(&root);
+                    run(peer.port, &[command, url])
+                };
+                assert_eq!(output.code, 0, "{command} {url} {}", output.stderr);
+                if !secret.is_empty() {
+                    assert!(output.stdout.contains(secret), "{command} {url}");
+                }
+                seen += 2;
+                peer.wait_actions(seen);
+                let log = peer.log.lock().unwrap().clone();
+                let noted = actions(&log);
+                assert_eq!(noted.len(), seen, "{command} {url}");
+                let start = &noted[seen - 2]["params"];
+                match expect {
+                    Some(sent) => assert_eq!(start["url"], sent, "{url}"),
+                    None => assert!(start.get("url").is_none(), "{url} {start}"),
+                }
+                if !secret.is_empty() {
+                    assert!(!start.to_string().contains(secret), "{url} {start}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
         fn assert_frames_clean(noted: &[&Value]) {
             let rendered = noted
                 .iter()
