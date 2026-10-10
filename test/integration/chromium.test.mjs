@@ -50,6 +50,7 @@ async function playwrightFlow(runner, site) {
   const page = `${site.origin}/page`;
   const opened = await runner.playwright(['open', page], cwd);
   assert.equal(opened.code, 0, opened.stderr);
+  const openedId = targetOf(opened.stdout);
   const shot = await runner.playwright(['snapshot'], cwd);
   assert.equal(shot.code, 0, `${shot.stderr}\n${shot.stdout}`);
   const button = refOf(shot.stdout, 'button', 'Go');
@@ -83,16 +84,18 @@ async function playwrightFlow(runner, site) {
   assert.equal(png[1], 0x50);
   const listed = await runner.playwright(['tab-list'], cwd);
   assert.equal(listed.code, 0, listed.stderr);
+  assert.match(listed.stdout, new RegExp(escapeReg(`[${openedId}]`)));
   assert.match(listed.stdout, new RegExp(escapeReg(page)));
   const extra = await runner.playwright(['tab-new', `${site.origin}/other`], cwd);
   assert.equal(extra.code, 0, extra.stderr);
   const extraId = targetOf(extra.stdout);
   const againListed = await runner.playwright(['tab-list'], cwd);
-  const pageLine = againListed.stdout.split('\n').find((line) => line.includes(page));
+  const pageLine = againListed.stdout.split('\n').find((line) => line.includes(`[${openedId}]`));
   const pageIndex = pageLine?.match(/^(\d+):/)?.[1];
   assert.ok(pageIndex, againListed.stdout);
   const selected = await runner.playwright(['tab-select', pageIndex], cwd);
   assert.equal(selected.code, 0, selected.stderr);
+  assert.match(selected.stdout, new RegExp(escapeReg(openedId)));
   const moved = await runner.playwright(['goto', `${site.origin}/one`], cwd);
   assert.equal(moved.code, 0, moved.stderr);
   const closed = await runner.playwright(['tab-close', '--tab', extraId], cwd);
@@ -164,6 +167,10 @@ async function curlFlow(runner, site, wsUrl) {
   );
   assert.notEqual(missing.code, 0, missing.stdout);
   assert.match(missing.stderr, /no frame/);
+  const closedPage = await runner.playwright(['tab-close', '--tab', tab], cwd);
+  assert.equal(closedPage.code, 0, closedPage.stderr);
+  const closedOther = await runner.playwright(['tab-close', '--tab', other], cwd);
+  assert.equal(closedOther.code, 0, closedOther.stderr);
 }
 
 function targetOf(stdout) {
