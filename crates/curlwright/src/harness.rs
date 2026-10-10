@@ -597,12 +597,118 @@ fn a_verbose_failure_reports_the_error_line_not_the_trace() {
     let actions: Vec<&Call> = log.iter().filter(|call| call.method == "Slicc.action").collect();
     assert_eq!(actions.len(), 2);
     assert_eq!(actions[1].params["ok"], false);
-    assert_eq!(
-        actions[1].params["error"],
-        "curlwright: (22) The requested URL returned error: 500"
-    );
+    assert_eq!(actions[1].params["error"], "failed");
     let rendered = actions.iter().map(|call| call.params.to_string()).collect::<String>();
     assert!(!rendered.contains("secret-token"));
     assert!(!rendered.contains("Authorization"));
     assert!(!rendered.contains("> GET"));
+}
+
+#[test]
+fn request_actions_keep_origin_and_path_only() {
+    let secret = "https://user:pass@app.example/form?q=QUERYSECRET&tok=x#FRAGSECRET";
+    let cases: [&[&str]; 2] = [&[secret], &["-d", "secret-body", secret]];
+    for args in cases {
+        let running = serve_mode(one_page(), SliccReply::Silent);
+        let output = run_at(running.port, args);
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        let actions = wait_actions(&running, 2);
+        let start = &actions[0].params;
+        assert_eq!(start["url"], "https://app.example/form");
+        assert_eq!(actions[1].params["ok"], true);
+        assert!(actions[1].params.get("error").is_none());
+        let rendered = actions
+            .iter()
+            .map(|call| call.params.to_string())
+            .collect::<String>();
+        for needle in ["QUERYSECRET", "FRAGSECRET", "user:pass", "tok=x", "secret-body"] {
+            assert!(!rendered.contains(needle), "{rendered}");
+        }
+        if args.len() == 1 {
+            assert_eq!(start["method"], "GET");
+        } else {
+            assert_eq!(start["method"], "POST");
+        }
+    }
+}
+
+#[test]
+fn a_foreign_tab_reports_not_allowed_without_the_secret_url() {
+    let pages = vec![PageSpec {
+        target_id: "OTHER".into(),
+        url: "https://other.example/dash".into(),
+        title: "Other".into(),
+        frames: vec![],
+    }];
+    let running = serve_mode(pages, SliccReply::Silent);
+    let output = run_at(
+        running.port,
+        &["https://user:pass@app.example/form?q=QUERYSECRET&tok=x#FRAGSECRET"],
+    );
+    assert_eq!(output.code, 2, "{}", output.stderr);
+    assert!(output.stderr.contains("no open tab is on"));
+    let actions = wait_actions(&running, 2);
+    assert_eq!(actions[0].params["url"], "https://app.example/form");
+    assert_eq!(actions[0].params["method"], "GET");
+    assert_eq!(actions[1].params["ok"], false);
+    assert_eq!(actions[1].params["error"], "not allowed");
+    let rendered = actions
+        .iter()
+        .map(|call| call.params.to_string())
+        .collect::<String>();
+    for needle in ["QUERYSECRET", "FRAGSECRET", "user:pass", "tok=x"] {
+        assert!(!rendered.contains(needle), "{rendered}");
+    }
+}
+
+#[test]
+fn a_scheme_relative_url_drops_userinfo_on_the_action() {
+    let running = serve_mode(one_page(), SliccReply::Silent);
+    let _output = run_at(
+        running.port,
+        &[
+            "--tab",
+            "T1",
+            "//user:pass@app.example/form?q=QUERYSECRET&tok=x#FRAGSECRET",
+        ],
+    );
+    let actions = wait_actions(&running, 2);
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].params["url"], "//app.example/form");
+    assert_eq!(actions[0].params["method"], "GET");
+    let rendered = actions
+        .iter()
+        .map(|call| call.params.to_string())
+        .collect::<String>();
+    for needle in ["QUERYSECRET", "FRAGSECRET", "user:pass", "tok=x"] {
+        assert!(!rendered.contains(needle), "{rendered}");
+    }
+}
+
+fn wait_actions(running: &Running, count: usize) -> Vec<Call> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        let ready = running
+            .shared
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.method == "Slicc.action")
+            .count()
+            >= count;
+        if ready {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    running
+        .shared
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.method == "Slicc.action")
+        .cloned()
+        .collect()
 }

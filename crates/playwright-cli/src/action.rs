@@ -311,7 +311,15 @@ mod tests {
                         .get("expression")
                         .and_then(|item| item.as_str())
                         .unwrap_or("");
-                    if expr == "document.readyState" {
+                    if expr.contains("EVALSECRET-in-error") {
+                        json!({
+                            "result": { "type": "object", "subtype": "error" },
+                            "exceptionDetails": {
+                                "text": "Uncaught",
+                                "exception": { "description": "Error: EVALSECRET-in-error" }
+                            }
+                        })
+                    } else if expr == "document.readyState" {
                         json!({ "result": { "type": "string", "value": "complete" } })
                     } else {
                         json!({ "result": { "type": "string", "value": "ok" } })
@@ -569,7 +577,8 @@ mod tests {
                 assert!(noted[0]["params"].get("tab").is_none());
                 assert!(noted[0]["params"].get("target").is_none());
                 assert_eq!(noted[1]["params"]["ok"], false);
-                assert_eq!(noted[1]["params"]["error"], expected.trim_end());
+                assert_eq!(noted[1]["params"]["error"], "unknown tab");
+                assert!(!noted[1].to_string().contains("targetId"));
                 let names = method_names(&log);
                 let listed = names
                     .iter()
@@ -724,6 +733,76 @@ mod tests {
                 assert!(start < eval);
             }
             let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn annotation_frames_omit_query_fragment_userinfo_and_eval_text() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "slicc-action-secrets-{}",
+                std::process::id()
+            ));
+            let secret = "http://user:pass@a.test/form?q=QUERYSECRET&tok=x#FRAGSECRET";
+            let open_dir = root.join("open");
+            let goto_dir = root.join("goto");
+            let eval_dir = root.join("eval");
+            std::fs::create_dir_all(&open_dir).unwrap();
+            std::fs::create_dir_all(&goto_dir).unwrap();
+            std::fs::create_dir_all(&eval_dir).unwrap();
+            let opened_peer = Peer::start(SliccReply::Silent, false);
+            let opened = {
+                let _dir = DirGuard::enter(&open_dir);
+                run(opened_peer.port, &["open", secret])
+            };
+            assert_eq!(opened.code, 0, "{}", opened.stderr);
+            assert!(opened.stdout.contains("QUERYSECRET"));
+            assert!(opened.stdout.contains("FRAGSECRET"));
+            opened_peer.wait_actions(2);
+            let opened_log = opened_peer.log.lock().unwrap().clone();
+            let opened_actions = actions(&opened_log);
+            assert_eq!(opened_actions[0]["params"]["url"], "http://a.test/form");
+            assert_frames_clean(&opened_actions);
+            let went_peer = Peer::start(SliccReply::Silent, true);
+            let went = {
+                let _dir = DirGuard::enter(&goto_dir);
+                run(went_peer.port, &["goto", secret])
+            };
+            assert_eq!(went.code, 0, "{}", went.stderr);
+            assert!(went.stdout.contains("QUERYSECRET"));
+            went_peer.wait_actions(2);
+            let went_log = went_peer.log.lock().unwrap().clone();
+            let went_actions = actions(&went_log);
+            assert_eq!(went_actions[0]["params"]["kind"], "goto");
+            assert_eq!(went_actions[0]["params"]["url"], "http://a.test/form");
+            assert_frames_clean(&went_actions);
+            let failed_peer = Peer::start(SliccReply::Silent, true);
+            let failed = {
+                let _dir = DirGuard::enter(&eval_dir);
+                run(
+                    failed_peer.port,
+                    &["eval", "throw new Error('EVALSECRET-in-error')"],
+                )
+            };
+            assert_ne!(failed.code, 0);
+            assert!(failed.stderr.contains("EVALSECRET-in-error"));
+            failed_peer.wait_actions(2);
+            let failed_log = failed_peer.log.lock().unwrap().clone();
+            let failed_actions = actions(&failed_log);
+            assert_eq!(failed_actions[0]["params"]["kind"], "eval");
+            assert_eq!(failed_actions[1]["params"]["ok"], false);
+            assert!(failed_actions[1]["params"].get("error").is_none());
+            assert_frames_clean(&failed_actions);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        fn assert_frames_clean(noted: &[&Value]) {
+            let rendered = noted
+                .iter()
+                .map(|message| message.to_string())
+                .collect::<String>();
+            for secret in ["QUERYSECRET", "FRAGSECRET", "user:pass", "tok=x", "EVALSECRET"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
         }
     }
 }
