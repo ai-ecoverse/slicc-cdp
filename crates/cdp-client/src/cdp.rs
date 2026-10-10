@@ -197,7 +197,9 @@ impl ActionNote {
         params.insert("kind".into(), json!(self.kind));
         insert_text(&mut params, "tab", self.tab.as_deref());
         insert_text(&mut params, "target", self.target.as_deref());
-        insert_text(&mut params, "url", self.url.as_deref());
+        if let Some(url) = self.url.as_deref().and_then(public_url) {
+            params.insert("url".into(), json!(url));
+        }
         insert_text(&mut params, "key", self.key.as_deref());
         if let Some(length) = self.length {
             params.insert("length".into(), json!(length));
@@ -212,8 +214,8 @@ impl ActionNote {
         params.insert("phase".into(), json!("end"));
         params.insert("ok".into(), json!(ok));
         if !ok {
-            if let Some(line) = first_stderr_line(stderr) {
-                params.insert("error".into(), json!(line));
+            if let Some(error) = action_error(&self.kind, stderr) {
+                params.insert("error".into(), json!(error));
             }
         }
         insert_text(&mut params, "tab", self.tab.as_deref());
@@ -229,6 +231,95 @@ fn insert_text(params: &mut serde_json::Map<String, Value>, key: &str, value: Op
 
 pub fn first_stderr_line(stderr: &str) -> Option<&str> {
     stderr.lines().next().filter(|line| !line.is_empty())
+}
+
+fn public_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let without_fragment = raw.split_once('#').map(|(head, _)| head).unwrap_or(raw);
+    let without_query = without_fragment
+        .split_once('?')
+        .map(|(head, _)| head)
+        .unwrap_or(without_fragment);
+    if without_query.is_empty() {
+        return None;
+    }
+    let Some((scheme, rest)) = without_query.split_once("://") else {
+        return Some(strip_userinfo(without_query));
+    };
+    if scheme.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let host = match authority.rfind('@') {
+        Some(index) => &authority[index + 1..],
+        None => authority,
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}{path}"))
+}
+
+fn strip_userinfo(url: &str) -> String {
+    let (authority, path) = match url.find('/') {
+        Some(index) => (&url[..index], &url[index..]),
+        None => (url, ""),
+    };
+    let host = match authority.rfind('@') {
+        Some(index) => &authority[index + 1..],
+        None => authority,
+    };
+    format!("{host}{path}")
+}
+
+fn action_error(kind: &str, stderr: &str) -> Option<&'static str> {
+    if kind == "eval" {
+        return None;
+    }
+    let line = first_stderr_line(stderr).unwrap_or("").to_ascii_lowercase();
+    if line.contains("timed out") {
+        return Some("timeout");
+    }
+    if line.contains("websocket closed")
+        || line.contains("websocket connection closed")
+        || line.contains("websocket write failed")
+        || line.contains("websocket read failed")
+        || line.contains("connection reset")
+        || line.contains("broken pipe")
+    {
+        return Some("connection lost");
+    }
+    if line.contains("no snapshot") || line.contains("likely stale") {
+        return Some("no snapshot");
+    }
+    if line.contains("unknown ref")
+        || line.contains("element not found")
+        || line.contains("not an element ref")
+        || line.contains("could not resolve")
+        || line.contains("no backend node")
+    {
+        return Some("element not found");
+    }
+    if line.contains("no open tab is on") {
+        return Some("not allowed");
+    }
+    if line.contains("unknown tab")
+        || line.contains("--tab")
+        || line.contains("no open tabs")
+        || line.contains("explicit tab")
+    {
+        return Some("unknown tab");
+    }
+    if line.starts_with("navigate:") || line.contains("page.navigate") {
+        return Some("navigation failed");
+    }
+    Some("failed")
 }
 
 pub fn slicc_agent() -> Option<String> {
@@ -327,7 +418,7 @@ mod tests {
             json!({
                 "phase": "end",
                 "ok": false,
-                "error": "No snapshot available. Run \"snapshot\" first.",
+                "error": "no snapshot",
                 "tab": "1234"
             })
         );
@@ -407,5 +498,125 @@ mod tests {
         assert!(ActionNote::default().start_params().get("agent").is_none());
         assert_eq!(first_stderr_line("only-line"), Some("only-line"));
         assert_eq!(first_stderr_line("\n"), None);
+    }
+
+    #[test]
+    fn action_urls_and_errors_drop_page_secrets() {
+        let secret = "https://user:pass@app.example/form?q=QUERYSECRET&tok=x#FRAGSECRET";
+        let open = ActionNote {
+            kind: "open".to_string(),
+            url: Some(secret.to_string()),
+            ..ActionNote::default()
+        };
+        let started = open.start_params();
+        assert_eq!(started["url"], "https://app.example/form");
+        assert_clean(&started);
+        let goto = ActionNote {
+            kind: "goto".to_string(),
+            url: Some(secret.to_string()),
+            ..ActionNote::default()
+        };
+        assert_eq!(goto.start_params()["url"], "https://app.example/form");
+        let posted = ActionNote {
+            kind: "request".to_string(),
+            method: Some("POST".to_string()),
+            url: Some(secret.to_string()),
+            ..ActionNote::default()
+        };
+        let request = posted.start_params();
+        assert_eq!(request["method"], "POST");
+        assert_eq!(request["url"], "https://app.example/form");
+        assert_clean(&request);
+        let gotten = ActionNote {
+            kind: "request".to_string(),
+            method: Some("GET".to_string()),
+            url: Some("http://user:p%40ss@[::1]:8443/a/b?x=1#y".to_string()),
+            ..ActionNote::default()
+        };
+        assert_eq!(gotten.start_params()["url"], "http://[::1]:8443/a/b");
+        assert_eq!(
+            ActionNote {
+                kind: "open".to_string(),
+                url: Some("about:blank".to_string()),
+                ..ActionNote::default()
+            }
+            .start_params()["url"],
+            "about:blank"
+        );
+        let eval_failed = ActionNote {
+            kind: "eval".to_string(),
+            tab: Some("T".to_string()),
+            ..ActionNote::default()
+        };
+        let eval_end = eval_failed.end_params(false, "Error: EVALSECRET-in-error\n");
+        assert_eq!(eval_end["ok"], false);
+        assert!(eval_end.get("error").is_none());
+        assert_clean(&eval_end);
+        let cases = [
+            (
+                "click",
+                "Unknown ref \"e1\". Available: e2\n",
+                "element not found",
+            ),
+            (
+                "screenshot",
+                "No snapshot available. Run \"snapshot\" first.\n",
+                "no snapshot",
+            ),
+            (
+                "screenshot",
+                "screenshot: could not resolve element e1 to a visible box — the snapshot is likely stale\n",
+                "no snapshot",
+            ),
+            (
+                "click",
+                "Error: --tab <targetId> is required. Run 'playwright-cli tab-list' to get tab IDs.\n",
+                "unknown tab",
+            ),
+            (
+                "goto",
+                "navigate: refused https://app.example/form?q=QUERYSECRET#FRAGSECRET\n",
+                "navigation failed",
+            ),
+            ("click", "Page.navigate timed out\n", "timeout"),
+            (
+                "open",
+                "websocket closed 1011 the browser went away\n",
+                "connection lost",
+            ),
+            (
+                "request",
+                "curlwright: no open tab is on https://app.example — pass --tab.\nhttps://other.example/dash?q=QUERYSECRET\n",
+                "not allowed",
+            ),
+            (
+                "request",
+                "curlwright: (22) The requested URL returned error: 500\n",
+                "failed",
+            ),
+        ];
+        for (kind, stderr, code) in cases {
+            let note = ActionNote {
+                kind: kind.to_string(),
+                ..ActionNote::default()
+            };
+            let ended = note.end_params(false, stderr);
+            assert_eq!(ended["error"], code, "{stderr}");
+            assert_clean(&ended);
+        }
+    }
+
+    fn assert_clean(value: &serde_json::Value) {
+        let rendered = value.to_string();
+        for secret in [
+            "QUERYSECRET",
+            "FRAGSECRET",
+            "EVALSECRET",
+            "user:pass",
+            "tok=x",
+            "p%40ss",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 }
