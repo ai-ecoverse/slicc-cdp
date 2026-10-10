@@ -842,6 +842,14 @@ mod tests {
                     "ABOUTSECRET",
                 ),
                 ("open", "example.com/PATHSECRET", None, "PATHSECRET"),
+                ("goto", "HOSTSECRET3:8080/path", None, "HOSTSECRET3"),
+                (
+                    "open",
+                    "USERSECRET5:PASSSECRET5@127.0.0.1/form",
+                    None,
+                    "USERSECRET5",
+                ),
+                ("goto", "foo:bar", None, "foo:"),
             ];
             let peer = Peer::start(SliccReply::Silent, true);
             let mut seen = 0usize;
@@ -867,6 +875,7 @@ mod tests {
                 if !secret.is_empty() {
                     assert!(!start.to_string().contains(secret), "{url} {start}");
                 }
+                assert!(!start.to_string().contains("PASSSECRET5"), "{url} {start}");
             }
             let _ = std::fs::remove_dir_all(&root);
         }

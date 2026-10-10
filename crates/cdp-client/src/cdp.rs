@@ -254,14 +254,34 @@ fn public_url(raw: &str) -> Option<String> {
         return Some(format!("//{host}{path}"));
     }
     let (scheme, rest) = without_query.split_once(':')?;
-    if !is_scheme(scheme) {
+    if !is_scheme(scheme) || !scheme_allowed(scheme) {
         return None;
     }
+    let scheme = scheme.to_ascii_lowercase();
     let Some(authority) = rest.strip_prefix("//") else {
-        return Some(format!("{}:", scheme.to_ascii_lowercase()));
+        return Some(format!("{scheme}:"));
     };
     let (host, path) = host_and_path(authority)?;
     Some(format!("{scheme}://{host}{path}"))
+}
+
+fn scheme_allowed(scheme: &str) -> bool {
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http"
+            | "https"
+            | "ws"
+            | "wss"
+            | "file"
+            | "data"
+            | "javascript"
+            | "blob"
+            | "about"
+            | "chrome"
+            | "chrome-extension"
+            | "view-source"
+            | "ftp"
+    )
 }
 
 fn is_about_blank(url: &str) -> bool {
@@ -615,6 +635,29 @@ mod tests {
             ),
             ("goto", "example.com/PATHSECRET", None, "PATHSECRET"),
             ("open", "not a url PATHSECRET", None, "PATHSECRET"),
+            ("goto", "HOSTSECRET3:8080/path", None, "HOSTSECRET3"),
+            ("open", "host:8080/x", None, "host:"),
+            (
+                "goto",
+                "USERSECRET5:PASSSECRET5@127.0.0.1/form",
+                None,
+                "USERSECRET5",
+            ),
+            (
+                "open",
+                "USERSECRET5:PASSSECRET5@127.0.0.1/form",
+                None,
+                "PASSSECRET5",
+            ),
+            ("goto", "user:pw@host/x", None, "user:"),
+            ("open", "foo:bar", None, "foo:"),
+            ("goto", "foo://example.com/FOOSECRET", None, "FOOSECRET"),
+            (
+                "open",
+                "view-source:https://example.com/VIEWSECRET",
+                Some("view-source:"),
+                "VIEWSECRET",
+            ),
         ];
         for (kind, raw, expect, secret) in opaque {
             let note = ActionNote {
