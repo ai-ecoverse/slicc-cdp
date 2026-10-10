@@ -246,18 +246,31 @@ fn public_url(raw: &str) -> Option<String> {
     if without_query.is_empty() {
         return None;
     }
+    if without_query == "about:blank" {
+        return Some("about:blank".to_string());
+    }
     if let Some(rest) = without_query.strip_prefix("//") {
         let (host, path) = host_and_path(rest)?;
         return Some(format!("//{host}{path}"));
     }
-    let Some((scheme, rest)) = without_query.split_once("://") else {
-        return Some(strip_userinfo(without_query));
-    };
-    if scheme.is_empty() || rest.is_empty() {
+    let (scheme, rest) = without_query.split_once(':')?;
+    if !is_scheme(scheme) {
         return None;
     }
-    let (host, path) = host_and_path(rest)?;
+    let Some(authority) = rest.strip_prefix("//") else {
+        return Some(format!("{scheme}:"));
+    };
+    let (host, path) = host_and_path(authority)?;
     Some(format!("{scheme}://{host}{path}"))
+}
+
+fn is_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.')
 }
 
 fn host_and_path(rest: &str) -> Option<(&str, &str)> {
@@ -270,18 +283,6 @@ fn host_and_path(rest: &str) -> Option<(&str, &str)> {
         None => authority,
     };
     if host.is_empty() { None } else { Some((host, path)) }
-}
-
-fn strip_userinfo(url: &str) -> String {
-    let (authority, path) = match url.find('/') {
-        Some(index) => (&url[..index], &url[index..]),
-        None => (url, ""),
-    };
-    let host = match authority.rfind('@') {
-        Some(index) => &authority[index + 1..],
-        None => authority,
-    };
-    format!("{host}{path}")
 }
 
 fn action_error(kind: &str, stderr: &str) -> Option<&'static str> {
@@ -558,6 +559,54 @@ mod tests {
             .start_params()["url"],
             "about:blank"
         );
+        let opaque = [
+            (
+                "goto",
+                "data:text/html,<title>DATASECRET</title>",
+                Some("data:"),
+                "DATASECRET",
+            ),
+            (
+                "open",
+                "data:text/html,DATASECRET2",
+                Some("data:"),
+                "DATASECRET2",
+            ),
+            (
+                "goto",
+                "javascript:void('JSSECRET')",
+                Some("javascript:"),
+                "JSSECRET",
+            ),
+            (
+                "open",
+                "blob:https://example.com/BLOBSECRET",
+                Some("blob:"),
+                "BLOBSECRET",
+            ),
+            ("goto", "about:blank?q=BLANKSECRET", Some("about:blank"), "BLANKSECRET"),
+            (
+                "open",
+                "about:srcdoc,ABOUTSECRET",
+                Some("about:"),
+                "ABOUTSECRET",
+            ),
+            ("goto", "example.com/PATHSECRET", None, "PATHSECRET"),
+            ("open", "not a url PATHSECRET", None, "PATHSECRET"),
+        ];
+        for (kind, raw, expect, secret) in opaque {
+            let note = ActionNote {
+                kind: kind.to_string(),
+                url: Some(raw.to_string()),
+                ..ActionNote::default()
+            };
+            let params = note.start_params();
+            match expect {
+                Some(url) => assert_eq!(params["url"], url, "{raw}"),
+                None => assert!(params.get("url").is_none(), "{raw} {params}"),
+            }
+            assert!(!params.to_string().contains(secret), "{raw} {params}");
+        }
         let eval_failed = ActionNote {
             kind: "eval".to_string(),
             tab: Some("T".to_string()),
