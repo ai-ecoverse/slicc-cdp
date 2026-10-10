@@ -1,3 +1,4 @@
+use crate::action::{self, Report};
 use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
@@ -31,26 +32,27 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let mut cdp = connected;
     let mut state = session::load();
     let command = invocation.command.as_deref().unwrap_or("");
+    let mut report = action::Report::for_command(command);
     let result = match command {
-        "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation),
-        "close" | "tab-close" => cmd_close(&mut cdp, &mut state, invocation),
-        "goto" => cmd_goto(&mut cdp, &mut state, invocation),
-        "snapshot" => cmd_snapshot(&mut cdp, &mut state, invocation),
-        "click" => cmd_click(&mut cdp, &mut state, invocation),
-        "fill" => cmd_fill(&mut cdp, &mut state, invocation),
-        "type" => cmd_type(&mut cdp, &mut state, invocation),
-        "press" => cmd_press(&mut cdp, &mut state, invocation),
-        "screenshot" => cmd_screenshot(&mut cdp, &mut state, invocation),
-        "eval" => cmd_eval(&mut cdp, &mut state, invocation),
+        "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report),
+        "close" | "tab-close" => cmd_close(&mut cdp, &mut state, invocation, &mut report),
+        "goto" => cmd_goto(&mut cdp, &mut state, invocation, &mut report),
+        "snapshot" => cmd_snapshot(&mut cdp, &mut state, invocation, &mut report),
+        "click" => cmd_click(&mut cdp, &mut state, invocation, &mut report),
+        "fill" => cmd_fill(&mut cdp, &mut state, invocation, &mut report),
+        "type" => cmd_type(&mut cdp, &mut state, invocation, &mut report),
+        "press" => cmd_press(&mut cdp, &mut state, invocation, &mut report),
+        "screenshot" => cmd_screenshot(&mut cdp, &mut state, invocation, &mut report),
+        "eval" => cmd_eval(&mut cdp, &mut state, invocation, &mut report),
         "tab-list" => cmd_tab_list(&mut cdp, &state),
-        "tab-select" => cmd_tab_select(&mut cdp, &mut state, invocation),
+        "tab-select" => cmd_tab_select(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
-    if let Err(message) = session::save(&state) {
-        if result.code == 0 {
-            return Output::err(message);
-        }
-    }
+    let result = match session::save(&state) {
+        Err(message) if result.code == 0 => Output::err(message),
+        _ => result,
+    };
+    report.finish(&mut cdp, &result);
     result
 }
 
@@ -72,15 +74,24 @@ fn deferred_flag(invocation: &Invocation) -> Option<String> {
     None
 }
 
-fn cmd_open(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_open(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let url = invocation
         .positionals
         .first()
         .map(String::as_str)
         .unwrap_or("about:blank");
-    let foreground = flag_true(&invocation.flags, "foreground") || flag_true(&invocation.flags, "fg");
+    let foreground =
+        flag_true(&invocation.flags, "foreground") || flag_true(&invocation.flags, "fg");
+    report.url(url);
+    report.begin(cdp);
     match browser::create_target(cdp, url, foreground) {
         Ok(target_id) => {
+            report.tab(&target_id);
             state.current = Some(target_id.clone());
             Output::ok(format!("Opened {url} in new tab [targetId: {target_id}]\n"))
         }
@@ -88,7 +99,12 @@ fn cmd_open(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     }
 }
 
-fn cmd_close(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_close(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -97,6 +113,8 @@ fn cmd_close(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Out
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     match browser::close_target(cdp, &target) {
         Ok(()) => {
             state.snapshots.remove(&target);
@@ -109,10 +127,16 @@ fn cmd_close(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Out
     }
 }
 
-fn cmd_goto(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_goto(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let Some(url) = invocation.positionals.first() else {
         return Output::err("goto requires a URL\n");
     };
+    report.url(url.as_str());
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -121,6 +145,8 @@ fn cmd_goto(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     let existed = pages.iter().any(|page| page.target_id == target);
     let result = if existed {
         browser::navigate(cdp, &target, url)
@@ -163,7 +189,12 @@ fn cmd_tab_list(cdp: &mut Cdp, state: &Session) -> Output {
     Output::ok(format!("{}\n", lines.join("\n")))
 }
 
-fn cmd_tab_select(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_tab_select(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let Some(index_text) = invocation.positionals.first() else {
         return Output::err("tab-select requires a tab index\n");
     };
@@ -189,6 +220,8 @@ fn cmd_tab_select(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -
             pages.len()
         ));
     };
+    report.tab(&page.target_id);
+    report.begin(cdp);
     match browser::activate(cdp, &page.target_id) {
         Ok(()) => {
             state.current = Some(page.target_id.clone());
@@ -201,7 +234,12 @@ fn cmd_tab_select(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -
     }
 }
 
-fn cmd_snapshot(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_snapshot(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -210,6 +248,8 @@ fn cmd_snapshot(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> 
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     let session = match cdp::attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
@@ -260,16 +300,18 @@ fn build_snapshot(
         body
     } else {
         let frames = browser::frame_tree(cdp, session).unwrap_or_default();
-        let (stitched, assigned) = snapshot::stitch_iframes(&body, &url, &frames, |frame, prefix| {
-            let nodes = browser::accessibility_tree(cdp, session, Some(&frame.frame_id)).ok()?;
-            let root = single_root(nodes);
-            let (text, frame_refs) = snapshot::render_tree(&root, prefix);
-            for (id, mut rec) in frame_refs {
-                rec.frame_id = Some(frame.frame_id.clone());
-                refs.insert(id, rec);
-            }
-            Some(text)
-        });
+        let (stitched, assigned) =
+            snapshot::stitch_iframes(&body, &url, &frames, |frame, prefix| {
+                let nodes =
+                    browser::accessibility_tree(cdp, session, Some(&frame.frame_id)).ok()?;
+                let root = single_root(nodes);
+                let (text, frame_refs) = snapshot::render_tree(&root, prefix);
+                for (id, mut rec) in frame_refs {
+                    rec.frame_id = Some(frame.frame_id.clone());
+                    refs.insert(id, rec);
+                }
+                Some(text)
+            });
         let _ = assigned;
         stitched
     };
@@ -290,29 +332,44 @@ fn single_root(mut nodes: Vec<crate::snapshot::AxNode>) -> crate::snapshot::AxNo
     }
 }
 
-fn cmd_click(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_click(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let Some(id) = invocation.positionals.first() else {
         return Output::err("click requires a ref (e.g. e5)\n");
     };
-    let button = invocation.positionals.get(1).map(String::as_str).unwrap_or("left");
+    let button = invocation
+        .positionals
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("left");
     if !matches!(button, "left" | "right" | "middle") {
         return Output::err(format!("unknown button \"{button}\"\n"));
     }
     let modifiers = modifiers_of(invocation.flags.get("modifiers").map(String::as_str));
-    with_ref(cdp, state, invocation, id, |cdp, session, rec| {
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
         browser::click_ref(cdp, session, rec, button, modifiers)?;
         Ok(format!("Clicked {id}\n"))
     })
 }
 
-fn cmd_fill(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_fill(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     if invocation.positionals.len() < 2 {
         return Output::err("fill requires <ref> <text>\n");
     }
     let id = &invocation.positionals[0];
     let text = invocation.positionals[1..].join(" ");
+    report.length(text.chars().count());
     let submit = flag_true(&invocation.flags, "submit");
-    with_ref(cdp, state, invocation, id, |cdp, session, rec| {
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
         browser::fill_ref(cdp, session, rec, &text)?;
         if submit {
             browser::press_key(cdp, session, "Enter")?;
@@ -321,11 +378,17 @@ fn cmd_fill(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     })
 }
 
-fn cmd_type(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_type(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     if invocation.positionals.is_empty() {
         return Output::err("type requires text\n");
     }
     let text = invocation.positionals.join(" ");
+    report.length(text.chars().count());
     let submit = flag_true(&invocation.flags, "submit");
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
@@ -335,6 +398,8 @@ fn cmd_type(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     let session = match cdp::attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
@@ -356,10 +421,16 @@ fn cmd_type(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     }
 }
 
-fn cmd_press(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_press(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let Some(key) = invocation.positionals.first() else {
         return Output::err("press requires a key name\n");
     };
+    report.key(key.as_str());
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -368,6 +439,8 @@ fn cmd_press(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Out
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     let session = match cdp::attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
@@ -380,7 +453,12 @@ fn cmd_press(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Out
     }
 }
 
-fn cmd_screenshot(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_screenshot(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -389,6 +467,13 @@ fn cmd_screenshot(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    if let Some(id) = invocation.positionals.first() {
+        if let Some(label) = session::stored_label(state, &target, id) {
+            report.target(label);
+        }
+    }
+    report.begin(cdp);
     let session = match cdp::attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
@@ -425,7 +510,8 @@ fn capture(
         }
         clip = Some(value);
     }
-    let full = flag_true(&invocation.flags, "fullPage") || flag_true(&invocation.flags, "full-page");
+    let full =
+        flag_true(&invocation.flags, "fullPage") || flag_true(&invocation.flags, "full-page");
     let mut bytes = browser::screenshot(cdp, session, full, clip)?;
     if let Some(max) = invocation.flags.get("max-width") {
         let max = max
@@ -454,7 +540,12 @@ fn capture(
     ))
 }
 
-fn cmd_eval(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+fn cmd_eval(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
     if invocation.positionals.is_empty() {
         return Output::err("eval requires an expression\n");
     }
@@ -467,16 +558,19 @@ fn cmd_eval(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     let session = match cdp::attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
     let result: Result<String, String> = (|| {
         let value = if let Some(frame_id) = invocation.flags.get("frame") {
-            browser::evaluate_in_frame(cdp, &session, frame_id, &expression)
-                .or_else(|err| retry_await(err, &expression, |source| {
+            browser::evaluate_in_frame(cdp, &session, frame_id, &expression).or_else(|err| {
+                retry_await(err, &expression, |source| {
                     browser::evaluate_in_frame(cdp, &session, frame_id, source)
-                }))?
+                })
+            })?
         } else {
             browser::evaluate(cdp, &session, &expression, true).or_else(|err| {
                 retry_await(err, &expression, |source| {
@@ -533,6 +627,7 @@ fn with_ref(
     cdp: &mut Cdp,
     state: &mut Session,
     invocation: &Invocation,
+    report: &mut Report,
     id: &str,
     body: impl FnOnce(&mut Cdp, &str, &RefRec) -> Result<String, String>,
 ) -> Output {
@@ -544,6 +639,11 @@ fn with_ref(
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    if let Some(label) = session::stored_label(state, &target, id) {
+        report.target(label);
+    }
+    report.begin(cdp);
     let refs = match state.snapshots.get(&target) {
         Some(refs) => refs.clone(),
         None => return Output::err("No snapshot available. Run \"snapshot\" first.\n"),

@@ -1,3 +1,4 @@
+mod action;
 mod body;
 mod page;
 mod parse;
@@ -82,20 +83,33 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(cdp) => cdp,
         Err(message) => return Output::plain(message, 1),
     };
+    let mut report = action::Report::request(&request.method, &request.url);
     let target = match tab::resolve_tab(&mut cdp, &request.url, opts.tab.as_deref()) {
         Ok(target) => target,
-        Err(stop) => return Output::from_stop(stop),
+        Err(stop) => {
+            let output = Output::from_stop(stop);
+            report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
+            return output;
+        }
     };
+    report.tab(&target);
+    report.begin(&mut cdp);
     let session = match page::attach(&mut cdp, &target) {
         Ok(session) => session,
-        Err(message) => return Output::plain(message, 1),
+        Err(message) => {
+            let output = Output::plain(message, 1);
+            report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
+            return output;
+        }
     };
     let context = if let Some(frame) = opts.frame.as_deref().filter(|frame| !frame.is_empty()) {
         match page::frame_context(&mut cdp, &session, frame) {
             Ok(id) => Some(id),
             Err(stop) => {
                 page::detach(&mut cdp, &session);
-                return Output::from_stop(stop);
+                let output = Output::from_stop(stop);
+                report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
+                return output;
             }
         }
     } else {
@@ -106,9 +120,29 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     let fetched = page::run_fetch(&mut cdp, &session, &request, context);
     let elapsed = started.elapsed().as_secs_f64();
     page::detach(&mut cdp, &session);
-    match fetched {
+    let output = match fetched {
         Ok(result) => render(&opts, &request, &result, elapsed, &trace),
         Err(err) => render_failure(&opts, &request, &err, elapsed, &trace),
+    };
+    report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
+    output
+}
+
+fn annotation_stderr(stderr: &str) -> &str {
+    let mut rest = stderr;
+    loop {
+        let Some(line) = rest.lines().next() else {
+            return "";
+        };
+        if !(line.starts_with("> ") || line.starts_with("< ")) {
+            return rest;
+        }
+        rest = &rest[line.len()..];
+        if let Some(stripped) = rest.strip_prefix("\r\n") {
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix('\n') {
+            rest = stripped;
+        }
     }
 }
 
@@ -299,6 +333,20 @@ mod tests {
     fn run(args: &[&str]) -> Output {
         let argv: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         execute(&argv, None)
+    }
+
+    #[test]
+    fn annotation_stderr_skips_the_verbose_trace() {
+        let stderr = "> GET https://app.example/nope?token=secret\n> Authorization: secret-token\n> \n< HTTP/1.1 500 ERR\n< \ncurlwright: (22) The requested URL returned error: 500\n";
+        assert_eq!(
+            annotation_stderr(stderr),
+            "curlwright: (22) The requested URL returned error: 500\n"
+        );
+        assert_eq!(
+            annotation_stderr("curlwright: (7) Failed to fetch\n"),
+            "curlwright: (7) Failed to fetch\n"
+        );
+        assert_eq!(annotation_stderr("> GET https://app.example/\n> \n"), "");
     }
 
     #[test]
