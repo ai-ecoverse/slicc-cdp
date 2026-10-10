@@ -98,6 +98,30 @@ async function playwrightFlow(runner, site) {
   assert.match(selected.stdout, new RegExp(escapeReg(openedId)));
   const moved = await runner.playwright(['goto', `${site.origin}/one`], cwd);
   assert.equal(moved.code, 0, moved.stderr);
+  const logged = await runner.playwright(['eval', "console.error('slicc-console-marker')"], cwd);
+  assert.equal(logged.code, 0, logged.stderr);
+  const messages = await runner.playwright(['console'], cwd);
+  assert.equal(messages.code, 0, `${messages.stderr}\n${messages.stdout}`);
+  assert.match(messages.stdout, /\[ERROR\] slicc-console-marker/);
+  const fetched = await runner.playwright(
+    ['eval', `fetch('${site.origin}/api/me').then((response) => response.text())`],
+    cwd
+  );
+  assert.equal(fetched.code, 0, `${fetched.stderr}\n${fetched.stdout}`);
+  const requests = await runner.playwright(['requests'], cwd);
+  assert.equal(requests.code, 0, `${requests.stderr}\n${requests.stdout}`);
+  assert.match(requests.stdout, /\/api\/me/);
+  const requestIndex = requests.stdout
+    .split('\n')
+    .find((line) => line.includes('/api/me'))
+    ?.match(/^(\d+)\./)?.[1];
+  assert.ok(requestIndex, requests.stdout);
+  const one = await runner.playwright(['request', requestIndex], cwd);
+  assert.equal(one.code, 0, `${one.stderr}\n${one.stdout}`);
+  assert.match(one.stdout, /\/api\/me/);
+  const missing = await runner.playwright(['request', '9999'], cwd);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /not found/);
   const closed = await runner.playwright(['tab-close', '--tab', extraId], cwd);
   assert.equal(closed.code, 0, closed.stderr);
   const finished = await runner.playwright(['close'], cwd);

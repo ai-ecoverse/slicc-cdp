@@ -5,12 +5,17 @@ use crate::cdp::{self, Cdp};
 use crate::connect;
 use crate::session::{self, Session};
 use crate::snapshot::{self, RefRec};
+use crate::trace::{self, Piece};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
+    let command = invocation.command.as_deref().unwrap_or("");
+    if let Some(message) = trace::precheck(command, &invocation.positionals) {
+        return Output::err(message);
+    }
     let start = match connect::choose_start(invocation.cdp.as_deref(), env_url) {
         Ok(start) => start,
         Err(message) => return Output::err(message),
@@ -31,7 +36,6 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load();
-    let command = invocation.command.as_deref().unwrap_or("");
     let mut report = action::Report::for_command(command);
     let result = match command {
         "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report),
@@ -46,6 +50,11 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         "eval" => cmd_eval(&mut cdp, &mut state, invocation, &mut report),
         "tab-list" => cmd_tab_list(&mut cdp, &state),
         "tab-select" => cmd_tab_select(&mut cdp, &mut state, invocation, &mut report),
+        "console" => cmd_console(&mut cdp, &mut state, invocation),
+        "requests" => cmd_requests(&mut cdp, &mut state, invocation),
+        _ if trace::is_request_command(command) => {
+            cmd_request(&mut cdp, &mut state, invocation, command)
+        }
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
@@ -89,7 +98,7 @@ fn cmd_open(
         flag_true(&invocation.flags, "foreground") || flag_true(&invocation.flags, "fg");
     report.url(url);
     report.begin(cdp);
-    match browser::create_target(cdp, url, foreground) {
+    match browser::create_target(cdp, state, url, foreground) {
         Ok(target_id) => {
             report.tab(&target_id);
             state.current = Some(target_id.clone());
@@ -118,6 +127,8 @@ fn cmd_close(
     match browser::close_target(cdp, &target) {
         Ok(()) => {
             state.snapshots.remove(&target);
+            session::clear_console(state, &target);
+            session::clear_requests(state, &target);
             if state.current.as_deref() == Some(target.as_str()) {
                 state.current = None;
             }
@@ -149,7 +160,7 @@ fn cmd_goto(
     report.begin(cdp);
     let existed = pages.iter().any(|page| page.target_id == target);
     let result = if existed {
-        browser::navigate(cdp, &target, url)
+        browser::navigate(cdp, state, &target, url)
     } else {
         Ok(())
     };
@@ -250,16 +261,19 @@ fn cmd_snapshot(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
     let built = build_snapshot(cdp, &session, invocation);
-    cdp::detach(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
     let (text, refs) = match built {
         Ok(value) => value,
         Err(message) => return Output::err(message),
     };
+    if let Err(message) = watched {
+        return Output::err(message);
+    }
     state.current = Some(target.clone());
     state.snapshots.insert(target, refs);
     if let Some(filename) = invocation.flags.get("filename") {
@@ -400,7 +414,7 @@ fn cmd_type(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -411,9 +425,12 @@ fn cmd_type(
         }
         Ok(())
     })();
-    cdp::detach(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(()) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
             state.snapshots.remove(&target);
             Output::ok(format!("Typed: {text}\n"))
         }
@@ -441,14 +458,19 @@ fn cmd_press(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
     let result = browser::press_key(cdp, &session, key);
-    cdp::detach(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
-        Ok(()) => Output::ok(format!("Pressed {key}\n")),
+        Ok(()) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            Output::ok(format!("Pressed {key}\n"))
+        }
         Err(message) => Output::err(message),
     }
 }
@@ -474,14 +496,19 @@ fn cmd_screenshot(
         }
     }
     report.begin(cdp);
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
     let result = capture(cdp, state, invocation, &target, &session);
-    cdp::detach(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
-        Ok(message) => Output::ok(message),
+        Ok(message) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            Output::ok(message)
+        }
         Err(message) => Output::err(message),
     }
 }
@@ -560,7 +587,7 @@ fn cmd_eval(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -580,9 +607,12 @@ fn cmd_eval(
         };
         Ok(browser::format_eval(&value))
     })();
-    cdp::detach(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(text) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
             state.current = Some(target);
             if let Some(path) = invocation
                 .flags
@@ -652,14 +682,17 @@ fn with_ref(
         Ok(rec) => rec.clone(),
         Err(message) => return Output::err(message),
     };
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
     let result = body(cdp, &session, &rec);
-    cdp::detach(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(text) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
             state.snapshots.remove(&target);
             Output::ok(text)
         }
@@ -670,7 +703,7 @@ fn with_ref(
 fn resolve_target(
     cdp: &mut Cdp,
     invocation: &Invocation,
-    state: &Session,
+    state: &mut Session,
     pages: &[PageInfo],
     create_for_goto: bool,
 ) -> Result<String, String> {
@@ -692,13 +725,165 @@ fn resolve_target(
     }
     if create_for_goto && pages.is_empty() {
         if let Some(url) = invocation.positionals.first() {
-            return browser::create_target(cdp, url, false);
+            return browser::create_target(cdp, state, url, false);
         }
     }
     Err(
         "Error: --tab <targetId> is required. Run 'playwright-cli tab-list' to get tab IDs.\n"
             .to_string(),
     )
+}
+
+fn cmd_console(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+    let target = match current_target(cdp, invocation, state) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    if flag_true(&invocation.flags, "clear") {
+        session::clear_console(state, &target);
+        return Output::ok("Console messages cleared\n");
+    }
+    let level = invocation
+        .positionals
+        .first()
+        .map(String::as_str)
+        .unwrap_or("info");
+    let entries = state.console.get(&target).cloned().unwrap_or_default();
+    match trace::render_console(&entries, level) {
+        Ok(text) => Output::ok(format!("{text}\n")),
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_requests(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
+    let target = match current_target(cdp, invocation, state) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    if flag_true(&invocation.flags, "clear") {
+        session::clear_requests(state, &target);
+        return Output::ok("Network requests cleared\n");
+    }
+    let items = state.requests.get(&target).cloned().unwrap_or_default();
+    let filter = invocation.flags.get("filter").map(String::as_str);
+    match trace::render_requests(&items, flag_true(&invocation.flags, "static"), filter) {
+        Ok(text) => Output::ok(format!("{text}\n")),
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_request(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    command: &str,
+) -> Output {
+    let Some(index) = invocation
+        .positionals
+        .first()
+        .and_then(|text| trace::positive_index(text))
+    else {
+        return Output::err(format!("playwright-cli {command}: index is required\n"));
+    };
+    let target = match current_target(cdp, invocation, state) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    let items = state.requests.get(&target).cloned().unwrap_or_default();
+    let filename = invocation.flags.get("filename").map(String::as_str);
+    let title = part_title(command);
+    if command == "request" {
+        let text = match trace::render_request(&items, index) {
+            Ok(text) => text,
+            Err(message) => return Output::err(message),
+        };
+        if filename.is_some() {
+            let body = text.strip_prefix("### Result\n").unwrap_or(&text);
+            return finish_text(false, title, body, filename);
+        }
+        return finish_text(true, title, &text, None);
+    }
+    match trace::render_part(&items, index, command) {
+        Ok(Piece::Text(body)) => finish_text(true, title, &body, filename),
+        Ok(Piece::Empty) => finish_text(true, title, "", filename),
+        Ok(Piece::File { bytes, extension }) => finish_file(title, &bytes, &extension, filename),
+        Err(message) => Output::err(message),
+    }
+}
+
+fn current_target(
+    cdp: &mut Cdp,
+    invocation: &Invocation,
+    state: &mut Session,
+) -> Result<String, String> {
+    let pages = browser::list_pages(cdp)?;
+    resolve_target(cdp, invocation, state, &pages, false)
+}
+
+fn finish_text(raw: bool, title: &str, body: &str, filename: Option<&str>) -> Output {
+    if let Some(path) = filename {
+        if let Err(message) = write_text(path, body) {
+            return Output::err(message);
+        }
+        let link = trace::printable_link(title, path);
+        if raw {
+            return Output::ok(format!("{link}\n"));
+        }
+        return Output::ok(format!("### Result\n{link}\n"));
+    }
+    if body.is_empty() {
+        return Output::ok(String::new());
+    }
+    if body.ends_with('\n') {
+        Output::ok(body.to_string())
+    } else {
+        Output::ok(format!("{body}\n"))
+    }
+}
+
+fn finish_file(title: &str, bytes: &[u8], extension: &str, filename: Option<&str>) -> Output {
+    let path = match filename {
+        Some(path) => PathBuf::from(path),
+        None => default_body_path(extension),
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return Output::err(format!("{}: {err}\n", path.display()));
+            }
+        }
+    }
+    if let Err(err) = fs::write(&path, bytes) {
+        return Output::err(format!("{}: {err}\n", path.display()));
+    }
+    let link = trace::printable_link(title, &path.display().to_string());
+    Output::ok(format!("{link}\n"))
+}
+
+fn default_body_path(extension: &str) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let name = format!("response-{millis}.{extension}");
+    #[cfg(not(target_os = "wasi"))]
+    {
+        PathBuf::from("/tmp").join(name)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        PathBuf::from(".playwright-cli").join(name)
+    }
+}
+
+fn part_title(command: &str) -> &'static str {
+    match command {
+        "request-headers" => "Request headers",
+        "request-body" => "Request body",
+        "response-headers" => "Response headers",
+        "response-body" => "Response body",
+        _ => "Request",
+    }
 }
 
 fn flag_true(flags: &BTreeMap<String, String>, name: &str) -> bool {

@@ -37,6 +37,15 @@ pub fn global_help() -> String {
         row("tab-close [index]", "close a browser tab"),
         row("tab-select <index>", "select a browser tab"),
         String::new(),
+        "Console and network:".to_string(),
+        row("console [min-level]", "list console messages"),
+        row("requests", "list network requests"),
+        row("request <index>", "show one network request"),
+        row("request-headers <index>", "print request headers"),
+        row("request-body <index>", "print the request body"),
+        row("response-headers <index>", "print response headers"),
+        row("response-body <index>", "print the response body"),
+        String::new(),
         "Not implemented yet:".to_string(),
     ];
     let pending: Vec<&str> = spec::all()
@@ -247,6 +256,78 @@ fn implemented_page(name: &str) -> Option<String> {
             &[("[index]", "not implemented")],
             &[("--tab <targetId>", "tab to close (defaults to the current tab)")],
         ),
+        "console" => page(
+            "console [min-level]",
+            &[
+                "List console messages",
+                "",
+                "Levels: error, warning, info, debug. Defaults to info. Each level includes more severe levels.",
+            ],
+            &[("[min-level]", "minimum level to show")],
+            &[
+                ("--clear", "drop the stored console list for the tab"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "requests" => page(
+            "requests",
+            &["List network requests captured for the tab. Each line is numbered for request."],
+            &[],
+            &[
+                ("--static", "include successful static resources"),
+                ("--filter <text>", "substring of the request URL"),
+                ("--clear", "drop the stored network list for the tab"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "request" => page(
+            "request <index>",
+            &["Show one network request by its number from requests."],
+            &[("<index>", "1-based request number from requests")],
+            &[
+                ("--filename <path>", "write the text to a file"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "request-headers" => page(
+            "request-headers <index>",
+            &["Print request headers for one network request."],
+            &[("<index>", "1-based request number from requests")],
+            &[
+                ("--filename <path>", "write the text to a file"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "request-body" => page(
+            "request-body <index>",
+            &["Print the request body for one network request."],
+            &[("<index>", "1-based request number from requests")],
+            &[
+                ("--filename <path>", "write the text to a file"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "response-headers" => page(
+            "response-headers <index>",
+            &["Print response headers for one network request."],
+            &[("<index>", "1-based request number from requests")],
+            &[
+                ("--filename <path>", "write the text to a file"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "response-body" => page(
+            "response-body <index>",
+            &[
+                "Print the response body for one network request.",
+                "Text bodies are printed. Binary bodies are saved and the path is printed.",
+            ],
+            &[("<index>", "1-based request number from requests")],
+            &[
+                ("--filename <path>", "write the text to a file"),
+                ("--tab <targetId>", "tab to read"),
+            ],
+        ),
         _ => return None,
     };
     Some(page)
@@ -300,6 +381,7 @@ fn arg_optional(spec: &Spec, index: usize) -> bool {
         ("open", 0)
             | ("tab-new", 0)
             | ("screenshot", 0)
+            | ("console", 0)
             | ("dialog-accept", 0)
             | ("unroute", 0)
             | ("record", 0)
