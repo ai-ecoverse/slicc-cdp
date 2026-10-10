@@ -51,15 +51,18 @@
     "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js",
     "format": "biome check --write .",
     "test": "true",
+    "test:integration": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo build -p playwright-cli -p curlwright && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --target wasm32-wasip1 -p playwright-cli -p curlwright && npx playwright-core install chromium && node --test --test-timeout=180000 test/integration/chromium.test.mjs",
     "test:unit": "mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node --test 'test/unit/**/*.test.mjs'",
     "trust": "npx fledgling sync -y --skip-publish",
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",
     "release": "semantic-release"
   },
   "devDependencies": {
+    "@ai-ecoverse/slicc-kernel": "1.42.3",
     "@ai-ecoverse/slicc-shared-web": "1.12.0",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.1.16",
+    "playwright-core": "1.63.0",
     "semantic-release": "25.0.9"
   }
 }
