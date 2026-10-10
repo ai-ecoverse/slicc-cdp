@@ -831,6 +831,12 @@ mod tests {
                 ("open", "about:blank", Some("about:blank"), ""),
                 (
                     "goto",
+                    "ABOUT:blank?q=BLANKSECRET",
+                    Some("about:blank"),
+                    "BLANKSECRET",
+                ),
+                (
+                    "goto",
                     "about:srcdoc,ABOUTSECRET",
                     Some("about:"),
                     "ABOUTSECRET",

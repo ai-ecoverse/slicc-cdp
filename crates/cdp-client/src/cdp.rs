@@ -246,7 +246,7 @@ fn public_url(raw: &str) -> Option<String> {
     if without_query.is_empty() {
         return None;
     }
-    if without_query == "about:blank" {
+    if is_about_blank(without_query) {
         return Some("about:blank".to_string());
     }
     if let Some(rest) = without_query.strip_prefix("//") {
@@ -258,10 +258,17 @@ fn public_url(raw: &str) -> Option<String> {
         return None;
     }
     let Some(authority) = rest.strip_prefix("//") else {
-        return Some(format!("{scheme}:"));
+        return Some(format!("{}:", scheme.to_ascii_lowercase()));
     };
     let (host, path) = host_and_path(authority)?;
     Some(format!("{scheme}://{host}{path}"))
+}
+
+fn is_about_blank(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("about") && rest.eq_ignore_ascii_case("blank")
 }
 
 fn is_scheme(scheme: &str) -> bool {
@@ -585,11 +592,26 @@ mod tests {
                 "BLOBSECRET",
             ),
             ("goto", "about:blank?q=BLANKSECRET", Some("about:blank"), "BLANKSECRET"),
+            ("open", "ABOUT:blank?q=BLANKSECRET", Some("about:blank"), "BLANKSECRET"),
+            ("goto", "About:blank", Some("about:blank"), "BLANKSECRET"),
+            (
+                "open",
+                "DATA:text/html,DATASECRET",
+                Some("data:"),
+                "DATASECRET",
+            ),
             (
                 "open",
                 "about:srcdoc,ABOUTSECRET",
                 Some("about:"),
                 "ABOUTSECRET",
+            ),
+            ("goto", "file:/tmp/PATHSECRET", Some("file:"), "PATHSECRET"),
+            (
+                "open",
+                "https:example.com/PATHSECRET",
+                Some("https:"),
+                "PATHSECRET",
             ),
             ("goto", "example.com/PATHSECRET", None, "PATHSECRET"),
             ("open", "not a url PATHSECRET", None, "PATHSECRET"),
