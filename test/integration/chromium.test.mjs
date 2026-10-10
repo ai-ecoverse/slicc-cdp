@@ -12,28 +12,38 @@ const wasmDir = path.join(root, 'target/wasm32-wasip1/debug');
 
 test('chromium through the native binaries and the kernel', async (t) => {
   const site = await startServer();
-  const browser = await launchBrowser();
-  const native = nativeRunner(
-    path.join(nativeDir, process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'),
-    path.join(nativeDir, process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'),
-    browser.wsUrl
-  );
-  const kernel = await kernelRunner(
-    path.join(wasmDir, 'playwright-cli.wasm'),
-    path.join(wasmDir, 'curlwright.wasm'),
-    browser.wsUrl
-  );
+  let browser;
+  let kernel;
   try {
+    browser = await launchBrowser();
+    const native = nativeRunner(
+      path.join(nativeDir, process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'),
+      path.join(nativeDir, process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'),
+      browser.wsUrl
+    );
+    kernel = await kernelRunner(
+      path.join(wasmDir, 'playwright-cli.wasm'),
+      path.join(wasmDir, 'curlwright.wasm'),
+      browser.wsUrl
+    );
     await t.test('native playwright-cli', () => playwrightFlow(native, site));
     await t.test('native curlwright', () => curlFlow(native, site, browser.wsUrl));
     await t.test('kernel playwright-cli', () => playwrightFlow(kernel, site));
     await t.test('kernel curlwright', () => curlFlow(kernel, site, browser.wsUrl));
   } finally {
-    await kernel.close();
-    await browser.close();
-    await site.close();
+    await settle(kernel?.close());
+    await settle(browser?.close());
+    await settle(site.close());
   }
 });
+
+async function settle(value) {
+  try {
+    await value;
+  } catch {
+    return undefined;
+  }
+}
 
 async function playwrightFlow(runner, site) {
   const cwd = await runner.fresh();

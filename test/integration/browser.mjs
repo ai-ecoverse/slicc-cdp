@@ -22,23 +22,34 @@ export async function launchBrowser() {
   if (port === 9222) port = await freePort();
   if (port === 9222) throw new Error('refusing to bind the kernel CDP port');
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
+  let chromeLog = '';
   const child = spawn(
     chromium.executablePath(),
     [
       `--remote-debugging-port=${port}`,
+      '--remote-debugging-address=127.0.0.1',
       `--user-data-dir=${userDataDir}`,
       '--headless=new',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-gpu',
       '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
       '--remote-allow-origins=*',
       'about:blank',
     ],
-    { stdio: 'ignore' }
+    { stdio: ['ignore', 'ignore', 'pipe'] }
   );
+  child.stderr.on('data', (chunk) => {
+    chromeLog = (chromeLog + chunk.toString('utf8')).slice(-4000);
+  });
+  const stop = () => {
+    if (child.exitCode !== null || child.signalCode) return;
+    child.kill('SIGKILL');
+  };
   try {
-    const version = await waitVersion(port);
+    const version = await waitVersion(port, () => chromeStatus(child, chromeLog));
     const wsUrl = version.webSocketDebuggerUrl;
     if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || wsUrl.includes(':9222/')) {
       throw new Error(`unexpected debugger url ${wsUrl}`);
@@ -47,21 +58,32 @@ export async function launchBrowser() {
       port,
       wsUrl,
       async close() {
-        child.kill('SIGKILL');
+        stop();
         await rm(userDataDir, { recursive: true, force: true });
       },
     };
   } catch (error) {
-    child.kill('SIGKILL');
+    stop();
     await rm(userDataDir, { recursive: true, force: true });
     throw error;
   }
 }
 
-async function waitVersion(port) {
+function chromeStatus(child, log) {
+  const tail = log.trim().slice(-2000);
+  if (child.exitCode !== null || child.signalCode) {
+    const how = child.signalCode ? `signal ${child.signalCode}` : `code ${child.exitCode}`;
+    return `chromium exited ${how}${tail ? `\n${tail}` : ''}`;
+  }
+  return tail;
+}
+
+async function waitVersion(port, status) {
   const deadline = Date.now() + 20000;
   let last = 'no response';
   while (Date.now() < deadline) {
+    const early = status();
+    if (early.startsWith('chromium exited')) throw new Error(early);
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json/version`);
       if (response.ok) return await response.json();
@@ -71,7 +93,10 @@ async function waitVersion(port) {
     }
     await delay(100);
   }
-  throw new Error(`debugging port ${port} did not answer /json/version (${last})`);
+  const detail = status();
+  throw new Error(
+    `debugging port ${port} did not answer /json/version (${last})${detail ? `\n${detail}` : ''}`
+  );
 }
 
 function delay(ms) {
