@@ -14,6 +14,22 @@ pub struct RefRec {
     pub backend_node_id: Option<u64>,
     pub selector: String,
     pub frame_id: Option<String>,
+    pub label: Option<String>,
+}
+
+pub fn ref_label(role: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let full = format!("{role} \"{}\"", escape_yaml(name));
+    Some(cap_chars(&full, 80))
+}
+
+fn cap_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    value.chars().take(max).collect()
 }
 
 pub fn render_tree(node: &AxNode, frame_prefix: &str) -> (String, BTreeMap<String, RefRec>) {
@@ -43,6 +59,7 @@ fn render_node(
                 backend_node_id: node.backend_node_id,
                 selector: build_ref_selector(&role, &name),
                 frame_id: None,
+                label: ref_label(&role, &name),
             },
         );
     }
@@ -148,7 +165,11 @@ pub fn ax_from_cdp(nodes: &[serde_json::Value]) -> Vec<AxNode> {
     let roots: Vec<String> = nodes
         .iter()
         .filter(|node| node.get("parentId").and_then(|v| v.as_str()).is_none())
-        .filter_map(|node| node.get("nodeId").and_then(|v| v.as_str()).map(str::to_string))
+        .filter_map(|node| {
+            node.get("nodeId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .collect();
     fn child_ids<'a>(node: &'a serde_json::Value) -> Vec<&'a str> {
         node.get("childIds")
@@ -156,10 +177,7 @@ pub fn ax_from_cdp(nodes: &[serde_json::Value]) -> Vec<AxNode> {
             .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect())
             .unwrap_or_default()
     }
-    fn build(
-        id: &str,
-        by_id: &HashMap<String, &serde_json::Value>,
-    ) -> Vec<AxNode> {
+    fn build(id: &str, by_id: &HashMap<String, &serde_json::Value>) -> Vec<AxNode> {
         let Some(node) = by_id.get(id) else {
             return Vec::new();
         };
@@ -167,7 +185,11 @@ pub fn ax_from_cdp(nodes: &[serde_json::Value]) -> Vec<AxNode> {
         for child in child_ids(node) {
             children.extend(build(child, by_id));
         }
-        if node.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if node
+            .get("ignored")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return children;
         }
         let role = node
@@ -191,10 +213,7 @@ pub fn ax_from_cdp(nodes: &[serde_json::Value]) -> Vec<AxNode> {
             children,
         }]
     }
-    roots
-        .iter()
-        .flat_map(|id| build(id, &by_id))
-        .collect()
+    roots.iter().flat_map(|id| build(id, &by_id)).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -353,7 +372,10 @@ fn normalize_url(raw: &str, base: Option<&str>) -> Option<String> {
 fn split_origin(url: &str) -> Option<(&str, &str)> {
     let idx = url.find("://")?;
     let after = idx + 3;
-    let slash = url[after..].find('/').map(|pos| after + pos).unwrap_or(url.len());
+    let slash = url[after..]
+        .find('/')
+        .map(|pos| after + pos)
+        .unwrap_or(url.len());
     Some((&url[..slash], &url[slash..]))
 }
 
@@ -441,6 +463,32 @@ mod tests {
         assert!(text.contains("[ref=e1]"));
         assert!(text.contains(": \"0\""));
         assert_eq!(refs["e1"].backend_node_id, Some(44));
+        assert_eq!(
+            refs["e1"].label.as_deref(),
+            Some("textbox \"{\\\"label\\\":\\\"Message\\\"}\"")
+        );
+    }
+
+    #[test]
+    fn ref_label_quotes_the_name_and_caps_at_80() {
+        let tree = node("button", "Sign in", vec![]);
+        let (_, refs) = render_tree(&tree, "");
+        assert_eq!(refs["e1"].label.as_deref(), Some("button \"Sign in\""));
+        let quoted = node("button", "Say \"hi\"", vec![]);
+        let (_, refs) = render_tree(&quoted, "");
+        assert_eq!(
+            refs["e1"].label.as_deref(),
+            Some("button \"Say \\\"hi\\\"\"")
+        );
+        let long = "é".repeat(90);
+        let wide = node("button", &long, vec![]);
+        let (_, refs) = render_tree(&wide, "");
+        let label = refs["e1"].label.clone().unwrap();
+        assert_eq!(label.chars().count(), 80);
+        assert!(label.starts_with("button \""));
+        let bare = node("textbox", "", vec![]);
+        let (_, refs) = render_tree(&bare, "");
+        assert!(refs["e1"].label.is_none());
     }
 
     #[test]
@@ -458,9 +506,10 @@ mod tests {
                 url: "https://cdn.example/ad".to_string(),
             },
         ];
-        let (text, assigned) = stitch_iframes(content, "https://example.com/", &frames, |_, prefix| {
-            Some(format!("- button \"Go\" [ref={prefix}e5]"))
-        });
+        let (text, assigned) =
+            stitch_iframes(content, "https://example.com/", &frames, |_, prefix| {
+                Some(format!("- button \"Go\" [ref={prefix}e5]"))
+            });
         assert!(text.contains("[ref=f1e5]"));
         assert_eq!(assigned, vec![("f1".to_string(), "child".to_string())]);
     }

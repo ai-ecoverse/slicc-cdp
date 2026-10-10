@@ -23,10 +23,18 @@ struct Call {
     params: Value,
 }
 
+#[derive(Clone, Copy)]
+enum SliccReply {
+    Ack,
+    NotFound,
+    Silent,
+}
+
 struct Shared {
     log: Mutex<Vec<Call>>,
     discovery_path: Mutex<String>,
     ws_path: Mutex<String>,
+    slicc: Mutex<SliccReply>,
 }
 
 struct Running {
@@ -55,10 +63,15 @@ fn one_page() -> Vec<PageSpec> {
 }
 
 fn serve(pages: Vec<PageSpec>) -> Running {
+    serve_mode(pages, SliccReply::Ack)
+}
+
+fn serve_mode(pages: Vec<PageSpec>, slicc: SliccReply) -> Running {
     let shared = Arc::new(Shared {
         log: Mutex::new(Vec::new()),
         discovery_path: Mutex::new(String::new()),
         ws_path: Mutex::new(String::new()),
+        slicc: Mutex::new(slicc),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -160,6 +173,14 @@ fn on_message(text: &str, pages: &[PageSpec], shared: &Shared) -> Vec<String> {
     let params = value.get("params").cloned().unwrap_or(Value::Null);
     let session_id = value.get("sessionId").and_then(|item| item.as_str()).map(str::to_string);
     shared.log.lock().unwrap().push(Call { method: method.clone(), session_id: session_id.clone(), params: params.clone() });
+    if method == "Slicc.action" {
+        let mode = *shared.slicc.lock().unwrap();
+        return match mode {
+            SliccReply::Ack => vec![wrap(id, json!({}))],
+            SliccReply::NotFound => vec![json!({"id": id, "error": {"message": "'Slicc.action' wasn't found"}}).to_string()],
+            SliccReply::Silent => Vec::new(),
+        };
+    }
     match method.as_str() {
         "Target.getTargets" => vec![wrap(id, json!({
             "targetInfos": pages.iter().map(|page| json!({
@@ -474,4 +495,66 @@ fn a_single_foreign_tab_is_not_a_guess() {
     assert!(output.stderr.contains("--tab=OTHER"));
     assert!(output.stderr.contains("https://other.example/dash"));
     assert!(running.shared.log.lock().unwrap().iter().all(|call| call.method != "Runtime.evaluate"));
+}
+
+#[test]
+fn a_missing_action_reply_does_not_change_the_response() {
+    let args = ["-H", "Authorization: secret-token", "-d", "secret-text", "https://app.example/api/me"];
+    let started = std::time::Instant::now();
+    let ack = serve_mode(one_page(), SliccReply::Ack);
+    let missing = serve_mode(one_page(), SliccReply::NotFound);
+    let silent = serve_mode(one_page(), SliccReply::Silent);
+    let acknowledged = run_at(ack.port, &args);
+    let rejected = run_at(missing.port, &args);
+    let quiet = run_at(silent.port, &args);
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    assert_eq!(acknowledged.code, 0, "{}", acknowledged.stderr);
+    assert_eq!(acknowledged.stdout, rejected.stdout);
+    assert_eq!(acknowledged.stderr, rejected.stderr);
+    assert_eq!(acknowledged.code, rejected.code);
+    assert_eq!(acknowledged.stdout, quiet.stdout);
+    assert_eq!(acknowledged.stderr, quiet.stderr);
+    assert_eq!(acknowledged.code, quiet.code);
+    assert_eq!(acknowledged.as_text(), "session=from-tab");
+    assert!(!acknowledged.stderr.contains("wasn't found"));
+    for running in [&ack, &missing, &silent] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            let ready = running.shared.log.lock().unwrap().iter().filter(|call| call.method == "Slicc.action").count() >= 2;
+            if ready {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let log = running.shared.log.lock().unwrap();
+        let actions: Vec<&Call> = log.iter().filter(|call| call.method == "Slicc.action").collect();
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|call| call.session_id.is_none()));
+        let start = &actions[0].params;
+        assert_eq!(start["phase"], "start");
+        assert_eq!(start["kind"], "request");
+        assert_eq!(start["method"], "POST");
+        assert_eq!(start["url"], "https://app.example/api/me");
+        assert_eq!(start["tab"], "T1");
+        let rendered = start.to_string();
+        assert!(!rendered.contains("secret-text"));
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("Authorization"));
+        assert!(start.get("headers").is_none());
+        assert!(start.get("body").is_none());
+        assert_eq!(actions[1].params["phase"], "end");
+        assert_eq!(actions[1].params["ok"], true);
+        assert_eq!(actions[1].params["tab"], "T1");
+        assert!(actions[1].params.get("error").is_none());
+        let names: Vec<&str> = log.iter().map(|call| call.method.as_str()).collect();
+        let resolved = names.iter().position(|name| *name == "Target.getTargets").unwrap();
+        let began = names.iter().position(|name| *name == "Slicc.action").unwrap();
+        let fetched = names.iter().position(|name| *name == "Runtime.evaluate").unwrap();
+        let ended = names.iter().rposition(|name| *name == "Slicc.action").unwrap();
+        assert!(resolved < began && began < fetched && fetched < ended);
+        let eval = log.iter().find(|call| call.method == "Runtime.evaluate").unwrap();
+        let expression = eval.params["expression"].as_str().unwrap_or("");
+        assert!(expression.contains("c2VjcmV0LXRleHQ="));
+        assert!(expression.contains("secret-token"));
+    }
 }

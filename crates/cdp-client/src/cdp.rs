@@ -72,6 +72,20 @@ impl Cdp {
         }
     }
 
+    pub fn notify(&mut self, method: &str, params: Value, session_id: Option<&str>) {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut message = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Some(session_id) = session_id {
+            message["sessionId"] = json!(session_id);
+        }
+        let _ = self.ws.send_text(&message.to_string());
+    }
+
     pub fn wait_load(&mut self, session_id: &str) -> Result<(), String> {
         if self.events.iter().any(|event| is_load(event, session_id)) {
             return Ok(());
@@ -86,7 +100,9 @@ impl Cdp {
             Duration::from_secs(1),
         );
         let settled = match &probe {
-            Ok(result) => probe_is_settled(Ok(result.pointer("/result/value").and_then(|value| value.as_str())))?,
+            Ok(result) => probe_is_settled(Ok(result
+                .pointer("/result/value")
+                .and_then(|value| value.as_str())))?,
             Err(err) => probe_is_settled(Err(err.as_str()))?,
         };
         if settled {
@@ -112,14 +128,18 @@ impl Cdp {
             }
         }
     }
-
 }
 
 fn probe_is_settled(outcome: Result<Option<&str>, &str>) -> Result<bool, String> {
     match outcome {
         Ok(Some("loading")) | Ok(Some("interactive")) => Ok(false),
         Ok(_) => Ok(true),
-        Err(err) if err.starts_with("Runtime.evaluate timed out") || err.starts_with("Runtime.evaluate:") => Ok(true),
+        Err(err)
+            if err.starts_with("Runtime.evaluate timed out")
+                || err.starts_with("Runtime.evaluate:") =>
+        {
+            Ok(true)
+        }
         Err(err) => Err(err.to_string()),
     }
 }
@@ -131,10 +151,7 @@ fn is_load(event: &Value, session_id: &str) -> bool {
     match event.get("method").and_then(|v| v.as_str()) {
         Some("Page.loadEventFired") => true,
         Some("Page.lifecycleEvent") => {
-            event
-                .pointer("/params/name")
-                .and_then(|v| v.as_str())
-                == Some("load")
+            event.pointer("/params/name").and_then(|v| v.as_str()) == Some("load")
         }
         _ => false,
     }
@@ -159,6 +176,65 @@ pub fn detach(cdp: &mut Cdp, session_id: &str) {
         json!({ "sessionId": session_id }),
         None,
     );
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ActionNote {
+    pub kind: String,
+    pub tab: Option<String>,
+    pub target: Option<String>,
+    pub url: Option<String>,
+    pub key: Option<String>,
+    pub length: Option<u64>,
+    pub method: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl ActionNote {
+    pub fn start_params(&self) -> Value {
+        let mut params = serde_json::Map::new();
+        params.insert("phase".into(), json!("start"));
+        params.insert("kind".into(), json!(self.kind));
+        insert_text(&mut params, "tab", self.tab.as_deref());
+        insert_text(&mut params, "target", self.target.as_deref());
+        insert_text(&mut params, "url", self.url.as_deref());
+        insert_text(&mut params, "key", self.key.as_deref());
+        if let Some(length) = self.length {
+            params.insert("length".into(), json!(length));
+        }
+        insert_text(&mut params, "method", self.method.as_deref());
+        insert_text(&mut params, "agent", self.agent.as_deref());
+        Value::Object(params)
+    }
+
+    pub fn end_params(&self, ok: bool, stderr: &str) -> Value {
+        let mut params = serde_json::Map::new();
+        params.insert("phase".into(), json!("end"));
+        params.insert("ok".into(), json!(ok));
+        if !ok {
+            if let Some(line) = first_stderr_line(stderr) {
+                params.insert("error".into(), json!(line));
+            }
+        }
+        insert_text(&mut params, "tab", self.tab.as_deref());
+        Value::Object(params)
+    }
+}
+
+fn insert_text(params: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        params.insert(key.to_string(), json!(value));
+    }
+}
+
+pub fn first_stderr_line(stderr: &str) -> Option<&str> {
+    stderr.lines().next().filter(|line| !line.is_empty())
+}
+
+pub fn slicc_agent() -> Option<String> {
+    std::env::var("SLICC_AGENT")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, String> {
@@ -186,14 +262,21 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
 
 #[cfg(test)]
 mod tests {
-    use super::probe_is_settled;
+    use super::{first_stderr_line, probe_is_settled, ActionNote};
+    use serde_json::json;
 
     #[test]
     fn a_finished_document_does_not_wait_for_load() {
         assert_eq!(probe_is_settled(Ok(Some("complete"))).unwrap(), true);
         assert_eq!(probe_is_settled(Ok(None)).unwrap(), true);
-        assert_eq!(probe_is_settled(Err("Runtime.evaluate timed out\n")).unwrap(), true);
-        assert_eq!(probe_is_settled(Err("Runtime.evaluate: 'Runtime.evaluate' wasn't found\n")).unwrap(), true);
+        assert_eq!(
+            probe_is_settled(Err("Runtime.evaluate timed out\n")).unwrap(),
+            true
+        );
+        assert_eq!(
+            probe_is_settled(Err("Runtime.evaluate: 'Runtime.evaluate' wasn't found\n")).unwrap(),
+            true
+        );
     }
 
     #[test]
@@ -214,5 +297,115 @@ mod tests {
             let reported = probe_is_settled(Err(err)).unwrap_err();
             assert_eq!(reported, err);
         }
+    }
+
+    #[test]
+    fn action_start_and_end_keep_the_panel_fields() {
+        let click = ActionNote {
+            kind: "click".to_string(),
+            tab: Some("1234".to_string()),
+            target: Some("button \"Sign in\"".to_string()),
+            agent: Some("cone:cone-1".to_string()),
+            ..ActionNote::default()
+        };
+        assert_eq!(
+            click.start_params(),
+            json!({
+                "phase": "start",
+                "kind": "click",
+                "tab": "1234",
+                "target": "button \"Sign in\"",
+                "agent": "cone:cone-1"
+            })
+        );
+        let failed = click.end_params(
+            false,
+            "No snapshot available. Run \"snapshot\" first.\nignored\n",
+        );
+        assert_eq!(
+            failed,
+            json!({
+                "phase": "end",
+                "ok": false,
+                "error": "No snapshot available. Run \"snapshot\" first.",
+                "tab": "1234"
+            })
+        );
+        assert!(failed.get("agent").is_none());
+        assert!(failed.get("kind").is_none());
+        assert!(failed.get("target").is_none());
+        let open = ActionNote {
+            kind: "open".to_string(),
+            url: Some("http://a.test/".to_string()),
+            ..ActionNote::default()
+        };
+        assert!(open.start_params().get("tab").is_none());
+        assert_eq!(open.start_params()["url"], "http://a.test/");
+        let mut opened = open.clone();
+        opened.tab = Some("TAB1".to_string());
+        assert_eq!(opened.end_params(true, "")["tab"], "TAB1");
+        assert!(opened.end_params(true, "").get("error").is_none());
+    }
+
+    #[test]
+    fn action_params_omit_typed_text_eval_source_and_request_secrets() {
+        let secret = "secret-text";
+        let fill = ActionNote {
+            kind: "fill".to_string(),
+            tab: Some("T".to_string()),
+            target: Some("textbox \"Email\"".to_string()),
+            length: Some(secret.chars().count() as u64),
+            ..ActionNote::default()
+        };
+        let fill_params = fill.start_params();
+        assert_eq!(fill_params["length"], 11);
+        assert!(!fill_params.to_string().contains(secret));
+        assert!(fill_params.get("value").is_none());
+        let typed = "héllo";
+        let type_note = ActionNote {
+            kind: "type".to_string(),
+            length: Some(typed.chars().count() as u64),
+            ..ActionNote::default()
+        };
+        assert_eq!(type_note.start_params()["length"], 5);
+        assert!(!type_note.start_params().to_string().contains(typed));
+        let source = "document.cookie";
+        let eval_note = ActionNote {
+            kind: "eval".to_string(),
+            tab: Some("T".to_string()),
+            ..ActionNote::default()
+        };
+        let eval_params = eval_note.start_params();
+        assert!(!eval_params.to_string().contains(source));
+        assert!(eval_params.get("expression").is_none());
+        let request = ActionNote {
+            kind: "request".to_string(),
+            tab: Some("T1".to_string()),
+            method: Some("POST".to_string()),
+            url: Some("https://app.example/api/me".to_string()),
+            ..ActionNote::default()
+        };
+        let request_params = request.start_params();
+        assert_eq!(
+            request_params,
+            json!({
+                "phase": "start",
+                "kind": "request",
+                "tab": "T1",
+                "method": "POST",
+                "url": "https://app.example/api/me"
+            })
+        );
+        assert!(!request_params.to_string().contains("Authorization"));
+        assert!(!request_params.to_string().contains(secret));
+        let press = ActionNote {
+            kind: "press".to_string(),
+            key: Some("Enter".to_string()),
+            ..ActionNote::default()
+        };
+        assert_eq!(press.start_params()["key"], "Enter");
+        assert!(ActionNote::default().start_params().get("agent").is_none());
+        assert_eq!(first_stderr_line("only-line"), Some("only-line"));
+        assert_eq!(first_stderr_line("\n"), None);
     }
 }
