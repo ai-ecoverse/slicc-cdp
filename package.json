@@ -45,6 +45,8 @@
     "build:wasm": "cargo build --release --target wasm32-wasip1 -p playwright-cli -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
     "prepublishOnly": "npm run build:wasm",
     "lint": "slicc-lint",
+    "typecheck": "true",
+    "test:unit": "mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node --test 'test/unit/**/*.test.mjs'",
     "format": "biome check --write .",
     "test": "true",
     "trust": "npx fledgling sync -y --skip-publish",
