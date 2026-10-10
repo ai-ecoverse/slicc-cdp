@@ -1,5 +1,8 @@
 use crate::spec::{self, Spec};
 
+#[cfg(test)]
+pub const UPSTREAM_PLAYWRIGHT_CLI: &str = "0.1.22";
+
 pub fn global_help() -> String {
     let mut lines = vec![
         "playwright-cli - run playwright mcp commands from terminal".to_string(),
@@ -12,21 +15,27 @@ pub fn global_help() -> String {
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
         "This CLI does not launch Chrome.".to_string(),
         String::new(),
-        "Commands:".to_string(),
-        row("open [url]", "create a tab on the CDP endpoint"),
-        row("close", "close the current tab"),
-        row("goto <url>", "navigate the current tab"),
-        row("type <text>", "type text into the focused element"),
-        row("click <ref> [button]", "click an element ref from the snapshot"),
-        row("fill <ref> <text>", "fill an element ref"),
-        row("press <key>", "press a key"),
-        row("snapshot", "capture an ARIA snapshot with element refs"),
-        row("eval <expression>", "evaluate JavaScript in the page"),
-        row("screenshot [ref]", "capture a PNG of the page or an element"),
-        row("tab-list", "list open tabs"),
-        row("tab-new [url]", "create a tab"),
-        row("tab-select <index>", "activate a tab by 1-based index"),
-        row("tab-close", "close a tab"),
+        "Core:".to_string(),
+        row("open [url]", "open the browser"),
+        row("close", "close the browser"),
+        row("goto <url>", "navigate to a url"),
+        row("type <text>", "type text into editable element"),
+        row("click <target> [button]", "perform click on a web page"),
+        row("fill <target> <text>", "fill text into editable element"),
+        row("snapshot [target]", "capture page snapshot to obtain element ref"),
+        row("eval <func> [target]", "evaluate javascript expression on page or element"),
+        String::new(),
+        "Keyboard:".to_string(),
+        row("press <key>", "press a key on the keyboard, `a`, `arrowleft`"),
+        String::new(),
+        "Save as:".to_string(),
+        row("screenshot [target]", "screenshot of the current page or element"),
+        String::new(),
+        "Tabs:".to_string(),
+        row("tab-list", "list all tabs"),
+        row("tab-new [url]", "create a new tab"),
+        row("tab-close [index]", "close a browser tab"),
+        row("tab-select <index>", "select a browser tab"),
         String::new(),
         "Not implemented yet:".to_string(),
     ];
@@ -38,36 +47,236 @@ pub fn global_help() -> String {
     lines.push(format!("  {}", pending.join(", ")));
     lines.push(String::new());
     lines.push("Options:".to_string());
-    lines.push(row("--cdp <url>", "WebSocket URL, or an http URL used for /json/version"));
-    lines.push(row("--runtime <name>", "query parameter on the URL that is opened"));
+    lines.push(row(
+        "--cdp <url>",
+        "WebSocket URL, or an http URL used for /json/version",
+    ));
+    lines.push(row(
+        "--runtime <name>",
+        "query parameter on the URL that is opened",
+    ));
     lines.push(row("-h, --help", "show help"));
     lines.push(row("-V, --version", "print the version"));
     lines.join("\n")
 }
 
 fn row(name: &str, text: &str) -> String {
-    format!("  {name:<28} {text}")
+    format!("  {name:<28}{text}")
 }
 
 pub fn command_help(spec: &Spec) -> String {
+    if let Some(page) = implemented_page(spec.name) {
+        return page;
+    }
     let usage = usage_line(spec);
-    let body = match spec.name {
-        "open" | "tab-new" => "Create a tab with Target.createTarget. Does not launch Chrome.\n--foreground, --fg    activate the new tab\n--runtime <name>      query parameter on the CDP URL",
-        "close" | "tab-close" => "Close a tab with Target.closeTarget.\n--tab <targetId>      tab to close (defaults to the current tab)",
-        "goto" => "Navigate the current tab with Page.navigate.\n--tab <targetId>",
-        "type" => "Type text with Input.insertText.\n--submit              press Enter after typing\n--tab <targetId>",
-        "click" => "Click a snapshot ref.\nclick <ref> [button]  button is left, right, or middle\n--modifiers <list>    Alt,Control,Meta,Shift\n--tab <targetId>",
-        "fill" => "Fill a snapshot ref.\n--submit              press Enter after filling\n--tab <targetId>",
-        "press" => "Press a key with Input.dispatchKeyEvent.\n--tab <targetId>",
-        "snapshot" => "Print an ARIA snapshot. Refs look like e1, e2, and f1e5 inside iframes.\n--filename <path>     write the snapshot to a file\n--frame <frameId>     snapshot one frame\n--no-iframes          skip child frames\n--tab <targetId>",
-        "eval" => "Evaluate JavaScript with Runtime.evaluate.\n--filename <path>     write the result to a file\n--output <path>       same, if --filename is omitted\n--frame <frameId>\n--tab <targetId>",
-        "screenshot" => "Capture a PNG with Page.captureScreenshot.\n--filename <path>\n--full-page           capture beyond the viewport\n--max-width <px>\n--tab <targetId>",
-        "tab-list" => "List actionable page targets from Target.getTargets.\nEach line starts with its 1-based index for tab-select.",
-        "tab-select" => "Activate a tab with Target.activateTarget.\ntab-select <index>    index from tab-list",
-        _ if !spec.implemented => "Not implemented yet.",
-        _ => "",
+    let body = if !spec.implemented {
+        "Not implemented yet."
+    } else {
+        ""
     };
     format!("playwright-cli {usage}\n\n{body}\n")
+}
+
+fn implemented_page(name: &str) -> Option<String> {
+    let page = match name {
+        "open" => page(
+            "open [url]",
+            &[
+                "Open the browser",
+                "",
+                "This CLI does not launch a browser. It creates a tab on the attached endpoint.",
+            ],
+            &[("[url]", "the url to navigate to")],
+            &[
+                ("--browser", "not implemented"),
+                ("--config", "not implemented"),
+                ("--device", "not implemented"),
+                ("--headed", "not implemented"),
+                ("--idle-timeout", "not implemented"),
+                ("--mobile", "not implemented"),
+                ("--persistent", "not implemented"),
+                ("--profile", "not implemented"),
+                ("--foreground", "activate the new tab"),
+                ("--fg", "activate the new tab"),
+                ("--runtime <name>", "query parameter on the CDP URL"),
+            ],
+        ),
+        "close" => page(
+            "close ",
+            &[
+                "Close the browser",
+                "",
+                "This CLI does not stop a browser session. It closes the current tab.",
+            ],
+            &[],
+            &[("--tab <targetId>", "tab to close (defaults to the current tab)")],
+        ),
+        "goto" => page(
+            "goto <url>",
+            &["Navigate to a URL"],
+            &[("<url>", "the url to navigate to")],
+            &[("--tab <targetId>", "tab to navigate")],
+        ),
+        "type" => page(
+            "type <text>",
+            &["Type text into editable element"],
+            &[("<text>", "text to type into the element")],
+            &[
+                ("--submit", "whether to submit entered text (press enter after)"),
+                ("--tab <targetId>", "tab to type into"),
+            ],
+        ),
+        "click" => page(
+            "click <target> [button]",
+            &["Perform click on a web page"],
+            &[
+                (
+                    "<target>",
+                    "exact target element reference from the page snapshot, or a unique element selector",
+                ),
+                ("[button]", "button to click, defaults to left"),
+            ],
+            &[
+                ("--modifiers", "modifier key to press (repeatable)"),
+                ("--tab <targetId>", "tab to click"),
+            ],
+        ),
+        "fill" => page(
+            "fill <target> <text>",
+            &["Fill text into editable element"],
+            &[
+                (
+                    "<target>",
+                    "exact target element reference from the page snapshot, or a unique element selector",
+                ),
+                ("<text>", "text to fill into the element"),
+            ],
+            &[
+                ("--submit", "whether to submit entered text (press enter after)"),
+                ("--tab <targetId>", "tab to fill"),
+            ],
+        ),
+        "press" => page(
+            "press <key>",
+            &["Press a key on the keyboard, `a`, `ArrowLeft`"],
+            &[(
+                "<key>",
+                "name of the key to press or a character to generate, such as `arrowleft` or `a`",
+            )],
+            &[("--tab <targetId>", "tab to press")],
+        ),
+        "snapshot" => page(
+            "snapshot [target]",
+            &["Capture page snapshot to obtain element ref"],
+            &[("[target]", "not implemented")],
+            &[
+                (
+                    "--filename",
+                    "save snapshot to markdown file instead of returning it in the response.",
+                ),
+                ("--depth", "not implemented"),
+                ("--boxes", "not implemented"),
+                ("--frame <frameId>", "snapshot one frame"),
+                ("--no-iframes", "skip child frames"),
+                ("--tab <targetId>", "tab to snapshot"),
+            ],
+        ),
+        "eval" => page(
+            "eval <func> [target]",
+            &["Evaluate JavaScript expression on page or element"],
+            &[
+                (
+                    "<func>",
+                    "() => { /* code */ } or (element) => { /* code */ } when element is provided",
+                ),
+                ("[target]", "not implemented"),
+            ],
+            &[
+                (
+                    "--filename",
+                    "save evaluation result to a file instead of returning it in the response.",
+                ),
+                ("--output <path>", "write the result to a file when --filename is omitted"),
+                ("--frame <frameId>", "evaluate in one frame"),
+                ("--tab <targetId>", "tab to evaluate"),
+            ],
+        ),
+        "screenshot" => page(
+            "screenshot [target]",
+            &["screenshot of the current page or element"],
+            &[(
+                "[target]",
+                "exact target element reference from the page snapshot, or a unique element selector",
+            )],
+            &[
+                (
+                    "--filename",
+                    "file name to save the screenshot to. defaults to screenshot-{timestamp}.png if not specified.",
+                ),
+                ("--type", "not implemented"),
+                (
+                    "--full-page",
+                    "when true, takes a screenshot of the full scrollable page, instead of the currently visible viewport.",
+                ),
+                ("--hires", "not implemented"),
+                ("--max-width <px>", "limit the image width in pixels"),
+                ("--tab <targetId>", "tab to capture"),
+            ],
+        ),
+        "tab-list" => "playwright-cli tab-list \n\nList all tabs\n\n".to_string(),
+        "tab-new" => page(
+            "tab-new [url]",
+            &["Create a new tab"],
+            &[(
+                "[url]",
+                "the url to navigate to in the new tab. if omitted, the new tab will be blank.",
+            )],
+            &[
+                ("--foreground", "activate the new tab"),
+                ("--fg", "activate the new tab"),
+                ("--runtime <name>", "query parameter on the CDP URL"),
+            ],
+        ),
+        "tab-select" => {
+            "playwright-cli tab-select <index>\n\nSelect a browser tab\n\nArguments:\n  <index>                     tab index\n"
+                .to_string()
+        }
+        "tab-close" => page(
+            "tab-close [index]",
+            &["Close a browser tab"],
+            &[("[index]", "not implemented")],
+            &[("--tab <targetId>", "tab to close (defaults to the current tab)")],
+        ),
+        _ => return None,
+    };
+    Some(page)
+}
+
+fn page(
+    usage: &str,
+    summary: &[&str],
+    arguments: &[(&str, &str)],
+    options: &[(&str, &str)],
+) -> String {
+    let mut lines = vec![format!("playwright-cli {usage}"), String::new()];
+    lines.extend(summary.iter().map(|line| (*line).to_string()));
+    if !arguments.is_empty() {
+        lines.push(String::new());
+        lines.push("Arguments:".to_string());
+        for (name, text) in arguments {
+            lines.push(row(name, text));
+        }
+    }
+    if !options.is_empty() {
+        if arguments.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("Options:".to_string());
+        for (name, text) in options {
+            lines.push(row(name, text));
+        }
+    }
+    format!("{}\n", lines.join("\n"))
 }
 
 fn usage_line(spec: &Spec) -> String {
@@ -88,6 +297,12 @@ fn usage_line(spec: &Spec) -> String {
 fn arg_optional(spec: &Spec, index: usize) -> bool {
     matches!(
         (spec.name, index),
-        ("open", 0) | ("tab-new", 0) | ("screenshot", 0) | ("dialog-accept", 0) | ("unroute", 0) | ("record", 0) | ("highlight", 0)
+        ("open", 0)
+            | ("tab-new", 0)
+            | ("screenshot", 0)
+            | ("dialog-accept", 0)
+            | ("unroute", 0)
+            | ("record", 0)
+            | ("highlight", 0)
     )
 }
