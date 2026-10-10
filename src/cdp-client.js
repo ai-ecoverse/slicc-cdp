@@ -50,13 +50,16 @@ export class CDPClient {
         finish(this.#failure);
       }, timeout);
       ws.addEventListener('open', () => {
+        if (ws !== this.#ws) return;
         this.#state = 'connected';
         finish();
       });
       ws.addEventListener('message', (event) => {
+        if (ws !== this.#ws) return;
         this.#onMessage(event?.data);
       });
       ws.addEventListener('error', () => {
+        if (ws !== this.#ws) return;
         if (this.#state !== 'connecting') return;
         const error = new Error('CDP connection failed\n');
         this.#failure = error;
@@ -64,7 +67,7 @@ export class CDPClient {
         finish(error);
       });
       ws.addEventListener('close', (event) => {
-        if (this.#localClose) return;
+        if (ws !== this.#ws) return;
         const error = new Error(closeMessage(event?.code, event?.reason));
         this.#fail(error);
         finish(error);
