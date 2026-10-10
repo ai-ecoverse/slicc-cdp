@@ -47,6 +47,7 @@
     "lint": "slicc-lint",
     "format": "biome check --write .",
     "test": "true",
+    "test:unit": "mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node --test 'test/unit/**/*.test.mjs'",
     "trust": "npx fledgling sync -y --skip-publish",
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",
     "release": "semantic-release"
