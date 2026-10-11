@@ -43,15 +43,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cdp-client"
-version = "0.0.0"
-dependencies = [
- "native-tls",
- "serde_json",
- "wasix-net",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,8 +77,8 @@ dependencies = [
 name = "curlwright"
 version = "0.0.0"
 dependencies = [
- "cdp-client",
  "serde_json",
+ "slicc-cdp-client",
 ]
 
 [[package]]
@@ -316,9 +307,9 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "playwright-cli"
 version = "0.0.0"
 dependencies = [
- "cdp-client",
  "image",
  "serde_json",
+ "slicc-cdp-client",
 ]
 
 [[package]]
@@ -462,6 +453,15 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "slicc-cdp-client"
+version = "0.0.0"
+dependencies = [
+ "native-tls",
+ "serde_json",
+ "wasix-net",
+]
 
 [[package]]
 name = "syn"

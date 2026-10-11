@@ -16,7 +16,7 @@ jobs:
   release:
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       LEFTHOOK: '0'
     permissions:
@@ -50,3 +50,46 @@ jobs:
       - run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide crates publish
+        id: crates
+        run: |
+          version=$(node -e "process.stdout.write(require('./package.json').version)")
+          if [ "$version" = "0.0.0" ]; then
+            git fetch origin --tags --force
+            tag=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+            if [ -z "$tag" ]; then
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "semantic-release did not publish; skipping crates.io"
+              exit 0
+            fi
+            version=${tag#v}
+            echo "resuming crate publish for $version"
+          fi
+          if grep -q 'vendor/wasix-net' crates/cdp-client/Cargo.toml; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "slicc-cdp-client still depends on the vendored wasix-net path; skipping crates.io"
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w "%{http_code}" -A "slicc-cdp (https://github.com/ai-ecoverse/slicc-cdp)" "https://crates.io/api/v1/crates/slicc-cdp-client")
+          if [ "$code" = "404" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "slicc-cdp-client is not on crates.io yet; the first publish is manual"
+            exit 0
+          fi
+          if [ "$code" != "200" ]; then
+            echo "crates.io lookup for slicc-cdp-client returned $code"
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.crates.outputs.publish == 'true'
+
+      - name: Publish crates
+        if: steps.crates.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: sh scripts/publish-crates.sh "${{ steps.crates.outputs.version }}"

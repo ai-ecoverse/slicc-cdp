@@ -1,7 +1,9 @@
 fn main() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../package.json");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let version = version_field(&text).unwrap_or_else(|| "0.0.0".to_string());
+    let version = version_field(&text).unwrap_or_else(|| {
+        std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
+    });
     println!("cargo:rustc-env=PLAYWRIGHT_CLI_VERSION={version}");
     println!("cargo:rerun-if-changed=../../package.json");
 }

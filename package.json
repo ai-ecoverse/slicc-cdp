@@ -47,7 +47,7 @@
     }
   },
   "scripts": {
-    "prepare": "lefthook install",
+    "prepare": "lefthook install && node scripts/allow-crate-readmes.mjs",
     "build:wasm": "cargo build --release --target wasm32-wasip1 -p playwright-cli -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
     "prepublishOnly": "npm run build:wasm",
     "lint": "slicc-lint",

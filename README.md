@@ -27,3 +27,38 @@ Inside the kernel the browser socket is `SLICC_CDP_URL`: `ws://127.0.0.1:9222/de
 ## Package
 
 Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on `main`. Git `package.json` stays `0.0.0`. The published version is the release tag.
+
+## Install and run
+
+`cargo install` builds the host binaries. They run on macOS, Linux, and Windows. TLS there is `native-tls` (Secure Transport, OpenSSL, or SChannel). `playwright-cli` needs Rust 1.88. `curlwright` and `slicc-cdp-client` need Rust 1.83.
+
+```
+cargo install playwright-cli
+cargo install curlwright
+```
+
+`@ai-ecoverse/slicc-cdp` on npm is the SLICC package. It ships `bin/playwright-cli.wasm` and `bin/curlwright.wasm`, built for `wasm32-wasip1`. Those builds have no TLS, so `wss://` and `https://` fail in the kernel. The same commands exist there; the Cargo install is the host build, not those wasm files.
+
+Neither binary launches Chrome. Start one with `--remote-debugging-port`, then pass that HTTP endpoint as `--cdp`. The examples use port 9333.
+
+macOS:
+
+```
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --remote-debugging-port=9333
+```
+
+Linux:
+
+```
+google-chrome --headless --remote-debugging-port=9333
+```
+
+```
+playwright-cli --cdp http://127.0.0.1:9333 open https://example.com
+playwright-cli --cdp http://127.0.0.1:9333 snapshot
+playwright-cli --cdp http://127.0.0.1:9333 tab-list
+curlwright --cdp http://127.0.0.1:9333 https://example.com/
+curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
+```
+
+`--cdp` still wins over `SLICC_CDP_URL`, which wins over discovery at `http://127.0.0.1:9222/json/version`. A crate installed from crates.io prints its crate version. In this repository, and in the npm wasm builds, `--version` prints the `package.json` version. The release workflow writes that version into the crate manifests before `cargo publish`, and only after semantic-release has published the npm package. Git keeps the crate versions at `0.0.0`.
