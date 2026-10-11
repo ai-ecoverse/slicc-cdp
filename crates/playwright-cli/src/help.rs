@@ -46,6 +46,12 @@ pub fn global_help() -> String {
         row("response-headers <index>", "print response headers"),
         row("response-body <index>", "print the response body"),
         String::new(),
+        "Browsers:".to_string(),
+        row(
+            "list",
+            "list connected browsers, debug ports, and launchables",
+        ),
+        String::new(),
         "Not implemented yet:".to_string(),
     ];
     let pending: Vec<&str> = spec::all()
@@ -290,6 +296,25 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--filename <path>", "write the text to a file"),
                 ("--tab <targetId>", "tab to read"),
             ],
+        ),
+        "list" => page(
+            "list",
+            &[
+                "List connected browsers, debug ports, and launchables.",
+                "",
+                "connected",
+                "Browsers already attached. A browser target is `browser <targetId> <url>`. An open socket with no browser target is `browser - <websocket url>`. Nothing connected is `none`.",
+                "",
+                "debug ports",
+                "Host processes with a DevTools port. A line is `pid <pid> port <port> <executable>`. This section is `none` on wasm32-wasip1.",
+                "",
+                "launchable",
+                "Apps the host can start. A line is `<name> <kind> <path>`. Kind is `browser` or `electron`. This section is `none` on wasm32-wasip1.",
+                "",
+                "list does not launch a browser. A connection failure still prints the other sections and exits 0.",
+            ],
+            &[],
+            &[],
         ),
         _ => return None,
     };

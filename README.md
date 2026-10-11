@@ -12,7 +12,7 @@ Connect, in order: `--cdp`, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:922
 
 One browser WebSocket. `Target.attachToTarget` uses `{targetId, flatten: true}`. Later page commands send that `sessionId` at the top level. There is no `/devtools/page/<id>` socket.
 
-Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`. `snapshot` prints ARIA refs such as `e1` and iframe refs such as `f1e5`. Other names from the command manifest print `playwright-cli <command>: not implemented yet` and exit non-zero. `--help` lists those names under "Not implemented yet". It does not yet match upstream help for the whole shared set.
+Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`, `list`. `snapshot` prints ARIA refs such as `e1` and iframe refs such as `f1e5`. Other names from the command manifest print `playwright-cli <command>: not implemented yet` and exit non-zero. `--help` lists those names under "Not implemented yet". It does not yet match upstream help for the whole shared set.
 
 A non-2xx discovery response prints the status and the body and exits non-zero. A server close frame prints `websocket closed <code> <reason>` and exits non-zero. After that frame is visible, the client does not write to the socket again. `--version` and `-V` print `playwright-cli` plus the `package.json` version.
 
@@ -59,8 +59,11 @@ google-chrome --headless --remote-debugging-port=9333 --user-data-dir=/tmp/chrom
 playwright-cli --cdp http://127.0.0.1:9333 open https://example.com
 playwright-cli --cdp http://127.0.0.1:9333 snapshot
 playwright-cli --cdp http://127.0.0.1:9333 tab-list
+playwright-cli list
 curlwright --cdp http://127.0.0.1:9333 https://example.com/
 curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ```
+
+`playwright-cli list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser.
 
 `--cdp` still wins over `SLICC_CDP_URL`, which wins over discovery at `http://127.0.0.1:9222/json/version`. A crate installed from crates.io prints its crate version. In this repository, and in the npm wasm builds, `--version` prints the `package.json` version. The release workflow writes that version into the crate manifests before `cargo publish`, and only after semantic-release has published the npm package. Git keeps the crate versions at `0.0.0`.
