@@ -41,7 +41,7 @@ cargo install curlwright
 
 `@ai-ecoverse/slicc-cdp` on npm is the SLICC package. It ships `bin/playwright-cli.wasm` and `bin/curlwright.wasm`, built for `wasm32-wasip1`. Those builds have no TLS, so `wss://` and `https://` fail in the kernel. The same commands exist there; the Cargo install is the host build, not those wasm files.
 
-Neither binary launches Chrome. Start one with `--remote-debugging-port`, then pass that HTTP endpoint as `--cdp`. The examples use port 9333.
+Neither binary launches Chrome. Start one with `--remote-debugging-port`, then pass that HTTP endpoint as `--cdp`. `--headless` is optional: leave it off to open a window. The examples use port 9333.
 
 macOS:
 

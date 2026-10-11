@@ -8,7 +8,7 @@ cargo install slicc-cdp
 
 That installs the `playwright-cli` command. It talks to a Chrome that is already running and does not launch the browser.
 
-Host builds run on macOS, Linux, and Windows. Rust 1.88 or newer. Start Chrome with `--remote-debugging-port`, then pass that endpoint:
+Host builds run on macOS, Linux, and Windows. Rust 1.88 or newer. Start Chrome with `--remote-debugging-port`, then pass that endpoint. `--headless` is optional: leave it off to open a window.
 
 ```
 google-chrome --headless --remote-debugging-port=9333
