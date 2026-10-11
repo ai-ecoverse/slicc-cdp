@@ -2,6 +2,7 @@ mod action;
 mod body;
 mod page;
 mod parse;
+mod profiles;
 mod request;
 mod response;
 mod tab;
@@ -16,6 +17,37 @@ use std::time::Instant;
 use write_out::{format_write_out, WriteOut};
 
 const HELP: &str = include_str!("help.txt");
+
+fn connect_start(
+    cdp: Option<&str>,
+    env: Option<&str>,
+) -> Result<cdp_client::connect::Start, String> {
+    if host_endpoint_missing(cdp, env) {
+        return profile_start(profiles::attached_port());
+    }
+    cdp_client::connect::choose_start(cdp, env)
+}
+
+fn profile_start(
+    found: Result<Option<String>, String>,
+) -> Result<cdp_client::connect::Start, String> {
+    match found {
+        Ok(Some(url)) => Ok(cdp_client::connect::Start::Discover(url)),
+        Ok(None) => Err("curlwright: no debugger is connected\n".to_string()),
+        Err(message) => Err(message),
+    }
+}
+
+fn host_endpoint_missing(cdp: Option<&str>, env: Option<&str>) -> bool {
+    if cfg!(target_arch = "wasm32") {
+        return false;
+    }
+    trimmed_nonempty(cdp).is_none() && trimmed_nonempty(env).is_none()
+}
+
+fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
 
 pub struct Output {
     pub stdout: Vec<u8>,
@@ -75,7 +107,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(request) => request,
         Err(stop) => return Output::from_stop(stop),
     };
-    let start = match cdp_client::connect::choose_start(opts.cdp.as_deref(), cdp_env) {
+    let start = match connect_start(opts.cdp.as_deref(), cdp_env) {
         Ok(start) => start,
         Err(message) => return Output::plain(message, 1),
     };
@@ -395,6 +427,52 @@ mod tests {
     fn a_cdp_deadline_is_a_timeout() {
         let (_, _, code) = classify("Runtime.evaluate timed out\n");
         assert_eq!(code, 28);
+    }
+
+    #[test]
+    fn host_refuses_an_unnamed_debugger() {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let missing = connect_start(None, None).unwrap_err();
+            assert_eq!(missing, "curlwright: no debugger is connected\n");
+            let blank = connect_start(Some(" "), Some("")).unwrap_err();
+            assert_eq!(blank, "curlwright: no debugger is connected\n");
+            assert_eq!(
+                connect_start(Some("http://127.0.0.1:9225"), None).unwrap(),
+                cdp_client::connect::Start::Discover(
+                    "http://127.0.0.1:9225/json/version".to_string()
+                )
+            );
+            let output = run(&["https://app.example/x"]);
+            assert_eq!(output.code, 1);
+            assert_eq!(output.stderr, "curlwright: no debugger is connected\n");
+            assert!(!output.stderr.contains("9222"));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            assert_eq!(
+                connect_start(None, None).unwrap(),
+                cdp_client::connect::Start::Discover(
+                    "http://127.0.0.1:9222/json/version".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_seven_profile_is_discovery() {
+        let url = "http://127.0.0.1:9333/json/version".to_string();
+        assert_eq!(
+            profile_start(Ok(Some(url.clone()))).unwrap(),
+            cdp_client::connect::Start::Discover(url)
+        );
+        let missing = profile_start(Ok(None)).unwrap_err();
+        assert_eq!(missing, "curlwright: no debugger is connected\n");
+        assert!(!missing.contains("9222"));
+        assert_eq!(
+            profile_start(Err("HTTP 500\nno\n".to_string())).unwrap_err(),
+            "HTTP 500\nno\n"
+        );
     }
 
     #[test]

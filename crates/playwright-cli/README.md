@@ -22,7 +22,7 @@ playwright-cli list
 
 On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
 
-`--cdp` wins, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:9222/json/version`. A host build dials `wss://`. The `wasm32-wasip1` binaries in the npm package `@ai-ecoverse/slicc-cdp` have no TLS.
+`--cdp` wins, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort. The host never dials `127.0.0.1:9222-9229` unless `--cdp` or `SLICC_CDP_URL` names that URL. The wasm build still uses port 9222. A host build dials `wss://`. The `wasm32-wasip1` binaries in the npm package `@ai-ecoverse/slicc-cdp` have no TLS.
 
 Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`, `list`.
 

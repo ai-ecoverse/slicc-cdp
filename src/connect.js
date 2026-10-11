@@ -14,7 +14,7 @@ export function chooseStart(cdp, env) {
   if (explicit !== undefined) return classify(explicit);
   const fromEnv = nonempty(env);
   if (fromEnv !== undefined) return classify(fromEnv);
-  return { kind: 'discover', url: 'http://127.0.0.1:9222/json/version' };
+  throw new Error('no debugger is connected\n');
 }
 
 function classify(url) {

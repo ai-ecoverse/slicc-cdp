@@ -715,16 +715,16 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
         cache.borrow_mut().insert(url.to_string(), hit.clone());
         hit
     };
-    match connect::choose_start(invocation.cdp.as_deref(), cdp_env) {
-        Err(_) => {}
-        Ok(Start::Direct(url)) => {
+    match listed_start(invocation, cdp_env) {
+        None => {}
+        Some(Start::Direct(url)) => {
             let runtime = runtime_name(invocation);
             dial = Some(connect::append_runtime(&url, runtime.as_deref()));
             if let Some(draft) = flag_from_direct(&url, &http) {
                 drafts.push(draft);
             }
         }
-        Ok(Start::Discover(url)) => {
+        Some(Start::Discover(url)) => {
             if explicit || !json {
                 match http(&url) {
                     HttpResult::Response { status, body } if (200..300).contains(&status) => {
@@ -800,6 +800,17 @@ fn explicit_endpoint(invocation: &Invocation, cdp_env: Option<&str>) -> bool {
     nonempty(invocation.cdp.as_deref()).is_some() || nonempty(cdp_env).is_some()
 }
 
+fn listed_start(invocation: &Invocation, cdp_env: Option<&str>) -> Option<Start> {
+    if !explicit_endpoint(invocation, cdp_env) && cfg!(not(target_arch = "wasm32")) {
+        return None;
+    }
+    connect::choose_start(invocation.cdp.as_deref(), cdp_env).ok()
+}
+
+fn reserved_debug_port(port: u32) -> bool {
+    (9222..=9229).contains(&port)
+}
+
 fn runtime_name(invocation: &Invocation) -> Option<String> {
     invocation.runtime.clone().or_else(|| {
         invocation
@@ -833,11 +844,17 @@ fn resolve_process(
         }
         let text = read(&active_port_path(dir))?;
         let (port, ws_path) = parse_active_port(&text)?;
+        if reserved_debug_port(port) {
+            return Some((port, draft_bare(port, "process")));
+        }
         let base = format!("http://127.0.0.1:{port}");
         let doc = version_doc_checked(&base, Some(&ws_path), http)?;
         let tabs = fetch_tabs(&base, http);
         let draft = draft_from_doc(&base, "process", Some(dir), None, doc, tabs)?;
         return Some((port, draft));
+    }
+    if reserved_debug_port(hit.port) {
+        return Some((hit.port, draft_bare(hit.port, "process")));
     }
     let base = format!("http://127.0.0.1:{}", hit.port);
     let draft = match version_doc_checked(&base, None, http) {
@@ -866,6 +883,9 @@ fn profile_drafts(io: &ListIo<'_>, http: &dyn Fn(&str) -> HttpResult) -> Vec<End
             let Some((port, ws_path)) = parse_active_port(&text) else {
                 continue;
             };
+            if reserved_debug_port(port) {
+                continue;
+            }
             let base = format!("http://127.0.0.1:{port}");
             let Some(doc) = version_doc_checked(&base, Some(&ws_path), http) else {
                 continue;
@@ -2164,7 +2184,12 @@ mod tests {
             "{expected}\n{}",
             global.stdout
         );
-        assert!(global.stdout.contains("This CLI does not launch Chrome.\n"));
+        assert!(global.stdout.contains(
+            "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.\n"
+        ));
+        assert!(global.stdout.contains(
+            "The host never dials 127.0.0.1:9222-9229 unless --cdp or SLICC_CDP_URL names that URL."
+        ));
         let pending = global.stdout.split("Not implemented yet:").nth(1).unwrap();
         let pending_names: Vec<&str> = pending
             .split(|ch: char| ch == ',' || ch.is_whitespace())
@@ -2245,10 +2270,50 @@ mod tests {
         assert_eq!(missing.code, 0);
         assert_eq!(missing.stderr, "");
         assert!(missing.stdout.starts_with("connected\nnone\n\n"));
-        assert_eq!(
-            urls.borrow().as_slice(),
-            ["http://127.0.0.1:9222/json/version"]
+        assert!(urls.borrow().is_empty());
+
+        urls.borrow_mut().clear();
+        let reserved_processes = "  7 /usr/bin/chrome --remote-debugging-port=9222\n  8 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=/tmp/seven\n";
+        let reserved_read = |path: &str| -> Option<String> {
+            if path == "/tmp/seven/DevToolsActivePort" {
+                Some("9228\n/devtools/browser/seven\n".to_string())
+            } else if path == "/home/me/.config/slicc/seven-profiles/chrome/DevToolsActivePort" {
+                Some("9223\n/devtools/browser/personal\n".to_string())
+            } else {
+                None
+            }
+        };
+        let reserved_list = |path: &str| {
+            if path == "/home/me/.config/slicc/seven-profiles" {
+                vec!["chrome".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let reserved = run_fake(
+            &list_invocation(None, false),
+            None,
+            HostOs::Linux,
+            Some("/home/me"),
+            None,
+            None,
+            reserved_processes,
+            false,
+            false,
+            &http,
+            &reserved_read,
+            &reserved_list,
         );
+        assert_eq!(reserved.code, 0);
+        assert_eq!(reserved.stderr, "");
+        assert!(reserved.stdout.contains("pid 7 port 9222 /usr/bin/chrome\n"));
+        assert!(reserved.stdout.contains("pid 8 port 9228 /usr/bin/chromium\n"));
+        assert!(urls.borrow().iter().all(|url| {
+            !url.contains(":9222")
+                && !url.contains(":9223")
+                && !url.contains(":9228")
+                && !url.contains(":9229")
+        }));
 
         urls.borrow_mut().clear();
         let processes = "  42 /usr/bin/chromium --remote-debugging-port=9444\n";
