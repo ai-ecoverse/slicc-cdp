@@ -2,6 +2,7 @@ mod action;
 mod body;
 mod page;
 mod parse;
+mod profiles;
 mod request;
 mod response;
 mod tab;
@@ -22,9 +23,19 @@ fn connect_start(
     env: Option<&str>,
 ) -> Result<cdp_client::connect::Start, String> {
     if host_endpoint_missing(cdp, env) {
-        return Err("curlwright: no debugger is connected\n".to_string());
+        return profile_start(profiles::attached_port());
     }
     cdp_client::connect::choose_start(cdp, env)
+}
+
+fn profile_start(
+    found: Result<Option<String>, String>,
+) -> Result<cdp_client::connect::Start, String> {
+    match found {
+        Ok(Some(url)) => Ok(cdp_client::connect::Start::Discover(url)),
+        Ok(None) => Err("curlwright: no debugger is connected\n".to_string()),
+        Err(message) => Err(message),
+    }
 }
 
 fn host_endpoint_missing(cdp: Option<&str>, env: Option<&str>) -> bool {
@@ -446,6 +457,22 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_live_seven_profile_is_discovery() {
+        let url = "http://127.0.0.1:9333/json/version".to_string();
+        assert_eq!(
+            profile_start(Ok(Some(url.clone()))).unwrap(),
+            cdp_client::connect::Start::Discover(url)
+        );
+        let missing = profile_start(Ok(None)).unwrap_err();
+        assert_eq!(missing, "curlwright: no debugger is connected\n");
+        assert!(!missing.contains("9222"));
+        assert_eq!(
+            profile_start(Err("HTTP 500\nno\n".to_string())).unwrap_err(),
+            "HTTP 500\nno\n"
+        );
     }
 
     #[test]

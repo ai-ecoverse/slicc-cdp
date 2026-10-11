@@ -16,7 +16,7 @@ curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 
 On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
 
-Connect order: `--cdp`, else `SLICC_CDP_URL`. On the host, if neither is set, curlwright exits without dialing port 9222. The wasm build still uses port 9222. Without `--tab`, curlwright uses the `current` tab in `.playwright-cli/session.json` when that tab is still open, otherwise the single open tab on the URL's origin. Any other case exits 2 and lists `--tab` choices.
+Connect order: `--cdp`, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort. On the host, if none of those exist, curlwright exits without dialing port 9222. Ports 9222-9229 inside those files are not dialed. The wasm build still uses port 9222. Without `--tab`, curlwright uses the `current` tab in `.playwright-cli/session.json` when that tab is still open, otherwise the single open tab on the URL's origin. Any other case exits 2 and lists `--tab` choices.
 
 The npm package `@ai-ecoverse/slicc-cdp` ships the `wasm32-wasip1` build for SLICC. That build has no TLS.
 

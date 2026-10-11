@@ -1,6 +1,6 @@
 # slicc-cdp
 
-`@ai-ecoverse/slicc-cdp` publishes `playwright-cli` and `curlwright`, Rust clients for an already-running Chrome. They speak Chrome DevTools Protocol JSON. The package root exports `CDPClient` and `connect`, one browser DevTools socket.
+`@ai-ecoverse/slicc-cdp` publishes `playwright-cli` and `curlwright`, Rust clients for an already-running Chrome. They speak Chrome DevTools Protocol JSON. The package root exports `CDPClient` and `connect`, one browser DevTools socket. Host `connect()` does not dial port 9222 unless `options.url` or `SLICC_CDP_URL` names it.
 
 `playwright-cli` is a playwright-cli-compatible command for SLICC and not affiliated with Microsoft Playwright.
 
@@ -18,7 +18,7 @@ A non-2xx discovery response prints the status and the body and exits non-zero. 
 
 ## curlwright
 
-`curlwright` is the Rust binary in `crates/curlwright`. It runs curl-style requests as a page-context `fetch()` in an already-open tab, so that tab's cookies, origin, and service worker apply. It uses `--cdp`, else `SLICC_CDP_URL`. On the host, if neither is set, it exits without dialing port 9222. The wasm build still uses port 9222. The shared CDP client is `crates/cdp-client`. Without `--tab`, it uses the `current` target in `.playwright-cli/session.json` when that tab is still open, otherwise the single open tab on the request URL's origin. Any other case exits 2 and lists `--tab` choices. A tab on a different origin is not used unless `--tab` or that session names it.
+`curlwright` is the Rust binary in `crates/curlwright`. It runs curl-style requests as a page-context `fetch()` in an already-open tab, so that tab's cookies, origin, and service worker apply. It uses `--cdp`, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort. On the host, if none of those exist, it exits without dialing port 9222. Ports 9222-9229 inside those files are not dialed. The wasm build still uses port 9222. The shared CDP client is `crates/cdp-client`. Without `--tab`, it uses the `current` target in `.playwright-cli/session.json` when that tab is still open, otherwise the single open tab on the request URL's origin. Any other case exits 2 and lists `--tab` choices. A tab on a different origin is not used unless `--tab` or that session names it.
 
 ## Kernel commands
 
@@ -66,4 +66,4 @@ curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 
 `playwright-cli list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser. `playwright-cli list --json` prints one JSON document and no text sections.
 
-`--cdp` still wins over `SLICC_CDP_URL`, which wins over a live `seven-profiles` DevToolsActivePort. The host never dials `127.0.0.1:9222-9229` unless one of those names that URL. The wasm build still uses port 9222. A crate installed from crates.io prints its crate version. In this repository, and in the npm wasm builds, `--version` prints the `package.json` version. The release workflow writes that version into the crate manifests before `cargo publish`, and only after semantic-release has published the npm package. Git keeps the crate versions at `0.0.0`.
+`--cdp` still wins over `SLICC_CDP_URL`, which wins over a live `seven-profiles` DevToolsActivePort for `playwright-cli` and `curlwright`. The host never dials `127.0.0.1:9222-9229` unless `--cdp` or `SLICC_CDP_URL` names that URL. Node `connect()` requires `options.url` or `SLICC_CDP_URL` and does not dial port 9222 by itself. The wasm build still uses port 9222. A crate installed from crates.io prints its crate version. In this repository, and in the npm wasm builds, `--version` prints the `package.json` version. The release workflow writes that version into the crate manifests before `cargo publish`, and only after semantic-release has published the npm package. Git keeps the crate versions at `0.0.0`.
