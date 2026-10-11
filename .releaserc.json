@@ -5,7 +5,15 @@
       "@semantic-release/commit-analyzer",
       {
         "preset": "angular",
-        "releaseRules": [{ "scope": "sliccy-browser", "release": false }]
+        "releaseRules": [
+          { "scope": "sliccy-browser", "release": false },
+          {
+            "type": "fix",
+            "scope": "deps",
+            "subject": "update dependency @ai-ecoverse/slicc-cdp*",
+            "release": false
+          }
+        ]
       }
     ],
     "@semantic-release/release-notes-generator",
