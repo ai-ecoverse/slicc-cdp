@@ -1,10 +1,12 @@
-# playwright-cli
+# slicc-cdp
 
-CDP client for a Chrome that is already running. It does not launch the browser.
+`playwright-cli` is a playwright-cli-compatible command for SLICC and not affiliated with Microsoft Playwright.
 
 ```
-cargo install playwright-cli
+cargo install slicc-cdp
 ```
+
+That installs the `playwright-cli` command. It talks to a Chrome that is already running and does not launch the browser.
 
 Host builds run on macOS, Linux, and Windows. Rust 1.88 or newer. Start Chrome with `--remote-debugging-port`, then pass that endpoint:
 

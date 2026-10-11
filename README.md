@@ -2,6 +2,8 @@
 
 `@ai-ecoverse/slicc-cdp` publishes `playwright-cli` and `curlwright`, Rust clients for an already-running Chrome. They speak Chrome DevTools Protocol JSON. The package root exports `CDPClient` and `connect`, one browser DevTools socket.
 
+`playwright-cli` is a playwright-cli-compatible command for SLICC and not affiliated with Microsoft Playwright.
+
 ## playwright-cli
 
 The binary is `crates/playwright-cli`. It does not launch Chrome and it does not invent a debugger path.
@@ -30,10 +32,10 @@ Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on 
 
 ## Install and run
 
-`cargo install` builds the host binaries. They run on macOS, Linux, and Windows. TLS there is `native-tls` (Secure Transport, OpenSSL, or SChannel). `playwright-cli` needs Rust 1.88. `curlwright` and `slicc-cdp-client` need Rust 1.83.
+`cargo install slicc-cdp` installs the `playwright-cli` command. `cargo install curlwright` installs `curlwright`. Host builds run on macOS, Linux, and Windows. TLS there is `native-tls` (Secure Transport, OpenSSL, or SChannel). The `slicc-cdp` crate needs Rust 1.88. `curlwright` and `slicc-cdp-client` need Rust 1.83.
 
 ```
-cargo install playwright-cli
+cargo install slicc-cdp
 cargo install curlwright
 ```
 
