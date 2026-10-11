@@ -1,0 +1,34 @@
+{
+  "name": "@ai-ecoverse/sliccy-browser",
+  "version": "0.1.0",
+  "description": "sliccy:browser for jsh, over CDP",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ai-ecoverse/slicc-cdp.git",
+    "directory": "packages/sliccy-browser"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "exports": {
+    ".": {
+      "slicc": "./src/browser.js",
+      "import": "./src/browser.js",
+      "require": "./src/browser.js",
+      "default": "./src/browser.js"
+    }
+  },
+  "main": "./src/browser.js",
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "@ai-ecoverse/slicc-cdp": "1.5.0"
+  }
+}
