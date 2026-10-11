@@ -126,6 +126,9 @@ fn collect_profile_root<F: ScanFs>(
         return;
     }
     for id in fs.list_dirs(root) {
+        if !profile_dir_name(&id) {
+            continue;
+        }
         let dir = join_parts(windows, &[root.to_string(), id]);
         if is_six_profile(&dir) {
             continue;
@@ -189,6 +192,20 @@ fn config_dir(env: &HostEnv) -> String {
             join_parts(false, &[env.home.clone(), ".config".to_string()])
         }
     }
+}
+
+fn profile_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || name.contains("..") {
+        return false;
+    }
+    let [first, rest @ ..] = bytes else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && rest
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn is_six_profile(path: &str) -> bool {
@@ -470,13 +487,43 @@ mod tests {
             "9555\n/devtools/browser/agent\n",
         );
         fs.file(
+            &port_file(&format!("{root}/.migrated-from-profiles"), false),
+            40,
+            "9667\n/devtools/browser/marker\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/.hidden"), false),
+            39,
+            "9668\n/devtools/browser/hidden\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/chrome..old"), false),
+            38,
+            "9669\n/devtools/browser/dots\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/has space"), false),
+            37,
+            "9670\n/devtools/browser/space\n",
+        );
+        fs.file(
             &port_file(&format!("{six}/chrome"), false),
             99,
             "9666\n/devtools/browser/six\n",
         );
         fs.dir(
             &root,
-            &["browser-coding-agent-chrome", "brave", "chrome", "edge", "live"],
+            &[
+                ".migrated-from-profiles",
+                ".hidden",
+                "browser-coding-agent-chrome",
+                "brave",
+                "chrome",
+                "chrome..old",
+                "edge",
+                "has space",
+                "live",
+            ],
         );
         let live = format!("{root}/live");
         fs.file(
@@ -499,6 +546,12 @@ mod tests {
         assert!(seen.iter().all(|url| !url.contains("9228")));
         assert_no_six(&fs.reads.borrow());
         assert_no_six(&fs.lists.borrow());
+        assert!(fs.reads.borrow().iter().all(|path| {
+            !path.contains("/.migrated-from-profiles/")
+                && !path.contains("/.hidden/")
+                && !path.contains("chrome..old")
+                && !path.contains("has space")
+        }));
     }
 
     #[test]

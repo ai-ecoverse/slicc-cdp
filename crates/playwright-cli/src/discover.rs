@@ -873,7 +873,7 @@ fn profile_drafts(io: &ListIo<'_>, http: &dyn Fn(&str) -> HttpResult) -> Vec<End
         let mut names = (io.list_dir)(&root);
         names.sort();
         for name in names {
-            if !dir_name_ok(&name) {
+            if !profile_dir_name(&name) || name.starts_with("browser-coding-agent-chrome") {
                 continue;
             }
             let dir = join_two(&root, &name);
@@ -980,6 +980,20 @@ fn dir_name_ok(name: &str) -> bool {
         && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
+}
+
+fn profile_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || name.contains("..") {
+        return false;
+    }
+    let [first, rest @ ..] = bytes else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && rest
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn profiles_under_slicc(path: &str) -> bool {
@@ -2419,13 +2433,27 @@ mod tests {
                 "/home/me/.config/slicc/profiles/chrome/DevToolsActivePort" => {
                     Some("9339\n/devtools/browser/six\n".to_string())
                 }
+                "/home/me/.config/slicc/seven-profiles/.migrated-from-profiles/DevToolsActivePort"
+                | "/home/me/.config/slicc/seven-profiles/.hidden/DevToolsActivePort"
+                | "/home/me/.config/slicc/seven-profiles/browser-coding-agent-chrome/DevToolsActivePort"
+                | "/home/me/.config/slicc/seven-profiles/chrome..old/DevToolsActivePort"
+                | "/home/me/.config/slicc/seven-profiles/has space/DevToolsActivePort" => {
+                    Some("9777\n/devtools/browser/nope\n".to_string())
+                }
                 _ => None,
             }
         };
         let list_dir = |path: &str| -> Vec<String> {
             lists.borrow_mut().push(path.to_string());
             match path {
-                "/home/me/.config/slicc/seven-profiles" => vec!["chrome".to_string()],
+                "/home/me/.config/slicc/seven-profiles" => vec![
+                    ".migrated-from-profiles".to_string(),
+                    ".hidden".to_string(),
+                    "browser-coding-agent-chrome".to_string(),
+                    "chrome".to_string(),
+                    "chrome..old".to_string(),
+                    "has space".to_string(),
+                ],
                 "/home/me/snap" => vec!["slicc".to_string()],
                 "/home/me/snap/slicc/common/slicc/seven-profiles" => vec!["edge".to_string()],
                 _ => Vec::new(),
@@ -2461,6 +2489,13 @@ mod tests {
             .borrow()
             .iter()
             .all(|path| !path.contains("/slicc/profiles")));
+        assert!(reads.borrow().iter().all(|path| {
+            !path.contains("/.migrated-from-profiles/")
+                && !path.contains("/.hidden/")
+                && !path.contains("browser-coding-agent-chrome")
+                && !path.contains("chrome..old")
+                && !path.contains("has space")
+        }));
         assert!(!reads.borrow().iter().any(|path| path.contains("9339") || path.ends_with("/tmp/also/DevToolsActivePort")));
         let value: Value = serde_json::from_str(output.stdout.trim()).unwrap();
         assert_eq!(value["schema"], 1);
