@@ -102,7 +102,12 @@ async function playwrightFlow(runner, site) {
   assert.equal(logged.code, 0, logged.stderr);
   const messages = await runner.playwright(['console'], cwd);
   assert.equal(messages.code, 0, `${messages.stderr}\n${messages.stdout}`);
-  assert.match(messages.stdout, /\[ERROR\] slicc-console-marker/);
+  assert.equal(markerCount(messages.stdout), 1, messages.stdout);
+  const reread = await runner.playwright(['snapshot'], cwd);
+  assert.equal(reread.code, 0, `${reread.stderr}\n${reread.stdout}`);
+  const replayed = await runner.playwright(['console'], cwd);
+  assert.equal(replayed.code, 0, `${replayed.stderr}\n${replayed.stdout}`);
+  assert.equal(markerCount(replayed.stdout), 1, replayed.stdout);
   const fetched = await runner.playwright(
     ['eval', `fetch('${site.origin}/api/me').then((response) => response.text())`],
     cwd
@@ -195,6 +200,10 @@ async function curlFlow(runner, site, wsUrl) {
   assert.equal(closedPage.code, 0, closedPage.stderr);
   const closedOther = await runner.playwright(['tab-close', '--tab', other], cwd);
   assert.equal(closedOther.code, 0, closedOther.stderr);
+}
+
+function markerCount(stdout) {
+  return stdout.split('slicc-console-marker').length - 1;
 }
 
 function targetOf(stdout) {

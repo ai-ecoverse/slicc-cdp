@@ -9,6 +9,7 @@ pub struct ConsoleEntry {
     pub text: String,
     pub url: String,
     pub line: u64,
+    pub stamp: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +260,11 @@ fn console_from(params: &Value) -> Option<ConsoleEntry> {
         text: console_text(params),
         url,
         line,
+        stamp: params
+            .get("timestamp")
+            .and_then(|value| value.as_f64())
+            .map(|value| value as u64)
+            .unwrap_or(0),
     })
 }
 
@@ -846,6 +852,7 @@ pub fn console_json(entry: &ConsoleEntry) -> Value {
         "text": entry.text,
         "url": entry.url,
         "line": entry.line,
+        "stamp": entry.stamp,
     })
 }
 
@@ -855,6 +862,7 @@ pub fn console_from_json(value: &Value) -> Option<ConsoleEntry> {
         text: value.get("text").and_then(|item| item.as_str()).unwrap_or("").to_string(),
         url: value.get("url").and_then(|item| item.as_str()).unwrap_or("").to_string(),
         line: value.get("line").and_then(|item| item.as_u64()).unwrap_or(0),
+        stamp: value.get("stamp").and_then(|item| item.as_u64()).unwrap_or(0),
     })
 }
 
@@ -947,6 +955,24 @@ fn pairs_from(value: Option<&Value>) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_stamp_comes_from_the_event_timestamp() {
+        let events = vec![json!({
+            "method": "Runtime.consoleAPICalled",
+            "sessionId": "S",
+            "params": {
+                "type": "error",
+                "executionContextId": 1,
+                "timestamp": 1700000000000.5,
+                "args": [{"type": "string", "value": "once"}]
+            }
+        })];
+        let (console, _) = from_events(&events, "S");
+        assert_eq!(console.len(), 1);
+        assert_eq!(console[0].text, "once");
+        assert_eq!(console[0].stamp, 1700000000000);
+    }
 
     fn sample_events() -> Vec<Value> {
         vec![

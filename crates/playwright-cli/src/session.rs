@@ -147,11 +147,21 @@ pub fn push_trace(
     requests: Vec<NetRequest>,
 ) {
     if !console.is_empty() {
-        session
-            .console
-            .entry(target.to_string())
-            .or_default()
-            .extend(console);
+        let stored = session.console.entry(target.to_string()).or_default();
+        for entry in console {
+            if entry.stamp != 0
+                && stored.iter().any(|have| {
+                    have.stamp == entry.stamp
+                        && have.kind == entry.kind
+                        && have.text == entry.text
+                        && have.url == entry.url
+                        && have.line == entry.line
+                })
+            {
+                continue;
+            }
+            stored.push(entry);
+        }
     }
     if !requests.is_empty() {
         session
@@ -252,6 +262,7 @@ mod tests {
                 text: "hi".to_string(),
                 url: "https://user:secret@example.test/a?q=1#h".to_string(),
                 line: 4,
+                stamp: 9,
             }],
             vec![NetRequest {
                 method: "GET".to_string(),
@@ -273,6 +284,33 @@ mod tests {
             again.console["T"][0].url,
             "https://user:secret@example.test/a?q=1#h"
         );
+        assert_eq!(again.console["T"][0].stamp, 9);
+        push_trace(
+            &mut again,
+            "T",
+            vec![ConsoleEntry {
+                kind: "log".to_string(),
+                text: "hi".to_string(),
+                url: "https://user:secret@example.test/a?q=1#h".to_string(),
+                line: 4,
+                stamp: 9,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(again.console["T"].len(), 1);
+        push_trace(
+            &mut again,
+            "T",
+            vec![ConsoleEntry {
+                kind: "log".to_string(),
+                text: "again".to_string(),
+                url: String::new(),
+                line: 0,
+                stamp: 0,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(again.console["T"].len(), 2);
         assert_eq!(again.requests["T"][0].url, "https://example.test/a?token=1#x");
         assert_eq!(
             again.requests["T"][0].request_headers[0].1,
