@@ -10,7 +10,7 @@ pub fn global_help() -> String {
         "Usage: playwright-cli <command> [args] [options]".to_string(),
         "Usage: playwright-cli --cdp=<url> <command> [args] [options]".to_string(),
         String::new(),
-        "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else GET http://127.0.0.1:9222/json/version and dial webSocketDebuggerUrl.".to_string(),
+        "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort. The host never dials 127.0.0.1:9222-9229 unless --cdp or SLICC_CDP_URL names that URL. The wasm build still uses port 9222.".to_string(),
         "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
         "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.".to_string(),
@@ -317,7 +317,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "",
                 "Endpoint sources are `devtools-active-port`, `flag`, and `process`.",
                 "",
-                "list does not launch a browser. An explicit --cdp or SLICC_CDP_URL whose HTTP discovery returns a non-2xx status prints that status and body on stderr and exits non-zero. Debug ports and launchables are still printed. A missing default http://127.0.0.1:9222/json/version stays connected / none and does not by itself exit non-zero.",
+                "list does not launch a browser. An explicit --cdp or SLICC_CDP_URL whose HTTP discovery returns a non-2xx status prints that status and body on stderr and exits non-zero. Debug ports and launchables are still printed. On the host, a missing endpoint stays connected / none and does not dial 127.0.0.1:9222-9229. The wasm build still uses port 9222. A missing endpoint does not by itself exit non-zero.",
             ],
             &[],
             &[(

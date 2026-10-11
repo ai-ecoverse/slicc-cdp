@@ -3,8 +3,6 @@
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-const DEFAULT_DISCOVERY: &str = "http://127.0.0.1:9222/json/version";
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     Chromium,
@@ -204,7 +202,10 @@ pub fn start_after_explicit(
     if let Some(url) = active {
         return Ok(crate::connect::Start::Discover(url));
     }
-    crate::connect::choose_start(None, None)
+    if cfg!(target_arch = "wasm32") {
+        return crate::connect::choose_start(None, None);
+    }
+    Err("playwright-cli: no debugger is connected\n".to_string())
 }
 
 pub fn attached_port() -> Result<Option<String>, String> {
@@ -318,7 +319,7 @@ pub fn decide(
     }
     match probe() {
         Ok(()) => Ok(Resolved {
-            discover: DEFAULT_DISCOVERY.to_string(),
+            discover: "http://127.0.0.1:9333/json/version".to_string(),
             started: None,
         }),
         Err(message) if message.starts_with("HTTP ") => Err(message),
@@ -1254,16 +1255,6 @@ fn route<F: ProfileFs>(
     if let Some(discover) = live_port(&plan.user_data_dir, windows, fs, probe)? {
         return Ok(Route::Attach { discover });
     }
-    match probe(DEFAULT_DISCOVERY) {
-        Ok(body) if crate::connect::websocket_url_from_version(&body).is_ok() => {
-            return Ok(Route::Attach {
-                discover: DEFAULT_DISCOVERY.to_string(),
-            });
-        }
-        Ok(_) => {}
-        Err(message) if message.starts_with("HTTP ") => return Err(message),
-        Err(_) => {}
-    }
     prepare_profile(request.command, &plan.user_data_dir, windows, now_micros, fs)?;
     Ok(Route::Launch(plan))
 }
@@ -1996,6 +1987,7 @@ mod tests {
         assert_eq!(probes, 1);
         assert_eq!(launcher.calls, 0);
         assert!(resolved.started.is_none());
+        assert!(!resolved.discover.contains("9222"));
         drop(resolved);
         assert!(!stop.get());
     }
@@ -2570,14 +2562,10 @@ mod tests {
             &mut fs,
             &mut |url| {
                 seen.push(url.to_string());
-                if url == DEFAULT_DISCOVERY {
-                    Err("no debugger is connected\n".to_string())
-                } else {
-                    Ok(
-                        r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/browser/other"}"#
-                            .to_string(),
-                    )
-                }
+                Ok(
+                    r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/browser/other"}"#
+                        .to_string(),
+                )
             },
             &mut |plan| {
                 spawned = Some(plan.clone());
@@ -2585,13 +2573,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            seen,
-            vec![
-                "http://127.0.0.1:9333/json/version".to_string(),
-                DEFAULT_DISCOVERY.to_string(),
-            ]
-        );
+        assert_eq!(seen, vec!["http://127.0.0.1:9333/json/version".to_string()]);
         let plan = spawned.unwrap();
         assert_eq!(plan.port, 0);
         assert_eq!(plan.user_data_dir, dir);
@@ -2610,20 +2592,43 @@ mod tests {
             "9224\n/devtools/browser/abc\n".to_string(),
         );
         let mut seen = Vec::new();
-        run(
+        let resolved = run(
             &open_request(None, false, None),
             &host,
             0,
             &mut fs,
             &mut |url| {
                 seen.push(url.to_string());
-                assert!(!url.contains("9224"), "{url}");
-                absent(url)
+                panic!("probed {url}");
             },
             &mut |_| Ok(()),
         )
         .unwrap();
-        assert_eq!(seen, vec![DEFAULT_DISCOVERY.to_string()]);
+        assert!(seen.is_empty());
+        assert_eq!(resolved.discover, dir);
+        assert!(!resolved.discover.contains("9222"));
+    }
+
+    #[test]
+    fn an_absent_port_file_launches_without_9222() {
+        let host = env("linux");
+        let mut fs = MemFs::new();
+        let mut seen = Vec::new();
+        let resolved = run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut |url| {
+                seen.push(url.to_string());
+                panic!("probed {url}");
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(seen.is_empty());
+        assert_eq!(resolved.discover, chrome_dir(&host));
+        assert!(!resolved.discover.contains("9222"));
     }
 
     #[test]
@@ -3265,9 +3270,20 @@ mod tests {
             start_after_explicit(None, None, Some(active.clone())).unwrap(),
             crate::connect::Start::Discover(active)
         );
-        assert_eq!(
-            start_after_explicit(None, None, None).unwrap(),
-            crate::connect::Start::Discover(DEFAULT_DISCOVERY.to_string())
-        );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let err = start_after_explicit(None, None, None).unwrap_err();
+            assert_eq!(err, "playwright-cli: no debugger is connected\n");
+            assert!(!err.contains("9222"));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            assert_eq!(
+                start_after_explicit(None, None, None).unwrap(),
+                crate::connect::Start::Discover(
+                    "http://127.0.0.1:9222/json/version".to_string()
+                )
+            );
+        }
     }
 }
