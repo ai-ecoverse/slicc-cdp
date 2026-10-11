@@ -304,15 +304,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "playwright-cli"
-version = "0.0.0"
-dependencies = [
- "image",
- "serde_json",
- "slicc-cdp-client",
-]
-
-[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,6 +444,15 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "slicc-cdp"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "serde_json",
+ "slicc-cdp-client",
+]
 
 [[package]]
 name = "slicc-cdp-client"

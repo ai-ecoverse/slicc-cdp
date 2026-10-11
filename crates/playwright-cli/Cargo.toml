@@ -1,16 +1,19 @@
 [package]
-name = "playwright-cli"
+name = "slicc-cdp"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-description = "CDP playwright-cli for macOS and the SLICC kernel"
+description = "SLICC CDP client; installs the playwright-cli command"
 repository = "https://github.com/ai-ecoverse/slicc-cdp"
 homepage = "https://github.com/ai-ecoverse/slicc-cdp"
 readme = "README.md"
-keywords = ["cdp", "chrome", "devtools", "playwright"]
+keywords = ["cdp", "chrome", "devtools", "browser"]
 categories = ["command-line-utilities", "development-tools"]
 publish = true
+
+[lib]
+name = "slicc_cdp"
 
 [[bin]]
 name = "playwright-cli"
