@@ -18,7 +18,7 @@ playwright-cli --cdp http://127.0.0.1:9333 tab-list
 playwright-cli list
 ```
 
-`list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser.
+`list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser. `list --json` prints one JSON document and no text sections.
 
 On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
 

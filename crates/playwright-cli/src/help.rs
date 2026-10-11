@@ -311,10 +311,15 @@ fn implemented_page(name: &str) -> Option<String> {
                 "launchable",
                 "Apps the host can start. A line is `<name> <kind> <path>`. Kind is `browser` or `electron`. This section is `none` on wasm32-wasip1.",
                 "",
-                "list does not launch a browser. A connection failure still prints the other sections and exits 0.",
+                "Endpoint sources are `devtools-active-port`, `flag`, and `process`.",
+                "",
+                "list does not launch a browser. An explicit --cdp or SLICC_CDP_URL whose HTTP discovery returns a non-2xx status prints that status and body on stderr and exits non-zero. Debug ports and launchables are still printed. A missing default http://127.0.0.1:9222/json/version stays connected / none and does not by itself exit non-zero.",
             ],
             &[],
-            &[],
+            &[(
+                "--json",
+                "print one JSON document and no text sections",
+            )],
         ),
         _ => return None,
     };

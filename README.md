@@ -64,6 +64,6 @@ curlwright --cdp http://127.0.0.1:9333 https://example.com/
 curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ```
 
-`playwright-cli list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser.
+`playwright-cli list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser. `playwright-cli list --json` prints one JSON document and no text sections.
 
 `--cdp` still wins over `SLICC_CDP_URL`, which wins over discovery at `http://127.0.0.1:9222/json/version`. A crate installed from crates.io prints its crate version. In this repository, and in the npm wasm builds, `--version` prints the `package.json` version. The release workflow writes that version into the crate manifests before `cargo publish`, and only after semantic-release has published the npm package. Git keeps the crate versions at `0.0.0`.
