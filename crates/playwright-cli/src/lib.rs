@@ -186,7 +186,15 @@ mod tests {
         ] {
             assert!(stdout.contains(line), "{line}");
         }
-        for name in ["console", "requests", "request", "request-headers", "request-body", "response-headers", "response-body"] {
+        for name in [
+            "console",
+            "requests",
+            "request",
+            "request-headers",
+            "request-body",
+            "response-headers",
+            "response-body",
+        ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
         for name in ["dblclick", "go-back", "pdf"] {
@@ -198,102 +206,87 @@ mod tests {
             "playwright-cli open [url]\n\nOpen the browser\n",
             &[
                 "  [url]                       the url to navigate to",
-                "  --browser                   not implemented",
-                "  --config                    not implemented",
-                "  --device                    not implemented",
-                "  --headed                    not implemented",
-                "  --idle-timeout              not implemented",
-                "  --mobile                    not implemented",
-                "  --persistent                not implemented",
-                "  --profile                   not implemented",
-                "  --foreground                activate the new tab",
-                "  --fg                        activate the new tab",
-                "  --runtime <name>            query parameter on the CDP URL",
+                "  --browser                   browser or chrome channel to use, possible values: chrome, firefox, webkit, msedge.",
+                "  --config                    path to the configuration file, defaults to .playwright/cli.config.json",
+                "  --device                    emulate a specific device, for example \"iphone 15\".",
+                "  --headed                    run browser in headed mode",
+                "  --idle-timeout              shut the session down after this many milliseconds without a command. defaults to one hour for headless browsers, never for headed ones. pass 0 to disable.",
+                "  --mobile                    emulate a generic mobile device (pixel 10 for chromium, iphone 17 for webkit). mobile pages are usually lighter, which saves tokens.",
+                "  --persistent                use persistent browser profile",
+                "  --profile                   path to a persistent user data directory.",
             ],
             &[
-                "run browser in headed mode",
-                "chrome channel",
-                "persistent browser profile",
-                "shut the session down",
+                "--foreground",
+                "--fg",
+                "--runtime",
             ],
         );
         assert_page(
             "close",
             "playwright-cli close \n\nClose the browser\n",
-            &[
-                "This CLI does not stop a browser session. It closes the current tab.",
-                "  --tab <targetId>            tab to close (defaults to the current tab)",
-            ],
+            &[],
             &["-s="],
         );
         assert_page(
             "goto",
             "playwright-cli goto <url>\n\nNavigate to a URL\n\nArguments:\n  <url>                       the url to navigate to",
-            &["  --tab <targetId>            tab to navigate"],
+            &[],
             &[],
         );
         assert_page(
             "type",
             "playwright-cli type <text>\n\nType text into editable element\n\nArguments:\n  <text>                      text to type into the element\nOptions:\n  --submit                    whether to submit entered text (press enter after)",
-            &["  --tab <targetId>            tab to type into"],
+            &[],
             &[],
         );
         assert_page(
             "click",
             "playwright-cli click <target> [button]\n\nPerform click on a web page\n\nArguments:\n  <target>                    exact target element reference from the page snapshot, or a unique element selector\n  [button]                    button to click, defaults to left\nOptions:\n  --modifiers                 modifier key to press (repeatable)",
-            &["  --tab <targetId>            tab to click"],
+            &[],
             &[],
         );
         assert_page(
             "fill",
             "playwright-cli fill <target> <text>\n\nFill text into editable element\n\nArguments:\n  <target>                    exact target element reference from the page snapshot, or a unique element selector\n  <text>                      text to fill into the element\nOptions:\n  --submit                    whether to submit entered text (press enter after)",
-            &["  --tab <targetId>            tab to fill"],
+            &[],
             &[],
         );
         assert_page(
             "press",
             "playwright-cli press <key>\n\nPress a key on the keyboard, `a`, `ArrowLeft`\n\nArguments:\n  <key>                       name of the key to press or a character to generate, such as `arrowleft` or `a`",
-            &["  --tab <targetId>            tab to press"],
+            &[],
             &[],
         );
         assert_page(
             "snapshot",
             "playwright-cli snapshot [target]\n\nCapture page snapshot to obtain element ref\n",
             &[
-                "  [target]                    not implemented",
+                "  [target]                    element reference from the previous page snapshot, or a unique element selector for the root element to capture a partial snapshot instead of the whole page",
                 "  --filename                  save snapshot to markdown file instead of returning it in the response.",
-                "  --depth                     not implemented",
-                "  --boxes                     not implemented",
-                "  --frame <frameId>           snapshot one frame",
-                "  --no-iframes                skip child frames",
-                "  --tab <targetId>            tab to snapshot",
+                "  --depth                     limit snapshot depth, unlimited by default.",
+                "  --boxes                     include each element's bounding box as [box=x,y,width,height] in the snapshot. coordinates are viewport-relative, in css pixels (element.getboundingclientrect).",
             ],
-            &["bounding box", "limit snapshot depth"],
+            &["--frame", "--no-iframes", "--tab"],
         );
         assert_page(
             "eval",
             "playwright-cli eval <func> [target]\n\nEvaluate JavaScript expression on page or element\n\nArguments:\n  <func>                      () => { /* code */ } or (element) => { /* code */ } when element is provided",
             &[
-                "  [target]                    not implemented",
+                "  [target]                    exact target element reference from the page snapshot, or a unique element selector",
                 "  --filename                  save evaluation result to a file instead of returning it in the response.",
-                "  --output <path>             write the result to a file when --filename is omitted",
-                "  --frame <frameId>           evaluate in one frame",
-                "  --tab <targetId>            tab to evaluate",
             ],
-            &[],
+            &["--output", "--frame", "--tab"],
         );
         assert_page(
             "screenshot",
             "playwright-cli screenshot [target]\n\nscreenshot of the current page or element\n\nArguments:\n  [target]                    exact target element reference from the page snapshot, or a unique element selector",
             &[
-                "  --filename                  file name to save the screenshot to. defaults to screenshot-{timestamp}.png if not specified.",
-                "  --type                      not implemented",
+                "  --filename                  file name to save the screenshot to. defaults to `page-{timestamp}.{png|jpeg|webp}` if not specified.",
+                "  --type                      image format. if unset, inferred from the filename extension, otherwise png. (one of: png, jpeg, webp)",
                 "  --full-page                 when true, takes a screenshot of the full scrollable page, instead of the currently visible viewport.",
-                "  --hires                     not implemented",
-                "  --max-width <px>            limit the image width in pixels",
-                "  --tab <targetId>            tab to capture",
+                "  --hires                     when true, captures a high-resolution screenshot using device pixels (accounts for the device pixel ratio), instead of css pixels.",
             ],
-            &["device pixel ratio", "jpeg"],
+            &["--max-width", "--tab"],
         );
         let tab_list = execute(&["tab-list".into(), "--help".into()], None);
         assert_eq!(tab_list.code, 0);
@@ -304,12 +297,8 @@ mod tests {
         assert_page(
             "tab-new",
             "playwright-cli tab-new [url]\n\nCreate a new tab\n\nArguments:\n  [url]                       the url to navigate to in the new tab. if omitted, the new tab will be blank.",
-            &[
-                "  --foreground                activate the new tab",
-                "  --fg                        activate the new tab",
-                "  --runtime <name>            query parameter on the CDP URL",
-            ],
-            &["--headed", "--browser"],
+            &[],
+            &["--headed", "--browser", "--foreground", "--fg", "--runtime"],
         );
         let tab_select = execute(&["tab-select".into(), "--help".into()], None);
         assert_eq!(tab_select.code, 0);
@@ -320,10 +309,7 @@ mod tests {
         assert_page(
             "tab-close",
             "playwright-cli tab-close [index]\n\nClose a browser tab\n",
-            &[
-                "  [index]                     not implemented",
-                "  --tab <targetId>            tab to close (defaults to the current tab)",
-            ],
+            &["  [index]                     tab index. if omitted, current tab is closed."],
             &[],
         );
 
@@ -388,7 +374,9 @@ mod tests {
         assert_eq!(snapshot_target.code, 1);
         assert!(snapshot_target.stderr.contains("too many arguments"));
         assert!(snapshot_target.stdout.contains("[target]"));
-        assert!(snapshot_target.stdout.contains("not implemented"));
+        assert!(snapshot_target
+            .stdout
+            .contains("partial snapshot instead of the whole page"));
         let tab_index = execute(&["tab-close".into(), "1".into()], None);
         assert_eq!(tab_index.code, 1);
         assert!(tab_index.stderr.contains("too many arguments"));
