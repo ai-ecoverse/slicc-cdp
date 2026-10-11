@@ -4,6 +4,7 @@ mod browser;
 mod cdp;
 mod commands;
 mod connect;
+mod discover;
 mod help;
 mod launch;
 mod net;
@@ -46,6 +47,9 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     }
     if let Err(output) = args::validate(&invocation, spec) {
         return output;
+    }
+    if command == "list" {
+        return discover::run(&invocation, cdp_env);
     }
     if !spec.implemented {
         return Output::err(format!("playwright-cli {command}: not implemented yet\n"));

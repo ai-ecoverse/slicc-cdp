@@ -15,12 +15,15 @@ google-chrome --headless --remote-debugging-port=9333 --user-data-dir=/tmp/chrom
 playwright-cli --cdp http://127.0.0.1:9333 open https://example.com
 playwright-cli --cdp http://127.0.0.1:9333 snapshot
 playwright-cli --cdp http://127.0.0.1:9333 tab-list
+playwright-cli list
 ```
+
+`list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser. `list --json` prints one JSON document and no text sections.
 
 On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
 
 `--cdp` wins, else `SLICC_CDP_URL`, else `GET http://127.0.0.1:9222/json/version`. A host build dials `wss://`. The `wasm32-wasip1` binaries in the npm package `@ai-ecoverse/slicc-cdp` have no TLS.
 
-Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`.
+Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`, `list`.
 
 `playwright-cli --version` prints the crates.io version. A build from this repository prints the `package.json` version instead.

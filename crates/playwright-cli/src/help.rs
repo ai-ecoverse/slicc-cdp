@@ -46,6 +46,12 @@ pub fn global_help() -> String {
         row("response-headers <index>", "print response headers"),
         row("response-body <index>", "print the response body"),
         String::new(),
+        "Browsers:".to_string(),
+        row(
+            "list",
+            "list connected browsers, debug ports, and launchables",
+        ),
+        String::new(),
         "Not implemented yet:".to_string(),
     ];
     let pending: Vec<&str> = spec::all()
@@ -294,6 +300,30 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--filename <path>", "write the text to a file"),
                 ("--tab <targetId>", "tab to read"),
             ],
+        ),
+        "list" => page(
+            "list",
+            &[
+                "List connected browsers, debug ports, and launchables.",
+                "",
+                "connected",
+                "Browsers already attached. A browser target is `browser <targetId> <url>`. An open socket with no browser target is `browser - <websocket url>`. Nothing connected is `none`.",
+                "",
+                "debug ports",
+                "Host processes with a DevTools port. A line is `pid <pid> port <port> <executable>`. This section is `none` on wasm32-wasip1.",
+                "",
+                "launchable",
+                "Apps the host can start. A line is `<name> <kind> <path>`. Kind is `browser` or `electron`. This section is `none` on wasm32-wasip1.",
+                "",
+                "Endpoint sources are `devtools-active-port`, `flag`, and `process`.",
+                "",
+                "list does not launch a browser. An explicit --cdp or SLICC_CDP_URL whose HTTP discovery returns a non-2xx status prints that status and body on stderr and exits non-zero. Debug ports and launchables are still printed. A missing default http://127.0.0.1:9222/json/version stays connected / none and does not by itself exit non-zero.",
+            ],
+            &[],
+            &[(
+                "--json",
+                "print one JSON document and no text sections",
+            )],
         ),
         _ => return None,
     };
