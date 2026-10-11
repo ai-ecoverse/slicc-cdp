@@ -13,7 +13,7 @@ pub fn global_help() -> String {
         "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else GET http://127.0.0.1:9222/json/version and dial webSocketDebuggerUrl.".to_string(),
         "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
-        "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.".to_string(),
+        "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.".to_string(),
         String::new(),
         "Core:".to_string(),
         row("open [url]", "open the browser"),
@@ -92,7 +92,8 @@ fn implemented_page(name: &str) -> Option<String> {
             "open [url]",
             &[
                 "Open the browser",
-                "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.",
+                "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.",
+                "Chromium uses --remote-debugging-port=0 and DevToolsActivePort in the shared seven-profiles directory.",
             ],
             &[("[url]", "the url to navigate to")],
             &[
@@ -103,7 +104,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--idle-timeout", "shut the session down after this many milliseconds without a command. defaults to one hour for headless browsers, never for headed ones. pass 0 to disable."),
                 ("--mobile", "emulate a generic mobile device (pixel 10 for chromium, iphone 17 for webkit). mobile pages are usually lighter, which saves tokens."),
                 ("--persistent", "use persistent browser profile"),
-                ("--profile", "path to a persistent user data directory."),
+                ("--profile", "filesystem path that replaces the shared profile directory. it is not a profile name."),
             ],
         ),
         "close" => page("close ", &["Close the browser"], &[], &[]),

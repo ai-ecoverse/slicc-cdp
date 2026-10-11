@@ -1,5 +1,6 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 const DEFAULT_DISCOVERY: &str = "http://127.0.0.1:9222/json/version";
@@ -107,6 +108,10 @@ pub struct HostEnv {
     pub program_files_x86: Option<String>,
     pub temp_dir: String,
     pub unique: String,
+    pub home: String,
+    pub app_data: Option<String>,
+    pub xdg_config_home: Option<String>,
+    pub snap_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +120,14 @@ pub struct SpawnPlan {
     pub args: Vec<String>,
     pub port: u16,
     pub user_data_dir: String,
+    pub delete_on_failure: bool,
+    pub via_open: bool,
 }
+
+const SEVEN_SITE: &str = "[*.]sliccy.ai";
+const CHROME_EPOCH_MICROS: i64 = 11_644_473_600_000_000;
+const SEVEN_FEATURES: &str = "LocalNetworkAccessChecks,LocalNetworkAccessChecksWebSockets,IntensiveWakeUpThrottling,HighEfficiencyModeAvailable,InfiniteTabsFreezing,InfiniteTabsFreezingOnMemoryPressure,CPUMeasurementInFreezingPolicy,MemoryMeasurementInFreezingPolicy,AllowDevtoolsConnectedDiscard";
+const ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
 
 pub struct Started {
     pub version_url: String,
@@ -158,6 +170,7 @@ impl std::fmt::Debug for Resolved {
     }
 }
 
+#[cfg(test)]
 pub trait Launcher {
     fn launch(&mut self, request: &LaunchRequest) -> Result<Started, String>;
 }
@@ -265,6 +278,7 @@ pub fn poll_version(body: Result<String, String>, running: bool) -> Result<Poll,
     }
 }
 
+#[cfg(test)]
 pub fn decide(
     command: &str,
     browser: Option<&str>,
@@ -320,85 +334,80 @@ pub fn resolve_without_endpoint(
         flags.get("headed").map(String::as_str),
         Some("true") | Some("")
     );
-    let mut launcher = HostLauncher;
-    decide(
+    if let Some(name) = browser {
+        validate_browser(command, name)?;
+    }
+    let request = LaunchRequest {
         command,
         browser,
         headed,
         profile,
-        &mut probe_default,
-        &mut launcher,
-    )
-}
-
-struct HostLauncher;
-
-impl Launcher for HostLauncher {
-    fn launch(&mut self, request: &LaunchRequest) -> Result<Started, String> {
-        launch_real(request)
-    }
-}
-
-fn probe_default() -> Result<(), String> {
-    #[cfg(test)]
-    {
-        return Err("no debugger is connected\n".to_string());
-    }
-    #[cfg(not(test))]
-    {
-        match crate::net::http_get(DEFAULT_DISCOVERY) {
-            Ok(_) => Ok(()),
-            Err(message) if message.starts_with("HTTP ") => Err(message),
-            Err(_) => Err("no debugger is connected\n".to_string()),
-        }
-    }
-}
-
-fn launch_real(request: &LaunchRequest) -> Result<Started, String> {
+    };
     #[cfg(test)]
     {
         let _ = request;
         return Err("playwright-cli: browser launch is not available in tests\n".to_string());
     }
-    #[cfg(all(not(test), target_arch = "wasm32"))]
+    #[cfg(not(test))]
     {
-        return Err(format!(
-            "playwright-cli {}: launching a browser is host-only\n",
-            request.command
-        ));
+        host_open(&request)
     }
-    #[cfg(all(not(test), not(target_arch = "wasm32")))]
-    {
-        launch_host(request)
-    }
+}
+
+#[cfg(all(not(test), target_arch = "wasm32"))]
+fn host_open(_request: &LaunchRequest) -> Result<Resolved, String> {
+    Err("playwright-cli: browser launch is not available in this build\n".to_string())
 }
 
 pub fn plan_launch(
     request: &LaunchRequest,
     env: &HostEnv,
-    port: u16,
+    electron_port: u16,
     exists: &dyn Fn(&str) -> bool,
     mdfind: &dyn Fn(&str) -> Vec<String>,
     read_plist: &dyn Fn(&str) -> Option<String>,
 ) -> Result<SpawnPlan, String> {
     let command = request.command;
-    if !port_allowed(port) {
-        return Err(format!(
-            "playwright-cli {command}: refusing debugger port {port}\n"
-        ));
-    }
     let (program, kind) = if let Some(name) = request.browser {
         resolve_named(command, name, env, exists, mdfind, read_plist)?
     } else {
         resolve_default(command, env, exists, mdfind, read_plist)?
     };
-    let user_data_dir = user_data_dir(command, request.profile, env)?;
-    let args = build_args(kind, request.headed, port, &user_data_dir);
+    let (user_data_dir, delete_on_failure) = data_dir(command, request, env, kind, &program)?;
+    if kind == Kind::Electron && !port_allowed(electron_port) {
+        return Err(format!(
+            "playwright-cli {command}: refusing debugger port {electron_port}\n"
+        ));
+    }
+    let browser_args = if kind == Kind::Chromium {
+        chromium_args(&user_data_dir, request.headed)
+    } else {
+        electron_args(electron_port, &user_data_dir)
+    };
+    let (program, args, via_open) = if kind == Kind::Chromium
+        && request.headed
+        && env.platform == "macos"
+    {
+        if let Some(app) = bundle_app(&program) {
+            let (program, args) = open_command(&app, &browser_args);
+            (program, args, true)
+        } else {
+            (program, browser_args, false)
+        }
+    } else {
+        (program, browser_args, false)
+    };
     Ok(SpawnPlan {
         program,
         args,
-        port,
+        port: if kind == Kind::Electron {
+            electron_port
+        } else {
+            0
+        },
         user_data_dir,
+        delete_on_failure,
+        via_open,
     })
 }
 
@@ -413,6 +422,12 @@ fn validate_browser(command: &str, name: &str) -> Result<&'static Known, String>
     if key == "firefox" || key == "webkit" {
         return Err(format!(
             "playwright-cli {command}: {key} is not launchable\n"
+        ));
+    }
+    if key == "claude" || key == "1password" {
+        let label = if key == "claude" { "Claude" } else { "1Password" };
+        return Err(format!(
+            "playwright-cli {command}: {label} blocks remote debugging\n"
         ));
     }
     find_known(trimmed).ok_or_else(|| {
@@ -585,38 +600,582 @@ fn macos_executable(
     exists(&candidate).then(|| candidate)
 }
 
-fn user_data_dir(command: &str, profile: Option<&str>, env: &HostEnv) -> Result<String, String> {
-    if let Some(path) = profile {
+fn profile_id(bundle_id: &str) -> &'static str {
+    match bundle_id {
+        "com.google.Chrome" => "chrome",
+        "com.google.Chrome.beta" => "chrome-beta",
+        "com.google.Chrome.dev" => "chrome-dev",
+        "com.google.Chrome.canary" => "chrome-canary",
+        "com.google.chrome.for.testing" => "chrome-for-testing",
+        "com.brave.Browser" => "brave",
+        "com.brave.Browser.beta" => "brave-beta",
+        "com.brave.Browser.nightly" => "brave-nightly",
+        "com.microsoft.edgemac" => "edge",
+        "com.microsoft.edgemac.Beta" => "edge-beta",
+        "com.microsoft.edgemac.Dev" => "edge-dev",
+        "com.microsoft.edgemac.Canary" => "edge-canary",
+        "com.vivaldi.Vivaldi" => "vivaldi",
+        "com.vivaldi.Vivaldi.snapshot" => "vivaldi-snapshot",
+        "com.operasoftware.Opera" => "opera",
+        "company.thebrowser.Browser" => "arc",
+        "company.thebrowser.dia" => "dia",
+        "com.openai.atlas" => "atlas",
+        "org.chromium.Chromium" => "chromium",
+        _ => "chrome",
+    }
+}
+
+fn browser_snap(program: &str) -> Option<String> {
+    let name = program.strip_prefix("/snap/bin/")?;
+    if name.is_empty() || name.contains('/') {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn windows_host(env: &HostEnv) -> bool {
+    env.platform == "windows"
+}
+
+fn join_parts(windows: bool, parts: &[String]) -> String {
+    let sep = if windows { '\\' } else { '/' };
+    let mut out = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        let piece = if windows {
+            part.replace('/', "\\")
+        } else {
+            part.clone()
+        };
+        let piece = if index == 0 {
+            piece.trim_end_matches(sep).to_string()
+        } else {
+            piece.trim_matches(sep).to_string()
+        };
+        if piece.is_empty() {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(sep) {
+            out.push(sep);
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
+fn config_dir(env: &HostEnv) -> String {
+    match env.platform {
+        "macos" => join_parts(
+            false,
+            &[
+                env.home.clone(),
+                "Library".to_string(),
+                "Application Support".to_string(),
+            ],
+        ),
+        "windows" => {
+            if let Some(app_data) = &env.app_data {
+                app_data.clone()
+            } else {
+                join_parts(
+                    true,
+                    &[
+                        env.home.clone(),
+                        "AppData".to_string(),
+                        "Roaming".to_string(),
+                    ],
+                )
+            }
+        }
+        _ => {
+            if let Some(xdg) = &env.xdg_config_home {
+                if xdg.starts_with('/') {
+                    return xdg.clone();
+                }
+            }
+            join_parts(false, &[env.home.clone(), ".config".to_string()])
+        }
+    }
+}
+
+fn snap_profiles_root(home: &str, snap: &str, windows: bool) -> String {
+    join_parts(
+        windows,
+        &[
+            home.to_string(),
+            "snap".to_string(),
+            snap.to_string(),
+            "common".to_string(),
+            "slicc".to_string(),
+            "seven-profiles".to_string(),
+        ],
+    )
+}
+
+fn profiles_root(env: &HostEnv, browser_snap: Option<&str>) -> String {
+    let windows = windows_host(env);
+    if let Some(snap) = browser_snap {
+        return snap_profiles_root(&env.home, snap, windows);
+    }
+    if let Some(snap) = &env.snap_name {
+        return snap_profiles_root(&env.home, snap, windows);
+    }
+    join_parts(
+        windows,
+        &[
+            config_dir(env),
+            "slicc".to_string(),
+            "seven-profiles".to_string(),
+        ],
+    )
+}
+
+fn path_parts(path: &str) -> Vec<String> {
+    path.replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_six_profile(path: &str) -> bool {
+    let parts = path_parts(path);
+    parts
+        .windows(2)
+        .any(|window| window[0] == "slicc" && window[1] == "profiles")
+        || parts
+            .iter()
+            .any(|part| part.starts_with("browser-coding-agent-chrome"))
+}
+
+fn under_seven_profiles(path: &str) -> bool {
+    if is_six_profile(path) {
+        return false;
+    }
+    path_parts(path)
+        .windows(2)
+        .any(|window| window[0] == "slicc" && window[1] == "seven-profiles")
+}
+
+fn temp_profile(env: &HostEnv) -> String {
+    let temp = env.temp_dir.trim_end_matches(['/', '\\']);
+    let name = format!("playwright-cli-{}", env.unique);
+    if windows_host(env) || temp.contains('\\') {
+        format!("{temp}\\{name}")
+    } else {
+        format!("{temp}/{name}")
+    }
+}
+
+fn data_dir(
+    command: &str,
+    request: &LaunchRequest,
+    env: &HostEnv,
+    kind: Kind,
+    program: &str,
+) -> Result<(String, bool), String> {
+    if let Some(path) = request.profile {
         let path = path.trim();
         if path.is_empty() {
             return Err(format!(
                 "playwright-cli {command}: --profile requires a path\n"
             ));
         }
-        return Ok(path.to_string());
+        if is_six_profile(path) {
+            return Err(format!(
+                "playwright-cli {command}: refusing profile {path}\n"
+            ));
+        }
+        return Ok((path.to_string(), false));
     }
-    let temp = env.temp_dir.trim_end_matches(['/', '\\']);
-    let name = format!("playwright-cli-{}", env.unique);
-    if temp.contains('\\') {
-        Ok(format!("{temp}\\{name}"))
+    if kind == Kind::Electron {
+        return Ok((temp_profile(env), true));
+    }
+    let id = match request.browser.and_then(find_known) {
+        Some(known) => profile_id(known.bundle_id),
+        None => "chrome",
+    };
+    let snap = browser_snap(program);
+    let root = profiles_root(env, snap.as_deref());
+    if is_six_profile(&root) {
+        return Err(format!(
+            "playwright-cli {command}: refusing profile {root}\n"
+        ));
+    }
+    Ok((
+        join_parts(windows_host(env), &[root, id.to_string()]),
+        false,
+    ))
+}
+
+fn chromium_args(user_data_dir: &str, headed: bool) -> Vec<String> {
+    let mut args = vec![
+        "--remote-debugging-port=0".to_string(),
+        format!("--user-data-dir={user_data_dir}"),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-background-tracing".to_string(),
+        format!("--disable-features={SEVEN_FEATURES}"),
+    ];
+    if !headed {
+        args.push("--headless=new".to_string());
+    }
+    args
+}
+
+fn electron_args(port: u16, user_data_dir: &str) -> Vec<String> {
+    vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={user_data_dir}"),
+    ]
+}
+
+fn bundle_app(program: &str) -> Option<String> {
+    if program.ends_with(".app") {
+        return Some(program.to_string());
+    }
+    let marker = program.find(".app/").or_else(|| program.find(".app\\"))?;
+    Some(program[..marker + 4].to_string())
+}
+
+fn open_command(app: &str, browser_args: &[String]) -> (String, Vec<String>) {
+    let mut args = vec![
+        "-n".to_string(),
+        "-a".to_string(),
+        app.to_string(),
+        "--args".to_string(),
+    ];
+    args.extend(browser_args.iter().cloned());
+    ("/usr/bin/open".to_string(), args)
+}
+
+pub fn parse_active_port(text: &str) -> Option<(u16, String)> {
+    let text = text.replace("\r\n", "\n");
+    let mut lines = text.split('\n');
+    let port: u16 = lines.next()?.trim().parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    let path = lines.next()?.trim();
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some((port, path.to_string()))
+}
+
+fn version_accepts(body: &str, path: &str) -> bool {
+    crate::connect::websocket_url_from_version(body)
+        .ok()
+        .is_some_and(|url| url.ends_with(path))
+}
+
+fn child_path(dir: &str, name: &str, windows: bool) -> String {
+    join_parts(windows, &[dir.to_string(), name.to_string()])
+}
+
+fn lock_pid(target: &str) -> Option<u32> {
+    let index = target.rfind('-')?;
+    let pid: u32 = target[index + 1..].trim().parse().ok()?;
+    if pid == 0 {
+        None
     } else {
-        Ok(format!("{temp}/{name}"))
+        Some(pid)
     }
 }
 
-fn build_args(kind: Kind, headed: bool, port: u16, user_data_dir: &str) -> Vec<String> {
-    let mut args = vec![
-        format!("--remote-debugging-port={port}"),
-        format!("--user-data-dir={user_data_dir}"),
-    ];
-    if kind == Kind::Chromium {
-        args.push("--no-first-run".to_string());
-        args.push("--no-default-browser-check".to_string());
-        if !headed {
-            args.push("--headless=new".to_string());
+trait ProfileFs {
+    fn read(&self, path: &str) -> Option<String>;
+    fn read_link(&self, path: &str) -> Option<String>;
+    fn pid_alive(&self, pid: u32) -> bool;
+    fn remove(&mut self, path: &str);
+    fn write(&mut self, path: &str, body: &str) -> Result<(), String>;
+}
+
+fn profile_owner<F: ProfileFs>(dir: &str, windows: bool, fs: &F) -> Option<u32> {
+    let target = fs.read_link(&child_path(dir, "SingletonLock", windows))?;
+    let pid = lock_pid(&target)?;
+    fs.pid_alive(pid).then_some(pid)
+}
+
+fn live_port<F: ProfileFs>(
+    dir: &str,
+    windows: bool,
+    fs: &F,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(text) = fs.read(&child_path(dir, ACTIVE_PORT_FILE, windows)) else {
+        return Ok(None);
+    };
+    let Some((port, path)) = parse_active_port(&text) else {
+        return Ok(None);
+    };
+    if (9222..=9229).contains(&port) {
+        return Ok(None);
+    }
+    let url = version_url(port);
+    match probe(&url) {
+        Ok(body) if version_accepts(&body, &path) => Ok(Some(url)),
+        Ok(_) => Ok(None),
+        Err(message) if message.starts_with("HTTP ") => Err(message),
+        Err(_) => Ok(None),
+    }
+}
+
+pub fn seed_preferences(existing: Option<&str>, unix_micros: i64) -> Result<Option<String>, ()> {
+    let mut prefs = Map::new();
+    let existed = match existing {
+        None => false,
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => {
+                prefs = map;
+                true
+            }
+            _ => return Err(()),
+        },
+    };
+    let mut changed = false;
+    if existed {
+        changed = mark_clean_exit(&mut prefs);
+    }
+    changed = apply_seven_prefs(&mut prefs, unix_micros) || changed;
+    if !changed {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Object(prefs).to_string()))
+    }
+}
+
+fn set_pref(map: &mut Map<String, Value>, key: &str, value: Value) -> bool {
+    if map.get(key) == Some(&value) {
+        false
+    } else {
+        map.insert(key.to_string(), value);
+        true
+    }
+}
+
+fn with_child(
+    map: &mut Map<String, Value>,
+    key: &str,
+    changed: &mut bool,
+    update: impl FnOnce(&mut Map<String, Value>) -> bool,
+) {
+    let mut child = match map.remove(key) {
+        Some(Value::Object(child)) => child,
+        Some(_) => {
+            *changed = true;
+            Map::new()
+        }
+        None => {
+            *changed = true;
+            Map::new()
+        }
+    };
+    if update(&mut child) {
+        *changed = true;
+    }
+    map.insert(key.to_string(), Value::Object(child));
+}
+
+fn mark_clean_exit(prefs: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    with_child(prefs, "profile", &mut changed, |profile| {
+        let mut inner = false;
+        inner |= set_pref(profile, "exit_type", Value::String("Normal".to_string()));
+        inner |= set_pref(profile, "exited_cleanly", Value::Bool(true));
+        inner
+    });
+    changed
+}
+
+fn apply_seven_prefs(prefs: &mut Map<String, Value>, unix_micros: i64) -> bool {
+    let mut changed = false;
+    changed |= set_pref(prefs, "tab_freezing_enabled", Value::Bool(false));
+    with_child(prefs, "performance_tuning", &mut changed, |tuning| {
+        let mut inner = false;
+        with_child(tuning, "tab_freezing", &mut inner, |tab| {
+            set_pref(tab, "enabled", Value::Bool(false))
+        });
+        with_child(tuning, "high_efficiency_mode", &mut inner, |mode| {
+            set_pref(mode, "state", Value::Number(serde_json::Number::from(0u64)))
+        });
+        with_child(tuning, "tab_discarding", &mut inner, |discard| {
+            let mut sites = false;
+            sites |= merge_site_list(discard);
+            with_child(discard, "exceptions_with_time", &mut sites, |times| {
+                if times.contains_key(SEVEN_SITE) {
+                    false
+                } else {
+                    times.insert(
+                        SEVEN_SITE.to_string(),
+                        Value::String(chrome_time(unix_micros)),
+                    );
+                    true
+                }
+            });
+            sites
+        });
+        inner
+    });
+    changed
+}
+
+fn merge_site_list(discard: &mut Map<String, Value>) -> bool {
+    let mut have = Vec::new();
+    let mut changed = false;
+    match discard.get("exceptions") {
+        Some(Value::Array(list)) => {
+            for item in list {
+                if let Some(site) = item.as_str() {
+                    if !have.iter().any(|kept: &String| kept == site) {
+                        have.push(site.to_string());
+                    } else {
+                        changed = true;
+                    }
+                } else {
+                    changed = true;
+                }
+            }
+            if have.len() != list.len() {
+                changed = true;
+            }
+        }
+        _ => changed = true,
+    }
+    if !have.iter().any(|site| site == SEVEN_SITE) {
+        have.push(SEVEN_SITE.to_string());
+        changed = true;
+    }
+    if changed {
+        discard.insert(
+            "exceptions".to_string(),
+            Value::Array(have.into_iter().map(Value::String).collect()),
+        );
+    }
+    changed
+}
+
+fn chrome_time(unix_micros: i64) -> String {
+    (unix_micros + CHROME_EPOCH_MICROS).to_string()
+}
+
+fn prepare_profile<F: ProfileFs>(
+    command: &str,
+    dir: &str,
+    windows: bool,
+    now_micros: i64,
+    fs: &mut F,
+) -> Result<(), String> {
+    if let Some(pid) = profile_owner(dir, windows, fs) {
+        return Err(format!(
+            "playwright-cli {command}: profile is in use: {dir} is held by process {pid}\n"
+        ));
+    }
+    if under_seven_profiles(dir) {
+        let prefs_path = child_path(dir, "Default/Preferences", windows);
+        let existing = fs.read(&prefs_path);
+        match seed_preferences(existing.as_deref(), now_micros) {
+            Err(()) => {
+                return Err(format!(
+                    "playwright-cli {command}: {prefs_path}: not a JSON object, left alone\n"
+                ));
+            }
+            Ok(Some(body)) => fs.write(&prefs_path, &body)?,
+            Ok(None) => {}
         }
     }
-    args
+    for name in [
+        ACTIVE_PORT_FILE,
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+    ] {
+        fs.remove(&child_path(dir, name, windows));
+    }
+    Ok(())
+}
+
+enum Route {
+    Attach { discover: String },
+    Launch(SpawnPlan),
+}
+
+fn route<F: ProfileFs>(
+    request: &LaunchRequest,
+    env: &HostEnv,
+    electron_port: u16,
+    now_micros: i64,
+    exists: &dyn Fn(&str) -> bool,
+    mdfind: &dyn Fn(&str) -> Vec<String>,
+    read_plist: &dyn Fn(&str) -> Option<String>,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    fs: &mut F,
+) -> Result<Route, String> {
+    let plan = plan_launch(
+        request,
+        env,
+        electron_port,
+        exists,
+        mdfind,
+        read_plist,
+    )?;
+    let windows = windows_host(env);
+    if let Some(discover) = live_port(&plan.user_data_dir, windows, fs, probe)? {
+        return Ok(Route::Attach { discover });
+    }
+    match probe(DEFAULT_DISCOVERY) {
+        Ok(body) if crate::connect::websocket_url_from_version(&body).is_ok() => {
+            return Ok(Route::Attach {
+                discover: DEFAULT_DISCOVERY.to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(message) if message.starts_with("HTTP ") => return Err(message),
+        Err(_) => {}
+    }
+    prepare_profile(request.command, &plan.user_data_dir, windows, now_micros, fs)?;
+    Ok(Route::Launch(plan))
+}
+
+#[cfg(test)]
+fn drive<F: ProfileFs>(
+    request: &LaunchRequest,
+    env: &HostEnv,
+    electron_port: u16,
+    now_micros: i64,
+    exists: &dyn Fn(&str) -> bool,
+    mdfind: &dyn Fn(&str) -> Vec<String>,
+    read_plist: &dyn Fn(&str) -> Option<String>,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    fs: &mut F,
+    spawn: &mut dyn FnMut(&SpawnPlan) -> Result<(), String>,
+) -> Result<Resolved, String> {
+    match route(
+        request,
+        env,
+        electron_port,
+        now_micros,
+        exists,
+        mdfind,
+        read_plist,
+        probe,
+        fs,
+    )? {
+        Route::Attach { discover } => Ok(Resolved {
+            discover,
+            started: None,
+        }),
+        Route::Launch(plan) => {
+            spawn(&plan)?;
+            Ok(Resolved {
+                discover: plan.user_data_dir,
+                started: None,
+            })
+        }
+    }
 }
 
 fn not_found(command: &str, name: &str) -> String {
@@ -624,51 +1183,223 @@ fn not_found(command: &str, name: &str) -> String {
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
-fn launch_host(request: &LaunchRequest) -> Result<Started, String> {
-    let port = choose_port(bind_localhost)?;
+fn host_open(request: &LaunchRequest) -> Result<Resolved, String> {
     let env = current_env();
-    let plan = plan_launch(
+    let electron = request
+        .browser
+        .and_then(find_known)
+        .is_some_and(|known| known.kind == Kind::Electron);
+    let electron_port = if electron {
+        choose_port(bind_localhost)?
+    } else {
+        0
+    };
+    let mut fs = DiskFs;
+    let now = unix_micros();
+    match route(
         request,
         &env,
-        port,
+        electron_port,
+        now,
         &file_exists,
         &spotlight,
         &read_plist_file,
-    )?;
+        &mut |url| http_body(url),
+        &mut fs,
+    )? {
+        Route::Attach { discover } => Ok(Resolved {
+            discover,
+            started: None,
+        }),
+        Route::Launch(plan) => launch_plan(request, &plan),
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn launch_plan(request: &LaunchRequest, plan: &SpawnPlan) -> Result<Resolved, String> {
     if let Err(err) = std::fs::create_dir_all(&plan.user_data_dir) {
         return Err(format!(
             "playwright-cli {}: could not create the browser profile: {err}\n",
             request.command
         ));
     }
-    let mut child = match spawn_child(&plan) {
+    let mut child = match spawn_child(plan) {
         Ok(child) => child,
         Err(message) => {
-            if request.profile.is_none() {
+            if plan.delete_on_failure {
                 let _ = std::fs::remove_dir_all(&plan.user_data_dir);
             }
             return Err(message);
         }
     };
-    if let Err(message) = wait_ready(port, &mut child) {
-        kill_child(&mut child);
-        if request.profile.is_none() {
-            let _ = std::fs::remove_dir_all(&plan.user_data_dir);
+    let version_url = match wait_for_debugger(request.command, plan, &mut child) {
+        Ok(url) => url,
+        Err(message) => {
+            stop_started(plan, &mut child);
+            return Err(message);
         }
-        return Err(message);
-    }
-    let version_url = version_url(port);
-    let owned = request.profile.is_none();
+    };
+    let owner = if plan.via_open {
+        observed_owner(&plan.user_data_dir)
+    } else {
+        None
+    };
+    let via_open = plan.via_open;
+    let delete = plan.delete_on_failure;
     let dir = plan.user_data_dir.clone();
-    Ok(Started::running(
+    let started = Started::running(
         version_url,
         Box::new(move || {
-            kill_child(&mut child);
-            if owned {
+            if via_open {
+                if let Some(pid) = owner {
+                    kill_pid(pid);
+                }
+                if matches!(child.try_wait(), Ok(None)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            } else {
+                kill_child(&mut child);
+            }
+            if delete {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }),
-    ))
+    );
+    let discover = started.version_url.clone();
+    Ok(Resolved {
+        discover,
+        started: Some(started),
+    })
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn wait_for_debugger(
+    command: &str,
+    plan: &SpawnPlan,
+    child: &mut std::process::Child,
+) -> Result<String, String> {
+    if plan.port != 0 {
+        wait_ready(plan.port, child)?;
+        return Ok(version_url(plan.port));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let windows = cfg!(windows);
+    loop {
+        if child_failed(plan, child) {
+            return Err(
+                "playwright-cli: browser exited before the debugger was ready\n".to_string(),
+            );
+        }
+        let port_path = child_path(&plan.user_data_dir, ACTIVE_PORT_FILE, windows);
+        if let Some((port, path)) = std::fs::read_to_string(&port_path)
+            .ok()
+            .as_deref()
+            .and_then(parse_active_port)
+        {
+            if (9222..=9229).contains(&port) {
+                return Err(format!(
+                    "playwright-cli {command}: refusing debugger port {port}\n"
+                ));
+            }
+            let url = version_url(port);
+            match http_body(&url) {
+                Ok(body) if version_accepts(&body, &path) => return Ok(url),
+                Ok(_) => {}
+                Err(message) if message.starts_with("HTTP ") => return Err(message),
+                Err(_) => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "playwright-cli: timed out waiting for the browser debugger\n".to_string(),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn child_failed(plan: &SpawnPlan, child: &mut std::process::Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(status)) => !(plan.via_open && status.success()),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn stop_started(plan: &SpawnPlan, child: &mut std::process::Child) {
+    if plan.via_open {
+        if let Some(pid) = observed_owner(&plan.user_data_dir) {
+            kill_pid(pid);
+        }
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    } else {
+        kill_child(child);
+    }
+    if plan.delete_on_failure {
+        let _ = std::fs::remove_dir_all(&plan.user_data_dir);
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn observed_owner(dir: &str) -> Option<u32> {
+    let path = child_path(dir, "SingletonLock", cfg!(windows));
+    let target = std::fs::read_link(path).ok()?;
+    let pid = lock_pid(&target.to_string_lossy())?;
+    pid_alive(pid).then_some(pid)
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+struct DiskFs;
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+impl ProfileFs for DiskFs {
+    fn read(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn read_link(&self, path: &str) -> Option<String> {
+        std::fs::read_link(path)
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned())
+    }
+
+    fn pid_alive(&self, pid: u32) -> bool {
+        pid_alive(pid)
+    }
+
+    fn remove(&mut self, path: &str) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn write(&mut self, path: &str, body: &str) -> Result<(), String> {
+        let parent = std::path::Path::new(path).parent();
+        if let Some(parent) = parent {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                format!("playwright-cli: could not write preferences: {err}\n")
+            })?;
+        }
+        let tmp = format!("{path}.slicc-tmp");
+        std::fs::write(&tmp, body).map_err(|err| {
+            format!("playwright-cli: could not write preferences: {err}\n")
+        })?;
+        std::fs::rename(&tmp, path).map_err(|err| {
+            format!("playwright-cli: could not write preferences: {err}\n")
+        })
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
@@ -681,7 +1412,24 @@ fn current_env() -> HostEnv {
         program_files_x86: env_var("PROGRAMFILES(X86)"),
         temp_dir: std::env::temp_dir().to_string_lossy().into_owned(),
         unique: unique_name(),
+        home: home_dir(),
+        app_data: env_var("APPDATA"),
+        xdg_config_home: env_var("XDG_CONFIG_HOME"),
+        snap_name: env_var("SNAP_NAME"),
     }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn home_dir() -> String {
+    if cfg!(windows) {
+        if let Some(home) = env_var("USERPROFILE") {
+            return home;
+        }
+    }
+    if let Some(home) = env_var("HOME") {
+        return home;
+    }
+    env_var("USERPROFILE").unwrap_or_default()
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
@@ -814,15 +1562,61 @@ fn kill_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+#[cfg(all(not(test), not(target_arch = "wasm32"), unix))]
+fn kill_pid(pid: u32) {
+    if pid != 0 {
+        unsafe {
+            kill(pid as i32, 9);
+        }
+    }
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32"), unix))]
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
 #[cfg(all(not(test), not(target_arch = "wasm32"), windows))]
 fn kill_child(child: &mut std::process::Child) {
+    kill_pid(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32"), windows))]
+fn kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
     let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &child.id().to_string()])
+        .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32"), windows))]
+fn pid_alive(pid: u32) -> bool {
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(0x1000, 0, pid) };
+    if handle.is_null() {
+        false
+    } else {
+        unsafe {
+            CloseHandle(handle);
+        }
+        true
+    }
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32"), unix))]
@@ -834,6 +1628,7 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::rc::Rc;
 
     fn env(platform: &'static str) -> HostEnv {
@@ -845,6 +1640,14 @@ mod tests {
             program_files_x86: None,
             temp_dir: "/tmp".to_string(),
             unique: "test".to_string(),
+            home: match platform {
+                "macos" => "/Users/me".to_string(),
+                "windows" => "C:\\Users\\me".to_string(),
+                _ => "/home/me".to_string(),
+            },
+            app_data: None,
+            xdg_config_home: None,
+            snap_name: None,
         }
     }
 
@@ -1117,18 +1920,32 @@ mod tests {
         .unwrap();
         assert_eq!(plan.program, "/custom/chrome");
         assert!(queries.borrow().is_empty());
+        assert_eq!(plan.port, 0);
+        assert!(!plan.via_open);
+        assert!(!plan.delete_on_failure);
+        assert_eq!(
+            plan.user_data_dir,
+            "/Users/me/Library/Application Support/slicc/seven-profiles/chrome"
+        );
         assert_eq!(
             plan.args,
             vec![
-                "--remote-debugging-port=9333".to_string(),
-                "--user-data-dir=/tmp/playwright-cli-test".to_string(),
+                "--remote-debugging-port=0".to_string(),
+                "--user-data-dir=/Users/me/Library/Application Support/slicc/seven-profiles/chrome"
+                    .to_string(),
                 "--no-first-run".to_string(),
                 "--no-default-browser-check".to_string(),
+                "--disable-background-timer-throttling".to_string(),
+                "--disable-backgrounding-occluded-windows".to_string(),
+                "--disable-renderer-backgrounding".to_string(),
+                "--disable-background-tracing".to_string(),
+                format!("--disable-features={SEVEN_FEATURES}"),
                 "--headless=new".to_string(),
             ]
         );
         assert!(!plan.args.iter().any(|arg| arg.contains("9222")));
         assert!(!plan.args.iter().any(|arg| arg == "--headless"));
+        assert!(!plan.user_data_dir.contains("/slicc/profiles"));
 
         host.chrome_path = Some("/missing".to_string());
         let plan = plan_launch(
@@ -1234,16 +2051,25 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(plan.program, "/usr/bin/open");
         assert_eq!(
-            plan.program,
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            &plan.args[..4],
+            [
+                "-n".to_string(),
+                "-a".to_string(),
+                "/Applications/Google Chrome.app".to_string(),
+                "--args".to_string(),
+            ]
         );
+        assert!(!plan.args.iter().any(|arg| arg == "-W"));
+        assert!(plan.via_open);
         assert_eq!(plan.user_data_dir, "/tmp/my-profile");
         assert!(!plan.args.iter().any(|arg| arg.contains("headless")));
         assert!(plan.args.contains(&"--no-first-run".to_string()));
         assert!(plan
             .args
             .contains(&"--user-data-dir=/tmp/my-profile".to_string()));
+        assert!(plan.args.contains(&"--remote-debugging-port=0".to_string()));
     }
 
     #[test]
@@ -1265,8 +2091,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.program, "/usr/bin/microsoft-edge");
+        assert!(!plan.via_open);
         assert!(!plan.args.iter().any(|arg| arg.contains("headless")));
         assert!(plan.args.iter().any(|arg| arg == "--no-first-run"));
+        assert!(plan
+            .args
+            .contains(&"--remote-debugging-port=0".to_string()));
+        assert_eq!(
+            plan.user_data_dir,
+            "/home/me/.config/slicc/seven-profiles/edge"
+        );
     }
 
     #[test]
@@ -1301,6 +2135,10 @@ mod tests {
             ]
         );
         assert!(queries.borrow().is_empty());
+        assert!(!plan.user_data_dir.contains("seven-profiles"));
+        assert!(!plan.args.iter().any(|arg| arg.contains("disable-features")));
+        assert!(!plan.args.iter().any(|arg| arg.contains("headless")));
+        assert!(plan.delete_on_failure);
     }
 
     #[test]
@@ -1308,7 +2146,7 @@ mod tests {
         let host = env("linux");
         let request = LaunchRequest {
             command: "open",
-            browser: Some("chrome"),
+            browser: Some("Slack"),
             headed: false,
             profile: None,
         };
@@ -1338,5 +2176,488 @@ mod tests {
         flags.insert("browser".to_string(), "firefox".to_string());
         let err = resolve_without_endpoint("open", &flags).unwrap_err();
         assert_eq!(err, "playwright-cli open: firefox is not launchable\n");
+    }
+
+    fn installed(path: &str) -> bool {
+        matches!(
+            path,
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                | "/usr/bin/google-chrome"
+                | "/usr/bin/slack"
+                | "/snap/bin/chromium"
+                | "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe"
+        )
+    }
+
+    #[derive(Default)]
+    struct Mem {
+        files: BTreeMap<String, String>,
+        links: BTreeMap<String, String>,
+        alive: Vec<u32>,
+        removed: Vec<String>,
+        writes: Vec<String>,
+        reads: Vec<String>,
+    }
+
+    struct MemFs(RefCell<Mem>);
+
+    impl MemFs {
+        fn new() -> Self {
+            Self(RefCell::new(Mem::default()))
+        }
+    }
+
+    impl ProfileFs for MemFs {
+        fn read(&self, path: &str) -> Option<String> {
+            let mut mem = self.0.borrow_mut();
+            mem.reads.push(path.to_string());
+            mem.files.get(path).cloned()
+        }
+
+        fn read_link(&self, path: &str) -> Option<String> {
+            let mut mem = self.0.borrow_mut();
+            mem.reads.push(path.to_string());
+            mem.links.get(path).cloned()
+        }
+
+        fn pid_alive(&self, pid: u32) -> bool {
+            self.0.borrow().alive.contains(&pid)
+        }
+
+        fn remove(&mut self, path: &str) {
+            let mut mem = self.0.borrow_mut();
+            mem.removed.push(path.to_string());
+            mem.files.remove(path);
+            mem.links.remove(path);
+        }
+
+        fn write(&mut self, path: &str, body: &str) -> Result<(), String> {
+            let mut mem = self.0.borrow_mut();
+            mem.writes.push(path.to_string());
+            mem.files.insert(path.to_string(), body.to_string());
+            Ok(())
+        }
+    }
+
+    fn open_request<'a>(
+        browser: Option<&'a str>,
+        headed: bool,
+        profile: Option<&'a str>,
+    ) -> LaunchRequest<'a> {
+        LaunchRequest {
+            command: "open",
+            browser,
+            headed,
+            profile,
+        }
+    }
+
+    fn run(
+        request: &LaunchRequest,
+        host: &HostEnv,
+        port: u16,
+        fs: &mut MemFs,
+        probe: &mut dyn FnMut(&str) -> Result<String, String>,
+        spawn: &mut dyn FnMut(&SpawnPlan) -> Result<(), String>,
+    ) -> Result<Resolved, String> {
+        drive(
+            request,
+            host,
+            port,
+            50,
+            &installed,
+            &no_mdfind,
+            &no_plist,
+            probe,
+            fs,
+            spawn,
+        )
+    }
+
+    fn absent(url: &str) -> Result<String, String> {
+        let _ = url;
+        Err("no debugger is connected\n".to_string())
+    }
+
+    fn chrome_dir(host: &HostEnv) -> String {
+        plan_launch(
+            &open_request(None, false, None),
+            host,
+            0,
+            &installed,
+            &no_mdfind,
+            &no_plist,
+        )
+        .unwrap()
+        .user_data_dir
+    }
+
+    fn assert_no_six(paths: &[String]) {
+        for path in paths {
+            assert!(!path.contains("/slicc/profiles"), "{path}");
+            assert!(!path.contains("\\slicc\\profiles"), "{path}");
+            assert!(!path.contains("browser-coding-agent-chrome"), "{path}");
+        }
+    }
+
+    #[test]
+    fn seven_profile_directories() {
+        let macos = chrome_dir(&env("macos"));
+        assert_eq!(
+            macos,
+            "/Users/me/Library/Application Support/slicc/seven-profiles/chrome"
+        );
+        let linux = chrome_dir(&env("linux"));
+        assert_eq!(linux, "/home/me/.config/slicc/seven-profiles/chrome");
+        let mut xdg = env("linux");
+        xdg.xdg_config_home = Some("/srv/xdg".to_string());
+        assert_eq!(
+            chrome_dir(&xdg),
+            "/srv/xdg/slicc/seven-profiles/chrome"
+        );
+        xdg.xdg_config_home = Some("relative/config".to_string());
+        assert_eq!(
+            chrome_dir(&xdg),
+            "/home/me/.config/slicc/seven-profiles/chrome"
+        );
+        let mut snap = env("linux");
+        snap.snap_name = Some("slicc".to_string());
+        assert_eq!(
+            chrome_dir(&snap),
+            "/home/me/snap/slicc/common/slicc/seven-profiles/chrome"
+        );
+        let named = open_request(Some("chromium"), false, None);
+        let plan = plan_launch(&named, &snap, 0, &installed, &no_mdfind, &no_plist).unwrap();
+        assert_eq!(plan.program, "/snap/bin/chromium");
+        assert_eq!(
+            plan.user_data_dir,
+            "/home/me/snap/chromium/common/slicc/seven-profiles/chromium"
+        );
+        let mut windows = env("windows");
+        windows.local_app_data = Some("C:\\Users\\me\\AppData\\Local".to_string());
+        windows.app_data = Some("C:\\Users\\me\\AppData\\Roaming".to_string());
+        assert_eq!(
+            chrome_dir(&windows),
+            "C:\\Users\\me\\AppData\\Roaming\\slicc\\seven-profiles\\chrome"
+        );
+    }
+
+    #[test]
+    fn a_live_port_attaches_without_launch_or_9222() {
+        let host = env("macos");
+        let dir = chrome_dir(&host);
+        let mut fs = MemFs::new();
+        fs.0.borrow_mut().files.insert(
+            format!("{dir}/{ACTIVE_PORT_FILE}"),
+            "9333\n/devtools/browser/abc\n".to_string(),
+        );
+        let mut seen = Vec::new();
+        let resolved = run(
+            &open_request(None, false, None),
+            &host,
+            9333,
+            &mut fs,
+            &mut |url| {
+                seen.push(url.to_string());
+                assert!(!url.contains("9222"), "{url}");
+                Ok(
+                    r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/browser/abc"}"#
+                        .to_string(),
+                )
+            },
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap();
+        assert!(resolved.started.is_none());
+        assert_eq!(resolved.discover, "http://127.0.0.1:9333/json/version");
+        assert_eq!(seen, vec!["http://127.0.0.1:9333/json/version".to_string()]);
+        assert!(fs.0.borrow().removed.is_empty());
+        assert!(fs.0.borrow().writes.is_empty());
+        assert_no_six(&fs.0.borrow().reads);
+    }
+
+    #[test]
+    fn a_stale_port_falls_through_and_the_websocket_path_must_match() {
+        let host = env("linux");
+        let dir = chrome_dir(&host);
+        let mut fs = MemFs::new();
+        fs.0.borrow_mut().files.insert(
+            format!("{dir}/{ACTIVE_PORT_FILE}"),
+            "9333\n/devtools/browser/abc\n".to_string(),
+        );
+        let mut seen = Vec::new();
+        let mut spawned = None;
+        let resolved = run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut |url| {
+                seen.push(url.to_string());
+                if url == DEFAULT_DISCOVERY {
+                    Err("no debugger is connected\n".to_string())
+                } else {
+                    Ok(
+                        r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/browser/other"}"#
+                            .to_string(),
+                    )
+                }
+            },
+            &mut |plan| {
+                spawned = Some(plan.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9333/json/version".to_string(),
+                DEFAULT_DISCOVERY.to_string(),
+            ]
+        );
+        let plan = spawned.unwrap();
+        assert_eq!(plan.port, 0);
+        assert_eq!(plan.user_data_dir, dir);
+        assert_eq!(resolved.discover, dir);
+        assert!(fs.0.borrow().writes.len() == 1);
+        assert_no_six(&fs.0.borrow().reads);
+    }
+
+    #[test]
+    fn a_forbidden_port_file_is_not_probed() {
+        let host = env("linux");
+        let dir = chrome_dir(&host);
+        let mut fs = MemFs::new();
+        fs.0.borrow_mut().files.insert(
+            format!("{dir}/{ACTIVE_PORT_FILE}"),
+            "9224\n/devtools/browser/abc\n".to_string(),
+        );
+        let mut seen = Vec::new();
+        run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut |url| {
+                seen.push(url.to_string());
+                assert!(!url.contains("9224"), "{url}");
+                absent(url)
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(seen, vec![DEFAULT_DISCOVERY.to_string()]);
+    }
+
+    #[test]
+    fn an_http_error_from_the_port_file_does_not_launch() {
+        let host = env("linux");
+        let dir = chrome_dir(&host);
+        let mut fs = MemFs::new();
+        fs.0.borrow_mut().files.insert(
+            format!("{dir}/{ACTIVE_PORT_FILE}"),
+            "9400\n/devtools/browser/abc\n".to_string(),
+        );
+        let err = run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut |_| Err("HTTP 500\nno\n".to_string()),
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "HTTP 500\nno\n");
+    }
+
+    #[test]
+    fn preferences_are_seeded_only_under_seven_profiles() {
+        let created = seed_preferences(None, 5).unwrap().unwrap();
+        let settled = seed_preferences(Some(&created), 99).unwrap().unwrap();
+        assert!(seed_preferences(Some(&settled), 100).unwrap().is_none());
+        let parsed: serde_json::Value = serde_json::from_str(&settled).unwrap();
+        assert_eq!(parsed["tab_freezing_enabled"], serde_json::Value::Bool(false));
+        assert_eq!(
+            parsed["performance_tuning"]["high_efficiency_mode"]["state"],
+            serde_json::Value::Number(serde_json::Number::from(0u64))
+        );
+        assert_eq!(parsed["profile"]["exit_type"], "Normal");
+        assert_eq!(
+            parsed["profile"]["exited_cleanly"],
+            serde_json::Value::Bool(true)
+        );
+        let stamp = parsed["performance_tuning"]["tab_discarding"]["exceptions_with_time"]
+            [SEVEN_SITE]
+            .as_str()
+            .unwrap();
+        assert_eq!(stamp, chrome_time(5));
+        assert!(seed_preferences(Some("[]"), 1).is_err());
+        assert!(seed_preferences(Some("{"), 1).is_err());
+
+        let host = env("macos");
+        let dir = chrome_dir(&host);
+        let prefs = format!("{dir}/Default/Preferences");
+        let mut fs = MemFs::new();
+        fs.0.borrow_mut().files.insert(prefs.clone(), "[]".to_string());
+        let err = run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut absent,
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a JSON object, left alone"), "{err}");
+        assert_eq!(fs.0.borrow().files.get(&prefs).map(String::as_str), Some("[]"));
+        assert!(fs.0.borrow().removed.is_empty());
+
+        fs.0.borrow_mut().files.insert(prefs.clone(), settled);
+        let mut spawned = false;
+        run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut absent,
+            &mut |_| {
+                spawned = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(spawned);
+        assert!(fs.0.borrow().writes.is_empty());
+        assert_eq!(fs.0.borrow().removed.len(), 4);
+
+        let mut outside = MemFs::new();
+        run(
+            &open_request(None, false, Some("/tmp/other")),
+            &host,
+            0,
+            &mut outside,
+            &mut absent,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(outside.0.borrow().writes.is_empty());
+
+        let inside = "/Users/me/Library/Application Support/slicc/seven-profiles/chrome";
+        let mut explicit = MemFs::new();
+        run(
+            &open_request(None, false, Some(inside)),
+            &host,
+            0,
+            &mut explicit,
+            &mut absent,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(explicit.0.borrow().writes.len(), 1);
+        assert_no_six(&explicit.0.borrow().reads);
+    }
+
+    #[test]
+    fn a_live_owner_blocks_launch_and_keeps_the_locks() {
+        let host = env("linux");
+        let dir = chrome_dir(&host);
+        let mut fs = MemFs::new();
+        fs.0
+            .borrow_mut()
+            .links
+            .insert(format!("{dir}/SingletonLock"), "host-77".to_string());
+        fs.0.borrow_mut().alive.push(77);
+        let err = run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut absent,
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("playwright-cli open: profile is in use: {dir} is held by process 77\n")
+        );
+        assert!(fs.0.borrow().removed.is_empty());
+        assert!(fs.0.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn six_profiles_are_refused_without_reading_them() {
+        for path in [
+            "/Users/me/Library/Application Support/slicc/profiles/chrome",
+            "/home/me/.config/slicc/profiles/browser-coding-agent-chrome",
+            "/tmp/browser-coding-agent-chrome-extra",
+            "C:\\Users\\me\\AppData\\Roaming\\slicc\\profiles\\chrome",
+        ] {
+            let mut fs = MemFs::new();
+            let err = run(
+                &open_request(None, false, Some(path)),
+                &env("linux"),
+                0,
+                &mut fs,
+                &mut |_| panic!("probed"),
+                &mut |_| panic!("spawned"),
+            )
+            .unwrap_err();
+            assert!(err.contains("refusing profile"), "{err}");
+            assert!(err.contains(path), "{err}");
+            assert!(fs.0.borrow().reads.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn claude_and_1password_are_refused_before_a_probe() {
+        let (mut launcher, _) = recorder();
+        let mut probes = 0;
+        for (name, label) in [("claude", "Claude"), ("1Password", "1Password")] {
+            let err = decide(
+                "open",
+                Some(name),
+                false,
+                None,
+                &mut || {
+                    probes += 1;
+                    Ok(())
+                },
+                &mut launcher,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!("playwright-cli open: {label} blocks remote debugging\n")
+            );
+        }
+        assert_eq!(probes, 0);
+        assert_eq!(launcher.calls, 0);
+    }
+
+    #[test]
+    fn headed_chromium_uses_open_without_waiting() {
+        let host = env("macos");
+        let request = open_request(None, true, None);
+        let plan = plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+        assert_eq!(plan.program, "/usr/bin/open");
+        assert!(!plan.args.iter().any(|arg| arg == "-W"));
+        assert!(!plan.args.iter().any(|arg| arg.contains("headless")));
+        assert!(plan.via_open);
+        let headless = plan_launch(
+            &open_request(None, false, None),
+            &host,
+            9333,
+            &installed,
+            &no_mdfind,
+            &no_plist,
+        )
+        .unwrap();
+        assert_eq!(
+            headless.program,
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        );
+        assert!(headless.args.iter().any(|arg| arg == "--headless=new"));
+        assert!(!headless.via_open);
     }
 }

@@ -128,7 +128,7 @@ mod tests {
             "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.\n"
         ));
         assert!(stdout.contains(
-            "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.\n"
+            "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.\n"
         ));
         for line in [
             "  open [url]                  open the browser",
@@ -209,7 +209,8 @@ mod tests {
             "playwright-cli open [url]\n\nOpen the browser\n",
             &[
                 "  [url]                       the url to navigate to",
-                "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.",
+                "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.",
+                "Chromium uses --remote-debugging-port=0 and DevToolsActivePort in the shared seven-profiles directory.",
                 "  --browser                   host browser to launch. chrome-family names, plus chrome, chromium, and msedge. firefox and webkit are not launchable. an electron app name launches that app.",
                 "  --config                    path to the configuration file, defaults to .playwright/cli.config.json",
                 "  --device                    emulate a specific device, for example \"iphone 15\".",
@@ -217,7 +218,7 @@ mod tests {
                 "  --idle-timeout              shut the session down after this many milliseconds without a command. defaults to one hour for headless browsers, never for headed ones. pass 0 to disable.",
                 "  --mobile                    emulate a generic mobile device (pixel 10 for chromium, iphone 17 for webkit). mobile pages are usually lighter, which saves tokens.",
                 "  --persistent                use persistent browser profile",
-                "  --profile                   path to a persistent user data directory.",
+                "  --profile                   filesystem path that replaces the shared profile directory. it is not a profile name.",
             ],
             &[
                 "--foreground",
