@@ -65,9 +65,13 @@ pub fn create_target(
     url: &str,
     foreground: bool,
 ) -> Result<String, String> {
+    let blank = url.eq_ignore_ascii_case("about:blank");
     let result = cdp.call(
         "Target.createTarget",
-        json!({ "url": url, "background": !foreground }),
+        json!({
+            "url": if blank { url } else { "about:blank" },
+            "background": !foreground
+        }),
         None,
     )?;
     let target_id = result
@@ -84,10 +88,41 @@ pub fn create_target(
         cdp::detach(cdp, &session);
         return Err(message);
     }
-    let loaded = cdp.wait_load(&session);
+    let mut abandon = false;
+    let loaded = if blank {
+        cdp.wait_load(&session)
+    } else {
+        let mark = cdp.events().len();
+        match cdp.call("Page.navigate", json!({ "url": url }), Some(&session)) {
+            Ok(result) => {
+                if let Some(error) = result
+                    .get("errorText")
+                    .and_then(|value| value.as_str())
+                    .filter(|error| !error.is_empty())
+                {
+                    abandon = true;
+                    Err(format!("navigate: {error}\n"))
+                } else if navigation_commits(&result) {
+                    cdp.wait_load_since(&session, mark)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(message) => {
+                abandon = true;
+                Err(message)
+            }
+        }
+    };
     let traced = trace::absorb(cdp, &session);
     cdp::detach(cdp, &session);
-    loaded?;
+    if let Err(message) = loaded {
+        if abandon {
+            let closed = close_target(cdp, &target_id);
+            return Err(closed.err().unwrap_or(message));
+        }
+        return Err(message);
+    }
     let (console, requests) = traced?;
     session::push_trace(state, &target_id, console, requests);
     Ok(target_id)
@@ -125,6 +160,16 @@ fn enable_page(cdp: &mut Cdp, session: &str) -> Result<(), String> {
 
 fn cdp_error_response(method: &str, err: &str) -> bool {
     err.starts_with(&format!("{method}:"))
+}
+
+fn navigation_commits(result: &Value) -> bool {
+    if result.get("isDownload").and_then(|value| value.as_bool()) == Some(true) {
+        return false;
+    }
+    match result.get("loaderId").and_then(|value| value.as_str()) {
+        Some(loader_id) if !loader_id.is_empty() => true,
+        _ => false,
+    }
 }
 
 pub fn activate(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
@@ -636,7 +681,8 @@ pub fn lookup_ref<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::cdp_error_response;
+    use super::{cdp_error_response, navigation_commits};
+    use serde_json::json;
 
     #[test]
     fn page_enable_ignores_only_a_cdp_error_response() {
@@ -646,5 +692,15 @@ mod tests {
         assert!(!cdp_error_response("Page.enable", "websocket write failed: broken pipe\n"));
         assert!(!cdp_error_response("Page.enable", "websocket read failed: reset\n"));
         assert!(!cdp_error_response("Page.enable", "Page.enable timed out\n"));
+    }
+
+    #[test]
+    fn a_fragment_or_download_does_not_commit_a_document() {
+        assert!(navigation_commits(&json!({ "loaderId": "ABC", "frameId": "F" })));
+        assert!(!navigation_commits(&json!({ "loaderId": "", "frameId": "F" })));
+        assert!(!navigation_commits(&json!({ "frameId": "F" })));
+        assert!(!navigation_commits(
+            &json!({ "loaderId": "ABC", "isDownload": true })
+        ));
     }
 }

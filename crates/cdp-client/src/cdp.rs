@@ -128,6 +128,28 @@ impl Cdp {
             }
         }
     }
+
+    pub fn wait_load_since(&mut self, session_id: &str, from: usize) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if navigation_settled(&self.events, session_id, from) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            match self.ws.recv_text(deadline)? {
+                Some(text) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        if value.get("method").is_some() {
+                            self.events.push(value);
+                        }
+                    }
+                }
+                None => return Ok(()),
+            }
+        }
+    }
 }
 
 fn probe_is_settled(outcome: Result<Option<&str>, &str>) -> Result<bool, String> {
@@ -142,6 +164,34 @@ fn probe_is_settled(outcome: Result<Option<&str>, &str>) -> Result<bool, String>
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+fn navigation_settled(events: &[Value], session_id: &str, from: usize) -> bool {
+    let mut committed = false;
+    for event in events.iter().skip(from) {
+        if !committed && is_commit(event, session_id) {
+            committed = true;
+            continue;
+        }
+        if committed && is_load(event, session_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_commit(event: &Value, session_id: &str) -> bool {
+    if event.get("sessionId").and_then(|value| value.as_str()) != Some(session_id) {
+        return false;
+    }
+    if event.get("method").and_then(|value| value.as_str()) != Some("Page.frameNavigated") {
+        return false;
+    }
+    let url = event
+        .pointer("/params/frame/url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    !url.is_empty() && !url.eq_ignore_ascii_case("about:blank")
 }
 
 fn is_load(event: &Value, session_id: &str) -> bool {
@@ -402,6 +452,37 @@ mod tests {
             probe_is_settled(Err("Runtime.evaluate: 'Runtime.evaluate' wasn't found\n")).unwrap(),
             true
         );
+    }
+
+    #[test]
+    fn a_blank_load_does_not_settle_the_next_navigation() {
+        let session = "sess";
+        let blank_load = json!({
+            "method": "Page.loadEventFired",
+            "sessionId": session,
+            "params": {}
+        });
+        let blank_frame = json!({
+            "method": "Page.frameNavigated",
+            "sessionId": session,
+            "params": { "frame": { "url": "about:blank" } }
+        });
+        let commit = json!({
+            "method": "Page.frameNavigated",
+            "sessionId": session,
+            "params": { "frame": { "url": "http://a.test/boot" } }
+        });
+        let load = json!({
+            "method": "Page.loadEventFired",
+            "sessionId": session,
+            "params": {}
+        });
+        let raced = vec![blank_frame, blank_load.clone(), commit.clone()];
+        assert!(!super::navigation_settled(&raced, session, 0));
+        let ready = vec![blank_load.clone(), commit.clone(), load.clone()];
+        assert!(super::navigation_settled(&ready, session, 0));
+        let stale = vec![commit, load, blank_load];
+        assert!(!super::navigation_settled(&stale, session, 2));
     }
 
     #[test]

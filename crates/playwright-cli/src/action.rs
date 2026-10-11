@@ -267,8 +267,10 @@ mod tests {
                         continue;
                     }
                     let text = String::from_utf8_lossy(&payload);
-                    if let Some(response) = on_message(&text, mode, pages, log) {
-                        let _ = stream.write_all(&server_text(&response));
+                    if let Some(frames) = on_message(&text, mode, pages, log) {
+                        for frame in frames {
+                            let _ = stream.write_all(&server_text(&frame));
+                        }
                     }
                 }
                 let mut tmp = [0u8; 8192];
@@ -286,7 +288,7 @@ mod tests {
             mode: SliccReply,
             pages: bool,
             log: &Mutex<Vec<Value>>,
-        ) -> Option<String> {
+        ) -> Option<Vec<String>> {
             let value: Value = serde_json::from_str(text).ok()?;
             let id = value.get("id").cloned()?;
             log.lock().unwrap().push(value.clone());
@@ -297,10 +299,10 @@ mod tests {
             if method == "Slicc.action" {
                 return match mode {
                     SliccReply::Silent => None,
-                    SliccReply::NotFound => Some(
+                    SliccReply::NotFound => Some(vec![
                         json!({"id": id, "error": {"message": "'Slicc.action' wasn't found"}})
                             .to_string(),
-                    ),
+                    ]),
                 };
             }
             let params = value.get("params").cloned().unwrap_or(Value::Null);
@@ -338,7 +340,30 @@ mod tests {
                 }
                 _ => json!({}),
             };
-            Some(json!({"id": id, "result": result}).to_string())
+            let mut frames = vec![json!({"id": id, "result": result}).to_string()];
+            if method == "Page.navigate" {
+                let url = params
+                    .get("url")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("http://navigated.test/");
+                frames.push(
+                    json!({
+                        "method": "Page.frameNavigated",
+                        "params": { "frame": { "id": "frame", "url": url } },
+                        "sessionId": "sess"
+                    })
+                    .to_string(),
+                );
+                frames.push(
+                    json!({
+                        "method": "Page.loadEventFired",
+                        "params": {},
+                        "sessionId": "sess"
+                    })
+                    .to_string(),
+                );
+            }
+            Some(frames)
         }
 
         fn timed_out(err: &std::io::Error) -> bool {

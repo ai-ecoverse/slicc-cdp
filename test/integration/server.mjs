@@ -30,6 +30,8 @@ export function startServer() {
 function answer(req, res, pathname, body) {
   if (pathname === '/slow') return hold(req, res);
   if (pathname === '/api/me') return text(res, 200, req.headers.cookie || 'missing');
+  if (pathname === '/api/boot') return text(res, 200, 'booted');
+  if (pathname === '/boot') return html(res, bootPage());
   if (pathname === '/json-post') return jsonPost(req, res, body);
   if (pathname === '/upload') return upload(res, body);
   if (pathname === '/show') return text(res, 200, 'hi', { 'x-test': 'yes' });
@@ -90,4 +92,8 @@ function fixture(title) {
 
 function childPage() {
   return '<!doctype html><title>Child</title><p>child-frame</p>';
+}
+
+function bootPage() {
+  return '<!doctype html><title>Boot</title><script>fetch("/api/boot")</script>';
 }

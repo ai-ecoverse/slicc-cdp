@@ -46,6 +46,12 @@ async function settle(value) {
 }
 
 async function playwrightFlow(runner, site) {
+  const bootDir = await runner.fresh();
+  const booted = await runner.playwright(['open', `${site.origin}/boot`], bootDir);
+  assert.equal(booted.code, 0, `${booted.stderr}\n${booted.stdout}`);
+  const bootList = await runner.playwright(['requests'], bootDir);
+  assert.equal(bootList.code, 0, `${bootList.stderr}\n${bootList.stdout}`);
+  assert.match(bootList.stdout, /\/api\/boot/);
   const cwd = await runner.fresh();
   const page = `${site.origin}/page`;
   const opened = await runner.playwright(['open', page], cwd);
