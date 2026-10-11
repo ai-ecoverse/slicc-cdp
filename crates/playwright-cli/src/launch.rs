@@ -765,6 +765,20 @@ fn path_parts(path: &str) -> Vec<String> {
         .collect()
 }
 
+fn profile_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || name.contains("..") {
+        return false;
+    }
+    let [first, rest @ ..] = bytes else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && rest
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn is_six_profile(path: &str) -> bool {
     let parts = path_parts(path);
     parts.windows(2).any(|window| {
@@ -1014,6 +1028,9 @@ fn collect_profile_root<F: ScanFs>(
         return;
     }
     for id in fs.list_dirs(root) {
+        if !profile_dir_name(&id) {
+            continue;
+        }
         let dir = join_parts(windows, &[root.to_string(), id]);
         if is_six_profile(&dir) {
             continue;
@@ -2934,7 +2951,18 @@ mod tests {
         );
         let six = "/Users/me/Library/Application Support/Slicc/profiles";
         let mut fs = ClockFs::new();
-        fs.dir(&root, &["browser-coding-agent-chrome", "chrome", "edge"]);
+        fs.dir(
+            &root,
+            &[
+                ".migrated-from-profiles",
+                ".hidden",
+                "browser-coding-agent-chrome",
+                "chrome",
+                "chrome..old",
+                "edge",
+                "has space",
+            ],
+        );
         fs.dir(six, &["chrome"]);
         fs.dir(
             "/Users/me/Library/Application Support/Slicc",
@@ -2954,6 +2982,26 @@ mod tests {
             &port_file(&format!("{root}/browser-coding-agent-chrome"), false),
             9,
             "9555\n/devtools/browser/agent\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/.migrated-from-profiles"), false),
+            50,
+            "9667\n/devtools/browser/marker\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/.hidden"), false),
+            49,
+            "9668\n/devtools/browser/hidden\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/chrome..old"), false),
+            48,
+            "9669\n/devtools/browser/dots\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/has space"), false),
+            47,
+            "9670\n/devtools/browser/space\n",
         );
         fs.file(
             &port_file(&format!("{six}/chrome"), false),
@@ -2976,6 +3024,12 @@ mod tests {
         assert!(fs.reads.borrow().iter().any(|path| path.contains("/chrome/")));
         assert_no_six(&fs.reads.borrow());
         assert_no_six(&fs.lists.borrow());
+        assert!(fs.reads.borrow().iter().all(|path| {
+            !path.contains("/.migrated-from-profiles/")
+                && !path.contains("/.hidden/")
+                && !path.contains("chrome..old")
+                && !path.contains("has space")
+        }));
     }
 
     #[test]
