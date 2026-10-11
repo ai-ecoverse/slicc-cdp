@@ -90,50 +90,31 @@ fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
         "open" => page(
             "open [url]",
-            &[
-                "Open the browser",
-                "",
-                "This CLI does not launch a browser. It creates a tab on the attached endpoint.",
-            ],
+            &["Open the browser"],
             &[("[url]", "the url to navigate to")],
             &[
-                ("--browser", "not implemented"),
-                ("--config", "not implemented"),
-                ("--device", "not implemented"),
-                ("--headed", "not implemented"),
-                ("--idle-timeout", "not implemented"),
-                ("--mobile", "not implemented"),
-                ("--persistent", "not implemented"),
-                ("--profile", "not implemented"),
-                ("--foreground", "activate the new tab"),
-                ("--fg", "activate the new tab"),
-                ("--runtime <name>", "query parameter on the CDP URL"),
+                ("--browser", "browser or chrome channel to use, possible values: chrome, firefox, webkit, msedge."),
+                ("--config", "path to the configuration file, defaults to .playwright/cli.config.json"),
+                ("--device", "emulate a specific device, for example \"iphone 15\"."),
+                ("--headed", "run browser in headed mode"),
+                ("--idle-timeout", "shut the session down after this many milliseconds without a command. defaults to one hour for headless browsers, never for headed ones. pass 0 to disable."),
+                ("--mobile", "emulate a generic mobile device (pixel 10 for chromium, iphone 17 for webkit). mobile pages are usually lighter, which saves tokens."),
+                ("--persistent", "use persistent browser profile"),
+                ("--profile", "path to a persistent user data directory."),
             ],
         ),
-        "close" => page(
-            "close ",
-            &[
-                "Close the browser",
-                "",
-                "This CLI does not stop a browser session. It closes the current tab.",
-            ],
-            &[],
-            &[("--tab <targetId>", "tab to close (defaults to the current tab)")],
-        ),
+        "close" => page("close ", &["Close the browser"], &[], &[]),
         "goto" => page(
             "goto <url>",
             &["Navigate to a URL"],
             &[("<url>", "the url to navigate to")],
-            &[("--tab <targetId>", "tab to navigate")],
+            &[],
         ),
         "type" => page(
             "type <text>",
             &["Type text into editable element"],
             &[("<text>", "text to type into the element")],
-            &[
-                ("--submit", "whether to submit entered text (press enter after)"),
-                ("--tab <targetId>", "tab to type into"),
-            ],
+            &[("--submit", "whether to submit entered text (press enter after)")],
         ),
         "click" => page(
             "click <target> [button]",
@@ -145,10 +126,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 ),
                 ("[button]", "button to click, defaults to left"),
             ],
-            &[
-                ("--modifiers", "modifier key to press (repeatable)"),
-                ("--tab <targetId>", "tab to click"),
-            ],
+            &[("--modifiers", "modifier key to press (repeatable)")],
         ),
         "fill" => page(
             "fill <target> <text>",
@@ -160,10 +138,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 ),
                 ("<text>", "text to fill into the element"),
             ],
-            &[
-                ("--submit", "whether to submit entered text (press enter after)"),
-                ("--tab <targetId>", "tab to fill"),
-            ],
+            &[("--submit", "whether to submit entered text (press enter after)")],
         ),
         "press" => page(
             "press <key>",
@@ -172,22 +147,19 @@ fn implemented_page(name: &str) -> Option<String> {
                 "<key>",
                 "name of the key to press or a character to generate, such as `arrowleft` or `a`",
             )],
-            &[("--tab <targetId>", "tab to press")],
+            &[],
         ),
         "snapshot" => page(
             "snapshot [target]",
             &["Capture page snapshot to obtain element ref"],
-            &[("[target]", "not implemented")],
+            &[("[target]", "element reference from the previous page snapshot, or a unique element selector for the root element to capture a partial snapshot instead of the whole page")],
             &[
                 (
                     "--filename",
                     "save snapshot to markdown file instead of returning it in the response.",
                 ),
-                ("--depth", "not implemented"),
-                ("--boxes", "not implemented"),
-                ("--frame <frameId>", "snapshot one frame"),
-                ("--no-iframes", "skip child frames"),
-                ("--tab <targetId>", "tab to snapshot"),
+                ("--depth", "limit snapshot depth, unlimited by default."),
+                ("--boxes", "include each element's bounding box as [box=x,y,width,height] in the snapshot. coordinates are viewport-relative, in css pixels (element.getboundingclientrect)."),
             ],
         ),
         "eval" => page(
@@ -198,16 +170,13 @@ fn implemented_page(name: &str) -> Option<String> {
                     "<func>",
                     "() => { /* code */ } or (element) => { /* code */ } when element is provided",
                 ),
-                ("[target]", "not implemented"),
+                ("[target]", "exact target element reference from the page snapshot, or a unique element selector"),
             ],
             &[
                 (
                     "--filename",
                     "save evaluation result to a file instead of returning it in the response.",
                 ),
-                ("--output <path>", "write the result to a file when --filename is omitted"),
-                ("--frame <frameId>", "evaluate in one frame"),
-                ("--tab <targetId>", "tab to evaluate"),
             ],
         ),
         "screenshot" => page(
@@ -220,16 +189,14 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 (
                     "--filename",
-                    "file name to save the screenshot to. defaults to screenshot-{timestamp}.png if not specified.",
+                    "file name to save the screenshot to. defaults to `page-{timestamp}.{png|jpeg|webp}` if not specified.",
                 ),
-                ("--type", "not implemented"),
+                ("--type", "image format. if unset, inferred from the filename extension, otherwise png. (one of: png, jpeg, webp)"),
                 (
                     "--full-page",
                     "when true, takes a screenshot of the full scrollable page, instead of the currently visible viewport.",
                 ),
-                ("--hires", "not implemented"),
-                ("--max-width <px>", "limit the image width in pixels"),
-                ("--tab <targetId>", "tab to capture"),
+                ("--hires", "when true, captures a high-resolution screenshot using device pixels (accounts for the device pixel ratio), instead of css pixels."),
             ],
         ),
         "tab-list" => "playwright-cli tab-list \n\nList all tabs\n\n".to_string(),
@@ -240,11 +207,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "[url]",
                 "the url to navigate to in the new tab. if omitted, the new tab will be blank.",
             )],
-            &[
-                ("--foreground", "activate the new tab"),
-                ("--fg", "activate the new tab"),
-                ("--runtime <name>", "query parameter on the CDP URL"),
-            ],
+            &[],
         ),
         "tab-select" => {
             "playwright-cli tab-select <index>\n\nSelect a browser tab\n\nArguments:\n  <index>                     tab index\n"
@@ -253,8 +216,8 @@ fn implemented_page(name: &str) -> Option<String> {
         "tab-close" => page(
             "tab-close [index]",
             &["Close a browser tab"],
-            &[("[index]", "not implemented")],
-            &[("--tab <targetId>", "tab to close (defaults to the current tab)")],
+            &[("[index]", "tab index. if omitted, current tab is closed.")],
+            &[],
         ),
         "console" => page(
             "console [min-level]",
