@@ -6,10 +6,10 @@ curl-style requests inside an already-open browser tab. The request is a page-co
 cargo install curlwright
 ```
 
-Host builds run on macOS, Linux, and Windows. Rust 1.83 or newer.
+Host builds run on macOS, Linux, and Windows. Rust 1.83 or newer. Start Chrome with `--remote-debugging-port` and a non-default `--user-data-dir`. Chrome 136 and later ignore the debugging port on the default profile. `--headless` is optional: leave it off to open a window.
 
 ```
-google-chrome --headless --remote-debugging-port=9333
+google-chrome --headless --remote-debugging-port=9333 --user-data-dir=/tmp/chrome-cdp
 curlwright --cdp http://127.0.0.1:9333 https://example.com/
 curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ```
