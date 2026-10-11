@@ -30,11 +30,17 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             .filter(|value| !value.is_empty())
             .cloned()
     });
+    let explicit = launch::endpoint_is_explicit(invocation.cdp.as_deref(), env_url);
+    let active = if explicit {
+        None
+    } else {
+        match launch::attached_port() {
+            Ok(active) => active,
+            Err(message) => return Output::err(message),
+        }
+    };
     let mut started = None;
-    let start = if launch::should_launch(
-        command,
-        launch::endpoint_is_explicit(invocation.cdp.as_deref(), env_url),
-    ) {
+    let start = if active.is_none() && launch::should_launch(command, explicit) {
         match launch::resolve_without_endpoint(command, &invocation.flags) {
             Ok(resolved) => {
                 started = resolved.started;
@@ -43,7 +49,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             Err(message) => return Output::err(message),
         }
     } else {
-        match connect::choose_start(invocation.cdp.as_deref(), env_url) {
+        match launch::start_after_explicit(invocation.cdp.as_deref(), env_url, active) {
             Ok(start) => start,
             Err(message) => return Output::err(message),
         }
