@@ -513,10 +513,8 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "wasix-net"
 version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "966dbac17aacf0e6e9743a1b497aa384b89f3270343a3e5e7adc2fc05d975f93"
 
 [[package]]
 name = "windows-link"

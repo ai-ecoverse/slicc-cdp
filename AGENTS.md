@@ -1,6 +1,6 @@
 # slicc-cdp
 
-`@ai-ecoverse/slicc-cdp`. Node ≥ 24, ESM. `src/index.js` exports `CDPClient` and `connect`. `slicc-lint`. No comments in files we write. No CLAUDE.md. Extra tests: `test/unit/`, `test/integration/`, or `#[cfg(test)]`. semantic-release on `main`. `vendor/wasix-net` is homescoop `86df95d`, copied as-is.
+`@ai-ecoverse/slicc-cdp`. Node ≥ 24, ESM. `src/index.js` exports `CDPClient` and `connect`. `slicc-lint`. No comments in files we write. No CLAUDE.md. Extra tests: `test/unit/`, `test/integration/`, or `#[cfg(test)]`. semantic-release on `main`. `wasix-net` 0.1 comes from crates.io.
 
 CLIs: `crates/playwright-cli`, `crates/curlwright`. Shared CDP: `crates/cdp-client`. Attach with `flatten: true` and a top-level `sessionId`. No `/devtools/page/<id>` socket. `--version` prints `package.json`.
 
