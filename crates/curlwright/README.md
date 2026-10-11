@@ -6,7 +6,7 @@ curl-style requests inside an already-open browser tab. The request is a page-co
 cargo install curlwright
 ```
 
-Host builds run on macOS, Linux, and Windows.
+Host builds run on macOS, Linux, and Windows. Rust 1.83 or newer.
 
 ```
 google-chrome --headless --remote-debugging-port=9333

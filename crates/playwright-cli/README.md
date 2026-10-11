@@ -6,7 +6,7 @@ CDP client for a Chrome that is already running. It does not launch the browser.
 cargo install playwright-cli
 ```
 
-Host builds run on macOS, Linux, and Windows. Start Chrome with `--remote-debugging-port`, then pass that endpoint:
+Host builds run on macOS, Linux, and Windows. Rust 1.88 or newer. Start Chrome with `--remote-debugging-port`, then pass that endpoint:
 
 ```
 google-chrome --headless --remote-debugging-port=9333

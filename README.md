@@ -30,7 +30,7 @@ Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on 
 
 ## Install and run
 
-`cargo install` builds the host binaries. They run on macOS, Linux, and Windows. TLS there is `native-tls` (Secure Transport, OpenSSL, or SChannel).
+`cargo install` builds the host binaries. They run on macOS, Linux, and Windows. TLS there is `native-tls` (Secure Transport, OpenSSL, or SChannel). `playwright-cli` needs Rust 1.88. `curlwright` and `slicc-cdp-client` need Rust 1.83.
 
 ```
 cargo install playwright-cli

@@ -2,7 +2,7 @@
 name = "playwright-cli"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "CDP playwright-cli for macOS and the SLICC kernel"
 repository = "https://github.com/ai-ecoverse/slicc-cdp"
