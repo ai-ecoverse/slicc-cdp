@@ -6,7 +6,7 @@
 cargo install slicc-cdp
 ```
 
-That installs the `playwright-cli` command. It talks to a Chrome that is already running and does not launch the browser.
+That installs the `playwright-cli` command. Host `open` launches a browser when nothing is connected. Inside slicc it opens a tab.
 
 Host builds run on macOS, Linux, and Windows. Rust 1.88 or newer. Start Chrome with `--remote-debugging-port` and a non-default `--user-data-dir`, then pass that endpoint. Chrome 136 and later ignore the debugging port on the default profile. `--headless` is optional: leave it off to open a window.
 

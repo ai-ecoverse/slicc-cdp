@@ -27,8 +27,8 @@ const S: bool = true;
 const B: bool = false;
 
 static SPECS: &[Spec] = &[
-    spec("open", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),
-    spec("tab-new", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),
+    spec("open", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S), ("browser", S), ("headed", B), ("profile", S)], true, RefMode::None),
+    spec("tab-new", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S), ("browser", S), ("headed", B), ("profile", S)], true, RefMode::None),
     spec("close", &[], false, &[("tab", S)], true, RefMode::None),
     spec("goto", &["url"], false, &[("tab", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),
     spec("type", &["text"], true, &[("tab", S), ("submit", B)], true, RefMode::None),

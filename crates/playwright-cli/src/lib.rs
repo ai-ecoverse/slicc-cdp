@@ -5,6 +5,7 @@ mod cdp;
 mod commands;
 mod connect;
 mod help;
+mod launch;
 mod net;
 mod session;
 mod snapshot;
@@ -126,7 +127,9 @@ mod tests {
         assert!(stdout.contains(
             "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.\n"
         ));
-        assert!(stdout.contains("This CLI does not launch Chrome.\n"));
+        assert!(stdout.contains(
+            "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.\n"
+        ));
         for line in [
             "  open [url]                  open the browser",
             "  close                       close the browser",
@@ -206,7 +209,8 @@ mod tests {
             "playwright-cli open [url]\n\nOpen the browser\n",
             &[
                 "  [url]                       the url to navigate to",
-                "  --browser                   browser or chrome channel to use, possible values: chrome, firefox, webkit, msedge.",
+                "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.",
+                "  --browser                   host browser to launch. chrome-family names, plus chrome, chromium, and msedge. firefox and webkit are not launchable. an electron app name launches that app.",
                 "  --config                    path to the configuration file, defaults to .playwright/cli.config.json",
                 "  --device                    emulate a specific device, for example \"iphone 15\".",
                 "  --headed                    run browser in headed mode",
@@ -350,8 +354,6 @@ mod tests {
         );
 
         for args in [
-            vec!["open", "--headed"],
-            vec!["open", "--browser", "firefox"],
             vec!["open", "--persistent"],
             vec!["snapshot", "--depth", "1"],
             vec!["snapshot", "--boxes"],
@@ -368,6 +370,32 @@ mod tests {
             );
             assert!(!output.stderr.contains("9222"), "{args:?}");
         }
+        for args in [
+            vec!["open", "--headed"],
+            vec!["open", "--browser", "chrome"],
+            vec!["open", "--profile", "/tmp/playwright-cli-profile"],
+            vec!["tab-new", "--headed"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|part| (*part).to_string()).collect();
+            let output = execute(&owned, None);
+            assert_eq!(output.code, 1, "{args:?} {}", output.stderr);
+            assert!(
+                !output.stderr.contains("Unknown option"),
+                "{args:?} {}",
+                output.stderr
+            );
+            assert!(!output.stderr.contains("9222"), "{args:?} {}", output.stderr);
+        }
+        let firefox = execute(
+            &["open".into(), "--browser".into(), "firefox".into()],
+            None,
+        );
+        assert_eq!(firefox.code, 1);
+        assert_eq!(
+            firefox.stderr,
+            "playwright-cli open: firefox is not launchable\n"
+        );
+        assert!(!firefox.stderr.contains("9222"));
         let missing_file = execute(&["eval".into(), "--filename".into()], None);
         assert!(missing_file.stderr.contains("--filename"));
         let snapshot_target = execute(&["snapshot".into(), "e1".into()], None);

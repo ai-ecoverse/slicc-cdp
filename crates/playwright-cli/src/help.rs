@@ -13,7 +13,7 @@ pub fn global_help() -> String {
         "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else GET http://127.0.0.1:9222/json/version and dial webSocketDebuggerUrl.".to_string(),
         "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
-        "This CLI does not launch Chrome.".to_string(),
+        "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.".to_string(),
         String::new(),
         "Core:".to_string(),
         row("open [url]", "open the browser"),
@@ -90,10 +90,13 @@ fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
         "open" => page(
             "open [url]",
-            &["Open the browser"],
+            &[
+                "Open the browser",
+                "The host build launches a browser when no debugger is already connected; the wasm build only opens a tab.",
+            ],
             &[("[url]", "the url to navigate to")],
             &[
-                ("--browser", "browser or chrome channel to use, possible values: chrome, firefox, webkit, msedge."),
+                ("--browser", "host browser to launch. chrome-family names, plus chrome, chromium, and msedge. firefox and webkit are not launchable. an electron app name launches that app."),
                 ("--config", "path to the configuration file, defaults to .playwright/cli.config.json"),
                 ("--device", "emulate a specific device, for example \"iphone 15\"."),
                 ("--headed", "run browser in headed mode"),

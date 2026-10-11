@@ -3,6 +3,7 @@ use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::connect;
+use crate::launch::{self, Started};
 use crate::session::{self, Session};
 use crate::snapshot::{self, RefRec};
 use crate::trace::{self, Piece};
@@ -16,10 +17,12 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = trace::precheck(command, &invocation.positionals) {
         return Output::err(message);
     }
-    let start = match connect::choose_start(invocation.cdp.as_deref(), env_url) {
-        Ok(start) => start,
-        Err(message) => return Output::err(message),
-    };
+    if let Some(message) = launch::reject_wasm_flags(command, &invocation.flags) {
+        return Output::err(message);
+    }
+    if let Some(message) = deferred_flag(invocation) {
+        return Output::err(message);
+    }
     let runtime = invocation.runtime.clone().or_else(|| {
         invocation
             .flags
@@ -27,9 +30,24 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             .filter(|value| !value.is_empty())
             .cloned()
     });
-    if let Some(message) = deferred_flag(invocation) {
-        return Output::err(message);
-    }
+    let mut started = None;
+    let start = if launch::should_launch(
+        command,
+        launch::endpoint_is_explicit(invocation.cdp.as_deref(), env_url),
+    ) {
+        match launch::resolve_without_endpoint(command, &invocation.flags) {
+            Ok(resolved) => {
+                started = resolved.started;
+                connect::Start::Discover(resolved.discover)
+            }
+            Err(message) => return Output::err(message),
+        }
+    } else {
+        match connect::choose_start(invocation.cdp.as_deref(), env_url) {
+            Ok(start) => start,
+            Err(message) => return Output::err(message),
+        }
+    };
     let connected = match cdp::open(start, runtime.as_deref()) {
         Ok(cdp) => cdp,
         Err(message) => return Output::err(message),
@@ -38,7 +56,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let mut state = session::load();
     let mut report = action::Report::for_command(command);
     let result = match command {
-        "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report),
+        "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report, &mut started),
         "close" | "tab-close" => cmd_close(&mut cdp, &mut state, invocation, &mut report),
         "goto" => cmd_goto(&mut cdp, &mut state, invocation, &mut report),
         "snapshot" => cmd_snapshot(&mut cdp, &mut state, invocation, &mut report),
@@ -88,6 +106,7 @@ fn cmd_open(
     state: &mut Session,
     invocation: &Invocation,
     report: &mut Report,
+    started: &mut Option<Started>,
 ) -> Output {
     let url = invocation
         .positionals
@@ -100,6 +119,9 @@ fn cmd_open(
     report.begin(cdp);
     match browser::create_target(cdp, state, url, foreground) {
         Ok(target_id) => {
+            if let Some(started) = started.as_mut() {
+                started.disarm();
+            }
             report.tab(&target_id);
             state.current = Some(target_id.clone());
             Output::ok(format!("Opened {url} in new tab [targetId: {target_id}]\n"))
