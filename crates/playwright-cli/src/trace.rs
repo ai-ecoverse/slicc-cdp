@@ -9,7 +9,7 @@ pub struct ConsoleEntry {
     pub text: String,
     pub url: String,
     pub line: u64,
-    pub stamp: u64,
+    pub stamp: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,12 +260,22 @@ fn console_from(params: &Value) -> Option<ConsoleEntry> {
         text: console_text(params),
         url,
         line,
-        stamp: params
-            .get("timestamp")
-            .and_then(|value| value.as_f64())
-            .map(|value| value as u64)
-            .unwrap_or(0),
+        stamp: timestamp_text(params.get("timestamp")),
     })
+}
+
+fn timestamp_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Number(number)) => {
+            let text = number.to_string();
+            if text == "0" {
+                String::new()
+            } else {
+                text
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 fn console_text(params: &Value) -> String {
@@ -847,13 +857,25 @@ pub fn printable_link(title: &str, path: &str) -> String {
 }
 
 pub fn console_json(entry: &ConsoleEntry) -> Value {
-    json!({
+    let mut object = json!({
         "type": entry.kind,
         "text": entry.text,
         "url": entry.url,
         "line": entry.line,
-        "stamp": entry.stamp,
-    })
+    });
+    if let Some(stamp) = stamp_json(&entry.stamp) {
+        object["stamp"] = stamp;
+    }
+    object
+}
+
+fn stamp_json(stamp: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(stamp).ok()?;
+    if value.is_number() {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 pub fn console_from_json(value: &Value) -> Option<ConsoleEntry> {
@@ -862,7 +884,7 @@ pub fn console_from_json(value: &Value) -> Option<ConsoleEntry> {
         text: value.get("text").and_then(|item| item.as_str()).unwrap_or("").to_string(),
         url: value.get("url").and_then(|item| item.as_str()).unwrap_or("").to_string(),
         line: value.get("line").and_then(|item| item.as_u64()).unwrap_or(0),
-        stamp: value.get("stamp").and_then(|item| item.as_u64()).unwrap_or(0),
+        stamp: timestamp_text(value.get("stamp")),
     })
 }
 
@@ -971,7 +993,7 @@ mod tests {
         let (console, _) = from_events(&events, "S");
         assert_eq!(console.len(), 1);
         assert_eq!(console[0].text, "once");
-        assert_eq!(console[0].stamp, 1700000000000);
+        assert_eq!(console[0].stamp, "1700000000000.5");
     }
 
     fn sample_events() -> Vec<Value> {
