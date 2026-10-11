@@ -65,9 +65,13 @@ pub fn create_target(
     url: &str,
     foreground: bool,
 ) -> Result<String, String> {
+    let blank = url.eq_ignore_ascii_case("about:blank");
     let result = cdp.call(
         "Target.createTarget",
-        json!({ "url": url, "background": !foreground }),
+        json!({
+            "url": if blank { url } else { "about:blank" },
+            "background": !foreground
+        }),
         None,
     )?;
     let target_id = result
@@ -84,7 +88,21 @@ pub fn create_target(
         cdp::detach(cdp, &session);
         return Err(message);
     }
-    let loaded = cdp.wait_load(&session);
+    let loaded = if blank {
+        cdp.wait_load(&session)
+    } else {
+        let mark = cdp.events().len();
+        match cdp.call("Page.navigate", json!({ "url": url }), Some(&session)) {
+            Ok(result) => {
+                if let Some(error) = result.get("errorText").and_then(|value| value.as_str()) {
+                    Err(format!("navigate: {error}\n"))
+                } else {
+                    cdp.wait_load_since(&session, mark)
+                }
+            }
+            Err(message) => Err(message),
+        }
+    };
     let traced = trace::absorb(cdp, &session);
     cdp::detach(cdp, &session);
     loaded?;
