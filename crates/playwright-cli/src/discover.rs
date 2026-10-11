@@ -388,6 +388,7 @@ fn argv_hit(pid: u32, command: &str) -> Option<ArgvHit> {
     })
 }
 
+#[cfg(test)]
 fn argv_line(hit: &ArgvHit) -> String {
     format!("pid {} port {} {}", hit.pid, hit.port, hit.executable)
 }
@@ -827,12 +828,15 @@ fn resolve_process(
 ) -> Option<(u32, EndpointDraft)> {
     if hit.port == 0 {
         let dir = hit.user_data_dir.as_deref()?;
+        if profiles_under_slicc(dir) {
+            return None;
+        }
         let text = read(&active_port_path(dir))?;
         let (port, ws_path) = parse_active_port(&text)?;
         let base = format!("http://127.0.0.1:{port}");
         let doc = version_doc_checked(&base, Some(&ws_path), http)?;
         let tabs = fetch_tabs(&base, http);
-        let draft = draft_from_doc(&base, "devtools-active-port", Some(dir), None, doc, tabs)?;
+        let draft = draft_from_doc(&base, "process", Some(dir), None, doc, tabs)?;
         return Some((port, draft));
     }
     let base = format!("http://127.0.0.1:{}", hit.port);
@@ -956,6 +960,20 @@ fn dir_name_ok(name: &str) -> bool {
         && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
+}
+
+fn profiles_under_slicc(path: &str) -> bool {
+    let mut slicc = false;
+    for component in path.split(['/', '\\']) {
+        if component.is_empty() {
+            continue;
+        }
+        if slicc && component.eq_ignore_ascii_case("profiles") {
+            return true;
+        }
+        slicc = component.eq_ignore_ascii_case("slicc");
+    }
+    false
 }
 
 fn join_two(root: &str, child: &str) -> String {
@@ -1540,14 +1558,12 @@ fn endpoint_json(endpoint: &EndpointDraft) -> String {
     let mut out = String::from("{");
     let mut first = true;
     field(&mut out, &mut first, "cdp", &json_string(&endpoint.cdp));
-    if let Some(websocket) = &endpoint.websocket {
-        field(
-            &mut out,
-            &mut first,
-            "webSocketDebuggerUrl",
-            &json_string(websocket),
-        );
-    }
+    field(
+        &mut out,
+        &mut first,
+        "webSocketDebuggerUrl",
+        &json_string(endpoint.websocket.as_deref().unwrap_or("")),
+    );
     field(&mut out, &mut first, "name", &json_string(&endpoint.name));
     if let Some(version) = &endpoint.version {
         field(&mut out, &mut first, "version", &json_string(version));
@@ -2595,6 +2611,193 @@ mod tests {
             .borrow()
             .iter()
             .all(|path| !path.contains(r"\slicc\profiles")));
+    }
+
+    #[test]
+    fn port_zero_skips_six_profiles_and_emits_an_empty_debugger_url() {
+        let reads = RefCell::new(Vec::new());
+        let http = |url: &str| -> HttpResult {
+            let doc = |port: u32, path: &str| {
+                format!(
+                    "{{\"Browser\":\"Chrome/120.0.0.0\",\"User-Agent\":\"Mozilla/5.0 Chrome/120.0.0.0\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:{port}{path}\"}}"
+                )
+            };
+            match url {
+                "http://127.0.0.1:9333/json/version" => HttpResult::Response {
+                    status: 200,
+                    body: doc(9333, "/devtools/browser/live"),
+                },
+                "http://127.0.0.1:9334/json/version" => HttpResult::Response {
+                    status: 200,
+                    body: doc(9334, "/devtools/browser/brave"),
+                },
+                "http://127.0.0.1:9335/json/version" => HttpResult::Response {
+                    status: 200,
+                    body: doc(9335, "/devtools/browser/opt"),
+                },
+                "http://127.0.0.1:9336/json/version" => HttpResult::Response {
+                    status: 200,
+                    body: doc(9336, "/devtools/browser/prof"),
+                },
+                "http://127.0.0.1:9666/json/version" => HttpResult::Response {
+                    status: 200,
+                    body: doc(9666, "/devtools/browser/fixed"),
+                },
+                _ => HttpResult::Transport,
+            }
+        };
+        let read = |path: &str| -> Option<String> {
+            reads.borrow_mut().push(path.to_string());
+            match path {
+                "/tmp/live/DevToolsActivePort" => Some("9333\n/devtools/browser/live\n".to_string()),
+                "/home/me/.config/slicc/seven-profiles/brave/DevToolsActivePort" => {
+                    Some("9334\n/devtools/browser/brave\n".to_string())
+                }
+                "/opt/slicc-profiles/data/DevToolsActivePort" => {
+                    Some("9335\n/devtools/browser/opt\n".to_string())
+                }
+                "/home/me/.config/slicc/seven-profiles/chrome/DevToolsActivePort" => {
+                    Some("9336\n/devtools/browser/prof\n".to_string())
+                }
+                "/tmp/fixed-only/DevToolsActivePort" => {
+                    Some("9404\n/devtools/browser/nope\n".to_string())
+                }
+                "/Users/me/Library/Application Support/Slicc/profiles/browser-coding-agent-chrome/DevToolsActivePort" => {
+                    Some("9401\n/devtools/browser/six\n".to_string())
+                }
+                "/home/me/.config/slicc/profiles/chrome/DevToolsActivePort" => {
+                    Some("9402\n/devtools/browser/six\n".to_string())
+                }
+                "C:\\Users\\me\\AppData\\Roaming\\SLICC\\Profiles\\chrome\\DevToolsActivePort" => {
+                    Some("9403\n/devtools/browser/six\n".to_string())
+                }
+                _ => None,
+            }
+        };
+        let list_dir = |path: &str| -> Vec<String> {
+            if path == "/home/me/.config/slicc/seven-profiles" {
+                vec!["chrome".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let processes = "\
+  21 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=\"/Users/me/Library/Application Support/Slicc/profiles/browser-coding-agent-chrome\"
+  22 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=/home/me/.config/slicc/profiles/chrome
+  23 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=C:\\Users\\me\\AppData\\Roaming\\SLICC\\Profiles\\chrome
+  24 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=/tmp/live
+  25 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=/home/me/.config/slicc/seven-profiles/brave
+  26 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=/opt/slicc-profiles/data
+  27 /usr/bin/chromium --remote-debugging-port=0 --user-data-dir=/tmp/missing
+  28 /usr/bin/chromium --remote-debugging-port=9555 --user-data-dir=/home/me/.config/slicc/profiles/chrome
+  29 /usr/bin/chromium --remote-debugging-port=9666 --user-data-dir=/tmp/fixed-only
+";
+        let output = run_fake(
+            &list_invocation(None, true),
+            None,
+            HostOs::Linux,
+            Some("/home/me"),
+            Some("relative/config"),
+            None,
+            processes,
+            false,
+            false,
+            &http,
+            &read,
+            &list_dir,
+        );
+        assert_eq!(output.code, 0);
+        assert_eq!(output.stderr, "");
+        let seen = reads.borrow();
+        assert!(seen.iter().any(|path| path == "/tmp/live/DevToolsActivePort"));
+        assert!(seen.iter().any(|path| {
+            path == "/home/me/.config/slicc/seven-profiles/brave/DevToolsActivePort"
+        }));
+        assert!(seen
+            .iter()
+            .any(|path| path == "/opt/slicc-profiles/data/DevToolsActivePort"));
+        assert!(seen.iter().any(|path| path == "/tmp/missing/DevToolsActivePort"));
+        assert!(seen.iter().any(|path| {
+            path == "/home/me/.config/slicc/seven-profiles/chrome/DevToolsActivePort"
+        }));
+        assert!(!seen.iter().any(|path| path == "/tmp/fixed-only/DevToolsActivePort"));
+        assert!(seen.iter().all(|path| {
+            let lower = path.to_ascii_lowercase();
+            !lower.contains("slicc/profiles")
+                && !lower.contains("slicc\\profiles")
+                && !lower.contains("browser-coding-agent-chrome")
+        }));
+        drop(seen);
+        let value: Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "cdp:127.0.0.1:9333",
+                "cdp:127.0.0.1:9334",
+                "cdp:127.0.0.1:9335",
+                "cdp:127.0.0.1:9666",
+                "cdp:127.0.0.1:9555",
+                "cdp:127.0.0.1:9336",
+            ]
+        );
+        assert_eq!(entries[0]["endpoint"]["source"], "process");
+        assert_eq!(
+            entries[0]["endpoint"]["webSocketDebuggerUrl"],
+            "ws://127.0.0.1:9333/devtools/browser/live"
+        );
+        assert_eq!(entries[1]["endpoint"]["source"], "process");
+        assert_eq!(
+            entries[1]["endpoint"]["userDataDir"],
+            "/home/me/.config/slicc/seven-profiles/brave"
+        );
+        assert_eq!(entries[2]["endpoint"]["source"], "process");
+        assert_eq!(entries[3]["endpoint"]["source"], "process");
+        assert_eq!(
+            entries[3]["endpoint"]["webSocketDebuggerUrl"],
+            "ws://127.0.0.1:9666/devtools/browser/fixed"
+        );
+        assert_eq!(entries[4]["name"], "Chromium");
+        assert_eq!(entries[4]["endpoint"]["source"], "process");
+        assert_eq!(entries[4]["endpoint"]["webSocketDebuggerUrl"], "");
+        assert!(output
+            .stdout
+            .contains("\"cdp\":\"http://127.0.0.1:9555\",\"webSocketDebuggerUrl\":\"\""));
+        assert_eq!(entries[5]["endpoint"]["source"], "devtools-active-port");
+        assert_eq!(entries[5]["endpoint"]["browser"], "chrome");
+        assert_eq!(entries[5]["name"], "Google Chrome");
+        assert!(!output.stdout.contains("9401"));
+        assert!(!output.stdout.contains("9402"));
+        assert!(!output.stdout.contains("9403"));
+        assert!(!output.stdout.contains("browser-coding-agent-chrome"));
+
+        let text = run_fake(
+            &list_invocation(None, false),
+            None,
+            HostOs::Linux,
+            Some("/home/me"),
+            Some("relative/config"),
+            None,
+            processes,
+            false,
+            false,
+            &http,
+            &read,
+            &list_dir,
+        );
+        assert_eq!(text.code, 0);
+        assert!(text.stdout.contains("pid 24 port 9333 /usr/bin/chromium"));
+        assert!(text.stdout.contains("pid 25 port 9334 /usr/bin/chromium"));
+        assert!(text.stdout.contains("pid 28 port 9555 /usr/bin/chromium"));
+        assert!(text.stdout.contains("pid 29 port 9666 /usr/bin/chromium"));
+        assert!(!text.stdout.contains("port 0"));
+        assert!(!text.stdout.contains("9401"));
+        assert!(!text.stdout.contains("9402"));
+        assert!(!text.stdout.contains("9403"));
     }
 
     fn list_invocation(cdp: Option<&str>, json: bool) -> Invocation {
