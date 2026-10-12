@@ -817,13 +817,18 @@ fn temp_profile(env: &HostEnv) -> String {
     }
 }
 
-fn data_dir(
+enum ProfilePick {
+    Dir(String),
+    Temporary,
+}
+
+fn choose_profile(
     command: &str,
     request: &LaunchRequest,
     env: &HostEnv,
     kind: Kind,
-    program: &str,
-) -> Result<(String, bool), String> {
+    snap: Option<&str>,
+) -> Result<ProfilePick, String> {
     if let Some(path) = request.profile {
         let path = path.trim();
         if path.is_empty() {
@@ -836,26 +841,39 @@ fn data_dir(
                 "playwright-cli {command}: refusing profile {path}\n"
             ));
         }
-        return Ok((path.to_string(), false));
+        return Ok(ProfilePick::Dir(path.to_string()));
     }
     if kind == Kind::Electron {
-        return Ok((temp_profile(env), true));
+        return Ok(ProfilePick::Temporary);
     }
     let id = match request.browser.and_then(find_known) {
         Some(known) => profile_id(known.bundle_id),
         None => "chrome",
     };
-    let snap = browser_snap(program);
-    let root = profiles_root(env, snap.as_deref());
+    let root = profiles_root(env, snap);
     if is_six_profile(&root) {
         return Err(format!(
             "playwright-cli {command}: refusing profile {root}\n"
         ));
     }
-    Ok((
-        join_parts(windows_host(env), &[root, id.to_string()]),
-        false,
-    ))
+    Ok(ProfilePick::Dir(join_parts(
+        windows_host(env),
+        &[root, id.to_string()],
+    )))
+}
+
+fn data_dir(
+    command: &str,
+    request: &LaunchRequest,
+    env: &HostEnv,
+    kind: Kind,
+    program: &str,
+) -> Result<(String, bool), String> {
+    let snap = browser_snap(program);
+    match choose_profile(command, request, env, kind, snap.as_deref())? {
+        ProfilePick::Dir(path) => Ok((path, false)),
+        ProfilePick::Temporary => Ok((temp_profile(env), true)),
+    }
 }
 
 fn chromium_args(user_data_dir: &str, headed: bool) -> Vec<String> {
@@ -1285,6 +1303,30 @@ fn reuse_probed_browser(
     Ok(None)
 }
 
+fn attach_without_launch<F: ProfileFs>(
+    request: &LaunchRequest,
+    env: &HostEnv,
+    windows: bool,
+    fs: &mut F,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    missing: String,
+) -> Result<Route, String> {
+    let kind = request
+        .browser
+        .and_then(find_known)
+        .map(|known| known.kind)
+        .unwrap_or(Kind::Chromium);
+    if let ProfilePick::Dir(dir) = choose_profile(request.command, request, env, kind, None)? {
+        if let Some(discover) = live_port(&dir, windows, fs, probe)? {
+            return Ok(Route::Attach { discover });
+        }
+    }
+    if let Some(discover) = reuse_probed_browser(probe)? {
+        return Ok(Route::Attach { discover });
+    }
+    Err(missing)
+}
+
 fn route<F: ProfileFs>(
     request: &LaunchRequest,
     env: &HostEnv,
@@ -1296,15 +1338,14 @@ fn route<F: ProfileFs>(
     probe: &mut dyn FnMut(&str) -> Result<String, String>,
     fs: &mut F,
 ) -> Result<Route, String> {
-    let plan = plan_launch(
-        request,
-        env,
-        electron_port,
-        exists,
-        mdfind,
-        read_plist,
-    )?;
     let windows = windows_host(env);
+    let plan = match plan_launch(request, env, electron_port, exists, mdfind, read_plist) {
+        Ok(plan) => plan,
+        Err(message) if message.ends_with(" was not found\n") => {
+            return attach_without_launch(request, env, windows, fs, probe, message);
+        }
+        Err(message) => return Err(message),
+    };
     if let Some(discover) = live_port(&plan.user_data_dir, windows, fs, probe)? {
         return Ok(Route::Attach { discover });
     }
@@ -2729,6 +2770,135 @@ mod tests {
             ]
         );
         assert!(fs.0.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_launch_target_reuses_a_probed_seven_tab() {
+        let host = env("linux");
+        let mut fs = MemFs::new();
+        let mut seen = Vec::new();
+        let resolved = drive(
+            &open_request(None, false, None),
+            &host,
+            0,
+            50,
+            &|_| false,
+            &no_mdfind,
+            &no_plist,
+            &mut |url| {
+                seen.push(url.to_string());
+                assert!(catalog_probe_url(url), "{url}");
+                if url == "http://127.0.0.1:9222/json/version" {
+                    Ok(version_body(9222, "/devtools/browser/personal"))
+                } else if url == "http://127.0.0.1:9222/json/list" {
+                    Ok(
+                        r#"[{"id":"T1","type":"page","url":"https://lars.sliccy.ai/","title":"seven"}]"#
+                            .to_string(),
+                    )
+                } else {
+                    Err("connection refused\n".to_string())
+                }
+            },
+            &mut fs,
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap();
+        assert!(resolved.started.is_none());
+        assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9222/json/version".to_string(),
+                "http://127.0.0.1:9222/json/list".to_string(),
+            ]
+        );
+        assert!(fs.0.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_launch_target_without_a_seven_tab_is_not_found() {
+        let host = env("linux");
+        let mut fs = MemFs::new();
+        let mut seen = Vec::new();
+        let err = drive(
+            &open_request(None, false, None),
+            &host,
+            0,
+            50,
+            &|_| false,
+            &no_mdfind,
+            &no_plist,
+            &mut |url| {
+                seen.push(url.to_string());
+                assert!(catalog_probe_url(url), "{url}");
+                Err("connection refused\n".to_string())
+            },
+            &mut fs,
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap_err();
+        assert_eq!(err, "playwright-cli open: chrome was not found\n");
+        assert_eq!(
+            seen.len(),
+            slicc_browsers::catalog().discovery.probe_ports.len()
+        );
+        assert!(seen.iter().all(|url| url.ends_with("/json/version")));
+        assert!(fs.0.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_launch_target_keeps_a_live_seven_profiles_port() {
+        let host = env("linux");
+        let dir = "/home/me/.config/slicc/seven-profiles/chrome";
+        let mut fs = MemFs::new();
+        fs.0.borrow_mut().files.insert(
+            format!("{dir}/{ACTIVE_PORT_FILE}"),
+            "9400\n/devtools/browser/abc\n".to_string(),
+        );
+        let mut seen = Vec::new();
+        let resolved = drive(
+            &open_request(None, false, None),
+            &host,
+            0,
+            50,
+            &|_| false,
+            &no_mdfind,
+            &no_plist,
+            &mut |url| {
+                seen.push(url.to_string());
+                assert_eq!(url, "http://127.0.0.1:9400/json/version");
+                Ok(version_body(9400, "/devtools/browser/abc"))
+            },
+            &mut fs,
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap();
+        assert_eq!(resolved.discover, "http://127.0.0.1:9400/json/version");
+        assert_eq!(seen, vec!["http://127.0.0.1:9400/json/version".to_string()]);
+        assert!(fs.0.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_launch_target_still_refuses_a_six_profile() {
+        let host = env("linux");
+        let mut fs = MemFs::new();
+        let path = "/home/me/.config/slicc/profiles/chrome";
+        let err = drive(
+            &open_request(None, false, Some(path)),
+            &host,
+            0,
+            50,
+            &|_| false,
+            &no_mdfind,
+            &no_plist,
+            &mut |_| panic!("probed"),
+            &mut fs,
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing profile"), "{err}");
+        assert!(err.contains(path), "{err}");
+        assert!(fs.0.borrow().reads.is_empty());
     }
 
     #[test]
