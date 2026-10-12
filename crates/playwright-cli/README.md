@@ -18,11 +18,11 @@ playwright-cli --cdp http://127.0.0.1:9333 tab-list
 playwright-cli list
 ```
 
-`list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser. `list --json` prints one JSON document and no text sections.
+`list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser and does not open a websocket. On the host it probes `127.0.0.1:9222-9229`. `list --json` prints one JSON document and no text sections.
 
 On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
 
-`--cdp` wins, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort. The host never dials `127.0.0.1:9222-9229` unless `--cdp` or `SLICC_CDP_URL` names that URL. The wasm build still uses port 9222. A host build dials `wss://`. The `wasm32-wasip1` binaries in the npm package `@ai-ecoverse/slicc-cdp` have no TLS.
+`--cdp` wins, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort. Host `list`, and `open` when that port is absent, GET `/json/version` and `/json/list` on `127.0.0.1:9222-9229`. Launch never binds those ports. The wasm build still uses port 9222. A host build dials `wss://`. The `wasm32-wasip1` binaries in the npm package `@ai-ecoverse/slicc-cdp` have no TLS.
 
 Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`, `list`.
 

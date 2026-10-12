@@ -123,7 +123,7 @@ mod tests {
         ));
         assert!(stdout.contains("Usage: playwright-cli --cdp=<url> <command> [args] [options]\n"));
         assert!(stdout.contains(
-            "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort. The host never dials 127.0.0.1:9222-9229 unless --cdp or SLICC_CDP_URL names that URL. The wasm build still uses port 9222.\n"
+            "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort. Host list, and open when that port is absent, GET /json/version and /json/list on 127.0.0.1:9222-9229. Launch never binds those ports. The wasm build still uses port 9222.\n"
         ));
         assert!(stdout.contains(
             "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.\n"

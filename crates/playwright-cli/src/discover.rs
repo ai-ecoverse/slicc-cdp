@@ -1,7 +1,6 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use crate::args::{Invocation, Output};
-use crate::cdp::Cdp;
 use crate::connect::{self, Start};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -636,8 +635,9 @@ struct ListIo<'a> {
     http: &'a dyn Fn(&str) -> HttpResult,
     read: &'a dyn Fn(&str) -> Option<String>,
     list_dir: &'a dyn Fn(&str) -> Vec<String>,
-    targets: &'a dyn Fn(&str) -> Result<Probe, ()>,
     flag_urls: &'a [&'a str],
+    probe_ports: &'a [u16],
+    origins: &'a [&'a str],
     installed: Option<&'a [Value]>,
 }
 
@@ -706,11 +706,16 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
     let mut drafts = Vec::new();
     let cache = RefCell::new(HashMap::<String, HttpResult>::new());
     let http = |url: &str| -> HttpResult {
-        if let Some(hit) = cache.borrow().get(url).cloned() {
-            return hit;
+        let list_body = url.ends_with("/json/list");
+        if !list_body {
+            if let Some(hit) = cache.borrow().get(url).cloned() {
+                return hit;
+            }
         }
         let hit = (io.http)(url);
-        cache.borrow_mut().insert(url.to_string(), hit.clone());
+        if !list_body {
+            cache.borrow_mut().insert(url.to_string(), hit.clone());
+        }
         hit
     };
     match listed_start(invocation, cdp_env) {
@@ -718,7 +723,7 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
         Some(Start::Direct(url)) => {
             let runtime = runtime_name(invocation);
             dial = Some(connect::append_runtime(&url, runtime.as_deref()));
-            if let Some(draft) = flag_from_direct(&url, &http) {
+            if let Some(draft) = flag_from_direct(&url, &http, io.origins) {
                 drafts.push(draft);
             }
         }
@@ -730,7 +735,7 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
                             let runtime = runtime_name(invocation);
                             dial = Some(connect::append_runtime(&ws, runtime.as_deref()));
                             if explicit {
-                                if let Some(draft) = flag_from_version(&url, &body, &http) {
+                                if let Some(draft) = flag_from_version(&url, &body, &http, io.origins) {
                                     drafts.push(draft);
                                 }
                             }
@@ -747,18 +752,12 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
         }
     }
     for url in io.flag_urls {
-        push_flag_url(url, &mut drafts, &http);
+        push_flag_url(url, &mut drafts, &http, io.origins);
     }
     let mut connected = if json {
         Vec::new()
     } else if let Some(url) = dial.as_deref() {
-        match (io.targets)(url) {
-            Ok(probe) => match probe.targets {
-                Ok(value) => browser_lines(&probe.websocket_url, &value),
-                Err(()) => vec![format!("browser - {}", probe.websocket_url)],
-            },
-            Err(()) => Vec::new(),
-        }
+        vec![format!("browser - {url}")]
     } else {
         Vec::new()
     };
@@ -774,12 +773,26 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
             argv_hits_unix(io.process_text, io.self_pid)
         };
         for hit in hits {
-            if let Some((port, draft)) = resolve_process(&hit, io.read, &http) {
+            if let Some((port, draft)) = resolve_process(&hit, io.read, &http, io.origins) {
                 port_lines.push(format!("pid {} port {port} {}", hit.pid, hit.executable));
                 drafts.push(draft);
             }
         }
         apps = found_apps(&io.launch);
+    }
+    for &port in io.probe_ports {
+        if let Some(draft) = draft_from_port(
+            u32::from(port),
+            "probe",
+            None,
+            None,
+            None,
+            None,
+            &http,
+            io.origins,
+        ) {
+            drafts.push(draft);
+        }
     }
     let endpoints = merge_drafts(drafts);
     if !json {
@@ -851,6 +864,7 @@ fn resolve_process(
     hit: &ArgvHit,
     read: &dyn Fn(&str) -> Option<String>,
     http: &dyn Fn(&str) -> HttpResult,
+    origins: &[&str],
 ) -> Option<(u32, EndpointDraft)> {
     if hit.port == 0 {
         let dir = hit.user_data_dir.as_deref()?;
@@ -862,7 +876,16 @@ fn resolve_process(
         if reserved_debug_port(port) {
             return Some((port, draft_bare(port, "process")));
         }
-        let draft = draft_from_port(port, "process", Some(dir), None, None, Some(&ws_path), http)?;
+        let draft = draft_from_port(
+            port,
+            "process",
+            Some(dir),
+            None,
+            None,
+            Some(&ws_path),
+            http,
+            origins,
+        )?;
         return Some((port, draft));
     }
     if reserved_debug_port(hit.port) {
@@ -876,6 +899,7 @@ fn resolve_process(
         None,
         None,
         http,
+        origins,
     )?;
     Some((hit.port, draft))
 }
@@ -923,6 +947,7 @@ fn draft_from_active_file(
         profile,
         Some(&ws_path),
         http,
+        io.origins,
     )
 }
 
@@ -934,6 +959,7 @@ fn draft_from_port(
     profile: Option<&str>,
     ws_path: Option<&str>,
     http: &dyn Fn(&str) -> HttpResult,
+    origins: &[&str],
 ) -> Option<EndpointDraft> {
     let base = format!("http://127.0.0.1:{port}");
     let version_url = format!("{base}/json/version");
@@ -947,7 +973,7 @@ fn draft_from_port(
                             return None;
                         }
                     }
-                    let tabs = fetch_tabs(&base, http);
+                    let tabs = fetch_tabs(&base, http, origins);
                     let mut draft = draft_from_doc(&base, source, dir, browser, doc, tabs)?;
                     draft.profile = profile.map(str::to_string);
                     return Some(draft);
@@ -1240,14 +1266,14 @@ fn parse_active_port(text: &str) -> Option<(u32, String)> {
     Some((port, path))
 }
 
-fn fetch_tabs(base: &str, http: &dyn Fn(&str) -> HttpResult) -> Vec<TabDraft> {
+fn fetch_tabs(base: &str, http: &dyn Fn(&str) -> HttpResult, origins: &[&str]) -> Vec<TabDraft> {
     let HttpResult::Response { status, body } = http(&format!("{base}/json/list")) else {
         return Vec::new();
     };
     if !(200..300).contains(&status) {
         return Vec::new();
     }
-    parse_tabs(&body).unwrap_or_default()
+    parse_tabs(&body, origins).unwrap_or_default()
 }
 
 fn parse_version(body: &str) -> Option<VersionDoc> {
@@ -1295,7 +1321,11 @@ fn split_product(product: &str) -> (String, Option<String>) {
     }
 }
 
-fn parse_tabs(body: &str) -> Option<Vec<TabDraft>> {
+pub(crate) fn list_has_seven_tab(body: &str) -> bool {
+    parse_tabs(body, &[]).is_some_and(|tabs| !tabs.is_empty())
+}
+
+fn parse_tabs(body: &str, origins: &[&str]) -> Option<Vec<TabDraft>> {
     let value: Value = serde_json::from_str(body).ok()?;
     let items = value.as_array()?;
     let mut tabs = Vec::new();
@@ -1304,7 +1334,7 @@ fn parse_tabs(body: &str) -> Option<Vec<TabDraft>> {
             continue;
         }
         let url = item.get("url").and_then(|value| value.as_str()).unwrap_or("");
-        if !seven_origin(url) {
+        if !seven_origin(url) && !extra_origin(url, origins) {
             continue;
         }
         tabs.push(TabDraft {
@@ -1370,6 +1400,52 @@ fn seven_origin(url: &str) -> bool {
     last != '-'
 }
 
+fn extra_origin(url: &str, origins: &[&str]) -> bool {
+    let Some(page) = comparable_origin(url) else {
+        return false;
+    };
+    origins
+        .iter()
+        .any(|origin| comparable_origin(origin) == Some(page.clone()))
+}
+
+fn comparable_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if hostport.is_empty() {
+        return None;
+    }
+    let hostport = hostport.rsplit('@').next().unwrap_or(hostport);
+    let (host, port) = if let Some(stripped) = hostport.strip_prefix('[') {
+        let (name, rest) = stripped.split_once(']')?;
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|text| text.parse::<u16>().ok());
+        (name.to_string(), port)
+    } else if let Some((name, text)) = hostport.rsplit_once(':') {
+        if text.bytes().all(|byte| byte.is_ascii_digit()) {
+            (name.to_string(), text.parse::<u16>().ok())
+        } else {
+            (hostport.to_string(), None)
+        }
+    } else {
+        (hostport.to_string(), None)
+    };
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let default = if scheme == "https" { 443 } else { 80 };
+    match port {
+        Some(port) if port != default => Some(format!("{scheme}://{host}:{port}")),
+        _ => Some(format!("{scheme}://{host}")),
+    }
+}
+
 fn ws_path_matches(websocket: &str, path: &str) -> bool {
     let bare = websocket.split(['?', '#']).next().unwrap_or(websocket);
     let Some((_, rest)) = bare.split_once("://") else {
@@ -1387,13 +1463,18 @@ enum FlagKind {
     Discover(String),
 }
 
-fn push_flag_url(raw: &str, drafts: &mut Vec<EndpointDraft>, http: &dyn Fn(&str) -> HttpResult) {
+fn push_flag_url(
+    raw: &str,
+    drafts: &mut Vec<EndpointDraft>,
+    http: &dyn Fn(&str) -> HttpResult,
+    origins: &[&str],
+) {
     let Some(kind) = classify_flag(raw) else {
         return;
     };
     match kind {
         FlagKind::Direct(url) => {
-            if let Some(draft) = flag_from_direct(&url, http) {
+            if let Some(draft) = flag_from_direct(&url, http, origins) {
                 drafts.push(draft);
             }
         }
@@ -1401,7 +1482,7 @@ fn push_flag_url(raw: &str, drafts: &mut Vec<EndpointDraft>, http: &dyn Fn(&str)
             let version_url = connect::discovery_url(&url);
             if let HttpResult::Response { status, body } = http(&version_url) {
                 if (200..300).contains(&status) {
-                    if let Some(draft) = flag_from_version(&version_url, &body, http) {
+                    if let Some(draft) = flag_from_version(&version_url, &body, http, origins) {
                         drafts.push(draft);
                     }
                 }
@@ -1449,14 +1530,18 @@ fn host_port_text(text: &str) -> bool {
         && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn flag_from_direct(url: &str, http: &dyn Fn(&str) -> HttpResult) -> Option<EndpointDraft> {
+fn flag_from_direct(
+    url: &str,
+    http: &dyn Fn(&str) -> HttpResult,
+    origins: &[&str],
+) -> Option<EndpointDraft> {
     let base = ws_to_http_base(url)?;
     let version_url = format!("{base}/json/version");
     match http(&version_url) {
         HttpResult::Transport => None,
         HttpResult::Response { status, body } if (200..300).contains(&status) => {
             if let Some(doc) = parse_version(&body) {
-                let tabs = fetch_tabs(&base, http);
+                let tabs = fetch_tabs(&base, http, origins);
                 draft_from_doc(&base, "flag", None, None, doc, tabs)
             } else {
                 ws_only_flag(url, &base)
@@ -1490,10 +1575,11 @@ fn flag_from_version(
     discovery: &str,
     body: &str,
     http: &dyn Fn(&str) -> HttpResult,
+    origins: &[&str],
 ) -> Option<EndpointDraft> {
     let doc = parse_version(body)?;
     let base = http_origin(discovery)?;
-    let tabs = fetch_tabs(&base, http);
+    let tabs = fetch_tabs(&base, http, origins);
     draft_from_doc(&base, "flag", None, None, doc, tabs)
 }
 
@@ -1646,22 +1732,55 @@ fn merge_drafts(drafts: Vec<EndpointDraft>) -> Vec<EndpointDraft> {
         if too_old(draft.user_agent.as_deref().unwrap_or("")) {
             continue;
         }
-        match best.get(&draft.id) {
-            Some(current) if source_rank(current.source) <= source_rank(draft.source) => {}
-            _ => {
-                best.insert(draft.id.clone(), draft);
+        let incoming = source_rank(draft.source);
+        let keep = best
+            .get(&draft.id)
+            .is_some_and(|current| source_rank(current.source) <= incoming);
+        if keep {
+            if let Some(current) = best.get_mut(&draft.id) {
+                adopt_richer(current, &draft);
             }
+        } else {
+            let id = draft.id.clone();
+            let mut next = draft;
+            if let Some(current) = best.get(&id) {
+                adopt_richer(&mut next, current);
+            }
+            best.insert(id, next);
         }
     }
     best.into_values().collect()
 }
 
-fn source_rank(source: &str) -> u8 {
-    match source {
-        "devtools-active-port" => 0,
-        "flag" => 1,
-        _ => 2,
+fn adopt_richer(winner: &mut EndpointDraft, donor: &EndpointDraft) {
+    if winner.websocket.is_some() || donor.websocket.is_none() {
+        return;
     }
+    winner.websocket = donor.websocket.clone();
+    winner.name = donor.name.clone();
+    winner.version = donor.version.clone();
+    winner.product = donor.product.clone();
+    winner.user_agent = donor.user_agent.clone();
+    winner.ws_only = donor.ws_only;
+    winner.seven_open = donor.seven_open;
+    winner.tabs = donor
+        .tabs
+        .iter()
+        .map(|tab| TabDraft {
+            id: tab.id.clone(),
+            url: tab.url.clone(),
+            title: tab.title.clone(),
+        })
+        .collect();
+}
+
+fn source_rank(source: &str) -> u8 {
+    slicc_browsers::catalog()
+        .discovery
+        .source_rank
+        .get(source)
+        .copied()
+        .unwrap_or(u8::MAX)
 }
 
 fn too_old(user_agent: &str) -> bool {
@@ -2097,6 +2216,7 @@ fn run_host(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let appdata = std::env::var("APPDATA").ok();
     let process_text = read_process_text();
     let os = host_os().unwrap_or(HostOs::Linux);
+    let probe_ports = slicc_browsers::catalog().discovery.probe_ports;
     let launch = LaunchQuery {
         os,
         bundles: &mdfind_bundle,
@@ -2119,8 +2239,9 @@ fn run_host(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         http: &http_real,
         read: &read_real,
         list_dir: &list_dir_real,
-        targets: &live_targets,
         flag_urls: &[],
+        probe_ports: &probe_ports,
+        origins: &[],
         installed: None,
     };
     assemble(invocation, cdp_env, &io)
@@ -2150,22 +2271,12 @@ fn run_guest(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         http: &http_real,
         read: &|_| None,
         list_dir: &|_| Vec::new(),
-        targets: &live_targets,
         flag_urls: &[],
+        probe_ports: &[],
+        origins: &[],
         installed: None,
     };
     assemble(invocation, cdp_env, &io)
-}
-
-fn live_targets(url: &str) -> Result<Probe, ()> {
-    let mut cdp = Cdp::connect(url).map_err(|_| ())?;
-    let targets = cdp
-        .call("Target.getTargets", serde_json::json!({}), None)
-        .map_err(|_| ());
-    Ok(Probe {
-        websocket_url: url.to_string(),
-        targets,
-    })
 }
 
 fn http_real(url: &str) -> HttpResult {
@@ -2568,13 +2679,15 @@ mod tests {
         assert!(output.stdout.contains("connected"));
         assert!(output.stdout.contains("debug ports"));
         assert!(output.stdout.contains("launchable"));
-        assert!(output.stdout.contains("browser <targetId> <url>"));
+        assert!(output.stdout.contains("browser - <websocket url>"));
+        assert!(!output.stdout.contains("browser <targetId> <url>"));
         assert!(output.stdout.contains("pid <pid> port <port> <executable>"));
         assert!(output.stdout.contains("<name> <kind> <path>"));
         assert!(output.stdout.contains("--json"));
         assert!(output.stdout.contains("devtools-active-port"));
         assert!(output.stdout.contains("`flag`"));
         assert!(output.stdout.contains("`process`"));
+        assert!(output.stdout.contains("`probe`"));
         let flagged = crate::execute(
             &["list".to_string(), "--json".to_string(), "--help".to_string()],
             None,
@@ -2606,8 +2719,9 @@ mod tests {
             "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.\n"
         ));
         assert!(global.stdout.contains(
-            "The host never dials 127.0.0.1:9222-9229 unless --cdp or SLICC_CDP_URL names that URL."
+            "Host list, and open when that port is absent, GET /json/version and /json/list on 127.0.0.1:9222-9229."
         ));
+        assert!(global.stdout.contains("Launch never binds those ports."));
         let pending = global.stdout.split("Not implemented yet:").nth(1).unwrap();
         let pending_names: Vec<&str> = pending
             .split(|ch: char| ch == ',' || ch.is_whitespace())
@@ -3336,6 +3450,40 @@ mod tests {
         read: &dyn Fn(&str) -> Option<String>,
         list_dir: &dyn Fn(&str) -> Vec<String>,
     ) -> Output {
+        run_scoped(
+            invocation,
+            cdp_env,
+            os,
+            home,
+            xdg,
+            appdata,
+            processes,
+            windows,
+            with_apps,
+            http,
+            read,
+            list_dir,
+            &[],
+            &[],
+        )
+    }
+
+    fn run_scoped(
+        invocation: &Invocation,
+        cdp_env: Option<&str>,
+        os: HostOs,
+        home: Option<&str>,
+        xdg: Option<&str>,
+        appdata: Option<&str>,
+        processes: &str,
+        windows: bool,
+        with_apps: bool,
+        http: &dyn Fn(&str) -> HttpResult,
+        read: &dyn Fn(&str) -> Option<String>,
+        list_dir: &dyn Fn(&str) -> Vec<String>,
+        probe_ports: &[u16],
+        origins: &[&str],
+    ) -> Output {
         let launch = LaunchQuery {
             os,
             bundles: &|bundle_id| {
@@ -3379,11 +3527,87 @@ mod tests {
             http,
             read,
             list_dir,
-            targets: &|_| Err(()),
             flag_urls: &[],
+            probe_ports,
+            origins,
             installed: None,
         };
         assemble(invocation, cdp_env, &io)
+    }
+
+    #[test]
+    fn probe_drops_personal_tabs_and_does_not_open_a_socket() {
+        let urls = RefCell::new(Vec::new());
+        let secret = "PERSONAL-SECRET-TITLE";
+        let http = |url: &str| -> HttpResult {
+            urls.borrow_mut().push(url.to_string());
+            assert!(
+                url.ends_with("/json/version") || url.ends_with("/json/list"),
+                "{url}"
+            );
+            if url == "http://127.0.0.1:9222/json/version" {
+                return HttpResult::Response {
+                    status: 200,
+                    body: r#"{"Browser":"Chrome/154.0.8037.98","User-Agent":"Mozilla/5.0 Chrome/154.0.8037.98","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/q"}"#.to_string(),
+                };
+            }
+            if url == "http://127.0.0.1:9222/json/list" {
+                return HttpResult::Response {
+                    status: 200,
+                    body: format!(
+                        r#"[{{"id":"T1","type":"page","url":"https://lars.sliccy.ai/home","title":"seven"}},{{"id":"P1","type":"page","url":"https://example.com/secret","title":"{secret}"}}]"#
+                    ),
+                };
+            }
+            if url == "http://127.0.0.1:9401/json/version" {
+                return HttpResult::Response {
+                    status: 200,
+                    body: r#"{"Browser":"Chrome/154.0.8037.98","User-Agent":"Mozilla/5.0 Chrome/154.0.8037.98","webSocketDebuggerUrl":"ws://127.0.0.1:9401/devtools/browser/q1"}"#.to_string(),
+                };
+            }
+            if url == "http://127.0.0.1:9401/json/list" {
+                return HttpResult::Response {
+                    status: 200,
+                    body: "[]".to_string(),
+                };
+            }
+            HttpResult::Transport
+        };
+        let ports = [9222u16, 9401];
+        let output = run_scoped(
+            &list_invocation(None, true),
+            None,
+            HostOs::Linux,
+            None,
+            None,
+            None,
+            "  7 /usr/bin/chrome --remote-debugging-port=9222\n",
+            false,
+            false,
+            &http,
+            &|_path| None,
+            &|_path| Vec::new(),
+            &ports,
+            &[],
+        );
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert!(!output.stdout.contains(secret));
+        assert!(!output.stdout.contains("example.com"));
+        let actual: Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        let entries = actual["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["endpoint"]["source"], "process");
+        assert_eq!(entries[0]["endpoint"]["cdp"], "http://127.0.0.1:9222");
+        assert_eq!(entries[0]["endpoint"]["sevenTabs"][0]["id"], "T1");
+        assert_eq!(entries[0]["tier"], 1);
+        assert_eq!(entries[1]["endpoint"]["source"], "probe");
+        assert_eq!(entries[1]["endpoint"]["cdp"], "http://127.0.0.1:9401");
+        assert!(entries[1]["endpoint"]["sevenTabs"].as_array().unwrap().is_empty());
+        assert!(urls.borrow().iter().any(|url| url == "http://127.0.0.1:9222/json/version"));
+        assert!(urls.borrow().iter().any(|url| url == "http://127.0.0.1:9222/json/list"));
+        assert!(urls.borrow().iter().all(|url| {
+            url.ends_with("/json/version") || url.ends_with("/json/list")
+        }));
     }
 
     #[test]
@@ -3408,10 +3632,18 @@ mod tests {
             slicc_browsers::corpus::NEED_PROFILES,
             slicc_browsers::corpus::NEED_FLAG,
             slicc_browsers::corpus::NEED_PROCESS,
+            slicc_browsers::corpus::NEED_PROBE,
+            slicc_browsers::corpus::NEED_ORIGINS,
             slicc_browsers::corpus::NEED_INSTALLED,
         ];
+        let corpus = slicc_browsers::corpus::corpus();
+        let applicable = corpus
+            .cases
+            .iter()
+            .filter(|case| case.input.os.is_empty() || case.input.os.iter().any(|item| item == os))
+            .count();
         let mut ran = 0;
-        for case in slicc_browsers::corpus::corpus().cases {
+        for case in corpus.cases {
             if !case.runs(os, &supported) {
                 continue;
             }
@@ -3426,6 +3658,9 @@ mod tests {
             let file_map: BTreeMap<String, String> = case.files(&layout).into_iter().collect();
             let flags = case.cdp(&layout);
             let flag_refs: Vec<&str> = flags.iter().map(String::as_str).collect();
+            let probe_ports = case.input.probe_ports.clone();
+            let origins = case.input.origins.clone();
+            let origin_refs: Vec<&str> = origins.iter().map(String::as_str).collect();
             let installed_rows = expand_corpus_values(&layout, &case.input.installed);
             let installed = if installed_rows.is_empty() {
                 None
@@ -3462,8 +3697,9 @@ mod tests {
                 http: &http,
                 read: &read,
                 list_dir: &list_dir,
-                targets: &|_| Err(()),
                 flag_urls: &flag_refs,
+                probe_ports: &probe_ports,
+                origins: &origin_refs,
                 installed,
             };
             let output = assemble(&list_invocation(None, true), None, &io);
@@ -3473,7 +3709,7 @@ mod tests {
             });
             assert_eq!(actual, case.expected(&layout), "{}", case.name);
         }
-        assert!(ran > 0);
+        assert_eq!(ran, applicable);
     }
 
     fn corpus_http(case: &slicc_browsers::corpus::Case, url: &str) -> HttpResult {
