@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -33,7 +33,7 @@ function hostConfigDir() {
     return path.join(home, 'AppData', 'Roaming');
   }
   const xdg = process.env.XDG_CONFIG_HOME;
-  if (xdg && xdg.startsWith('/')) return xdg;
+  if (xdg?.startsWith('/')) return xdg;
   return path.join(home, '.config');
 }
 
