@@ -73,7 +73,7 @@ pub fn load_at(path: &Path) -> Session {
     let Ok(text) = fs::read_to_string(path) else {
         return Session::default();
     };
-    private_file(path);
+    let _ = private_file(path);
     decode(&text)
 }
 
@@ -298,6 +298,10 @@ pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let existed = path.is_file();
+        if existed {
+            private_file(path)?;
+        }
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -305,7 +309,12 @@ pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
             .mode(0o600)
             .open(path)
             .map_err(|err| format!("session: {err}\n"))?;
-        private_file(path);
+        if !existed {
+            if let Err(err) = private_file(path) {
+                let _ = fs::remove_file(path);
+                return Err(err);
+            }
+        }
         file.write_all(body.as_bytes())
             .map_err(|err| format!("session: {err}\n"))?;
         return Ok(());
@@ -378,16 +387,27 @@ pub fn page_visible(provenance: Option<&str>, url: &str, id: &str, owned: &[Stri
     crate::discover::seven_origin(url) || owned.iter().any(|item| item == id)
 }
 
-fn private_file(path: &Path) {
+#[cfg(test)]
+thread_local! {
+    static FAIL_PRIVATE_FILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn private_file(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_PRIVATE_FILE.get() {
+        return Err("session: Operation not permitted\n".into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("session: {err}\n"))?;
     }
     #[cfg(not(unix))]
     {
         let _ = path;
     }
+    Ok(())
 }
 
 pub fn loopback_url(url: &str) -> bool {
@@ -718,6 +738,21 @@ mod tests {
         let loaded = load_at(&path);
         assert_eq!(loaded.provenance.as_deref(), Some("probe"));
         assert_eq!(loaded.owned, vec!["OWN".to_string()]);
+        let locked = session_path(root.to_str().unwrap(), Path::new("/work-locked")).unwrap();
+        fs::write(&locked, "ORIGINAL\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o666)).unwrap();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::FAIL_PRIVATE_FILE.set(false);
+            }
+        }
+        super::FAIL_PRIVATE_FILE.set(true);
+        let _reset = Reset;
+        let err = write_at(&locked, &session).unwrap_err();
+        assert_eq!(err, "session: Operation not permitted\n");
+        assert_eq!(fs::read_to_string(&locked).unwrap(), "ORIGINAL\n");
+        assert_eq!(fs::metadata(&locked).unwrap().permissions().mode() & 0o777, 0o666);
         let _ = fs::remove_dir_all(&root);
     }
 
