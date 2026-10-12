@@ -2719,7 +2719,7 @@ mod tests {
             "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.\n"
         ));
         assert!(global.stdout.contains(
-            "Host list, and open when that port is absent, GET /json/version and /json/list on 127.0.0.1:9222-9229."
+            "Host list, and open when that port is absent or unreachable, GET /json/version and /json/list on 127.0.0.1:9222-9229."
         ));
         assert!(global.stdout.contains("Launch never binds those ports."));
         let pending = global.stdout.split("Not implemented yet:").nth(1).unwrap();

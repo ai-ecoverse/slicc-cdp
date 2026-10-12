@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     pub current: Option<String>,
+    pub endpoint: Option<String>,
     pub snapshots: BTreeMap<String, BTreeMap<String, RefRec>>,
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
@@ -31,6 +32,11 @@ fn decode(text: &str) -> Session {
     let current = value
         .get("current")
         .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let endpoint = value
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .filter(|text| !text.is_empty())
         .map(str::to_string);
     let mut snapshots = BTreeMap::new();
     if let Some(tabs) = value.get("snapshots").and_then(|v| v.as_object()) {
@@ -65,6 +71,7 @@ fn decode(text: &str) -> Session {
     }
     Session {
         current,
+        endpoint,
         snapshots,
         console: decode_console(&value),
         requests: decode_requests(&value),
@@ -120,6 +127,7 @@ fn encode(session: &Session) -> Value {
     }
     json!({
         "current": session.current,
+        "endpoint": session.endpoint,
         "snapshots": snapshots,
         "console": encode_lists(&session.console, trace::console_json),
         "requests": encode_lists(&session.requests, trace::request_json),
@@ -215,8 +223,24 @@ mod tests {
         assert!(rec.label.is_none());
         assert!(stored_label(&session, "T", "e1").is_none());
         assert!(stored_label(&session, "T", "e9").is_none());
+        assert!(session.endpoint.is_none());
         assert!(session.console.is_empty());
         assert!(session.requests.is_empty());
+    }
+
+    #[test]
+    fn an_endpoint_round_trips_and_a_blank_one_is_absent() {
+        let session = Session {
+            endpoint: Some("http://127.0.0.1:9333/json/version".to_string()),
+            ..Session::default()
+        };
+        let again = decode(&encode(&session).to_string());
+        assert_eq!(
+            again.endpoint.as_deref(),
+            Some("http://127.0.0.1:9333/json/version")
+        );
+        let blank = decode(r#"{"endpoint":"","current":null}"#);
+        assert!(blank.endpoint.is_none());
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             .cloned()
     });
     let explicit = launch::endpoint_is_explicit(invocation.cdp.as_deref(), env_url);
-    let active = if explicit {
+    let profile = if explicit {
         None
     } else {
         match launch::attached_port() {
@@ -39,27 +39,54 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             Err(message) => return Output::err(message),
         }
     };
+    let remembered = if explicit || profile.is_some() {
+        None
+    } else {
+        launch::remembered_endpoint()
+    };
+    let mut from_memory = remembered.is_some();
+    let active = profile.or(remembered);
     let mut started = None;
-    let start = if active.is_none() && launch::should_launch(command, explicit) {
-        match launch::resolve_without_endpoint(command, &invocation.flags) {
-            Ok(resolved) => {
-                started = resolved.started;
-                connect::Start::Discover(resolved.discover)
-            }
+    let mut start = if active.is_none() && launch::should_launch(command, explicit) {
+        match start_by_launching(command, &invocation.flags, &mut started) {
+            Ok(start) => start,
             Err(message) => return Output::err(message),
         }
     } else {
         match launch::start_after_explicit(invocation.cdp.as_deref(), env_url, active) {
             Ok(start) => start,
+            Err(_) if from_memory && launch::should_launch(command, false) => {
+                from_memory = false;
+                match start_by_launching(command, &invocation.flags, &mut started) {
+                    Ok(start) => start,
+                    Err(message) => return Output::err(message),
+                }
+            }
             Err(message) => return Output::err(message),
         }
     };
-    let connected = match cdp::open(start, runtime.as_deref()) {
+    let mut opened = cdp::open(start.clone(), runtime.as_deref());
+    if let Err(message) = &opened {
+        if from_memory && launch::retry_open_without_endpoint(command, message) {
+            match start_by_launching(command, &invocation.flags, &mut started) {
+                Ok(next) => {
+                    start = next;
+                    opened = cdp::open(start.clone(), runtime.as_deref());
+                }
+                Err(next) => return Output::err(next),
+            }
+        }
+    }
+    let connected = match opened {
         Ok(cdp) => cdp,
         Err(message) => return Output::err(message),
     };
+    let endpoint = match &start {
+        connect::Start::Direct(url) | connect::Start::Discover(url) => url.clone(),
+    };
     let mut cdp = connected;
     let mut state = session::load();
+    state.endpoint = Some(endpoint);
     let mut report = action::Report::for_command(command);
     let result = match command {
         "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report, &mut started),
@@ -87,6 +114,16 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     report.finish(&mut cdp, &result);
     result
+}
+
+fn start_by_launching(
+    command: &str,
+    flags: &BTreeMap<String, String>,
+    started: &mut Option<Started>,
+) -> Result<connect::Start, String> {
+    let resolved = launch::resolve_without_endpoint(command, flags)?;
+    *started = resolved.started;
+    Ok(connect::Start::Discover(resolved.discover))
 }
 
 fn deferred_flag(invocation: &Invocation) -> Option<String> {

@@ -10,7 +10,7 @@ pub fn global_help() -> String {
         "Usage: playwright-cli <command> [args] [options]".to_string(),
         "Usage: playwright-cli --cdp=<url> <command> [args] [options]".to_string(),
         String::new(),
-        "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort. Host list, and open when that port is absent, GET /json/version and /json/list on 127.0.0.1:9222-9229. Launch never binds those ports. The wasm build still uses port 9222.".to_string(),
+        "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else the endpoint in .playwright-cli/session.json. Host list, and open when that port is absent or unreachable, GET /json/version and /json/list on 127.0.0.1:9222-9229. A reused browser is written to that session file. A ws:// or wss:// value there is dialed directly. Host open and tab-new treat an unreachable value there as absent. Launch never binds those ports. The wasm build still uses port 9222.".to_string(),
         "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
         "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.".to_string(),
