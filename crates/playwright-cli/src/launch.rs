@@ -1259,6 +1259,32 @@ enum Route {
     Launch(SpawnPlan),
 }
 
+fn reuse_probed_browser(
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let ports = slicc_browsers::catalog().discovery.probe_ports;
+    for port in ports {
+        let version = version_url(port);
+        let body = match probe(&version) {
+            Ok(body) => body,
+            Err(message) if message.starts_with("HTTP ") => continue,
+            Err(_) => continue,
+        };
+        if crate::connect::websocket_url_from_version(&body).is_err() {
+            continue;
+        }
+        let list = match probe(&format!("http://127.0.0.1:{port}/json/list")) {
+            Ok(body) => body,
+            Err(message) if message.starts_with("HTTP ") => continue,
+            Err(_) => continue,
+        };
+        if crate::discover::list_has_seven_tab(&list) {
+            return Ok(Some(version));
+        }
+    }
+    Ok(None)
+}
+
 fn route<F: ProfileFs>(
     request: &LaunchRequest,
     env: &HostEnv,
@@ -1280,6 +1306,9 @@ fn route<F: ProfileFs>(
     )?;
     let windows = windows_host(env);
     if let Some(discover) = live_port(&plan.user_data_dir, windows, fs, probe)? {
+        return Ok(Route::Attach { discover });
+    }
+    if let Some(discover) = reuse_probed_browser(probe)? {
         return Ok(Route::Attach { discover });
     }
     prepare_profile(request.command, &plan.user_data_dir, windows, now_micros, fs)?;
@@ -2600,7 +2629,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(seen, vec!["http://127.0.0.1:9333/json/version".to_string()]);
+        assert_eq!(seen[0], "http://127.0.0.1:9333/json/version");
+        assert!(seen[1..].iter().all(|url| catalog_probe_url(url)));
         let plan = spawned.unwrap();
         assert_eq!(plan.port, 0);
         assert_eq!(plan.user_data_dir, dir);
@@ -2626,12 +2656,14 @@ mod tests {
             &mut fs,
             &mut |url| {
                 seen.push(url.to_string());
-                panic!("probed {url}");
+                assert!(catalog_probe_url(url), "{url}");
+                Err("connection refused\n".to_string())
             },
             &mut |_| Ok(()),
         )
         .unwrap();
-        assert!(seen.is_empty());
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|url| catalog_probe_url(url)));
         assert_eq!(resolved.discover, dir);
         assert!(!resolved.discover.contains("9222"));
     }
@@ -2648,14 +2680,55 @@ mod tests {
             &mut fs,
             &mut |url| {
                 seen.push(url.to_string());
-                panic!("probed {url}");
+                assert!(catalog_probe_url(url), "{url}");
+                Err("connection refused\n".to_string())
             },
             &mut |_| Ok(()),
         )
         .unwrap();
-        assert!(seen.is_empty());
+        assert_eq!(seen.len(), slicc_browsers::catalog().discovery.probe_ports.len());
+        assert!(seen.iter().all(|url| url.ends_with("/json/version")));
         assert_eq!(resolved.discover, chrome_dir(&host));
         assert!(!resolved.discover.contains("9222"));
+    }
+
+    #[test]
+    fn a_probe_port_with_a_seven_tab_is_reused() {
+        let host = env("linux");
+        let mut fs = MemFs::new();
+        let mut seen = Vec::new();
+        let resolved = run(
+            &open_request(None, false, None),
+            &host,
+            0,
+            &mut fs,
+            &mut |url| {
+                seen.push(url.to_string());
+                assert!(catalog_probe_url(url), "{url}");
+                if url == "http://127.0.0.1:9222/json/version" {
+                    Ok(version_body(9222, "/devtools/browser/personal"))
+                } else if url == "http://127.0.0.1:9222/json/list" {
+                    Ok(
+                        r#"[{"id":"T1","type":"page","url":"https://lars.sliccy.ai/","title":"seven"},{"id":"P1","type":"page","url":"https://example.com/","title":"PERSONAL-SECRET-TITLE"}]"#
+                            .to_string(),
+                    )
+                } else {
+                    Err("connection refused\n".to_string())
+                }
+            },
+            &mut |_| panic!("spawned"),
+        )
+        .unwrap();
+        assert!(resolved.started.is_none());
+        assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9222/json/version".to_string(),
+                "http://127.0.0.1:9222/json/list".to_string(),
+            ]
+        );
+        assert!(fs.0.borrow().writes.is_empty());
     }
 
     #[test]
@@ -2885,6 +2958,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.user_data_dir, path);
+    }
+
+    fn catalog_probe_url(url: &str) -> bool {
+        let Some(rest) = url.strip_prefix("http://127.0.0.1:") else {
+            return false;
+        };
+        let Some((port, path)) = rest.split_once('/') else {
+            return false;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            return false;
+        };
+        slicc_browsers::catalog()
+            .discovery
+            .probe_ports
+            .contains(&port)
+            && (path == "json/version" || path == "json/list")
     }
 
     fn version_body(port: u16, path: &str) -> String {

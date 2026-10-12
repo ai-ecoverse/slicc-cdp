@@ -494,6 +494,10 @@ fn connect_error(parts: &Parts, err: &str) -> String {
 }
 
 fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
+    #[cfg(test)]
+    if reserved_loopback(parts) {
+        panic!("test dialed {}:{}", parts.host, parts.port);
+    }
     let addr = resolve(&parts.host, parts.port)?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|err| {
         connect_error(parts, &err.to_string())
@@ -506,6 +510,15 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
     } else {
         Ok(Box::new(tcp))
     }
+}
+
+#[cfg(test)]
+fn reserved_loopback(parts: &Parts) -> bool {
+    (9222..=9229).contains(&parts.port)
+        && matches!(
+            parts.host.to_ascii_lowercase().as_str(),
+            "127.0.0.1" | "localhost" | "::1"
+        )
 }
 
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
@@ -728,6 +741,18 @@ mod tests {
         );
         assert_eq!(close_message(&[]), "websocket closed\n");
         assert_eq!(close_message(&[0x03, 0xf3]), "websocket closed 1011\n");
+    }
+
+    #[test]
+    fn tests_do_not_dial_reserved_debug_ports() {
+        let err = std::panic::catch_unwind(|| {
+            let _ = http_get("http://127.0.0.1:9222/json/version");
+        });
+        assert!(err.is_err());
+        let err = std::panic::catch_unwind(|| {
+            let _ = ws_connect("ws://localhost:9229/devtools/browser/abc");
+        });
+        assert!(err.is_err());
     }
 
     #[test]
