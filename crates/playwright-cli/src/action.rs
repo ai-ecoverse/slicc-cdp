@@ -637,9 +637,11 @@ mod tests {
             let body = format!(
                 r#"{{"current":"TAB1","snapshots":{{"TAB1":{{"e1":{{"backendNodeId":7,"selector":"input","frameId":null{label}}}}}}}}}"#
             );
-            let session = dir.join(".playwright-cli");
-            std::fs::create_dir_all(&session).unwrap();
-            std::fs::write(session.join("session.json"), body).unwrap();
+            let session = crate::session::storage_path(dir);
+            if let Some(parent) = session.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(session, body).unwrap();
         }
 
         #[test]

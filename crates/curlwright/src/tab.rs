@@ -2,6 +2,7 @@ use crate::parse::Stop;
 use cdp_client::cdp::Cdp;
 use serde_json::{json, Value};
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -87,8 +88,46 @@ fn format_candidates(pages: &[&Page]) -> String {
 }
 
 fn session_current() -> Option<String> {
-    let text = fs::read_to_string(".playwright-cli/session.json").ok()?;
+    let text = fs::read_to_string(session_file()?).ok()?;
     current_target(&text)
+}
+
+fn session_file() -> Option<PathBuf> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(PathBuf::from(".playwright-cli").join("session.json"))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let cwd = std::env::current_dir().ok()?;
+        let canonical = cwd.canonicalize().unwrap_or(cwd);
+        Some(session_path(&config_root(), &canonical))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn config_root() -> String {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("slicc-cdp-session-tests")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(test))]
+    {
+        crate::profiles::user_config_dir()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn session_path(config_dir: &str, cwd: &std::path::Path) -> PathBuf {
+    let key = cdp_client::hash::sha256_hex(cwd.to_string_lossy().as_bytes());
+    PathBuf::from(config_dir)
+        .join("slicc")
+        .join("playwright-cli")
+        .join("sessions")
+        .join(format!("{key}.json"))
 }
 
 pub fn current_target(text: &str) -> Option<String> {
@@ -180,5 +219,33 @@ mod tests {
         assert_eq!(choose_tab(&pages, "https://app.example/api", None, Some("GONE")).unwrap(), "ONLY");
         assert_eq!(current_target(r#"{"current":"ABC"}"#).as_deref(), Some("ABC"));
         assert_eq!(current_target("{}"), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_cwd_session_file_does_not_supply_the_current_tab() {
+        let cwd = std::env::current_dir().unwrap();
+        let canonical = cwd.canonicalize().unwrap_or(cwd);
+        let planted = canonical.join(".playwright-cli").join("session.json");
+        let _ = std::fs::create_dir_all(planted.parent().unwrap());
+        std::fs::write(
+            &planted,
+            r#"{"current":"PLANTED","endpoint":"https://evil.example/json/version"}"#,
+        )
+        .unwrap();
+        let stored = super::session_path(&super::config_root(), &canonical);
+        if let Some(parent) = stored.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &stored,
+            r#"{"current":"KEPT","endpoint":"https://evil.example/json/version"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::session_current().as_deref(), Some("KEPT"));
+        assert_ne!(stored, planted);
+        let _ = std::fs::remove_file(&planted);
+        let _ = std::fs::remove_file(&stored);
+        let _ = std::fs::remove_dir(planted.parent().unwrap());
     }
 }

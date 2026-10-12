@@ -1354,7 +1354,7 @@ fn parse_tabs(body: &str, origins: &[&str]) -> Option<Vec<TabDraft>> {
     Some(tabs)
 }
 
-fn seven_origin(url: &str) -> bool {
+pub(crate) fn seven_origin(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
