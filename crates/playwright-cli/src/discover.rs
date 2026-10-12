@@ -3553,4 +3553,51 @@ mod tests {
             })
             .collect()
     }
+
+    #[test]
+    fn discovery_port_probe_field_is_not_consumed() {
+        let field = ["probe", "_ports"].concat();
+        let key = ["probe", "Ports"].concat();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut hits = Vec::new();
+        scan_sources(&root, &field, &key, &mut hits);
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    fn scan_sources(dir: &std::path::Path, field: &str, key: &str, hits: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | ".git" | ".build" | "dist" | ".playwright-cli"
+                ) {
+                    continue;
+                }
+                scan_sources(&path, field, key, hits);
+                continue;
+            }
+            let ext = path.extension().and_then(|item| item.to_str()).unwrap_or("");
+            if !matches!(ext, "rs" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "toml") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if text.contains(field) || text.contains(key) {
+                hits.push(path.display().to_string());
+            }
+        }
+    }
 }
