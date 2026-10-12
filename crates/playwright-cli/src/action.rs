@@ -637,7 +637,7 @@ mod tests {
             let body = format!(
                 r#"{{"current":"TAB1","snapshots":{{"TAB1":{{"e1":{{"backendNodeId":7,"selector":"input","frameId":null{label}}}}}}}}}"#
             );
-            let session = crate::session::storage_path(dir);
+            let session = crate::session::storage_path(dir).unwrap();
             if let Some(parent) = session.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }

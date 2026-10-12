@@ -101,7 +101,7 @@ fn session_file() -> Option<PathBuf> {
     {
         let cwd = std::env::current_dir().ok()?;
         let canonical = cwd.canonicalize().unwrap_or(cwd);
-        Some(session_path(&config_root(), &canonical))
+        session_path(&config_root(), &canonical)
     }
 }
 
@@ -121,13 +121,18 @@ fn config_root() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn session_path(config_dir: &str, cwd: &std::path::Path) -> PathBuf {
-    let key = cdp_client::hash::sha256_hex(cwd.to_string_lossy().as_bytes());
-    PathBuf::from(config_dir)
-        .join("slicc")
-        .join("playwright-cli")
-        .join("sessions")
-        .join(format!("{key}.json"))
+fn session_path(config_dir: &str, cwd: &std::path::Path) -> Option<PathBuf> {
+    let root = std::path::Path::new(config_dir);
+    if !root.is_absolute() {
+        return None;
+    }
+    let key = cdp_client::hash::sha256_hex(cwd.as_os_str().as_encoded_bytes());
+    Some(
+        root.join("slicc")
+            .join("playwright-cli")
+            .join("sessions")
+            .join(format!("{key}.json")),
+    )
 }
 
 pub fn current_target(text: &str) -> Option<String> {
@@ -233,7 +238,7 @@ mod tests {
             r#"{"current":"PLANTED","endpoint":"https://evil.example/json/version"}"#,
         )
         .unwrap();
-        let stored = super::session_path(&super::config_root(), &canonical);
+        let stored = super::session_path(&super::config_root(), &canonical).unwrap();
         if let Some(parent) = stored.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -247,5 +252,26 @@ mod tests {
         let _ = std::fs::remove_file(&planted);
         let _ = std::fs::remove_file(&stored);
         let _ = std::fs::remove_dir(planted.parent().unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_relative_config_dir_is_not_a_session_file() {
+        assert!(super::session_path(".config", std::path::Path::new("work")).is_none());
+        assert!(super::session_path("AppData\\Roaming", std::path::Path::new("work")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_directories_do_not_share_a_session_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let left = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff"));
+        let right = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/work/\xfe"));
+        assert_eq!(left.to_string_lossy(), right.to_string_lossy());
+        let root = std::env::temp_dir();
+        let root = root.to_str().unwrap();
+        let a = super::session_path(root, left).unwrap();
+        let b = super::session_path(root, right).unwrap();
+        assert_ne!(a, b);
     }
 }

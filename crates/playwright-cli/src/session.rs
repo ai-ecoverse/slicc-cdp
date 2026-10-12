@@ -18,10 +18,10 @@ pub struct Session {
     pub requests: BTreeMap<String, Vec<NetRequest>>,
 }
 
-pub fn storage_path(cwd: &Path) -> PathBuf {
+pub fn storage_path(cwd: &Path) -> Option<PathBuf> {
     #[cfg(target_arch = "wasm32")]
     {
-        cwd.join(".playwright-cli").join("session.json")
+        Some(cwd.join(".playwright-cli").join("session.json"))
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -31,13 +31,18 @@ pub fn storage_path(cwd: &Path) -> PathBuf {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn session_path(config_dir: &str, cwd: &Path) -> PathBuf {
-    let key = cdp_client::hash::sha256_hex(cwd.to_string_lossy().as_bytes());
-    PathBuf::from(config_dir)
-        .join("slicc")
-        .join("playwright-cli")
-        .join("sessions")
-        .join(format!("{key}.json"))
+pub fn session_path(config_dir: &str, cwd: &Path) -> Option<PathBuf> {
+    let root = Path::new(config_dir);
+    if !root.is_absolute() {
+        return None;
+    }
+    let key = cdp_client::hash::sha256_hex(cwd.as_os_str().as_encoded_bytes());
+    Some(
+        root.join("slicc")
+            .join("playwright-cli")
+            .join("sessions")
+            .join(format!("{key}.json")),
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,14 +60,13 @@ fn config_root() -> String {
     }
 }
 
-fn path() -> PathBuf {
-    std::env::current_dir()
-        .map(|cwd| storage_path(&cwd))
-        .unwrap_or_else(|_| PathBuf::from(".playwright-cli").join("session.json"))
+fn path() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    storage_path(&cwd)
 }
 
 pub fn load() -> Session {
-    load_at(&path())
+    path().as_deref().map(load_at).unwrap_or_default()
 }
 
 pub fn load_at(path: &Path) -> Session {
@@ -270,7 +274,10 @@ pub fn save(session: &Session) -> Result<(), String> {
         stored.endpoint = None;
         stored.provenance = None;
     }
-    write_at(&path(), &stored)
+    let Some(file) = path() else {
+        return Err("session: user config dir is not absolute\n".into());
+    };
+    write_at(&file, &stored)
 }
 
 pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
@@ -591,7 +598,7 @@ mod tests {
             r#"{"endpoint":"https://evil.example/json/version","provenance":"explicit","current":"personal"}"#,
         )
         .unwrap();
-        let stored = session_path(config.to_str().unwrap(), &cwd);
+        let stored = session_path(config.to_str().unwrap(), &cwd).unwrap();
         assert_ne!(stored, cwd.join(".playwright-cli").join("session.json"));
         assert!(stored.starts_with(&config));
         assert!(!stored.starts_with(&cwd));
@@ -677,7 +684,7 @@ mod tests {
     fn a_saved_session_is_private_to_the_user() {
         let root = std::env::temp_dir().join(format!("slicc-session-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let path = session_path(root.to_str().unwrap(), Path::new("/work"));
+        let path = session_path(root.to_str().unwrap(), Path::new("/work")).unwrap();
         let session = Session {
             endpoint: Some("http://127.0.0.1:9333/json/version".to_string()),
             provenance: Some("probe".to_string()),
@@ -700,5 +707,34 @@ mod tests {
         assert_eq!(loaded.provenance.as_deref(), Some("probe"));
         assert_eq!(loaded.owned, vec!["OWN".to_string()]);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_relative_config_dir_is_not_a_session_path() {
+        assert!(session_path(".config", Path::new("work")).is_none());
+        assert!(session_path("AppData\\Roaming", Path::new("work")).is_none());
+        assert!(session_path("", Path::new("work")).is_none());
+        let stored = session_path(
+            std::env::temp_dir().to_str().unwrap(),
+            Path::new("/work"),
+        )
+        .unwrap();
+        assert!(stored.is_absolute());
+        let key = sha256_hex(Path::new("/work").as_os_str().as_encoded_bytes());
+        assert!(stored.ends_with(format!("{key}.json")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_directories_do_not_share_a_session_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let left = Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff"));
+        let right = Path::new(std::ffi::OsStr::from_bytes(b"/work/\xfe"));
+        assert_eq!(left.to_string_lossy(), right.to_string_lossy());
+        let root = std::env::temp_dir();
+        let root = root.to_str().unwrap();
+        let a = session_path(root, left).unwrap();
+        let b = session_path(root, right).unwrap();
+        assert_ne!(a, b);
     }
 }
