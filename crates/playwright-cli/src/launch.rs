@@ -200,12 +200,25 @@ pub fn start_after_explicit(
         return crate::connect::choose_start(cdp, env);
     }
     if let Some(url) = active {
-        return Ok(crate::connect::Start::Discover(url));
+        return crate::connect::choose_start(Some(&url), None);
     }
     if cfg!(target_arch = "wasm32") {
         return crate::connect::choose_start(None, None);
     }
     Err("playwright-cli: no debugger is connected\n".to_string())
+}
+
+pub fn retry_open_without_endpoint(command: &str, message: &str) -> bool {
+    should_launch(command, false) && remembered_endpoint_unreachable(message)
+}
+
+fn remembered_endpoint_unreachable(message: &str) -> bool {
+    if message.starts_with("HTTP ") {
+        return false;
+    }
+    message.contains("CDP connection to ")
+        || message.contains("CDP discovery failed for ")
+        || message.contains("could not resolve ")
 }
 
 pub fn remembered_endpoint() -> Option<String> {
@@ -3606,6 +3619,57 @@ mod tests {
             start_after_explicit(None, None, Some(active.clone())).unwrap(),
             crate::connect::Start::Discover(active)
         );
+        assert_eq!(
+            start_after_explicit(
+                None,
+                None,
+                Some("ws://127.0.0.1:9333/devtools/browser/abc".to_string()),
+            )
+            .unwrap(),
+            crate::connect::Start::Direct("ws://127.0.0.1:9333/devtools/browser/abc".to_string())
+        );
+        assert_eq!(
+            start_after_explicit(
+                None,
+                None,
+                Some("wss://127.0.0.1:9333/devtools/browser/abc".to_string()),
+            )
+            .unwrap(),
+            crate::connect::Start::Direct(
+                "wss://127.0.0.1:9333/devtools/browser/abc".to_string()
+            )
+        );
+        assert_eq!(
+            start_after_explicit(None, None, Some("http://127.0.0.1:9333".to_string())).unwrap(),
+            crate::connect::Start::Discover("http://127.0.0.1:9333/json/version".to_string())
+        );
+        let bad = start_after_explicit(None, None, Some("ftp://127.0.0.1:9333".to_string()))
+            .unwrap_err();
+        assert!(bad.contains("unsupported CDP URL"));
+        let dead = "CDP connection to 127.0.0.1:9333 failed: connection refused. This CLI does not launch Chrome. Pass --cdp or set SLICC_CDP_URL.\n";
+        let http = "HTTP 500\nnope\n";
+        let discovery = "CDP discovery failed for http://127.0.0.1:9333/json/version: broken pipe\n";
+        let missing = "could not resolve browser.example: no such host\n";
+        let body = "json/version returned no webSocketDebuggerUrl\n";
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(retry_open_without_endpoint("open", dead));
+            assert!(retry_open_without_endpoint("tab-new", dead));
+            assert!(retry_open_without_endpoint("open", discovery));
+            assert!(retry_open_without_endpoint("open", missing));
+            assert!(!retry_open_without_endpoint("snapshot", dead));
+            assert!(!retry_open_without_endpoint("tab-list", dead));
+            assert!(!retry_open_without_endpoint("open", http));
+            assert!(!retry_open_without_endpoint("open", body));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            assert!(!retry_open_without_endpoint("open", dead));
+            assert!(!retry_open_without_endpoint("tab-new", discovery));
+            assert!(!retry_open_without_endpoint("open", http));
+            assert!(!retry_open_without_endpoint("open", missing));
+            assert!(!retry_open_without_endpoint("open", body));
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let err = start_after_explicit(None, None, None).unwrap_err();
