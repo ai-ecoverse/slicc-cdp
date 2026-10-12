@@ -104,29 +104,6 @@ const BUNDLE_IDS: &[(&str, &str)] = &[
     ("org.chromium.Chromium", "chromium"),
 ];
 
-const BROWSER_NAMES: &[(&str, &str)] = &[
-    ("chrome", "Google Chrome"),
-    ("edge", "Microsoft Edge"),
-    ("brave", "Brave Browser"),
-    ("opera", "Opera"),
-    ("vivaldi", "Vivaldi"),
-    ("arc", "Arc"),
-    ("atlas", "ChatGPT Atlas"),
-    ("dia", "Dia"),
-    ("chrome-beta", "Google Chrome Beta"),
-    ("chrome-dev", "Google Chrome Dev"),
-    ("chrome-canary", "Google Chrome Canary"),
-    ("brave-beta", "Brave Browser Beta"),
-    ("brave-nightly", "Brave Browser Nightly"),
-    ("edge-beta", "Microsoft Edge Beta"),
-    ("edge-dev", "Microsoft Edge Dev"),
-    ("edge-canary", "Microsoft Edge Canary"),
-    ("vivaldi-snapshot", "Vivaldi Snapshot"),
-    ("chrome-for-testing", "Google Chrome for Testing"),
-    ("chromium", "Chromium"),
-];
-
-const MIN_CHROMIUM: u32 = 116;
 const ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -524,7 +501,21 @@ fn take_token(text: &str) -> String {
     if text.starts_with('"') || text.starts_with('\'') {
         return quoted_token(text);
     }
-    text.split_whitespace().next().unwrap_or("").to_string()
+    if text.starts_with("--") {
+        return String::new();
+    }
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            let after = text[index..].trim_start();
+            if after.starts_with("--") {
+                return text[..index].trim_end().to_string();
+            }
+        }
+        index += 1;
+    }
+    text.trim_end().to_string()
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -646,6 +637,8 @@ struct ListIo<'a> {
     read: &'a dyn Fn(&str) -> Option<String>,
     list_dir: &'a dyn Fn(&str) -> Vec<String>,
     targets: &'a dyn Fn(&str) -> Result<Probe, ()>,
+    flag_urls: &'a [&'a str],
+    installed: Option<&'a [Value]>,
 }
 
 struct VersionDoc {
@@ -675,6 +668,8 @@ struct EndpointDraft {
     user_agent: Option<String>,
     browser: Option<String>,
     user_data_dir: Option<String>,
+    profile: Option<String>,
+    ws_only: bool,
     seven_open: bool,
     tabs: Vec<TabDraft>,
 }
@@ -696,8 +691,11 @@ struct ReportEntry {
     version: Option<String>,
     port: u32,
     tie: String,
+    priority: usize,
+    sort_name: String,
     endpoint: Option<EndpointDraft>,
     installed: Option<InstalledDraft>,
+    installed_raw: Option<Value>,
 }
 
 fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> Output {
@@ -748,7 +746,10 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
             }
         }
     }
-    let connected = if json {
+    for url in io.flag_urls {
+        push_flag_url(url, &mut drafts, &http);
+    }
+    let mut connected = if json {
         Vec::new()
     } else if let Some(url) = dial.as_deref() {
         match (io.targets)(url) {
@@ -781,7 +782,21 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
         apps = found_apps(&io.launch);
     }
     let endpoints = merge_drafts(drafts);
-    let mut entries = report_entries(&endpoints, &apps);
+    if !json {
+        for endpoint in &endpoints {
+            if endpoint.source != "devtools-active-port" {
+                continue;
+            }
+            let Some(ws) = endpoint.websocket.as_deref().filter(|item| !item.is_empty()) else {
+                continue;
+            };
+            let line = format!("browser - {ws}");
+            if !connected.iter().any(|item| item == &line) {
+                connected.push(line);
+            }
+        }
+    }
+    let mut entries = report_entries(&endpoints, &apps, io.installed);
     sort_entries(&mut entries);
     if json {
         return output_of(report_json(&entries), stderr);
@@ -847,66 +862,255 @@ fn resolve_process(
         if reserved_debug_port(port) {
             return Some((port, draft_bare(port, "process")));
         }
-        let base = format!("http://127.0.0.1:{port}");
-        let doc = version_doc_checked(&base, Some(&ws_path), http)?;
-        let tabs = fetch_tabs(&base, http);
-        let draft = draft_from_doc(&base, "process", Some(dir), None, doc, tabs)?;
+        let draft = draft_from_port(port, "process", Some(dir), None, None, Some(&ws_path), http)?;
         return Some((port, draft));
     }
     if reserved_debug_port(hit.port) {
         return Some((hit.port, draft_bare(hit.port, "process")));
     }
-    let base = format!("http://127.0.0.1:{}", hit.port);
-    let draft = match version_doc_checked(&base, None, http) {
-        Some(doc) => {
-            let tabs = fetch_tabs(&base, http);
-            draft_from_doc(&base, "process", None, None, doc, tabs)?
-        }
-        None => draft_bare(hit.port, "process"),
-    };
+    let draft = draft_from_port(
+        hit.port,
+        "process",
+        hit.user_data_dir.as_deref(),
+        None,
+        None,
+        None,
+        http,
+    )?;
     Some((hit.port, draft))
 }
 
 fn profile_drafts(io: &ListIo<'_>, http: &dyn Fn(&str) -> HttpResult) -> Vec<EndpointDraft> {
     let mut out = Vec::new();
+    for (id, dir) in user_data_dirs(io) {
+        if let Some(draft) = draft_from_active_file(&dir, Some(&id), None, io, http) {
+            out.push(draft);
+        }
+    }
     for root in profile_roots(io) {
         let mut names = (io.list_dir)(&root);
         names.sort();
         for name in names {
-            if !profile_dir_name(&name) || name.starts_with("browser-coding-agent-chrome") {
+            if !profile_dir_name(&name) || six_profile_name(&name) {
                 continue;
             }
             let dir = join_two(&root, &name);
-            let Some(text) = (io.read)(&active_port_path(&dir)) else {
-                continue;
-            };
-            let Some((port, ws_path)) = parse_active_port(&text) else {
-                continue;
-            };
-            if reserved_debug_port(port) {
-                continue;
-            }
-            let base = format!("http://127.0.0.1:{port}");
-            let Some(doc) = version_doc_checked(&base, Some(&ws_path), http) else {
-                continue;
-            };
-            let browser = if browser_name(&name).is_some() {
-                Some(name.as_str())
-            } else {
-                None
-            };
-            let tabs = fetch_tabs(&base, http);
-            if let Some(draft) = draft_from_doc(
-                &base,
-                "devtools-active-port",
-                Some(&dir),
-                browser,
-                doc,
-                tabs,
-            ) {
+            if let Some(draft) = draft_from_active_file(&dir, None, Some(&name), io, http) {
                 out.push(draft);
             }
         }
+    }
+    out
+}
+
+fn draft_from_active_file(
+    dir: &str,
+    browser: Option<&str>,
+    profile: Option<&str>,
+    io: &ListIo<'_>,
+    http: &dyn Fn(&str) -> HttpResult,
+) -> Option<EndpointDraft> {
+    let text = (io.read)(&active_port_path(dir))?;
+    let (port, ws_path) = parse_active_port(&text)?;
+    if reserved_debug_port(port) {
+        return None;
+    }
+    draft_from_port(
+        port,
+        "devtools-active-port",
+        Some(dir),
+        browser,
+        profile,
+        Some(&ws_path),
+        http,
+    )
+}
+
+fn draft_from_port(
+    port: u32,
+    source: &'static str,
+    dir: Option<&str>,
+    browser: Option<&str>,
+    profile: Option<&str>,
+    ws_path: Option<&str>,
+    http: &dyn Fn(&str) -> HttpResult,
+) -> Option<EndpointDraft> {
+    let base = format!("http://127.0.0.1:{port}");
+    let version_url = format!("{base}/json/version");
+    match http(&version_url) {
+        HttpResult::Transport => None,
+        HttpResult::Response { status, body } => {
+            if (200..300).contains(&status) {
+                if let Some(doc) = parse_version(&body) {
+                    if let Some(path) = ws_path {
+                        if !ws_path_matches(&doc.websocket, path) {
+                            return None;
+                        }
+                    }
+                    let tabs = fetch_tabs(&base, http);
+                    let mut draft = draft_from_doc(&base, source, dir, browser, doc, tabs)?;
+                    draft.profile = profile.map(str::to_string);
+                    return Some(draft);
+                }
+            }
+            ws_only_from_file(port, source, dir, browser, profile, ws_path)
+        }
+    }
+}
+
+fn ws_only_from_file(
+    port: u32,
+    source: &'static str,
+    dir: Option<&str>,
+    browser: Option<&str>,
+    profile: Option<&str>,
+    ws_path: Option<&str>,
+) -> Option<EndpointDraft> {
+    let path = ws_path?;
+    let fallback = slicc_browsers::catalog().discovery.names.fallback.clone();
+    let name = match browser {
+        Some(id) => catalog_browser_name(id).unwrap_or(fallback),
+        None => fallback,
+    };
+    let mut draft = draft_bare(port, source);
+    draft.websocket = Some(format!("ws://127.0.0.1:{port}{path}"));
+    draft.name = name;
+    draft.user_data_dir = dir.map(str::to_string);
+    draft.browser = browser.and_then(|id| catalog_browser_name(id).map(|_| id.to_string()));
+    draft.profile = profile.map(str::to_string);
+    draft.ws_only = true;
+    Some(draft)
+}
+
+fn six_profile_name(name: &str) -> bool {
+    let prefix = "browser-coding-agent-chrome";
+    name.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn user_data_dirs(io: &ListIo<'_>) -> Vec<(String, String)> {
+    let catalog = slicc_browsers::catalog();
+    let mut dirs = Vec::new();
+    for browser in &catalog.browsers {
+        match io.os {
+            HostOs::Macos => {
+                if browser.macos.data_dir.is_empty() {
+                    continue;
+                }
+                let config = config_dir(io, &catalog);
+                if config.is_empty() {
+                    continue;
+                }
+                dirs.push((
+                    browser.id.clone(),
+                    join_all(&config, &browser.macos.data_dir),
+                ));
+            }
+            HostOs::Windows => {
+                let Some(windows) = browser.windows.as_ref().filter(|item| !item.data_dir.is_empty())
+                else {
+                    continue;
+                };
+                let root = windows_root(io, &catalog, &windows.data_root);
+                if root.is_empty() {
+                    continue;
+                }
+                dirs.push((browser.id.clone(), join_all(&root, &windows.data_dir)));
+            }
+            HostOs::Linux => {
+                let Some(linux) = &browser.linux else {
+                    continue;
+                };
+                if !linux.config_dir.is_empty() {
+                    let config = config_dir(io, &catalog);
+                    if !config.is_empty() {
+                        dirs.push((browser.id.clone(), join_all(&config, &linux.config_dir)));
+                    }
+                    if let Some(flatpak) = &linux.flatpak {
+                        if let Some(home) = nonempty(io.home) {
+                            let base = join_all(
+                                home,
+                                &[
+                                    ".var".to_string(),
+                                    "app".to_string(),
+                                    flatpak.clone(),
+                                    "config".to_string(),
+                                ],
+                            );
+                            dirs.push((browser.id.clone(), join_all(&base, &linux.config_dir)));
+                        }
+                    }
+                }
+                if let Some(snap) = linux.snap.as_ref().filter(|_| !linux.snap_data_dir.is_empty())
+                {
+                    if let Some(home) = nonempty(io.home) {
+                        let base = join_all(
+                            home,
+                            &["snap".to_string(), snap.clone(), "common".to_string()],
+                        );
+                        dirs.push((browser.id.clone(), join_all(&base, &linux.snap_data_dir)));
+                    }
+                }
+            }
+        }
+    }
+    dirs
+}
+
+fn config_dir(io: &ListIo<'_>, catalog: &slicc_browsers::Catalog) -> String {
+    let (loc, absolute_only) = match io.os {
+        HostOs::Macos => (&catalog.platforms.macos.config, false),
+        HostOs::Windows => (&catalog.platforms.windows.config, false),
+        HostOs::Linux => (&catalog.platforms.linux.config, true),
+    };
+    if let Some(name) = &loc.env {
+        let value = match name.as_str() {
+            "XDG_CONFIG_HOME" => io.xdg_config_home,
+            "APPDATA" => io.appdata,
+            _ => None,
+        };
+        if let Some(value) = nonempty(value) {
+            if !absolute_only || is_absolute(value) {
+                return value.to_string();
+            }
+        }
+    }
+    if let Some(abs) = &loc.absolute {
+        return abs.clone();
+    }
+    match nonempty(io.home) {
+        Some(home) => join_all(home, &loc.home),
+        None => String::new(),
+    }
+}
+
+fn windows_root(io: &ListIo<'_>, catalog: &slicc_browsers::Catalog, name: &str) -> String {
+    let Some(loc) = catalog.platforms.windows.roots.get(name) else {
+        return String::new();
+    };
+    let env_value = match loc.env.as_deref() {
+        Some("LOCALAPPDATA") => io.launch.local_app_data,
+        Some("PROGRAMFILES") => io.launch.program_files,
+        Some("PROGRAMFILES(X86)") => io.launch.program_files_x86,
+        Some("APPDATA") => io.appdata,
+        _ => None,
+    };
+    if let Some(value) = nonempty(env_value) {
+        return value.to_string();
+    }
+    if let Some(abs) = &loc.absolute {
+        return abs.clone();
+    }
+    match nonempty(io.home) {
+        Some(home) => join_all(home, &loc.home),
+        None => String::new(),
+    }
+}
+
+fn join_all(root: &str, parts: &[String]) -> String {
+    let mut out = root.to_string();
+    for part in parts {
+        out = join_two(&out, part);
     }
     out
 }
@@ -1036,30 +1240,6 @@ fn parse_active_port(text: &str) -> Option<(u32, String)> {
     Some((port, path))
 }
 
-fn version_doc_checked(
-    base: &str,
-    ws_path: Option<&str>,
-    http: &dyn Fn(&str) -> HttpResult,
-) -> Option<VersionDoc> {
-    let doc = fetch_version(base, http)?;
-    if let Some(path) = ws_path {
-        if !ws_path_matches(&doc.websocket, path) {
-            return None;
-        }
-    }
-    Some(doc)
-}
-
-fn fetch_version(base: &str, http: &dyn Fn(&str) -> HttpResult) -> Option<VersionDoc> {
-    let HttpResult::Response { status, body } = http(&format!("{base}/json/version")) else {
-        return None;
-    };
-    if !(200..300).contains(&status) {
-        return None;
-    }
-    parse_version(&body)
-}
-
 fn fetch_tabs(base: &str, http: &dyn Fn(&str) -> HttpResult) -> Vec<TabDraft> {
     let HttpResult::Response { status, body } = http(&format!("{base}/json/list")) else {
         return Vec::new();
@@ -1154,9 +1334,17 @@ fn seven_origin(url: &str) -> bool {
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = host.rsplit('@').next().unwrap_or(host);
     let host = if let Some(stripped) = host.strip_prefix('[') {
-        stripped.split_once(']').map(|(name, _)| name).unwrap_or(stripped)
+        stripped
+            .split_once(']')
+            .map(|(name, _)| name)
+            .unwrap_or(stripped)
+    } else if let Some((name, port)) = host.rsplit_once(':') {
+        if port != "443" {
+            return false;
+        }
+        name
     } else {
-        host.split(':').next().unwrap_or(host)
+        host
     };
     let host = host.to_ascii_lowercase();
     let Some(label) = host.strip_suffix(".sliccy.ai") else {
@@ -1194,23 +1382,108 @@ fn ws_path_matches(websocket: &str, path: &str) -> bool {
     url_path == path
 }
 
-fn flag_from_direct(url: &str, http: &dyn Fn(&str) -> HttpResult) -> Option<EndpointDraft> {
-    let base = ws_to_http_base(url)?;
-    match version_doc_checked(&base, None, http) {
-        Some(doc) => {
-            let tabs = fetch_tabs(&base, http);
-            draft_from_doc(&base, "flag", None, None, doc, tabs)
+enum FlagKind {
+    Direct(String),
+    Discover(String),
+}
+
+fn push_flag_url(raw: &str, drafts: &mut Vec<EndpointDraft>, http: &dyn Fn(&str) -> HttpResult) {
+    let Some(kind) = classify_flag(raw) else {
+        return;
+    };
+    match kind {
+        FlagKind::Direct(url) => {
+            if let Some(draft) = flag_from_direct(&url, http) {
+                drafts.push(draft);
+            }
         }
-        None => {
-            let (host, port) = host_port(&base)?;
-            let mut draft = draft_bare(port, "flag");
-            draft.host = host.clone();
-            draft.id = format!("cdp:{host}:{port}");
-            draft.cdp = normalized_cdp(&base).unwrap_or(base);
-            draft.websocket = Some(url.to_string());
-            Some(draft)
+        FlagKind::Discover(url) => {
+            let version_url = connect::discovery_url(&url);
+            if let HttpResult::Response { status, body } = http(&version_url) {
+                if (200..300).contains(&status) {
+                    if let Some(draft) = flag_from_version(&version_url, &body, http) {
+                        drafts.push(draft);
+                    }
+                }
+            }
         }
     }
+}
+
+fn classify_flag(raw: &str) -> Option<FlagKind> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("ws://") || lower.starts_with("wss://") {
+        return Some(FlagKind::Direct(trimmed.to_string()));
+    }
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(FlagKind::Discover(trimmed.to_string()));
+    }
+    if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(FlagKind::Discover(format!("http://127.0.0.1:{trimmed}")));
+    }
+    if host_port_text(trimmed) {
+        return Some(FlagKind::Discover(format!("http://{trimmed}")));
+    }
+    None
+}
+
+fn host_port_text(text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            return false;
+        };
+        return !host.is_empty()
+            && !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    let Some((host, port)) = text.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.contains('/')
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn flag_from_direct(url: &str, http: &dyn Fn(&str) -> HttpResult) -> Option<EndpointDraft> {
+    let base = ws_to_http_base(url)?;
+    let version_url = format!("{base}/json/version");
+    match http(&version_url) {
+        HttpResult::Transport => None,
+        HttpResult::Response { status, body } if (200..300).contains(&status) => {
+            if let Some(doc) = parse_version(&body) {
+                let tabs = fetch_tabs(&base, http);
+                draft_from_doc(&base, "flag", None, None, doc, tabs)
+            } else {
+                ws_only_flag(url, &base)
+            }
+        }
+        HttpResult::Response { .. } => ws_only_flag(url, &base),
+    }
+}
+
+fn ws_only_flag(url: &str, base: &str) -> Option<EndpointDraft> {
+    if !ws_scheme(url) {
+        return None;
+    }
+    let (host, port) = host_port(base)?;
+    let mut draft = draft_bare(port, "flag");
+    draft.host = host.clone();
+    draft.id = format!("cdp:{host}:{port}");
+    draft.cdp = normalized_cdp(base).unwrap_or_else(|| base.to_string());
+    draft.websocket = Some(url.to_string());
+    draft.name = slicc_browsers::catalog().discovery.names.fallback.clone();
+    draft.ws_only = true;
+    Some(draft)
+}
+
+fn ws_scheme(url: &str) -> bool {
+    let scheme = url.split("://").next().unwrap_or("");
+    scheme.eq_ignore_ascii_case("ws") || scheme.eq_ignore_ascii_case("wss")
 }
 
 fn flag_from_version(
@@ -1253,8 +1526,10 @@ fn draft_from_doc(
         } else {
             Some(doc.user_agent)
         },
-        browser: browser.and_then(|id| browser_name(id).map(|_| id.to_string())),
+        browser: browser.and_then(|id| catalog_browser_name(id).map(|_| id.to_string())),
         user_data_dir: user_data_dir.map(str::to_string),
+        profile: None,
+        ws_only: false,
         seven_open: !tabs.is_empty(),
         tabs,
     })
@@ -1274,26 +1549,38 @@ fn draft_bare(port: u32, source: &'static str) -> EndpointDraft {
         user_agent: None,
         browser: None,
         user_data_dir: None,
+        profile: None,
+        ws_only: false,
         seven_open: false,
         tabs: Vec::new(),
     }
 }
 
 fn endpoint_name(browser: Option<&str>, product_name: &str, user_agent: &str) -> String {
+    let catalog = slicc_browsers::catalog();
     if let Some(id) = browser {
-        if let Some(name) = browser_name(id) {
-            return name.to_string();
+        if let Some(browser) = catalog.browser(id) {
+            return browser.name.clone();
         }
     }
-    if user_agent.contains(" Electron/") {
-        return "Electron".to_string();
+    let names = &catalog.discovery.names;
+    if user_agent.contains(&names.electron_user_agent) {
+        return names.electron.clone();
     }
-    match product_name {
-        "Edg" => "Microsoft Edge".to_string(),
-        "HeadlessChrome" => "Chrome (headless)".to_string(),
-        "" => "Chromium".to_string(),
-        other => other.to_string(),
+    if product_name.is_empty() {
+        return names.fallback.clone();
     }
+    names
+        .products
+        .get(product_name)
+        .cloned()
+        .unwrap_or_else(|| product_name.to_string())
+}
+
+fn catalog_browser_name(id: &str) -> Option<String> {
+    slicc_browsers::catalog()
+        .browser(id)
+        .map(|browser| browser.name.clone())
 }
 
 fn http_origin(url: &str) -> Option<String> {
@@ -1378,33 +1665,50 @@ fn source_rank(source: &str) -> u8 {
 }
 
 fn too_old(user_agent: &str) -> bool {
-    chrome_major(user_agent).is_some_and(|major| major < MIN_CHROMIUM)
+    let min = slicc_browsers::catalog().min_chromium_major;
+    chrome_major(user_agent).is_some_and(|major| major < min)
 }
 
 fn chrome_major(user_agent: &str) -> Option<u32> {
-    let mut rest = user_agent;
-    while let Some(index) = rest.find("Chrome/") {
-        let after = &rest[index + "Chrome/".len()..];
+    let mut best: Option<(usize, u32)> = None;
+    for marker in ["HeadlessChrome/", "Chromium/", "Chrome/"] {
+        let Some(index) = user_agent.find(marker) else {
+            continue;
+        };
+        let after = &user_agent[index + marker.len()..];
         let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            return digits.parse().ok();
+        let Ok(major) = digits.parse::<u32>() else {
+            continue;
+        };
+        if best.map(|(at, _)| index < at).unwrap_or(true) {
+            best = Some((index, major));
         }
-        rest = &rest[index + "Chrome/".len()..];
     }
-    None
+    best.map(|(_, major)| major)
 }
 
-fn report_entries(endpoints: &[EndpointDraft], apps: &[FoundApp]) -> Vec<ReportEntry> {
+fn report_entries(
+    endpoints: &[EndpointDraft],
+    apps: &[FoundApp],
+    installed: Option<&[Value]>,
+) -> Vec<ReportEntry> {
+    let catalog = slicc_browsers::catalog();
     let mut entries = Vec::new();
     for draft in endpoints {
         entries.push(ReportEntry {
             id: draft.id.clone(),
             kind: "endpoint",
-            tier: if draft.seven_open { 1 } else { 2 },
+            tier: if draft.seven_open {
+                catalog.rank.tiers.seven_open
+            } else {
+                catalog.rank.tiers.endpoint
+            },
             name: draft.name.clone(),
             version: draft.version.clone(),
             port: draft.port,
             tie: draft.host.clone(),
+            priority: 0,
+            sort_name: String::new(),
             endpoint: Some(EndpointDraft {
                 id: draft.id.clone(),
                 host: draft.host.clone(),
@@ -1418,6 +1722,8 @@ fn report_entries(endpoints: &[EndpointDraft], apps: &[FoundApp]) -> Vec<ReportE
                 user_agent: draft.user_agent.clone(),
                 browser: draft.browser.clone(),
                 user_data_dir: draft.user_data_dir.clone(),
+                profile: draft.profile.clone(),
+                ws_only: draft.ws_only,
                 seven_open: draft.seven_open,
                 tabs: draft
                     .tabs
@@ -1430,7 +1736,17 @@ fn report_entries(endpoints: &[EndpointDraft], apps: &[FoundApp]) -> Vec<ReportE
                     .collect(),
             }),
             installed: None,
+            installed_raw: None,
         });
+    }
+    if let Some(rows) = installed {
+        for row in rows {
+            if installed_too_old(&catalog, row) {
+                continue;
+            }
+            entries.push(installed_entry(row, &catalog));
+        }
+        return entries;
     }
     for app in apps {
         let (id, engine, debug) = installed_identity(app);
@@ -1449,6 +1765,8 @@ fn report_entries(endpoints: &[EndpointDraft], apps: &[FoundApp]) -> Vec<ReportE
             version: None,
             port: 0,
             tie: app.path.clone(),
+            priority: catalog.priority(&id),
+            sort_name: app.name.to_ascii_lowercase(),
             endpoint: None,
             installed: Some(InstalledDraft {
                 id,
@@ -1458,9 +1776,78 @@ fn report_entries(endpoints: &[EndpointDraft], apps: &[FoundApp]) -> Vec<ReportE
                 bundle_id: app.bundle_id.clone(),
                 debug_support: debug,
             }),
+            installed_raw: None,
         });
     }
     entries
+}
+
+fn installed_entry(row: &Value, catalog: &slicc_browsers::Catalog) -> ReportEntry {
+    let id = row
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = row
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let engine = row.get("engine").and_then(|value| value.as_str()).unwrap_or("");
+    let path = row
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = row
+        .get("version")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let tier = if engine == "electron" {
+        catalog.rank.tiers.electron
+    } else if id == catalog.rank.chrome_id {
+        catalog.rank.tiers.chrome
+    } else {
+        catalog.rank.tiers.chromium
+    };
+    ReportEntry {
+        id: id.clone(),
+        kind: "installed",
+        tier,
+        name: name.clone(),
+        version,
+        port: 0,
+        tie: path,
+        priority: catalog.priority(&id),
+        sort_name: name.to_ascii_lowercase(),
+        endpoint: None,
+        installed: None,
+        installed_raw: Some(row.clone()),
+    }
+}
+
+fn installed_too_old(catalog: &slicc_browsers::Catalog, row: &Value) -> bool {
+    let Some(id) = row.get("id").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(browser) = catalog.browser(id) else {
+        return false;
+    };
+    if !browser.chromium_version {
+        return false;
+    }
+    let Some(version) = row.get("version").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let digits: String = version
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    let Ok(major) = digits.parse::<u32>() else {
+        return false;
+    };
+    major < catalog.min_chromium_major
 }
 
 fn installed_identity(app: &FoundApp) -> (String, &'static str, &'static str) {
@@ -1486,13 +1873,6 @@ fn bundle_id_to_slicc(bundle: &str) -> Option<&'static str> {
         .iter()
         .find(|(id, _)| *id == bundle)
         .map(|(_, slicc)| *slicc)
-}
-
-fn browser_name(id: &str) -> Option<&'static str> {
-    BROWSER_NAMES
-        .iter()
-        .find(|(key, _)| *key == id)
-        .map(|(_, name)| *name)
 }
 
 fn chromium_id_for_name(name: &str) -> Option<&'static str> {
@@ -1541,11 +1921,22 @@ fn slug(name: &str) -> String {
 
 fn sort_entries(entries: &mut [ReportEntry]) {
     entries.sort_by(|left, right| {
-        left.tier
-            .cmp(&right.tier)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.port.cmp(&right.port))
-            .then_with(|| left.tie.cmp(&right.tie))
+        left.tier.cmp(&right.tier).then_with(|| {
+            match (left.kind, right.kind) {
+                ("endpoint", "endpoint") => left
+                    .tie
+                    .cmp(&right.tie)
+                    .then(left.port.cmp(&right.port))
+                    .then(left.id.cmp(&right.id)),
+                ("installed", "installed") => left
+                    .priority
+                    .cmp(&right.priority)
+                    .then(left.sort_name.cmp(&right.sort_name))
+                    .then(left.id.cmp(&right.id))
+                    .then(left.tie.cmp(&right.tie)),
+                _ => std::cmp::Ordering::Equal,
+            }
+        })
     });
 }
 
@@ -1557,7 +1948,8 @@ fn apps_to_lines(mut apps: Vec<FoundApp>) -> Vec<String> {
 }
 
 fn report_json(entries: &[ReportEntry]) -> String {
-    let mut body = String::from("{\"schema\":1,\"minChromium\":116,\"entries\":[");
+    let min = slicc_browsers::catalog().min_chromium_major;
+    let mut body = format!("{{\"schema\":1,\"minChromium\":{min},\"entries\":[");
     for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             body.push(',');
@@ -1581,7 +1973,9 @@ fn entry_json(entry: &ReportEntry) -> String {
     if let Some(endpoint) = &entry.endpoint {
         field(&mut out, &mut first, "endpoint", &endpoint_json(endpoint));
     }
-    if let Some(installed) = &entry.installed {
+    if let Some(raw) = &entry.installed_raw {
+        field(&mut out, &mut first, "installed", &raw.to_string());
+    } else if let Some(installed) = &entry.installed {
         field(&mut out, &mut first, "installed", &installed_json(installed));
     }
     out.push('}');
@@ -1614,6 +2008,12 @@ fn endpoint_json(endpoint: &EndpointDraft) -> String {
     }
     if let Some(dir) = &endpoint.user_data_dir {
         field(&mut out, &mut first, "userDataDir", &json_string(dir));
+    }
+    if let Some(profile) = &endpoint.profile {
+        field(&mut out, &mut first, "profile", &json_string(profile));
+    }
+    if endpoint.ws_only {
+        field(&mut out, &mut first, "wsOnly", "true");
     }
     field(
         &mut out,
@@ -1720,6 +2120,8 @@ fn run_host(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         read: &read_real,
         list_dir: &list_dir_real,
         targets: &live_targets,
+        flag_urls: &[],
+        installed: None,
     };
     assemble(invocation, cdp_env, &io)
 }
@@ -1749,6 +2151,8 @@ fn run_guest(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         read: &|_| None,
         list_dir: &|_| Vec::new(),
         targets: &live_targets,
+        flag_urls: &[],
+        installed: None,
     };
     assemble(invocation, cdp_env, &io)
 }
@@ -2348,7 +2752,7 @@ mod tests {
         assert_eq!(failed.code, 1);
         assert_eq!(failed.stderr, "HTTP 503\nbroken\n");
         assert!(failed.stdout.contains("connected\nnone\n"));
-        assert!(failed.stdout.contains("debug ports\npid 42 port 9444 /usr/bin/chromium\n"));
+        assert!(failed.stdout.contains("debug ports\nnone\n"));
         assert!(failed
             .stdout
             .contains("launchable\nGoogle Chrome browser /usr/bin/google-chrome\n"));
@@ -2506,16 +2910,19 @@ mod tests {
         assert_eq!(entries[0]["kind"], "endpoint");
         assert_eq!(entries[0]["tier"], 1);
         assert_eq!(entries[0]["endpoint"]["source"], "devtools-active-port");
-        assert_eq!(entries[0]["endpoint"]["browser"], "chrome");
+        assert!(entries[0]["endpoint"].get("browser").is_none());
+        assert_eq!(entries[0]["endpoint"]["profile"], "chrome");
         assert_eq!(entries[0]["endpoint"]["sevenOpen"], true);
         assert_eq!(entries[0]["endpoint"]["sevenTabs"].as_array().unwrap().len(), 1);
         assert_eq!(entries[0]["endpoint"]["sevenTabs"][0]["id"], "T1");
-        assert_eq!(entries[0]["endpoint"]["name"], "Google Chrome");
+        assert_eq!(entries[0]["endpoint"]["name"], "Chrome");
+        assert_eq!(entries[0]["name"], "Chrome");
         assert_eq!(entries[0]["version"], "120.0.0.0");
         assert_eq!(entries[1]["id"], "cdp:127.0.0.1:9334");
         assert_eq!(entries[1]["tier"], 2);
         assert_eq!(entries[1]["endpoint"]["source"], "devtools-active-port");
-        assert_eq!(entries[1]["endpoint"]["browser"], "edge");
+        assert!(entries[1]["endpoint"].get("browser").is_none());
+        assert_eq!(entries[1]["endpoint"]["profile"], "edge");
         assert_eq!(entries[1]["endpoint"]["name"], "Microsoft Edge");
         assert_eq!(entries[1]["endpoint"]["sevenOpen"], false);
         assert!(entries[1]["endpoint"]["sevenTabs"].as_array().unwrap().is_empty());
@@ -2840,9 +3247,8 @@ mod tests {
                 "cdp:127.0.0.1:9333",
                 "cdp:127.0.0.1:9334",
                 "cdp:127.0.0.1:9335",
-                "cdp:127.0.0.1:9666",
-                "cdp:127.0.0.1:9555",
                 "cdp:127.0.0.1:9336",
+                "cdp:127.0.0.1:9666",
             ]
         );
         assert_eq!(entries[0]["endpoint"]["source"], "process");
@@ -2856,20 +3262,16 @@ mod tests {
             "/home/me/.config/slicc/seven-profiles/brave"
         );
         assert_eq!(entries[2]["endpoint"]["source"], "process");
-        assert_eq!(entries[3]["endpoint"]["source"], "process");
+        assert_eq!(entries[3]["endpoint"]["source"], "devtools-active-port");
+        assert!(entries[3]["endpoint"].get("browser").is_none());
+        assert_eq!(entries[3]["endpoint"]["profile"], "chrome");
+        assert_eq!(entries[3]["name"], "Chrome");
+        assert_eq!(entries[4]["endpoint"]["source"], "process");
         assert_eq!(
-            entries[3]["endpoint"]["webSocketDebuggerUrl"],
+            entries[4]["endpoint"]["webSocketDebuggerUrl"],
             "ws://127.0.0.1:9666/devtools/browser/fixed"
         );
-        assert_eq!(entries[4]["name"], "Chromium");
-        assert_eq!(entries[4]["endpoint"]["source"], "process");
-        assert_eq!(entries[4]["endpoint"]["webSocketDebuggerUrl"], "");
-        assert!(output
-            .stdout
-            .contains("\"cdp\":\"http://127.0.0.1:9555\",\"webSocketDebuggerUrl\":\"\""));
-        assert_eq!(entries[5]["endpoint"]["source"], "devtools-active-port");
-        assert_eq!(entries[5]["endpoint"]["browser"], "chrome");
-        assert_eq!(entries[5]["name"], "Google Chrome");
+        assert!(!output.stdout.contains("9555"));
         assert!(!output.stdout.contains("9401"));
         assert!(!output.stdout.contains("9402"));
         assert!(!output.stdout.contains("9403"));
@@ -2892,8 +3294,11 @@ mod tests {
         assert_eq!(text.code, 0);
         assert!(text.stdout.contains("pid 24 port 9333 /usr/bin/chromium"));
         assert!(text.stdout.contains("pid 25 port 9334 /usr/bin/chromium"));
-        assert!(text.stdout.contains("pid 28 port 9555 /usr/bin/chromium"));
+        assert!(!text.stdout.contains("9555"));
         assert!(text.stdout.contains("pid 29 port 9666 /usr/bin/chromium"));
+        assert!(text.stdout.contains(
+            "browser - ws://127.0.0.1:9336/devtools/browser/prof"
+        ));
         assert!(!text.stdout.contains("port 0"));
         assert!(!text.stdout.contains("9401"));
         assert!(!text.stdout.contains("9402"));
@@ -2975,8 +3380,165 @@ mod tests {
             read,
             list_dir,
             targets: &|_| Err(()),
+            flag_urls: &[],
+            installed: None,
         };
         assemble(invocation, cdp_env, &io)
+    }
+
+    #[test]
+    fn slicc_browsers_corpus_matches_list_json() {
+        let catalog = slicc_browsers::catalog();
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        let host_os = match os {
+            "darwin" => HostOs::Macos,
+            "windows" => HostOs::Windows,
+            _ => HostOs::Linux,
+        };
+        let home = if os == "windows" {
+            r"C:\corpus-home"
+        } else {
+            "/corpus-home"
+        };
+        let supported = [
+            slicc_browsers::corpus::NEED_USER_DATA_DIRS,
+            slicc_browsers::corpus::NEED_PROFILES,
+            slicc_browsers::corpus::NEED_FLAG,
+            slicc_browsers::corpus::NEED_PROCESS,
+            slicc_browsers::corpus::NEED_INSTALLED,
+        ];
+        let mut ran = 0;
+        for case in slicc_browsers::corpus::corpus().cases {
+            if !case.runs(os, &supported) {
+                continue;
+            }
+            ran += 1;
+            let getenv = |key: &str| case.input.env.get(key).cloned();
+            let layout = slicc_browsers::corpus::Layout {
+                os,
+                home,
+                env: &getenv,
+                catalog: &catalog,
+            };
+            let file_map: BTreeMap<String, String> = case.files(&layout).into_iter().collect();
+            let flags = case.cdp(&layout);
+            let flag_refs: Vec<&str> = flags.iter().map(String::as_str).collect();
+            let installed_rows = expand_corpus_values(&layout, &case.input.installed);
+            let installed = if installed_rows.is_empty() {
+                None
+            } else {
+                Some(installed_rows.as_slice())
+            };
+            let process_text = if os == "windows" {
+                case.cim_output(&layout, 8675309)
+            } else {
+                case.ps_output(&layout, 8675309)
+            };
+            let http = |url: &str| corpus_http(&case, url);
+            let read = |path: &str| file_map.get(path).cloned();
+            let list_dir = |path: &str| corpus_children(&file_map, path);
+            let launch = LaunchQuery {
+                os: host_os,
+                bundles: &|_| Vec::new(),
+                exists: &|_| false,
+                chrome_path: None,
+                local_app_data: None,
+                program_files: None,
+                program_files_x86: None,
+            };
+            let io = ListIo {
+                scan_host: true,
+                os: host_os,
+                home: Some(home),
+                xdg_config_home: case.input.env.get("XDG_CONFIG_HOME").map(String::as_str),
+                appdata: case.input.env.get("APPDATA").map(String::as_str),
+                process_text: &process_text,
+                windows_processes: os == "windows",
+                self_pid: 8675309,
+                launch,
+                http: &http,
+                read: &read,
+                list_dir: &list_dir,
+                targets: &|_| Err(()),
+                flag_urls: &flag_refs,
+                installed,
+            };
+            let output = assemble(&list_invocation(None, true), None, &io);
+            assert_eq!(output.code, 0, "{}: {}", case.name, output.stderr);
+            let actual: Value = serde_json::from_str(output.stdout.trim()).unwrap_or_else(|err| {
+                panic!("{}: {err}\n{}", case.name, output.stdout);
+            });
+            assert_eq!(actual, case.expected(&layout), "{}", case.name);
+        }
+        assert!(ran > 0);
+    }
+
+    fn corpus_http(case: &slicc_browsers::corpus::Case, url: &str) -> HttpResult {
+        let Some((_, rest)) = url.split_once("://") else {
+            return HttpResult::Transport;
+        };
+        let (hostport, path) = match rest.find('/') {
+            Some(index) => (&rest[..index], &rest[index..]),
+            None => (rest, "/"),
+        };
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        match case.http_get(hostport, path) {
+            None => HttpResult::Transport,
+            Some((status, body)) => HttpResult::Response { status, body },
+        }
+    }
+
+    fn corpus_children(files: &BTreeMap<String, String>, dir: &str) -> Vec<String> {
+        if dir.is_empty() {
+            return Vec::new();
+        }
+        let sep = if dir.contains('\\') && !dir.contains('/') {
+            '\\'
+        } else {
+            '/'
+        };
+        let prefix = format!("{}{sep}", dir.trim_end_matches(['/', '\\']));
+        let mut names = BTreeSet::new();
+        for path in files.keys() {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let name = rest.split(['/', '\\']).next().unwrap_or("");
+            if dir_name_ok(name) {
+                names.insert(name.to_string());
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    fn expand_corpus_values(
+        layout: &slicc_browsers::corpus::Layout<'_>,
+        rows: &[Value],
+    ) -> Vec<Value> {
+        rows.iter()
+            .map(|row| expand_corpus_value(layout, row))
+            .collect()
+    }
+
+    fn expand_corpus_value(layout: &slicc_browsers::corpus::Layout<'_>, value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(layout.expand(text)),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| expand_corpus_value(layout, item))
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, item)| (key.clone(), expand_corpus_value(layout, item)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
     }
 
     fn app_names(lines: &[String]) -> Vec<String> {
