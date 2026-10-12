@@ -37,6 +37,21 @@ struct Parts {
     path: String,
 }
 
+pub struct EndpointUrl {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, String> {
+    let parts = parse_url(url)?;
+    Ok(EndpointUrl {
+        scheme: parts.scheme,
+        host: parts.host,
+        port: parts.port,
+    })
+}
+
 pub fn http_get(url: &str) -> Result<HttpResponse, String> {
     let parts = parse_url(url)?;
     if parts.scheme != "http" && parts.scheme != "https" {
@@ -429,28 +444,46 @@ fn parse_url(url: &str) -> Result<Parts, String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("unsupported CDP URL \"{url}\"\n"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
+    let scheme = scheme.to_ascii_lowercase();
+    let cut = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..cut];
+    let path: String = if cut == rest.len() || rest.as_bytes()[cut] == b'#' {
+        "/".to_string()
+    } else if rest.as_bytes()[cut] == b'/' {
+        rest[cut..].to_string()
+    } else {
+        format!("/{}", &rest[cut..])
     };
-    let (host, port_text) = if let Some(host) = authority.strip_prefix('[') {
+    let hostport = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    if hostport.is_empty() {
+        return Err(format!("bad CDP URL \"{url}\"\n"));
+    }
+    let (host, port_text) = if let Some(host) = hostport.strip_prefix('[') {
         let end = host
             .find(']')
             .ok_or_else(|| format!("bad CDP URL \"{url}\"\n"))?;
         let host = &host[..end];
-        let after = &authority[end + 2..];
+        let after = &hostport[end + 2..];
+        if !after.is_empty() && !after.starts_with(':') {
+            return Err(format!("bad CDP URL \"{url}\"\n"));
+        }
         let port = after.strip_prefix(':');
         (host.to_string(), port.map(str::to_string))
-    } else if let Some((host, port)) = authority.rsplit_once(':') {
+    } else if let Some((host, port)) = hostport.rsplit_once(':') {
         if host.contains(':') {
-            (authority.to_string(), None)
+            (hostport.to_string(), None)
+        } else if port.is_empty() {
+            return Err(format!("bad port in CDP URL \"{url}\"\n"));
         } else {
             (host.to_string(), Some(port.to_string()))
         }
     } else {
-        (authority.to_string(), None)
+        (hostport.to_string(), None)
     };
-    let default_port = match scheme {
+    let default_port = match scheme.as_str() {
         "https" | "wss" => 443,
         _ => 80,
     };
@@ -463,9 +496,9 @@ fn parse_url(url: &str) -> Result<Parts, String> {
     if host.is_empty() {
         return Err(format!("bad CDP URL \"{url}\"\n"));
     }
-    let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+    let path = if path.is_empty() { "/".to_string() } else { path };
     Ok(Parts {
-        scheme: scheme.to_string(),
+        scheme,
         host,
         port,
         path,
@@ -761,6 +794,30 @@ mod tests {
         assert_eq!(parts.host, "127.0.0.1");
         assert_eq!(parts.port, 9222);
         assert_eq!(parts.path, "/devtools/browser/abc-def?x=1");
+    }
+
+    #[test]
+    fn userinfo_is_not_part_of_the_dial_host() {
+        let same = parse_url("http://evil.example@127.0.0.1:9222/json/version").unwrap();
+        assert_eq!(same.scheme, "http");
+        assert_eq!(same.host, "127.0.0.1");
+        assert_eq!(same.port, 9222);
+        assert_eq!(same.path, "/json/version");
+        let other = parse_url("http://127.0.0.1:9222@evil.example/json/version").unwrap();
+        assert_eq!(other.host, "evil.example");
+        assert_eq!(other.port, 80);
+        assert_eq!(other.path, "/json/version");
+        let v6 = parse_url("http://user@[::1]:9333/json/version").unwrap();
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.port, 9333);
+        let query = parse_url("http://127.0.0.1:9333?x=1").unwrap();
+        assert_eq!(query.host, "127.0.0.1");
+        assert_eq!(query.port, 9333);
+        assert_eq!(query.path, "/?x=1");
+        let published = parse_endpoint("HTTP://evil.example@127.0.0.1:9222").unwrap();
+        assert_eq!(published.scheme, "http");
+        assert_eq!(published.host, "127.0.0.1");
+        assert_eq!(published.port, 9222);
     }
 
     #[cfg(not(target_os = "wasi"))]
