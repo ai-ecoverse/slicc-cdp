@@ -780,12 +780,22 @@ fn profile_dir_name(name: &str) -> bool {
 }
 
 fn is_six_profile(path: &str) -> bool {
+    six_profile_path(path)
+        || std::fs::canonicalize(path)
+            .ok()
+            .and_then(|full| full.to_str().map(six_profile_path))
+            .unwrap_or(false)
+}
+
+fn six_profile_path(path: &str) -> bool {
     let parts = path_parts(path);
+    let prefix = "browser-coding-agent-chrome";
     parts.windows(2).any(|window| {
         window[0].eq_ignore_ascii_case("slicc") && window[1].eq_ignore_ascii_case("profiles")
-    }) || parts
-        .iter()
-        .any(|part| part.starts_with("browser-coding-agent-chrome"))
+    }) || parts.iter().any(|part| {
+        part.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
 }
 
 fn under_seven_profiles(path: &str) -> bool {

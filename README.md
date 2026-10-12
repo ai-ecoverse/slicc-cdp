@@ -64,6 +64,6 @@ curlwright --cdp http://127.0.0.1:9333 https://example.com/
 curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ```
 
-`playwright-cli list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser. `playwright-cli list --json` prints one JSON document and no text sections.
+`playwright-cli list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. `connected` includes an explicit `--cdp` or `SLICC_CDP_URL` browser and each live `DevToolsActivePort`. It does not launch a browser. `playwright-cli list --json` prints one JSON document and no text sections. A child of `seven-profiles` is a `profile`. A default user-data directory is a `browser`. `https://<label>.sliccy.ai:443/` counts as seven. Any other explicit port does not.
 
 `--cdp` still wins over `SLICC_CDP_URL`, which wins over a live `seven-profiles` DevToolsActivePort for `playwright-cli` and `curlwright`. The host never dials `127.0.0.1:9222-9229` unless `--cdp` or `SLICC_CDP_URL` names that URL. Node `connect()` requires `options.url` or `SLICC_CDP_URL` and does not dial port 9222 by itself. The wasm build still uses port 9222. A crate installed from crates.io prints its crate version. In this repository, and in the npm wasm builds, `--version` prints the `package.json` version. The release workflow writes that version into the crate manifests before `cargo publish`, and only after semantic-release has published the npm package. Git keeps the crate versions at `0.0.0`.

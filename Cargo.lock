@@ -398,6 +398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -446,11 +447,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
+name = "slicc-browsers"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afbc2a9dc62303a0844dd5fe4f7e8ec20b95d7db646efd4ca31e252ced131958"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "slicc-cdp"
 version = "0.0.0"
 dependencies = [
  "image",
  "serde_json",
+ "slicc-browsers",
  "slicc-cdp-client",
 ]
 
