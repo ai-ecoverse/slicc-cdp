@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createNodeKernel } from '@ai-ecoverse/slicc-kernel/node';
@@ -15,6 +16,32 @@ const manifest = JSON.stringify({
     },
   },
 });
+
+function hostHome() {
+  if (process.platform === 'win32' && process.env.USERPROFILE) return process.env.USERPROFILE;
+  if (process.env.HOME) return process.env.HOME;
+  return process.env.USERPROFILE || '';
+}
+
+function hostConfigDir() {
+  const home = hostHome();
+  if (process.platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support');
+  }
+  if (process.platform === 'win32') {
+    if (process.env.APPDATA) return process.env.APPDATA;
+    return path.join(home, 'AppData', 'Roaming');
+  }
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg?.startsWith('/')) return xdg;
+  return path.join(home, '.config');
+}
+
+async function hostSessionFile(cwd) {
+  const canonical = await realpath(cwd);
+  const key = createHash('sha256').update(canonical).digest('hex');
+  return path.join(hostConfigDir(), 'slicc', 'playwright-cli', 'sessions', `${key}.json`);
+}
 
 export function runProcess(file, args, cwd, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
@@ -64,9 +91,9 @@ export function nativeRunner(playwright, curlwright, wsUrl) {
       return readFile(path.join(cwd, name));
     },
     async clearSession(cwd) {
-      const dir = path.join(cwd, '.playwright-cli');
-      await mkdir(dir, { recursive: true });
-      await writeFile(path.join(dir, 'session.json'), '{}\n');
+      const file = await hostSessionFile(cwd);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, '{}\n');
     },
     async close() {},
   };

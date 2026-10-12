@@ -125,6 +125,7 @@ pub fn create_target(
     }
     let (console, requests) = traced?;
     session::push_trace(state, &target_id, console, requests);
+    session::note_owned(state, &target_id);
     Ok(target_id)
 }
 

@@ -156,6 +156,7 @@ impl Drop for Started {
 pub struct Resolved {
     pub discover: String,
     pub started: Option<Started>,
+    pub from_probe: bool,
 }
 
 impl std::fmt::Debug for Resolved {
@@ -164,6 +165,7 @@ impl std::fmt::Debug for Resolved {
             .debug_struct("Resolved")
             .field("discover", &self.discover)
             .field("started", &self.started.is_some())
+            .field("from_probe", &self.from_probe)
             .finish()
     }
 }
@@ -224,7 +226,16 @@ fn remembered_endpoint_unreachable(message: &str) -> bool {
 pub fn remembered_endpoint() -> Option<String> {
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        crate::session::load().endpoint
+        let session = crate::session::load();
+        let endpoint = session.endpoint.as_deref()?;
+        let provenance = session.provenance.as_deref()?;
+        let body = if provenance == "probe" {
+            let list = crate::session::list_url(endpoint)?;
+            Some(http_body(&list).ok()?)
+        } else {
+            None
+        };
+        crate::session::reuse_saved(Some(endpoint), Some(provenance), body.as_deref())
     }
     #[cfg(any(test, target_arch = "wasm32"))]
     {
@@ -345,6 +356,7 @@ pub fn decide(
         Ok(()) => Ok(Resolved {
             discover: "http://127.0.0.1:9333/json/version".to_string(),
             started: None,
+            from_probe: false,
         }),
         Err(message) if message.starts_with("HTTP ") => Err(message),
         Err(_) => {
@@ -359,6 +371,7 @@ pub fn decide(
             Ok(Resolved {
                 discover,
                 started: Some(started),
+                from_probe: false,
             })
         }
     }
@@ -712,6 +725,11 @@ fn join_parts(windows: bool, parts: &[String]) -> String {
         out.push_str(&piece);
     }
     out
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub fn user_config_dir() -> String {
+    config_dir(&current_env())
 }
 
 fn config_dir(env: &HostEnv) -> String {
@@ -1297,7 +1315,7 @@ fn prepare_profile<F: ProfileFs>(
 }
 
 enum Route {
-    Attach { discover: String },
+    Attach { discover: String, from_probe: bool },
     Launch(SpawnPlan),
 }
 
@@ -1342,11 +1360,17 @@ fn attach_without_launch<F: ProfileFs>(
         .unwrap_or(Kind::Chromium);
     if let ProfilePick::Dir(dir) = choose_profile(request.command, request, env, kind, None)? {
         if let Some(discover) = live_port(&dir, windows, fs, probe)? {
-            return Ok(Route::Attach { discover });
+            return Ok(Route::Attach {
+                discover,
+                from_probe: false,
+            });
         }
     }
     if let Some(discover) = reuse_probed_browser(probe)? {
-        return Ok(Route::Attach { discover });
+        return Ok(Route::Attach {
+            discover,
+            from_probe: true,
+        });
     }
     Err(missing)
 }
@@ -1371,10 +1395,16 @@ fn route<F: ProfileFs>(
         Err(message) => return Err(message),
     };
     if let Some(discover) = live_port(&plan.user_data_dir, windows, fs, probe)? {
-        return Ok(Route::Attach { discover });
+        return Ok(Route::Attach {
+            discover,
+            from_probe: false,
+        });
     }
     if let Some(discover) = reuse_probed_browser(probe)? {
-        return Ok(Route::Attach { discover });
+        return Ok(Route::Attach {
+            discover,
+            from_probe: true,
+        });
     }
     prepare_profile(request.command, &plan.user_data_dir, windows, now_micros, fs)?;
     Ok(Route::Launch(plan))
@@ -1404,15 +1434,17 @@ fn drive<F: ProfileFs>(
         probe,
         fs,
     )? {
-        Route::Attach { discover } => Ok(Resolved {
+        Route::Attach { discover, from_probe } => Ok(Resolved {
             discover,
             started: None,
+            from_probe,
         }),
         Route::Launch(plan) => {
             spawn(&plan)?;
             Ok(Resolved {
                 discover: plan.user_data_dir,
                 started: None,
+                from_probe: false,
             })
         }
     }
@@ -1447,9 +1479,10 @@ fn host_open(request: &LaunchRequest) -> Result<Resolved, String> {
         &mut |url| http_body(url),
         &mut fs,
     )? {
-        Route::Attach { discover } => Ok(Resolved {
+        Route::Attach { discover, from_probe } => Ok(Resolved {
             discover,
             started: None,
+            from_probe,
         }),
         Route::Launch(plan) => launch_plan(request, &plan),
     }
@@ -1510,6 +1543,7 @@ fn launch_plan(request: &LaunchRequest, plan: &SpawnPlan) -> Result<Resolved, St
     Ok(Resolved {
         discover,
         started: Some(started),
+        from_probe: false,
     })
 }
 
@@ -2754,6 +2788,7 @@ mod tests {
         assert_eq!(seen.len(), slicc_browsers::catalog().discovery.probe_ports.len());
         assert!(seen.iter().all(|url| url.ends_with("/json/version")));
         assert_eq!(resolved.discover, chrome_dir(&host));
+        assert!(!resolved.from_probe);
         assert!(!resolved.discover.contains("9222"));
     }
 
@@ -2785,6 +2820,7 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.started.is_none());
+        assert!(resolved.from_probe);
         assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
         assert_eq!(
             seen,
@@ -2828,6 +2864,7 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.started.is_none());
+        assert!(resolved.from_probe);
         assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
         assert_eq!(
             seen,
@@ -2898,6 +2935,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.discover, "http://127.0.0.1:9400/json/version");
+        assert!(!resolved.from_probe);
         assert_eq!(seen, vec!["http://127.0.0.1:9400/json/version".to_string()]);
         assert!(fs.0.borrow().writes.is_empty());
     }

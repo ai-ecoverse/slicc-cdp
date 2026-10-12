@@ -308,6 +308,11 @@ impl ScanFs for DiskFs {
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) fn user_config_dir() -> String {
+    config_dir(&current_env())
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 fn current_env() -> HostEnv {
     HostEnv {
         platform: host_platform(),

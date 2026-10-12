@@ -45,11 +45,15 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         launch::remembered_endpoint()
     };
     let mut from_memory = remembered.is_some();
-    let active = profile.or(remembered);
+    let active = profile.clone().or(remembered);
     let mut started = None;
+    let mut from_probe = false;
     let mut start = if active.is_none() && launch::should_launch(command, explicit) {
         match start_by_launching(command, &invocation.flags, &mut started) {
-            Ok(start) => start,
+            Ok((start, probed)) => {
+                from_probe = probed;
+                start
+            }
             Err(message) => return Output::err(message),
         }
     } else {
@@ -58,7 +62,10 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             Err(_) if from_memory && launch::should_launch(command, false) => {
                 from_memory = false;
                 match start_by_launching(command, &invocation.flags, &mut started) {
-                    Ok(start) => start,
+                    Ok((start, probed)) => {
+                        from_probe = probed;
+                        start
+                    }
                     Err(message) => return Output::err(message),
                 }
             }
@@ -68,8 +75,10 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let mut opened = cdp::open(start.clone(), runtime.as_deref());
     if let Err(message) = &opened {
         if from_memory && launch::retry_open_without_endpoint(command, message) {
+            from_memory = false;
             match start_by_launching(command, &invocation.flags, &mut started) {
-                Ok(next) => {
+                Ok((next, probed)) => {
+                    from_probe = probed;
                     start = next;
                     opened = cdp::open(start.clone(), runtime.as_deref());
                 }
@@ -86,7 +95,25 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load();
-    state.endpoint = Some(endpoint);
+    let loaded_kind = state.provenance.clone();
+    match saved_provenance(
+        explicit,
+        profile.is_some(),
+        from_memory,
+        from_probe,
+        &endpoint,
+        loaded_kind.as_deref(),
+    ) {
+        Some(kind) => {
+            state.endpoint = Some(endpoint);
+            state.provenance = Some(kind);
+        }
+        None if explicit || !cfg!(target_arch = "wasm32") => {
+            state.endpoint = None;
+            state.provenance = None;
+        }
+        None => {}
+    }
     let mut report = action::Report::for_command(command);
     let result = match command {
         "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report, &mut started),
@@ -120,10 +147,57 @@ fn start_by_launching(
     command: &str,
     flags: &BTreeMap<String, String>,
     started: &mut Option<Started>,
-) -> Result<connect::Start, String> {
+) -> Result<(connect::Start, bool), String> {
     let resolved = launch::resolve_without_endpoint(command, flags)?;
+    let from_probe = resolved.from_probe;
     *started = resolved.started;
-    Ok(connect::Start::Discover(resolved.discover))
+    Ok((connect::Start::Discover(resolved.discover), from_probe))
+}
+
+fn saved_provenance(
+    explicit: bool,
+    profile: bool,
+    from_memory: bool,
+    from_probe: bool,
+    endpoint: &str,
+    loaded: Option<&str>,
+) -> Option<String> {
+    if cfg!(target_arch = "wasm32") && !explicit {
+        return None;
+    }
+    if !session::loopback_url(endpoint) {
+        return None;
+    }
+    if explicit {
+        return Some("explicit".to_string());
+    }
+    if profile {
+        return Some("seven-profile".to_string());
+    }
+    if from_memory {
+        return loaded
+            .filter(|kind| session::known_provenance(kind))
+            .map(str::to_string);
+    }
+    if from_probe {
+        return Some("probe".to_string());
+    }
+    Some("seven-profile".to_string())
+}
+
+fn visible_pages(cdp: &mut Cdp, state: &Session) -> Result<Vec<PageInfo>, String> {
+    let pages = browser::list_pages(cdp)?;
+    Ok(pages
+        .into_iter()
+        .filter(|page| {
+            session::page_visible(
+                state.provenance.as_deref(),
+                &page.url,
+                &page.target_id,
+                &state.owned,
+            )
+        })
+        .collect())
 }
 
 fn deferred_flag(invocation: &Invocation) -> Option<String> {
@@ -179,7 +253,7 @@ fn cmd_close(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -213,7 +287,7 @@ fn cmd_goto(
         return Output::err("goto requires a URL\n");
     };
     report.url(url.as_str());
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -240,7 +314,7 @@ fn cmd_goto(
 }
 
 fn cmd_tab_list(cdp: &mut Cdp, state: &Session) -> Output {
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -285,7 +359,7 @@ fn cmd_tab_select(
     if index == 0 {
         return Output::err("tab-select index must be a positive integer\n");
     }
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -316,7 +390,7 @@ fn cmd_snapshot(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -469,7 +543,7 @@ fn cmd_type(
     let text = invocation.positionals.join(" ");
     report.length(text.chars().count());
     let submit = flag_true(&invocation.flags, "submit");
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -513,7 +587,7 @@ fn cmd_press(
         return Output::err("press requires a key name\n");
     };
     report.key(key.as_str());
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -546,7 +620,7 @@ fn cmd_screenshot(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -642,7 +716,7 @@ fn cmd_eval(
         return Output::err("eval requires an expression\n");
     }
     let expression = invocation.positionals.join(" ");
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -726,7 +800,7 @@ fn with_ref(
     id: &str,
     body: impl FnOnce(&mut Cdp, &str, &RefRec) -> Result<String, String>,
 ) -> Output {
-    let pages = match browser::list_pages(cdp) {
+    let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -881,7 +955,7 @@ fn current_target(
     invocation: &Invocation,
     state: &mut Session,
 ) -> Result<String, String> {
-    let pages = browser::list_pages(cdp)?;
+    let pages = visible_pages(cdp, state)?;
     resolve_target(cdp, invocation, state, &pages, false)
 }
 

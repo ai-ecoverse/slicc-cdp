@@ -5,3 +5,4 @@ artifacts/
 test/unit/
 target/
 bin/*.wasm
+.playwright-cli/
