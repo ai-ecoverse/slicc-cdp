@@ -35,7 +35,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         None
     } else {
         match launch::attached_port() {
-            Ok(active) => active,
+            Ok(active) => active.or_else(launch::remembered_endpoint),
             Err(message) => return Output::err(message),
         }
     };
@@ -54,12 +54,16 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             Err(message) => return Output::err(message),
         }
     };
+    let endpoint = match &start {
+        connect::Start::Direct(url) | connect::Start::Discover(url) => url.clone(),
+    };
     let connected = match cdp::open(start, runtime.as_deref()) {
         Ok(cdp) => cdp,
         Err(message) => return Output::err(message),
     };
     let mut cdp = connected;
     let mut state = session::load();
+    state.endpoint = Some(endpoint);
     let mut report = action::Report::for_command(command);
     let result = match command {
         "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report, &mut started),

@@ -208,6 +208,17 @@ pub fn start_after_explicit(
     Err("playwright-cli: no debugger is connected\n".to_string())
 }
 
+pub fn remembered_endpoint() -> Option<String> {
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    {
+        crate::session::load().endpoint
+    }
+    #[cfg(any(test, target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 pub fn attached_port() -> Result<Option<String>, String> {
     #[cfg(any(test, target_arch = "wasm32"))]
     {
@@ -3579,6 +3590,7 @@ mod tests {
     #[test]
     fn explicit_endpoints_win_and_tests_do_not_scan() {
         assert_eq!(attached_port().unwrap(), None);
+        assert!(remembered_endpoint().is_none());
         let active = "http://127.0.0.1:9444/json/version".to_string();
         assert_eq!(
             start_after_explicit(Some("http://127.0.0.1:9333"), None, Some(active.clone()))
