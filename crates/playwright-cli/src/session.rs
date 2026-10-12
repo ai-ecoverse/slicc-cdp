@@ -73,6 +73,7 @@ pub fn load_at(path: &Path) -> Session {
     let Ok(text) = fs::read_to_string(path) else {
         return Session::default();
     };
+    private_file(path);
     decode(&text)
 }
 
@@ -304,6 +305,7 @@ pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
             .mode(0o600)
             .open(path)
             .map_err(|err| format!("session: {err}\n"))?;
+        private_file(path);
         file.write_all(body.as_bytes())
             .map_err(|err| format!("session: {err}\n"))?;
         return Ok(());
@@ -376,35 +378,26 @@ pub fn page_visible(provenance: Option<&str>, url: &str, id: &str, owned: &[Stri
     crate::discover::seven_origin(url) || owned.iter().any(|item| item == id)
 }
 
+fn private_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 pub fn loopback_url(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(endpoint) = cdp_client::net::parse_endpoint(url) else {
         return false;
     };
-    if !matches!(
-        scheme.to_ascii_lowercase().as_str(),
-        "http" | "https" | "ws" | "wss"
-    ) {
+    if !matches!(endpoint.scheme.as_str(), "http" | "https" | "ws" | "wss") {
         return false;
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return false;
-    }
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(stripped) = hostport.strip_prefix('[') {
-        let Some(end) = stripped.find(']') else {
-            return false;
-        };
-        stripped[..end].to_ascii_lowercase()
-    } else if let Some((name, port)) = hostport.rsplit_once(':') {
-        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
-            name.to_ascii_lowercase()
-        } else {
-            hostport.to_ascii_lowercase()
-        }
-    } else {
-        hostport.to_ascii_lowercase()
-    };
+    let host = endpoint.host.to_ascii_lowercase();
     host == "localhost" || host == "::1" || ipv4_loopback(&host)
 }
 
@@ -643,6 +636,18 @@ mod tests {
         assert!(usable_endpoint(Some("http://127.0.0.1:9333/json/version"), Some("planted")).is_none());
         assert!(loopback_url("http://127.8.8.8:9222/json/version"));
         assert!(!loopback_url("http://10.0.0.1/json/version"));
+        let disguised = "http://evil.example@127.0.0.1:9222/json/version";
+        let parsed = cdp_client::net::parse_endpoint(disguised).unwrap();
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 9222);
+        assert!(loopback_url(disguised));
+        let remote = "http://127.0.0.1:9222@evil.example/json/version";
+        let parsed = cdp_client::net::parse_endpoint(remote).unwrap();
+        assert_eq!(parsed.host, "evil.example");
+        assert!(!loopback_url(remote));
+        assert!(usable_endpoint(Some(remote), Some("explicit")).is_none());
+        assert!(loopback_url("http://user@[::1]:9333/json/version"));
+        assert!(loopback_url("http://127.0.0.1:9333?x=1"));
         assert_eq!(
             list_url("http://127.0.0.1:9333/json/version").as_deref(),
             Some("http://127.0.0.1:9333/json/list")
@@ -703,6 +708,13 @@ mod tests {
         assert_eq!(file_mode, 0o600);
         assert_eq!(dir_mode, 0o700);
         assert_eq!(parent_mode, 0o700);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+        write_at(&path, &session).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let _ = load_at(&path);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let loaded = load_at(&path);
         assert_eq!(loaded.provenance.as_deref(), Some("probe"));
         assert_eq!(loaded.owned, vec!["OWN".to_string()]);
