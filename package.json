@@ -61,7 +61,7 @@
     "release": "semantic-release"
   },
   "devDependencies": {
-    "@ai-ecoverse/slicc-kernel": "1.64.0",
+    "@ai-ecoverse/slicc-kernel": "1.64.1",
     "@ai-ecoverse/slicc-shared-web": "1.13.0",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.1.17",
