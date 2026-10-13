@@ -1084,6 +1084,82 @@ mod tests {
             raw.close(&target);
         }
 
+        let hits = |raw: &mut Raw, scratch: &str| -> u64 {
+            let probe = raw.session(scratch);
+            raw.eval(&probe, &format!("fetch({}).then((r) => r.text())", json!(format!("{app}/hits?path=/api/leak"))))
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0)
+        };
+        let scratch = raw.create(&format!("{app}/one"));
+        std::thread::sleep(Duration::from_millis(500));
+
+        {
+            let leak = format!("{app}/api/leak");
+            let before = hits(&mut raw, &scratch);
+            let (target, session) = page_on(&mut cdp, "about:blank");
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let record = seen.clone();
+            let refresh = format!("{app}/refresh-leak");
+            let landing = format!("{vault}/landing?leak={}", url::form_urlencoded::byte_serialize(leak.as_bytes()).collect::<String>());
+            crate::fetch::enable(&mut cdp, &session, &[Pattern::request("*")]).unwrap();
+            cdp.set_decider(
+                &session,
+                Some(Box::new(move |paused: &crate::fetch::Paused| {
+                    record.borrow_mut().push(paused.url.clone());
+                    if paused.url.contains("refresh-leak") {
+                        let body = format!("<!doctype html><meta http-equiv=\"refresh\" content=\"0;url={landing}\">");
+                        return Decision::Fulfill(Fulfill::html(200, body));
+                    }
+                    Decision::default()
+                })),
+            );
+            let _ = cdp.notify("Page.navigate", json!({ "url": refresh }), Some(&session));
+            until_blocked(&mut cdp, &session);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+            }
+            assert!(seen.borrow().iter().any(|url| url.contains("refresh-leak")));
+            assert!(seen.borrow().iter().all(|url| !url.contains("leak") || url.contains("refresh-leak")), "{:?}", seen.borrow());
+            assert_eq!(hits(&mut raw, &scratch), before, "the vault page ran and sent its request");
+            nothing_mentions(&cdp, "LEAKKEY");
+            raw.close(&target);
+        }
+
+        {
+            let idp = live("SLICC_FETCH_LIVE_IDP");
+            let leak = format!("{app}/api/leak");
+            let before = hits(&mut raw, &scratch);
+            let mut slipped = Cdp::connect(&ws).unwrap();
+            let (target, session) = page_on(&mut slipped, &format!("{idp}/landing"));
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let record = seen.clone();
+            crate::fetch::enable(&mut slipped, &session, &[Pattern::request("*")]).unwrap();
+            slipped.set_decider(
+                &session,
+                Some(Box::new(move |paused: &crate::fetch::Paused| {
+                    record.borrow_mut().push(paused.url.clone());
+                    Decision::default()
+                })),
+            );
+            let origin = idp.trim_end_matches('/').to_string();
+            slipped.protect_origins(&[origin.as_str()]);
+            let page = raw.session(&target);
+            raw.eval(&page, &format!("fetch({}, {{ headers: {{ Authorization: 'Bearer LEAKKEY' }} }}).catch(() => {{}}), true", json!(leak)));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let _ = slipped.pump(Instant::now() + Duration::from_millis(100));
+            }
+            assert!(seen.borrow().iter().all(|url| !url.contains("api/leak")), "{:?}", seen.borrow());
+            assert_eq!(hits(&mut raw, &scratch), before + 1, "the request was not continued unchanged");
+            nothing_mentions(&slipped, "LEAKKEY");
+            nothing_mentions(&slipped, "api/leak");
+            raw.close(&target);
+        }
+        raw.close(&scratch);
+
         nothing_mentions(&cdp, "SECRETKEY");
         nothing_mentions(&cdp, "COOKIESECRET");
         raw.close(&seven_tab);

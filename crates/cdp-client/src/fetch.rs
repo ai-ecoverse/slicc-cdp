@@ -932,6 +932,103 @@ mod tests {
         assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.failRequest"]);
     }
 
+    fn panic_decider() -> Option<crate::cdp::Decider> {
+        Some(Box::new(|paused: &Paused| {
+            panic!("the agent saw {} paused", paused.url)
+        }))
+    }
+
+    #[test]
+    fn a_tab_that_commits_seven_stops_intercepting_and_hands_out_nothing() {
+        let mut leak = paused_event("S", "R1", "https://api.model.example/v1/chat");
+        leak["params"]["resourceType"] = json!("Fetch");
+        let (mut cdp, log) = fake(
+            vec![
+                json!({
+                    "method": "Page.frameNavigated",
+                    "sessionId": "S",
+                    "params": { "frame": { "id": "F", "url": "https://seven.sliccy.ai/os/", "securityOrigin": "https://seven.sliccy.ai" } }
+                }),
+                leak,
+                json!({
+                    "method": "Network.requestWillBeSent",
+                    "sessionId": "S",
+                    "params": { "requestId": "N1", "documentURL": "https://seven.sliccy.ai/os/", "request": { "url": "https://api.model.example/v1/chat", "headers": { "Authorization": "Bearer KEY" } } }
+                }),
+            ],
+            Box::new(|message| vec![ok(message)]),
+        );
+        cdp.set_decider("S", panic_decider());
+        while cdp.pump(Instant::now() + Duration::from_millis(10)).unwrap() {}
+        assert!(cdp.session_blocked("S"));
+        assert_eq!(
+            methods(&log),
+            ["Fetch.disable", "Target.detachFromTarget", "Fetch.continueRequest"]
+        );
+        assert!(log.borrow()[2]["params"].get("headers").is_none());
+        assert!(cdp.events().is_empty(), "{:?}", cdp.events());
+        assert!(cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap_err().starts_with("slicc: refused"));
+    }
+
+    #[test]
+    fn a_worker_attaches_without_a_page_guard_and_a_page_without_page_domains_still_does() {
+        let (mut cdp, log) = fake(
+            Vec::new(),
+            Box::new(|message| match message["method"].as_str().unwrap() {
+                "Target.getTargetInfo" => {
+                    let kind = if message["params"]["targetId"] == "W" { "service_worker" } else { "page" };
+                    vec![json!({ "id": message["id"], "result": { "targetInfo": { "targetId": message["params"]["targetId"], "type": kind, "url": "https://app.example/sw.js" } } })]
+                }
+                "Target.attachToTarget" => {
+                    vec![json!({ "id": message["id"], "result": { "sessionId": format!("S{}", message["id"]) } })]
+                }
+                "Page.enable" | "Runtime.enable" => vec![json!({ "id": message["id"], "error": { "message": "'Page.enable' wasn't found" } })],
+                _ => vec![ok(message)],
+            }),
+        );
+        crate::cdp::attach(&mut cdp, "W").unwrap();
+        assert_eq!(methods(&log), ["Target.getTargetInfo", "Target.attachToTarget"]);
+        crate::cdp::attach(&mut cdp, "P").unwrap();
+        assert!(methods(&log).contains(&"Network.setBypassServiceWorker".to_string()));
+    }
+
+    #[test]
+    fn requests_from_a_protected_frame_or_referrer_are_continued_unseen() {
+        let mut framed = paused_event("S", "R1", "https://api.example/a");
+        framed["params"]["frameId"] = json!("CHILD");
+        framed["params"]["resourceType"] = json!("XHR");
+        let mut referred = paused_event("S", "R2", "https://api.example/b");
+        referred["params"]["frameId"] = json!("OTHER");
+        referred["params"]["resourceType"] = json!("XHR");
+        referred["params"]["request"]["headers"] = json!({ "Referer": "https://vault.sliccy.ai/unlock" });
+        let mut plain = paused_event("S", "R3", "https://api.example/c");
+        plain["params"]["frameId"] = json!("OTHER");
+        plain["params"]["resourceType"] = json!("XHR");
+        let (mut cdp, log) = fake(
+            vec![
+                json!({
+                    "method": "Page.frameNavigated",
+                    "sessionId": "S",
+                    "params": { "frame": { "id": "CHILD", "parentId": "MAIN", "url": "https://vault.sliccy.ai/frame" } }
+                }),
+                framed,
+                referred,
+                plain,
+            ],
+            Box::new(|message| vec![ok(message)]),
+        );
+        let got = cdp.next_paused(Some("S"), Duration::from_millis(50)).unwrap().unwrap();
+        assert_eq!(got.request_id, "R3");
+        let continued: Vec<String> = log
+            .borrow()
+            .iter()
+            .filter(|item| item["method"] == "Fetch.continueRequest")
+            .map(|item| item["params"]["requestId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(continued, ["R1", "R2"]);
+        assert!(cdp.call("Fetch.getResponseBody", json!({ "requestId": "R1" }), Some("S")).is_err());
+    }
+
     #[test]
     fn enable_refuses_protected_patterns_and_browser_wide_interception() {
         let (mut cdp, log) = fake(Vec::new(), Box::new(|message| vec![ok(message)]));
@@ -1095,6 +1192,8 @@ mod tests {
                 "Fetch.enable",
                 "Network.enable",
                 "Network.setBypassServiceWorker",
+                "Page.enable",
+                "Runtime.enable",
                 "Fetch.enable",
                 "Fetch.getResponseBody",
                 "Fetch.fulfillRequest",

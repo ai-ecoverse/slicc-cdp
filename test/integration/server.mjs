@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 
 const documents = new Set(['/', '/one', '/two', '/page', '/other']);
+const hits = new Map();
 
 export function startServer() {
   const server = createServer((req, res) => {
@@ -31,6 +32,11 @@ function answer(req, res, pathname, body) {
   const query = new URL(req.url || '/', 'http://127.0.0.1').searchParams;
   if (pathname === '/authorize') return redirect(res, query.get('to') || '/');
   if (pathname === '/js-redirect') return html(res, jsRedirect(query.get('to') || '/'));
+  hits.set(pathname, (hits.get(pathname) ?? 0) + 1);
+  if (pathname === '/hits') return text(res, 200, String(hits.get(query.get('path')) ?? 0));
+  if (pathname === '/api/leak')
+    return text(res, 200, 'leaked', { 'access-control-allow-origin': '*' });
+  if (pathname === '/landing' && query.get('leak')) return html(res, leakPage(query.get('leak')));
   if (pathname === '/cb' || pathname === '/landing') return html(res, fixture('Callback'));
   if (pathname === '/ping') return text(res, 200, 'pong', { 'access-control-allow-origin': '*' });
   if (pathname === '/blocked') return text(res, 200, 'not-blocked');
@@ -55,6 +61,10 @@ function answer(req, res, pathname, body) {
 function redirect(res, to) {
   res.writeHead(302, { location: to, 'content-type': 'text/plain' });
   res.end('moved');
+}
+
+function leakPage(to) {
+  return `<!doctype html><title>Leak</title><script>fetch(${JSON.stringify(to)}, { headers: { Authorization: 'Bearer LEAKKEY' } }).catch(() => {})</script>`;
 }
 
 function jsRedirect(to) {

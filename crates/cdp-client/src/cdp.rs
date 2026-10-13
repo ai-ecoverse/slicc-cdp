@@ -48,6 +48,7 @@ pub struct Cdp {
     streams: BTreeSet<String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
+    frames: BTreeMap<String, Vec<String>>,
 }
 
 impl Cdp {
@@ -76,6 +77,7 @@ impl Cdp {
             streams: BTreeSet::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
+            frames: BTreeMap::new(),
         }
     }
 
@@ -423,6 +425,9 @@ impl Cdp {
             Err(_) if frame => return Ok(false),
             Err(message) => return Err(message),
         };
+        if info.is_object() {
+            self.targets.insert(target_id.to_string(), info.clone());
+        }
         let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let opener = match info
             .get("openerId")
@@ -493,6 +498,28 @@ impl Cdp {
         if target_id.is_empty() || self.guards.contains_key(target_id) {
             return Ok(());
         }
+        let kind = match self.targets.get(target_id) {
+            Some(info) => info.get("type").and_then(|v| v.as_str()).map(str::to_string),
+            None => self
+                .raw_call(
+                    "Target.getTargetInfo",
+                    json!({ "targetId": target_id }),
+                    None,
+                    Duration::from_secs(10),
+                )
+                .ok()
+                .and_then(|info| {
+                    info.pointer("/targetInfo/type")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                }),
+        };
+        if kind
+            .as_deref()
+            .is_some_and(|kind| !matches!(kind, "page" | "iframe" | "background_page" | "webview" | "other"))
+        {
+            return Ok(());
+        }
         if !self.discovering {
             self.raw_call(
                 "Target.setDiscoverTargets",
@@ -525,12 +552,16 @@ impl Cdp {
             ),
             ("Network.enable", json!({})),
             ("Network.setBypassServiceWorker", json!({ "bypass": true })),
+            ("Page.enable", json!({})),
+            ("Runtime.enable", json!({})),
         ];
         for (method, params) in setup {
-            if self
-                .raw_call(method, params, Some(&session), Duration::from_secs(10))
-                .is_err()
-            {
+            let optional = matches!(method, "Page.enable" | "Runtime.enable");
+            let failed = match self.raw_call(method, params, Some(&session), Duration::from_secs(10)) {
+                Ok(_) => false,
+                Err(message) => !(optional && message.starts_with(&format!("{method}:"))),
+            };
+            if failed {
                 self.guards.remove(target_id);
                 let _ = self.raw_call(
                     "Target.detachFromTarget",
@@ -560,11 +591,59 @@ impl Cdp {
                 self.paused.push_back(paused);
             }
         }
+        let _ = self.send("Fetch.disable", json!({}), Some(session_id));
         let _ = self.send(
             "Target.detachFromTarget",
             json!({ "sessionId": session_id }),
             None,
         );
+    }
+
+    fn session_target(&self, session_id: &str) -> Option<String> {
+        self.session_targets.get(session_id).cloned().or_else(|| {
+            self.guards
+                .iter()
+                .find(|(_, guard)| guard.as_str() == session_id)
+                .map(|(target, _)| target.clone())
+        })
+    }
+
+    fn committed_protected(&mut self, session_id: &str) {
+        match self.session_target(session_id) {
+            Some(target) => self.protect_target(&target),
+            None => self.block(session_id),
+        }
+        if !self.guard_sessions.contains(session_id) {
+            self.block(session_id);
+        }
+    }
+
+    fn frame_protected(&self, frame_id: &str) -> bool {
+        if frame_id.is_empty() {
+            return false;
+        }
+        self.protected_targets.contains(frame_id)
+            || self
+                .frames
+                .get(frame_id)
+                .is_some_and(|known| known.iter().any(|url| self.guard.url(url)))
+    }
+
+    fn initiated_by_protected(&self, paused: &Paused) -> bool {
+        if self.frame_protected(&paused.frame_id) {
+            return true;
+        }
+        if self
+            .session_target(&paused.session_id)
+            .is_some_and(|target| self.protected_targets.contains(&target))
+        {
+            return true;
+        }
+        ["referer", "origin"].iter().any(|name| {
+            paused
+                .header(name)
+                .is_some_and(|value| value != "null" && self.guard.url(value))
+        })
     }
 
     fn protect_target(&mut self, target_id: &str) {
@@ -613,7 +692,18 @@ impl Cdp {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         if let Some(id) = params.get("requestId").and_then(|v| v.as_str()) {
             if let Some(url) = shield::request_url(&params) {
-                let protected = self.guard.url(&url) || self.guard.url(&shield::web_socket_as_http(&url));
+                let initiator = ["documentURL"]
+                    .iter()
+                    .filter_map(|key| params.get(*key).and_then(|v| v.as_str()))
+                    .chain(params.pointer("/initiator/url").and_then(|v| v.as_str()))
+                    .any(|text| self.guard.url(text))
+                    || params
+                        .get("frameId")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|frame| self.frame_protected(frame));
+                let protected = initiator
+                    || self.guard.url(&url)
+                    || self.guard.url(&shield::web_socket_as_http(&url));
                 let entry = self.requests.entry(id.to_string()).or_insert(false);
                 *entry = *entry || protected;
             }
@@ -630,9 +720,13 @@ impl Cdp {
                 let origin = frame
                     .get("securityOrigin")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if frame.get("parentId").is_none() && (self.guard.url(&url) || self.guard.url(origin)) {
-                    self.block(&session);
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(id) = frame.get("id").and_then(|v| v.as_str()) {
+                    self.frames.insert(id.to_string(), vec![url.clone(), origin.clone()]);
+                }
+                if frame.get("parentId").is_none() && (self.guard.url(&url) || self.guard.url(&origin)) {
+                    self.committed_protected(&session);
                 }
             }
             "Runtime.executionContextCreated" => {
@@ -645,8 +739,16 @@ impl Cdp {
                     .pointer("/context/auxData/isDefault")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                if let Some(frame) = params.pointer("/context/auxData/frameId").and_then(|v| v.as_str()) {
+                    if default {
+                        self.frames
+                            .entry(frame.to_string())
+                            .or_default()
+                            .push(origin.to_string());
+                    }
+                }
                 if default && self.guard.url(origin) {
-                    self.block(&session);
+                    self.committed_protected(&session);
                 }
             }
             "Target.targetCreated" | "Target.targetInfoChanged" => {
@@ -864,10 +966,11 @@ impl Cdp {
                 return;
             };
             let protected = fetch::reaches_protected(&self.guard, &paused);
-            self.requests.insert(paused.request_id.clone(), protected);
+            let initiated = self.initiated_by_protected(&paused);
+            self.requests.insert(paused.request_id.clone(), protected || initiated);
             if let Some(network) = &paused.network_id {
                 let entry = self.requests.entry(network.clone()).or_insert(false);
-                *entry = *entry || protected;
+                *entry = *entry || protected || initiated;
             }
             if self.guard_sessions.contains(&paused.session_id) {
                 if protected && paused.resource_type == "Document" {
@@ -877,8 +980,12 @@ impl Cdp {
                 }
                 return;
             }
-            if self.blocked.contains(&paused.session_id) || protected {
+            if protected {
                 self.answer_protected(&paused);
+                return;
+            }
+            if self.blocked.contains(&paused.session_id) || initiated {
+                self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
             }
             if self.deciders.contains_key(&paused.session_id) {
