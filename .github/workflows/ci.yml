@@ -82,14 +82,17 @@ jobs:
           /tmp/test-bin/playwright-cli --version | grep "99.0.0"
           /tmp/test-bin/curlwright --version | grep "99.0.0"
 
-      - name: TLS handshake
+      - name: TLS verified HTTPS exchange
         run: |
           output=$(/tmp/test-bin/playwright-cli --cdp https://example.com/ list 2>&1) || true
-          if echo "$output" | grep -qi "certificate\|unable to get local issuer\|ssl.*handshake\|tls.*error"; then
-            echo "TLS certificate error detected:"
-            echo "$output"
-            exit 1
-          fi
+          echo "$output"
+          echo "$output" | grep -q "HTTP 404"
+
+      - name: TLS rejects invalid certificate
+        run: |
+          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ list 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
 
       - name: Tampered asset refusal
         run: |
@@ -216,14 +219,17 @@ jobs:
           /tmp/test-bin/playwright-cli --version | grep "99.0.0"
           /tmp/test-bin/curlwright --version | grep "99.0.0"
 
-      - name: TLS handshake
+      - name: TLS verified HTTPS exchange
         run: |
           output=$(/tmp/test-bin/playwright-cli --cdp https://example.com/ list 2>&1) || true
-          if echo "$output" | grep -qi "certificate\|unable to get local issuer\|ssl.*handshake\|tls.*error"; then
-            echo "TLS certificate error detected:"
-            echo "$output"
-            exit 1
-          fi
+          echo "$output"
+          echo "$output" | grep -q "HTTP 404"
+
+      - name: TLS rejects invalid certificate
+        run: |
+          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ list 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
 
       - name: Tampered asset refusal
         run: |
