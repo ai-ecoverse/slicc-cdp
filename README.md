@@ -38,6 +38,12 @@ Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on 
 
 ## Install and run
 
+```
+curl -fsSL https://github.com/ai-ecoverse/slicc-cdp/releases/latest/download/install.sh | sh
+```
+
+Flags: `sh -s -- --version 1.2.3 --dir /usr/local/bin --only playwright-cli`.
+
 `cargo install slicc-cdp` installs the `playwright-cli` command. `cargo install curlwright` installs `curlwright`. Host builds run on macOS, Linux, and Windows. TLS there is `native-tls` (Secure Transport, OpenSSL, or SChannel). The `slicc-cdp` crate needs Rust 1.88. `curlwright` and `slicc-cdp-client` need Rust 1.83.
 
 ```

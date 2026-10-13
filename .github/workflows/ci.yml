@@ -38,3 +38,217 @@ jobs:
           npx playwright-core install-deps chromium
           npx playwright-core install chromium
       - run: npm run test:integration
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: shellcheck -s sh install.sh
+
+  build-binaries:
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: "99.0.0"
+
+  installer-ubuntu:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: /tmp/serve
+          pattern: binaries-linux-amd64
+          merge-multiple: true
+
+      - name: Prepare assets
+        run: cd /tmp/serve && sha256sum * > SHA256SUMS
+
+      - name: Start server
+        run: |
+          python3 -m http.server 8399 --directory /tmp/serve &
+          sleep 1
+
+      - name: Install with curl
+        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Verify version output
+        run: |
+          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
+          /tmp/test-bin/curlwright --version | grep "99.0.0"
+
+      - name: TLS verified HTTPS exchange
+        run: |
+          output=$(/tmp/test-bin/playwright-cli --cdp https://example.com/ list 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "HTTP 404"
+
+      - name: TLS rejects invalid certificate
+        run: |
+          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ tab-list 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
+
+      - name: Tampered asset refusal
+        run: |
+          cp /tmp/serve/curlwright-linux-amd64 /tmp/serve/curlwright-linux-amd64.bak
+          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
+          printf "tampered" > /tmp/serve/curlwright-linux-amd64
+          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
+            echo "should have failed on tampered asset"
+            exit 1
+          fi
+          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
+          cp /tmp/serve/curlwright-linux-amd64.bak /tmp/serve/curlwright-linux-amd64
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Custom INSTALL_DIR
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+          /tmp/custom-dir/curlwright --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Idempotent re-run
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+          /tmp/custom-dir/curlwright --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+  installer-macos:
+    needs: build-binaries
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: /tmp/serve
+          pattern: binaries-darwin-arm64
+          merge-multiple: true
+
+      - name: Prepare assets
+        run: cd /tmp/serve && shasum -a 256 * > SHA256SUMS
+
+      - name: Start server
+        run: |
+          python3 -m http.server 8399 --directory /tmp/serve &
+          sleep 1
+
+      - name: Install with curl
+        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Verify version output
+        run: |
+          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
+          /tmp/test-bin/curlwright --version | grep "99.0.0"
+
+      - name: Tampered asset refusal
+        run: |
+          cp /tmp/serve/curlwright-darwin-arm64 /tmp/serve/curlwright-darwin-arm64.bak
+          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
+          printf "tampered" > /tmp/serve/curlwright-darwin-arm64
+          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
+            echo "should have failed on tampered asset"
+            exit 1
+          fi
+          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
+          cp /tmp/serve/curlwright-darwin-arm64.bak /tmp/serve/curlwright-darwin-arm64
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Custom INSTALL_DIR
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Idempotent re-run
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+  installer-alpine:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: alpine:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Setup
+        run: apk add --no-cache wget python3 ca-certificates
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: /tmp/serve
+          pattern: binaries-linux-amd64
+          merge-multiple: true
+
+      - name: Prepare assets
+        run: cd /tmp/serve && sha256sum * > SHA256SUMS
+
+      - name: Start server
+        run: |
+          python3 -m http.server 8399 --directory /tmp/serve &
+          sleep 1
+
+      - name: Install with wget
+        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Verify version output
+        run: |
+          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
+          /tmp/test-bin/curlwright --version | grep "99.0.0"
+
+      - name: TLS verified HTTPS exchange
+        run: |
+          output=$(/tmp/test-bin/playwright-cli --cdp https://example.com/ list 2>&1) || true
+          echo "$output"
+          echo "$output" | grep -q "HTTP 404"
+
+      - name: Tampered asset refusal
+        run: |
+          cp /tmp/serve/curlwright-linux-amd64 /tmp/serve/curlwright-linux-amd64.bak
+          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
+          printf "tampered" > /tmp/serve/curlwright-linux-amd64
+          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
+            echo "should have failed on tampered asset"
+            exit 1
+          fi
+          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
+          cp /tmp/serve/curlwright-linux-amd64.bak /tmp/serve/curlwright-linux-amd64
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Custom INSTALL_DIR
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Idempotent re-run
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399

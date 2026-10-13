@@ -24,5 +24,8 @@ wasix-net = "0.1"
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 native-tls = "0.2"
 
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 [dev-dependencies]
 slicc-browsers = { version = "1.4", features = ["corpus"] }
