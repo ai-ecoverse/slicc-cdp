@@ -454,8 +454,20 @@ test('discover hardening', { timeout: 180_000 }, async (t) => {
       }
     });
 
-    await t.test('--once navigates to B and probes B', async () => {
+    await t.test('--once from A to B probes B not A', async () => {
+      let aProbed = false;
       let bProbed = false;
+      const siteA = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/.well-known/ard.json') {
+          aProbed = true;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ name: 'A' }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<!doctype html><title>A</title>');
+      });
       const siteB = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/.well-known/ard.json') {
@@ -467,18 +479,26 @@ test('discover hardening', { timeout: 180_000 }, async (t) => {
         res.writeHead(200, { 'content-type': 'text/html' });
         res.end('<!doctype html><title>B</title>');
       });
+      await new Promise((r) => siteA.listen(0, '127.0.0.1', r));
       await new Promise((r) => siteB.listen(0, '127.0.0.1', r));
+      const originA = `http://127.0.0.1:${siteA.address().port}`;
       const originB = `http://127.0.0.1:${siteB.address().port}`;
       try {
         const cwd = await runner.fresh();
         await runner.clearSession(cwd);
+        await runner.playwright(['tab-new', `${originA}/`], cwd);
+        await new Promise((r) => setTimeout(r, 1000));
+        aProbed = false;
         const result = await runner.playwright(
           ['discover', '--json', '--once', `${originB}/`],
           cwd
         );
         assert.equal(result.code, 0, `stderr: ${result.stderr}`);
         assert.ok(bProbed, 'B must be probed');
+        assert.ok(!aProbed, 'A must NOT be probed during the --once B run');
       } finally {
+        siteA.closeAllConnections();
+        siteA.close();
         siteB.closeAllConnections();
         siteB.close();
       }
@@ -615,6 +635,41 @@ Object.defineProperty(document, 'modelContext', {
       }
     });
 
+    await t.test('playwright-cli eval throw with ESC/C1 is sanitized in stderr', async () => {
+      const evalEscServer = createServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><title>EvalEsc</title>');
+      });
+      await new Promise((r) => evalEscServer.listen(0, '127.0.0.1', r));
+      const evalEscOrigin = `http://127.0.0.1:${evalEscServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        await runner.playwright(['open', `${evalEscOrigin}/`], cwd);
+        const result = await runner.playwright(
+          ['eval', `(function(){ throw new Error('evil\x1b[31m\x07\x7f\u009b'); })()`],
+          cwd
+        );
+        assert.notEqual(result.code, 0);
+        const raw = Buffer.from(result.stderr, 'utf8');
+        for (let i = 0; i < raw.length; i++) {
+          assert.notEqual(raw[i], 0x1b, `stderr byte ${i} is raw ESC`);
+          assert.notEqual(raw[i], 0x07, `stderr byte ${i} is raw BEL`);
+          assert.notEqual(raw[i], 0x7f, `stderr byte ${i} is raw DEL`);
+        }
+        for (const ch of result.stderr) {
+          const cp = ch.codePointAt(0);
+          assert.ok(
+            !(cp >= 0x80 && cp <= 0x9f),
+            `stderr contains raw C1 U+${cp.toString(16).padStart(4, '0')}`
+          );
+        }
+      } finally {
+        evalEscServer.closeAllConnections();
+        evalEscServer.close();
+      }
+    });
+
     await t.test('48 MiB well-known body is capped by host fallback', async () => {
       const bigSize = 48 * 1024 * 1024;
       let bytesSent = 0;
@@ -662,13 +717,21 @@ Object.defineProperty(document, 'modelContext', {
           bytesSent < bigSize,
           `server should see early close: sent ${bytesSent} of ${bigSize}`
         );
+        const events = parseEvents(result.stdout);
+        const ardEvents = events.filter((e) => e.standard === 'ard');
+        const hasInvalid = ardEvents.some((e) => e.status === 'invalid' && e.reason);
+        const hasNone = ardEvents.length === 0;
+        assert.ok(
+          hasInvalid || hasNone,
+          `ard event must be invalid-with-reason or absent: ${JSON.stringify(ardEvents)}`
+        );
       } finally {
         bigServer.closeAllConnections();
         bigServer.close();
       }
     });
 
-    await t.test('stalled body probe gives up within 30s', async () => {
+    await t.test('stalled body probe gives up within 6s', async () => {
       const stallServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/') {
@@ -695,7 +758,7 @@ Object.defineProperty(document, 'modelContext', {
         const start = Date.now();
         await runner.playwright(['discover', '--json', '--once', `${stallOrigin}/`], cwd);
         const elapsed = Date.now() - start;
-        assert.ok(elapsed < 30000, `probe must not stall for 30s, took ${elapsed}ms`);
+        assert.ok(elapsed < 6000, `probe must give up within 6s, took ${elapsed}ms`);
       } finally {
         stallServer.closeAllConnections();
         stallServer.close();
