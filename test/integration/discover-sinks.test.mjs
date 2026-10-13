@@ -108,12 +108,13 @@ test('playwright-cli discover sinks', { timeout: 120_000 }, async (t) => {
     });
 
     await t.test('--exec with hostile URL does not expand shell metacharacters', async () => {
+      const sentinel = path.join(cwd, 'pwned-sentinel');
       const hostileServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/') {
           res.writeHead(200, {
             'content-type': 'text/html; charset=utf-8',
-            link: '</api>; rel="api-catalog"',
+            link: `</$(touch ${sentinel})>; rel="api-catalog"`,
           });
           res.end('<!doctype html><title>Hostile</title>');
           return;
@@ -127,15 +128,36 @@ test('playwright-cli discover sinks', { timeout: 120_000 }, async (t) => {
 
         const tmp = await mkdtemp(path.join(cwd, 'hostile-'));
         const record = path.join(tmp, 'stdin.json');
-        const cmd = `cat > ${record}`;
+        const envFile = path.join(tmp, 'env.txt');
+        const cmd = `cat > ${record} && echo "$SLICC_DISCOVER_URL" > ${envFile}`;
 
         const result = await runner.playwright(
           ['discover', '--once', `${hostileOrigin}/`, '--no-probe', '--exec', cmd],
           cwd
         );
         assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+
         const content = await readFile(record, 'utf8');
         assert.ok(content.length > 0, 'exec must receive stdin');
+        const event = JSON.parse(content.trim());
+        assert.ok(
+          event.url.includes('$(touch'),
+          `event URL must contain hostile literal: ${event.url}`
+        );
+
+        const envUrl = (await readFile(envFile, 'utf8')).trim();
+        assert.ok(
+          envUrl.includes('$(touch'),
+          `env var must contain hostile literal unexpanded: ${envUrl}`
+        );
+
+        const { stat } = await import('node:fs/promises');
+        try {
+          await stat(sentinel);
+          assert.fail(`sentinel file ${sentinel} must not exist — injection happened`);
+        } catch (e) {
+          assert.equal(e.code, 'ENOENT', 'sentinel must not exist');
+        }
       } finally {
         hostileServer.closeAllConnections();
         hostileServer.close();
