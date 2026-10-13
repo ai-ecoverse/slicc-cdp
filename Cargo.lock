@@ -619,6 +619,7 @@ dependencies = [
  "serde_json",
  "slicc-browsers",
  "slicc-cdp-client",
+ "slicc-discovery",
  "url",
 ]
 

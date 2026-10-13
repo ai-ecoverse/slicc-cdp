@@ -1,4 +1,5 @@
 mod action;
+mod agent_discover;
 mod args;
 mod browser;
 mod cdp;
@@ -52,6 +53,9 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     }
     if command == "list" {
         return discover::run(&invocation, cdp_env);
+    }
+    if command == "discover" {
+        return agent_discover::run(&invocation, cdp_env);
     }
     if !spec.implemented {
         return Output::err(format!("playwright-cli {command}: not implemented yet\n"));

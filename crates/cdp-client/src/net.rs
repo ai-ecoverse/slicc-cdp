@@ -8,6 +8,22 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+pub struct ProbeResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl ProbeResponse {
+    pub fn content_type(&self) -> &str {
+        self.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("")
+    }
+}
+
 pub struct Ws {
     stream: Box<dyn ReadWrite>,
     buf: Vec<u8>,
@@ -72,6 +88,55 @@ pub fn http_get(url: &str) -> Result<HttpResponse, String> {
     }
     let _ = status;
     Ok(HttpResponse { body })
+}
+
+const PROBE_MAX_BODY: usize = 1024 * 1024;
+
+#[cfg(not(target_os = "wasi"))]
+pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
+    let parts = parse_url(url)?;
+    if parts.scheme != "http" && parts.scheme != "https" {
+        return Err(format!("probe URL must be http or https: {url}\n"));
+    }
+    #[cfg(test)]
+    if reserved_loopback(&parts) {
+        panic!("test dialed {}:{}", parts.host, parts.port);
+    }
+    let addr = resolve(&parts.host, parts.port)?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|err| format!("probe connect failed for {url}: {err}\n"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("probe timeout setup failed: {err}\n"))?;
+    tcp.set_nodelay(true).ok();
+    let mut stream: Box<dyn ReadWrite> = if parts.scheme == "https" {
+        wrap_tls(&parts.host, tcp)?
+    } else {
+        Box::new(tcp)
+    };
+    let host_hdr = host_header(&parts);
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\n\r\n",
+        parts.path, host_hdr, accept
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("probe write failed for {url}: {err}\n"))?;
+    let (status, headers, body, _rest) = read_http(stream.as_mut())?;
+    let capped = if body.len() > PROBE_MAX_BODY {
+        body[..PROBE_MAX_BODY].to_vec()
+    } else {
+        body
+    };
+    Ok(ProbeResponse {
+        status,
+        headers,
+        body: capped,
+    })
+}
+
+#[cfg(target_os = "wasi")]
+pub fn http_probe(_url: &str, _accept: &str) -> Result<ProbeResponse, String> {
+    Err("probes are not available in this build\n".to_string())
 }
 
 pub fn ws_connect(url: &str) -> Result<Ws, String> {
@@ -903,5 +968,74 @@ mod tests {
         let err = ws.send_text("{}").unwrap_err();
         assert_eq!(err, "websocket closed 1011 the CDP host is gone\n");
         assert_eq!(server.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn probe_response_content_type() {
+        let resp = ProbeResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/json; charset=utf-8".into()),
+            ],
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(resp.content_type(), "application/json; charset=utf-8");
+    }
+
+    #[test]
+    fn probe_response_missing_content_type() {
+        let resp = ProbeResponse {
+            status: 200,
+            headers: vec![],
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(resp.content_type(), "");
+    }
+
+    #[test]
+    fn probe_html_200_never_matches_ard() {
+        let resp = ProbeResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/html".into())],
+            body: b"<html>".to_vec(),
+        };
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.content_type(), "text/html");
+    }
+
+    #[test]
+    fn probe_404_never_matches_ard() {
+        let resp = ProbeResponse {
+            status: 404,
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: b"{}".to_vec(),
+        };
+        assert_ne!(resp.status, 200);
+    }
+
+    #[test]
+    fn probe_301_never_matches_ard() {
+        let resp = ProbeResponse {
+            status: 301,
+            headers: vec![
+                ("Location".into(), "https://example.com/.well-known/ard.json".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body: Vec::new(),
+        };
+        assert_ne!(resp.status, 200);
+    }
+
+    #[test]
+    fn probe_body_cap_constant() {
+        assert_eq!(PROBE_MAX_BODY, 1024 * 1024);
+    }
+
+    #[test]
+    fn probe_does_not_dial_reserved_ports() {
+        let err = std::panic::catch_unwind(|| {
+            let _ = http_probe("http://127.0.0.1:9222/.well-known/ard.json", "application/json");
+        });
+        assert!(err.is_err(), "probe must not dial 9222");
     }
 }

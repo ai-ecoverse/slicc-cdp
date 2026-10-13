@@ -296,6 +296,9 @@ impl Cdp {
         if let Some(stream) = result.get("stream").and_then(|v| v.as_str()) {
             self.streams.insert(stream.to_string());
         }
+        if let Some(stream) = result.pointer("/resource/stream").and_then(|v| v.as_str()) {
+            self.streams.insert(stream.to_string());
+        }
         if method == "IO.resolveBlob" {
             if let Some(uuid) = result.get("uuid").and_then(|v| v.as_str()) {
                 self.streams.insert(format!("blob:{uuid}"));
