@@ -24,6 +24,7 @@ cdp-client = { package = "slicc-cdp-client", path = "../cdp-client", version = "
 image = { version = "0.25.8", default-features = false, features = ["png"] }
 serde_json = "1"
 slicc-browsers = { version = "1.4", features = ["serde"] }
+url = "2.5"
 
 [dev-dependencies]
 slicc-browsers = { version = "1.4", features = ["corpus"] }

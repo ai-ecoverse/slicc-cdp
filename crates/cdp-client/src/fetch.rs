@@ -360,34 +360,53 @@ fn header_list(headers: &[(String, String)]) -> Value {
     )
 }
 
-fn refresh_target(value: &str) -> Option<&str> {
-    let lower = value.to_ascii_lowercase();
-    let index = lower.find("url=")?;
-    Some(
-        value[index + 4..]
-            .trim()
-            .trim_matches(|ch| ch == '\'' || ch == '"'),
-    )
+fn refresh_target(value: &str) -> &str {
+    let rest = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let rest = rest.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.');
+    let rest = rest.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let rest = rest
+        .strip_prefix(';')
+        .or_else(|| rest.strip_prefix(','))
+        .unwrap_or(rest);
+    let rest = rest.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let rest = match rest.get(..3) {
+        Some(head) if head.eq_ignore_ascii_case("url") => {
+            let after = rest[3..].trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+            match after.strip_prefix('=') {
+                Some(value) => value.trim_start_matches(|ch: char| ch.is_ascii_whitespace()),
+                None => rest,
+            }
+        }
+        _ => rest,
+    };
+    let rest = rest.trim_end_matches(|ch: char| ch.is_ascii_whitespace());
+    match rest.chars().next() {
+        Some(quote @ ('\'' | '"')) => {
+            let inner = &rest[1..];
+            inner.split(quote).next().unwrap_or(inner)
+        }
+        _ => rest,
+    }
 }
 
 fn redirects_to_protected(guard: &Protected, base: &str, headers: &[(String, String)]) -> bool {
     let base = url::Url::parse(base).ok();
+    let reaches = |target: &str| {
+        let resolved = base
+            .as_ref()
+            .and_then(|base| base.join(target).ok())
+            .map(|url| url.to_string())
+            .unwrap_or_else(|| target.to_string());
+        guard.url(&resolved) || guard.url(target)
+    };
     headers.iter().any(|(name, value)| {
-        let target = if name.eq_ignore_ascii_case("location") {
-            Some(value.as_str())
+        if name.eq_ignore_ascii_case("location") {
+            reaches(value) || guard.pattern(value)
         } else if name.eq_ignore_ascii_case("refresh") {
-            refresh_target(value)
+            reaches(refresh_target(value)) || guard.pattern(value)
         } else {
-            None
-        };
-        target.is_some_and(|target| {
-            let resolved = base
-                .as_ref()
-                .and_then(|base| base.join(target).ok())
-                .map(|url| url.to_string())
-                .unwrap_or_else(|| target.to_string());
-            guard.url(&resolved) || guard.url(target)
-        })
+            false
+        }
     })
 }
 

@@ -396,17 +396,60 @@ fn resolve(pattern: &str) -> String {
     if pattern.starts_with('*') {
         return pattern.to_string();
     }
-    let Some((scheme, rest)) = pattern.split_once("://") else {
+    if ["about:", "data:", "chrome:", "edge:", "file:"]
+        .iter()
+        .any(|prefix| pattern.starts_with(prefix))
+    {
+        return pattern.to_string();
+    }
+    let mut tokens: Vec<(String, String)> = Vec::new();
+    let mut map = |original: &str, replacement: String| {
+        if original.is_empty() {
+            return String::new();
+        }
+        tokens.push((replacement.clone(), original.to_string()));
+        replacement
+    };
+    let relative: Vec<String> = pattern
+        .split('/')
+        .enumerate()
+        .map(|(index, token)| {
+            if token == "." || token == ".." || token.is_empty() {
+                return token.to_string();
+            }
+            if index == 0 && token.ends_with(':') {
+                if token.contains(['*', '{']) {
+                    return map(token, "http:".to_string());
+                }
+                return token.to_string();
+            }
+            if !token.contains(['*', '?', '{', '}', '\\']) {
+                return token.to_string();
+            }
+            match token.find('?') {
+                None => map(token, format!("$_{index}_$")),
+                Some(question) => {
+                    let prefix = map(&token[..question], format!("$_{index}_$"));
+                    let suffix = map(&token[question..], format!("?$_{index}_$"));
+                    prefix + &suffix
+                }
+            }
+        })
+        .collect();
+    let Ok(url) = url::Url::parse(&relative.join("/")) else {
         return pattern.to_string();
     };
-    if !rest.is_empty() && !rest.contains('/') && !rest.contains(['*', '?', '{', '}', '\\']) {
-        return format!(
-            "{}://{}/",
-            scheme.to_ascii_lowercase(),
-            rest.to_ascii_lowercase()
-        );
+    let origin = url.origin().ascii_serialization();
+    let mut resolved = url.to_string();
+    for (token, original) in tokens {
+        let replacement = if origin.contains(&token) {
+            original.to_lowercase()
+        } else {
+            original
+        };
+        resolved = resolved.replacen(&token, &replacement, 1);
     }
-    pattern.to_string()
+    resolved
 }
 
 fn cdp_pattern(glob: &str) -> String {
@@ -614,13 +657,22 @@ mod tests {
         assert_eq!(list(&state).stdout, "No active routes\n");
         let added = add(&mut state, &invocation(&["route", "**/a", "--status=404"]));
         assert_eq!(added.stdout, "Route added for pattern: **/a\n");
-        add(&mut state, &invocation(&["route", "**/b", "--body", &"x".repeat(60)]));
+        add(
+            &mut state,
+            &invocation(&["route", "**/b", "--body", &"x".repeat(60)]),
+        );
         add(&mut state, &invocation(&["route", "**/a"]));
         assert_eq!(
             list(&state).stdout,
-            format!("1. **/a (status=404)\n2. **/b (body={}...)\n3. **/a\n", "x".repeat(50))
+            format!(
+                "1. **/a (status=404)\n2. **/b (body={}...)\n3. **/a\n",
+                "x".repeat(50)
+            )
         );
-        let refused = add(&mut state, &invocation(&["route", "https://vault.sliccy.ai/*"]));
+        let refused = add(
+            &mut state,
+            &invocation(&["route", "https://vault.sliccy.ai/*"]),
+        );
         assert_eq!(refused.code, 1);
         assert_eq!(state.routes.len(), 3);
         assert_eq!(
@@ -631,7 +683,10 @@ mod tests {
             remove(&mut state, &invocation(&["unroute", "**/zzz"])).stdout,
             "Removed 0 route(s) for pattern: **/zzz\n"
         );
-        assert_eq!(remove(&mut state, &invocation(&["unroute"])).stdout, "Removed all 1 route(s)\n");
+        assert_eq!(
+            remove(&mut state, &invocation(&["unroute"])).stdout,
+            "Removed all 1 route(s)\n"
+        );
         assert!(state.routes.is_empty());
     }
 
@@ -654,6 +709,24 @@ mod tests {
         assert!(glob("https://a.test/\\*", "https://a.test/*"));
         assert!(!glob("https://a.test/\\*", "https://a.test/x"));
         assert!(!glob("*.jpg", "https://a.test/x.jpg"));
+        assert!(glob("HTTPS://EXAMPLE.COM/api", "https://example.com/api"));
+        assert!(!glob("https://example.com/API", "https://example.com/api"));
+        assert!(glob(
+            "https://*.Example.com/**",
+            "https://a.example.com/x/y"
+        ));
+        assert!(glob("https://example.com:443/x", "https://example.com/x"));
+        assert!(glob(
+            "https://example.com/a b/*",
+            "https://example.com/a%20b/c"
+        ));
+        assert!(glob(
+            "https://example.com/search?q=*",
+            "https://example.com/search?q=cats"
+        ));
+        assert!(glob("http*://example.com/x", "https://example.com/x"));
+        assert!(glob("data:text/plain,*", "data:text/plain,hi"));
+        assert!(glob("api/users", "api/users"));
         assert!(Glob::parse("{a,{b}}").is_err());
         assert!(Glob::parse("a}").is_err());
         assert!(Glob::parse("{a").is_err());
