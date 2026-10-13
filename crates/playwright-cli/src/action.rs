@@ -148,7 +148,10 @@ mod tests {
         enum SliccReply {
             NotFound,
             Silent,
+            Takeover,
         }
+
+        const TAKEOVER: &str = "another page took over the local proxy’s browser connection (superseded-by-new-cdp-client)";
 
         struct Peer {
             port: u16,
@@ -269,6 +272,23 @@ mod tests {
                     let text = String::from_utf8_lossy(&payload);
                     if let Some(frames) = on_message(&text, mode, pages, log) {
                         for frame in frames {
+                            if frame == "\u{0}close" {
+                                let reason = TAKEOVER.as_bytes();
+                                let mut close = vec![0x88, (2 + reason.len()) as u8, 0x03, 0xf3];
+                                close.extend_from_slice(reason);
+                                let _ = stream.write_all(&close);
+                                let deadline = Instant::now() + Duration::from_secs(3);
+                                let mut sink = [0u8; 4096];
+                                while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+                                    match stream.read(&mut sink) {
+                                        Ok(0) => break,
+                                        Ok(_) => {}
+                                        Err(err) if timed_out(&err) => {}
+                                        Err(_) => break,
+                                    }
+                                }
+                                return;
+                            }
                             let _ = stream.write_all(&server_text(&frame));
                         }
                     }
@@ -296,9 +316,18 @@ mod tests {
                 .get("method")
                 .and_then(|item| item.as_str())
                 .unwrap_or("");
+            let expression = value
+                .pointer("/params/expression")
+                .and_then(|item| item.as_str())
+                .unwrap_or("");
+            if expression.contains("TAKEOVER")
+                || (matches!(mode, SliccReply::Takeover) && method == "Target.setDiscoverTargets")
+            {
+                return Some(vec!["\u{0}close".to_string()]);
+            }
             if method == "Slicc.action" {
                 return match mode {
-                    SliccReply::Silent => None,
+                    SliccReply::Silent | SliccReply::Takeover => None,
                     SliccReply::NotFound => Some(vec![
                         json!({"id": id, "error": {"message": "'Slicc.action' wasn't found"}})
                             .to_string(),
@@ -736,6 +765,26 @@ mod tests {
             let noted = actions(&old_log);
             assert!(noted[0]["params"].get("target").is_none());
             assert!(!noted[0]["params"].to_string().contains("secret-text"));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn a_takeover_prints_the_close_frame_not_a_guard_refusal() {
+            let _lock = CWD.lock().unwrap();
+            let root =
+                std::env::temp_dir().join(format!("slicc-action-takeover-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let _dir = DirGuard::enter(&root);
+            let expected = format!("websocket closed 1011 {TAKEOVER}\n");
+            let held = Peer::start(SliccReply::NotFound, true);
+            let output = run(held.port, &["eval", "new Promise(() => { TAKEOVER })"]);
+            assert_eq!(output.code, 1);
+            assert_eq!(output.stderr, expected);
+            let guarding = Peer::start(SliccReply::Takeover, true);
+            let output = run(guarding.port, &["eval", "1"]);
+            assert_eq!(output.code, 1);
+            assert_eq!(output.stderr, expected);
+            drop(_dir);
             let _ = std::fs::remove_dir_all(&root);
         }
 

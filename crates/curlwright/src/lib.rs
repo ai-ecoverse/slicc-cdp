@@ -77,6 +77,20 @@ impl Output {
     }
 }
 
+fn reaches_protected(url: &str) -> bool {
+    let guard = cdp_client::protected::Protected::default();
+    let trimmed = url.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch.is_ascii_control());
+    if guard.url(trimmed) {
+        return true;
+    }
+    let mut chars = trimmed.chars();
+    let authority = matches!(
+        (chars.next(), chars.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    );
+    authority && (guard.url(&format!("https:{trimmed}")) || guard.url(&format!("http:{trimmed}")))
+}
+
 pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     if argv.is_empty() {
         return Output::from_stop(Stop::usage(
@@ -107,6 +121,12 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(request) => request,
         Err(stop) => return Output::from_stop(stop),
     };
+    if reaches_protected(&request.url) {
+        return Output::plain(
+            format!("curlwright: {}\n", cdp_client::protected::refusal()),
+            1,
+        );
+    }
     let start = match connect_start(opts.cdp.as_deref(), cdp_env) {
         Ok(start) => start,
         Err(message) => return Output::plain(message, 1),
@@ -365,6 +385,29 @@ mod tests {
     fn run(args: &[&str]) -> Output {
         let argv: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         execute(&argv, None)
+    }
+
+    #[test]
+    fn protected_urls_are_refused_before_any_tab_is_chosen() {
+        for url in [
+            "https://vault.sliccy.ai/unlock",
+            "http://seven.sliccy.ai/x",
+            "HTTPS://SEVEN.SLICCY.AI",
+            "//vault.sliccy.ai/x",
+            "\\\\vault.sliccy.ai\\x",
+            "blob:https://vault.sliccy.ai/1",
+        ] {
+            let output = run(&["--cdp", "ws://127.0.0.1:1/devtools/browser/x", url]);
+            assert_eq!(output.code, 1, "{url}");
+            assert_eq!(
+                output.stderr,
+                "curlwright: slicc: refused: target is on seven's origin\n",
+                "{url}"
+            );
+        }
+        assert!(!super::reaches_protected("https://notsliccy.ai/"));
+        assert!(!super::reaches_protected("/api/me"));
+        assert!(!super::reaches_protected("https://app.example/?next=https://vault.sliccy.ai/"));
     }
 
     #[test]

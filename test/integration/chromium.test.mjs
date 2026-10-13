@@ -346,6 +346,11 @@ async function protectedFlow(runner, site, wsUrl) {
       assert.match(curled.stderr, /slicc: refused: /);
       assert.ok((await raw.targetUrl(tab)).includes('SECRET'), 'the protected tab moved');
     }
+    for (const url of ['http://vault.sliccy.ai/landing', '//seven.sliccy.ai/x']) {
+      const curled = await runner.curl([url], cwd);
+      assert.equal(curled.code, 1, curled.stdout);
+      assert.equal(curled.stderr, "curlwright: slicc: refused: target is on seven's origin\n");
+    }
     await refused(['open', 'http://vault.sliccy.ai/'], cwd);
     await refused(['open', 'https://seven.sliccy.ai/os/'], cwd);
     const body =
