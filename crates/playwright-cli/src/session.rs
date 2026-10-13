@@ -13,6 +13,7 @@ pub struct Session {
     pub current: Option<String>,
     pub endpoint: Option<String>,
     pub provenance: Option<String>,
+    pub session_name: Option<String>,
     pub owned: Vec<String>,
     pub snapshots: BTreeMap<String, BTreeMap<String, RefRec>>,
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
@@ -20,25 +21,45 @@ pub struct Session {
     pub routes: Vec<Route>,
 }
 
+#[allow(dead_code)]
 pub fn storage_path(cwd: &Path) -> Option<PathBuf> {
+    storage_path_named(cwd, None)
+}
+
+pub fn storage_path_named(cwd: &Path, session_name: Option<&str>) -> Option<PathBuf> {
+    let session_name = session_name.filter(|name| !name.is_empty());
     #[cfg(target_arch = "wasm32")]
     {
-        Some(cwd.join(".playwright-cli").join("session.json"))
+        match session_name {
+            Some(name) => {
+                let key = cdp_client::hash::sha256_hex(name.as_bytes());
+                Some(cwd.join(".playwright-cli").join(format!("session-{key}.json")))
+            }
+            None => Some(cwd.join(".playwright-cli").join("session.json")),
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        session_path(&config_root(), &canonical)
+        session_path(&config_root(), &canonical, session_name)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn session_path(config_dir: &str, cwd: &Path) -> Option<PathBuf> {
+pub fn session_path(config_dir: &str, cwd: &Path, session_name: Option<&str>) -> Option<PathBuf> {
     let root = Path::new(config_dir);
     if !root.is_absolute() {
         return None;
     }
-    let key = cdp_client::hash::sha256_hex(cwd.as_os_str().as_encoded_bytes());
+    let key = match session_name.filter(|name| !name.is_empty()) {
+        Some(name) => {
+            let mut input = cwd.as_os_str().as_encoded_bytes().to_vec();
+            input.push(0);
+            input.extend_from_slice(name.as_bytes());
+            cdp_client::hash::sha256_hex(&input)
+        }
+        None => cdp_client::hash::sha256_hex(cwd.as_os_str().as_encoded_bytes()),
+    };
     Some(
         root.join("slicc")
             .join("playwright-cli")
@@ -62,13 +83,27 @@ fn config_root() -> String {
     }
 }
 
-fn path() -> Option<PathBuf> {
+fn path_named(session_name: Option<&str>) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    storage_path(&cwd)
+    storage_path_named(&cwd, session_name)
 }
 
-pub fn load() -> Session {
-    path().as_deref().map(load_at).unwrap_or_default()
+pub fn load_named(session_name: Option<&str>) -> Session {
+    let session_name = session_name.filter(|name| !name.is_empty());
+    let mut sess = path_named(session_name)
+        .as_deref()
+        .map(load_at)
+        .unwrap_or_default();
+    if let Some(name) = session_name {
+        if sess.session_name.as_deref() != Some(name) {
+            sess.current = None;
+        }
+        sess.session_name = Some(name.to_string());
+    } else if sess.session_name.is_some() {
+        sess.current = None;
+        sess.session_name = None;
+    }
+    sess
 }
 
 pub fn load_at(path: &Path) -> Session {
@@ -96,6 +131,11 @@ fn decode(text: &str) -> Session {
         .get("provenance")
         .and_then(|v| v.as_str())
         .filter(|text| known_provenance(text))
+        .map(str::to_string);
+    let session_name = value
+        .get("sessionName")
+        .and_then(|v| v.as_str())
+        .filter(|text| !text.is_empty())
         .map(str::to_string);
     let mut owned = Vec::new();
     if let Some(items) = value.get("owned").and_then(|item| item.as_array()) {
@@ -142,6 +182,7 @@ fn decode(text: &str) -> Session {
         current,
         endpoint,
         provenance,
+        session_name,
         owned,
         snapshots,
         console: decode_console(&value),
@@ -205,6 +246,7 @@ fn encode(session: &Session) -> Value {
         "current": session.current,
         "endpoint": session.endpoint,
         "provenance": session.provenance,
+        "sessionName": session.session_name,
         "owned": session.owned,
         "snapshots": snapshots,
         "console": encode_lists(&session.console, trace::console_json),
@@ -283,7 +325,7 @@ pub fn save(session: &Session) -> Result<(), String> {
         stored.endpoint = None;
         stored.provenance = None;
     }
-    let Some(file) = path() else {
+    let Some(file) = path_named(stored.session_name.as_deref()) else {
         return Err("session: user config dir is not absolute\n".into());
     };
     write_at(&file, &stored)
@@ -619,7 +661,7 @@ mod tests {
             r#"{"endpoint":"https://evil.example/json/version","provenance":"explicit","current":"personal"}"#,
         )
         .unwrap();
-        let stored = session_path(config.to_str().unwrap(), &cwd).unwrap();
+        let stored = session_path(config.to_str().unwrap(), &cwd, None).unwrap();
         assert_ne!(stored, cwd.join(".playwright-cli").join("session.json"));
         assert!(stored.starts_with(&config));
         assert!(!stored.starts_with(&cwd));
@@ -717,7 +759,7 @@ mod tests {
     fn a_saved_session_is_private_to_the_user() {
         let root = std::env::temp_dir().join(format!("slicc-session-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let path = session_path(root.to_str().unwrap(), Path::new("/work")).unwrap();
+        let path = session_path(root.to_str().unwrap(), Path::new("/work"), None).unwrap();
         let session = Session {
             endpoint: Some("http://127.0.0.1:9333/json/version".to_string()),
             provenance: Some("probe".to_string()),
@@ -746,7 +788,7 @@ mod tests {
         let loaded = load_at(&path);
         assert_eq!(loaded.provenance.as_deref(), Some("probe"));
         assert_eq!(loaded.owned, vec!["OWN".to_string()]);
-        let locked = session_path(root.to_str().unwrap(), Path::new("/work-locked")).unwrap();
+        let locked = session_path(root.to_str().unwrap(), Path::new("/work-locked"), None).unwrap();
         fs::write(&locked, "ORIGINAL\n").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o666)).unwrap();
         struct Reset;
@@ -766,12 +808,13 @@ mod tests {
 
     #[test]
     fn a_relative_config_dir_is_not_a_session_path() {
-        assert!(session_path(".config", Path::new("work")).is_none());
-        assert!(session_path("AppData\\Roaming", Path::new("work")).is_none());
-        assert!(session_path("", Path::new("work")).is_none());
+        assert!(session_path(".config", Path::new("work"), None).is_none());
+        assert!(session_path("AppData\\Roaming", Path::new("work"), None).is_none());
+        assert!(session_path("", Path::new("work"), None).is_none());
         let stored = session_path(
             std::env::temp_dir().to_str().unwrap(),
             Path::new("/work"),
+            None,
         )
         .unwrap();
         assert!(stored.is_absolute());
@@ -788,8 +831,152 @@ mod tests {
         assert_eq!(left.to_string_lossy(), right.to_string_lossy());
         let root = std::env::temp_dir();
         let root = root.to_str().unwrap();
-        let a = session_path(root, left).unwrap();
-        let b = session_path(root, right).unwrap();
+        let a = session_path(root, left, None).unwrap();
+        let b = session_path(root, right, None).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn named_session_uses_different_file_than_unnamed() {
+        let root = std::env::temp_dir();
+        let root = root.to_str().unwrap();
+        let cwd = Path::new("/work");
+        let unnamed = session_path(root, cwd, None).unwrap();
+        let named = session_path(root, cwd, Some("agent-1")).unwrap();
+        assert_ne!(unnamed, named);
+        let other = session_path(root, cwd, Some("agent-2")).unwrap();
+        assert_ne!(named, other);
+    }
+
+    #[test]
+    fn empty_session_name_is_same_as_unnamed() {
+        let root = std::env::temp_dir();
+        let root = root.to_str().unwrap();
+        let cwd = Path::new("/work");
+        let unnamed = session_path(root, cwd, None).unwrap();
+        let empty = session_path(root, cwd, Some("")).unwrap();
+        assert_eq!(unnamed, empty);
+    }
+
+    #[test]
+    fn session_name_round_trips() {
+        let text = r#"{"current":"T","sessionName":"agent-1","snapshots":{}}"#;
+        let session = decode(text);
+        assert_eq!(session.session_name.as_deref(), Some("agent-1"));
+        let again = decode(&encode(&session).to_string());
+        assert_eq!(again.session_name.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn missing_session_name_decodes_as_none() {
+        let text = r#"{"current":"T","snapshots":{}}"#;
+        let session = decode(text);
+        assert!(session.session_name.is_none());
+    }
+
+    #[test]
+    fn two_named_sessions_keep_separate_current_tabs() {
+        let unique = format!(
+            "slicc-named-sess-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        );
+        let cwd = std::env::temp_dir().join(&unique);
+        fs::create_dir_all(&cwd).unwrap();
+        let root = std::env::temp_dir()
+            .join("slicc-cdp-session-tests")
+            .to_string_lossy()
+            .into_owned();
+        let path_a = session_path(&root, &cwd, Some("agent-a")).unwrap();
+        let path_b = session_path(&root, &cwd, Some("agent-b")).unwrap();
+        assert_ne!(path_a, path_b);
+        let sess_a = Session {
+            current: Some("TAB_A".to_string()),
+            session_name: Some("agent-a".to_string()),
+            ..Session::default()
+        };
+        let sess_b = Session {
+            current: Some("TAB_B".to_string()),
+            session_name: Some("agent-b".to_string()),
+            ..Session::default()
+        };
+        write_at(&path_a, &sess_a).unwrap();
+        write_at(&path_b, &sess_b).unwrap();
+        let loaded_a = load_at(&path_a);
+        let loaded_b = load_at(&path_b);
+        assert_eq!(loaded_a.current.as_deref(), Some("TAB_A"));
+        assert_eq!(loaded_b.current.as_deref(), Some("TAB_B"));
+        assert_eq!(loaded_a.session_name.as_deref(), Some("agent-a"));
+        assert_eq!(loaded_b.session_name.as_deref(), Some("agent-b"));
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn unnamed_session_is_unchanged() {
+        let unique = format!(
+            "slicc-unnamed-sess-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        );
+        let cwd = std::env::temp_dir().join(&unique);
+        fs::create_dir_all(&cwd).unwrap();
+        let root = std::env::temp_dir()
+            .join("slicc-cdp-session-tests")
+            .to_string_lossy()
+            .into_owned();
+        let path_unnamed = session_path(&root, &cwd, None).unwrap();
+        let sess = Session {
+            current: Some("TAB_X".to_string()),
+            ..Session::default()
+        };
+        write_at(&path_unnamed, &sess).unwrap();
+        let loaded = load_at(&path_unnamed);
+        assert_eq!(loaded.current.as_deref(), Some("TAB_X"));
+        assert!(loaded.session_name.is_none());
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_file(&path_unnamed);
+    }
+
+    #[test]
+    fn guard_ignores_current_from_different_session_name() {
+        let text = r#"{"current":"T","sessionName":"agent-a","snapshots":{}}"#;
+        let mut sess = decode(text);
+        assert_eq!(sess.current.as_deref(), Some("T"));
+        assert_eq!(sess.session_name.as_deref(), Some("agent-a"));
+        if sess.session_name.as_deref() != Some("agent-b") {
+            sess.current = None;
+        }
+        sess.session_name = Some("agent-b".to_string());
+        assert!(sess.current.is_none());
+    }
+
+    #[test]
+    fn guard_keeps_current_for_matching_session_name() {
+        let text = r#"{"current":"T","sessionName":"agent-a","snapshots":{}}"#;
+        let mut sess = decode(text);
+        if sess.session_name.as_deref() != Some("agent-a") {
+            sess.current = None;
+        }
+        assert_eq!(sess.current.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn guard_unnamed_ignores_current_if_file_had_session_name() {
+        let text = r#"{"current":"T","sessionName":"agent-a","snapshots":{}}"#;
+        let mut sess = decode(text);
+        if sess.session_name.is_some() {
+            sess.current = None;
+            sess.session_name = None;
+        }
+        assert!(sess.current.is_none());
+        assert!(sess.session_name.is_none());
     }
 }
