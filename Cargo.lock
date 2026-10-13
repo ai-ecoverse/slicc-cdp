@@ -616,6 +616,7 @@ name = "slicc-cdp"
 version = "0.0.0"
 dependencies = [
  "image",
+ "libc",
  "serde_json",
  "slicc-browsers",
  "slicc-cdp-client",
