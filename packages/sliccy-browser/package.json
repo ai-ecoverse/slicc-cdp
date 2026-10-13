@@ -29,6 +29,6 @@
     "src"
   ],
   "dependencies": {
-    "@ai-ecoverse/slicc-cdp": "1.11.1"
+    "@ai-ecoverse/slicc-cdp": "1.14.0"
   }
 }
