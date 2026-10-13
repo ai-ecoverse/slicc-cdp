@@ -24,6 +24,10 @@ jobs:
       issues: write
       pull-requests: write
       id-token: write
+    outputs:
+      released: ${{ steps.version.outputs.released }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -51,29 +55,34 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Decide crates publish
-        id: crates
+      - name: Detect release
+        id: version
         run: |
-          version=$(node -e "process.stdout.write(require('./package.json').version)")
-          if [ "$version" = "0.0.0" ]; then
-            git fetch origin --tags --force
-            tag=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
-            if [ -z "$tag" ]; then
-              echo "publish=false" >> "$GITHUB_OUTPUT"
-              echo "semantic-release did not publish; skipping crates.io"
-              exit 0
-            fi
-            version=${tag#v}
-            echo "resuming crate publish for $version"
+          git fetch origin --tags --force
+          tag=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [ -z "$tag" ]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: steps.version.outputs.released == 'true'
+
+      - name: Publish crates
+        if: steps.version.outputs.released == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
           if grep -q 'vendor/wasix-net' crates/cdp-client/Cargo.toml; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "slicc-cdp-client still depends on the vendored wasix-net path; skipping crates.io"
             exit 0
           fi
           code=$(curl -s -o /dev/null -w "%{http_code}" -A "slicc-cdp (https://github.com/ai-ecoverse/slicc-cdp)" "https://crates.io/api/v1/crates/slicc-cdp-client")
           if [ "$code" = "404" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "slicc-cdp-client is not on crates.io yet; the first publish is manual"
             exit 0
           fi
@@ -81,15 +90,138 @@ jobs:
             echo "crates.io lookup for slicc-cdp-client returned $code"
             exit 1
           fi
-          echo "publish=true" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          sh scripts/publish-crates.sh "${{ steps.version.outputs.version }}"
 
-      - uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-        if: steps.crates.outputs.publish == 'true'
+  build-binaries:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: macos-13, target: x86_64-apple-darwin, label: darwin-amd64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, label: darwin-arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, label: linux-amd64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, label: linux-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: windows-amd64 }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, label: windows-arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Publish crates
-        if: steps.crates.outputs.publish == 'true'
+      - name: Stamp version
+        shell: bash
+        run: |
+          version="${{ needs.release.outputs.version }}"
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '$version';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target ${{ matrix.target }}
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if echo "${{ matrix.target }}" | grep -q linux-musl; then
+            cross build --release --target ${{ matrix.target }} -p slicc-cdp -p curlwright
+          else
+            cargo build --release --target ${{ matrix.target }} -p slicc-cdp -p curlwright
+          fi
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ext=".exe"
+          else
+            ext=""
+          fi
+          cp "target/${{ matrix.target }}/release/playwright-cli${ext}" "dist/playwright-cli-${{ matrix.label }}${ext}"
+          cp "target/${{ matrix.target }}/release/curlwright${ext}" "dist/curlwright-${{ matrix.label }}${ext}"
+
+      - name: Ad-hoc sign macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          codesign -s - "dist/playwright-cli-${{ matrix.label }}"
+          codesign -s - "dist/curlwright-${{ matrix.label }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: binaries-${{ matrix.label }}
+          path: dist/*
+          retention-days: 1
+
+  upload-assets:
+    needs: [release, build-binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS
+
+      - name: Upload release assets
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: sh scripts/publish-crates.sh "${{ steps.crates.outputs.version }}"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.release.outputs.tag }}"
+          cp install.sh artifacts/install.sh
+          gh release upload "$tag" artifacts/* --clobber
+
+      - name: Verify assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.release.outputs.tag }}"
+          expected="playwright-cli-darwin-amd64 playwright-cli-darwin-arm64 playwright-cli-linux-amd64 playwright-cli-linux-arm64 playwright-cli-windows-amd64.exe playwright-cli-windows-arm64.exe curlwright-darwin-amd64 curlwright-darwin-arm64 curlwright-linux-amd64 curlwright-linux-arm64 curlwright-windows-amd64.exe curlwright-windows-arm64.exe SHA256SUMS install.sh"
+          assets=$(gh release view "$tag" --json assets -q '.assets[].name' | sort | tr '\n' ' ' | sed 's/ $//')
+          for name in $expected; do
+            if ! echo "$assets" | grep -qw "$name"; then
+              echo "missing asset: $name"
+              exit 1
+            fi
+          done
+
+  smoke:
+    needs: upload-assets
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, bin: playwright-cli }
+          - { os: macos-latest, bin: playwright-cli }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Install via one-liner
+        run: curl -fsSL https://github.com/ai-ecoverse/slicc-cdp/releases/latest/download/install.sh | sh -s -- --dir /tmp/smoke-bin
+
+      - name: Verify
+        run: |
+          /tmp/smoke-bin/playwright-cli --version
+          /tmp/smoke-bin/curlwright --version

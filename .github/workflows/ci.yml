@@ -38,3 +38,213 @@ jobs:
           npx playwright-core install-deps chromium
           npx playwright-core install chromium
       - run: npm run test:integration
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: shellcheck -s sh install.sh
+
+  installer-ubuntu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build test binaries
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '99.0.0';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          cargo build --release -p slicc-cdp -p curlwright
+          mkdir -p /tmp/serve
+          cp target/release/playwright-cli /tmp/serve/playwright-cli-linux-amd64
+          cp target/release/curlwright /tmp/serve/curlwright-linux-amd64
+          cd /tmp/serve && sha256sum playwright-cli-linux-amd64 curlwright-linux-amd64 > SHA256SUMS
+
+      - name: Start server
+        run: |
+          python3 -m http.server 8399 --directory /tmp/serve &
+          sleep 1
+
+      - name: Install with curl
+        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Verify version output
+        run: |
+          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
+          /tmp/test-bin/curlwright --version | grep "99.0.0"
+
+      - name: Tampered asset refusal
+        run: |
+          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
+          printf "tampered" > /tmp/serve/curlwright-linux-amd64
+          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
+            echo "should have failed on tampered asset"
+            exit 1
+          fi
+          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
+          cp target/release/curlwright /tmp/serve/curlwright-linux-amd64
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Custom INSTALL_DIR
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+          /tmp/custom-dir/curlwright --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Idempotent re-run
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+          /tmp/custom-dir/curlwright --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+  installer-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build test binaries
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '99.0.0';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          cargo build --release -p slicc-cdp -p curlwright
+          mkdir -p /tmp/serve
+          cp target/release/playwright-cli /tmp/serve/playwright-cli-darwin-arm64
+          cp target/release/curlwright /tmp/serve/curlwright-darwin-arm64
+          cd /tmp/serve && shasum -a 256 playwright-cli-darwin-arm64 curlwright-darwin-arm64 > SHA256SUMS
+
+      - name: Start server
+        run: |
+          python3 -m http.server 8399 --directory /tmp/serve &
+          sleep 1
+
+      - name: Install with curl
+        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Verify version output
+        run: |
+          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
+          /tmp/test-bin/curlwright --version | grep "99.0.0"
+
+      - name: Tampered asset refusal
+        run: |
+          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
+          printf "tampered" > /tmp/serve/curlwright-darwin-arm64
+          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
+            echo "should have failed on tampered asset"
+            exit 1
+          fi
+          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
+          cp target/release/curlwright /tmp/serve/curlwright-darwin-arm64
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Custom INSTALL_DIR
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Idempotent re-run
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+  installer-alpine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: alpine:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Setup
+        run: apk add --no-cache wget nodejs npm rust cargo gcc musl-dev openssl-dev openssl-libs-static pkgconf python3
+
+      - name: Build test binaries
+        run: |
+          node -e "
+            var fs = require('fs');
+            var pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '99.0.0';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          OPENSSL_STATIC=1 cargo build --release -p slicc-cdp -p curlwright
+          mkdir -p /tmp/serve
+          cp target/release/playwright-cli /tmp/serve/playwright-cli-linux-amd64
+          cp target/release/curlwright /tmp/serve/curlwright-linux-amd64
+          cd /tmp/serve && sha256sum playwright-cli-linux-amd64 curlwright-linux-amd64 > SHA256SUMS
+
+      - name: Start server
+        run: |
+          python3 -m http.server 8399 --directory /tmp/serve &
+          sleep 1
+
+      - name: Install with wget
+        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Verify version output
+        run: |
+          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
+          /tmp/test-bin/curlwright --version | grep "99.0.0"
+
+      - name: Tampered asset refusal
+        run: |
+          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
+          printf "tampered" > /tmp/serve/curlwright-linux-amd64
+          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
+            echo "should have failed on tampered asset"
+            exit 1
+          fi
+          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
+          cp target/release/curlwright /tmp/serve/curlwright-linux-amd64
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Custom INSTALL_DIR
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+
+      - name: Idempotent re-run
+        run: |
+          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
+          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
+        env:
+          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
