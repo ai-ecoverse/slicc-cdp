@@ -627,7 +627,10 @@ struct ListIo<'a> {
     os: HostOs,
     home: Option<&'a str>,
     xdg_config_home: Option<&'a str>,
+    xdg_state_home: Option<&'a str>,
     appdata: Option<&'a str>,
+    local_app_data: Option<&'a str>,
+    slicc_user_data_dir: Option<&'a str>,
     process_text: &'a str,
     windows_processes: bool,
     self_pid: u32,
@@ -670,6 +673,7 @@ struct EndpointDraft {
     user_data_dir: Option<String>,
     profile: Option<String>,
     ws_only: bool,
+    six: bool,
     seven_open: bool,
     tabs: Vec<TabDraft>,
 }
@@ -764,7 +768,7 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
     let mut port_lines = Vec::new();
     let mut apps = Vec::new();
     if io.scan_host {
-        for draft in profile_drafts(io, &http) {
+        for draft in profile_drafts(io, &http, json) {
             drafts.push(draft);
         }
         let hits = if io.windows_processes {
@@ -794,7 +798,21 @@ fn assemble(invocation: &Invocation, cdp_env: Option<&str>, io: &ListIo<'_>) -> 
             drafts.push(draft);
         }
     }
-    let endpoints = merge_drafts(drafts);
+    let mut endpoints = merge_drafts(drafts);
+    let six_root = six_profiles_root(io);
+    let extra_six = io.slicc_user_data_dir
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let case_sensitive = io.os == HostOs::Linux;
+    for ep in &mut endpoints {
+        if !ep.six {
+            if let Some(dir) = ep.user_data_dir.as_deref() {
+                if is_six_user_data_dir(dir, &six_root, extra_six, case_sensitive) {
+                    ep.six = true;
+                }
+            }
+        }
+    }
     if !json {
         for endpoint in &endpoints {
             if endpoint.source != "devtools-active-port" {
@@ -904,7 +922,85 @@ fn resolve_process(
     Some((hit.port, draft))
 }
 
-fn profile_drafts(io: &ListIo<'_>, http: &dyn Fn(&str) -> HttpResult) -> Vec<EndpointDraft> {
+fn six_profiles_root(io: &ListIo<'_>) -> String {
+    let catalog = slicc_browsers::catalog();
+    let roots = &catalog.profiles.six.roots;
+    let root = match io.os {
+        HostOs::Macos => &roots.macos,
+        HostOs::Linux => &roots.linux,
+        HostOs::Windows => &roots.windows,
+    };
+    let base = six_root_base(io, &root.base);
+    if base.is_empty() {
+        return String::new();
+    }
+    join_all(&base, &root.path)
+}
+
+fn six_root_base(io: &ListIo<'_>, loc: &slicc_browsers::Location) -> String {
+    if let Some(name) = &loc.env {
+        let value = match name.as_str() {
+            "XDG_STATE_HOME" => io.xdg_state_home,
+            "LOCALAPPDATA" => io.local_app_data,
+            _ => None,
+        };
+        if let Some(value) = nonempty(value) {
+            if io.os != HostOs::Linux || is_absolute(value) {
+                return value.to_string();
+            }
+        }
+    }
+    if let Some(abs) = &loc.absolute {
+        return abs.clone();
+    }
+    match nonempty(io.home) {
+        Some(home) => join_all(home, &loc.home),
+        None => String::new(),
+    }
+}
+
+fn is_six_user_data_dir(dir: &str, six_root: &str, extra_six_dir: Option<&str>, case_sensitive: bool) -> bool {
+    if let Some(extra) = extra_six_dir {
+        if paths_equal(dir, extra) {
+            return true;
+        }
+    }
+    if six_root.is_empty() {
+        return false;
+    }
+    let sep = if six_root.contains('\\') && !six_root.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let prefix = format!("{}{sep}", six_root.trim_end_matches(['/', '\\']));
+    let rest = match dir.get(..prefix.len()) {
+        Some(head) => {
+            if case_sensitive {
+                if head != prefix {
+                    return false;
+                }
+            } else if !head.eq_ignore_ascii_case(&prefix) {
+                return false;
+            }
+            &dir[prefix.len()..]
+        }
+        None => return false,
+    };
+    let has_child_sep = rest.contains('/') || rest.contains('\\');
+    if has_child_sep {
+        return false;
+    }
+    six_profile_name(rest)
+}
+
+fn paths_equal(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches(['/', '\\']);
+    let b = b.trim_end_matches(['/', '\\']);
+    a == b
+}
+
+fn profile_drafts(io: &ListIo<'_>, http: &dyn Fn(&str) -> HttpResult, json: bool) -> Vec<EndpointDraft> {
     let mut out = Vec::new();
     for (id, dir) in user_data_dirs(io) {
         if let Some(draft) = draft_from_active_file(&dir, Some(&id), None, io, http) {
@@ -921,6 +1017,32 @@ fn profile_drafts(io: &ListIo<'_>, http: &dyn Fn(&str) -> HttpResult) -> Vec<End
             let dir = join_two(&root, &name);
             if let Some(draft) = draft_from_active_file(&dir, None, Some(&name), io, http) {
                 out.push(draft);
+            }
+        }
+    }
+    if json {
+        let six_root = six_profiles_root(io);
+        let extra_six = io.slicc_user_data_dir
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(dir) = extra_six {
+            if let Some(mut draft) = draft_from_active_file(dir, None, None, io, http) {
+                draft.six = true;
+                out.push(draft);
+            }
+        }
+        if !six_root.is_empty() {
+            let mut names = (io.list_dir)(&six_root);
+            names.sort();
+            for name in names {
+                if !profile_dir_name(&name) || !six_profile_name(&name) {
+                    continue;
+                }
+                let dir = join_two(&six_root, &name);
+                if let Some(mut draft) = draft_from_active_file(&dir, None, None, io, http) {
+                    draft.six = true;
+                    out.push(draft);
+                }
             }
         }
     }
@@ -1005,13 +1127,26 @@ fn ws_only_from_file(
     draft.browser = browser.and_then(|id| catalog_browser_name(id).map(|_| id.to_string()));
     draft.profile = profile.map(str::to_string);
     draft.ws_only = true;
+    draft.six = false;
     Some(draft)
 }
 
 fn six_profile_name(name: &str) -> bool {
     let prefix = "browser-coding-agent-chrome";
-    name.get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    let Some(head) = name.get(..prefix.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(prefix) {
+        return false;
+    }
+    let rest = &name[prefix.len()..];
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(after_dash) = rest.strip_prefix('-') else {
+        return false;
+    };
+    !after_dash.is_empty() && after_dash.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn user_data_dirs(io: &ListIo<'_>) -> Vec<(String, String)> {
@@ -1563,6 +1698,7 @@ fn ws_only_flag(url: &str, base: &str) -> Option<EndpointDraft> {
     draft.websocket = Some(url.to_string());
     draft.name = slicc_browsers::catalog().discovery.names.fallback.clone();
     draft.ws_only = true;
+    draft.six = false;
     Some(draft)
 }
 
@@ -1616,6 +1752,7 @@ fn draft_from_doc(
         user_data_dir: user_data_dir.map(str::to_string),
         profile: None,
         ws_only: false,
+        six: false,
         seven_open: !tabs.is_empty(),
         tabs,
     })
@@ -1637,6 +1774,7 @@ fn draft_bare(port: u32, source: &'static str) -> EndpointDraft {
         user_data_dir: None,
         profile: None,
         ws_only: false,
+        six: false,
         seven_open: false,
         tabs: Vec::new(),
     }
@@ -1753,6 +1891,12 @@ fn merge_drafts(drafts: Vec<EndpointDraft>) -> Vec<EndpointDraft> {
 }
 
 fn adopt_richer(winner: &mut EndpointDraft, donor: &EndpointDraft) {
+    if donor.six && !winner.six {
+        winner.six = true;
+    }
+    if donor.user_data_dir.is_some() && winner.user_data_dir.is_none() {
+        winner.user_data_dir = donor.user_data_dir.clone();
+    }
     if winner.websocket.is_some() || donor.websocket.is_none() {
         return;
     }
@@ -1817,7 +1961,9 @@ fn report_entries(
         entries.push(ReportEntry {
             id: draft.id.clone(),
             kind: "endpoint",
-            tier: if draft.seven_open {
+            tier: if draft.six {
+                catalog.rank.tiers.six
+            } else if draft.seven_open {
                 catalog.rank.tiers.seven_open
             } else {
                 catalog.rank.tiers.endpoint
@@ -1843,6 +1989,7 @@ fn report_entries(
                 user_data_dir: draft.user_data_dir.clone(),
                 profile: draft.profile.clone(),
                 ws_only: draft.ws_only,
+                six: draft.six,
                 seven_open: draft.seven_open,
                 tabs: draft
                     .tabs
@@ -2128,6 +2275,9 @@ fn endpoint_json(endpoint: &EndpointDraft) -> String {
     if let Some(dir) = &endpoint.user_data_dir {
         field(&mut out, &mut first, "userDataDir", &json_string(dir));
     }
+    if endpoint.six {
+        field(&mut out, &mut first, "six", "true");
+    }
     if let Some(profile) = &endpoint.profile {
         field(&mut out, &mut first, "profile", &json_string(profile));
     }
@@ -2213,7 +2363,9 @@ fn run_host(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok());
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let xdg_state = std::env::var("XDG_STATE_HOME").ok();
     let appdata = std::env::var("APPDATA").ok();
+    let slicc_user_data_dir = std::env::var("SLICC_USER_DATA_DIR").ok();
     let process_text = read_process_text();
     let os = host_os().unwrap_or(HostOs::Linux);
     let probe_ports = slicc_browsers::catalog().discovery.probe_ports;
@@ -2231,7 +2383,10 @@ fn run_host(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         os,
         home: home.as_deref(),
         xdg_config_home: xdg.as_deref(),
+        xdg_state_home: xdg_state.as_deref(),
         appdata: appdata.as_deref(),
+        local_app_data: local_app_data.as_deref(),
+        slicc_user_data_dir: slicc_user_data_dir.as_deref(),
         process_text: &process_text,
         windows_processes: cfg!(target_os = "windows"),
         self_pid: std::process::id(),
@@ -2263,7 +2418,10 @@ fn run_guest(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         os: HostOs::Linux,
         home: None,
         xdg_config_home: None,
+        xdg_state_home: None,
         appdata: None,
+        local_app_data: None,
+        slicc_user_data_dir: None,
         process_text: "",
         windows_processes: false,
         self_pid: 0,
@@ -3002,11 +3160,11 @@ mod tests {
         assert!(lists
             .borrow()
             .iter()
-            .all(|path| !path.contains("/slicc/profiles") && !path.contains("browser-coding-agent-chrome")));
+            .all(|path| (!path.contains("/slicc/profiles") || path.contains("/.local/state/slicc/profiles")) && !path.contains("browser-coding-agent-chrome")));
         assert!(reads
             .borrow()
             .iter()
-            .all(|path| !path.contains("/slicc/profiles")));
+            .all(|path| !path.contains("/slicc/profiles") || path.contains("/.local/state/slicc/profiles")));
         assert!(reads.borrow().iter().all(|path| {
             !path.contains("/.migrated-from-profiles/")
                 && !path.contains("/.hidden/")
@@ -3520,7 +3678,10 @@ mod tests {
             os,
             home,
             xdg_config_home: xdg,
+            xdg_state_home: None,
             appdata,
+            local_app_data: None,
+            slicc_user_data_dir: None,
             process_text: processes,
             windows_processes: windows,
             self_pid: 1,
@@ -3636,14 +3797,13 @@ mod tests {
             slicc_browsers::corpus::NEED_PROBE,
             slicc_browsers::corpus::NEED_ORIGINS,
             slicc_browsers::corpus::NEED_INSTALLED,
+            slicc_browsers::corpus::NEED_SIX,
         ];
-        let deferred = [slicc_browsers::corpus::NEED_SIX];
         let corpus = slicc_browsers::corpus::corpus();
         let applicable = corpus
             .cases
             .iter()
             .filter(|case| case.input.os.is_empty() || case.input.os.iter().any(|item| item == os))
-            .filter(|case| !case.input.needs.iter().any(|need| deferred.contains(&need.as_str())))
             .count();
         let mut ran = 0;
         for case in corpus.cases {
@@ -3687,12 +3847,16 @@ mod tests {
                 program_files: None,
                 program_files_x86: None,
             };
+            let env = case.env(&layout);
             let io = ListIo {
                 scan_host: true,
                 os: host_os,
                 home: Some(home),
-                xdg_config_home: case.input.env.get("XDG_CONFIG_HOME").map(String::as_str),
-                appdata: case.input.env.get("APPDATA").map(String::as_str),
+                xdg_config_home: env.get("XDG_CONFIG_HOME").map(String::as_str),
+                xdg_state_home: env.get("XDG_STATE_HOME").map(String::as_str),
+                appdata: env.get("APPDATA").map(String::as_str),
+                local_app_data: env.get("LOCALAPPDATA").map(String::as_str),
+                slicc_user_data_dir: env.get("SLICC_USER_DATA_DIR").map(String::as_str),
                 process_text: &process_text,
                 windows_processes: os == "windows",
                 self_pid: 8675309,
