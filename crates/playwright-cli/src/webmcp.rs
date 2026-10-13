@@ -309,7 +309,7 @@ fn native_webmcp(cdp: &mut Cdp, session: &str) -> bool {
 
 fn input_expression(input: &Value, native: bool) -> String {
     if native {
-        format!("{input}")
+        format!("JSON.parse({})", json!(input.to_string()))
     } else {
         format!("JSON.stringify({input})")
     }
@@ -801,6 +801,7 @@ mod tests {
     fn input_expression_object_for_native() {
         let input = json!({"key": "value"});
         let expr = input_expression(&input, true);
+        assert!(expr.starts_with("JSON.parse("));
         assert!(!expr.contains("JSON.stringify"));
     }
 }
