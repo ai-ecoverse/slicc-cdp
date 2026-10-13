@@ -2,6 +2,7 @@ use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::launch;
+use crate::sanitize;
 use crate::session;
 use discovery::{
     classify_response, default_classifiers, default_probes, known_link_rels, parse_link_header,
@@ -980,26 +981,6 @@ fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &sess
     }
 }
 
-fn escape_control(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\n' | '\t' => out.push(ch),
-            '\x07' => out.push_str("\\x07"),
-            '\x08' => out.push_str("\\x08"),
-            '\r' => out.push_str("\\r"),
-            '\x1b' => out.push_str("\\x1b"),
-            c if c.is_control() || ('\u{0080}'..='\u{009f}').contains(&c) => {
-                for byte in c.to_string().bytes() {
-                    out.push_str(&format!("\\x{byte:02x}"));
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     state.events_emitted += 1;
     if state.json_mode {
@@ -1007,9 +988,9 @@ fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     } else {
         format!(
             "{} {} {} ({})\n",
-            escape_control(&event.standard),
-            escape_control(&event.origin),
-            escape_control(&event.url),
+            sanitize::terminal(&event.standard),
+            sanitize::terminal(&event.origin),
+            sanitize::terminal(&event.url),
             format_via(event.via)
         )
     }
@@ -1459,41 +1440,6 @@ mod tests {
         let probes = default_probes();
         let m = probes.check_response("ard", 301, "application/json", "".into(), "u".into());
         assert!(m.is_none(), "301 must not match engine check_response");
-    }
-
-    #[test]
-    fn escape_control_passes_normal_text() {
-        assert_eq!(escape_control("hello world"), "hello world");
-    }
-
-    #[test]
-    fn escape_control_preserves_newline_and_tab() {
-        assert_eq!(escape_control("a\tb\n"), "a\tb\n");
-    }
-
-    #[test]
-    fn escape_control_escapes_esc() {
-        assert_eq!(escape_control("\x1b[31mred\x1b[0m"), "\\x1b[31mred\\x1b[0m");
-    }
-
-    #[test]
-    fn escape_control_escapes_bel() {
-        assert_eq!(escape_control("ring\x07"), "ring\\x07");
-    }
-
-    #[test]
-    fn escape_control_escapes_cr() {
-        assert_eq!(escape_control("over\rwrite"), "over\\rwrite");
-    }
-
-    #[test]
-    fn escape_control_escapes_c1_range() {
-        assert_eq!(escape_control("a\u{0090}b"), "a\\xc2\\x90b");
-    }
-
-    #[test]
-    fn escape_control_escapes_null() {
-        assert_eq!(escape_control("a\x00b"), "a\\x00b");
     }
 
     #[test]
