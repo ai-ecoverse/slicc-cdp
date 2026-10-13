@@ -169,7 +169,9 @@ if (document.modelContext && document.modelContext.registerTool) {
       ];
     },
     async executeTool(tool, input) {
-      if (tool.name === 'greet') return 'Hello, ' + (input.name || 'world') + '!';
+      if (typeof input !== 'string') throw new TypeError('executeTool expects a JSON string, got ' + typeof input);
+      const parsed = JSON.parse(input);
+      if (tool.name === 'greet') return 'Hello, ' + (parsed.name || 'world') + '!';
       if (tool.name === 'fail') throw new Error('intentional failure');
       throw new Error('unknown tool');
     }

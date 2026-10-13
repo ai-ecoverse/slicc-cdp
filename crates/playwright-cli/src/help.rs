@@ -362,7 +362,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "List WebMCP tools registered on the page",
                 "",
                 "Evaluates document.modelContext.getTools() in the page's main world.",
-                "Also discovers declarative form[toolname] tools.",
+                "Chrome includes declarative form[toolname] tools in getTools().",
                 "If modelContext is absent, returns an empty list.",
             ],
             &[],

@@ -58,9 +58,6 @@ fn format_list(tools: &Value) -> String {
                 flags.push("untrusted");
             }
         }
-        if tool.get("declarative").and_then(|v| v.as_bool()) == Some(true) {
-            flags.push("form");
-        }
         let suffix = if flags.is_empty() {
             String::new()
         } else {
@@ -254,23 +251,6 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
       });
     }
   }
-  for (const form of document.querySelectorAll('form[toolname][tooldescription]')) {
-    const name = form.getAttribute('toolname');
-    if (tools.some(t => t.name === name)) continue;
-    const fields = {};
-    for (const el of form.elements) {
-      if (el.name) fields[el.name] = { type: 'string' };
-    }
-    tools.push({
-      name: name,
-      title: form.getAttribute('tooldescription') || name,
-      description: form.getAttribute('tooldescription') || null,
-      inputSchema: Object.keys(fields).length > 0 ? { type: 'object', properties: fields } : null,
-      origin: location.origin,
-      annotations: null,
-      declarative: true
-    });
-  }
   return tools;
 })()"#;
     let result = cdp.call(
@@ -326,8 +306,7 @@ fn evaluate_call(
     return {{ __webmcp_error: 'consequential', description: tool.description || '' }};
   }}
   try {{
-    const input = {input_json};
-    const result = await document.modelContext.executeTool(tool, typeof input === 'string' ? input : JSON.stringify(input));
+    const result = await document.modelContext.executeTool(tool, JSON.stringify({input_json}));
     return {{ __webmcp_result: String(result) }};
   }} catch (err) {{
     return {{ __webmcp_error: 'threw', message: String(err) }};
@@ -353,8 +332,7 @@ fn evaluate_call_force(
     return {{ __webmcp_error: 'unknown', tools: tools.map(t => t.name) }};
   }}
   try {{
-    const input = {input_json};
-    const result = await document.modelContext.executeTool(tool, typeof input === 'string' ? input : JSON.stringify(input));
+    const result = await document.modelContext.executeTool(tool, JSON.stringify({input_json}));
     return {{ __webmcp_result: String(result) }};
   }} catch (err) {{
     return {{ __webmcp_error: 'threw', message: String(err) }};
