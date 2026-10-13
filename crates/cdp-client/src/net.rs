@@ -604,12 +604,6 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
         panic!("test dialed {}:{}", parts.host, parts.port);
     }
     let addr = resolve(&parts.host, parts.port)?;
-    if is_reserved_cdp_socket(addr, parts.port) {
-        return Err(format!(
-            "refused to dial reserved CDP address {}:{}\n",
-            parts.host, parts.port
-        ));
-    }
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|err| {
         connect_error(parts, &err.to_string())
     })?;
