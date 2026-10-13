@@ -33,6 +33,7 @@ pub fn execute_with_session(argv: &[String], cdp_env: Option<&str>, session_env:
         }
         Err(output) => return output,
     };
+    sanitize::set_full_urls(invocation.full_urls);
     if invocation.version {
         return Output::ok(format!(
             "playwright-cli {}\n",

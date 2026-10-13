@@ -51,6 +51,7 @@ pub struct Options {
     pub user: Option<String>,
     pub referer: Option<String>,
     pub range: Option<String>,
+    pub full_urls: bool,
     pub help: bool,
     pub version: bool,
     pub cdp: Option<String>,
@@ -104,6 +105,7 @@ fn empty_options() -> Options {
         user: None,
         referer: None,
         range: None,
+        full_urls: false,
         help: false,
         version: false,
         cdp: None,
@@ -195,6 +197,7 @@ fn is_bool(name: &str) -> bool {
             | "remote-name"
             | "get"
             | "no-credentials"
+            | "full-urls"
             | "help"
             | "version"
     )
@@ -344,6 +347,7 @@ fn apply_option(
         "remote-name" => opts.remote_name = true,
         "get" => opts.get = true,
         "no-credentials" => opts.credentials = "omit".to_string(),
+        "full-urls" => opts.full_urls = true,
         "help" => opts.help = true,
         "version" => opts.version = true,
         _ => return Err(unknown(token)),

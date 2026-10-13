@@ -14,6 +14,8 @@ pub struct WriteOut {
     pub exit_code: i32,
     pub error_msg: String,
     pub response_headers: Vec<(String, String)>,
+    pub full_urls: bool,
+    pub base_url: String,
 }
 
 fn seconds_format(seconds: f64) -> String {
@@ -55,11 +57,24 @@ fn lookup_variable(name: &str, ctx: &WriteOut) -> Option<String> {
 }
 
 fn header_value(name: &str, ctx: &WriteOut) -> String {
-    ctx.response_headers
+    let raw = ctx.response_headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !ctx.full_urls && is_url_write_out_header(name) {
+        cdp_client::sanitize::redact_header_url(&raw, Some(&ctx.base_url))
+    } else {
+        raw
+    }
+}
+
+fn is_url_write_out_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "location" | "referer" | "content-location" | "refresh" | "link"
+    )
 }
 
 fn read_braced(chars: &[char], open: usize) -> Option<(String, usize)> {

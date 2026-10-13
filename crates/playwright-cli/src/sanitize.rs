@@ -1,3 +1,29 @@
+use std::cell::Cell;
+
+thread_local! {
+    static FULL_URLS: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_full_urls(enabled: bool) {
+    FULL_URLS.with(|cell| cell.set(enabled));
+}
+
+pub fn full_urls_enabled() -> bool {
+    FULL_URLS.with(|cell| cell.get())
+}
+
+pub fn display_url(raw: &str) -> String {
+    if full_urls_enabled() {
+        terminal(raw)
+    } else {
+        terminal(&url(raw))
+    }
+}
+
+pub fn url(raw: &str) -> String {
+    cdp_client::sanitize::redact_url(raw)
+}
+
 pub fn terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -91,5 +117,81 @@ mod tests {
         let input = "\x1b[A\x1b[K";
         let output = terminal(input);
         assert_eq!(output, "\\x1b[A\\x1b[K");
+    }
+
+    #[test]
+    fn url_redacts_query_values() {
+        set_full_urls(false);
+        let redacted = url("http://127.0.0.1/success?id_token=SECRET&state=x");
+        assert!(!redacted.contains("SECRET"));
+        assert!(redacted.contains("id_token="));
+        assert!(redacted.contains("state="));
+    }
+
+    #[test]
+    fn url_redacts_fragment() {
+        let redacted = url("http://example.com/page#access_token=SECRET");
+        assert!(!redacted.contains("SECRET"));
+    }
+
+    #[test]
+    fn url_redacts_userinfo() {
+        let redacted = url("http://user:pass@example.com/");
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("pass"));
+    }
+
+    #[test]
+    fn url_preserves_no_query() {
+        assert_eq!(
+            url("https://example.com/path"),
+            "https://example.com/path"
+        );
+    }
+
+    #[test]
+    fn url_preserves_data_urls() {
+        assert_eq!(
+            url("data:text/html,<h1>hi</h1>"),
+            "data:text/html,<h1>hi</h1>"
+        );
+    }
+
+    #[test]
+    fn url_preserves_blob_urls_without_query() {
+        assert_eq!(
+            url("blob:https://example.com/abc"),
+            "blob:https://example.com/abc"
+        );
+    }
+
+    #[test]
+    fn url_returns_invalid_as_is() {
+        assert_eq!(url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn display_url_redacts_by_default() {
+        set_full_urls(false);
+        let output = display_url("http://127.0.0.1/x?token=SECRET");
+        assert!(!output.contains("SECRET"));
+        assert!(output.contains("token="));
+    }
+
+    #[test]
+    fn display_url_shows_full_when_enabled() {
+        set_full_urls(true);
+        let output = display_url("http://127.0.0.1/x?token=SECRET");
+        assert!(output.contains("SECRET"));
+        set_full_urls(false);
+    }
+
+    #[test]
+    fn display_url_also_escapes_terminal() {
+        set_full_urls(true);
+        let output = display_url("http://example.com/\x1b[2J?x=1");
+        assert!(!output.contains('\x1b'));
+        assert!(output.contains("\\x1b"));
+        set_full_urls(false);
     }
 }

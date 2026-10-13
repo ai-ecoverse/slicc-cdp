@@ -1134,15 +1134,24 @@ fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &sess
     }
 }
 
+fn redact_event(event: &DiscoveryEvent) -> DiscoveryEvent {
+    let mut redacted = event.clone();
+    redacted.url = crate::sanitize::url(&redacted.url);
+    redacted.page = crate::sanitize::url(&redacted.page);
+    redacted.summary = cdp_client::sanitize::redact_json_urls(&redacted.summary);
+    redacted
+}
+
 fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     state.events_emitted += 1;
-    let json_line = format!("{}\n", event.to_json());
+    let display = if crate::sanitize::full_urls_enabled() { event.clone() } else { redact_event(event) };
+    let json_line = format!("{}\n", display.to_json());
     match &state.sink {
         Sink::Exec { cmd, timeout } => {
-            run_exec_sink(cmd, *timeout, event);
+            run_exec_sink(cmd, *timeout, &display);
         }
         Sink::Lick { slicc_dir } => {
-            write_lick_file(slicc_dir, event);
+            write_lick_file(slicc_dir, event, &display);
         }
         Sink::Stdout => {}
     }
@@ -1205,20 +1214,20 @@ fn atomic_write(path: &str, data: &[u8]) {
     }
 }
 
-fn write_lick_file(slicc_dir: &str, event: &DiscoveryEvent) {
-    let fp = fingerprint(&event.origin, &event.standard, &event.url);
+fn write_lick_file(slicc_dir: &str, original: &DiscoveryEvent, display: &DiscoveryEvent) {
+    let fp = fingerprint(&original.origin, &original.standard, &original.url);
     let hash = cdp_client::hash::sha256_hex(fp.as_bytes());
     let path = format!("{slicc_dir}/discoveries/{hash}.json");
     let content = serde_json::to_string_pretty(&json!({
-        "v": event.v,
-        "standard": event.standard,
-        "origin": event.origin,
-        "url": event.url,
-        "via": event.via,
-        "page": event.page,
-        "targetId": event.target_id,
-        "status": event.status,
-        "summary": event.summary,
+        "v": display.v,
+        "standard": display.standard,
+        "origin": display.origin,
+        "url": display.url,
+        "via": display.via,
+        "page": display.page,
+        "targetId": display.target_id,
+        "status": display.status,
+        "summary": display.summary,
     }))
     .unwrap_or_default();
     atomic_write(&path, content.as_bytes());
@@ -1804,6 +1813,7 @@ mod tests {
             cdp: None,
             runtime: None,
             session: None,
+            full_urls: false,
             help: false,
             command_help: false,
             version: false,
@@ -1851,7 +1861,7 @@ mod tests {
             summary: json!({"name": "test"}),
             reason: None,
         };
-        write_lick_file(&slicc.to_string_lossy(), &event);
+        write_lick_file(&slicc.to_string_lossy(), &event, &event);
         let fp = fingerprint("https://example.com", "ard", "https://example.com/.well-known/ard.json");
         let hash = cdp_client::hash::sha256_hex(fp.as_bytes());
         let path = slicc.join("discoveries").join(format!("{hash}.json"));
@@ -1880,7 +1890,7 @@ mod tests {
             summary: json!({}),
             reason: None,
         };
-        write_lick_file(&slicc.to_string_lossy(), &event);
+        write_lick_file(&slicc.to_string_lossy(), &event, &event);
         let entries: Vec<_> = std::fs::read_dir(slicc.join("discoveries"))
             .unwrap()
             .filter_map(|e| e.ok())

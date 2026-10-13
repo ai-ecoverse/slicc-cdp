@@ -2251,12 +2251,12 @@ fn entry_json(entry: &ReportEntry) -> String {
 fn endpoint_json(endpoint: &EndpointDraft) -> String {
     let mut out = String::from("{");
     let mut first = true;
-    field(&mut out, &mut first, "cdp", &json_string(&endpoint.cdp));
+    field(&mut out, &mut first, "cdp", &json_string(&if crate::sanitize::full_urls_enabled() { endpoint.cdp.clone() } else { crate::sanitize::url(&endpoint.cdp) }));
     field(
         &mut out,
         &mut first,
         "webSocketDebuggerUrl",
-        &json_string(endpoint.websocket.as_deref().unwrap_or("")),
+        &json_string(&if crate::sanitize::full_urls_enabled() { endpoint.websocket.clone().unwrap_or_default() } else { crate::sanitize::url(endpoint.websocket.as_deref().unwrap_or("")) }),
     );
     field(&mut out, &mut first, "name", &json_string(&endpoint.name));
     if let Some(version) = &endpoint.version {
@@ -2330,7 +2330,7 @@ fn tabs_json(tabs: &[TabDraft]) -> String {
         out.push('{');
         let mut first = true;
         field(&mut out, &mut first, "id", &json_string(&tab.id));
-        field(&mut out, &mut first, "url", &json_string(&tab.url));
+        field(&mut out, &mut first, "url", &json_string(&if crate::sanitize::full_urls_enabled() { tab.url.clone() } else { crate::sanitize::url(&tab.url) }));
         field(&mut out, &mut first, "title", &json_string(&tab.title));
         out.push('}');
     }
@@ -3590,6 +3590,7 @@ mod tests {
             cdp: cdp.map(str::to_string),
             runtime: None,
             session: None,
+            full_urls: false,
             help: false,
             command_help: false,
             version: false,
@@ -3775,6 +3776,7 @@ mod tests {
 
     #[test]
     fn slicc_browsers_corpus_matches_list_json() {
+        crate::sanitize::set_full_urls(true);
         let catalog = slicc_browsers::catalog();
         let os = match std::env::consts::OS {
             "macos" => "darwin",

@@ -29,6 +29,7 @@ Tab selection:
                              still open, else the one open tab on the URL's
                              origin. Any other case exits 2 and lists --tab
       --frame <frameId>      Run in a child frame of that tab
+      --full-urls            Print URLs without redacting query strings (may expose login tokens)
 
 Output:
   -o, --output <file>        Write the body to a VFS file, byte-exact ("-" = stdout)

@@ -6,4 +6,5 @@ pub mod net;
 pub mod protected;
 #[cfg(test)]
 mod raw;
+pub mod sanitize;
 pub mod shield;

@@ -104,6 +104,10 @@ pub fn global_help() -> String {
         "--runtime <name>",
         "query parameter on the URL that is opened",
     ));
+    lines.push(row(
+        "--full-urls",
+        "print URLs without redacting query strings (may expose login tokens)",
+    ));
     lines.push(row("-h, --help", "show help"));
     lines.push(row("-V, --version", "print the version"));
     lines.join("\n")
