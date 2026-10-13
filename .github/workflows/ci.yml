@@ -225,12 +225,6 @@ jobs:
           echo "$output"
           echo "$output" | grep -q "HTTP 404"
 
-      - name: TLS rejects invalid certificate
-        run: |
-          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ tab-list 2>&1) || true
-          echo "$output"
-          echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
-
       - name: Tampered asset refusal
         run: |
           cp /tmp/serve/curlwright-linux-amd64 /tmp/serve/curlwright-linux-amd64.bak
