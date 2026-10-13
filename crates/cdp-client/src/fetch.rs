@@ -1,6 +1,6 @@
 use crate::cdp::{self, Cdp};
 use crate::net::{base64_decode, base64_encode};
-use crate::protected::{Opener, Protected};
+use crate::protected::Protected;
 use serde_json::{json, Value};
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
@@ -567,40 +567,7 @@ pub fn response_body(cdp: &mut Cdp, paused: &Paused) -> Result<Vec<u8>, String> 
 }
 
 pub fn target_protected(cdp: &mut Cdp, target_id: &str) -> Result<bool, String> {
-    let info = cdp.call(
-        "Target.getTargetInfo",
-        json!({ "targetId": target_id }),
-        None,
-    )?;
-    let info = info.get("targetInfo").cloned().unwrap_or(Value::Null);
-    let url = info
-        .get("url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let opener_id = info
-        .get("openerId")
-        .and_then(|v| v.as_str())
-        .filter(|id| !id.is_empty())
-        .map(str::to_string);
-    let opener = match opener_id {
-        None => Opener::None,
-        Some(id) => match cdp.call("Target.getTargetInfo", json!({ "targetId": id }), None) {
-            Ok(found) => {
-                let opener_url = found
-                    .pointer("/targetInfo/url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if cdp.guard().target(opener_url, false, Opener::Unknown) {
-                    Opener::Protected
-                } else {
-                    Opener::Unprotected
-                }
-            }
-            Err(_) => Opener::Unknown,
-        },
-    };
-    Ok(cdp.guard().target(&url, false, opener))
+    cdp.target_protected(target_id, false)
 }
 
 pub fn refuse_target(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
@@ -903,10 +870,12 @@ mod tests {
         location["params"]["responseStatusCode"] = json!(302);
         location["params"]["responseHeaders"] =
             json!([{ "name": "location", "value": "https://vault.sliccy.ai/cb#token=t" }]);
+        let mut xhr = paused_event("S", "R2", "blob:https://vault.sliccy.ai/0b9e");
+        xhr["params"]["resourceType"] = json!("XHR");
         let (mut cdp, log) = fake(
             vec![
                 paused_event("S", "R1", "https://seven.sliccy.ai/api"),
-                paused_event("S", "R2", "blob:https://vault.sliccy.ai/0b9e"),
+                xhr,
                 location,
                 paused_event("S", "R4", "https://app.example/ok"),
             ],
@@ -927,7 +896,18 @@ mod tests {
             .filter(|item| item["method"] == "Fetch.continueRequest")
             .map(|item| item["params"]["requestId"].as_str().unwrap())
             .collect();
-        assert_eq!(continued, ["R1", "R2", "R3"]);
+        assert_eq!(continued, ["R2"]);
+        let failed: Vec<(&str, &str)> = sent
+            .iter()
+            .filter(|item| item["method"] == "Fetch.failRequest")
+            .map(|item| {
+                (
+                    item["params"]["requestId"].as_str().unwrap(),
+                    item["params"]["errorReason"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(failed, [("R1", "BlockedByClient"), ("R3", "BlockedByClient")]);
         assert!(sent.iter().all(|item| item["params"].get("url").is_none()));
         assert!(cdp.events().is_empty());
     }
@@ -949,7 +929,7 @@ mod tests {
             })),
         );
         cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
-        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.continueRequest"]);
+        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.failRequest"]);
     }
 
     #[test]
@@ -1066,6 +1046,7 @@ mod tests {
         let mut response = paused_event("S1", "R1", "https://idp.example/authorize");
         response["params"]["responseStatusCode"] = json!(200);
         let queued = Rc::new(RefCell::new(Some(response)));
+        let attaches = Rc::new(RefCell::new(0));
         let (mut cdp, log) = fake(
             Vec::new(),
             Box::new(move |message| match message["method"].as_str().unwrap() {
@@ -1073,9 +1054,13 @@ mod tests {
                     json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T1", "url": "about:blank" } } }),
                 ],
                 "Target.attachToTarget" => {
-                    vec![json!({ "id": message["id"], "result": { "sessionId": "S1" } })]
+                    *attaches.borrow_mut() += 1;
+                    let session = if *attaches.borrow() == 1 { "S1" } else { "G1" };
+                    vec![json!({ "id": message["id"], "result": { "sessionId": session } })]
                 }
-                "Fetch.enable" => vec![ok(message), queued.borrow_mut().take().unwrap()],
+                "Fetch.enable" if message["sessionId"] == "S1" => {
+                    vec![ok(message), queued.borrow_mut().take().unwrap()]
+                }
                 "Fetch.getResponseBody" => vec![
                     json!({ "id": message["id"], "result": { "body": base64_encode(b"<p>hi</p>"), "base64Encoded": true } }),
                 ],
@@ -1103,7 +1088,13 @@ mod tests {
             methods(&log),
             [
                 "Target.getTargetInfo",
+                "Target.getTargetInfo",
                 "Target.attachToTarget",
+                "Target.setDiscoverTargets",
+                "Target.attachToTarget",
+                "Fetch.enable",
+                "Network.enable",
+                "Network.setBypassServiceWorker",
                 "Fetch.enable",
                 "Fetch.getResponseBody",
                 "Fetch.fulfillRequest",
@@ -1209,7 +1200,7 @@ mod tests {
     }
 
     fn start_script(cdp: &mut Cdp, session: &str, expression: &str) {
-        cdp.notify(
+        let _ = cdp.notify(
             "Runtime.evaluate",
             json!({ "expression": expression, "returnByValue": true }),
             Some(session),
@@ -1237,7 +1228,7 @@ mod tests {
             let session = seen.session_id().to_string();
             seen.call("Page.enable", json!({}), Some(&session)).unwrap();
             let start = format!("{idp}/authorize?to={}", encoded(&implicit));
-            seen.notify("Page.navigate", json!({ "url": start }), Some(&session));
+            let _ = seen.notify("Page.navigate", json!({ "url": start }), Some(&session));
             let paused = seen
                 .next(Duration::from_secs(10))
                 .unwrap()
@@ -1264,7 +1255,7 @@ mod tests {
             let session = seen.session_id().to_string();
             seen.call("Page.enable", json!({}), Some(&session)).unwrap();
             let start = format!("{idp}/authorize?to={}", encoded(&code));
-            seen.notify("Page.navigate", json!({ "url": start }), Some(&session));
+            let _ = seen.notify("Page.navigate", json!({ "url": start }), Some(&session));
             let paused = seen
                 .next(Duration::from_secs(10))
                 .unwrap()
@@ -1284,7 +1275,7 @@ mod tests {
             let mark = cdp.events().len();
             let landing = format!("{app}/landing#id_token=J");
             let start = format!("{idp}/js-redirect?to={}", encoded(&landing));
-            cdp.notify("Page.navigate", json!({ "url": start }), Some(&session));
+            let _ = cdp.notify("Page.navigate", json!({ "url": start }), Some(&session));
             let guard = cdp.guard().clone();
             let event = cdp
                 .wait_event(mark, Duration::from_secs(10), |event| {
@@ -1382,7 +1373,11 @@ mod tests {
             assert!(refused.starts_with("slicc: refused"), "{refused}");
         }
 
-        let seven_tab = new_tab(&mut cdp, &format!("{seven}/landing"));
+        let refused = cdp
+            .call("Target.createTarget", json!({ "url": format!("{seven}/landing") }), None)
+            .unwrap_err();
+        assert!(refused.starts_with("slicc: refused"), "{refused}");
+        let seven_tab = crate::raw::Raw::open(&ws).create(&format!("{seven}/landing"));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match Interception::attach(&mut cdp, &seven_tab, &[Pattern::request("*")]) {
