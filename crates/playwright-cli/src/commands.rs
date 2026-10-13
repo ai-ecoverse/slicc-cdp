@@ -143,6 +143,8 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if trace::is_request_command(command) => {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
+        "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
+        "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
@@ -1117,4 +1119,38 @@ fn default_screenshot_path() -> PathBuf {
     {
         PathBuf::from(".playwright-cli").join(name)
     }
+}
+
+fn cmd_webmcp_list(
+    cdp: &mut Cdp,
+    state: &mut session::Session,
+    invocation: &Invocation,
+) -> Output {
+    let tab = invocation.flags.get("tab").map(String::as_str);
+    let json = flag_true(&invocation.flags, "json");
+    crate::webmcp::list(cdp, state, tab, json)
+}
+
+fn cmd_webmcp_call(
+    cdp: &mut Cdp,
+    state: &mut session::Session,
+    invocation: &Invocation,
+) -> Output {
+    let Some(name) = invocation.positionals.first() else {
+        return Output::err("webmcp-call requires <name> and <json-input>\n");
+    };
+    let Some(raw) = invocation.positionals.get(1) else {
+        return Output::err("webmcp-call requires <json-input>\n");
+    };
+    let input_json = if raw == "-" {
+        match crate::webmcp::read_stdin() {
+            Ok(text) => text,
+            Err(message) => return Output::err(message),
+        }
+    } else {
+        raw.clone()
+    };
+    let tab = invocation.flags.get("tab").map(String::as_str);
+    let allow_consequential = flag_true(&invocation.flags, "allow-consequential");
+    crate::webmcp::call(cdp, state, name, &input_json, tab, allow_consequential)
 }

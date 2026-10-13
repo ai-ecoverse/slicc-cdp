@@ -13,6 +13,7 @@ mod session;
 mod snapshot;
 mod spec;
 mod trace;
+mod webmcp;
 
 pub use args::Output;
 
@@ -57,6 +58,14 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     }
     if route::is_route_command(&command) {
         return route::run(&invocation);
+    }
+    if command == "webmcp-call" {
+        if invocation.positionals.is_empty() {
+            return Output::err("webmcp-call requires <name> and <json-input>\n");
+        }
+        if invocation.positionals.len() < 2 {
+            return Output::err("webmcp-call requires <json-input>\n");
+        }
     }
     commands::run_command(&invocation, cdp_env)
 }
