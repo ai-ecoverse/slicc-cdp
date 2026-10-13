@@ -123,7 +123,7 @@ function html(res, body) {
 }
 
 function fixture(title) {
-  return `<!doctype html><html><head><title>${title}</title></head><body><button id="go">Go</button><label for="name">Name</label><input id="name"><pre id="out"></pre><iframe src="/child.html"></iframe><script>document.getElementById('go').addEventListener('click',()=>{document.getElementById('out').textContent='clicked'});document.getElementById('name').addEventListener('keydown',(event)=>{if(event.key==='Enter'){document.getElementById('out').textContent='enter:'+event.target.value}});</script></body></html>`;
+  return `<!doctype html><html><head><title>${title}</title></head><body><button id="go">Go</button><label for="name">Name</label><input id="name"><pre id="out"></pre><label for="color">Color</label><select id="color"><option value="red">Red</option><option value="green">Green</option><option value="blue">Blue</option></select><label for="agree">Agree</label><input type="checkbox" id="agree"><label for="avatar">Avatar</label><input type="file" id="avatar"><iframe src="/child.html"></iframe><script>document.getElementById('go').addEventListener('click',()=>{document.getElementById('out').textContent='clicked'});document.getElementById('name').addEventListener('keydown',(event)=>{if(event.key==='Enter'){document.getElementById('out').textContent='enter:'+event.target.value}});document.getElementById('go').addEventListener('dblclick',()=>{document.getElementById('out').textContent='dblclicked'});document.getElementById('go').addEventListener('mouseover',()=>{document.getElementById('out').textContent='hovered'});</script></body></html>`;
 }
 
 function childPage() {

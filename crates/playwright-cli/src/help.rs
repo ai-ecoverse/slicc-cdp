@@ -28,8 +28,23 @@ pub fn global_help() -> String {
         "Keyboard:".to_string(),
         row("press <key>", "press a key on the keyboard, `a`, `arrowleft`"),
         String::new(),
+        "Pointer and form:".to_string(),
+        row("hover <ref>", "hover over an element"),
+        row("dblclick <ref> [button]", "double-click an element"),
+        row("select <ref> <val>", "select a value in a <select> element"),
+        row("check <ref>", "check a checkbox"),
+        row("uncheck <ref>", "uncheck a checkbox"),
+        row("upload <ref> <file...>", "upload files to a file input"),
+        row("drag <startRef> <endRef>", "drag one element to another"),
+        String::new(),
+        "Navigation:".to_string(),
+        row("go-back", "navigate to the previous page in history"),
+        row("go-forward", "navigate to the next page in history"),
+        row("reload", "reload the current page"),
+        String::new(),
         "Save as:".to_string(),
         row("screenshot [target]", "screenshot of the current page or element"),
+        row("pdf", "save the current page as a PDF"),
         String::new(),
         "Tabs:".to_string(),
         row("tab-list", "list all tabs"),
@@ -58,6 +73,9 @@ pub fn global_help() -> String {
         "WebMCP (SLICC):".to_string(),
         row("webmcp-list", "list WebMCP tools on the page"),
         row("webmcp-call <name> <json|->", "call a WebMCP tool on the page"),
+        String::new(),
+        "SLICC-only:".to_string(),
+        row("frames", "list frame IDs for the current page"),
         String::new(),
         "Not implemented yet:".to_string(),
     ];
@@ -306,6 +324,102 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 ("--filename <path>", "write the text to a file"),
                 ("--tab <targetId>", "tab to read"),
+            ],
+        ),
+        "go-back" => page(
+            "go-back",
+            &["Navigate to the previous page in history"],
+            &[],
+            &[],
+        ),
+        "go-forward" => page(
+            "go-forward",
+            &["Navigate to the next page in history"],
+            &[],
+            &[],
+        ),
+        "reload" => page(
+            "reload",
+            &["Reload the current page"],
+            &[],
+            &[],
+        ),
+        "hover" => page(
+            "hover <ref>",
+            &["Hover over an element on the page"],
+            &[
+                ("<ref>", "exact target element reference from the page snapshot"),
+            ],
+            &[],
+        ),
+        "dblclick" => page(
+            "dblclick <ref> [button]",
+            &["Double-click an element on the page"],
+            &[
+                ("<ref>", "exact target element reference from the page snapshot"),
+                ("[button]", "button to click, defaults to left"),
+            ],
+            &[("--modifiers", "modifier key to press (repeatable)")],
+        ),
+        "select" => page(
+            "select <ref> <val>",
+            &["Select a value in a <select> element"],
+            &[
+                ("<ref>", "exact target element reference from the page snapshot"),
+                ("<val>", "value to select"),
+            ],
+            &[],
+        ),
+        "check" => page(
+            "check <ref>",
+            &["Check a checkbox element"],
+            &[
+                ("<ref>", "exact target element reference from the page snapshot"),
+            ],
+            &[],
+        ),
+        "uncheck" => page(
+            "uncheck <ref>",
+            &["Uncheck a checkbox element"],
+            &[
+                ("<ref>", "exact target element reference from the page snapshot"),
+            ],
+            &[],
+        ),
+        "upload" => page(
+            "upload <ref> <file...>",
+            &["Upload one or more files to a file input element"],
+            &[
+                ("<ref>", "exact target element reference from the page snapshot pointing to a file input"),
+                ("<file...>", "one or more file paths to upload"),
+            ],
+            &[],
+        ),
+        "drag" => page(
+            "drag <startRef> <endRef>",
+            &["Drag one element to another"],
+            &[
+                ("<startRef>", "element reference for the drag source"),
+                ("<endRef>", "element reference for the drop target"),
+            ],
+            &[],
+        ),
+        "frames" => page(
+            "frames",
+            &[
+                "List frame IDs for the current page",
+                "",
+                "Frame IDs are for use with --frame on snapshot and eval, not --tab.",
+            ],
+            &[],
+            &[],
+        ),
+        "pdf" => page(
+            "pdf",
+            &["Save the current page as a PDF"],
+            &[],
+            &[
+                ("--filename", "file name to save the PDF to. defaults to page-{timestamp}.pdf."),
             ],
         ),
         "route" => page(
