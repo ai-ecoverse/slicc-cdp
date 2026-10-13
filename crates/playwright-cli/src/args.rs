@@ -10,6 +10,7 @@ pub struct Invocation {
     pub multi: BTreeMap<String, Vec<String>>,
     pub cdp: Option<String>,
     pub runtime: Option<String>,
+    pub session: Option<String>,
     pub help: bool,
     pub command_help: bool,
     pub version: bool,
@@ -57,6 +58,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     let mut rest = Vec::new();
     let mut cdp = None;
     let mut runtime = None;
+    let mut session = None;
     let mut help = false;
     let mut version = false;
     let mut index = 0;
@@ -104,6 +106,34 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             index += 1;
             continue;
         }
+        if let Some(value) = inline_value(token, "-s") {
+            session = Some(value);
+            index += 1;
+            continue;
+        }
+        if token == "-s" {
+            index += 1;
+            let value = args.get(index).cloned().ok_or_else(|| {
+                Output::err("playwright-cli: -s requires a session name\n")
+            })?;
+            session = Some(value);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = inline_value(token, "--session") {
+            session = Some(value);
+            index += 1;
+            continue;
+        }
+        if token == "--session" {
+            index += 1;
+            let value = args.get(index).cloned().ok_or_else(|| {
+                Output::err("playwright-cli: --session requires a name\n")
+            })?;
+            session = Some(value);
+            index += 1;
+            continue;
+        }
         rest.push(token.clone());
         index += 1;
     }
@@ -130,6 +160,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             multi: BTreeMap::new(),
             cdp,
             runtime,
+            session,
             help: help || command.is_none(),
             command_help: false,
             version,
@@ -150,6 +181,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             multi,
             cdp,
             runtime,
+            session,
             help,
             command_help,
             version,
@@ -214,6 +246,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         multi,
         cdp,
         runtime,
+        session,
         help,
         command_help,
         version,
@@ -292,5 +325,75 @@ mod tests {
         let err = validate(&invocation, spec).unwrap_err();
         assert!(err.stderr.contains("error: too many arguments: expected 1, received 2"));
         assert!(err.stdout.contains("press"));
+    }
+
+    #[test]
+    fn session_flag_long() {
+        let invocation = parse(&[
+            "--session".into(),
+            "agent-1".into(),
+            "snapshot".into(),
+        ])
+        .unwrap();
+        assert_eq!(invocation.session.as_deref(), Some("agent-1"));
+        assert_eq!(invocation.command.as_deref(), Some("snapshot"));
+    }
+
+    #[test]
+    fn session_flag_short_inline() {
+        let invocation = parse(&[
+            "-s=my-session".into(),
+            "goto".into(),
+            "https://example.com".into(),
+        ])
+        .unwrap();
+        assert_eq!(invocation.session.as_deref(), Some("my-session"));
+        assert_eq!(invocation.command.as_deref(), Some("goto"));
+    }
+
+    #[test]
+    fn session_flag_short_spaced() {
+        let invocation = parse(&[
+            "-s".into(),
+            "my-session".into(),
+            "snapshot".into(),
+        ])
+        .unwrap();
+        assert_eq!(invocation.session.as_deref(), Some("my-session"));
+        assert_eq!(invocation.command.as_deref(), Some("snapshot"));
+    }
+
+    #[test]
+    fn session_flag_short_missing_value() {
+        let err = parse(&["-s".into()]).unwrap_err();
+        assert!(err.stderr.contains("-s requires a session name"));
+    }
+
+    #[test]
+    fn session_flag_long_inline() {
+        let invocation = parse(&[
+            "--session=agent-2".into(),
+            "tab-list".into(),
+        ])
+        .unwrap();
+        assert_eq!(invocation.session.as_deref(), Some("agent-2"));
+    }
+
+    #[test]
+    fn session_flag_missing_value() {
+        let err = parse(&["--session".into()]).unwrap_err();
+        assert!(err.stderr.contains("--session requires a name"));
+    }
+
+    #[test]
+    fn session_absent_by_default() {
+        let invocation = parse(&["snapshot".into()]).unwrap();
+        assert!(invocation.session.is_none());
+    }
+
+    #[test]
+    fn session_empty_value_is_accepted() {
+        let invocation = parse(&["--session=".into(), "snapshot".into()]).unwrap();
+        assert_eq!(invocation.session.as_deref(), Some(""));
     }
 }

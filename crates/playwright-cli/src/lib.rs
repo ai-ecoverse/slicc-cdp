@@ -20,8 +20,17 @@ mod webmcp;
 pub use args::Output;
 
 pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
+    execute_with_session(argv, cdp_env, None)
+}
+
+pub fn execute_with_session(argv: &[String], cdp_env: Option<&str>, session_env: Option<&str>) -> Output {
     let invocation = match args::parse(argv) {
-        Ok(invocation) => invocation,
+        Ok(mut invocation) => {
+            if invocation.session.is_none() {
+                invocation.session = session_env.map(str::to_string);
+            }
+            invocation
+        }
         Err(output) => return output,
     };
     if invocation.version {
@@ -171,8 +180,9 @@ mod tests {
         ] {
             assert!(stdout.contains(line), "{line}");
         }
-        assert!(!stdout.contains("-s=<session>"));
-        assert!(!stdout.contains("--session"));
+        assert!(stdout.contains("-s=<session>"));
+        assert!(stdout.contains("--session"));
+        assert!(stdout.contains("PLAYWRIGHT_CLI_SESSION"));
         assert!(!stdout.contains("--headed"));
         assert!(!stdout.contains("--browser"));
         assert!(!stdout.contains("install-browser"));
@@ -721,5 +731,27 @@ mod tests {
         );
         assert_eq!(output.code, 1);
         assert!(output.stderr.contains("too many arguments"));
+    }
+
+    #[test]
+    fn session_flag_overrides_env() {
+        let output = execute_with_session(
+            &["-s=flag-session".to_string(), "--help".to_string()],
+            None,
+            Some("env-session"),
+        );
+        assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn session_env_is_used_when_no_flag() {
+        let inv = args::parse(&["snapshot".to_string()]).unwrap();
+        assert!(inv.session.is_none());
+        let output = execute_with_session(
+            &["--help".to_string()],
+            None,
+            Some("from-env"),
+        );
+        assert_eq!(output.code, 0);
     }
 }

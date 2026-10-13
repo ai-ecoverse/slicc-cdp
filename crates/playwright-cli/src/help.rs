@@ -9,6 +9,7 @@ pub fn global_help() -> String {
         String::new(),
         "Usage: playwright-cli <command> [args] [options]".to_string(),
         "Usage: playwright-cli --cdp=<url> <command> [args] [options]".to_string(),
+        "Usage: playwright-cli -s=<session> <command> [args] [options]".to_string(),
         String::new(),
         "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. A probe-derived session is reused only while that browser still has a seven tab, and follow-ups show only tabs this tool created. Host list, and open when that port is absent or unreachable, GET /json/version and /json/list on 127.0.0.1:9222-9229. Launch never binds those ports. The wasm build still uses port 9222.".to_string(),
         "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
@@ -94,6 +95,10 @@ pub fn global_help() -> String {
     lines.push(row(
         "--cdp <url>",
         "WebSocket URL, or an http URL used for /json/version",
+    ));
+    lines.push(row(
+        "-s, --session <name>",
+        "session name for per-agent tab isolation (env: PLAYWRIGHT_CLI_SESSION)",
     ));
     lines.push(row(
         "--runtime <name>",

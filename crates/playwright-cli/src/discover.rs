@@ -3589,6 +3589,7 @@ mod tests {
             multi: BTreeMap::new(),
             cdp: cdp.map(str::to_string),
             runtime: None,
+            session: None,
             help: false,
             command_help: false,
             version: false,

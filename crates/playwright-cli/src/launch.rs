@@ -223,10 +223,15 @@ fn remembered_endpoint_unreachable(message: &str) -> bool {
         || message.contains("could not resolve ")
 }
 
+#[allow(dead_code)]
 pub fn remembered_endpoint() -> Option<String> {
+    remembered_endpoint_named(None)
+}
+
+pub fn remembered_endpoint_named(session_name: Option<&str>) -> Option<String> {
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        let session = crate::session::load();
+        let session = crate::session::load_named(session_name);
         let endpoint = session.endpoint.as_deref()?;
         let provenance = session.provenance.as_deref()?;
         let body = if provenance == "probe" {
