@@ -3428,6 +3428,7 @@ mod tests {
             command: Some("list".to_string()),
             positionals: Vec::new(),
             flags,
+            multi: BTreeMap::new(),
             cdp: cdp.map(str::to_string),
             runtime: None,
             help: false,
@@ -3636,11 +3637,13 @@ mod tests {
             slicc_browsers::corpus::NEED_ORIGINS,
             slicc_browsers::corpus::NEED_INSTALLED,
         ];
+        let deferred = [slicc_browsers::corpus::NEED_SIX];
         let corpus = slicc_browsers::corpus::corpus();
         let applicable = corpus
             .cases
             .iter()
             .filter(|case| case.input.os.is_empty() || case.input.os.iter().any(|item| item == os))
+            .filter(|case| !case.input.needs.iter().any(|need| deferred.contains(&need.as_str())))
             .count();
         let mut ran = 0;
         for case in corpus.cases {

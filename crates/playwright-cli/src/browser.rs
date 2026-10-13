@@ -1,5 +1,6 @@
 use crate::cdp::{self, Cdp};
 use crate::net::base64_decode;
+use crate::route;
 use crate::session::{self, Session};
 use crate::snapshot::{self, AxNode, FrameRec, RefRec};
 use crate::trace;
@@ -88,6 +89,10 @@ pub fn create_target(
         cdp::detach(cdp, &session);
         return Err(message);
     }
+    if let Err(message) = route::arm(cdp, &target_id, &session, &state.routes) {
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
     let mut abandon = false;
     let loaded = if blank {
         cdp.wait_load(&session)
@@ -115,6 +120,7 @@ pub fn create_target(
         }
     };
     let traced = trace::absorb(cdp, &session);
+    route::disarm(cdp, &session);
     cdp::detach(cdp, &session);
     if let Err(message) = loaded {
         if abandon {
@@ -129,9 +135,13 @@ pub fn create_target(
     Ok(target_id)
 }
 
-pub fn watch_attach(cdp: &mut Cdp, target_id: &str) -> Result<String, String> {
+pub fn watch_attach(cdp: &mut Cdp, state: &Session, target_id: &str) -> Result<String, String> {
     let session = cdp::attach(cdp, target_id)?;
     if let Err(message) = trace::enable(cdp, &session) {
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
+    if let Err(message) = route::arm(cdp, target_id, &session, &state.routes) {
         cdp::detach(cdp, &session);
         return Err(message);
     }
@@ -145,6 +155,7 @@ pub fn watch_detach(
     session: &str,
 ) -> Result<(), String> {
     let traced = trace::absorb(cdp, session);
+    route::disarm(cdp, session);
     cdp::detach(cdp, session);
     let (console, requests) = traced?;
     session::push_trace(state, target_id, console, requests);
@@ -197,6 +208,7 @@ pub fn navigate(
     let result = (|| {
         cdp.call("Page.enable", json!({}), Some(&session))?;
         trace::enable(cdp, &session)?;
+        route::arm(cdp, target_id, &session, &state.routes)?;
         let result = cdp.call("Page.navigate", json!({ "url": url }), Some(&session))?;
         if let Some(error) = result.get("errorText").and_then(|v| v.as_str()) {
             return Err(format!("navigate: {error}\n"));
@@ -205,6 +217,7 @@ pub fn navigate(
         Ok(())
     })();
     let traced = trace::absorb(cdp, &session);
+    route::disarm(cdp, &session);
     cdp::detach(cdp, &session);
     result?;
     let (console, requests) = traced?;

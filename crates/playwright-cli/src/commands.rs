@@ -400,7 +400,7 @@ fn cmd_snapshot(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match browser::watch_attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -553,7 +553,7 @@ fn cmd_type(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match browser::watch_attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -597,7 +597,7 @@ fn cmd_press(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match browser::watch_attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -635,7 +635,7 @@ fn cmd_screenshot(
         }
     }
     report.begin(cdp);
-    let session = match browser::watch_attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -726,7 +726,7 @@ fn cmd_eval(
     };
     report.tab(&target);
     report.begin(cdp);
-    let session = match browser::watch_attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -821,7 +821,7 @@ fn with_ref(
         Ok(rec) => rec.clone(),
         Err(message) => return Output::err(message),
     };
-    let session = match browser::watch_attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };

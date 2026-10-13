@@ -45,6 +45,9 @@ pub fn global_help() -> String {
         row("request-body <index>", "print the request body"),
         row("response-headers <index>", "print response headers"),
         row("response-body <index>", "print the response body"),
+        row("route <pattern>", "mock network requests matching a url pattern"),
+        row("route-list", "list all active network routes"),
+        row("unroute [pattern]", "remove routes matching a pattern (or all routes)"),
         String::new(),
         "Browsers:".to_string(),
         row(
@@ -300,6 +303,30 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--filename <path>", "write the text to a file"),
                 ("--tab <targetId>", "tab to read"),
             ],
+        ),
+        "route" => page(
+            "route <pattern>",
+            &[
+                "Mock network requests matching a URL pattern",
+                "",
+                "Routes are saved with the session and apply while a later command is attached to a tab. Requests to seven's origins and the vault are never routed. Cookies are added from the browser's cookie jar after a route runs, so --remove-header cannot drop them.",
+            ],
+            &[("<pattern>", "url pattern to match (e.g., \"**/api/users\")")],
+            &[
+                ("--status", "http status code (default: 200)"),
+                ("--body", "response body (text or json string)"),
+                ("--content-type", "content-type header"),
+                ("--header", "header to add in \"name: value\" format (repeatable)"),
+                ("--remove-header", "comma-separated header names to remove"),
+                ("--fulfill-file", "file whose bytes are the response body (slicc extension)"),
+            ],
+        ),
+        "route-list" => "playwright-cli route-list \n\nList all active network routes\n\n".to_string(),
+        "unroute" => page(
+            "unroute [pattern]",
+            &["Remove routes matching a pattern (or all routes)"],
+            &[("[pattern]", "url pattern to unroute (omit to remove all)")],
+            &[],
         ),
         "list" => page(
             "list",

@@ -28,6 +28,13 @@ export function startServer() {
 }
 
 function answer(req, res, pathname, body) {
+  const query = new URL(req.url || '/', 'http://127.0.0.1').searchParams;
+  if (pathname === '/authorize') return redirect(res, query.get('to') || '/');
+  if (pathname === '/js-redirect') return html(res, jsRedirect(query.get('to') || '/'));
+  if (pathname === '/cb' || pathname === '/landing') return html(res, fixture('Callback'));
+  if (pathname === '/ping') return text(res, 200, 'pong', { 'access-control-allow-origin': '*' });
+  if (pathname === '/blocked') return text(res, 200, 'not-blocked');
+  if (pathname === '/api/headers') return headerEcho(req, res);
   if (pathname === '/slow') return hold(req, res);
   if (pathname === '/api/me') return text(res, 200, req.headers.cookie || 'missing');
   if (pathname === '/api/boot') return text(res, 200, 'booted');
@@ -43,6 +50,21 @@ function answer(req, res, pathname, body) {
   if (documents.has(pathname))
     return html(res, fixture(pathname === '/other' ? 'Other' : 'Fixture'));
   return text(res, 404, 'missing');
+}
+
+function redirect(res, to) {
+  res.writeHead(302, { location: to, 'content-type': 'text/plain' });
+  res.end('moved');
+}
+
+function jsRedirect(to) {
+  return `<!doctype html><title>Redirect</title><script>location.href=${JSON.stringify(to)}</script>`;
+}
+
+function headerEcho(req, res) {
+  const added = req.headers['x-added'] || 'none';
+  const dropped = req.headers['x-drop'] || 'none';
+  text(res, 200, `x-added=${added} x-drop=${dropped}`);
 }
 
 function hold(req, res) {

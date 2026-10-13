@@ -1,3 +1,4 @@
+use crate::route::{self, Route};
 use crate::snapshot::RefRec;
 use crate::trace::{self, ConsoleEntry, NetRequest};
 use serde_json::{json, Value};
@@ -16,6 +17,7 @@ pub struct Session {
     pub snapshots: BTreeMap<String, BTreeMap<String, RefRec>>,
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
+    pub routes: Vec<Route>,
 }
 
 pub fn storage_path(cwd: &Path) -> Option<PathBuf> {
@@ -144,6 +146,11 @@ fn decode(text: &str) -> Session {
         snapshots,
         console: decode_console(&value),
         requests: decode_requests(&value),
+        routes: value
+            .get("routes")
+            .and_then(|item| item.as_array())
+            .map(|items| items.iter().filter_map(route::decode).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -202,6 +209,7 @@ fn encode(session: &Session) -> Value {
         "snapshots": snapshots,
         "console": encode_lists(&session.console, trace::console_json),
         "requests": encode_lists(&session.requests, trace::request_json),
+        "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
     })
 }
 

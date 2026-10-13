@@ -8,6 +8,7 @@ mod discover;
 mod help;
 mod launch;
 mod net;
+mod route;
 mod session;
 mod snapshot;
 mod spec;
@@ -53,6 +54,9 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     }
     if !spec.implemented {
         return Output::err(format!("playwright-cli {command}: not implemented yet\n"));
+    }
+    if route::is_route_command(&command) {
+        return route::run(&invocation);
     }
     commands::run_command(&invocation, cdp_env)
 }
@@ -353,6 +357,38 @@ mod tests {
             ],
             &["Not implemented yet"],
         );
+        assert_page(
+            "route",
+            "playwright-cli route <pattern>\n\nMock network requests matching a URL pattern\n",
+            &[
+                "  <pattern>                   url pattern to match (e.g., \"**/api/users\")",
+                "  --status                    http status code (default: 200)",
+                "  --body                      response body (text or json string)",
+                "  --content-type              content-type header",
+                "  --header                    header to add in \"name: value\" format (repeatable)",
+                "  --remove-header             comma-separated header names to remove",
+                "  --fulfill-file              file whose bytes are the response body (slicc extension)",
+            ],
+            &["Not implemented yet", "--tab"],
+        );
+        assert_eq!(
+            execute(&["route-list".into(), "--help".into()], None).stdout,
+            "playwright-cli route-list \n\nList all active network routes\n\n"
+        );
+        assert_eq!(
+            execute(&["unroute".into(), "--help".into()], None).stdout,
+            "playwright-cli unroute [pattern]\n\nRemove routes matching a pattern (or all routes)\n\nArguments:\n  [pattern]                   url pattern to unroute (omit to remove all)\n"
+        );
+        for line in [
+            "  route <pattern>             mock network requests matching a url pattern",
+            "  route-list                  list all active network routes",
+            "  unroute [pattern]           remove routes matching a pattern (or all routes)",
+        ] {
+            assert!(stdout.contains(line), "{line}");
+        }
+        for name in ["route", "route-list", "unroute"] {
+            assert!(!pending_names.contains(&name), "{name} listed as pending");
+        }
         assert_eq!(
             execute(&["dblclick".into(), "--help".into()], None).stdout,
             "playwright-cli dblclick <ref> <button>\n\nNot implemented yet.\n"

@@ -15,7 +15,9 @@ test('chromium through the native binaries and the kernel', async (t) => {
   let browser;
   let kernel;
   try {
-    browser = await launchBrowser();
+    browser = await launchBrowser([
+      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}`,
+    ]);
     const native = nativeRunner(
       path.join(nativeDir, process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'),
       path.join(nativeDir, process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'),
@@ -28,8 +30,10 @@ test('chromium through the native binaries and the kernel', async (t) => {
     );
     await t.test('native playwright-cli', () => playwrightFlow(native, site));
     await t.test('native curlwright', () => curlFlow(native, site, browser.wsUrl));
+    await t.test('native route', () => routeFlow(native, site));
     await t.test('kernel playwright-cli', () => playwrightFlow(kernel, site));
     await t.test('kernel curlwright', () => curlFlow(kernel, site, browser.wsUrl));
+    await t.test('kernel route', () => routeFlow(kernel, site));
   } finally {
     await settle(kernel?.close());
     await settle(browser?.close());
@@ -206,6 +210,84 @@ async function curlFlow(runner, site, wsUrl) {
   assert.equal(closedPage.code, 0, closedPage.stderr);
   const closedOther = await runner.playwright(['tab-close', '--tab', other], cwd);
   assert.equal(closedOther.code, 0, closedOther.stderr);
+}
+
+async function routeFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const ok = (result) => assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+  const empty = await runner.playwright(['route-list'], cwd);
+  ok(empty);
+  assert.equal(empty.stdout, 'No active routes\n');
+  const refused = await runner.playwright(
+    ['route', 'https://vault.sliccy.ai/**', '--status=200'],
+    cwd
+  );
+  assert.equal(refused.code, 1);
+  assert.equal(refused.stderr, "slicc: refused: target is on seven's origin\n");
+  const mocked = await runner.playwright(
+    ['route', '**/api/me', '--body=mocked', '--content-type=text/plain', '--header', 'X-Mock: yes'],
+    cwd
+  );
+  ok(mocked);
+  assert.equal(mocked.stdout, 'Route added for pattern: **/api/me\n');
+  ok(
+    await runner.playwright(
+      ['route', '**/api/headers', '--header=X-Added: 1', '--remove-header=x-drop'],
+      cwd
+    )
+  );
+  await runner.write(cwd, 'mock.html', '<!doctype html><title>From file</title><p>file</p>');
+  ok(await runner.playwright(['route', '**/two', '--fulfill-file', 'mock.html'], cwd));
+  ok(await runner.playwright(['route', '*', '--status=418'], cwd));
+  ok(await runner.playwright(['route', '**/*', '--status=418'], cwd));
+  ok(await runner.playwright(['unroute', '**/*'], cwd));
+  const listed = await runner.playwright(['route-list'], cwd);
+  ok(listed);
+  assert.equal(
+    listed.stdout,
+    '1. **/api/me (body=mocked, contentType=text/plain, addHeaders={"X-Mock":"yes"})\n2. **/api/headers (addHeaders={"X-Added":"1"}, removeHeaders=x-drop)\n3. **/two (file=mock.html)\n4. * (status=418)\n'
+  );
+  ok(await runner.playwright(['unroute', '*'], cwd));
+  const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+  ok(opened);
+  const tab = targetOf(opened.stdout);
+  const me = await runner.playwright(
+    [
+      'eval',
+      "fetch('/api/me').then(async (r) => (await r.text()) + ':' + r.headers.get('x-mock'))",
+    ],
+    cwd
+  );
+  ok(me);
+  assert.equal(me.stdout, 'mocked:yes\n');
+  const edited = await runner.playwright(
+    ['eval', "fetch('/api/headers', { headers: { 'X-Drop': '1' } }).then((r) => r.text())"],
+    cwd
+  );
+  ok(edited);
+  assert.equal(edited.stdout, 'x-added=1 x-drop=none\n');
+  ok(await runner.playwright(['route', '**', '--status=418'], cwd));
+  const seven = await runner.playwright(
+    ['eval', "fetch('http://seven.sliccy.ai/ping').then((r) => r.status + ':' + r.statusText)"],
+    cwd
+  );
+  ok(seven);
+  assert.equal(seven.stdout, '200:OK\n');
+  ok(await runner.playwright(['unroute', '**'], cwd));
+  ok(await runner.playwright(['goto', `${site.origin}/two`], cwd));
+  const title = await runner.playwright(['eval', 'document.title'], cwd);
+  ok(title);
+  assert.equal(title.stdout, 'From file\n');
+  const removed = await runner.playwright(['unroute', '**/api/me'], cwd);
+  ok(removed);
+  assert.equal(removed.stdout, 'Removed 1 route(s) for pattern: **/api/me\n');
+  const real = await runner.playwright(['eval', "fetch('/api/me').then((r) => r.text())"], cwd);
+  ok(real);
+  assert.match(real.stdout, /session=from-tab/);
+  const all = await runner.playwright(['unroute'], cwd);
+  ok(all);
+  assert.equal(all.stdout, 'Removed all 2 route(s)\n');
+  ok(await runner.playwright(['tab-close', '--tab', tab], cwd));
 }
 
 function markerCount(stdout) {

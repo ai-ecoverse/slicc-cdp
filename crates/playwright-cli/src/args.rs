@@ -7,11 +7,21 @@ pub struct Invocation {
     pub command: Option<String>,
     pub positionals: Vec<String>,
     pub flags: BTreeMap<String, String>,
+    pub multi: BTreeMap<String, Vec<String>>,
     pub cdp: Option<String>,
     pub runtime: Option<String>,
     pub help: bool,
     pub command_help: bool,
     pub version: bool,
+}
+
+impl Invocation {
+    pub fn repeated(&self, name: &str) -> Vec<&str> {
+        self.multi
+            .get(name)
+            .map(|values| values.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +127,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             command: None,
             positionals: Vec::new(),
             flags: BTreeMap::new(),
+            multi: BTreeMap::new(),
             cdp,
             runtime,
             help: help || command.is_none(),
@@ -127,6 +138,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     let spec = spec::lookup(command.as_deref().unwrap());
     let mut positionals = Vec::new();
     let mut flags = BTreeMap::new();
+    let mut multi: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut command_help = false;
     let mut index = 0;
     if spec.is_none() {
@@ -135,6 +147,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             command,
             positionals,
             flags,
+            multi,
             cdp,
             runtime,
             help,
@@ -183,6 +196,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
                     Output::err(format!("playwright-cli: --{name} requires a value\n"))
                 })?
             };
+            multi.entry(name.clone()).or_default().push(value.clone());
             flags.insert(name, value);
             index += 1;
             continue;
@@ -197,6 +211,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         command,
         positionals,
         flags,
+        multi,
         cdp,
         runtime,
         help,
