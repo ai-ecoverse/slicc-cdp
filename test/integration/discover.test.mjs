@@ -226,3 +226,482 @@ function parseEvents(stdout) {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
 }
+
+test('discover hardening', { timeout: 180_000 }, async (t) => {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+
+    await t.test('302 redirect to protected origin produces no event', async () => {
+      let standInHits = 0;
+      const standIn = createServer((req, res) => {
+        standInHits++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ name: 'Protected' }));
+      });
+      await new Promise((r) => standIn.listen(0, '127.0.0.1', r));
+      const standInOrigin = `http://127.0.0.1:${standIn.address().port}`;
+      const rdServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>R302</title>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(302, { location: `${standInOrigin}/.well-known/ard.json` });
+          res.end('');
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => rdServer.listen(0, '127.0.0.1', r));
+      const rdOrigin = `http://127.0.0.1:${rdServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${rdOrigin}/`],
+          cwd
+        );
+        const events = parseEvents(result.stdout).filter((e) => e.standard === 'ard');
+        assert.equal(events.length, 0, `no ard event expected: ${result.stdout}`);
+        assert.equal(standInHits, 0, 'protected stand-in must see 0 requests');
+      } finally {
+        rdServer.closeAllConnections();
+        rdServer.close();
+        standIn.closeAllConnections();
+        standIn.close();
+      }
+    });
+
+    await t.test('307 redirect to protected origin produces no event', async () => {
+      let standInHits = 0;
+      const standIn = createServer((req, res) => {
+        standInHits++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ name: 'Protected307' }));
+      });
+      await new Promise((r) => standIn.listen(0, '127.0.0.1', r));
+      const standInOrigin = `http://127.0.0.1:${standIn.address().port}`;
+      const rdServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>R307</title>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(307, { location: `${standInOrigin}/.well-known/ard.json` });
+          res.end('');
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => rdServer.listen(0, '127.0.0.1', r));
+      const rdOrigin = `http://127.0.0.1:${rdServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${rdOrigin}/`],
+          cwd
+        );
+        const events = parseEvents(result.stdout).filter((e) => e.standard === 'ard');
+        assert.equal(events.length, 0, `no ard event expected: ${result.stdout}`);
+        assert.equal(standInHits, 0, 'protected stand-in must see 0 requests');
+      } finally {
+        rdServer.closeAllConnections();
+        rdServer.close();
+        standIn.closeAllConnections();
+        standIn.close();
+      }
+    });
+
+    await t.test('probe carries no Cookie or Authorization header', async () => {
+      let probeHeaders = null;
+      const cookieServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'set-cookie': 'httpcookie=secret; Path=/',
+          });
+          res.end(
+            `<!doctype html><title>Cookie</title><script>document.cookie='jscookie=jsval';</script>`
+          );
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          probeHeaders = { cookie: req.headers.cookie, authorization: req.headers.authorization };
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ name: 'Cookie Test' }));
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => cookieServer.listen(0, '127.0.0.1', r));
+      const cookieOrigin = `http://127.0.0.1:${cookieServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        await runner.playwright(['tab-new', `${cookieOrigin}/`], cwd);
+        await new Promise((r) => setTimeout(r, 1000));
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${cookieOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        assert.ok(probeHeaders !== null, 'probe must have reached the server');
+        assert.equal(
+          probeHeaders.cookie,
+          undefined,
+          `Cookie must not be sent: ${probeHeaders.cookie}`
+        );
+        assert.equal(probeHeaders.authorization, undefined, `Authorization must not be sent`);
+      } finally {
+        cookieServer.closeAllConnections();
+        cookieServer.close();
+      }
+    });
+
+    await t.test('html-link to protected origin produces no event', async () => {
+      const htmlLinkServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(
+            '<!doctype html><title>HtmlLink</title><link rel="ai-catalog" href="https://vault.sliccy.ai/catalog.json">'
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => htmlLinkServer.listen(0, '127.0.0.1', r));
+      const hlOrigin = `http://127.0.0.1:${htmlLinkServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${hlOrigin}/`],
+          cwd
+        );
+        const events = parseEvents(result.stdout).filter(
+          (e) => e.url?.includes('vault.sliccy.ai') || e.summary?.href?.includes('vault.sliccy.ai')
+        );
+        assert.equal(events.length, 0, `no event with protected href: ${result.stdout}`);
+      } finally {
+        htmlLinkServer.closeAllConnections();
+        htmlLinkServer.close();
+      }
+    });
+
+    await t.test('userinfo is stripped from all event fields', async () => {
+      const uiServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            link: '</api>; rel="api-catalog"',
+          });
+          res.end('<!doctype html><title>UserInfo</title>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ name: 'UI Test' }));
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => uiServer.listen(0, '127.0.0.1', r));
+      const uiPort = uiServer.address().port;
+      const uiOriginWithCreds = `http://u:PW@127.0.0.1:${uiPort}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${uiOriginWithCreds}/`],
+          cwd
+        );
+        const stdout = result.stdout;
+        assert.ok(!stdout.includes('PW'), `no event field must contain PW: ${stdout}`);
+        assert.ok(!stdout.includes('u:PW'), `no event field must contain u:PW: ${stdout}`);
+        if (stdout.trim()) {
+          const events = parseEvents(stdout);
+          for (const e of events) {
+            const json = JSON.stringify(e);
+            assert.ok(!json.includes('PW'), `event must not contain PW: ${json}`);
+          }
+        }
+      } finally {
+        uiServer.closeAllConnections();
+        uiServer.close();
+      }
+    });
+
+    await t.test('--once navigates to B and probes B', async () => {
+      let bProbed = false;
+      const siteB = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/.well-known/ard.json') {
+          bProbed = true;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ name: 'B' }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<!doctype html><title>B</title>');
+      });
+      await new Promise((r) => siteB.listen(0, '127.0.0.1', r));
+      const originB = `http://127.0.0.1:${siteB.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${originB}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        assert.ok(bProbed, 'B must be probed');
+      } finally {
+        siteB.closeAllConnections();
+        siteB.close();
+      }
+    });
+
+    if (process.platform !== 'win32') {
+      await t.test('lick dirs are 0700 and files 0600 under permissive umask', async () => {
+        const { spawn: nodeSpawn } = await import('node:child_process');
+        const { mkdtemp: mkd, readdir: rd, stat: st } = await import('node:fs/promises');
+        const { tmpdir: td } = await import('node:os');
+        const tempHome = await mkd(path.join(td(), 'slicc-cdp-perm-'));
+        const lickServer = createServer((req, res) => {
+          const url = new URL(req.url || '/', 'http://127.0.0.1');
+          if (url.pathname === '/') {
+            res.writeHead(200, {
+              'content-type': 'text/html; charset=utf-8',
+              link: '</api>; rel="api-catalog"',
+            });
+            res.end('<!doctype html><title>Perm</title>');
+            return;
+          }
+          if (url.pathname === '/.well-known/ard.json') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ name: 'Perm Test' }));
+            return;
+          }
+          res.writeHead(404);
+          res.end('nope');
+        });
+        await new Promise((r) => lickServer.listen(0, '127.0.0.1', r));
+        const lickOrigin = `http://127.0.0.1:${lickServer.address().port}`;
+        try {
+          const result = await new Promise((resolve, reject) => {
+            const env = { ...process.env, HOME: tempHome };
+            delete env.SLICC_CDP_URL;
+            const child = nodeSpawn(
+              'sh',
+              [
+                '-c',
+                `umask 000 && exec "$1" --cdp "$2" discover --once "$3" --lick`,
+                '--',
+                cli,
+                browser.wsUrl,
+                `${lickOrigin}/`,
+              ],
+              { cwd: tempHome, env, stdio: ['ignore', 'pipe', 'pipe'] }
+            );
+            const out = [];
+            const err = [];
+            child.stdout.on('data', (c) => out.push(c));
+            child.stderr.on('data', (c) => err.push(c));
+            const timer = setTimeout(() => {
+              child.kill('SIGKILL');
+              reject(new Error('timeout'));
+            }, 45000);
+            child.on('close', (code) => {
+              clearTimeout(timer);
+              resolve({
+                code: code ?? 1,
+                stdout: Buffer.concat(out).toString(),
+                stderr: Buffer.concat(err).toString(),
+              });
+            });
+          });
+          assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+          const sliccDir = path.join(tempHome, '.slicc');
+          for (const dir of ['discoveries', 'watches']) {
+            const s = await st(path.join(sliccDir, dir));
+            assert.equal(
+              s.mode & 0o777,
+              0o700,
+              `${dir} must be 0700, got ${(s.mode & 0o777).toString(8)}`
+            );
+          }
+          const discos = await rd(path.join(sliccDir, 'discoveries'));
+          for (const f of discos.filter((n) => n.endsWith('.json'))) {
+            const s = await st(path.join(sliccDir, 'discoveries', f));
+            assert.equal(
+              s.mode & 0o777,
+              0o600,
+              `${f} must be 0600, got ${(s.mode & 0o777).toString(8)}`
+            );
+          }
+          const watchStat = await st(path.join(sliccDir, 'watches', 'discover.json'));
+          assert.equal(watchStat.mode & 0o777, 0o600, `discover.json must be 0600`);
+        } finally {
+          lickServer.closeAllConnections();
+          lickServer.close();
+          const { rm: rmf } = await import('node:fs/promises');
+          await rmf(tempHome, { recursive: true, force: true }).catch(() => {});
+        }
+      });
+    }
+
+    await t.test('eval throw with ESC/BEL/DEL/C1 is sanitized in stderr', async () => {
+      const escServer = createServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html><title>EvalThrow</title><script>
+Object.defineProperty(document, 'modelContext', {
+  value: {
+    async getTools() {
+      return [{ name: 'evil-eval', description: 'throws evil', inputSchema: { type: 'object' }, origin: location.origin }];
+    },
+    async executeTool() { throw new Error('boom\x1b[31m\x07\x7f\u009b'); }
+  },
+  configurable: true
+});
+</script>`);
+      });
+      await new Promise((r) => escServer.listen(0, '127.0.0.1', r));
+      const escOrigin = `http://127.0.0.1:${escServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        await runner.playwright(['open', `${escOrigin}/`], cwd);
+        const result = await runner.playwright(['webmcp-call', 'evil-eval', '{}'], cwd);
+        assert.equal(result.code, 1);
+        const raw = Buffer.from(result.stderr, 'utf8');
+        for (let i = 0; i < raw.length; i++) {
+          assert.notEqual(raw[i], 0x1b, `stderr byte ${i} is raw ESC`);
+          assert.notEqual(raw[i], 0x07, `stderr byte ${i} is raw BEL`);
+          assert.notEqual(raw[i], 0x7f, `stderr byte ${i} is raw DEL`);
+        }
+        for (const ch of result.stderr) {
+          const cp = ch.codePointAt(0);
+          assert.ok(
+            !(cp >= 0x80 && cp <= 0x9f),
+            `stderr contains raw C1 U+${cp.toString(16).padStart(4, '0')}`
+          );
+        }
+      } finally {
+        escServer.closeAllConnections();
+        escServer.close();
+      }
+    });
+
+    await t.test('48 MiB well-known body is capped by host fallback', async () => {
+      const bigSize = 48 * 1024 * 1024;
+      let bytesSent = 0;
+      const bigServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>Big</title>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': String(bigSize),
+          });
+          const chunk = Buffer.alloc(256 * 1024, 0x58);
+          const write = () => {
+            while (bytesSent < bigSize) {
+              const ok = res.write(chunk);
+              bytesSent += chunk.length;
+              if (!ok) {
+                res.once('drain', write);
+                return;
+              }
+            }
+            res.end();
+          };
+          req.on('close', () => {});
+          write();
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => bigServer.listen(0, '127.0.0.1', r));
+      const bigOrigin = `http://127.0.0.1:${bigServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${bigOrigin}/`],
+          cwd
+        );
+        assert.ok(
+          bytesSent < bigSize,
+          `server should see early close: sent ${bytesSent} of ${bigSize}`
+        );
+      } finally {
+        bigServer.closeAllConnections();
+        bigServer.close();
+      }
+    });
+
+    await t.test('stalled body probe gives up within 30s', async () => {
+      const stallServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>Stall</title>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': '10000',
+          });
+          res.write('{"name":"x');
+          return;
+        }
+        res.writeHead(404);
+        res.end('nope');
+      });
+      await new Promise((r) => stallServer.listen(0, '127.0.0.1', r));
+      const stallOrigin = `http://127.0.0.1:${stallServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const start = Date.now();
+        await runner.playwright(['discover', '--json', '--once', `${stallOrigin}/`], cwd);
+        const elapsed = Date.now() - start;
+        assert.ok(elapsed < 30000, `probe must not stall for 30s, took ${elapsed}ms`);
+      } finally {
+        stallServer.closeAllConnections();
+        stallServer.close();
+      }
+    });
+  } finally {
+    await settle(browser?.close());
+  }
+});
