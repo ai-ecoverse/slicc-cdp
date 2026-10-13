@@ -438,6 +438,51 @@ async function basicsBatchFlow(runner, site) {
   assert.equal(uploaded.code, 0, uploaded.stderr);
   assert.match(uploaded.stdout, /Uploaded/);
 
+  const snap8 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap8.code, 0, `${snap8.stderr}\n${snap8.stdout}`);
+  const reactCb = refOf(snap8.stdout, 'checkbox', 'React');
+  const reactChecked = await runner.playwright(['check', reactCb], cwd);
+  assert.equal(reactChecked.code, 0, reactChecked.stderr);
+  assert.match(reactChecked.stdout, /Checked/);
+  const afterReactCheck = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterReactCheck.stdout, 'react-cb:true\n');
+
+  const snap9 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap9.code, 0, `${snap9.stderr}\n${snap9.stdout}`);
+  const lockedCb = refOf(snap9.stdout, 'checkbox', 'Locked');
+  const lockedCheck = await runner.playwright(['check', lockedCb], cwd);
+  assert.equal(lockedCheck.code, 1, lockedCheck.stdout);
+  assert.match(lockedCheck.stderr, /disabled/);
+
+  const framesOut = await runner.playwright(['frames'], cwd);
+  assert.equal(framesOut.code, 0, framesOut.stderr);
+  const childFrameLine = framesOut.stdout
+    .split('\n')
+    .find((l) => l.includes('[child]') && l.includes('/child.html'));
+  assert.ok(childFrameLine, framesOut.stdout);
+  const childFrameId = childFrameLine.match(/frameId=(\S+)/)?.[1];
+  assert.ok(childFrameId, childFrameLine);
+  const frameSnap = await runner.playwright(['snapshot', `--frame=${childFrameId}`], cwd);
+  assert.equal(frameSnap.code, 0, `${frameSnap.stderr}\n${frameSnap.stdout}`);
+  const hoverTarget = frameSnap.stdout.match(/statictext "hover me" \[ref=(f\d+e\d+)\]/)?.[1];
+  assert.ok(hoverTarget, `hover-target not found in frame snapshot:\n${frameSnap.stdout}`);
+  const hoverFrame = await runner.playwright(['hover', hoverTarget], cwd);
+  assert.equal(hoverFrame.code, 0, hoverFrame.stderr);
+  assert.match(hoverFrame.stdout, /Hovered/);
+  const hoverAttr = await runner.playwright(
+    [
+      'eval',
+      `--frame=${childFrameId}`,
+      'document.getElementById("hover-target").getAttribute("data-hovered")',
+    ],
+    cwd
+  );
+  assert.equal(hoverAttr.code, 0, hoverAttr.stderr);
+  assert.equal(hoverAttr.stdout, 'true\n');
+
   const closed = await runner.playwright(['close'], cwd);
   assert.equal(closed.code, 0, closed.stderr);
 }
