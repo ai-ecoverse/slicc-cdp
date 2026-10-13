@@ -90,8 +90,6 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 fetch "${BASE_URL}/SHA256SUMS" "${tmpdir}/SHA256SUMS"
 
-mkdir -p "${INSTALL_DIR}"
-
 for bin in ${BINS}; do
   asset="${bin}-${OS}-${ARCH}"
   fetch "${BASE_URL}/${asset}" "${tmpdir}/${asset}"
@@ -109,6 +107,12 @@ for bin in ${BINS}; do
   fi
 
   chmod 755 "${tmpdir}/${asset}"
+done
+
+mkdir -p "${INSTALL_DIR}"
+
+for bin in ${BINS}; do
+  asset="${bin}-${OS}-${ARCH}"
   mv "${tmpdir}/${asset}" "${INSTALL_DIR}/${bin}"
   "${INSTALL_DIR}/${bin}" --version
 done
