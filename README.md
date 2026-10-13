@@ -73,6 +73,13 @@ Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on 
 ## Install and run
 
 ```
+curl -fsSL https://get.sliccy.ai/playwright-cli | sh
+curl -fsSL https://get.sliccy.ai/curlwright | sh
+```
+
+Both at once, straight from the release:
+
+```
 curl -fsSL https://github.com/ai-ecoverse/slicc-cdp/releases/latest/download/install.sh | sh
 ```
 
