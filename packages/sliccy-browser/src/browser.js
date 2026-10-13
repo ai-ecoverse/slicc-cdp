@@ -146,13 +146,14 @@ export async function ensureTab(url, options = {}) {
     }
   }
   const client = await openClient();
-  const created = await client.send('Target.createTarget', { url });
+  const created = await client.send('Target.createTarget', { url: 'about:blank' });
   const targetId = created?.targetId;
   if (typeof targetId !== 'string' || targetId.length === 0) {
     throw new Error('Target.createTarget returned no targetId');
   }
   const { sessionId } = await sessionFor(targetId);
-  await waitForLoad(client, sessionId);
+  if (url === 'about:blank') await waitForLoad(client, sessionId);
+  else await navigateAndWait(client, sessionId, url);
   const live = (await listTabs()).find((tab) => tab.targetId === targetId);
   return live ?? { targetId, url, title: '' };
 }
@@ -282,6 +283,34 @@ function pageIsSettled(client, sessionId) {
       }
       throw error;
     });
+}
+
+function navigateAndWait(client, sessionId, url) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.off('Page.loadEventFired', listener);
+      if (error) reject(error);
+      else resolve();
+    };
+    const listener = (message) => {
+      if (typeof message?.sessionId === 'string' && message.sessionId !== sessionId) return;
+      finish();
+    };
+    client.on('Page.loadEventFired', listener);
+    timer = setTimeout(() => finish(), LOAD_TIMEOUT_MS);
+    client.send('Page.navigate', { url }, sessionId).then(
+      (result) => {
+        if (result?.errorText) finish(new Error(`navigate: ${result.errorText}`));
+        else if (!result?.loaderId) finish();
+      },
+      (error) => finish(error)
+    );
+  });
 }
 
 function waitForLoad(client, sessionId) {

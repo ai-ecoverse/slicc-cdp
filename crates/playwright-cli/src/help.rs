@@ -404,6 +404,7 @@ fn arg_optional(spec: &Spec, index: usize) -> bool {
         (spec.name, index),
         ("open", 0)
             | ("tab-new", 0)
+            | ("tab-close", 0)
             | ("screenshot", 0)
             | ("console", 0)
             | ("dialog-accept", 0)

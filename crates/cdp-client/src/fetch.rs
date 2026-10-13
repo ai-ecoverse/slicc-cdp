@@ -684,10 +684,14 @@ mod tests {
         log: Rc<RefCell<Vec<Value>>>,
         inbox: VecDeque<String>,
         reply: Reply,
+        closed: Option<String>,
     }
 
     impl Transport for Fake {
         fn send_text(&mut self, text: &str) -> Result<(), String> {
+            if let Some(closed) = &self.closed {
+                return Err(closed.clone());
+            }
             let value: Value = serde_json::from_str(text).unwrap();
             self.log.borrow_mut().push(value.clone());
             for out in (self.reply)(&value) {
@@ -697,7 +701,20 @@ mod tests {
         }
 
         fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
-            Ok(self.inbox.pop_front())
+            if let Some(closed) = &self.closed {
+                return Err(closed.clone());
+            }
+            let next = self.inbox.pop_front();
+            if let Some(text) = &next {
+                if let Some(reason) = serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|value| value.get("close").and_then(|v| v.as_str()).map(str::to_string))
+                {
+                    self.closed = Some(reason.clone());
+                    return Err(reason);
+                }
+            }
+            Ok(next)
         }
     }
 
@@ -707,6 +724,7 @@ mod tests {
             log: log.clone(),
             inbox: inbox.into_iter().map(|value| value.to_string()).collect(),
             reply,
+            closed: None,
         };
         (Cdp::from_transport(Box::new(transport)), log)
     }
@@ -990,6 +1008,47 @@ mod tests {
         assert_eq!(methods(&log), ["Target.getTargetInfo", "Target.attachToTarget"]);
         crate::cdp::attach(&mut cdp, "P").unwrap();
         assert!(methods(&log).contains(&"Network.setBypassServiceWorker".to_string()));
+    }
+
+    #[test]
+    fn a_takeover_close_frame_wins_over_the_guard_refusal() {
+        let close = "websocket closed 1011 another page took over slicc-node's /cdp (superseded-by-new-cdp-client)\n";
+        let (mut cdp, _log) = fake(
+            Vec::new(),
+            Box::new(move |message| match message["method"].as_str().unwrap() {
+                "Target.getTargetInfo" => vec![json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T", "type": "page", "url": "https://app.example/" } } })],
+                "Target.attachToTarget" => vec![json!({ "id": message["id"], "result": { "sessionId": "S" } })],
+                "Target.setDiscoverTargets" => vec![json!({ "close": close })],
+                _ => vec![ok(message)],
+            }),
+        );
+        assert_eq!(crate::cdp::attach(&mut cdp, "T").unwrap_err(), close);
+        assert_eq!(
+            cdp.call("Runtime.evaluate", json!({ "expression": "1" }), Some("S")).unwrap_err(),
+            close
+        );
+        let (mut live, _log) = fake(
+            Vec::new(),
+            Box::new(|message| match message["method"].as_str().unwrap() {
+                "Target.getTargetInfo" => vec![json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T", "type": "page", "url": "https://app.example/" } } })],
+                "Target.attachToTarget" => vec![json!({ "id": message["id"], "result": { "sessionId": format!("S{}", message["id"]) } })],
+                "Fetch.enable" => vec![json!({ "id": message["id"], "error": { "message": "Fetch is not available" } })],
+                _ => vec![ok(message)],
+            }),
+        );
+        assert_eq!(crate::cdp::attach(&mut live, "T").unwrap_err(), crate::cdp::UNGUARDED);
+    }
+
+    #[test]
+    fn a_target_that_landed_on_the_vault_is_reported_protected() {
+        let (mut cdp, _log) = fake(
+            Vec::new(),
+            Box::new(|message| vec![json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T", "type": "page", "url": "https://vault.sliccy.ai/landing" } } })]),
+        );
+        assert!(!cdp.is_protected_target("T"));
+        assert!(cdp.target_protected("T", false).unwrap());
+        assert!(cdp.is_protected_target("T"));
+        assert!(cdp.call("Target.attachToTarget", json!({ "targetId": "T", "flatten": true }), None).is_err());
     }
 
     #[test]

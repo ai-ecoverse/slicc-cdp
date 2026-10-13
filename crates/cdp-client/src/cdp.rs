@@ -99,6 +99,10 @@ impl Cdp {
 
     pub fn is_protected_target(&self, target_id: &str) -> bool {
         self.protected_targets.contains(target_id)
+            || self
+                .session_targets
+                .iter()
+                .any(|(session, target)| target == target_id && self.blocked.contains(session))
     }
 
     pub fn set_decider(&mut self, session_id: &str, decider: Option<Decider>) {
@@ -312,13 +316,22 @@ impl Cdp {
                 if !session.is_empty() {
                     self.session_targets.insert(session.clone(), target.clone());
                     if let Err(message) = self.touch(&target) {
-                        let _ = self.raw_call(
+                        if transport_error(&message) {
+                            self.session_targets.remove(&session);
+                            return Err(message);
+                        }
+                        let detached = self.raw_call(
                             "Target.detachFromTarget",
                             json!({ "sessionId": session }),
                             None,
                             Duration::from_secs(5),
                         );
                         self.session_targets.remove(&session);
+                        if let Err(closed) = detached {
+                            if transport_error(&closed) {
+                                return Err(closed);
+                            }
+                        }
                         return Err(message);
                     }
                     if self.protected_targets.contains(&target) {
@@ -527,7 +540,7 @@ impl Cdp {
                 None,
                 Duration::from_secs(10),
             )
-            .map_err(|_| UNGUARDED.to_string())?;
+            .map_err(unguarded)?;
             self.discovering = true;
         }
         let attached = self
@@ -537,7 +550,7 @@ impl Cdp {
                 None,
                 Duration::from_secs(10),
             )
-            .map_err(|_| UNGUARDED.to_string())?;
+            .map_err(unguarded)?;
         let session = attached
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -558,10 +571,11 @@ impl Cdp {
         for (method, params) in setup {
             let optional = matches!(method, "Page.enable" | "Runtime.enable");
             let failed = match self.raw_call(method, params, Some(&session), Duration::from_secs(10)) {
-                Ok(_) => false,
-                Err(message) => !(optional && message.starts_with(&format!("{method}:"))),
+                Ok(_) => None,
+                Err(message) if optional && message.starts_with(&format!("{method}:")) => None,
+                Err(message) => Some(message),
             };
-            if failed {
+            if let Some(message) = failed {
                 self.guards.remove(target_id);
                 let _ = self.raw_call(
                     "Target.detachFromTarget",
@@ -570,7 +584,7 @@ impl Cdp {
                     Duration::from_secs(5),
                 );
                 self.guard_sessions.remove(&session);
-                return Err(UNGUARDED.into());
+                return Err(unguarded(message));
             }
         }
         Ok(())
@@ -1079,6 +1093,18 @@ impl Cdp {
                 return Ok(());
             }
         }
+    }
+}
+
+pub fn transport_error(message: &str) -> bool {
+    message.starts_with("websocket ") || message.starts_with("CDP response was not JSON")
+}
+
+fn unguarded(message: String) -> String {
+    if transport_error(&message) {
+        message
+    } else {
+        UNGUARDED.to_string()
     }
 }
 
