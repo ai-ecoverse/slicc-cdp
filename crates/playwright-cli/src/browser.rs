@@ -740,8 +740,7 @@ fn dblclick_backend(
     let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let cx = if width > 0.0 { x + width / 2.0 } else { x };
     let cy = if height > 0.0 { y + height / 2.0 } else { y };
-    for kind in ["mousePressed", "mouseReleased", "mousePressed", "mouseReleased"] {
-        let count = if kind == "mousePressed" { 2 } else { 2 };
+    for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
         cdp.call(
             "Input.dispatchMouseEvent",
             json!({
@@ -831,7 +830,7 @@ pub fn select_ref(
 ) -> Result<(), String> {
     if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
         let expression = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.value = {}; el.dispatchEvent(new Event('change', {{ bubbles: true }})); }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.value = {}; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
             serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
         );
@@ -867,7 +866,7 @@ fn select_backend(
         "Runtime.callFunctionOn",
         json!({
             "objectId": object_id,
-            "functionDeclaration": "function(v) { this.value = v; this.dispatchEvent(new Event('change', { bubbles: true })); }",
+            "functionDeclaration": "function(v) { this.value = v; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }",
             "arguments": [{ "value": value }],
             "returnByValue": true,
         }),

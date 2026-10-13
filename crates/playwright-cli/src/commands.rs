@@ -1205,6 +1205,9 @@ fn cmd_go_back(
         Err(message) => return Output::err(message),
     };
     let result = browser::evaluate(cdp, &session, "history.back()", false);
+    if result.is_ok() {
+        let _ = cdp.wait_load(&session);
+    }
     let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(_) => {
@@ -1239,6 +1242,9 @@ fn cmd_go_forward(
         Err(message) => return Output::err(message),
     };
     let result = browser::evaluate(cdp, &session, "history.forward()", false);
+    if result.is_ok() {
+        let _ = cdp.wait_load(&session);
+    }
     let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(_) => {
@@ -1279,6 +1285,7 @@ fn cmd_reload(
             if let Err(message) = watched {
                 return Output::err(message);
             }
+            state.snapshots.remove(&target);
             Output::ok("Reloaded\n")
         }
         Err(message) => Output::err(message),
