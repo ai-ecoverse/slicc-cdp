@@ -1178,9 +1178,30 @@ pub fn upload_files(
     }
     let _ = cdp.call("DOM.enable", json!({}), Some(session));
     let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let frame_id = rec
+        .frame_id
+        .clone()
+        .or_else(|| {
+            cdp.call("Page.getFrameTree", json!({}), Some(session))
+                .ok()
+                .and_then(|r| {
+                    r.pointer("/frameTree/frame/id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+        })
+        .ok_or_else(|| "upload: could not determine frame id\n".to_string())?;
+    let world = cdp.call(
+        "Page.createIsolatedWorld",
+        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+        Some(session),
+    )?;
+    let context_id = world
+        .get("executionContextId")
+        .ok_or_else(|| "upload: isolated world returned no context\n".to_string())?;
     let resolved = cdp.call(
         "DOM.resolveNode",
-        json!({ "backendNodeId": backend }),
+        json!({ "backendNodeId": backend, "executionContextId": context_id }),
         Some(session),
     )?;
     let object_id = resolved
@@ -1188,27 +1209,6 @@ pub fn upload_files(
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
         .to_string();
-    let frame_id = cdp
-        .call(
-            "DOM.describeNode",
-            json!({ "backendNodeId": backend }),
-            Some(session),
-        )
-        .ok()
-        .and_then(|r| r.pointer("/node/frameId").and_then(|v| v.as_str()).map(String::from))
-        .or_else(|| rec.frame_id.clone());
-    let world_frame = frame_id.as_deref().unwrap_or("");
-    let world = if world_frame.is_empty() {
-        None
-    } else {
-        cdp.call(
-            "Page.createIsolatedWorld",
-            json!({ "frameId": world_frame, "grantUniveralAccess": true }),
-            Some(session),
-        )
-        .ok()
-        .and_then(|r| r.get("executionContextId").cloned())
-    };
     let file_array_js = entries
         .iter()
         .enumerate()
@@ -1235,16 +1235,16 @@ pub fn upload_files(
         arguments.push(json!({ "value": mime }));
         arguments.push(json!({ "value": b64 }));
     }
-    let mut params = json!({
-        "objectId": object_id,
-        "functionDeclaration": func,
-        "arguments": arguments,
-        "returnByValue": true,
-    });
-    if let Some(ctx) = world {
-        params["executionContextId"] = ctx;
-    }
-    let result = cdp.call("Runtime.callFunctionOn", params, Some(session))?;
+    let result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": func,
+            "arguments": arguments,
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
     if let Some(details) = result.get("exceptionDetails") {
         return Err(format!("upload: JS error: {}\n", exception_message(details)));
     }
