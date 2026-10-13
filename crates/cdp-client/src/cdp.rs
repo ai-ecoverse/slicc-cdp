@@ -97,13 +97,12 @@ impl Cdp {
         self.blocked.contains(session_id)
     }
 
-    pub fn listed_protected(&self, target_id: &str) -> bool {
+    pub fn is_protected_target(&self, target_id: &str) -> bool {
         self.protected_targets.contains(target_id)
-    }
-
-    pub fn is_protected_target(&mut self, target_id: &str) -> bool {
-        self.protected_targets.contains(target_id)
-            || self.target_protected(target_id, false).unwrap_or(true)
+            || self
+                .session_targets
+                .iter()
+                .any(|(session, target)| target == target_id && self.blocked.contains(session))
     }
 
     pub fn set_decider(&mut self, session_id: &str, decider: Option<Decider>) {

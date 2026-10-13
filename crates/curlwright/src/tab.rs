@@ -21,7 +21,7 @@ pub fn list_pages(cdp: &mut Cdp) -> Result<Vec<Page>, String> {
         let target_id = info.get("targetId").and_then(|value| value.as_str()).unwrap_or("").to_string();
         let url = info.get("url").and_then(|value| value.as_str()).unwrap_or("").to_string();
         let title = info.get("title").and_then(|value| value.as_str()).unwrap_or("").to_string();
-        if target_id.is_empty() || is_internal(&url, &title) || cdp.listed_protected(&target_id) {
+        if target_id.is_empty() || is_internal(&url, &title) || cdp.is_protected_target(&target_id) {
             continue;
         }
         pages.push(Page { target_id, url });

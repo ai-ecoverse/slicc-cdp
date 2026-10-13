@@ -884,8 +884,13 @@ fn resolve_target(
         if pages.iter().any(|page| page.target_id == *tab) {
             return Ok(tab.clone());
         }
-        if cdp.is_protected_target(tab) || cdp.target_protected(tab, false).unwrap_or(false) {
+        if cdp.is_protected_target(tab) {
             return Err(format!("{}\n", cdp.guard().refusal()));
+        }
+        match cdp.target_protected(tab, false) {
+            Ok(true) => return Err(format!("{}\n", cdp.guard().refusal())),
+            Err(message) if crate::cdp::transport_error(&message) => return Err(message),
+            _ => {}
         }
         return Err(format!(
             "Unknown tab \"{tab}\". Run 'playwright-cli tab-list' to get tab IDs.\n"
@@ -895,8 +900,13 @@ fn resolve_target(
         if pages.iter().any(|page| page.target_id == current) {
             return Ok(current);
         }
-        if cdp.is_protected_target(&current) || cdp.target_protected(&current, true).unwrap_or(false) {
+        if cdp.is_protected_target(&current) {
             return Err(format!("{}\n", cdp.guard().refusal()));
+        }
+        match cdp.target_protected(&current, true) {
+            Ok(true) => return Err(format!("{}\n", cdp.guard().refusal())),
+            Err(message) if crate::cdp::transport_error(&message) => return Err(message),
+            _ => {}
         }
     }
     if pages.len() == 1 {

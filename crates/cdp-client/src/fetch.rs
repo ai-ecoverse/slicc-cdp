@@ -1045,9 +1045,10 @@ mod tests {
             Vec::new(),
             Box::new(|message| vec![json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T", "type": "page", "url": "https://vault.sliccy.ai/landing" } } })]),
         );
-        assert!(!cdp.listed_protected("T"));
+        assert!(!cdp.is_protected_target("T"));
+        assert!(cdp.target_protected("T", false).unwrap());
         assert!(cdp.is_protected_target("T"));
-        assert!(cdp.listed_protected("T"));
+        assert!(cdp.call("Target.attachToTarget", json!({ "targetId": "T", "flatten": true }), None).is_err());
     }
 
     #[test]
