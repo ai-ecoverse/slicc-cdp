@@ -25,5 +25,6 @@ publish_one() {
   return 1
 }
 publish_one slicc-cdp-client
+publish_one slicc-discovery
 publish_one slicc-cdp
 publish_one curlwright
