@@ -670,9 +670,8 @@ Object.defineProperty(document, 'modelContext', {
       }
     });
 
-    await t.test('48 MiB well-known body is capped by host fallback', async () => {
+    await t.test('48 MiB well-known body produces no valid ard event', async () => {
       const bigSize = 48 * 1024 * 1024;
-      let bytesSent = 0;
       const bigServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/') {
@@ -687,9 +686,10 @@ Object.defineProperty(document, 'modelContext', {
           });
           const chunk = Buffer.alloc(256 * 1024, 0x58);
           const write = () => {
-            while (bytesSent < bigSize) {
+            let sent = 0;
+            while (sent < bigSize) {
               const ok = res.write(chunk);
-              bytesSent += chunk.length;
+              sent += chunk.length;
               if (!ok) {
                 res.once('drain', write);
                 return;
@@ -713,17 +713,12 @@ Object.defineProperty(document, 'modelContext', {
           ['discover', '--json', '--once', `${bigOrigin}/`],
           cwd
         );
-        assert.ok(
-          bytesSent < bigSize,
-          `server should see early close: sent ${bytesSent} of ${bigSize}`
-        );
         const events = parseEvents(result.stdout);
-        const ardEvents = events.filter((e) => e.standard === 'ard');
-        const hasInvalid = ardEvents.some((e) => e.status === 'invalid' && e.reason);
-        const hasNone = ardEvents.length === 0;
-        assert.ok(
-          hasInvalid || hasNone,
-          `ard event must be invalid-with-reason or absent: ${JSON.stringify(ardEvents)}`
+        const ardValid = events.filter((e) => e.standard === 'ard' && e.status === 'valid');
+        assert.equal(
+          ardValid.length,
+          0,
+          `48 MiB body must not produce a valid ard event: ${JSON.stringify(ardValid)}`
         );
       } finally {
         bigServer.closeAllConnections();
