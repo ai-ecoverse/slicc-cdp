@@ -683,6 +683,494 @@ pub fn format_eval(result: &EvalValue) -> String {
     }
 }
 
+pub fn dblclick_ref(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+    button: &str,
+    modifiers: i64,
+) -> Result<(), String> {
+    if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
+        let expression = format!(
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); el.dispatchEvent(new MouseEvent('dblclick', {{ bubbles: true }})); }})()",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
+        );
+        evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        return Ok(());
+    }
+    if let Some(backend) = rec.backend_node_id {
+        dblclick_backend(cdp, session, backend, button, modifiers)?;
+        return Ok(());
+    }
+    Err("element has no backend node\n".to_string())
+}
+
+fn dblclick_backend(
+    cdp: &mut Cdp,
+    session: &str,
+    backend: u64,
+    button: &str,
+    modifiers: i64,
+) -> Result<(), String> {
+    let _ = cdp.call("DOM.enable", json!({}), Some(session));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
+        .to_string();
+    let box_result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); return {x:r.x,y:r.y,width:r.width,height:r.height}; }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
+    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cx = if width > 0.0 { x + width / 2.0 } else { x };
+    let cy = if height > 0.0 { y + height / 2.0 } else { y };
+    for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
+        cdp.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind,
+                "x": cx,
+                "y": cy,
+                "button": button,
+                "clickCount": count,
+                "modifiers": modifiers,
+            }),
+            Some(session),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn hover_ref(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+) -> Result<(), String> {
+    if let Some(frame_id) = rec.frame_id.as_deref() {
+        let selector = first_selector(&rec.selector);
+        let frame_offset = frame_element_offset(cdp, session, frame_id)?;
+        let expression = format!(
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
+        );
+        let pos = evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let cx = frame_offset.0 + fx;
+        let cy = frame_offset.1 + fy;
+        cdp.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseMoved",
+                "x": cx,
+                "y": cy,
+            }),
+            Some(session),
+        )?;
+        return Ok(());
+    }
+    if let Some(backend) = rec.backend_node_id {
+        hover_backend(cdp, session, backend)?;
+        return Ok(());
+    }
+    Err("element has no backend node\n".to_string())
+}
+
+fn hover_backend(
+    cdp: &mut Cdp,
+    session: &str,
+    backend: u64,
+) -> Result<(), String> {
+    let _ = cdp.call("DOM.enable", json!({}), Some(session));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
+        .to_string();
+    let box_result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); return {x:r.x,y:r.y,width:r.width,height:r.height}; }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
+    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cx = if width > 0.0 { x + width / 2.0 } else { x };
+    let cy = if height > 0.0 { y + height / 2.0 } else { y };
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseMoved",
+            "x": cx,
+            "y": cy,
+        }),
+        Some(session),
+    )?;
+    Ok(())
+}
+
+pub fn select_ref(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+    value: &str,
+) -> Result<(), String> {
+    if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
+        let expression = format!(
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.value = {}; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); }})()",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+        );
+        evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        return Ok(());
+    }
+    if let Some(backend) = rec.backend_node_id {
+        select_backend(cdp, session, backend, value)?;
+        return Ok(());
+    }
+    Err("element has no backend node\n".to_string())
+}
+
+fn select_backend(
+    cdp: &mut Cdp,
+    session: &str,
+    backend: u64,
+    value: &str,
+) -> Result<(), String> {
+    let _ = cdp.call("DOM.enable", json!({}), Some(session));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
+        .to_string();
+    cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function(v) { this.value = v; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }",
+            "arguments": [{ "value": value }],
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    Ok(())
+}
+
+pub fn check_ref(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+    checked: bool,
+) -> Result<bool, String> {
+    if let Some(frame_id) = rec.frame_id.as_deref() {
+        let selector = first_selector(&rec.selector);
+        let pre_expr = format!(
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); return JSON.stringify({{ checked: el.checked, disabled: el.disabled || false }}); }})()",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
+        );
+        let pre = evaluate_in_frame(cdp, session, frame_id, &pre_expr)?;
+        let pre_text = match &pre.value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let pre_parsed: Value = serde_json::from_str(&pre_text).unwrap_or(Value::Null);
+        if pre_parsed.get("disabled").and_then(|v| v.as_bool()) == Some(true) {
+            return Err("element is disabled\n".to_string());
+        }
+        if pre_parsed.get("checked").and_then(|v| v.as_bool()) == Some(checked) {
+            return Ok(false);
+        }
+        let frame_offset = frame_element_offset(cdp, session, frame_id)?;
+        let click_expr = format!(
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
+        );
+        let pos = evaluate_in_frame(cdp, session, frame_id, &click_expr)?;
+        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let cx = frame_offset.0 + fx;
+        let cy = frame_offset.1 + fy;
+        for kind in ["mousePressed", "mouseReleased"] {
+            cdp.call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": cx, "y": cy, "button": "left", "clickCount": 1 }),
+                Some(session),
+            )?;
+        }
+        let post_expr = format!(
+            "(function() {{ var el = document.querySelector({}); return el ? el.checked : null; }})()",
+            serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
+        );
+        let post = evaluate_in_frame(cdp, session, frame_id, &post_expr)?;
+        let after = post.value.as_bool().unwrap_or(!checked);
+        if after != checked {
+            return Err(format!("check: element state did not change to {}\n", checked));
+        }
+        return Ok(true);
+    }
+    if let Some(backend) = rec.backend_node_id {
+        return check_backend(cdp, session, backend, checked);
+    }
+    Err("element has no backend node\n".to_string())
+}
+
+fn check_backend(
+    cdp: &mut Cdp,
+    session: &str,
+    backend: u64,
+    checked: bool,
+) -> Result<bool, String> {
+    let _ = cdp.call("DOM.enable", json!({}), Some(session));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
+        .to_string();
+    let pre = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { return JSON.stringify({ checked: this.checked, disabled: this.disabled || false }); }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let pre_text = pre.pointer("/result/value").and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+    let pre_parsed: Value = serde_json::from_str(&pre_text).unwrap_or(Value::Null);
+    if pre_parsed.get("disabled").and_then(|v| v.as_bool()) == Some(true) {
+        return Err("element is disabled\n".to_string());
+    }
+    if pre_parsed.get("checked").and_then(|v| v.as_bool()) == Some(checked) {
+        return Ok(false);
+    }
+    let box_result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
+    let cx = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cy = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    for kind in ["mousePressed", "mouseReleased"] {
+        cdp.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": kind,
+                "x": cx,
+                "y": cy,
+                "button": "left",
+                "clickCount": 1,
+            }),
+            Some(session),
+        )?;
+    }
+    let post = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { return this.checked; }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let after = post.pointer("/result/value").and_then(|v| v.as_bool()).unwrap_or(!checked);
+    if after != checked {
+        return Err(format!("check: element state did not change to {}\n", checked));
+    }
+    Ok(true)
+}
+
+pub fn drag_refs(
+    cdp: &mut Cdp,
+    session: &str,
+    start_rec: &RefRec,
+    end_rec: &RefRec,
+) -> Result<(), String> {
+    let start_box = element_center(cdp, session, start_rec)?;
+    let end_box = element_center(cdp, session, end_rec)?;
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseMoved",
+            "x": start_box.0,
+            "y": start_box.1,
+        }),
+        Some(session),
+    )?;
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mousePressed",
+            "x": start_box.0,
+            "y": start_box.1,
+            "button": "left",
+            "clickCount": 1,
+        }),
+        Some(session),
+    )?;
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseMoved",
+            "x": end_box.0,
+            "y": end_box.1,
+        }),
+        Some(session),
+    )?;
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseReleased",
+            "x": end_box.0,
+            "y": end_box.1,
+            "button": "left",
+            "clickCount": 1,
+        }),
+        Some(session),
+    )?;
+    Ok(())
+}
+
+fn element_center(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f64), String> {
+    let backend = rec
+        .backend_node_id
+        .ok_or_else(|| "element has no backend node\n".to_string())?;
+    let _ = cdp.call("DOM.enable", json!({}), Some(session));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
+        .to_string();
+    let box_result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
+    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    Ok((x, y))
+}
+
+fn frame_element_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<(f64, f64), String> {
+    let result = cdp.call(
+        "DOM.getFrameOwner",
+        json!({ "frameId": frame_id }),
+        Some(session),
+    )?;
+    let backend = result
+        .get("backendNodeId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "could not find frame owner element\n".to_string())?;
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "could not resolve frame owner\n".to_string())?
+        .to_string();
+    let box_result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": "function() { var r = this.getBoundingClientRect(); var s = getComputedStyle(this); var bt = parseFloat(s.borderTopWidth)||0; var bl = parseFloat(s.borderLeftWidth)||0; var pt = parseFloat(s.paddingTop)||0; var pl = parseFloat(s.paddingLeft)||0; return {x:r.x+bl+pl,y:r.y+bt+pt}; }",
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
+    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    Ok((x, y))
+}
+
+pub fn upload_files(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+    files: &[String],
+) -> Result<(), String> {
+    let backend = rec
+        .backend_node_id
+        .ok_or_else(|| "element has no backend node\n".to_string())?;
+    cdp.call(
+        "DOM.setFileInputFiles",
+        json!({
+            "files": files,
+            "backendNodeId": backend,
+        }),
+        Some(session),
+    )?;
+    Ok(())
+}
+
+pub fn print_to_pdf(cdp: &mut Cdp, session: &str) -> Result<Vec<u8>, String> {
+    let result = cdp.call("Page.printToPDF", json!({}), Some(session))?;
+    let data = result
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "pdf returned no data\n".to_string())?;
+    base64_decode(data)
+}
+
 pub fn lookup_ref<'a>(
     refs: &'a BTreeMap<String, RefRec>,
     id: &str,

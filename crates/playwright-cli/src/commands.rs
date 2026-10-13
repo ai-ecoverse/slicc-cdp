@@ -145,6 +145,18 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         }
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
+        "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
+        "go-forward" => cmd_go_forward(&mut cdp, &mut state, invocation, &mut report),
+        "reload" => cmd_reload(&mut cdp, &mut state, invocation, &mut report),
+        "hover" => cmd_hover(&mut cdp, &mut state, invocation, &mut report),
+        "dblclick" => cmd_dblclick(&mut cdp, &mut state, invocation, &mut report),
+        "select" => cmd_select(&mut cdp, &mut state, invocation, &mut report),
+        "check" => cmd_check(&mut cdp, &mut state, invocation, &mut report),
+        "uncheck" => cmd_uncheck(&mut cdp, &mut state, invocation, &mut report),
+        "upload" => cmd_upload(&mut cdp, &mut state, invocation, &mut report),
+        "drag" => cmd_drag(&mut cdp, &mut state, invocation, &mut report),
+        "frames" => cmd_frames(&mut cdp, &mut state, invocation, &mut report),
+        "pdf" => cmd_pdf(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
@@ -1153,4 +1165,410 @@ fn cmd_webmcp_call(
     let tab = invocation.flags.get("tab").map(String::as_str);
     let allow_consequential = flag_true(&invocation.flags, "allow-consequential");
     crate::webmcp::call(cdp, state, name, &input_json, tab, allow_consequential)
+}
+
+
+fn default_pdf_path() -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("page-{millis}.pdf");
+    #[cfg(not(target_os = "wasi"))]
+    {
+        PathBuf::from("/tmp").join(name)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        PathBuf::from(".playwright-cli").join(name)
+    }
+}
+
+fn cmd_go_back(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let pages = match visible_pages(cdp, state) {
+        Ok(pages) => pages,
+        Err(message) => return Output::err(message),
+    };
+    let target = match resolve_target(cdp, invocation, state, &pages, false) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    report.tab(&target);
+    report.begin(cdp);
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::evaluate(cdp, &session, "history.back()", false);
+    if result.is_ok() {
+        let _ = cdp.wait_load(&session);
+    }
+    let watched = browser::watch_detach(cdp, state, &target, &session);
+    match result {
+        Ok(_) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            state.snapshots.remove(&target);
+            Output::ok("Navigated back\n")
+        }
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_go_forward(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let pages = match visible_pages(cdp, state) {
+        Ok(pages) => pages,
+        Err(message) => return Output::err(message),
+    };
+    let target = match resolve_target(cdp, invocation, state, &pages, false) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    report.tab(&target);
+    report.begin(cdp);
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::evaluate(cdp, &session, "history.forward()", false);
+    if result.is_ok() {
+        let _ = cdp.wait_load(&session);
+    }
+    let watched = browser::watch_detach(cdp, state, &target, &session);
+    match result {
+        Ok(_) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            state.snapshots.remove(&target);
+            Output::ok("Navigated forward\n")
+        }
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_reload(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let pages = match visible_pages(cdp, state) {
+        Ok(pages) => pages,
+        Err(message) => return Output::err(message),
+    };
+    let target = match resolve_target(cdp, invocation, state, &pages, false) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    report.tab(&target);
+    report.begin(cdp);
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = cdp.call("Page.reload", serde_json::json!({}), Some(&session));
+    let watched = browser::watch_detach(cdp, state, &target, &session);
+    match result {
+        Ok(_) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            state.snapshots.remove(&target);
+            Output::ok("Reloaded\n")
+        }
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_hover(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let Some(id) = invocation.positionals.first() else {
+        return Output::err("hover requires a ref (e.g. e5)\n");
+    };
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
+        browser::hover_ref(cdp, session, rec)?;
+        Ok(format!("Hovered {id}\n"))
+    })
+}
+
+fn cmd_dblclick(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let Some(id) = invocation.positionals.first() else {
+        return Output::err("dblclick requires a ref (e.g. e5)\n");
+    };
+    let button = invocation
+        .positionals
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("left");
+    if !matches!(button, "left" | "right" | "middle") {
+        return Output::err(format!("unknown button \"{button}\"\n"));
+    }
+    let modifiers = modifiers_of(invocation.flags.get("modifiers").map(String::as_str));
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
+        browser::dblclick_ref(cdp, session, rec, button, modifiers)?;
+        Ok(format!("Double-clicked {id}\n"))
+    })
+}
+
+fn cmd_select(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    if invocation.positionals.len() < 2 {
+        return Output::err("select requires <ref> <value>\n");
+    }
+    let id = &invocation.positionals[0];
+    let value = invocation.positionals[1..].join(" ");
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
+        browser::select_ref(cdp, session, rec, &value)?;
+        Ok(format!("Selected \"{value}\" on {id}\n"))
+    })
+}
+
+fn cmd_check(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let Some(id) = invocation.positionals.first() else {
+        return Output::err("check requires a ref (e.g. e5)\n");
+    };
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
+        let toggled = browser::check_ref(cdp, session, rec, true)?;
+        if toggled {
+            Ok(format!("Checked {id}\n"))
+        } else {
+            Ok(format!("{id} already checked\n"))
+        }
+    })
+}
+
+fn cmd_uncheck(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let Some(id) = invocation.positionals.first() else {
+        return Output::err("uncheck requires a ref (e.g. e5)\n");
+    };
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
+        let toggled = browser::check_ref(cdp, session, rec, false)?;
+        if toggled {
+            Ok(format!("Unchecked {id}\n"))
+        } else {
+            Ok(format!("{id} already unchecked\n"))
+        }
+    })
+}
+
+fn cmd_upload(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    if invocation.positionals.len() < 2 {
+        return Output::err("upload requires <ref> <file>\n");
+    }
+    let id = &invocation.positionals[0];
+    let files: Vec<String> = invocation.positionals[1..].to_vec();
+    for file in &files {
+        if !PathBuf::from(file).exists() {
+            return Output::err(format!("upload: file not found: {file}\n"));
+        }
+    }
+    with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {
+        browser::upload_files(cdp, session, rec, &files)?;
+        let count = files.len();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| {
+                std::path::Path::new(f)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(f)
+            })
+            .collect();
+        Ok(format!(
+            "Uploaded {} file(s): {}\n",
+            count,
+            names.join(", ")
+        ))
+    })
+}
+
+fn cmd_drag(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    if invocation.positionals.len() < 2 {
+        return Output::err("drag requires <startRef> <endRef>\n");
+    }
+    let start_id = &invocation.positionals[0];
+    let end_id = &invocation.positionals[1];
+    let pages = match visible_pages(cdp, state) {
+        Ok(pages) => pages,
+        Err(message) => return Output::err(message),
+    };
+    let target = match resolve_target(cdp, invocation, state, &pages, false) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    report.tab(&target);
+    report.begin(cdp);
+    let refs = match state.snapshots.get(&target) {
+        Some(refs) => refs.clone(),
+        None => return Output::err("No snapshot available. Run \"snapshot\" first.\n"),
+    };
+    let start_rec = match browser::lookup_ref(&refs, start_id) {
+        Ok(rec) => rec.clone(),
+        Err(message) => return Output::err(message),
+    };
+    let end_rec = match browser::lookup_ref(&refs, end_id) {
+        Ok(rec) => rec.clone(),
+        Err(message) => return Output::err(message),
+    };
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::drag_refs(cdp, &session, &start_rec, &end_rec);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
+    match result {
+        Ok(()) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            state.snapshots.remove(&target);
+            Output::ok(format!("Dragged {start_id} to {end_id}\n"))
+        }
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_frames(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let pages = match visible_pages(cdp, state) {
+        Ok(pages) => pages,
+        Err(message) => return Output::err(message),
+    };
+    let target = match resolve_target(cdp, invocation, state, &pages, false) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    report.tab(&target);
+    report.begin(cdp);
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::frame_tree(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
+    match result {
+        Ok(frames) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            let mut lines = Vec::new();
+            for frame in &frames {
+                let kind = if frame.parent_frame_id.is_some() {
+                    "child"
+                } else {
+                    "main"
+                };
+                let parent = match &frame.parent_frame_id {
+                    Some(pid) => format!(" parentFrameId={pid}"),
+                    None => String::new(),
+                };
+                lines.push(format!(
+                    "  [{kind}] frameId={}{parent} - {}",
+                    frame.frame_id, frame.url
+                ));
+            }
+            Output::ok(format!(
+                "Frame IDs (use with --frame, never --tab):\n{}\n",
+                lines.join("\n")
+            ))
+        }
+        Err(message) => Output::err(message),
+    }
+}
+
+fn cmd_pdf(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+) -> Output {
+    let pages = match visible_pages(cdp, state) {
+        Ok(pages) => pages,
+        Err(message) => return Output::err(message),
+    };
+    let target = match resolve_target(cdp, invocation, state, &pages, false) {
+        Ok(target) => target,
+        Err(message) => return Output::err(message),
+    };
+    report.tab(&target);
+    report.begin(cdp);
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::print_to_pdf(cdp, &session);
+    let watched = browser::watch_detach(cdp, state, &target, &session);
+    match result {
+        Ok(bytes) => {
+            if let Err(message) = watched {
+                return Output::err(message);
+            }
+            let path = invocation
+                .flags
+                .get("filename")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_pdf_path);
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(err) = fs::create_dir_all(parent) {
+                        return Output::err(format!("pdf: {err}\n"));
+                    }
+                }
+            }
+            if let Err(err) = fs::write(&path, &bytes) {
+                return Output::err(format!("pdf: {err}\n"));
+            }
+            Output::ok(format!("Saved PDF to {}\n", path.display()))
+        }
+        Err(message) => Output::err(message),
+    }
 }

@@ -118,7 +118,8 @@ mod tests {
             .nth(1)
             .unwrap_or("");
         assert!(!pending.contains("console"));
-        assert!(pending.contains("dblclick"));
+        assert!(!pending.contains("dblclick"));
+        assert!(pending.contains("dialog-accept"));
         assert!(!output.stdout.contains("cdp.slicc.internal"));
         assert!(!output.stdout.contains("cdp.kernel.localhost"));
         assert!(!output.stdout.contains("/devtools/browser/slicc"));
@@ -217,7 +218,7 @@ mod tests {
         ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
-        for name in ["dblclick", "go-back", "pdf"] {
+        for name in ["dialog-accept", "keydown", "navigate"] {
             assert!(pending_names.contains(&name), "{name}");
         }
 
@@ -400,7 +401,7 @@ mod tests {
         }
         assert_eq!(
             execute(&["dblclick".into(), "--help".into()], None).stdout,
-            "playwright-cli dblclick <ref> <button>\n\nNot implemented yet.\n"
+            "playwright-cli dblclick <ref> [button]\n\nDouble-click an element on the page\n\nArguments:\n  <ref>                       exact target element reference from the page snapshot\n  [button]                    button to click, defaults to left\nOptions:\n  --modifiers                 modifier key to press (repeatable)\n"
         );
 
         for args in [
@@ -531,5 +532,189 @@ mod tests {
         let zero = execute(&["response-body".to_string(), "0".to_string()], None);
         assert_eq!(zero.code, 1);
         assert!(zero.stderr.contains("positive"));
+    }
+
+    #[test]
+    fn basics_batch_help_pages() {
+        for command in [
+            "go-back",
+            "go-forward",
+            "reload",
+            "hover",
+            "dblclick",
+            "select",
+            "check",
+            "uncheck",
+            "upload",
+            "drag",
+            "frames",
+            "pdf",
+        ] {
+            let output = execute(&[command.to_string(), "--help".to_string()], None);
+            assert_eq!(output.code, 0, "{command}");
+            assert_eq!(output.stderr, "", "{command}");
+            assert!(
+                output.stdout.starts_with(&format!("playwright-cli {command}")),
+                "{command}: {}",
+                output.stdout
+            );
+            assert!(
+                !output.stdout.contains("Not implemented yet"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn basics_batch_are_implemented_in_spec() {
+        for command in [
+            "go-back",
+            "go-forward",
+            "reload",
+            "hover",
+            "dblclick",
+            "select",
+            "check",
+            "uncheck",
+            "upload",
+            "drag",
+            "frames",
+            "pdf",
+        ] {
+            let spec = spec::lookup(command);
+            assert!(spec.is_some(), "{command} not in spec");
+            assert!(spec.unwrap().implemented, "{command} not implemented");
+        }
+    }
+
+    #[test]
+    fn basics_batch_not_in_pending_list() {
+        let output = execute(&[], None);
+        let pending = output
+            .stdout
+            .split("Not implemented yet:")
+            .nth(1)
+            .unwrap_or("");
+        for command in [
+            "go-back",
+            "go-forward",
+            "reload",
+            "hover",
+            "dblclick",
+            "select",
+            "check",
+            "uncheck",
+            "upload",
+            "drag",
+            "frames",
+            "pdf",
+        ] {
+            assert!(
+                !pending.contains(command),
+                "{command} still listed as pending"
+            );
+        }
+    }
+
+    #[test]
+    fn basics_batch_global_help_sections() {
+        let output = execute(&["--help".to_string()], None);
+        assert_eq!(output.code, 0);
+        for line in [
+            "  go-back",
+            "  go-forward",
+            "  reload",
+            "  hover <ref>",
+            "  dblclick <ref> [button]",
+            "  select <ref> <val>",
+            "  check <ref>",
+            "  uncheck <ref>",
+            "  upload <ref> <file...>",
+            "  drag <startRef> <endRef>",
+            "  pdf",
+            "  frames",
+        ] {
+            assert!(output.stdout.contains(line), "missing: {line}");
+        }
+        assert!(output.stdout.contains("Pointer and form:"));
+        assert!(output.stdout.contains("Navigation:"));
+        assert!(output.stdout.contains("SLICC-only:"));
+    }
+
+    #[test]
+    fn dblclick_rejects_bad_ref_before_connect() {
+        let output = execute(&["dblclick".to_string(), "/tmp/bad".to_string()], None);
+        assert_eq!(output.code, 1);
+        assert!(
+            output.stderr.contains("not an element ref"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn drag_rejects_bad_ref_before_connect() {
+        let output = execute(
+            &[
+                "drag".to_string(),
+                "not-a-ref".to_string(),
+                "e2".to_string(),
+            ],
+            None,
+        );
+        assert_eq!(output.code, 1);
+        assert!(
+            output.stderr.contains("not an element ref"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn hover_rejects_bad_ref_before_connect() {
+        let output = execute(&["hover".to_string(), "not-a-ref".to_string()], None);
+        assert_eq!(output.code, 1);
+        assert!(
+            output.stderr.contains("not an element ref"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn check_rejects_bad_ref_before_connect() {
+        let output = execute(&["check".to_string(), "button".to_string()], None);
+        assert_eq!(output.code, 1);
+        assert!(
+            output.stderr.contains("not an element ref"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn uncheck_rejects_bad_ref_before_connect() {
+        let output = execute(&["uncheck".to_string(), "button".to_string()], None);
+        assert_eq!(output.code, 1);
+        assert!(
+            output.stderr.contains("not an element ref"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn dblclick_too_many_args() {
+        let output = execute(
+            &[
+                "dblclick".to_string(),
+                "e1".to_string(),
+                "left".to_string(),
+                "extra".to_string(),
+            ],
+            None,
+        );
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("too many arguments"));
     }
 }

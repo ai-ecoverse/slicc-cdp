@@ -30,13 +30,17 @@ test('chromium through the native binaries and the kernel', async (t) => {
       browser.wsUrl
     );
     await t.test('native playwright-cli', () => playwrightFlow(native, site));
+    await t.test('native basics batch', () => basicsBatchFlow(native, site));
     await t.test('native curlwright', () => curlFlow(native, site, browser.wsUrl));
     await t.test('native route', () => routeFlow(native, site));
     await t.test('native protected tabs', () => protectedFlow(native, site, browser.wsUrl));
+    await t.test('native navigation guard', () => navigationGuardFlow(native, site, browser.wsUrl));
     await t.test('kernel playwright-cli', () => playwrightFlow(kernel, site));
+    await t.test('kernel basics batch', () => basicsBatchFlow(kernel, site));
     await t.test('kernel curlwright', () => curlFlow(kernel, site, browser.wsUrl));
     await t.test('kernel route', () => routeFlow(kernel, site));
     await t.test('kernel protected tabs', () => protectedFlow(kernel, site, browser.wsUrl));
+    await t.test('kernel navigation guard', () => navigationGuardFlow(kernel, site, browser.wsUrl));
   } finally {
     await settle(kernel?.close());
     await settle(browser?.close());
@@ -314,6 +318,203 @@ async function routeFlow(runner, site) {
   ok(all);
   assert.equal(all.stdout, 'Removed all 2 route(s)\n');
   ok(await runner.playwright(['tab-close', '--tab', tab], cwd));
+}
+
+async function basicsBatchFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const page = `${site.origin}/page`;
+  const opened = await runner.playwright(['open', page], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+
+  const nav1 = await runner.playwright(['goto', `${site.origin}/one`], cwd);
+  assert.equal(nav1.code, 0, nav1.stderr);
+  const back = await runner.playwright(['go-back'], cwd);
+  assert.equal(back.code, 0, back.stderr);
+  assert.equal(back.stdout, 'Navigated back\n');
+  const loc1 = await runner.playwright(['eval', 'location.pathname'], cwd);
+  assert.equal(loc1.code, 0, loc1.stderr);
+  assert.equal(loc1.stdout, '/page\n');
+  const forward = await runner.playwright(['go-forward'], cwd);
+  assert.equal(forward.code, 0, forward.stderr);
+  assert.equal(forward.stdout, 'Navigated forward\n');
+  const loc2 = await runner.playwright(['eval', 'location.pathname'], cwd);
+  assert.equal(loc2.code, 0, loc2.stderr);
+  assert.equal(loc2.stdout, '/one\n');
+
+  await runner.playwright(['goto', `${site.origin}/page`], cwd);
+  const reload = await runner.playwright(['reload'], cwd);
+  assert.equal(reload.code, 0, reload.stderr);
+  assert.equal(reload.stdout, 'Reloaded\n');
+
+  const snap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap.code, 0, `${snap.stderr}\n${snap.stdout}`);
+  const btn = refOf(snap.stdout, 'button', 'Go');
+
+  const hovered = await runner.playwright(['hover', btn], cwd);
+  assert.equal(hovered.code, 0, hovered.stderr);
+  assert.match(hovered.stdout, /Hovered/);
+  const afterHover = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterHover.stdout, 'hovered\n');
+
+  const snap2 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap2.code, 0, `${snap2.stderr}\n${snap2.stdout}`);
+  const btn2 = refOf(snap2.stdout, 'button', 'Go');
+  const dbl = await runner.playwright(['dblclick', btn2], cwd);
+  assert.equal(dbl.code, 0, dbl.stderr);
+  assert.match(dbl.stdout, /Double-clicked/);
+  const afterDbl = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterDbl.stdout, 'dblclicked\n');
+
+  const snap3 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap3.code, 0, `${snap3.stderr}\n${snap3.stdout}`);
+  const sel = refOf(snap3.stdout, 'combobox', 'Color');
+  const selected = await runner.playwright(['select', sel, 'green'], cwd);
+  assert.equal(selected.code, 0, selected.stderr);
+  assert.match(selected.stdout, /Selected/);
+  const afterSel = await runner.playwright(['eval', "document.getElementById('color').value"], cwd);
+  assert.equal(afterSel.stdout, 'green\n');
+
+  const snap4 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap4.code, 0, `${snap4.stderr}\n${snap4.stdout}`);
+  const cb = refOf(snap4.stdout, 'checkbox', 'Agree');
+  const checked = await runner.playwright(['check', cb], cwd);
+  assert.equal(checked.code, 0, checked.stderr);
+  assert.match(checked.stdout, /Checked/);
+  const afterCheck = await runner.playwright(
+    ['eval', "document.getElementById('agree').checked"],
+    cwd
+  );
+  assert.equal(afterCheck.stdout, 'true\n');
+
+  const snap5 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap5.code, 0, `${snap5.stderr}\n${snap5.stdout}`);
+  const cb2 = refOf(snap5.stdout, 'checkbox', 'Agree');
+  const already = await runner.playwright(['check', cb2], cwd);
+  assert.equal(already.code, 0, already.stderr);
+  assert.match(already.stdout, /already checked/);
+
+  const snap6 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap6.code, 0, `${snap6.stderr}\n${snap6.stdout}`);
+  const cb3 = refOf(snap6.stdout, 'checkbox', 'Agree');
+  const unchecked = await runner.playwright(['uncheck', cb3], cwd);
+  assert.equal(unchecked.code, 0, unchecked.stderr);
+  assert.match(unchecked.stdout, /Unchecked/);
+  const afterUncheck = await runner.playwright(
+    ['eval', "document.getElementById('agree').checked"],
+    cwd
+  );
+  assert.equal(afterUncheck.stdout, 'false\n');
+
+  const frames = await runner.playwright(['frames'], cwd);
+  assert.equal(frames.code, 0, frames.stderr);
+  assert.match(frames.stdout, /Frame IDs/);
+  assert.match(frames.stdout, /\[main\]/);
+  assert.match(frames.stdout, /\[child\]/);
+  assert.match(frames.stdout, /\/child\.html/);
+
+  const pdf = await runner.playwright(['pdf', '--filename', 'test.pdf'], cwd);
+  assert.equal(pdf.code, 0, pdf.stderr);
+  assert.match(pdf.stdout, /Saved PDF/);
+  const pdfBytes = await runner.read(cwd, 'test.pdf');
+  assert.equal(pdfBytes[0], 0x25);
+  assert.equal(pdfBytes[1], 0x50);
+  assert.equal(pdfBytes[2], 0x44);
+  assert.equal(pdfBytes[3], 0x46);
+
+  await runner.write(cwd, 'upload.txt', 'hello-upload');
+  const snap7 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap7.code, 0, `${snap7.stderr}\n${snap7.stdout}`);
+  const fileInput = refOf(snap7.stdout, 'button', 'Avatar');
+  const uploaded = await runner.playwright(
+    ['upload', fileInput, path.join(cwd, 'upload.txt')],
+    cwd
+  );
+  assert.equal(uploaded.code, 0, uploaded.stderr);
+  assert.match(uploaded.stdout, /Uploaded/);
+
+  const snap8 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap8.code, 0, `${snap8.stderr}\n${snap8.stdout}`);
+  const reactCb = refOf(snap8.stdout, 'checkbox', 'React');
+  const reactChecked = await runner.playwright(['check', reactCb], cwd);
+  assert.equal(reactChecked.code, 0, reactChecked.stderr);
+  assert.match(reactChecked.stdout, /Checked/);
+  const afterReactCheck = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterReactCheck.stdout, 'react-cb:true\n');
+
+  const snap9 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap9.code, 0, `${snap9.stderr}\n${snap9.stdout}`);
+  const lockedCb = refOf(snap9.stdout, 'checkbox', 'Locked');
+  const lockedCheck = await runner.playwright(['check', lockedCb], cwd);
+  assert.equal(lockedCheck.code, 1, lockedCheck.stdout);
+  assert.match(lockedCheck.stderr, /disabled/);
+
+  const framesOut = await runner.playwright(['frames'], cwd);
+  assert.equal(framesOut.code, 0, framesOut.stderr);
+  const childFrameLine = framesOut.stdout
+    .split('\n')
+    .find((l) => l.includes('[child]') && l.includes('/child.html'));
+  assert.ok(childFrameLine, framesOut.stdout);
+  const childFrameId = childFrameLine.match(/frameId=(\S+)/)?.[1];
+  assert.ok(childFrameId, childFrameLine);
+  const frameSnap = await runner.playwright(['snapshot', `--frame=${childFrameId}`], cwd);
+  assert.equal(frameSnap.code, 0, `${frameSnap.stderr}\n${frameSnap.stdout}`);
+  const hoverTarget = frameSnap.stdout.match(/statictext "hover me" \[ref=(f\d+e\d+)\]/)?.[1];
+  assert.ok(hoverTarget, `hover-target not found in frame snapshot:\n${frameSnap.stdout}`);
+  const hoverFrame = await runner.playwright(['hover', hoverTarget], cwd);
+  assert.equal(hoverFrame.code, 0, hoverFrame.stderr);
+  assert.match(hoverFrame.stdout, /Hovered/);
+  const hoverAttr = await runner.playwright(
+    [
+      'eval',
+      `--frame=${childFrameId}`,
+      'document.getElementById("hover-target").getAttribute("data-hovered")',
+    ],
+    cwd
+  );
+  assert.equal(hoverAttr.code, 0, hoverAttr.stderr);
+  assert.equal(hoverAttr.stdout, 'true\n');
+
+  const closed = await runner.playwright(['close'], cwd);
+  assert.equal(closed.code, 0, closed.stderr);
+}
+
+async function navigationGuardFlow(runner, site, wsUrl) {
+  const raw = await rawSocket(wsUrl);
+  const refusal = /^slicc: refused: /;
+  try {
+    const cwd = await runner.fresh();
+    const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+    assert.equal(opened.code, 0, opened.stderr);
+    await runner.playwright(['goto', 'http://seven.sliccy.ai/landing'], cwd);
+    const goBack = await runner.playwright(['go-back'], cwd);
+    if (goBack.code === 0) {
+      const probe = await runner.playwright(['eval', 'location.href'], cwd);
+      if (probe.code !== 0) {
+        assert.match(probe.stderr, refusal, 'go-back landed on protected origin');
+      }
+    }
+    const cwd2 = await runner.fresh();
+    const opened2 = await runner.playwright(['open', 'http://seven.sliccy.ai/landing'], cwd2);
+    if (opened2.code === 0) {
+      const goTo = await runner.playwright(['goto', `${site.origin}/page`], cwd2);
+      const reloaded = await runner.playwright(['reload'], cwd2);
+      if (reloaded.code === 0) {
+        const probe2 = await runner.playwright(['eval', 'location.href'], cwd2);
+        assert.equal(probe2.code, 0, probe2.stderr);
+      }
+    }
+  } finally {
+    raw.close();
+  }
 }
 
 async function protectedFlow(runner, site, wsUrl) {
