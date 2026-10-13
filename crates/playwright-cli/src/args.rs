@@ -11,6 +11,7 @@ pub struct Invocation {
     pub cdp: Option<String>,
     pub runtime: Option<String>,
     pub session: Option<String>,
+    pub full_urls: bool,
     pub help: bool,
     pub command_help: bool,
     pub version: bool,
@@ -61,6 +62,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     let mut session = None;
     let mut help = false;
     let mut version = false;
+    let mut full_urls = false;
     let mut index = 0;
     while index < args.len() {
         let token = &args[index];
@@ -75,6 +77,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         }
         if token == "-h" || token == "--help" {
             help = true;
+            index += 1;
+            continue;
+        }
+        if token == "--full-urls" {
+            full_urls = true;
             index += 1;
             continue;
         }
@@ -161,6 +168,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             cdp,
             runtime,
             session,
+            full_urls,
             help: help || command.is_none(),
             command_help: false,
             version,
@@ -182,6 +190,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             cdp,
             runtime,
             session,
+            full_urls,
             help,
             command_help,
             version,
@@ -247,6 +256,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         cdp,
         runtime,
         session,
+        full_urls,
         help,
         command_help,
         version,

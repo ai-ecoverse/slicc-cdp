@@ -91,6 +91,14 @@ fn reaches_protected(url: &str) -> bool {
     authority && (guard.url(&format!("https:{trimmed}")) || guard.url(&format!("http:{trimmed}")))
 }
 
+fn redact_url(url: &str, full: bool) -> String {
+    if full {
+        url.to_string()
+    } else {
+        cdp_client::sanitize::redact_url(url)
+    }
+}
+
 pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     if argv.is_empty() {
         return Output::from_stop(Stop::usage(
@@ -136,14 +144,16 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Err(message) => return Output::plain(message, 1),
     };
     let mut report = action::Report::request(&request.method, &request.url);
-    let target = match tab::resolve_tab(&mut cdp, &request.url, opts.tab.as_deref()) {
-        Ok(target) => target,
+    let (target, tab_page_url) = match tab::resolve_tab_with_url(&mut cdp, &request.url, opts.tab.as_deref(), opts.full_urls) {
+        Ok(result) => result,
         Err(stop) => {
             let output = Output::from_stop(stop);
             report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
             return output;
         }
     };
+    let effective_base = tab::effective_url(&request.url, tab_page_url.as_deref())
+        .unwrap_or_else(|| request.url.clone());
     report.tab(&target);
     report.begin(&mut cdp);
     let session = match page::attach(&mut cdp, &target) {
@@ -167,14 +177,14 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     } else {
         None
     };
-    let trace = if opts.verbose { format_request_trace(&request) } else { String::new() };
+    let trace = if opts.verbose { format_request_trace(&request, opts.full_urls, Some(&effective_base)) } else { String::new() };
     let started = Instant::now();
     let fetched = page::run_fetch(&mut cdp, &session, &request, context);
     let elapsed = started.elapsed().as_secs_f64();
     page::detach(&mut cdp, &session);
     let output = match fetched {
-        Ok(result) => render(&opts, &request, &result, elapsed, &trace),
-        Err(err) => render_failure(&opts, &request, &err, elapsed, &trace),
+        Ok(result) => render(&opts, &request, &result, elapsed, &trace, &effective_base),
+        Err(err) => render_failure(&opts, &request, &err, elapsed, &trace, &effective_base),
     };
     report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
     output
@@ -206,13 +216,13 @@ fn content_type_of(headers: &[(String, String)]) -> String {
         .unwrap_or_default()
 }
 
-fn completed_write_out(request: &PreparedRequest, result: &FetchResult, elapsed: f64, exit_code: i32) -> WriteOut {
+fn completed_write_out(request: &PreparedRequest, result: &FetchResult, elapsed: f64, exit_code: i32, full_urls: bool, effective_base: &str) -> WriteOut {
     WriteOut {
-        url_effective: if result.url.is_empty() { request.url.clone() } else { result.url.clone() },
+        url_effective: redact_url(if result.url.is_empty() { &request.url } else { &result.url }, full_urls),
         http_code: i64::from(result.status),
         content_type: content_type_of(&result.headers),
         size_download: result.body.len(),
-        size_header: header_block_size(result.status, &result.status_text, &result.headers),
+        size_header: header_block_size(result.status, &result.status_text, &result.headers, true, None),
         size_upload: request.upload_size,
         method: request.method.clone(),
         num_redirects: if result.redirected { 1 } else { 0 },
@@ -220,12 +230,14 @@ fn completed_write_out(request: &PreparedRequest, result: &FetchResult, elapsed:
         exit_code,
         error_msg: String::new(),
         response_headers: result.headers.clone(),
+        full_urls,
+        base_url: effective_base.to_string(),
     }
 }
 
-fn failed_write_out(request: &PreparedRequest, elapsed: f64, exit_code: i32, error_msg: &str) -> WriteOut {
+fn failed_write_out(request: &PreparedRequest, elapsed: f64, exit_code: i32, error_msg: &str, full_urls: bool, effective_base: &str) -> WriteOut {
     WriteOut {
-        url_effective: request.url.clone(),
+        url_effective: redact_url(&request.url, full_urls),
         http_code: 0,
         content_type: String::new(),
         size_download: 0,
@@ -237,6 +249,8 @@ fn failed_write_out(request: &PreparedRequest, elapsed: f64, exit_code: i32, err
         exit_code,
         error_msg: error_msg.to_string(),
         response_headers: Vec::new(),
+        full_urls,
+        base_url: effective_base.to_string(),
     }
 }
 
@@ -267,11 +281,11 @@ fn classify(raw: &str) -> (String, String, i32) {
     (format!("curlwright: {raw}"), raw.to_string(), 1)
 }
 
-fn render_failure(opts: &Options, request: &PreparedRequest, err: &str, elapsed: f64, trace: &str) -> Output {
+fn render_failure(opts: &Options, request: &PreparedRequest, err: &str, elapsed: f64, trace: &str, effective_base: &str) -> Output {
     let (message, error_msg, code) = classify(err);
     let mut stdout = Vec::new();
     let mut messages = format!("{message}\n");
-    append_write_out(opts, &mut stdout, &mut messages, &failed_write_out(request, elapsed, code, &error_msg));
+    append_write_out(opts, &mut stdout, &mut messages, &failed_write_out(request, elapsed, code, &error_msg, opts.full_urls, effective_base));
     let quiet = opts.silent && !opts.show_error;
     Output {
         stdout,
@@ -334,22 +348,22 @@ fn emit_body(opts: &Options, messages: &mut String, stdout: &mut Vec<u8>, bytes:
     }
 }
 
-fn render(opts: &Options, request: &PreparedRequest, result: &FetchResult, elapsed: f64, trace: &str) -> Output {
+fn render(opts: &Options, request: &PreparedRequest, result: &FetchResult, elapsed: f64, trace: &str, effective_base: &str) -> Output {
     let mut stdout = Vec::new();
     let mut messages = String::new();
     let mut response_trace = String::new();
     let line = status_line(result.status, &result.status_text);
     if opts.verbose {
-        response_trace = format_response_trace(&line, &result.headers);
+        response_trace = format_response_trace(&line, &result.headers, opts.full_urls, Some(&effective_base));
     }
     if opts.include || opts.head {
         stdout.extend_from_slice(
-            format_header_block(result.status, &result.status_text, &result.headers).as_bytes(),
+            format_header_block(result.status, &result.status_text, &result.headers, opts.full_urls, Some(&effective_base)).as_bytes(),
         );
     }
     let mut dump_code = 0;
     if let Some(path) = &opts.dump_header {
-        let block = format_header_block(result.status, &result.status_text, &result.headers);
+        let block = format_header_block(result.status, &result.status_text, &result.headers, opts.full_urls, Some(&effective_base));
         if let Err(error) = write_file(path, block.as_bytes()) {
             messages.push_str(&error);
             messages.push('\n');
@@ -366,7 +380,7 @@ fn render(opts: &Options, request: &PreparedRequest, result: &FetchResult, elaps
     if code == 0 {
         code = dump_code;
     }
-    append_write_out(opts, &mut stdout, &mut messages, &completed_write_out(request, result, elapsed, code));
+    append_write_out(opts, &mut stdout, &mut messages, &completed_write_out(request, result, elapsed, code, opts.full_urls, effective_base));
     let quiet = opts.silent && !opts.show_error;
     Output {
         stdout,

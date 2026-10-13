@@ -536,7 +536,7 @@ pub fn render_console(entries: &[ConsoleEntry], min_level: &str) -> Result<Strin
             "[{}] {} @ {}:{}",
             entry.kind.to_ascii_uppercase(),
             sanitize::terminal(&entry.text),
-            sanitize::terminal(&entry.url),
+            sanitize::display_url(&entry.url),
             entry.line
         ));
     }
@@ -606,7 +606,7 @@ fn render_request_line(request: &NetRequest) -> String {
     let mut line = format!(
         "[{}] {}",
         request.method.to_ascii_uppercase(),
-        sanitize::terminal(&truncate_data_url(&request.url))
+        sanitize::display_url(&truncate_data_url(&request.url))
     );
     if let Some(status) = request.status {
         if request.status_text.is_empty() {
@@ -633,7 +633,7 @@ fn render_details(index: usize, request: &NetRequest) -> String {
         format!(
             "#{index} [{}] {}",
             request.method.to_ascii_uppercase(),
-            sanitize::terminal(&truncate_data_url(&request.url))
+            sanitize::display_url(&truncate_data_url(&request.url))
         ),
         String::new(),
         "  General".to_string(),
@@ -653,8 +653,8 @@ fn render_details(index: usize, request: &NetRequest) -> String {
         let mime = request.mime.split(';').next().unwrap_or("").trim();
         lines.push(general("mimeType", mime));
     }
-    append_headers(&mut lines, "Request headers", &request.request_headers);
-    append_headers(&mut lines, "Response headers", &request.response_headers);
+    append_headers(&mut lines, "Request headers", &request.request_headers, Some(&request.url));
+    append_headers(&mut lines, "Response headers", &request.response_headers, Some(&request.url));
     let mut hints = Vec::new();
     if request
         .request_body
@@ -682,27 +682,46 @@ fn general(label: &str, value: &str) -> String {
     format!("    {label}:{}{value}", " ".repeat(spaces))
 }
 
-fn append_headers(lines: &mut Vec<String>, title: &str, headers: &[(String, String)]) {
+fn is_url_header(name: &str) -> bool {
+    matches!(
+        name,
+        "location" | "referer" | "content-location" | "refresh" | "link"
+    )
+}
+
+fn display_header_value(name: &str, value: &str, base_url: Option<&str>) -> String {
+    if is_url_header(name) {
+        if crate::sanitize::full_urls_enabled() {
+            sanitize::terminal(value)
+        } else {
+            sanitize::terminal(&cdp_client::sanitize::redact_header_url(value, base_url))
+        }
+    } else {
+        sanitize::terminal(value)
+    }
+}
+
+fn append_headers(lines: &mut Vec<String>, title: &str, headers: &[(String, String)], base_url: Option<&str>) {
     if headers.is_empty() {
         return;
     }
     lines.push(String::new());
     lines.push(format!("  {title}"));
     for (name, value) in headers {
-        lines.push(format!("    {}: {}", sanitize::terminal(name), sanitize::terminal(value)));
+        lines.push(format!("    {}: {}", sanitize::terminal(name), display_header_value(name, value, base_url)));
     }
 }
 
 pub fn render_part(items: &[NetRequest], index: usize, part: &str) -> Result<Piece, String> {
     let request = lookup(items, index)?;
     match part {
-        "request-headers" => Ok(text_piece(&render_header_block(&request.request_headers))),
+        "request-headers" => Ok(text_piece(&render_header_block(&request.request_headers, Some(&request.url)))),
         "request-body" => Ok(request
             .request_body
             .as_ref()
             .map(|body| text_piece(body))
             .unwrap_or(Piece::Empty)),
-        "response-headers" => Ok(text_piece(&render_header_block(&request.response_headers))),
+        "response-headers" => Ok(text_piece(&render_header_block(&request.response_headers, Some(&request.url)))),
         "response-body" => Ok(response_piece(request)),
         _ => Err(format!("playwright-cli: unknown request part \"{part}\"\n")),
     }
@@ -716,10 +735,10 @@ fn text_piece(text: &str) -> Piece {
     }
 }
 
-fn render_header_block(headers: &[(String, String)]) -> String {
+fn render_header_block(headers: &[(String, String)], base_url: Option<&str>) -> String {
     headers
         .iter()
-        .map(|(name, value)| format!("{}: {}", sanitize::terminal(name), sanitize::terminal(value)))
+        .map(|(name, value)| format!("{}: {}", sanitize::terminal(name), display_header_value(name, value, base_url)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1115,13 +1134,16 @@ mod tests {
 
     #[test]
     fn console_keeps_the_query_and_filters_levels() {
+        crate::sanitize::set_full_urls(false);
         let (console, _) = from_events(&sample_events(), "S");
         assert_eq!(console.len(), 2);
         let listed = render_console(&console, "info").unwrap();
         assert!(listed.starts_with("### Result\n"));
         assert!(listed.contains("Total messages: 2 (Errors: 1, Warnings: 0)"));
         assert!(listed.contains("Returning 1 messages for level \"info\""));
-        assert!(listed.contains("[ERROR] slicc-console-marker @ http://user:pw@127.0.0.1/page?token=SECRET#frag:4"));
+        assert!(listed.contains("[ERROR] slicc-console-marker"));
+        assert!(!listed.contains("SECRET"));
+        assert!(listed.contains("token="));
         assert!(!listed.contains("hidden-debug"));
         assert!(!listed.contains("elsewhere"));
         assert!(!listed.contains("internal"));
@@ -1133,6 +1155,7 @@ mod tests {
 
     #[test]
     fn requests_number_the_full_list_and_skip_static() {
+        crate::sanitize::set_full_urls(false);
         let items = requests_of(&sample_events());
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].request_body.as_deref(), Some("{\"a\":1}"));
@@ -1144,14 +1167,18 @@ mod tests {
             ]
         );
         let listed = render_requests(&items, false, None).unwrap();
-        assert!(listed.contains("2. [POST] http://127.0.0.1/api/me?x=1 => [200] OK"));
+        assert!(listed.contains("[POST]"));
+        assert!(listed.contains("/api/me"));
+        assert!(!listed.contains("token=SECRET"));
         assert!(!listed.contains("/page?"));
         assert!(listed.contains("1 static request not shown"));
         let filtered = render_requests(&items, true, Some("/api/me")).unwrap();
         assert!(filtered.contains("2. [POST]"));
         assert!(!filtered.contains("/page?"));
         let all = render_requests(&items, true, None).unwrap();
-        assert!(all.contains("1. [GET] http://127.0.0.1/page?token=SECRET#frag => [200] OK"));
+        assert!(all.contains("1. [GET]"));
+        assert!(all.contains("/page?"));
+        assert!(!all.contains("token=SECRET"));
         assert!(render_requests(&[], false, None)
             .unwrap_err()
             .contains("No network requests"));
@@ -1159,9 +1186,11 @@ mod tests {
 
     #[test]
     fn request_parts_match_the_index_and_a_miss_is_an_error() {
+        crate::sanitize::set_full_urls(false);
         let items = requests_of(&sample_events());
         let details = render_request(&items, 2).unwrap();
-        assert!(details.contains("#2 [POST] http://127.0.0.1/api/me?x=1"));
+        assert!(details.contains("#2 [POST]"));
+        assert!(details.contains("/api/me"));
         assert!(details.contains("    status:    [200] OK"));
         assert!(details.contains("    type:      fetch"));
         assert!(details.contains("    cookie: session=from-tab"));
@@ -1252,7 +1281,6 @@ mod tests {
         assert!(!text.contains('\x1b'), "{text}");
         assert!(!text.contains('\x07'), "{text}");
         assert!(text.contains("\\x1b"), "{text}");
-        assert!(text.contains("\\x07"), "{text}");
     }
 
     #[test]

@@ -6,12 +6,25 @@ pub fn status_line(status: u16, status_text: &str) -> String {
     }
 }
 
-pub fn format_header_block(status: u16, status_text: &str, headers: &[(String, String)]) -> String {
+pub fn format_header_block(status: u16, status_text: &str, headers: &[(String, String)], full_urls: bool, base_url: Option<&str>) -> String {
     let mut lines = vec![status_line(status, status_text)];
     for (name, value) in headers {
-        lines.push(format!("{name}: {value}"));
+        let display = if !full_urls && is_url_header(name) {
+            cdp_client::sanitize::redact_header_url(value, base_url)
+        } else {
+            value.clone()
+        };
+        lines.push(format!("{name}: {display}"));
     }
     format!("{}\r\n\r\n", lines.join("\r\n"))
+}
+
+fn is_url_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "location" | "referer" | "content-location" | "refresh" | "link"
+    )
 }
 
 pub fn looks_binary(bytes: &[u8]) -> bool {
@@ -43,8 +56,8 @@ fn url_pathname(url: &str) -> Option<String> {
     Some(if path.is_empty() { "/".to_string() } else { path.to_string() })
 }
 
-pub fn header_block_size(status: u16, status_text: &str, headers: &[(String, String)]) -> usize {
-    format_header_block(status, status_text, headers).len()
+pub fn header_block_size(status: u16, status_text: &str, headers: &[(String, String)], full_urls: bool, base_url: Option<&str>) -> usize {
+    format_header_block(status, status_text, headers, full_urls, base_url).len()
 }
 
 #[cfg(test)]
@@ -55,14 +68,45 @@ mod tests {
     fn header_block_and_remote_name() {
         assert_eq!(status_line(200, "OK"), "HTTP/1.1 200 OK");
         assert_eq!(status_line(204, ""), "HTTP/1.1 204");
-        let block = format_header_block(200, "OK", &[("content-type".into(), "text/plain".into())]);
+        let block = format_header_block(200, "OK", &[("content-type".into(), "text/plain".into())], true, None);
         assert_eq!(block, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\n");
-        assert_eq!(header_block_size(200, "OK", &[("content-type".into(), "text/plain".into())]), block.len());
+        assert_eq!(header_block_size(200, "OK", &[("content-type".into(), "text/plain".into())], true, None), block.len());
         assert_eq!(remote_name("https://a.example/files/report.csv?v=1").as_deref(), Some("report.csv"));
         assert_eq!(remote_name("https://a.example/files/").as_deref(), Some("files"));
         assert_eq!(remote_name("https://a.example/"), None);
         assert!(!looks_binary("héllo".as_bytes()));
         assert!(looks_binary(&[0x61, 0x00, 0x62]));
         assert!(BINARY_OUTPUT_WARNING.contains("Binary output can mess up your terminal"));
+    }
+
+    #[test]
+    fn header_block_redacts_location_by_default() {
+        let headers = vec![
+            ("location".into(), "https://example.com/cb?code=SECRET".into()),
+            ("content-type".into(), "text/html".into()),
+        ];
+        let block = format_header_block(302, "Found", &headers, false, Some("https://example.com/login"));
+        assert!(!block.contains("SECRET"), "{block}");
+        assert!(block.contains("code="), "{block}");
+        assert!(block.contains("content-type: text/html"), "{block}");
+    }
+
+    #[test]
+    fn header_block_shows_full_with_flag() {
+        let headers = vec![
+            ("location".into(), "https://example.com/cb?code=SECRET".into()),
+        ];
+        let block = format_header_block(302, "Found", &headers, true, None);
+        assert!(block.contains("SECRET"), "{block}");
+    }
+
+    #[test]
+    fn header_block_redacts_relative_location() {
+        let headers = vec![
+            ("location".into(), "/callback?code=SECRET".into()),
+        ];
+        let block = format_header_block(302, "Found", &headers, false, Some("https://example.com/login"));
+        assert!(!block.contains("SECRET"), "{block}");
+        assert!(block.contains("/callback?"), "{block}");
     }
 }

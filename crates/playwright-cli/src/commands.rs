@@ -266,7 +266,7 @@ fn cmd_open(
             }
             report.tab(&target_id);
             state.current = Some(target_id.clone());
-            Output::ok(format!("Opened {url} in new tab [targetId: {target_id}]\n"))
+            Output::ok(format!("Opened {} in new tab [targetId: {target_id}]\n", sanitize::display_url(url)))
         }
         Err(message) => Output::err(message),
     }
@@ -356,7 +356,7 @@ fn cmd_goto(
         Ok(()) => {
             state.current = Some(target);
             state.snapshots.clear();
-            Output::ok(format!("Navigated to {url}\n"))
+            Output::ok(format!("Navigated to {}\n", sanitize::display_url(url)))
         }
         Err(message) => Output::err(message),
     }
@@ -381,7 +381,7 @@ fn cmd_tab_list(cdp: &mut Cdp, state: &Session) -> Output {
             "{}: [{}] {} \"{}\"{active}",
             index + 1,
             page.target_id,
-            sanitize::terminal(&page.url),
+            sanitize::display_url(&page.url),
             sanitize::terminal(&page.title)
         ));
     }
@@ -479,7 +479,7 @@ fn build_snapshot(
     invocation: &Invocation,
 ) -> Result<(String, BTreeMap<String, RefRec>), String> {
     let (url, title) = browser::page_location(cdp, session)?;
-    let url = sanitize::terminal(&url);
+    let url = sanitize::display_url(&url);
     let title = sanitize::terminal(&title);
     if let Some(frame_id) = invocation.flags.get("frame") {
         let frames = browser::frame_tree(cdp, session)?;
@@ -1516,7 +1516,7 @@ fn cmd_frames(
                 };
                 lines.push(format!(
                     "  [{kind}] frameId={}{parent} - {}",
-                    frame.frame_id, sanitize::terminal(&frame.url)
+                    frame.frame_id, sanitize::display_url(&frame.url)
                 ));
             }
             Output::ok(format!(

@@ -170,20 +170,50 @@ pub fn prepare(opts: &Options, body: ResolvedBody) -> Result<PreparedRequest, St
     })
 }
 
-pub fn format_request_trace(request: &PreparedRequest) -> String {
-    let mut lines = vec![format!("> {} {}", request.method, request.url)];
+pub fn format_request_trace(request: &PreparedRequest, full_urls: bool, effective_base: Option<&str>) -> String {
+    let display_url = if full_urls {
+        request.url.clone()
+    } else {
+        let abs = effective_base.unwrap_or(&request.url);
+        cdp_client::sanitize::redact_header_url(&request.url, Some(abs))
+    };
+    let mut lines = vec![format!("> {} {}", request.method, display_url)];
     for (name, value) in &request.headers {
-        lines.push(format!("> {name}: {}", value.as_str().unwrap_or("")));
+        let base = effective_base.unwrap_or(&request.url);
+        let display = if !full_urls && is_url_request_header(name) {
+            cdp_client::sanitize::redact_header_url(value.as_str().unwrap_or(""), Some(base))
+        } else {
+            value.as_str().unwrap_or("").to_string()
+        };
+        lines.push(format!("> {name}: {display}"));
     }
     lines.push("> ".to_string());
     format!("{}\n", lines.join("\n"))
 }
 
-pub fn format_response_trace(status_line: &str, headers: &[(String, String)]) -> String {
+pub fn format_response_trace(status_line: &str, headers: &[(String, String)], full_urls: bool, base_url: Option<&str>) -> String {
     let mut lines = vec![format!("< {status_line}")];
     for (name, value) in headers {
-        lines.push(format!("< {name}: {value}"));
+        let display = if !full_urls && is_url_response_header(name) {
+            cdp_client::sanitize::redact_header_url(value, base_url)
+        } else {
+            value.clone()
+        };
+        lines.push(format!("< {name}: {display}"));
     }
     lines.push("< ".to_string());
     format!("{}\n", lines.join("\n"))
+}
+
+fn is_url_request_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(lower.as_str(), "referer" | "origin")
+}
+
+fn is_url_response_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "location" | "referer" | "content-location" | "refresh" | "link"
+    )
 }

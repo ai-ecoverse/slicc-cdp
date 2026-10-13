@@ -83,8 +83,11 @@ fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> 
     Some((authority.to_string(), default_port))
 }
 
-fn format_candidates(pages: &[&Page]) -> String {
-    pages.iter().map(|page| format!("  --tab={}  {}", page.target_id, page.url)).collect::<Vec<_>>().join("\n")
+fn format_candidates(pages: &[&Page], full_urls: bool) -> String {
+    pages.iter().map(|page| {
+        let url = if full_urls { page.url.clone() } else { cdp_client::sanitize::redact_url(&page.url) };
+        format!("  --tab={}  {}", page.target_id, url)
+    }).collect::<Vec<_>>().join("\n")
 }
 
 fn session_current() -> Option<String> {
@@ -140,7 +143,7 @@ pub fn current_target(text: &str) -> Option<String> {
     value.get("current").and_then(|item| item.as_str()).filter(|tab| !tab.is_empty()).map(str::to_string)
 }
 
-pub fn choose_tab(pages: &[Page], url: &str, explicit: Option<&str>, current: Option<&str>) -> Result<String, Stop> {
+pub fn choose_tab(pages: &[Page], url: &str, explicit: Option<&str>, current: Option<&str>, full_urls: bool) -> Result<String, Stop> {
     if let Some(tab) = explicit.filter(|tab| !tab.is_empty()) {
         return Ok(tab.to_string());
     }
@@ -163,7 +166,7 @@ pub fn choose_tab(pages: &[Page], url: &str, explicit: Option<&str>, current: Op
         return Err(Stop::usage(format!(
             "curlwright: {} open tabs are on {origin} — pass --tab to pick one.\n{}\n",
             same.len(),
-            format_candidates(&same)
+            format_candidates(&same, full_urls)
         )));
     }
     let reason = match &wanted {
@@ -173,18 +176,35 @@ pub fn choose_tab(pages: &[Page], url: &str, explicit: Option<&str>, current: Op
     let refs: Vec<&Page> = pages.iter().collect();
     Err(Stop::usage(format!(
         "curlwright: {reason} — pass --tab.\n{}\n",
-        format_candidates(&refs)
+        format_candidates(&refs, full_urls)
     )))
 }
 
+pub fn effective_url(request_url: &str, page_url: Option<&str>) -> Option<String> {
+    if cdp_client::sanitize::is_absolute_url(request_url) {
+        return Some(request_url.to_string());
+    }
+    let base = page_url?;
+    cdp_client::sanitize::join_url(base, request_url)
+}
+
 pub fn resolve_tab(cdp: &mut Cdp, url: &str, explicit: Option<&str>) -> Result<String, Stop> {
+    let (target, _) = resolve_tab_with_url(cdp, url, explicit, false)?;
+    Ok(target)
+}
+
+pub fn resolve_tab_with_url(cdp: &mut Cdp, url: &str, explicit: Option<&str>, full_urls: bool) -> Result<(String, Option<String>), Stop> {
     if let Some(tab) = explicit.filter(|tab| !tab.is_empty()) {
-        return Ok(tab.to_string());
+        let pages = list_pages(cdp).unwrap_or_default();
+        let page_url = pages.iter().find(|p| p.target_id == tab).map(|p| p.url.clone());
+        return Ok((tab.to_string(), page_url));
     }
     let pages = list_pages(cdp).map_err(|err| {
         Stop::new(format!("curlwright: cannot list tabs: {}", err.trim_end_matches('\n')), 2)
     })?;
-    choose_tab(&pages, url, None, session_current().as_deref())
+    let target = choose_tab(&pages, url, None, session_current().as_deref(), full_urls)?;
+    let page_url = pages.iter().find(|p| p.target_id == target).map(|p| p.url.clone());
+    Ok((target, page_url))
 }
 
 #[cfg(test)]
@@ -201,27 +221,27 @@ mod tests {
             page("A", "https://app.example/home"),
             page("B", "https://other.example/"),
         ];
-        let chosen = choose_tab(&pages, "https://app.example/api", Some("B"), Some("A")).unwrap();
+        let chosen = choose_tab(&pages, "https://app.example/api", Some("B"), Some("A"), false).unwrap();
         assert_eq!(chosen, "B");
-        let current = choose_tab(&pages, "https://app.example/api", None, Some("B")).unwrap();
+        let current = choose_tab(&pages, "https://app.example/api", None, Some("B"), false).unwrap();
         assert_eq!(current, "B");
     }
 
     #[test]
     fn one_same_origin_tab_is_used_and_a_foreign_tab_is_not() {
         let foreign = vec![page("ONLY", "https://other.example/dash")];
-        let missed = choose_tab(&foreign, "https://app.example/api", None, None).unwrap_err();
+        let missed = choose_tab(&foreign, "https://app.example/api", None, None, false).unwrap_err();
         assert_eq!(missed.code, 2);
         assert!(missed.message.contains("--tab=ONLY"));
         assert!(missed.message.contains("no open tab is on https://app.example"));
         let same = vec![page("ONLY", "https://app.example/home")];
-        assert_eq!(choose_tab(&same, "https://app.example/api", None, None).unwrap(), "ONLY");
+        assert_eq!(choose_tab(&same, "https://app.example/api", None, None, false).unwrap(), "ONLY");
     }
 
     #[test]
     fn a_stale_session_falls_through_to_the_origin_tab() {
         let pages = vec![page("ONLY", "https://app.example/home")];
-        assert_eq!(choose_tab(&pages, "https://app.example/api", None, Some("GONE")).unwrap(), "ONLY");
+        assert_eq!(choose_tab(&pages, "https://app.example/api", None, Some("GONE"), false).unwrap(), "ONLY");
         assert_eq!(current_target(r#"{"current":"ABC"}"#).as_deref(), Some("ABC"));
         assert_eq!(current_target("{}"), None);
     }

@@ -857,8 +857,9 @@ mod tests {
                 run(opened_peer.port, &["open", secret])
             };
             assert_eq!(opened.code, 0, "{}", opened.stderr);
-            assert!(opened.stdout.contains("QUERYSECRET"));
-            assert!(opened.stdout.contains("FRAGSECRET"));
+            assert!(!opened.stdout.contains("QUERYSECRET"));
+            assert!(!opened.stdout.contains("FRAGSECRET"));
+            assert!(opened.stdout.contains("q="));
             opened_peer.wait_actions(2);
             let opened_log = opened_peer.log.lock().unwrap().clone();
             let opened_actions = actions(&opened_log);
@@ -870,7 +871,7 @@ mod tests {
                 run(went_peer.port, &["goto", secret])
             };
             assert_eq!(went.code, 0, "{}", went.stderr);
-            assert!(went.stdout.contains("QUERYSECRET"));
+            assert!(!went.stdout.contains("QUERYSECRET"));
             went_peer.wait_actions(2);
             let went_log = went_peer.log.lock().unwrap().clone();
             let went_actions = actions(&went_log);
@@ -962,7 +963,11 @@ mod tests {
                 };
                 assert_eq!(output.code, 0, "{command} {url} {}", output.stderr);
                 if !secret.is_empty() {
-                    assert!(output.stdout.contains(secret), "{command} {url}");
+                    let lower_stdout = output.stdout.to_ascii_lowercase();
+                    let lower_secret = secret.to_ascii_lowercase();
+                    if !url.contains('?') && !url.contains('#') {
+                        assert!(lower_stdout.contains(&lower_secret), "{command} {url}");
+                    }
                 }
                 seen += 2;
                 peer.wait_actions(seen);
