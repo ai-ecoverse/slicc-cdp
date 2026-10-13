@@ -980,6 +980,26 @@ fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &sess
     }
 }
 
+fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' | '\t' => out.push(ch),
+            '\x07' => out.push_str("\\x07"),
+            '\x08' => out.push_str("\\x08"),
+            '\r' => out.push_str("\\r"),
+            '\x1b' => out.push_str("\\x1b"),
+            c if c.is_control() || ('\u{0080}'..='\u{009f}').contains(&c) => {
+                for byte in c.to_string().bytes() {
+                    out.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     state.events_emitted += 1;
     if state.json_mode {
@@ -987,7 +1007,10 @@ fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     } else {
         format!(
             "{} {} {} ({})\n",
-            event.standard, event.origin, event.url, format_via(event.via)
+            escape_control(&event.standard),
+            escape_control(&event.origin),
+            escape_control(&event.url),
+            format_via(event.via)
         )
     }
 }
@@ -1436,5 +1459,95 @@ mod tests {
         let probes = default_probes();
         let m = probes.check_response("ard", 301, "application/json", "".into(), "u".into());
         assert!(m.is_none(), "301 must not match engine check_response");
+    }
+
+    #[test]
+    fn escape_control_passes_normal_text() {
+        assert_eq!(escape_control("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_control_preserves_newline_and_tab() {
+        assert_eq!(escape_control("a\tb\n"), "a\tb\n");
+    }
+
+    #[test]
+    fn escape_control_escapes_esc() {
+        assert_eq!(escape_control("\x1b[31mred\x1b[0m"), "\\x1b[31mred\\x1b[0m");
+    }
+
+    #[test]
+    fn escape_control_escapes_bel() {
+        assert_eq!(escape_control("ring\x07"), "ring\\x07");
+    }
+
+    #[test]
+    fn escape_control_escapes_cr() {
+        assert_eq!(escape_control("over\rwrite"), "over\\rwrite");
+    }
+
+    #[test]
+    fn escape_control_escapes_c1_range() {
+        assert_eq!(escape_control("a\u{0090}b"), "a\\xc2\\x90b");
+    }
+
+    #[test]
+    fn escape_control_escapes_null() {
+        assert_eq!(escape_control("a\x00b"), "a\\x00b");
+    }
+
+    #[test]
+    fn emit_event_text_escapes_control_chars() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: false,
+            events_emitted: 0, event_cursor: 0,
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://evil.com".into(),
+            url: "https://evil.com/\x1b[31mred\x1b[0m".into(),
+            via: Via::LinkHeader,
+            page: "https://evil.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        let line = emit_event(&mut state, &event);
+        assert!(!line.contains('\x1b'), "ESC must not appear raw: {line}");
+        assert!(line.contains("\\x1b"), "ESC must appear escaped: {line}");
+    }
+
+    #[test]
+    fn emit_event_json_does_not_escape_control_chars() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            events_emitted: 0, event_cursor: 0,
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://evil.com".into(),
+            url: "https://evil.com/\x1b[31m".into(),
+            via: Via::LinkHeader,
+            page: "https://evil.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        let line = emit_event(&mut state, &event);
+        assert!(line.starts_with('{'), "JSON mode must emit JSON");
     }
 }
