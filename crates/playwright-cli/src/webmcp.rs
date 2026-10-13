@@ -1,6 +1,6 @@
 use crate::args::Output;
 use crate::browser::{self, PageInfo};
-use crate::cdp::{self, Cdp};
+use crate::cdp::Cdp;
 use crate::session::Session;
 use serde_json::{json, Value};
 
@@ -13,12 +13,12 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
     let result = evaluate_list(cdp, &session);
-    cdp::detach(cdp, &session);
+    let _ = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(tools) => {
             state.current = Some(target);
@@ -93,6 +93,13 @@ pub fn call(
             }
         }
     };
+    if !parsed.is_object() {
+        return Output {
+            stdout: String::new(),
+            stderr: "webmcp-call: input must be a JSON object\n".into(),
+            code: 2,
+        };
+    }
     let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -101,7 +108,7 @@ pub fn call(
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
-    let session = match cdp::attach(cdp, &target) {
+    let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
@@ -112,7 +119,7 @@ pub fn call(
         }
         other => other,
     };
-    cdp::detach(cdp, &session);
+    let _ = browser::watch_detach(cdp, state, &target, &session);
     match outcome {
         Ok(outcome) => {
             state.current = Some(target);
@@ -247,7 +254,7 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
       });
     }
   }
-  for (const form of document.querySelectorAll('form[toolname]')) {
+  for (const form of document.querySelectorAll('form[toolname][tooldescription]')) {
     const name = form.getAttribute('toolname');
     if (tools.some(t => t.name === name)) continue;
     const fields = {};
@@ -670,5 +677,16 @@ mod tests {
         let output = call(&mut cdp, &mut state, "foo", "", None, false);
         assert_eq!(output.code, 2);
         assert!(output.stderr.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn call_non_object_json_exit_2() {
+        let mut cdp = fake_cdp(vec![]);
+        let mut state = Session::default();
+        for input in ["42", "null", "\"text\"", "[1,2]", "true"] {
+            let output = call(&mut cdp, &mut state, "foo", input, None, false);
+            assert_eq!(output.code, 2, "input {input}");
+            assert!(output.stderr.contains("must be a JSON object"), "input {input}: {}", output.stderr);
+        }
     }
 }
