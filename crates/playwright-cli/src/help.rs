@@ -70,7 +70,7 @@ pub fn global_help() -> String {
             "list connected browsers, debug ports, and launchables",
         ),
         row(
-            "discover [url]",
+            "discover [--once <url>]",
             "watch navigations and report agent-facing web standards",
         ),
         String::new(),

@@ -33,6 +33,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let json_mode = invocation.flags.contains_key("json");
     let once_url = invocation.flags.get("once").cloned();
     let once_tab = invocation.flags.get("tab").cloned();
+    let no_probe = invocation.flags.contains_key("no-probe");
 
     let explicit = launch::endpoint_is_explicit(invocation.cdp.as_deref(), cdp_env);
     let profile = if explicit {
@@ -125,7 +126,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 Ok(_) => {}
                 Err(_) => break,
             }
-            output.push_str(&process_events(&mut cdp, &mut state));
+            output.push_str(&process_events(&mut cdp, &mut state, &sess_state));
             if !loaded {
                 for event in cdp.events()[load_from..].iter() {
                     if event.get("method").and_then(|v| v.as_str()) == Some("Page.loadEventFired")
@@ -149,7 +150,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 let origin = sess
                     .and_then(|s| extract_origin(&s.page_url))
                     .unwrap_or_default();
-                if !origin.is_empty() {
+                if !origin.is_empty() && !no_probe {
                     output.push_str(&run_probes(&mut cdp, &mut state, &session, &origin));
                 }
                 break;
@@ -203,7 +204,6 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         }
     }
 
-    let mut stdout = String::new();
     loop {
         match cdp.pump(Instant::now() + Duration::from_millis(500)) {
             Ok(_) => {}
@@ -211,7 +211,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 if message.contains("closed") || message.contains("EOF") {
                     let stderr = format!("discover: connection lost: {message}");
                     return Output {
-                        stdout,
+                        stdout: String::new(),
                         stderr,
                         code: 1,
                     };
@@ -219,9 +219,54 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 continue;
             }
         }
-        stdout.push_str(&process_events(&mut cdp, &mut state));
+        let events_out = process_events(&mut cdp, &mut state, &sess_state);
+        if !events_out.is_empty() {
+            eprint_flush(&events_out);
+        }
+        let load_events = check_load_events(&cdp, &state);
+        for (session_id, origin) in &load_events {
+            let page_signals = collect_page_signals(&mut cdp, session_id);
+            let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
+            if !signals_out.is_empty() {
+                eprint_flush(&signals_out);
+            }
+            if !no_probe && !origin.is_empty() {
+                let probes_out = run_probes(&mut cdp, &mut state, session_id, origin);
+                if !probes_out.is_empty() {
+                    eprint_flush(&probes_out);
+                }
+            }
+        }
         attach_new_targets(&mut cdp, &mut state, &sess_state);
     }
+}
+
+fn eprint_flush(text: &str) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let _ = handle.write_all(text.as_bytes());
+    let _ = handle.flush();
+}
+
+fn check_load_events(cdp: &Cdp, state: &WatcherState) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    for event in cdp.events().iter().rev().take(50) {
+        if event.get("method").and_then(|v| v.as_str()) != Some("Page.loadEventFired") {
+            continue;
+        }
+        let session_id = event
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(sess) = state.sessions.get(session_id) {
+            let origin = extract_origin(&sess.page_url).unwrap_or_default();
+            if !results.iter().any(|(sid, _): &(String, String)| sid == session_id) {
+                results.push((session_id.to_string(), origin));
+            }
+        }
+    }
+    results
 }
 
 fn resolve_once_tab(
@@ -260,7 +305,7 @@ fn setup_session(cdp: &mut Cdp, session: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn process_events(cdp: &mut Cdp, state: &mut WatcherState) -> String {
+fn process_events(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &session::Session) -> String {
     let mut output = String::new();
     let events: Vec<Value> = cdp.events()[state.event_cursor..].to_vec();
     state.event_cursor = cdp.events().len();
@@ -280,7 +325,7 @@ fn process_events(cdp: &mut Cdp, state: &mut WatcherState) -> String {
                 handle_frame_navigated(state, session_id, &params);
             }
             "Target.targetCreated" => {
-                handle_target_created(cdp, state, &params);
+                handle_target_created(cdp, state, &params, sess_state);
             }
             "Target.targetInfoChanged" => {
                 handle_target_info_changed(cdp, state, &params);
@@ -323,13 +368,22 @@ fn handle_frame_navigated(state: &mut WatcherState, session_id: &str, params: &V
     }
 }
 
-fn handle_target_created(cdp: &mut Cdp, state: &mut WatcherState, params: &Value) {
+fn handle_target_created(cdp: &mut Cdp, state: &mut WatcherState, params: &Value, sess_state: &session::Session) {
     let Some(info) = params.get("targetInfo") else { return };
     let Some(target_id) = info.get("targetId").and_then(|v| v.as_str()) else { return };
     if info.get("type").and_then(|v| v.as_str()) != Some("page") {
         return;
     }
     if cdp.is_protected_target(target_id) {
+        return;
+    }
+    let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    if !session::page_visible(
+        sess_state.provenance.as_deref(),
+        url,
+        target_id,
+        &sess_state.owned,
+    ) {
         return;
     }
     if let Ok(session) = cdp::attach(cdp, target_id) {
