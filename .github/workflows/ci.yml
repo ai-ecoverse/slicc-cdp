@@ -90,7 +90,7 @@ jobs:
 
       - name: TLS rejects invalid certificate
         run: |
-          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ list 2>&1) || true
+          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ tab-list 2>&1) || true
           echo "$output"
           echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
 
@@ -227,7 +227,7 @@ jobs:
 
       - name: TLS rejects invalid certificate
         run: |
-          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ list 2>&1) || true
+          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ tab-list 2>&1) || true
           echo "$output"
           echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
 
