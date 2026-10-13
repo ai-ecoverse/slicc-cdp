@@ -79,7 +79,7 @@ impl Report {
             return;
         }
         self.started = true;
-        cdp.notify("Slicc.action", self.note.start_params(), None);
+        let _ = cdp.notify("Slicc.action", self.note.start_params(), None);
     }
 
     pub fn finish(&mut self, cdp: &mut Cdp, output: &Output) {
@@ -90,7 +90,7 @@ impl Report {
             self.begin(cdp);
         }
         self.ended = true;
-        cdp.notify(
+        let _ = cdp.notify(
             "Slicc.action",
             self.note.end_params(output.code == 0, &output.stderr),
             None,
@@ -317,7 +317,22 @@ mod tests {
                 }),
                 "Target.getTargets" => json!({ "targetInfos": [] }),
                 "Target.createTarget" => json!({ "targetId": "TAB1" }),
-                "Target.attachToTarget" => json!({ "sessionId": "sess" }),
+                "Target.attachToTarget" => {
+                    let calls = log.lock().unwrap();
+                    let previous = calls
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|index| calls.get(index))
+                        .and_then(|call| call.get("method"))
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if previous == "Target.setDiscoverTargets" {
+                        json!({ "sessionId": "guard" })
+                    } else {
+                        json!({ "sessionId": "sess" })
+                    }
+                }
                 "DOM.resolveNode" => json!({ "object": { "objectId": "obj-1" } }),
                 "Runtime.evaluate" => {
                     let expr = params

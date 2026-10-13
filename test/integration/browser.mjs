@@ -157,6 +157,53 @@ function socketText(data) {
   return new TextDecoder().decode(data);
 }
 
+export async function rawSocket(wsUrl) {
+  const ws = new WebSocket(wsUrl);
+  await new Promise((resolve, reject) => {
+    ws.addEventListener('open', () => resolve(), { once: true });
+    ws.addEventListener('error', () => reject(new Error('browser websocket failed')), {
+      once: true,
+    });
+  });
+  const pending = new Map();
+  let next = 0;
+  ws.addEventListener('message', (event) => {
+    const message = JSON.parse(socketText(event.data));
+    const waiter = pending.get(message.id);
+    if (!waiter) return;
+    pending.delete(message.id);
+    if (message.error) waiter.reject(new Error(JSON.stringify(message.error)));
+    else waiter.resolve(message.result ?? {});
+  });
+  const send = (method, params = {}, sessionId) => {
+    const id = ++next;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      const body = { id, method, params };
+      if (sessionId) body.sessionId = sessionId;
+      ws.send(JSON.stringify(body));
+    });
+  };
+  const targetUrl = async (targetId) => {
+    const { targetInfo } = await send('Target.getTargetInfo', { targetId });
+    return targetInfo.url;
+  };
+  return {
+    send,
+    targetUrl,
+    async open(url) {
+      const { targetId } = await send('Target.createTarget', { url, background: true });
+      const deadline = Date.now() + 15000;
+      while (!(await targetUrl(targetId)).startsWith(url.split('?')[0])) {
+        if (Date.now() > deadline) throw new Error(`${url} never opened`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return targetId;
+    },
+    close: () => ws.close(),
+  };
+}
+
 export async function frameId(wsUrl, targetId) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {

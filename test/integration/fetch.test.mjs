@@ -13,7 +13,8 @@ test('the cdp-client Fetch API against chromium', async () => {
   let browser;
   try {
     browser = await launchBrowser([
-      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}`,
+      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}, MAP vault.sliccy.ai 127.0.0.1:${site.port}`,
+      '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
     ]);
     const result = await cargo(
       [
@@ -25,16 +26,19 @@ test('the cdp-client Fetch API against chromium', async () => {
         '--ignored',
         '--exact',
         'fetch::tests::live_chromium_interception',
+        'shield::tests::live_protected_targets',
+        '--test-threads=1',
       ],
       {
         SLICC_FETCH_LIVE_WS: browser.wsUrl,
         SLICC_FETCH_LIVE_APP: site.origin,
         SLICC_FETCH_LIVE_IDP: `http://localhost:${site.port}`,
         SLICC_FETCH_LIVE_SEVEN: 'http://seven.sliccy.ai',
+        SLICC_FETCH_LIVE_VAULT: 'http://vault.sliccy.ai',
       }
     );
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stdout, /1 passed/);
+    assert.match(result.stdout, /2 passed/);
   } finally {
     await browser?.close();
     await site.close();

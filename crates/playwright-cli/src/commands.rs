@@ -850,13 +850,19 @@ fn resolve_target(
         if pages.iter().any(|page| page.target_id == *tab) {
             return Ok(tab.clone());
         }
+        if cdp.is_protected_target(tab) || cdp.target_protected(tab, false).unwrap_or(false) {
+            return Err(format!("{}\n", cdp.guard().refusal()));
+        }
         return Err(format!(
             "Unknown tab \"{tab}\". Run 'playwright-cli tab-list' to get tab IDs.\n"
         ));
     }
-    if let Some(current) = state.current.as_ref() {
-        if pages.iter().any(|page| &page.target_id == current) {
-            return Ok(current.clone());
+    if let Some(current) = state.current.clone() {
+        if pages.iter().any(|page| page.target_id == current) {
+            return Ok(current);
+        }
+        if cdp.is_protected_target(&current) || cdp.target_protected(&current, true).unwrap_or(false) {
+            return Err(format!("{}\n", cdp.guard().refusal()));
         }
     }
     if pages.len() == 1 {

@@ -200,6 +200,16 @@ fn on_message(text: &str, pages: &[PageSpec], shared: &Shared) -> Vec<String> {
             if !pages.iter().any(|page| page.target_id == target) {
                 return vec![json!({"id": id, "error": {"message": "No target with given id found"}}).to_string()];
             }
+            let earlier = shared
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.method == "Target.attachToTarget" && call.params.get("targetId").and_then(|item| item.as_str()) == Some(target))
+                .count();
+            if earlier % 2 == 0 {
+                return vec![wrap(id, json!({ "sessionId": format!("g-{target}-{earlier}") }))];
+            }
             vec![wrap(id, json!({ "sessionId": format!("s-{target}") }))]
         }
         "Target.detachFromTarget" => vec![wrap(id, json!({}))],

@@ -32,7 +32,7 @@ impl Report {
             return;
         }
         self.started = true;
-        cdp.notify("Slicc.action", self.note.start_params(), None);
+        let _ = cdp.notify("Slicc.action", self.note.start_params(), None);
     }
 
     pub fn finish(&mut self, cdp: &mut Cdp, code: i32, stderr: &str) {
@@ -43,6 +43,6 @@ impl Report {
             self.begin(cdp);
         }
         self.ended = true;
-        cdp.notify("Slicc.action", self.note.end_params(code == 0, stderr), None);
+        let _ = cdp.notify("Slicc.action", self.note.end_params(code == 0, stderr), None);
     }
 }

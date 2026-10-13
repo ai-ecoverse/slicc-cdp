@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { frameId, launchBrowser } from './browser.mjs';
+import { frameId, launchBrowser, rawSocket } from './browser.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
 
@@ -16,7 +16,8 @@ test('chromium through the native binaries and the kernel', async (t) => {
   let kernel;
   try {
     browser = await launchBrowser([
-      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}`,
+      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}, MAP vault.sliccy.ai 127.0.0.1:${site.port}`,
+      '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
     ]);
     const native = nativeRunner(
       path.join(nativeDir, process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'),
@@ -31,9 +32,11 @@ test('chromium through the native binaries and the kernel', async (t) => {
     await t.test('native playwright-cli', () => playwrightFlow(native, site));
     await t.test('native curlwright', () => curlFlow(native, site, browser.wsUrl));
     await t.test('native route', () => routeFlow(native, site));
+    await t.test('native protected tabs', () => protectedFlow(native, site, browser.wsUrl));
     await t.test('kernel playwright-cli', () => playwrightFlow(kernel, site));
     await t.test('kernel curlwright', () => curlFlow(kernel, site, browser.wsUrl));
     await t.test('kernel route', () => routeFlow(kernel, site));
+    await t.test('kernel protected tabs', () => protectedFlow(kernel, site, browser.wsUrl));
   } finally {
     await settle(kernel?.close());
     await settle(browser?.close());
@@ -288,6 +291,76 @@ async function routeFlow(runner, site) {
   ok(all);
   assert.equal(all.stdout, 'Removed all 2 route(s)\n');
   ok(await runner.playwright(['tab-close', '--tab', tab], cwd));
+}
+
+async function protectedFlow(runner, site, wsUrl) {
+  const raw = await rawSocket(wsUrl);
+  const refusal = /^slicc: refused: /;
+  const refused = async (args, cwd) => {
+    const result = await runner.playwright(args, cwd);
+    assert.equal(result.code, 1, `${args.join(' ')}\n${result.stdout}`);
+    assert.match(result.stderr, refusal, args.join(' '));
+    assert.doesNotMatch(result.stdout + result.stderr, /SECRET/);
+  };
+  try {
+    const seven = await raw.open('http://seven.sliccy.ai/landing?k=SEVENSECRET');
+    const vault = await raw.open('http://vault.sliccy.ai/landing?k=VAULTSECRET');
+    const cwd = await runner.fresh();
+    const listed = await runner.playwright(['tab-list'], cwd);
+    assert.equal(listed.code, 0, listed.stderr);
+    for (const hidden of [seven, vault, 'sliccy', 'SECRET']) {
+      assert.doesNotMatch(listed.stdout, new RegExp(escapeReg(hidden)), listed.stdout);
+    }
+    for (const tab of [seven, vault]) {
+      await refused(['eval', 'location.href', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
+      await refused(['screenshot', '--tab', tab, '--filename', 'x.png'], cwd);
+      await refused(['press', 'a', '--tab', tab], cwd);
+      await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+      await refused(['tab-close', '--tab', tab], cwd);
+      const curled = await runner.curl(['--tab', tab, `${site.origin}/api/me`], cwd);
+      assert.notEqual(curled.code, 0, curled.stdout);
+      assert.match(curled.stderr, /slicc: refused: /);
+      assert.ok((await raw.targetUrl(tab)).includes('SECRET'), 'the protected tab moved');
+    }
+    await refused(['open', 'http://vault.sliccy.ai/'], cwd);
+    await refused(['open', 'https://seven.sliccy.ai/os/'], cwd);
+    const body =
+      '<!doctype html><meta http-equiv="refresh" content="0;url=http://vault.sliccy.ai/landing?n=refresh"><title>refresh</title>';
+    const routed = await runner.playwright(
+      ['route', '**/refresh', `--body=${body}`, '--content-type=text/html'],
+      cwd
+    );
+    assert.equal(routed.code, 0, routed.stderr);
+    const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+    assert.equal(opened.code, 0, opened.stderr);
+    const tab = targetOf(opened.stdout);
+    await runner.playwright(['goto', `${site.origin}/refresh`], cwd);
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      const probe = await runner.playwright(['eval', 'location.href'], cwd);
+      if (probe.code !== 0 && refusal.test(probe.stderr)) break;
+      assert.ok(
+        Date.now() < deadline,
+        `the refreshed tab was never refused: ${probe.stdout}${probe.stderr}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.match(await raw.targetUrl(tab), /^http:\/\/vault\.sliccy\.ai\//);
+    await refused(['eval', 'document.cookie', '--tab', tab], cwd);
+    await refused(['snapshot', '--tab', tab], cwd);
+    await refused(['screenshot', '--tab', tab, '--filename', 'y.png'], cwd);
+    await refused(['press', 'a', '--tab', tab], cwd);
+    await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+    const afterList = await runner.playwright(['tab-list'], cwd);
+    assert.doesNotMatch(afterList.stdout, new RegExp(escapeReg(tab)));
+    const requests = await runner.playwright(['requests', '--tab', tab], cwd);
+    assert.doesNotMatch(requests.stdout + requests.stderr, /vault|n=refresh/);
+    await runner.playwright(['unroute'], cwd);
+    for (const id of [seven, vault, tab]) await raw.send('Target.closeTarget', { targetId: id });
+  } finally {
+    raw.close();
+  }
 }
 
 function markerCount(stdout) {

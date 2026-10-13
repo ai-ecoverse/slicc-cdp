@@ -121,17 +121,24 @@ impl Protected {
 
     pub fn pattern(&self, pattern: &str) -> bool {
         let lowered = pattern.to_ascii_lowercase();
-        let names = self.rules.domains.iter().chain(self.rules.hosts.iter());
-        for name in names {
-            if lowered.contains(name.as_str()) {
-                return true;
-            }
-        }
         if self
             .rules
             .any_schemes
             .iter()
             .any(|scheme| lowered.starts_with(&format!("{scheme}:")))
+        {
+            return true;
+        }
+        let names: Vec<&String> = self
+            .rules
+            .domains
+            .iter()
+            .chain(self.rules.hosts.iter())
+            .chain(self.extra_hosts.iter())
+            .collect();
+        if pattern_hosts(&lowered)
+            .iter()
+            .any(|host| names.iter().any(|name| host_reaches(host, name)))
         {
             return true;
         }
@@ -174,6 +181,96 @@ impl Protected {
             depth += 1;
         }
         url
+    }
+}
+
+fn pattern_hosts(pattern: &str) -> Vec<String> {
+    if let Some(index) = pattern.find("://") {
+        let scheme = &pattern[..index];
+        if !scheme.is_empty()
+            && scheme.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.' | '*' | '{' | '}' | ',')
+            })
+        {
+            let rest = &pattern[index + 3..];
+            let end = rest.find(['/', '#', '?']).unwrap_or(rest.len());
+            return authority_host(&rest[..end]).into_iter().collect();
+        }
+    }
+    let end = pattern.find(['#', '?']).unwrap_or(pattern.len());
+    pattern[..end]
+        .split('/')
+        .filter_map(authority_host)
+        .filter(|host| host.contains('.'))
+        .collect()
+}
+
+fn authority_host(authority: &str) -> Option<String> {
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.rfind(':') {
+        Some(index)
+            if !host.starts_with('[')
+                && host[index + 1..]
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == '*') =>
+        {
+            &host[..index]
+        }
+        _ => host,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty()
+        || host
+            .chars()
+            .all(|ch| matches!(ch, '*' | '?' | '{' | '}' | ','))
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn host_reaches(glob: &str, name: &str) -> bool {
+    let first: String = glob
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    let label = if first.is_empty() {
+        "x".to_string()
+    } else {
+        first
+    };
+    [
+        name.to_string(),
+        format!("x.{name}"),
+        format!("{label}.{name}"),
+    ]
+    .iter()
+    .any(|candidate| host_glob(glob.as_bytes(), candidate.as_bytes()))
+}
+
+fn host_glob(glob: &[u8], text: &[u8]) -> bool {
+    let Some((&first, rest)) = glob.split_first() else {
+        return text.is_empty();
+    };
+    match first {
+        b'*' => (0..=text.len()).any(|taken| host_glob(rest, &text[taken..])),
+        b'{' => match rest.iter().position(|ch| *ch == b'}') {
+            Some(close) => {
+                (0..=text.len()).any(|taken| host_glob(&rest[close + 1..], &text[taken..]))
+            }
+            None => text.first() == Some(&b'{') && host_glob(rest, &text[1..]),
+        },
+        b'?' => !text.is_empty() && host_glob(rest, &text[1..]),
+        b'\\' => match rest.split_first() {
+            Some((&literal, after)) => {
+                text.first() == Some(&literal) && host_glob(after, &text[1..])
+            }
+            None => text.is_empty(),
+        },
+        literal => text.first() == Some(&literal) && host_glob(rest, &text[1..]),
     }
 }
 
@@ -277,11 +374,29 @@ mod tests {
             assert!(guard.pattern(pattern), "{pattern}");
         }
         for pattern in [
+            "**://*.sliccy.ai/**",
+            "**/*.sliccy.ai/**",
+            "https://seven.sliccy.*/x",
+            "https://user@vault.sliccy.ai:443/x",
+            "https://vault.sliccy.ai./x",
+            "*://{seven,other}.sliccy.ai/*",
+        ] {
+            assert!(guard.pattern(pattern), "{pattern}");
+        }
+        for pattern in [
             "*",
             "**/*",
             "**/api/users",
+            "https://*/api",
             "https://example.com/*",
             "https://vault-sliccy.example/*",
+            "https://notsliccy.ai/*",
+            "https://vault.sliccy.ai.example/*",
+            "https://vault-sliccy.ai/*",
+            "**/x?next=https://seven.sliccy.ai/",
+            "https://example.com/?next=https://seven.sliccy.ai/",
+            "*/blocked*",
+            "**/api/*/details",
         ] {
             assert!(!guard.pattern(pattern), "{pattern}");
         }
