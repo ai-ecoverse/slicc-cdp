@@ -2,16 +2,19 @@ use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::launch;
-use crate::sanitize;
 use crate::session;
 use discovery::{
-    classify_response, default_classifiers, default_probes, known_link_rels, parse_link_header,
-    ClassifierRegistry, DedupSet, DiscoveryEvent, ProbeRegistry, Validity, Via, EVENT_VERSION,
+    classify_response, default_classifiers, default_probes, fingerprint, known_link_rels,
+    parse_link_header, ClassifierRegistry, DedupSet, DiscoveryEvent, ProbeRegistry, Validity, Via,
+    EVENT_VERSION,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use url::Url;
+
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const IO_READ_CAP: usize = 1024 * 1024;
 
@@ -31,6 +34,55 @@ fn is_reserved_cdp_origin(origin: &str) -> bool {
     (9222..=9229).contains(&port)
 }
 
+#[derive(Clone)]
+enum Sink {
+    Stdout,
+    Exec { cmd: String, timeout: Duration },
+    Lick { slicc_dir: String },
+}
+
+fn slicc_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return String::new();
+    }
+    format!("{home}/.slicc")
+}
+
+fn disabled_path() -> String {
+    let config = discover_config_dir();
+    if config.is_empty() {
+        return String::new();
+    }
+    format!("{config}/slicc/discover.disabled")
+}
+
+fn discover_config_dir() -> String {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("slicc-cdp-discover-tests")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    {
+        launch::user_config_dir()
+    }
+    #[cfg(all(not(test), target_arch = "wasm32"))]
+    {
+        String::new()
+    }
+}
+
+fn is_disabled() -> bool {
+    let path = disabled_path();
+    if path.is_empty() {
+        return false;
+    }
+    std::path::Path::new(&path).exists()
+}
+
 struct WatcherState {
     dedup: DedupSet,
     probed_origins: BTreeSet<String>,
@@ -40,6 +92,7 @@ struct WatcherState {
     json_mode: bool,
     events_emitted: usize,
     event_cursor: usize,
+    sink: Sink,
 }
 
 struct SessionState {
@@ -49,10 +102,54 @@ struct SessionState {
 }
 
 pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
+    if invocation.flags.contains_key("off") {
+        return Output::ok("");
+    }
+    if is_disabled() {
+        return Output {
+            stdout: String::new(),
+            stderr: "discover: disabled by discover.disabled\n".to_string(),
+            code: 0,
+        };
+    }
+
     let json_mode = invocation.flags.contains_key("json");
     let once_url = invocation.flags.get("once").cloned();
     let once_tab = invocation.flags.get("tab").cloned();
     let no_probe = invocation.flags.contains_key("no-probe");
+    let exec_cmd = invocation.flags.get("exec").cloned();
+    let lick_mode = invocation.flags.contains_key("lick");
+    let exec_timeout = invocation
+        .flags
+        .get("exec-timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    #[cfg(target_os = "wasi")]
+    if exec_cmd.is_some() {
+        return Output::err("discover: --exec is not available in wasm\n");
+    }
+
+    #[cfg(not(unix))]
+    if exec_cmd.is_some() {
+        return Output::err("discover: --exec is only available on unix\n");
+    }
+
+    let sink = if let Some(cmd) = exec_cmd {
+        Sink::Exec {
+            cmd,
+            timeout: Duration::from_secs(exec_timeout),
+        }
+    } else if lick_mode || (cdp_env.is_some() && !json_mode) {
+        let dir = slicc_dir();
+        if dir.is_empty() {
+            return Output::err("discover: HOME is not set, cannot use --lick\n");
+        }
+        ensure_lick_dirs(&dir);
+        Sink::Lick { slicc_dir: dir }
+    } else {
+        Sink::Stdout
+    };
 
     let explicit = launch::endpoint_is_explicit(invocation.cdp.as_deref(), cdp_env);
     let profile = if explicit {
@@ -86,6 +183,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         json_mode,
         events_emitted: 0,
         event_cursor: 0,
+        sink: sink.clone(),
     };
 
     if let Err(message) = cdp.call(
@@ -223,6 +321,61 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         }
     }
 
+    #[cfg(unix)]
+    {
+        static SIGHUP_FLAG: AtomicBool = AtomicBool::new(false);
+        unsafe {
+            libc::signal(libc::SIGHUP, sighup_handler as libc::sighandler_t);
+        }
+        extern "C" fn sighup_handler(_: libc::c_int) {
+            SIGHUP_FLAG.store(true, Ordering::SeqCst);
+        }
+
+        loop {
+            if SIGHUP_FLAG.swap(false, Ordering::SeqCst) && is_disabled() {
+                return Output {
+                    stdout: String::new(),
+                    stderr: "discover: disabled by discover.disabled (SIGHUP)\n".to_string(),
+                    code: 0,
+                };
+            }
+            match cdp.pump(Instant::now() + Duration::from_millis(500)) {
+                Ok(_) => {}
+                Err(message) => {
+                    if message.contains("closed") || message.contains("EOF") {
+                        let stderr = format!("discover: connection lost: {message}");
+                        return Output {
+                            stdout: String::new(),
+                            stderr,
+                            code: 1,
+                        };
+                    }
+                    continue;
+                }
+            }
+            let events_out = process_events(&mut cdp, &mut state, &sess_state);
+            if !events_out.is_empty() {
+                eprint_flush(&events_out);
+            }
+            let load_events = check_load_events(&cdp, &state);
+            for (session_id, origin) in &load_events {
+                let page_signals = collect_page_signals(&mut cdp, session_id);
+                let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
+                if !signals_out.is_empty() {
+                    eprint_flush(&signals_out);
+                }
+                if !no_probe && !origin.is_empty() {
+                    let probes_out = run_probes(&mut cdp, &mut state, session_id, origin);
+                    if !probes_out.is_empty() {
+                        eprint_flush(&probes_out);
+                    }
+                }
+            }
+            attach_new_targets(&mut cdp, &mut state, &sess_state);
+        }
+    }
+
+    #[cfg(not(unix))]
     loop {
         match cdp.pump(Instant::now() + Duration::from_millis(500)) {
             Ok(_) => {}
@@ -983,28 +1136,179 @@ fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &sess
 
 fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     state.events_emitted += 1;
-    if state.json_mode {
-        format!("{}\n", event.to_json())
-    } else {
-        format!(
-            "{} {} {} ({})\n",
-            sanitize::terminal(&event.standard),
-            sanitize::terminal(&event.origin),
-            sanitize::terminal(&event.url),
-            format_via(event.via)
-        )
+    let json_line = format!("{}\n", event.to_json());
+    match &state.sink {
+        Sink::Exec { cmd, timeout } => {
+            run_exec_sink(cmd, *timeout, event);
+        }
+        Sink::Lick { slicc_dir } => {
+            write_lick_file(slicc_dir, event);
+        }
+        Sink::Stdout => {}
+    }
+    match &state.sink {
+        Sink::Stdout => json_line,
+        _ => {
+            if state.json_mode {
+                json_line
+            } else {
+                String::new()
+            }
+        }
     }
 }
 
-fn format_via(via: Via) -> &'static str {
-    match via {
-        Via::LinkHeader => "link-header",
-        Via::HtmlLink => "html-link",
-        Via::WellKnown => "well-known",
-        Via::PageApi => "page-api",
-        Via::Response => "response",
+fn ensure_lick_dirs(slicc_dir: &str) {
+    let discoveries = format!("{slicc_dir}/discoveries");
+    let watches = format!("{slicc_dir}/watches");
+    let _ = std::fs::create_dir_all(&discoveries);
+    let _ = std::fs::create_dir_all(&watches);
+    let watch_file = format!("{watches}/discover.json");
+    if !std::path::Path::new(&watch_file).exists() {
+        let watch_json = json!({
+            "path": format!("{slicc_dir}/discoveries"),
+            "glob": "*.json",
+            "target": "cone",
+            "message": "browser discovery found an agent-facing web standard",
+            "debounce": 500,
+            "triage": "a web page offers an agent-facing standard; decide whether to use it"
+        });
+        let content = serde_json::to_string_pretty(&watch_json).unwrap_or_default();
+        atomic_write(&watch_file, content.as_bytes());
     }
 }
+
+fn atomic_write(path: &str, data: &[u8]) {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if dir.is_empty() {
+        return;
+    }
+    let unique = format!(
+        "{dir}/.tmp.{}.{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    );
+    match std::fs::write(&unique, data) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&unique, path) {
+                eprintln!("discover: rename {unique} -> {path}: {e}");
+                let _ = std::fs::remove_file(&unique);
+            }
+        }
+        Err(e) => {
+            eprintln!("discover: write {unique}: {e}");
+            let _ = std::fs::remove_file(&unique);
+        }
+    }
+}
+
+fn write_lick_file(slicc_dir: &str, event: &DiscoveryEvent) {
+    let fp = fingerprint(&event.origin, &event.standard, &event.url);
+    let hash = cdp_client::hash::sha256_hex(fp.as_bytes());
+    let path = format!("{slicc_dir}/discoveries/{hash}.json");
+    let content = serde_json::to_string_pretty(&json!({
+        "v": event.v,
+        "standard": event.standard,
+        "origin": event.origin,
+        "url": event.url,
+        "via": event.via,
+        "page": event.page,
+        "targetId": event.target_id,
+        "status": event.status,
+        "summary": event.summary,
+    }))
+    .unwrap_or_default();
+    atomic_write(&path, content.as_bytes());
+}
+
+#[cfg(unix)]
+fn run_exec_sink(cmd: &str, timeout: Duration, event: &DiscoveryEvent) {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let json = event.to_json();
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("SLICC_DISCOVER_STANDARD", &event.standard)
+        .env("SLICC_DISCOVER_ORIGIN", &event.origin)
+        .env("SLICC_DISCOVER_URL", &event.url);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("discover: --exec failed to start: {e}");
+            return;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(json.as_bytes());
+        drop(stdin);
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!(
+                        "discover: --exec exited with {}",
+                        status.code().unwrap_or(-1)
+                    );
+                }
+                return;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_group(&child);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("discover: --exec timed out after {}s", timeout.as_secs());
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("discover: --exec wait error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &std::process::Child) {
+    let pid = child.id() as i32;
+    unsafe {
+        let ret = libc::kill(-pid, libc::SIGKILL);
+        if ret != 0 {
+            eprintln!(
+                "discover: kill process group failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_exec_sink(_cmd: &str, _timeout: Duration, _event: &DiscoveryEvent) {}
 
 pub fn extract_origin(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
@@ -1065,15 +1369,6 @@ mod tests {
     }
 
     #[test]
-    fn format_via_all_variants() {
-        assert_eq!(format_via(Via::LinkHeader), "link-header");
-        assert_eq!(format_via(Via::HtmlLink), "html-link");
-        assert_eq!(format_via(Via::WellKnown), "well-known");
-        assert_eq!(format_via(Via::PageApi), "page-api");
-        assert_eq!(format_via(Via::Response), "response");
-    }
-
-    #[test]
     fn emit_event_json() {
         let mut state = WatcherState {
             dedup: DedupSet::new(),
@@ -1084,7 +1379,7 @@ mod tests {
             json_mode: true,
             
             
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -1116,7 +1411,7 @@ mod tests {
             json_mode: false,
             
             
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -1132,8 +1427,8 @@ mod tests {
         };
         let line = emit_event(&mut state, &event);
         assert!(line.contains("ard"));
-        assert!(line.contains("well-known"));
-        assert!(!line.contains("\"v\""));
+        assert!(line.contains("\"v\":1"));
+        assert!(line.ends_with('\n'));
     }
 
     #[test]
@@ -1147,7 +1442,7 @@ mod tests {
             json_mode: false,
             
             
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.probed_origins.insert("https://example.com".to_string());
         assert!(state.probed_origins.contains("https://example.com"));
@@ -1172,7 +1467,7 @@ mod tests {
             json_mode: false,
             
             
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -1205,7 +1500,7 @@ mod tests {
             json_mode: false,
             
             
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -1288,7 +1583,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -1321,7 +1616,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -1354,7 +1649,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -1451,7 +1746,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -1467,7 +1762,7 @@ mod tests {
         };
         let line = emit_event(&mut state, &event);
         assert!(!line.contains('\x1b'), "ESC must not appear raw: {line}");
-        assert!(line.contains("\\x1b"), "ESC must appear escaped: {line}");
+        assert!(line.starts_with('{'), "stdout sink must emit JSON");
     }
 
     #[test]
@@ -1479,7 +1774,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
-            events_emitted: 0, event_cursor: 0,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -1495,5 +1790,389 @@ mod tests {
         };
         let line = emit_event(&mut state, &event);
         assert!(line.starts_with('{'), "JSON mode must emit JSON");
+    }
+
+    #[test]
+    fn off_flag_exits_immediately() {
+        let mut flags = BTreeMap::new();
+        flags.insert("off".to_string(), "true".to_string());
+        let invocation = Invocation {
+            command: Some("discover".to_string()),
+            positionals: vec![],
+            flags,
+            multi: BTreeMap::new(),
+            cdp: None,
+            runtime: None,
+            help: false,
+            command_help: false,
+            version: false,
+        };
+        let output = run(&invocation, None);
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn disabled_file_is_checked() {
+        let config = discover_config_dir();
+        let slicc = std::path::Path::new(&config).join("slicc");
+        std::fs::create_dir_all(&slicc).unwrap();
+        let disabled = slicc.join("discover.disabled");
+        std::fs::write(&disabled, "").unwrap();
+        let result = is_disabled();
+        let _ = std::fs::remove_file(&disabled);
+        assert!(result);
+    }
+
+    #[test]
+    fn disabled_file_absent_means_enabled() {
+        let config = discover_config_dir();
+        let disabled = std::path::Path::new(&config).join("slicc").join("discover.disabled");
+        let _ = std::fs::remove_file(&disabled);
+        let result = is_disabled();
+        assert!(!result);
+    }
+
+    #[test]
+    fn lick_file_uses_fingerprint_hash() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-lick-{}", std::process::id()));
+        let slicc = tmp.join(".slicc");
+        std::fs::create_dir_all(slicc.join("discoveries")).unwrap();
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T1".into(),
+            status: Validity::Valid,
+            summary: json!({"name": "test"}),
+            reason: None,
+        };
+        write_lick_file(&slicc.to_string_lossy(), &event);
+        let fp = fingerprint("https://example.com", "ard", "https://example.com/.well-known/ard.json");
+        let hash = cdp_client::hash::sha256_hex(fp.as_bytes());
+        let path = slicc.join("discoveries").join(format!("{hash}.json"));
+        assert!(path.exists(), "lick file must exist at {}", path.display());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["standard"], "ard");
+        assert_eq!(parsed["origin"], "https://example.com");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn lick_file_name_never_uses_event_fields() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-hostile-lick-{}", std::process::id()));
+        let slicc = tmp.join(".slicc");
+        std::fs::create_dir_all(slicc.join("discoveries")).unwrap();
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://evil.com".into(),
+            url: "https://evil.com/$(rm -rf /)".into(),
+            via: Via::WellKnown,
+            page: "https://evil.com/`whoami`".into(),
+            target_id: "T1".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        write_lick_file(&slicc.to_string_lossy(), &event);
+        let entries: Vec<_> = std::fs::read_dir(slicc.join("discoveries"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let name = entries[0].file_name().to_string_lossy().to_string();
+        assert!(name.ends_with(".json"));
+        assert!(!name.contains("rm"));
+        assert!(!name.contains("whoami"));
+        assert!(!name.contains("$"));
+        assert!(!name.contains("`"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn ensure_lick_dirs_creates_structure_and_watch() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-ensure-{}", std::process::id()));
+        let slicc = tmp.join(".slicc");
+        ensure_lick_dirs(&slicc.to_string_lossy());
+        assert!(slicc.join("discoveries").is_dir());
+        assert!(slicc.join("watches").is_dir());
+        let watch = slicc.join("watches").join("discover.json");
+        assert!(watch.exists());
+        let content = std::fs::read_to_string(&watch).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["glob"], "*.json");
+        assert_eq!(parsed["target"], "cone");
+        assert!(parsed["path"].as_str().unwrap().ends_with("/discoveries"));
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_creates_file() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("test.json");
+        atomic_write(&path.to_string_lossy(), b"hello");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        let tmp_file = tmp.join(format!(".tmp.{}", std::process::id()));
+        assert!(!tmp_file.exists(), "temp file must be cleaned up");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn emit_event_with_lick_sink_writes_file() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-emit-lick-{}", std::process::id()));
+        let slicc = tmp.join(".slicc");
+        std::fs::create_dir_all(slicc.join("discoveries")).unwrap();
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() },
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T1".into(),
+            status: Validity::Valid,
+            summary: json!({"name": "test"}),
+            reason: None,
+        };
+        let output = emit_event(&mut state, &event);
+        assert!(output.is_empty(), "lick sink should not output to stdout");
+        assert_eq!(state.events_emitted, 1);
+        let entries: Vec<_> = std::fs::read_dir(slicc.join("discoveries"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn exec_sink_hostile_url_not_in_command_line() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-hostile-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let record = tmp.join("stdin.json");
+        let cmd = format!("cat > {}", record.display());
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://evil.com".into(),
+            url: "https://evil.com/$(touch /tmp/pwned)\"'`backtick`".into(),
+            via: Via::WellKnown,
+            page: "https://evil.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        run_exec_sink(
+            &cmd,
+            Duration::from_secs(5),
+            &event,
+        );
+        assert!(record.exists(), "script must receive stdin");
+        let content = std::fs::read_to_string(&record).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["standard"], "ard");
+        assert!(!std::path::Path::new("/tmp/pwned").exists(), "command injection must not happen");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn exec_sink_timeout_kills_process() {
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        let start = Instant::now();
+        run_exec_sink(
+            "sleep 60",
+            Duration::from_secs(1),
+            &event,
+        );
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "timeout should kill quickly, took {elapsed:?}");
+    }
+
+    #[test]
+    fn exec_sink_nonzero_exit_does_not_panic() {
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        run_exec_sink(
+            "exit 42",
+            Duration::from_secs(5),
+            &event,
+        );
+    }
+
+    #[test]
+    fn exec_sink_env_vars_are_set() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-env-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("env.txt");
+        let cmd = format!(
+            "echo \"$SLICC_DISCOVER_STANDARD\" > {} && echo \"$SLICC_DISCOVER_ORIGIN\" >> {} && echo \"$SLICC_DISCOVER_URL\" >> {}",
+            out.display(),
+            out.display(),
+            out.display()
+        );
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        run_exec_sink(
+            &cmd,
+            Duration::from_secs(5),
+            &event,
+        );
+        let content = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = content.trim().split('\n').collect();
+        assert_eq!(lines[0], "ard");
+        assert_eq!(lines[1], "https://example.com");
+        assert_eq!(lines[2], "https://example.com/.well-known/ard.json");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn exec_sink_command_with_arguments() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-args-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let record = tmp.join("args.json");
+        let cmd = format!("cat > {} < /dev/stdin", record.display());
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({"name": "test"}),
+            reason: None,
+        };
+        run_exec_sink(&cmd, Duration::from_secs(5), &event);
+        assert!(record.exists(), "command with arguments must work");
+        let content = std::fs::read_to_string(&record).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["standard"], "ard");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn exec_sink_hostile_url_unexpanded_in_env() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-env-hostile-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("env.txt");
+        let cmd = format!("echo \"$SLICC_DISCOVER_URL\" > {}", out.display());
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://evil.com".into(),
+            url: "https://evil.com/$(touch /tmp/pwned2)\"'`backtick`".into(),
+            via: Via::WellKnown,
+            page: "https://evil.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        run_exec_sink(&cmd, Duration::from_secs(5), &event);
+        assert!(!std::path::Path::new("/tmp/pwned2").exists(), "env var must not expand shell metacharacters");
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("$(touch /tmp/pwned2)"), "hostile URL must pass through as literal in env: {content}");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn stdout_sink_emits_ndjson() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T1".into(),
+            status: Validity::Valid,
+            summary: json!({"name": "test"}),
+            reason: None,
+        };
+        let line = emit_event(&mut state, &event);
+        assert!(line.ends_with('\n'));
+        let parsed: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["standard"], "ard");
+    }
+
+    #[test]
+    fn watch_json_matches_slicc_agent_format() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-watch-fmt-{}", std::process::id()));
+        let slicc = tmp.join(".slicc");
+        ensure_lick_dirs(&slicc.to_string_lossy());
+        let watch = slicc.join("watches").join("discover.json");
+        let content = std::fs::read_to_string(&watch).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("path").is_some());
+        assert!(parsed.get("glob").is_some());
+        assert!(parsed.get("target").is_some());
+        assert!(parsed.get("message").is_some());
+        assert!(parsed.get("debounce").is_some());
+        assert!(parsed.get("triage").is_some());
+        let obj = parsed.as_object().unwrap();
+        for key in obj.keys() {
+            assert!(
+                ["path", "glob", "target", "message", "debounce", "triage"].contains(&key.as_str()),
+                "unexpected key {key} in discover.json"
+            );
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
