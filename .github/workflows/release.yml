@@ -95,80 +95,9 @@ jobs:
   build-binaries:
     needs: release
     if: needs.release.outputs.released == 'true'
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - { os: macos-latest, target: x86_64-apple-darwin, label: darwin-amd64 }
-          - { os: macos-latest, target: aarch64-apple-darwin, label: darwin-arm64 }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, label: linux-amd64 }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, label: linux-arm64 }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: windows-amd64 }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc, label: windows-arm64 }
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - name: Stamp version
-        shell: bash
-        run: |
-          version="${{ needs.release.outputs.version }}"
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            pkg.version = '$version';
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-
-      - name: Install Rust
-        shell: bash
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target ${{ matrix.target }}
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'linux-musl')
-        shell: bash
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build
-        shell: bash
-        env:
-          OPENSSL_DIR: /musl
-          OPENSSL_STATIC: "1"
-        run: |
-          if echo "${{ matrix.target }}" | grep -q linux-musl; then
-            cross build --release --target ${{ matrix.target }} -p slicc-cdp -p curlwright
-          else
-            cargo build --release --target ${{ matrix.target }} -p slicc-cdp -p curlwright
-          fi
-
-      - name: Prepare artifacts
-        shell: bash
-        run: |
-          mkdir -p dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ext=".exe"
-          else
-            ext=""
-          fi
-          cp "target/${{ matrix.target }}/release/playwright-cli${ext}" "dist/playwright-cli-${{ matrix.label }}${ext}"
-          cp "target/${{ matrix.target }}/release/curlwright${ext}" "dist/curlwright-${{ matrix.label }}${ext}"
-
-      - name: Ad-hoc sign macOS binaries
-        if: runner.os == 'macOS'
-        run: |
-          codesign -s - "dist/playwright-cli-${{ matrix.label }}"
-          codesign -s - "dist/curlwright-${{ matrix.label }}"
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: binaries-${{ matrix.label }}
-          path: dist/*
-          retention-days: 1
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
 
   upload-assets:
     needs: [release, build-binaries]
@@ -197,7 +126,7 @@ jobs:
           cp install.sh artifacts/install.sh
           gh release upload "$tag" artifacts/* --clobber
 
-      - name: Verify assets
+      - name: Verify and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -210,6 +139,7 @@ jobs:
               exit 1
             fi
           done
+          gh release edit "$tag" --draft=false --latest
 
   smoke:
     needs: upload-assets
