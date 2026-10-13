@@ -670,8 +670,8 @@ Object.defineProperty(document, 'modelContext', {
       }
     });
 
-    await t.test('48 MiB well-known body produces no valid ard event', async () => {
-      const bigSize = 48 * 1024 * 1024;
+    await t.test('5 MiB well-known body produces no valid ard event', async () => {
+      const bigSize = 5 * 1024 * 1024;
       const bigServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/') {
@@ -718,7 +718,7 @@ Object.defineProperty(document, 'modelContext', {
         assert.equal(
           ardValid.length,
           0,
-          `48 MiB body must not produce a valid ard event: ${JSON.stringify(ardValid)}`
+          `5 MiB body must not produce a valid ard event: ${JSON.stringify(ardValid)}`
         );
       } finally {
         bigServer.closeAllConnections();
