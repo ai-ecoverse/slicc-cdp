@@ -111,11 +111,12 @@ pub fn call(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let chrome_major = chrome_major_version(cdp);
-    let result = evaluate_call(cdp, &session, name, &parsed, chrome_major);
+    let _chrome_major = chrome_major_version(cdp);
+    let native = native_webmcp(cdp, &session);
+    let result = evaluate_call(cdp, &session, name, &parsed, native);
     let outcome = match result {
         Ok(CallOutcome::Consequential(_)) if allow_consequential => {
-            evaluate_call_force(cdp, &session, name, &parsed, chrome_major)
+            evaluate_call_force(cdp, &session, name, &parsed, native)
         }
         other => other,
     };
@@ -291,8 +292,23 @@ fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     version_part.split('.').next()?.parse().ok()
 }
 
-fn input_expression(input: &Value, chrome_major: Option<u32>) -> String {
-    if chrome_major.is_some_and(|v| v >= 156) {
+fn native_webmcp(cdp: &mut Cdp, session: &str) -> bool {
+    let result = cdp.call(
+        "Runtime.evaluate",
+        json!({
+            "expression": "Boolean(document.modelContext && typeof document.modelContext.registerTool === 'function' && document.modelContext[Symbol.toStringTag] === 'ModelContext')",
+            "returnByValue": true
+        }),
+        Some(session),
+    );
+    result
+        .ok()
+        .and_then(|v| v.pointer("/result/value").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+fn input_expression(input: &Value, native: bool) -> String {
+    if native {
         format!("{input}")
     } else {
         format!("JSON.stringify({input})")
@@ -312,9 +328,9 @@ fn evaluate_call(
     session: &str,
     name: &str,
     input: &Value,
-    chrome_major: Option<u32>,
+    native: bool,
 ) -> Result<CallOutcome, String> {
-    let input_expr = input_expression(input, chrome_major);
+    let input_expr = input_expression(input, native);
     let expression = format!(
         r#"(async () => {{
   if (!('modelContext' in document) || !document.modelContext) {{
@@ -345,9 +361,9 @@ fn evaluate_call_force(
     session: &str,
     name: &str,
     input: &Value,
-    chrome_major: Option<u32>,
+    native: bool,
 ) -> Result<CallOutcome, String> {
-    let input_expr = input_expression(input, chrome_major);
+    let input_expr = input_expression(input, native);
     let expression = format!(
         r#"(async () => {{
   const tools = await document.modelContext.getTools();
@@ -763,23 +779,28 @@ mod tests {
     }
 
     #[test]
-    fn input_expression_string_below_156() {
+    fn native_webmcp_true_when_model_context_present() {
+        let mut cdp = fake_cdp(vec![eval_result(json!(true))]);
+        assert!(native_webmcp(&mut cdp, "S1"));
+    }
+
+    #[test]
+    fn native_webmcp_false_when_absent() {
+        let mut cdp = fake_cdp(vec![eval_result(json!(false))]);
+        assert!(!native_webmcp(&mut cdp, "S1"));
+    }
+
+    #[test]
+    fn input_expression_string_for_polyfill() {
         let input = json!({"key": "value"});
-        let expr = input_expression(&input, Some(155));
+        let expr = input_expression(&input, false);
         assert!(expr.starts_with("JSON.stringify("));
     }
 
     #[test]
-    fn input_expression_object_at_156() {
+    fn input_expression_object_for_native() {
         let input = json!({"key": "value"});
-        let expr = input_expression(&input, Some(156));
+        let expr = input_expression(&input, true);
         assert!(!expr.contains("JSON.stringify"));
-    }
-
-    #[test]
-    fn input_expression_string_when_unknown() {
-        let input = json!({"key": "value"});
-        let expr = input_expression(&input, None);
-        assert!(expr.starts_with("JSON.stringify("));
     }
 }
