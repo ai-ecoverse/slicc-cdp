@@ -41,6 +41,9 @@ test('webmcp-list and webmcp-call through the native binary', async (t) => {
     await t.test('call on a page without WebMCP exits 2', () => absentCallFlow(runner, site));
     await t.test('list declarative form tools', () => formToolsFlow(runner, site));
     await t.test('refuse protected tab', () => protectedRefusalFlow(runner, site));
+    await t.test('canary: Chrome still rejects object executeTool input (#116)', () =>
+      executeToolStringCanary(runner, site)
+    );
   } finally {
     await settle(browser?.close());
     await settle(site.close());
@@ -223,4 +226,32 @@ function runWithStdin(bin, args, input, cwd) {
       });
     });
   });
+}
+
+async function executeToolStringCanary(runner, site) {
+  const cwd = await runner.fresh();
+  await runner.playwright(['open', `${site.origin}/webmcp`], cwd);
+  const r = await runner.playwright(
+    [
+      'eval',
+      `(async () => {
+        const tools = await document.modelContext.getTools();
+        const tool = tools.find(t => t.name === 'greet');
+        if (!tool) return 'skip: no greet tool';
+        try {
+          await document.modelContext.executeTool(tool, {name: 'Canary'});
+          return 'OBJECT_ACCEPTED';
+        } catch (e) {
+          return 'object_rejected: ' + e;
+        }
+      })()`,
+    ],
+    cwd
+  );
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(
+    !r.stdout.includes('OBJECT_ACCEPTED'),
+    'Chrome now accepts object input to executeTool. ' +
+      'Switch webmcp-call to pass an object instead of JSON.stringify. See #116.'
+  );
 }
