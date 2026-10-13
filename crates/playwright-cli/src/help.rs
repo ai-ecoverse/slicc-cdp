@@ -55,6 +55,10 @@ pub fn global_help() -> String {
             "list connected browsers, debug ports, and launchables",
         ),
         String::new(),
+        "WebMCP (SLICC):".to_string(),
+        row("webmcp-list", "list WebMCP tools on the page"),
+        row("webmcp-call <name> <json>", "call a WebMCP tool on the page"),
+        String::new(),
         "Not implemented yet:".to_string(),
     ];
     let pending: Vec<&str> = spec::all()
@@ -351,6 +355,42 @@ fn implemented_page(name: &str) -> Option<String> {
                 "--json",
                 "print one JSON document and no text sections",
             )],
+        ),
+        "webmcp-list" => page(
+            "webmcp-list",
+            &[
+                "List WebMCP tools registered on the page",
+                "",
+                "Evaluates document.modelContext.getTools() in the page's main world.",
+                "Also discovers declarative form[toolname] tools.",
+                "If modelContext is absent, returns an empty list.",
+            ],
+            &[],
+            &[
+                ("--tab <targetId>", "tab to query"),
+                ("--json", "print the tool list as a JSON array"),
+            ],
+        ),
+        "webmcp-call" => page(
+            "webmcp-call <name> <json-input>",
+            &[
+                "Call a WebMCP tool on the page",
+                "",
+                "Runs document.modelContext.executeTool in the page's main world.",
+                "The result string is printed to stdout.",
+                "",
+                "Exit codes:",
+                "  0  success",
+                "  1  tool threw an error",
+                "  2  unknown tool, invalid JSON input, or no WebMCP support",
+            ],
+            &[
+                ("<name>", "tool name"),
+                ("<json-input>", "JSON object passed to the tool"),
+            ],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+            ],
         ),
         _ => return None,
     };

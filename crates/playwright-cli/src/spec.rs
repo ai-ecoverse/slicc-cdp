@@ -100,6 +100,8 @@ static SPECS: &[Spec] = &[
     spec("frames", &[], false, &[("tab", S)], false, RefMode::None),
     spec("record", &["url"], false, &[("tab", S), ("filter", S)], false, RefMode::None),
     spec("stop-recording", &["recordingId"], false, &[("tab", S)], false, RefMode::None),
+    spec("webmcp-list", &[], false, &[("tab", S), ("json", B)], true, RefMode::None),
+    spec("webmcp-call", &["name", "json-input"], false, &[("tab", S)], true, RefMode::None),
 ];
 
 const fn spec(

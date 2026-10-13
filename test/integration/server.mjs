@@ -53,6 +53,9 @@ function answer(req, res, pathname, body) {
   if (pathname === '/code') return text(res, 201, '');
   if (pathname === '/nope') return text(res, 500, 'nope');
   if (pathname === '/child.html') return html(res, childPage());
+  if (pathname === '/webmcp') return html(res, webmcpPage());
+  if (pathname === '/webmcp-empty') return html(res, webmcpEmptyPage());
+  if (pathname === '/webmcp-form') return html(res, webmcpFormPage());
   if (documents.has(pathname))
     return html(res, fixture(pathname === '/other' ? 'Other' : 'Fixture'));
   return text(res, 404, 'missing');
@@ -128,4 +131,48 @@ function childPage() {
 
 function bootPage() {
   return '<!doctype html><title>Boot</title><script>fetch("/api/boot")</script>';
+}
+
+function webmcpPage() {
+  return `<!doctype html><title>WebMCP</title><script>
+if (document.modelContext && document.modelContext.registerTool) {
+  document.modelContext.registerTool({
+    name: 'greet',
+    title: 'Greet',
+    description: 'Returns a greeting',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' } } },
+    annotations: { readOnlyHint: true, consequentialHint: false, untrustedContentHint: false },
+    execute: async (input) => 'Hello, ' + (input.name || 'world') + '!'
+  });
+  document.modelContext.registerTool({
+    name: 'fail',
+    title: 'Fail',
+    description: 'Always throws',
+    inputSchema: { type: 'object', properties: {} },
+    execute: async () => { throw new Error('intentional failure'); }
+  });
+} else {
+  document.modelContext = {
+    async getTools() {
+      return [
+        { name: 'greet', title: 'Greet', description: 'Returns a greeting', inputSchema: { type: 'object', properties: { name: { type: 'string' } } }, origin: location.origin, annotations: { readOnlyHint: true, consequentialHint: false, untrustedContentHint: false } },
+        { name: 'fail', title: 'Fail', description: 'Always throws', inputSchema: { type: 'object', properties: {} }, origin: location.origin, annotations: null }
+      ];
+    },
+    async executeTool(tool, input) {
+      if (tool.name === 'greet') return 'Hello, ' + (input.name || 'world') + '!';
+      if (tool.name === 'fail') throw new Error('intentional failure');
+      throw new Error('unknown tool');
+    }
+  };
+}
+</script>`;
+}
+
+function webmcpEmptyPage() {
+  return '<!doctype html><title>No WebMCP</title><p>plain page</p>';
+}
+
+function webmcpFormPage() {
+  return '<!doctype html><title>Form Tools</title><form toolname="search" tooldescription="Search items"><input name="query"><button type="submit">Go</button></form>';
 }
