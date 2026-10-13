@@ -1006,8 +1006,9 @@ fn run_probes(
 
         let probe_result = isolated_world_probe(cdp, session_id, &frame_id, &probe_req.url);
         let (status, content_type, body) = match probe_result {
-            Some(r) => r,
-            None => {
+            IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
+            IsolatedProbeResult::Final => continue,
+            IsolatedProbeResult::Unavailable => {
                 match native_probe(&probe_req.url, &probe_req.probe.accept) {
                     Some((ns, nct, nbody)) => (ns, nct, nbody),
                     None => continue,
@@ -1054,22 +1055,33 @@ fn run_probes(
     output
 }
 
+enum IsolatedProbeResult {
+    Ok(u16, String, String),
+    Final,
+    Unavailable,
+}
+
 fn isolated_world_probe(
     cdp: &mut Cdp,
     session_id: &str,
     frame_id: &str,
     url: &str,
-) -> Option<(u16, String, String)> {
-    let world = cdp
-        .call(
-            "Page.createIsolatedWorld",
-            json!({ "frameId": frame_id, "grantUniveralAccess": true }),
-            Some(session_id),
-        )
-        .ok()?;
-    let execution_context_id = world
+) -> IsolatedProbeResult {
+    let world = match cdp.call(
+        "Page.createIsolatedWorld",
+        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+        Some(session_id),
+    ) {
+        Ok(w) => w,
+        Err(_) => return IsolatedProbeResult::Unavailable,
+    };
+    let execution_context_id = match world
         .get("executionContextId")
-        .and_then(|v| v.as_u64())?;
+        .and_then(|v| v.as_u64())
+    {
+        Some(id) => id,
+        None => return IsolatedProbeResult::Unavailable,
+    };
     let js = format!(
         r#"(async () => {{
   const cap = 1048576;
@@ -1097,26 +1109,30 @@ fn isolated_world_probe(
 "#,
         url = serde_json::to_string(url).unwrap_or_default()
     );
-    let result = cdp
-        .call_for(
-            "Runtime.evaluate",
-            json!({
-                "expression": js,
-                "contextId": execution_context_id,
-                "returnByValue": true,
-                "awaitPromise": true
-            }),
-            Some(session_id),
-            Duration::from_secs(5),
-        )
-        .ok()?;
+    let result = match cdp.call_for(
+        "Runtime.evaluate",
+        json!({
+            "expression": js,
+            "contextId": execution_context_id,
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+        Some(session_id),
+        Duration::from_secs(5),
+    ) {
+        Ok(r) => r,
+        Err(_) => return IsolatedProbeResult::Final,
+    };
     let value_str = result
         .pointer("/result/value")
         .and_then(|v| v.as_str())
         .unwrap_or("{}");
-    let parsed: Value = serde_json::from_str(value_str).ok()?;
+    let parsed: Value = match serde_json::from_str(value_str) {
+        Ok(v) => v,
+        Err(_) => return IsolatedProbeResult::Final,
+    };
     if parsed.get("err").is_some() {
-        return None;
+        return IsolatedProbeResult::Final;
     }
     let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     let ct = parsed
@@ -1129,7 +1145,7 @@ fn isolated_world_probe(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Some((status, ct, body))
+    IsolatedProbeResult::Ok(status, ct, body)
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -2484,5 +2500,22 @@ mod tests {
         assert!(guard.url("https://vault.sliccy.ai/catalog.json"));
         assert!(guard.url("https://seven.sliccy.ai/.well-known/ard.json"));
         assert!(!guard.url("https://example.com/.well-known/ard.json"));
+    }
+
+    #[test]
+    fn chrome_timeout_returns_final_not_unavailable() {
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let result = isolated_world_probe(&mut cdp, "S1", "F1", "http://example.com/.well-known/ard.json");
+        assert!(
+            !matches!(result, IsolatedProbeResult::Ok(_, _, _)),
+            "a failing CDP must not return Ok"
+        );
+    }
+
+    #[test]
+    fn isolated_probe_final_does_not_fall_through() {
+        let r = IsolatedProbeResult::Final;
+        let fell_through = matches!(r, IsolatedProbeResult::Unavailable);
+        assert!(!fell_through, "Final must not trigger the native fallback path");
     }
 }

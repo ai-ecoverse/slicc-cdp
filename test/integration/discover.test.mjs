@@ -731,7 +731,7 @@ Object.defineProperty(document, 'modelContext', {
       }
     });
 
-    await t.test('stalled body probe gives up within 12s', async () => {
+    await t.test('stalled body probe gives up within 6s', async () => {
       const stallServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/') {
@@ -758,7 +758,7 @@ Object.defineProperty(document, 'modelContext', {
         const start = Date.now();
         await runner.playwright(['discover', '--json', '--once', `${stallOrigin}/`], cwd);
         const elapsed = Date.now() - start;
-        assert.ok(elapsed < 12000, `probe must give up within 12s, took ${elapsed}ms`);
+        assert.ok(elapsed < 6000, `probe must give up within 6s, took ${elapsed}ms`);
       } finally {
         stallServer.closeAllConnections();
         stallServer.close();
