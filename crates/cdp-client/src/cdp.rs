@@ -1,24 +1,93 @@
+use crate::fetch::{self, Decision, Paused};
 use crate::net::Ws;
+use crate::protected::Protected;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+pub trait Transport {
+    fn send_text(&mut self, text: &str) -> Result<(), String>;
+    fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String>;
+}
+
+impl Transport for Ws {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        Ws::send_text(self, text)
+    }
+
+    fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        Ws::recv_text(self, deadline)
+    }
+}
+
+pub type Decider = Box<dyn FnMut(&Paused) -> Decision>;
+
 pub struct Cdp {
-    ws: Ws,
+    ws: Box<dyn Transport>,
     next_id: i64,
     events: Vec<Value>,
+    guard: Protected,
+    paused: VecDeque<Paused>,
+    deciders: BTreeMap<String, Decider>,
+    decided: BTreeMap<i64, (String, String)>,
+    fetch_errors: Vec<String>,
 }
 
 impl Cdp {
     pub fn connect(url: &str) -> Result<Self, String> {
-        Ok(Self {
-            ws: crate::net::ws_connect(url)?,
+        Ok(Self::from_transport(Box::new(crate::net::ws_connect(url)?)))
+    }
+
+    pub fn from_transport(ws: Box<dyn Transport>) -> Self {
+        Self {
+            ws,
             next_id: 0,
             events: Vec::new(),
-        })
+            guard: Protected::default(),
+            paused: VecDeque::new(),
+            deciders: BTreeMap::new(),
+            decided: BTreeMap::new(),
+            fetch_errors: Vec::new(),
+        }
     }
 
     pub fn events(&self) -> &[Value] {
         &self.events
+    }
+
+    pub fn guard(&self) -> &Protected {
+        &self.guard
+    }
+
+    pub fn protect_origins(&mut self, extra_origins: &[&str]) {
+        self.guard = Protected::new(extra_origins);
+    }
+
+    pub fn set_decider(&mut self, session_id: &str, decider: Option<Decider>) {
+        match decider {
+            Some(decider) => {
+                self.deciders.insert(session_id.to_string(), decider);
+                let queued: Vec<Paused> = self.paused.drain(..).collect();
+                for paused in queued {
+                    if paused.session_id == session_id {
+                        self.decide_inline(paused);
+                    } else {
+                        self.paused.push_back(paused);
+                    }
+                }
+            }
+            None => {
+                self.deciders.remove(session_id);
+            }
+        }
+    }
+
+    pub fn has_decider(&self, session_id: &str) -> bool {
+        self.deciders.contains_key(session_id)
+    }
+
+    pub fn take_fetch_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.fetch_errors)
     }
 
     pub fn call(
@@ -37,17 +106,7 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let mut message = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        if let Some(session_id) = session_id {
-            message["sessionId"] = json!(session_id);
-        }
-        self.ws.send_text(&message.to_string())?;
+        let id = self.send(method, params, session_id)?;
         let deadline = Instant::now() + timeout;
         loop {
             let text = match self.ws.recv_text(deadline)? {
@@ -66,13 +125,15 @@ impl Cdp {
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
-            if value.get("method").is_some() {
-                self.events.push(value);
-            }
+            self.absorb(value);
         }
     }
 
     pub fn notify(&mut self, method: &str, params: Value, session_id: Option<&str>) {
+        let _ = self.send(method, params, session_id);
+    }
+
+    fn send(&mut self, method: &str, params: Value, session_id: Option<&str>) -> Result<i64, String> {
         self.next_id += 1;
         let id = self.next_id;
         let mut message = json!({
@@ -83,7 +144,128 @@ impl Cdp {
         if let Some(session_id) = session_id {
             message["sessionId"] = json!(session_id);
         }
-        let _ = self.ws.send_text(&message.to_string());
+        self.ws.send_text(&message.to_string())?;
+        Ok(id)
+    }
+
+    pub fn pump(&mut self, deadline: Instant) -> Result<bool, String> {
+        match self.ws.recv_text(deadline)? {
+            Some(text) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    self.absorb(value);
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub fn next_paused(
+        &mut self,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<Paused>, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let found = self
+                .paused
+                .iter()
+                .position(|paused| session_id.is_none_or(|id| paused.session_id == id));
+            if let Some(index) = found {
+                return Ok(self.paused.remove(index));
+            }
+            if Instant::now() >= deadline || !self.pump(deadline)? {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub fn wait_event(
+        &mut self,
+        from: usize,
+        timeout: Duration,
+        mut matches: impl FnMut(&Value) -> bool,
+    ) -> Result<Option<Value>, String> {
+        let deadline = Instant::now() + timeout;
+        let mut seen = from;
+        loop {
+            while seen < self.events.len() {
+                if matches(&self.events[seen]) {
+                    return Ok(Some(self.events[seen].clone()));
+                }
+                seen += 1;
+            }
+            if Instant::now() >= deadline || !self.pump(deadline)? {
+                return Ok(None);
+            }
+        }
+    }
+
+    pub(crate) fn forget_paused(&mut self, session_id: &str) {
+        self.paused.retain(|paused| paused.session_id != session_id);
+        self.deciders.remove(session_id);
+    }
+
+    fn absorb(&mut self, value: Value) {
+        if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
+            if let Some((session, request)) = self.decided.remove(&id) {
+                if let Some(error) = value.get("error") {
+                    let text = error
+                        .get("message")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("CDP error");
+                    self.fetch_errors.push(format!("Fetch: {text}\n"));
+                    self.notify(
+                        "Fetch.continueRequest",
+                        json!({ "requestId": request }),
+                        Some(&session),
+                    );
+                }
+            }
+            return;
+        }
+        if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
+            let Some(paused) = Paused::from_event(&value) else {
+                return;
+            };
+            if fetch::reaches_protected(&self.guard, &paused) {
+                self.notify(
+                    "Fetch.continueRequest",
+                    json!({ "requestId": paused.request_id }),
+                    Some(&paused.session_id),
+                );
+                return;
+            }
+            if self.deciders.contains_key(&paused.session_id) {
+                self.decide_inline(paused);
+            } else {
+                self.paused.push_back(paused);
+            }
+            return;
+        }
+        if value.get("method").is_some() {
+            self.events.push(value);
+        }
+    }
+
+    fn decide_inline(&mut self, paused: Paused) {
+        let Some(decider) = self.deciders.get_mut(&paused.session_id) else {
+            self.paused.push_back(paused);
+            return;
+        };
+        let decision = decider(&paused);
+        let (method, params) = match fetch::command(&self.guard, &paused, &decision) {
+            Ok(command) => command,
+            Err(message) => {
+                self.fetch_errors.push(message);
+                fetch::command(&self.guard, &paused, &Decision::default())
+                    .expect("a plain continue is always allowed")
+            }
+        };
+        if let Ok(id) = self.send(method, params, Some(&paused.session_id)) {
+            self.decided
+                .insert(id, (paused.session_id.clone(), paused.request_id.clone()));
+        }
     }
 
     pub fn wait_load(&mut self, session_id: &str) -> Result<(), String> {
@@ -116,15 +298,8 @@ impl Cdp {
             if Instant::now() >= deadline {
                 return Ok(());
             }
-            match self.ws.recv_text(deadline)? {
-                Some(text) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        if value.get("method").is_some() {
-                            self.events.push(value);
-                        }
-                    }
-                }
-                None => return Ok(()),
+            if !self.pump(deadline)? {
+                return Ok(());
             }
         }
     }
@@ -138,15 +313,8 @@ impl Cdp {
             if Instant::now() >= deadline {
                 return Ok(());
             }
-            match self.ws.recv_text(deadline)? {
-                Some(text) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        if value.get("method").is_some() {
-                            self.events.push(value);
-                        }
-                    }
-                }
-                None => return Ok(()),
+            if !self.pump(deadline)? {
+                return Ok(());
             }
         }
     }
@@ -221,6 +389,7 @@ pub fn attach(cdp: &mut Cdp, target_id: &str) -> Result<String, String> {
 }
 
 pub fn detach(cdp: &mut Cdp, session_id: &str) {
+    cdp.forget_paused(session_id);
     let _ = cdp.call(
         "Target.detachFromTarget",
         json!({ "sessionId": session_id }),

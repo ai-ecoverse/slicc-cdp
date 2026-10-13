@@ -17,7 +17,7 @@ export function freePort() {
   });
 }
 
-export async function launchBrowser() {
+export async function launchBrowser(extraArgs = []) {
   let port = await freePort();
   if (port === 9222) port = await freePort();
   if (port === 9222) throw new Error('refusing to bind the kernel CDP port');
@@ -37,6 +37,7 @@ export async function launchBrowser() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--remote-allow-origins=*',
+      ...extraArgs,
       'about:blank',
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] }
