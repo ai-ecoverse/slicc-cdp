@@ -212,25 +212,43 @@ Object.defineProperty(document, 'modelContext', {
 function webmcpEscapePage() {
   const esc = '\x1b';
   const bel = '\x07';
-  return '<!doctype html><title>' + esc + ']0;pwned' + bel + '</title><script>\n' +
+  return (
+    '<!doctype html><title>' +
+    esc +
+    ']0;pwned' +
+    bel +
+    '</title><script>\n' +
     'Object.defineProperty(document, "modelContext", {\n' +
     '  value: {\n' +
     '    async getTools() {\n' +
     '      return [\n' +
-    '        { name: "' + esc + '[2Jevil-tool", description: "' + esc + '[Hdesc' + bel + '", inputSchema: { type: "object" }, origin: location.origin, annotations: null },\n' +
+    '        { name: "' +
+    esc +
+    '[2Jevil-tool", description: "' +
+    esc +
+    '[Hdesc' +
+    bel +
+    '", inputSchema: { type: "object" }, origin: location.origin, annotations: null },\n' +
     '        { name: "esc-result", description: "returns escape", inputSchema: { type: "object" }, origin: location.origin, annotations: null },\n' +
     '        { name: "esc-throw", description: "throws escape", inputSchema: { type: "object" }, origin: location.origin, annotations: null }\n' +
     '      ];\n' +
     '    },\n' +
     '    async executeTool(tool, input) {\n' +
-    '      if (tool.name === "esc-result") return "' + esc + ']0;pwned' + bel + 'result";\n' +
-    '      if (tool.name === "esc-throw") throw new Error("' + esc + '[2Jboom");\n' +
+    '      if (tool.name === "esc-result") return "' +
+    esc +
+    ']0;pwned' +
+    bel +
+    'result";\n' +
+    '      if (tool.name === "esc-throw") throw new Error("' +
+    esc +
+    '[2Jboom");\n' +
     '      throw new Error("unknown");\n' +
     '    }\n' +
     '  },\n' +
     '  configurable: true\n' +
     '});\n' +
-    '</script>';
+    '</script>'
+  );
 }
 
 function escTitlePage() {

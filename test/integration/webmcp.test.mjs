@@ -56,9 +56,7 @@ test('webmcp-list and webmcp-call through the native binary', async (t) => {
     await t.test('escape injection: tab-list title is sanitized', () =>
       escapeTabListFlow(runner, site)
     );
-    await t.test('escape injection: eval result is sanitized', () =>
-      escapeEvalFlow(runner, site)
-    );
+    await t.test('escape injection: eval result is sanitized', () => escapeEvalFlow(runner, site));
   } finally {
     await settle(browser?.close());
     await settle(site.close());
