@@ -491,7 +491,8 @@ fn implemented_page(name: &str) -> Option<String> {
                 "    Default when SLICC_CDP_URL is set and no other sink is given.",
                 "",
                 "Opt-out: --off exits immediately. A file named discover.disabled in",
-                "~/.slicc/ also disables the watcher; checked at start and on SIGHUP.",
+                "the user config dir (e.g. ~/.config/slicc/ or ~/Library/Application Support/slicc/)",
+                "also disables the watcher; checked at start and on SIGHUP.",
             ],
             &[],
             &[

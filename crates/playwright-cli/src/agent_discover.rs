@@ -51,11 +51,29 @@ fn slicc_dir() -> String {
 }
 
 fn disabled_path() -> String {
-    let base = slicc_dir();
-    if base.is_empty() {
+    let config = discover_config_dir();
+    if config.is_empty() {
         return String::new();
     }
-    format!("{base}/discover.disabled")
+    format!("{config}/slicc/discover.disabled")
+}
+
+fn discover_config_dir() -> String {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join("slicc-cdp-discover-tests")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(all(not(test), not(target_arch = "wasm32")))]
+    {
+        launch::user_config_dir()
+    }
+    #[cfg(all(not(test), target_arch = "wasm32"))]
+    {
+        String::new()
+    }
 }
 
 fn is_disabled() -> bool {
@@ -1225,8 +1243,10 @@ fn run_exec_sink(cmd: &str, timeout: Duration, event: &DiscoveryEvent) {
     use std::process::{Command, Stdio};
 
     let json = event.to_json();
-    let mut command = Command::new(cmd);
+    let mut command = Command::new("sh");
     command
+        .arg("-c")
+        .arg(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1815,24 +1835,22 @@ mod tests {
 
     #[test]
     fn disabled_file_is_checked() {
-        let tmp = std::env::temp_dir().join(format!("slicc-test-disabled-{}", std::process::id()));
-        let slicc = tmp.join(".slicc");
+        let config = discover_config_dir();
+        let slicc = std::path::Path::new(&config).join("slicc");
         std::fs::create_dir_all(&slicc).unwrap();
         let disabled = slicc.join("discover.disabled");
         std::fs::write(&disabled, "").unwrap();
-        std::env::set_var("HOME", &tmp);
         let result = is_disabled();
-        std::fs::remove_dir_all(&tmp).unwrap();
+        let _ = std::fs::remove_file(&disabled);
         assert!(result);
     }
 
     #[test]
     fn disabled_file_absent_means_enabled() {
-        let tmp = std::env::temp_dir().join(format!("slicc-test-enabled-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("HOME", &tmp);
+        let config = discover_config_dir();
+        let disabled = std::path::Path::new(&config).join("slicc").join("discover.disabled");
+        let _ = std::fs::remove_file(&disabled);
         let result = is_disabled();
-        std::fs::remove_dir_all(&tmp).unwrap();
         assert!(!result);
     }
 
@@ -1967,18 +1985,8 @@ mod tests {
     fn exec_sink_hostile_url_not_in_command_line() {
         let tmp = std::env::temp_dir().join(format!("slicc-test-exec-hostile-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let script = tmp.join("record.sh");
         let record = tmp.join("stdin.json");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\ncat > {}\n", record.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let cmd = format!("cat > {}", record.display());
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
@@ -1992,7 +2000,7 @@ mod tests {
             reason: None,
         };
         run_exec_sink(
-            script.to_str().unwrap(),
+            &cmd,
             Duration::from_secs(5),
             &event,
         );
@@ -2006,15 +2014,6 @@ mod tests {
 
     #[test]
     fn exec_sink_timeout_kills_process() {
-        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-timeout-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let script = tmp.join("slow.sh");
-        std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
@@ -2029,26 +2028,16 @@ mod tests {
         };
         let start = Instant::now();
         run_exec_sink(
-            script.to_str().unwrap(),
+            "sleep 60",
             Duration::from_secs(1),
             &event,
         );
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(5), "timeout should kill quickly, took {elapsed:?}");
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn exec_sink_nonzero_exit_does_not_panic() {
-        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-fail-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let script = tmp.join("fail.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 42\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
@@ -2062,34 +2051,23 @@ mod tests {
             reason: None,
         };
         run_exec_sink(
-            script.to_str().unwrap(),
+            "exit 42",
             Duration::from_secs(5),
             &event,
         );
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn exec_sink_env_vars_are_set() {
         let tmp = std::env::temp_dir().join(format!("slicc-test-exec-env-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let script = tmp.join("env.sh");
         let out = tmp.join("env.txt");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$SLICC_DISCOVER_STANDARD\" > {}\necho \"$SLICC_DISCOVER_ORIGIN\" >> {}\necho \"$SLICC_DISCOVER_URL\" >> {}\n",
-                out.display(),
-                out.display(),
-                out.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let cmd = format!(
+            "echo \"$SLICC_DISCOVER_STANDARD\" > {} && echo \"$SLICC_DISCOVER_ORIGIN\" >> {} && echo \"$SLICC_DISCOVER_URL\" >> {}",
+            out.display(),
+            out.display(),
+            out.display()
+        );
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
@@ -2103,7 +2081,7 @@ mod tests {
             reason: None,
         };
         run_exec_sink(
-            script.to_str().unwrap(),
+            &cmd,
             Duration::from_secs(5),
             &event,
         );
@@ -2112,6 +2090,57 @@ mod tests {
         assert_eq!(lines[0], "ard");
         assert_eq!(lines[1], "https://example.com");
         assert_eq!(lines[2], "https://example.com/.well-known/ard.json");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn exec_sink_command_with_arguments() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-args-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let record = tmp.join("args.json");
+        let cmd = format!("cat > {} < /dev/stdin", record.display());
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({"name": "test"}),
+            reason: None,
+        };
+        run_exec_sink(&cmd, Duration::from_secs(5), &event);
+        assert!(record.exists(), "command with arguments must work");
+        let content = std::fs::read_to_string(&record).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["standard"], "ard");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn exec_sink_hostile_url_unexpanded_in_env() {
+        let tmp = std::env::temp_dir().join(format!("slicc-test-exec-env-hostile-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("env.txt");
+        let cmd = format!("echo \"$SLICC_DISCOVER_URL\" > {}", out.display());
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://evil.com".into(),
+            url: "https://evil.com/$(touch /tmp/pwned2)\"'`backtick`".into(),
+            via: Via::WellKnown,
+            page: "https://evil.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        run_exec_sink(&cmd, Duration::from_secs(5), &event);
+        assert!(!std::path::Path::new("/tmp/pwned2").exists(), "env var must not expand shell metacharacters");
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("$(touch /tmp/pwned2)"), "hostile URL must pass through as literal in env: {content}");
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
