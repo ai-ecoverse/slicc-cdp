@@ -12,6 +12,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use url::Url;
 
+const IO_READ_CAP: usize = 1024 * 1024;
+
+fn is_reserved_cdp_origin(origin: &str) -> bool {
+    let Some(parsed) = Url::parse(origin).ok() else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        return false;
+    }
+    let port = parsed.port().unwrap_or(match parsed.scheme() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => 0,
+    });
+    (9222..=9229).contains(&port)
+}
+
 struct WatcherState {
     dedup: DedupSet,
     probed_origins: BTreeSet<String>,
@@ -726,6 +744,10 @@ fn run_probes(
         return output;
     }
 
+    if is_reserved_cdp_origin(origin) {
+        return output;
+    }
+
     let sess = match state.sessions.get(session_id) {
         Some(s) => s,
         None => return output,
@@ -747,7 +769,7 @@ fn run_probes(
         let (status, content_type, body) = match probe_result {
             Some(r) => r,
             None => {
-                match native_probe(&probe_req.url) {
+                match native_probe(&probe_req.url, &probe_req.probe.accept) {
                     Some((ns, nct, nbody)) => (ns, nct, nbody),
                     None => continue,
                 }
@@ -819,6 +841,11 @@ fn load_network_resource(
     if !success {
         return None;
     }
+    if let Some(final_url) = resource.get("url").and_then(|v| v.as_str()) {
+        if cdp.guard().url(final_url) {
+            return None;
+        }
+    }
     let status = resource
         .get("httpStatusCode")
         .and_then(|v| v.as_u64())
@@ -866,18 +893,26 @@ fn load_network_resource(
                         } else {
                             body.push_str(data);
                         }
+                        if body.len() > IO_READ_CAP {
+                            body.truncate(IO_READ_CAP);
+                            let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
+                            break;
+                        }
                         let eof = chunk
                             .get("eof")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true);
                         if eof {
+                            let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
+                        break;
+                    }
                 }
             }
-            let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
             body
         }
         None => String::new(),
@@ -887,13 +922,15 @@ fn load_network_resource(
 }
 
 #[cfg(not(target_os = "wasi"))]
-fn native_probe(url: &str) -> Option<(u16, String, String)> {
-    let resp = cdp_client::net::http_get(url).ok()?;
-    Some((200, "application/json".to_string(), String::from_utf8_lossy(&resp.body).into_owned()))
+fn native_probe(url: &str, accept: &str) -> Option<(u16, String, String)> {
+    let resp = cdp_client::net::http_probe(url, accept).ok()?;
+    let ct = resp.content_type().to_string();
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    Some((resp.status, ct, body))
 }
 
 #[cfg(target_os = "wasi")]
-fn native_probe(_url: &str) -> Option<(u16, String, String)> {
+fn native_probe(_url: &str, _accept: &str) -> Option<(u16, String, String)> {
     None
 }
 
@@ -1347,5 +1384,57 @@ mod tests {
         fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
             Ok(None)
         }
+    }
+
+    #[test]
+    fn reserved_cdp_ports_are_never_probed() {
+        for origin in [
+            "http://127.0.0.1:9222",
+            "http://127.0.0.1:9229",
+            "http://localhost:9222",
+            "http://[::1]:9225",
+        ] {
+            assert!(is_reserved_cdp_origin(origin), "{origin} should be reserved");
+        }
+    }
+
+    #[test]
+    fn non_reserved_ports_are_not_blocked() {
+        for origin in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:9221",
+            "http://127.0.0.1:9230",
+            "http://example.com:9222",
+            "http://10.0.0.1:9222",
+            "https://localhost:443",
+        ] {
+            assert!(!is_reserved_cdp_origin(origin), "{origin} should not be reserved");
+        }
+    }
+
+    #[test]
+    fn io_read_cap_is_one_mib() {
+        assert_eq!(IO_READ_CAP, 1024 * 1024);
+    }
+
+    #[test]
+    fn probe_engine_rejects_html_200() {
+        let probes = default_probes();
+        let m = probes.check_response("ard", 200, "text/html", "<html>".into(), "u".into());
+        assert!(m.is_none(), "HTML 200 must not match engine check_response");
+    }
+
+    #[test]
+    fn probe_engine_rejects_404() {
+        let probes = default_probes();
+        let m = probes.check_response("ard", 404, "application/json", "{}".into(), "u".into());
+        assert!(m.is_none(), "404 must not match engine check_response");
+    }
+
+    #[test]
+    fn probe_engine_rejects_301() {
+        let probes = default_probes();
+        let m = probes.check_response("ard", 301, "application/json", "".into(), "u".into());
+        assert!(m.is_none(), "301 must not match engine check_response");
     }
 }
