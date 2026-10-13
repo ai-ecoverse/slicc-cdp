@@ -10,6 +10,7 @@ mod help;
 mod launch;
 mod net;
 mod route;
+mod sanitize;
 mod session;
 mod snapshot;
 mod spec;

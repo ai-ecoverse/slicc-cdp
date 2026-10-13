@@ -4,6 +4,7 @@ use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::connect;
 use crate::launch::{self, Started};
+use crate::sanitize;
 use crate::session::{self, Session};
 use crate::snapshot::{self, RefRec};
 use crate::trace::{self, Piece};
@@ -380,8 +381,8 @@ fn cmd_tab_list(cdp: &mut Cdp, state: &Session) -> Output {
             "{}: [{}] {} \"{}\"{active}",
             index + 1,
             page.target_id,
-            page.url,
-            page.title
+            sanitize::terminal(&page.url),
+            sanitize::terminal(&page.title)
         ));
     }
     Output::ok(format!("{}\n", lines.join("\n")))
@@ -478,6 +479,8 @@ fn build_snapshot(
     invocation: &Invocation,
 ) -> Result<(String, BTreeMap<String, RefRec>), String> {
     let (url, title) = browser::page_location(cdp, session)?;
+    let url = sanitize::terminal(&url);
+    let title = sanitize::terminal(&title);
     if let Some(frame_id) = invocation.flags.get("frame") {
         let frames = browser::frame_tree(cdp, session)?;
         if !frames.iter().any(|frame| frame.frame_id == *frame_id) {
@@ -811,7 +814,7 @@ fn cmd_eval(
                     Err(message) => Output::err(message),
                 };
             }
-            Output::ok(format!("{text}\n"))
+            Output::ok(format!("{}\n", sanitize::terminal(&text)))
         }
         Err(message) => Output::err(message),
     }
@@ -1513,7 +1516,7 @@ fn cmd_frames(
                 };
                 lines.push(format!(
                     "  [{kind}] frameId={}{parent} - {}",
-                    frame.frame_id, frame.url
+                    frame.frame_id, sanitize::terminal(&frame.url)
                 ));
             }
             Output::ok(format!(

@@ -1,5 +1,6 @@
 use crate::cdp::Cdp;
 use crate::net::base64_decode;
+use crate::sanitize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -534,8 +535,8 @@ pub fn render_console(entries: &[ConsoleEntry], min_level: &str) -> Result<Strin
         lines.push(format!(
             "[{}] {} @ {}:{}",
             entry.kind.to_ascii_uppercase(),
-            entry.text,
-            entry.url,
+            sanitize::terminal(&entry.text),
+            sanitize::terminal(&entry.url),
             entry.line
         ));
     }
@@ -605,16 +606,16 @@ fn render_request_line(request: &NetRequest) -> String {
     let mut line = format!(
         "[{}] {}",
         request.method.to_ascii_uppercase(),
-        truncate_data_url(&request.url)
+        sanitize::terminal(&truncate_data_url(&request.url))
     );
     if let Some(status) = request.status {
         if request.status_text.is_empty() {
             line.push_str(&format!(" => [{status}]"));
         } else {
-            line.push_str(&format!(" => [{status}] {}", request.status_text));
+            line.push_str(&format!(" => [{status}] {}", sanitize::terminal(&request.status_text)));
         }
     } else if let Some(failed) = &request.failed {
-        line.push_str(&format!(" => [FAILED] {failed}"));
+        line.push_str(&format!(" => [FAILED] {}", sanitize::terminal(failed)));
     }
     line
 }
@@ -632,7 +633,7 @@ fn render_details(index: usize, request: &NetRequest) -> String {
         format!(
             "#{index} [{}] {}",
             request.method.to_ascii_uppercase(),
-            truncate_data_url(&request.url)
+            sanitize::terminal(&truncate_data_url(&request.url))
         ),
         String::new(),
         "  General".to_string(),
@@ -641,11 +642,11 @@ fn render_details(index: usize, request: &NetRequest) -> String {
         let text = if request.status_text.is_empty() {
             format!("[{status}]")
         } else {
-            format!("[{status}] {}", request.status_text)
+            format!("[{status}] {}", sanitize::terminal(&request.status_text))
         };
         lines.push(general("status", &text));
     } else if let Some(failed) = &request.failed {
-        lines.push(general("status", &format!("[FAILED] {failed}")));
+        lines.push(general("status", &format!("[FAILED] {}", sanitize::terminal(failed))));
     }
     lines.push(general("type", &request.resource_type));
     if !request.mime.is_empty() {
@@ -688,7 +689,7 @@ fn append_headers(lines: &mut Vec<String>, title: &str, headers: &[(String, Stri
     lines.push(String::new());
     lines.push(format!("  {title}"));
     for (name, value) in headers {
-        lines.push(format!("    {name}: {value}"));
+        lines.push(format!("    {}: {}", sanitize::terminal(name), sanitize::terminal(value)));
     }
 }
 
@@ -718,7 +719,7 @@ fn text_piece(text: &str) -> Piece {
 fn render_header_block(headers: &[(String, String)]) -> String {
     headers
         .iter()
-        .map(|(name, value)| format!("{name}: {value}"))
+        .map(|(name, value)| format!("{}: {}", sanitize::terminal(name), sanitize::terminal(value)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1236,5 +1237,63 @@ mod tests {
         let listed = render_requests(&items, false, None).unwrap();
         assert!(listed.contains("[FAILED] net::ERR_FAILED"));
         assert!(!listed.contains("static request"));
+    }
+
+    #[test]
+    fn console_sanitizes_terminal_escapes() {
+        let entries = vec![ConsoleEntry {
+            kind: "log".to_string(),
+            text: "\x1b[2Jevil message".to_string(),
+            url: "http://example.com/\x07bell".to_string(),
+            line: 1,
+            stamp: String::new(),
+        }];
+        let text = render_console(&entries, "info").unwrap();
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(!text.contains('\x07'), "{text}");
+        assert!(text.contains("\\x1b"), "{text}");
+        assert!(text.contains("\\x07"), "{text}");
+    }
+
+    #[test]
+    fn request_line_sanitizes_url_and_status_text() {
+        let items = vec![NetRequest {
+            method: "GET".to_string(),
+            url: "http://evil.com/\x1b[2J".to_string(),
+            resource_type: "fetch".to_string(),
+            status: Some(200),
+            status_text: "OK\x1b[Hpwned".to_string(),
+            failed: None,
+            mime: String::new(),
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            request_body: None,
+            response_body: None,
+            response_base64: false,
+        }];
+        let text = render_requests(&items, true, None).unwrap();
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(text.contains("\\x1b"), "{text}");
+    }
+
+    #[test]
+    fn request_details_sanitizes_headers() {
+        let items = vec![NetRequest {
+            method: "GET".to_string(),
+            url: "http://example.com/".to_string(),
+            resource_type: "fetch".to_string(),
+            status: Some(200),
+            status_text: String::new(),
+            failed: None,
+            mime: String::new(),
+            request_headers: vec![("X-Evil".to_string(), "\x1b[2Jvalue".to_string())],
+            response_headers: Vec::new(),
+            request_body: None,
+            response_body: None,
+            response_base64: false,
+        }];
+        let text = render_request(&items, 1).unwrap();
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(text.contains("\\x1b"), "{text}");
     }
 }
