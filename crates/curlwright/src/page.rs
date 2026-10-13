@@ -131,7 +131,7 @@ pub fn evaluate(
             .and_then(|value| value.as_str())
             .or_else(|| details.get("text").and_then(|value| value.as_str()))
             .unwrap_or("evaluation failed");
-        return Err(format!("{description}\n"));
+        return Err(format!("{}\n", crate::sanitize::terminal(description)));
     }
     Ok(result.pointer("/result/value").cloned().unwrap_or(Value::Null))
 }

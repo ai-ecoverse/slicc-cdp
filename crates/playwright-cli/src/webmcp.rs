@@ -24,7 +24,7 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -
         Ok(tools) => {
             state.current = Some(target);
             if json {
-                Output::ok(format!("{}\n", tools))
+                Output::ok(format!("{}\n", crate::sanitize::json_c1(&tools.to_string())))
             } else {
                 Output::ok(format_list(&tools))
             }
@@ -273,7 +273,7 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
             .and_then(|v| v.as_str())
             .or_else(|| details.get("text").and_then(|v| v.as_str()))
             .unwrap_or("evaluation failed");
-        return Err(format!("{description}\n"));
+        return Err(format!("{}\n", crate::sanitize::terminal(description)));
     }
     let value = result
         .pointer("/result/value")
@@ -408,7 +408,7 @@ fn parse_call_result(
             .and_then(|v| v.as_str())
             .or_else(|| details.get("text").and_then(|v| v.as_str()))
             .unwrap_or("evaluation failed");
-        return Err(format!("{description}\n"));
+        return Err(format!("{}\n", crate::sanitize::terminal(description)));
     }
     let value = result
         .pointer("/result/value")
@@ -821,5 +821,17 @@ mod tests {
         let expr = input_expression(&input, true);
         assert!(expr.starts_with("JSON.parse("));
         assert!(!expr.contains("JSON.stringify"));
+    }
+
+    #[test]
+    fn eval_exception_sanitizes_page_text() {
+        let evil = "Error: \x1b[31mred\x1b[0m \x07 \x7f \u{009b}";
+        let mut cdp = fake_cdp(vec![eval_exception(evil)]);
+        let result = evaluate_list(&mut cdp, "S1");
+        let err = result.unwrap_err();
+        assert!(!err.contains('\x1b'), "ESC must be escaped: {err}");
+        assert!(!err.contains('\x07'), "BEL must be escaped: {err}");
+        assert!(!err.contains('\x7f'), "DEL must be escaped: {err}");
+        assert!(!err.contains('\u{009b}'), "CSI must be escaped: {err}");
     }
 }

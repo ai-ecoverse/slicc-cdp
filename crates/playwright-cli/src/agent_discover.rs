@@ -16,22 +16,58 @@ use url::Url;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[allow(dead_code)]
 const IO_READ_CAP: usize = 1024 * 1024;
 
 fn is_reserved_cdp_origin(origin: &str) -> bool {
     let Some(parsed) = Url::parse(origin).ok() else {
         return false;
     };
-    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
-        return false;
-    }
     let port = parsed.port().unwrap_or(match parsed.scheme() {
         "http" | "ws" => 80,
         "https" | "wss" => 443,
         _ => 0,
     });
-    (9222..=9229).contains(&port)
+    if !(9222..=9229).contains(&port) {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            is_loopback_or_unspec_v4(ip)
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            is_loopback_or_unspec_v6(ip)
+        }
+        Some(url::Host::Domain(domain)) => {
+            let d = domain.to_ascii_lowercase();
+            let d = d.strip_suffix('.').unwrap_or(&d);
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
+fn is_loopback_or_unspec_v4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified()
+}
+
+fn is_loopback_or_unspec_v6(ip: std::net::Ipv6Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified()
+        || match ip.to_ipv4_mapped() {
+            Some(v4) => is_loopback_or_unspec_v4(v4),
+            None => false,
+        }
+}
+
+#[allow(dead_code)]
+pub fn is_reserved_cdp_addr(addr: std::net::SocketAddr, port: u16) -> bool {
+    if !(9222..=9229).contains(&port) {
+        return false;
+    }
+    match addr {
+        std::net::SocketAddr::V4(v4) => is_loopback_or_unspec_v4(*v4.ip()),
+        std::net::SocketAddr::V6(v6) => is_loopback_or_unspec_v6(*v6.ip()),
+    }
 }
 
 #[derive(Clone)]
@@ -257,6 +293,19 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 }
             }
             if loaded {
+                let committed_url = cdp
+                    .call("Page.getFrameTree", json!({}), Some(&session))
+                    .ok()
+                    .and_then(|r| {
+                        r.pointer("/frameTree/frame/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                if let Some(ref url) = committed_url {
+                    if let Some(sess) = state.sessions.get_mut(&session) {
+                        sess.page_url = url.clone();
+                    }
+                }
                 let page_signals = collect_page_signals(&mut cdp, &session);
                 output.push_str(&emit_page_signals(
                     &mut state,
@@ -358,14 +407,32 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 eprint_flush(&events_out);
             }
             let load_events = check_load_events(&cdp, &state);
-            for (session_id, origin) in &load_events {
+            for (session_id, _origin) in &load_events {
+                let committed_url = cdp
+                    .call("Page.getFrameTree", json!({}), Some(session_id))
+                    .ok()
+                    .and_then(|r| {
+                        r.pointer("/frameTree/frame/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                if let Some(ref url) = committed_url {
+                    if let Some(sess) = state.sessions.get_mut(session_id.as_str()) {
+                        sess.page_url = url.clone();
+                    }
+                }
+                let origin = state
+                    .sessions
+                    .get(session_id.as_str())
+                    .and_then(|s| extract_origin(&s.page_url))
+                    .unwrap_or_default();
                 let page_signals = collect_page_signals(&mut cdp, session_id);
                 let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
                 if !signals_out.is_empty() {
                     eprint_flush(&signals_out);
                 }
                 if !no_probe && !origin.is_empty() {
-                    let probes_out = run_probes(&mut cdp, &mut state, session_id, origin);
+                    let probes_out = run_probes(&mut cdp, &mut state, session_id, &origin);
                     if !probes_out.is_empty() {
                         eprint_flush(&probes_out);
                     }
@@ -396,19 +463,37 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
             eprint_flush(&events_out);
         }
         let load_events = check_load_events(&cdp, &state);
-        for (session_id, origin) in &load_events {
-            let page_signals = collect_page_signals(&mut cdp, session_id);
-            let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
-            if !signals_out.is_empty() {
-                eprint_flush(&signals_out);
-            }
-            if !no_probe && !origin.is_empty() {
-                let probes_out = run_probes(&mut cdp, &mut state, session_id, origin);
-                if !probes_out.is_empty() {
-                    eprint_flush(&probes_out);
+            for (session_id, _origin) in &load_events {
+                let committed_url = cdp
+                    .call("Page.getFrameTree", json!({}), Some(session_id))
+                    .ok()
+                    .and_then(|r| {
+                        r.pointer("/frameTree/frame/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                if let Some(ref url) = committed_url {
+                    if let Some(sess) = state.sessions.get_mut(session_id.as_str()) {
+                        sess.page_url = url.clone();
+                    }
+                }
+                let origin = state
+                    .sessions
+                    .get(session_id.as_str())
+                    .and_then(|s| extract_origin(&s.page_url))
+                    .unwrap_or_default();
+                let page_signals = collect_page_signals(&mut cdp, session_id);
+                let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
+                if !signals_out.is_empty() {
+                    eprint_flush(&signals_out);
+                }
+                if !no_probe && !origin.is_empty() {
+                    let probes_out = run_probes(&mut cdp, &mut state, session_id, &origin);
+                    if !probes_out.is_empty() {
+                        eprint_flush(&probes_out);
+                    }
                 }
             }
-        }
         attach_new_targets(&mut cdp, &mut state, &sess_state);
     }
 }
@@ -814,7 +899,7 @@ fn collect_page_signals(cdp: &mut Cdp, session: &str) -> Vec<(String, Value)> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if known_link_rels().contains(&rel.as_str()) && !href.is_empty() {
+                    if known_link_rels().contains(&rel.as_str()) && !href.is_empty() && !cdp.guard().url(&href) {
                         signals.push((
                             "html-link".to_string(),
                             json!({ "rel": rel, "href": href }),
@@ -919,7 +1004,7 @@ fn run_probes(
             continue;
         }
 
-        let probe_result = load_network_resource(cdp, session_id, &frame_id, &probe_req.url);
+        let probe_result = isolated_world_probe(cdp, session_id, &frame_id, &probe_req.url);
         let (status, content_type, body) = match probe_result {
             Some(r) => r,
             None => {
@@ -969,110 +1054,82 @@ fn run_probes(
     output
 }
 
-fn load_network_resource(
+fn isolated_world_probe(
     cdp: &mut Cdp,
     session_id: &str,
     frame_id: &str,
     url: &str,
 ) -> Option<(u16, String, String)> {
-    let result = cdp
-        .call_for(
-            "Network.loadNetworkResource",
-            json!({
-                "frameId": frame_id,
-                "url": url,
-                "options": {
-                    "disableCache": false,
-                    "includeCredentials": false
-                }
-            }),
+    let world = cdp
+        .call(
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame_id, "grantUniveralAccess": true }),
             Some(session_id),
-            Duration::from_secs(3),
         )
         .ok()?;
-    let resource = result.get("resource")?;
-    let success = resource.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !success {
+    let execution_context_id = world
+        .get("executionContextId")
+        .and_then(|v| v.as_u64())?;
+    let js = format!(
+        r#"(async () => {{
+  const cap = 1048576;
+  let r;
+  try {{
+    r = await fetch({url}, {{credentials:'omit',redirect:'manual',cache:'no-store'}});
+  }} catch(e) {{ return JSON.stringify({{err:e.message}}); }}
+  if (r.type === 'opaqueredirect') return JSON.stringify({{err:'redirect'}});
+  const ct = r.headers.get('content-type') || '';
+  let body = '';
+  if (r.body) {{
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let total = 0;
+    while (true) {{
+      const {{done, value}} = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      body += dec.decode(value, {{stream:true}});
+      if (total > cap) {{ reader.cancel(); body = body.slice(0, cap); break; }}
+    }}
+  }}
+  return JSON.stringify({{status:r.status,ct,body}});
+}})()
+"#,
+        url = serde_json::to_string(url).unwrap_or_default()
+    );
+    let result = cdp
+        .call_for(
+            "Runtime.evaluate",
+            json!({
+                "expression": js,
+                "contextId": execution_context_id,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+            Some(session_id),
+            Duration::from_secs(5),
+        )
+        .ok()?;
+    let value_str = result
+        .pointer("/result/value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("{}");
+    let parsed: Value = serde_json::from_str(value_str).ok()?;
+    if parsed.get("err").is_some() {
         return None;
     }
-    if let Some(final_url) = resource.get("url").and_then(|v| v.as_str()) {
-        if cdp.guard().url(final_url) {
-            return None;
-        }
-    }
-    let status = resource
-        .get("httpStatusCode")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u16;
-    let headers_obj = resource
-        .get("headers")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let content_type = headers_obj
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .and_then(|(_, v)| v.as_str())
+    let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let ct = parsed
+        .get("ct")
+        .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-
-    let stream = resource
-        .get("stream")
+    let body = parsed
+        .get("body")
         .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    let body = match stream {
-        Some(handle) => {
-            let mut body = String::new();
-            loop {
-                let read_result = cdp.call(
-                    "IO.read",
-                    json!({ "handle": handle }),
-                    Some(session_id),
-                );
-                match read_result {
-                    Ok(chunk) => {
-                        let data = chunk
-                            .get("data")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let base64 = chunk
-                            .get("base64Encoded")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if base64 {
-                            if let Ok(bytes) = cdp_client::net::base64_decode(data) {
-                                body.push_str(&String::from_utf8_lossy(&bytes));
-                            }
-                        } else {
-                            body.push_str(data);
-                        }
-                        if body.len() > IO_READ_CAP {
-                            body.truncate(IO_READ_CAP);
-                            let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
-                            break;
-                        }
-                        let eof = chunk
-                            .get("eof")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        if eof {
-                            let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = cdp.call("IO.close", json!({ "handle": handle }), Some(session_id));
-                        break;
-                    }
-                }
-            }
-            body
-        }
-        None => String::new(),
-    };
-
-    Some((status, content_type, body))
+        .unwrap_or("")
+        .to_string();
+    Some((status, ct, body))
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -1134,6 +1191,37 @@ fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &sess
     }
 }
 
+fn strip_userinfo(url_str: &str) -> String {
+    match Url::parse(url_str) {
+        Ok(mut parsed) => {
+            if parsed.username().is_empty() && parsed.password().is_none() {
+                return url_str.to_string();
+            }
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => url_str.to_string(),
+    }
+}
+
+fn sanitize_event_urls(event: &mut DiscoveryEvent) {
+    event.url = strip_userinfo(&event.url);
+    event.origin = strip_userinfo(&event.origin);
+    event.page = strip_userinfo(&event.page);
+    if let Some(obj) = event.summary.as_object_mut() {
+        for key in ["url", "href"] {
+            if let Some(val) = obj.get(key).and_then(|v| v.as_str()).map(|s| strip_userinfo(s)) {
+                obj.insert(key.to_string(), Value::String(val));
+            }
+        }
+    }
+}
+
+fn safe_json_str(s: &str) -> String {
+    crate::sanitize::json_c1(s)
+}
+
 fn redact_event(event: &DiscoveryEvent) -> DiscoveryEvent {
     let mut redacted = event.clone();
     redacted.url = crate::sanitize::url(&redacted.url);
@@ -1141,17 +1229,18 @@ fn redact_event(event: &DiscoveryEvent) -> DiscoveryEvent {
     redacted.summary = cdp_client::sanitize::redact_json_urls(&redacted.summary);
     redacted
 }
-
 fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
+    let mut event = event.clone();
+    sanitize_event_urls(&mut event);
     state.events_emitted += 1;
-    let display = if crate::sanitize::full_urls_enabled() { event.clone() } else { redact_event(event) };
-    let json_line = format!("{}\n", display.to_json());
+    let display = if crate::sanitize::full_urls_enabled() { event.clone() } else { redact_event(&event) };
+    let json_line = format!("{}\n", safe_json_str(&display.to_json()));
     match &state.sink {
         Sink::Exec { cmd, timeout } => {
             run_exec_sink(cmd, *timeout, &display);
         }
         Sink::Lick { slicc_dir } => {
-            write_lick_file(slicc_dir, event, &display);
+            write_lick_file(slicc_dir, &event, &display);
         }
         Sink::Stdout => {}
     }
@@ -1172,6 +1261,13 @@ fn ensure_lick_dirs(slicc_dir: &str) {
     let watches = format!("{slicc_dir}/watches");
     let _ = std::fs::create_dir_all(&discoveries);
     let _ = std::fs::create_dir_all(&watches);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [slicc_dir, &discoveries, &watches] {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
     let watch_file = format!("{watches}/discover.json");
     if !std::path::Path::new(&watch_file).exists() {
         let watch_json = json!({
@@ -1202,6 +1298,11 @@ fn atomic_write(path: &str, data: &[u8]) {
     );
     match std::fs::write(&unique, data) {
         Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&unique, std::fs::Permissions::from_mode(0o600));
+            }
             if let Err(e) = std::fs::rename(&unique, path) {
                 eprintln!("discover: rename {unique} -> {path}: {e}");
                 let _ = std::fs::remove_file(&unique);
@@ -1218,7 +1319,7 @@ fn write_lick_file(slicc_dir: &str, original: &DiscoveryEvent, display: &Discove
     let fp = fingerprint(&original.origin, &original.standard, &original.url);
     let hash = cdp_client::hash::sha256_hex(fp.as_bytes());
     let path = format!("{slicc_dir}/discoveries/{hash}.json");
-    let content = serde_json::to_string_pretty(&json!({
+    let raw = serde_json::to_string_pretty(&json!({
         "v": display.v,
         "standard": display.standard,
         "origin": display.origin,
@@ -1230,6 +1331,7 @@ fn write_lick_file(slicc_dir: &str, original: &DiscoveryEvent, display: &Discove
         "summary": display.summary,
     }))
     .unwrap_or_default();
+    let content = safe_json_str(&raw);
     atomic_write(&path, content.as_bytes());
 }
 
@@ -1239,7 +1341,7 @@ fn run_exec_sink(cmd: &str, timeout: Duration, event: &DiscoveryEvent) {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let json = event.to_json();
+    let json = safe_json_str(&event.to_json());
     let mut command = Command::new("sh");
     command
         .arg("-c")
@@ -1701,6 +1803,22 @@ mod tests {
             "http://127.0.0.1:9229",
             "http://localhost:9222",
             "http://[::1]:9225",
+            "http://127.1:9222",
+            "http://2130706433:9222",
+            "http://0x7f000001:9222",
+            "http://017700000001:9222",
+            "http://0.0.0.0:9222",
+            "http://localhost.:9223",
+            "http://127.0.0.2:9224",
+            "http://[::ffff:7f00:1]:9226",
+            "http://foo.localhost:9222",
+            "http://[::]:9223",
+            "http://[::ffff:0:0]:9224",
+            "http://LOCALHOST:9222",
+            "http://[0:0:0:0:0:0:0:1]:9222",
+            "http://[::ffff:127.0.0.1]:9225",
+            "http://0x7f.1:9222",
+            "http://0177.0.0.1:9222",
         ] {
             assert!(is_reserved_cdp_origin(origin), "{origin} should be reserved");
         }
@@ -2185,5 +2303,186 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn reserved_cdp_addr_ipv4_loopback() {
+        let addr = "127.0.0.1:9222".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9222));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_ipv4_unspec() {
+        let addr = "0.0.0.0:9222".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9222));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_ipv6_loopback() {
+        let addr = "[::1]:9222".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9222));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_ipv6_unspec() {
+        let addr = "[::]:9223".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9223));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_mapped_loopback() {
+        let addr = "[::ffff:127.0.0.1]:9224".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9224));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_mapped_unspec() {
+        let addr = "[::ffff:0.0.0.0]:9225".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9225));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_non_reserved_port() {
+        let addr = "127.0.0.1:9230".parse().unwrap();
+        assert!(!is_reserved_cdp_addr(addr, 9230));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_remote_host() {
+        let addr = "93.184.216.34:9222".parse().unwrap();
+        assert!(!is_reserved_cdp_addr(addr, 9222));
+    }
+
+    #[test]
+    fn reserved_cdp_addr_127_0_0_2() {
+        let addr = "127.0.0.2:9222".parse().unwrap();
+        assert!(is_reserved_cdp_addr(addr, 9222));
+    }
+
+    #[test]
+    fn strip_userinfo_removes_credentials() {
+        assert_eq!(
+            strip_userinfo("https://u:PW@host.com/path"),
+            "https://host.com/path"
+        );
+    }
+
+    #[test]
+    fn strip_userinfo_preserves_clean_url() {
+        assert_eq!(
+            strip_userinfo("https://host.com/path"),
+            "https://host.com/path"
+        );
+    }
+
+    #[test]
+    fn strip_userinfo_from_event_fields() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://user:pass@example.com".into(),
+            url: "https://user:pass@example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://user:pass@example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({ "href": "https://user:pass@example.com/api" }),
+            reason: None,
+        };
+        let line = emit_event(&mut state, &event);
+        assert!(!line.contains("user:pass"), "userinfo must be stripped: {line}");
+        assert!(line.contains("example.com"));
+        let parsed: Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(!parsed["origin"].as_str().unwrap().contains("user"));
+        assert!(!parsed["page"].as_str().unwrap().contains("pass"));
+        assert!(!parsed["summary"]["href"].as_str().unwrap().contains("user"));
+    }
+
+    #[test]
+    fn safe_json_escapes_del_and_c1() {
+        let input = "hello\x7fworld\u{009b}test";
+        let json_str = serde_json::to_string(input).unwrap();
+        let safe = safe_json_str(&json_str);
+        assert!(!safe.contains('\x7f'), "DEL must be escaped");
+        assert!(!safe.contains('\u{009b}'), "CSI must be escaped");
+        assert!(safe.contains("\\u007f"), "DEL must be \\u007f: {safe}");
+        assert!(safe.contains("\\u009b"), "CSI must be \\u009b: {safe}");
+        let unescaped: String = serde_json::from_str(&safe).unwrap();
+        assert_eq!(unescaped, input);
+    }
+
+    #[test]
+    fn lick_event_json_escapes_c1() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: "https://example.com".into(),
+            url: "https://example.com/\x7f".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "T".into(),
+            status: Validity::Valid,
+            summary: json!({}),
+            reason: None,
+        };
+        let line = emit_event(&mut state, &event);
+        assert!(!line.contains('\x7f'), "DEL must be escaped in event JSON");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lick_dirs_have_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("slicc-test-mode-{}", std::process::id()));
+        let slicc = tmp.join(".slicc");
+        let old_umask = unsafe { libc::umask(0o000) };
+        ensure_lick_dirs(&slicc.to_string_lossy());
+        unsafe { libc::umask(old_umask); }
+        let mode = std::fs::metadata(slicc.join("discoveries")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "discoveries dir mode must be 0700, got {mode:o}");
+        let mode = std::fs::metadata(slicc.join("watches")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "watches dir mode must be 0700, got {mode:o}");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_file_has_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("slicc-test-fmode-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("test.json");
+        let old_umask = unsafe { libc::umask(0o000) };
+        atomic_write(&path.to_string_lossy(), b"hello");
+        unsafe { libc::umask(old_umask); }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file mode must be 0600, got {mode:o}");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn protected_html_link_hrefs_are_filtered() {
+        let guard = cdp_client::protected::Protected::default();
+        assert!(guard.url("https://vault.sliccy.ai/catalog.json"));
+        assert!(guard.url("https://seven.sliccy.ai/.well-known/ard.json"));
+        assert!(!guard.url("https://example.com/.well-known/ard.json"));
     }
 }

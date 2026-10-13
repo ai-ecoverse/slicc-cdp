@@ -1,7 +1,7 @@
 use crate::connect::format_http_error;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasix_net::TcpStream;
 
 pub struct HttpResponse {
@@ -103,9 +103,16 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
         panic!("test dialed {}:{}", parts.host, parts.port);
     }
     let addr = resolve(&parts.host, parts.port)?;
-    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+    if is_reserved_cdp_socket(addr, parts.port) {
+        return Err(format!("probe refused for reserved CDP address: {url}\n"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let connect_timeout = Duration::from_secs(3).min(
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
         .map_err(|err| format!("probe connect failed for {url}: {err}\n"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(3)))
+    tcp.set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|err| format!("probe timeout setup failed: {err}\n"))?;
     tcp.set_nodelay(true).ok();
     let mut stream: Box<dyn ReadWrite> = if parts.scheme == "https" {
@@ -121,16 +128,16 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
     stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("probe write failed for {url}: {err}\n"))?;
-    let (status, headers, body, _rest) = read_http(stream.as_mut())?;
-    let capped = if body.len() > PROBE_MAX_BODY {
-        body[..PROBE_MAX_BODY].to_vec()
-    } else {
-        body
-    };
+    if Instant::now() >= deadline {
+        return Err(format!("probe deadline exceeded for {url}\n"));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    tcp_set_read_deadline(stream.as_mut(), remaining);
+    let (status, headers, body, _rest) = read_http_capped(stream.as_mut(), Some(PROBE_MAX_BODY), Some(deadline))?;
     Ok(ProbeResponse {
         status,
         headers,
-        body: capped,
+        body,
     })
 }
 
@@ -597,6 +604,12 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
         panic!("test dialed {}:{}", parts.host, parts.port);
     }
     let addr = resolve(&parts.host, parts.port)?;
+    if is_reserved_cdp_socket(addr, parts.port) {
+        return Err(format!(
+            "refused to dial reserved CDP address {}:{}\n",
+            parts.host, parts.port
+        ));
+    }
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|err| {
         connect_error(parts, &err.to_string())
     })?;
@@ -618,6 +631,25 @@ fn reserved_loopback(parts: &Parts) -> bool {
             "127.0.0.1" | "localhost" | "::1"
         )
 }
+
+pub fn is_reserved_cdp_socket(addr: SocketAddr, port: u16) -> bool {
+    if !(9222..=9229).contains(&port) {
+        return false;
+    }
+    match addr {
+        SocketAddr::V4(v4) => v4.ip().is_loopback() || v4.ip().is_unspecified(),
+        SocketAddr::V6(v6) => {
+            v6.ip().is_loopback()
+                || v6.ip().is_unspecified()
+                || match v6.ip().to_ipv4_mapped() {
+                    Some(v4) => v4.is_loopback() || v4.is_unspecified(),
+                    None => false,
+                }
+        }
+    }
+}
+
+fn tcp_set_read_deadline(_stream: &mut dyn ReadWrite, _remaining: Duration) {}
 
 fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
     wasix_net::resolve(host, port)
@@ -643,8 +675,19 @@ fn wrap_tls(_host: &str, _tcp: TcpStream) -> Result<Box<dyn ReadWrite>, String> 
 }
 
 fn read_http(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<(String, String)>, Vec<u8>, Vec<u8>), String> {
+    read_http_capped(stream, None, None)
+}
+
+fn read_http_capped(
+    stream: &mut dyn ReadWrite,
+    body_cap: Option<usize>,
+    deadline: Option<Instant>,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>, Vec<u8>), String> {
     let mut buf = Vec::new();
     let header_end = loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err("probe deadline exceeded\n".to_string());
+        }
         if let Some(pos) = find_header_end(&buf) {
             break pos;
         }
@@ -699,9 +742,18 @@ fn read_http(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<(String, String)>, 
         return Ok((status, headers, Vec::new(), rest));
     }
     let body = if chunked {
-        read_chunked(&mut rest, stream)?
+        read_chunked_capped(&mut rest, stream, body_cap, deadline)?
     } else if let Some(len) = content_length {
-        while rest.len() < len {
+        if let Some(cap) = body_cap {
+            if len > cap {
+                return Err("HTTP body exceeds cap\n".to_string());
+            }
+        }
+        let limit = body_cap.map(|c| c.min(len)).unwrap_or(len);
+        while rest.len() < limit {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err("probe deadline exceeded\n".to_string());
+            }
             let mut tmp = [0u8; 4096];
             match stream.read(&mut tmp) {
                 Ok(0) => break,
@@ -710,20 +762,27 @@ fn read_http(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<(String, String)>, 
                     if err.kind() == std::io::ErrorKind::TimedOut
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Err("probe deadline exceeded\n".to_string());
+                    }
                     continue;
                 }
                 Err(err) => return Err(format!("HTTP body read failed: {err}\n")),
             }
         }
-        let body = rest[..len.min(rest.len())].to_vec();
+        let body = rest[..limit.min(rest.len())].to_vec();
         let extra = if status == 101 {
-            rest[len.min(rest.len())..].to_vec()
+            rest[limit.min(rest.len())..].to_vec()
         } else {
             Vec::new()
         };
         return Ok((status, headers, body, extra));
     } else {
+        let close_cap = body_cap.unwrap_or(8 * 1024 * 1024);
         loop {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
             let mut tmp = [0u8; 4096];
             match stream.read(&mut tmp) {
                 Ok(0) => break,
@@ -736,19 +795,37 @@ fn read_http(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<(String, String)>, 
                 }
                 Err(err) => return Err(format!("HTTP body read failed: {err}\n")),
             }
-            if rest.len() > 8 * 1024 * 1024 {
+            if rest.len() > close_cap {
                 break;
             }
         }
         rest
     };
     let _ = close;
+    let body = if let Some(cap) = body_cap {
+        if body.len() > cap { body[..cap].to_vec() } else { body }
+    } else {
+        body
+    };
     Ok((status, headers, body, Vec::new()))
 }
 
+#[allow(dead_code)]
 fn read_chunked(rest: &mut Vec<u8>, stream: &mut dyn ReadWrite) -> Result<Vec<u8>, String> {
+    read_chunked_capped(rest, stream, None, None)
+}
+
+fn read_chunked_capped(
+    rest: &mut Vec<u8>,
+    stream: &mut dyn ReadWrite,
+    cap: Option<usize>,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(body);
+        }
         let line_end = loop {
             if let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
                 break pos;
@@ -790,6 +867,12 @@ fn read_chunked(rest: &mut Vec<u8>, stream: &mut dyn ReadWrite) -> Result<Vec<u8
         }
         body.extend_from_slice(&rest[..size]);
         rest.drain(..size + 2);
+        if let Some(limit) = cap {
+            if body.len() > limit {
+                body.truncate(limit);
+                return Ok(body);
+            }
+        }
     }
 }
 
@@ -1037,5 +1120,187 @@ mod tests {
             let _ = http_probe("http://127.0.0.1:9222/.well-known/ard.json", "application/json");
         });
         assert!(err.is_err(), "probe must not dial 9222");
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_loopback_v4() {
+        let addr: SocketAddr = "127.0.0.1:9222".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9222));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_unspec_v4() {
+        let addr: SocketAddr = "0.0.0.0:9222".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9222));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_loopback_v6() {
+        let addr: SocketAddr = "[::1]:9222".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9222));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_unspec_v6() {
+        let addr: SocketAddr = "[::]:9223".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9223));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_mapped_loopback() {
+        let addr: SocketAddr = "[::ffff:127.0.0.1]:9224".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9224));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_mapped_unspec() {
+        let addr: SocketAddr = "[::ffff:0.0.0.0]:9225".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9225));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_non_reserved() {
+        let addr: SocketAddr = "93.184.216.34:9222".parse().unwrap();
+        assert!(!is_reserved_cdp_socket(addr, 9222));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_wrong_port() {
+        let addr: SocketAddr = "127.0.0.1:9230".parse().unwrap();
+        assert!(!is_reserved_cdp_socket(addr, 9230));
+    }
+
+    #[test]
+    fn is_reserved_cdp_socket_127_range() {
+        let addr: SocketAddr = "127.0.0.2:9222".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9222));
+        let addr: SocketAddr = "127.255.255.254:9229".parse().unwrap();
+        assert!(is_reserved_cdp_socket(addr, 9229));
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn body_cap_content_length_truncates() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            let big = vec![b'X'; 5 * 1024 * 1024];
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    big.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let _ = sock.write_all(&big);
+        });
+        let resp = http_probe(
+            &format!("http://{addr}/.well-known/ard.json"),
+            "application/json",
+        );
+        server.join().unwrap();
+        match resp {
+            Ok(r) => assert!(
+                r.body.len() <= PROBE_MAX_BODY,
+                "body should be capped at {PROBE_MAX_BODY}, got {}",
+                r.body.len()
+            ),
+            Err(e) => assert!(
+                e.contains("cap") || e.contains("exceeds"),
+                "expected cap error, got: {e}"
+            ),
+        }
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn body_cap_chunked_truncates() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let chunk = vec![b'Y'; 512 * 1024];
+            for _ in 0..10 {
+                let _ = sock.write_all(format!("{:x}\r\n", chunk.len()).as_bytes());
+                let _ = sock.write_all(&chunk);
+                let _ = sock.write_all(b"\r\n");
+            }
+            let _ = sock.write_all(b"0\r\n\r\n");
+        });
+        let resp = http_probe(
+            &format!("http://{addr}/.well-known/ard.json"),
+            "application/json",
+        )
+        .unwrap();
+        assert!(
+            resp.body.len() <= PROBE_MAX_BODY,
+            "chunked body must be capped, got {}",
+            resp.body.len()
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn body_cap_close_delimited_truncates() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let chunk = vec![b'Z'; 256 * 1024];
+            for _ in 0..20 {
+                if sock.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let resp = http_probe(
+            &format!("http://{addr}/.well-known/ard.json"),
+            "application/json",
+        )
+        .unwrap();
+        assert!(
+            resp.body.len() <= PROBE_MAX_BODY,
+            "close-delimited body must be capped, got {}",
+            resp.body.len()
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn stalled_body_probe_returns_within_6s() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            let _ = sock.write_all(&[b'A'; 10]);
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let start = std::time::Instant::now();
+        let _ = http_probe(
+            &format!("http://{addr}/.well-known/ard.json"),
+            "application/json",
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "stalled probe must return within 7s, took {elapsed:?}"
+        );
+        drop(server);
     }
 }
