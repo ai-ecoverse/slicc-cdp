@@ -69,6 +69,10 @@ pub fn global_help() -> String {
             "list",
             "list connected browsers, debug ports, and launchables",
         ),
+        row(
+            "discover [url]",
+            "watch navigations and report agent-facing web standards",
+        ),
         String::new(),
         "WebMCP (SLICC):".to_string(),
         row("webmcp-list", "list WebMCP tools on the page"),

@@ -27,10 +27,10 @@ const S: bool = true;
 const B: bool = false;
 
 static SPECS: &[Spec] = &[
-    spec("open", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S), ("browser", S), ("headed", B), ("profile", S)], true, RefMode::None),
-    spec("tab-new", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S), ("browser", S), ("headed", B), ("profile", S)], true, RefMode::None),
+    spec("open", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S), ("browser", S), ("headed", B), ("profile", S)], true, RefMode::None),
+    spec("tab-new", &["url"], false, &[("foreground", B), ("fg", B), ("runtime", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S), ("browser", S), ("headed", B), ("profile", S)], true, RefMode::None),
     spec("close", &[], false, &[("tab", S)], true, RefMode::None),
-    spec("goto", &["url"], false, &[("tab", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),
+    spec("goto", &["url"], false, &[("tab", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),
     spec("type", &["text"], true, &[("tab", S), ("submit", B)], true, RefMode::None),
     spec("click", &["target", "button"], false, &[("tab", S), ("modifiers", S)], true, RefMode::Element),
     spec("fill", &["target", "text"], true, &[("tab", S), ("submit", B)], true, RefMode::Element),
@@ -42,6 +42,7 @@ static SPECS: &[Spec] = &[
     spec("tab-select", &["index"], false, &[], true, RefMode::None),
     spec("tab-close", &["index"], false, &[("tab", S)], true, RefMode::None),
     spec("list", &[], false, &[("json", B)], true, RefMode::None),
+    spec("discover", &[], false, &[("tab", S), ("json", B), ("once", S), ("only", S), ("skip", S), ("no-probe", B)], true, RefMode::None),
     spec("dblclick", &["ref", "button"], false, &[("tab", S), ("modifiers", S)], true, RefMode::Element),
     spec("drag", &["startRef", "endRef"], false, &[("tab", S)], true, RefMode::Element),
     spec("hover", &["ref"], false, &[("tab", S)], true, RefMode::Element),
@@ -94,9 +95,9 @@ static SPECS: &[Spec] = &[
     spec("generate-locator", &["target"], false, &[("tab", S)], false, RefMode::None),
     spec("highlight", &["target"], false, &[("tab", S), ("hide", B), ("style", S)], false, RefMode::None),
     spec("eval-file", &["path"], false, &[("tab", S), ("frame", S), ("output", S)], false, RefMode::None),
-    spec("navigate", &["url"], false, &[("tab", S), ("discover", B), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], false, RefMode::None),
+    spec("navigate", &["url"], false, &[("tab", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], false, RefMode::None),
     spec("teleport", &[], false, &[("tab", S), ("start", S), ("return", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("runtime", S), ("off", B), ("list", B)], false, RefMode::None),
-    spec("fetch", &["url"], false, &[("tab", S), ("method", S), ("discover", B)], false, RefMode::None),
+    spec("fetch", &["url"], false, &[("tab", S), ("method", S)], false, RefMode::None),
     spec("frames", &[], false, &[("tab", S)], true, RefMode::None),
     spec("record", &["url"], false, &[("tab", S), ("filter", S)], false, RefMode::None),
     spec("stop-recording", &["recordingId"], false, &[("tab", S)], false, RefMode::None),
