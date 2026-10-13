@@ -446,9 +446,16 @@ mod tests {
         assert!(snapshot_target
             .stdout
             .contains("partial snapshot instead of the whole page"));
-        let tab_index = execute(&["tab-close".into(), "1".into()], None);
-        assert_eq!(tab_index.code, 1);
-        assert!(tab_index.stderr.contains("too many arguments"));
+        let tab_extra = execute(&["tab-close".into(), "1".into(), "2".into()], None);
+        assert_eq!(tab_extra.code, 1);
+        assert!(tab_extra.stderr.contains("too many arguments"));
+        for bad in ["0", "x", "1.5", "01x"] {
+            let tab_index = execute(&["tab-close".into(), bad.into()], None);
+            assert_eq!(tab_index.code, 1, "{bad}");
+            assert_eq!(tab_index.stderr, "tab-close index must be a positive integer\n", "{bad}");
+        }
+        let both = execute(&["tab-close".into(), "1".into(), "--tab".into(), "T".into()], None);
+        assert_eq!(both.stderr, "tab-close takes an index or --tab, not both\n");
         let foreground = super::args::parse(&["open".into(), "--foreground".into()]).unwrap();
         assert_eq!(
             foreground.flags.get("foreground").map(String::as_str),

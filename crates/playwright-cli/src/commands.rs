@@ -23,6 +23,16 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = deferred_flag(invocation) {
         return Output::err(message);
     }
+    if command == "tab-close" {
+        if let Some(index) = invocation.positionals.first() {
+            if close_index(index).is_none() {
+                return Output::err("tab-close index must be a positive integer\n");
+            }
+            if invocation.flags.contains_key("tab") {
+                return Output::err("tab-close takes an index or --tab, not both\n");
+            }
+        }
+    }
     let runtime = invocation.runtime.clone().or_else(|| {
         invocation
             .flags
@@ -257,9 +267,26 @@ fn cmd_close(
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
-    let target = match resolve_target(cdp, invocation, state, &pages, false) {
-        Ok(target) => target,
-        Err(message) => return Output::err(message),
+    let indexed = if invocation.command.as_deref() == Some("tab-close") {
+        invocation.positionals.first().and_then(|text| close_index(text))
+    } else {
+        None
+    };
+    let target = match indexed {
+        Some(index) => match pages.get(index - 1) {
+            Some(page) => page.target_id.clone(),
+            None => {
+                let noun = if pages.len() == 1 { "tab" } else { "tabs" };
+                return Output::err(format!(
+                    "tab-close index {index} out of range ({} {noun} open)\n",
+                    pages.len()
+                ));
+            }
+        },
+        None => match resolve_target(cdp, invocation, state, &pages, false) {
+            Ok(target) => target,
+            Err(message) => return Output::err(message),
+        },
     };
     report.tab(&target);
     report.begin(cdp);
@@ -275,6 +302,13 @@ fn cmd_close(
         }
         Err(message) => Output::err(message),
     }
+}
+
+fn close_index(text: &str) -> Option<usize> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<usize>().ok().filter(|index| *index > 0)
 }
 
 fn cmd_goto(

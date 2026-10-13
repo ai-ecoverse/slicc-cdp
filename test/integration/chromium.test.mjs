@@ -142,6 +142,29 @@ async function playwrightFlow(runner, site) {
   assert.match(missing.stderr, /not found/);
   const closed = await runner.playwright(['tab-close', '--tab', extraId], cwd);
   assert.equal(closed.code, 0, closed.stderr);
+  const spare = await runner.playwright(['tab-new', `${site.origin}/two`], cwd);
+  assert.equal(spare.code, 0, spare.stderr);
+  const spareId = targetOf(spare.stdout);
+  const withSpare = await runner.playwright(['tab-list'], cwd);
+  const spareIndex = withSpare.stdout
+    .split('\n')
+    .find((line) => line.includes(`[${spareId}]`))
+    ?.match(/^(\d+):/)?.[1];
+  assert.ok(spareIndex, withSpare.stdout);
+  const byIndex = await runner.playwright(['tab-close', spareIndex], cwd);
+  assert.equal(byIndex.code, 0, byIndex.stderr);
+  assert.equal(byIndex.stdout, `Closed tab ${spareId}\n`);
+  const outOfRange = await runner.playwright(['tab-close', '99'], cwd);
+  assert.equal(outOfRange.code, 1);
+  assert.match(outOfRange.stderr, /out of range/);
+  const remaining = await runner.playwright(['tab-list'], cwd);
+  const backIndex = remaining.stdout
+    .split('\n')
+    .find((line) => line.includes(`[${openedId}]`))
+    ?.match(/^(\d+):/)?.[1];
+  assert.ok(backIndex, remaining.stdout);
+  const back = await runner.playwright(['tab-select', backIndex], cwd);
+  assert.equal(back.code, 0, back.stderr);
   const finished = await runner.playwright(['close'], cwd);
   assert.equal(finished.code, 0, finished.stderr);
 }
