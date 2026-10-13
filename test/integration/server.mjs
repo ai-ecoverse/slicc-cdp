@@ -56,6 +56,7 @@ function answer(req, res, pathname, body) {
   if (pathname === '/webmcp') return html(res, webmcpPage());
   if (pathname === '/webmcp-empty') return html(res, webmcpEmptyPage());
   if (pathname === '/webmcp-form') return html(res, webmcpFormPage());
+  if (pathname === '/webmcp-consequential') return html(res, webmcpConsequentialPage());
   if (documents.has(pathname))
     return html(res, fixture(pathname === '/other' ? 'Other' : 'Fixture'));
   return text(res, 404, 'missing');
@@ -151,6 +152,14 @@ if (document.modelContext && document.modelContext.registerTool) {
     inputSchema: { type: 'object', properties: {} },
     execute: async () => { throw new Error('intentional failure'); }
   });
+  document.modelContext.registerTool({
+    name: 'danger',
+    title: 'Danger',
+    description: 'Consequential action',
+    inputSchema: { type: 'object', properties: {} },
+    annotations: { consequentialHint: true },
+    execute: async () => 'done'
+  });
 } else {
   document.modelContext = {
     async getTools() {
@@ -175,4 +184,23 @@ function webmcpEmptyPage() {
 
 function webmcpFormPage() {
   return '<!doctype html><title>Form Tools</title><form toolname="search" tooldescription="Search items"><input name="query"><button type="submit">Go</button></form>';
+}
+
+function webmcpConsequentialPage() {
+  return `<!doctype html><title>Consequential</title><script>
+Object.defineProperty(document, 'modelContext', {
+  value: {
+    async getTools() {
+      return [
+        { name: 'safe', description: 'A safe tool', inputSchema: { type: 'object' }, origin: location.origin, annotations: { readOnlyHint: true } },
+        { name: 'risky', description: 'Deletes things', inputSchema: { type: 'object' }, origin: location.origin, annotations: { consequentialHint: true } }
+      ];
+    },
+    async executeTool(tool, input) {
+      return tool.name + ' executed';
+    }
+  },
+  configurable: true
+});
+</script>`;
 }

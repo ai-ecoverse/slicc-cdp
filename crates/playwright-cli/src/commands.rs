@@ -1127,7 +1127,8 @@ fn cmd_webmcp_list(
     invocation: &Invocation,
 ) -> Output {
     let tab = invocation.flags.get("tab").map(String::as_str);
-    crate::webmcp::list(cdp, state, tab)
+    let json = flag_true(&invocation.flags, "json");
+    crate::webmcp::list(cdp, state, tab, json)
 }
 
 fn cmd_webmcp_call(
@@ -1138,9 +1139,18 @@ fn cmd_webmcp_call(
     let Some(name) = invocation.positionals.first() else {
         return Output::err("webmcp-call requires <name> and <json-input>\n");
     };
-    let Some(input_json) = invocation.positionals.get(1) else {
+    let Some(raw) = invocation.positionals.get(1) else {
         return Output::err("webmcp-call requires <json-input>\n");
     };
+    let input_json = if raw == "-" {
+        match crate::webmcp::read_stdin() {
+            Ok(text) => text,
+            Err(message) => return Output::err(message),
+        }
+    } else {
+        raw.clone()
+    };
     let tab = invocation.flags.get("tab").map(String::as_str);
-    crate::webmcp::call(cdp, state, name, input_json, tab)
+    let allow_consequential = flag_true(&invocation.flags, "allow-consequential");
+    crate::webmcp::call(cdp, state, name, &input_json, tab, allow_consequential)
 }

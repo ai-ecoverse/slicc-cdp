@@ -4,7 +4,7 @@ use crate::cdp::{self, Cdp};
 use crate::session::Session;
 use serde_json::{json, Value};
 
-pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>) -> Output {
+pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -> Output {
     let pages = match visible_pages(cdp, state) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -22,10 +22,57 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>) -> Output {
     match result {
         Ok(tools) => {
             state.current = Some(target);
-            Output::ok(format!("{}\n", tools))
+            if json {
+                Output::ok(format!("{}\n", tools))
+            } else {
+                Output::ok(format_list(&tools))
+            }
         }
         Err(message) => Output::err(message),
     }
+}
+
+fn format_list(tools: &Value) -> String {
+    let arr = match tools.as_array() {
+        Some(arr) if arr.is_empty() => return "No WebMCP tools on this page\n".to_string(),
+        Some(arr) => arr,
+        None => return "No WebMCP tools on this page\n".to_string(),
+    };
+    let mut lines = Vec::new();
+    for tool in arr {
+        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let desc = tool
+            .get("description")
+            .and_then(|v| v.as_str())
+            .or_else(|| tool.get("title").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let mut flags = Vec::new();
+        if let Some(ann) = tool.get("annotations") {
+            if ann.get("consequentialHint").and_then(|v| v.as_bool()) == Some(true) {
+                flags.push("consequential");
+            }
+            if ann.get("readOnlyHint").and_then(|v| v.as_bool()) == Some(true) {
+                flags.push("read-only");
+            }
+            if ann.get("untrustedContentHint").and_then(|v| v.as_bool()) == Some(true) {
+                flags.push("untrusted");
+            }
+        }
+        if tool.get("declarative").and_then(|v| v.as_bool()) == Some(true) {
+            flags.push("form");
+        }
+        let suffix = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join(", "))
+        };
+        if desc.is_empty() {
+            lines.push(format!("  {name}{suffix}"));
+        } else {
+            lines.push(format!("  {name}  {desc}{suffix}"));
+        }
+    }
+    format!("{}\n", lines.join("\n"))
 }
 
 pub fn call(
@@ -34,6 +81,7 @@ pub fn call(
     name: &str,
     input_json: &str,
     tab: Option<&str>,
+    allow_consequential: bool,
 ) -> Output {
     let parsed: Value = match serde_json::from_str(input_json) {
         Ok(value) => value,
@@ -58,8 +106,14 @@ pub fn call(
         Err(message) => return Output::err(message),
     };
     let result = evaluate_call(cdp, &session, name, &parsed);
+    let outcome = match result {
+        Ok(CallOutcome::Consequential(desc)) if allow_consequential => {
+            evaluate_call_force(cdp, &session, name, &parsed)
+        }
+        other => other,
+    };
     cdp::detach(cdp, &session);
-    match result {
+    match outcome {
         Ok(outcome) => {
             state.current = Some(target);
             match outcome {
@@ -81,6 +135,18 @@ pub fn call(
                         code: 2,
                     }
                 }
+                CallOutcome::Consequential(desc) => {
+                    let hint = if desc.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {desc}")
+                    };
+                    Output {
+                        stdout: String::new(),
+                        stderr: format!("webmcp-call: tool \"{name}\" is consequential{hint}\nPass --allow-consequential to permit this call.\n"),
+                        code: 2,
+                    }
+                }
                 CallOutcome::Threw(message) => Output {
                     stdout: String::new(),
                     stderr: format!("webmcp-call: tool \"{name}\" threw: {message}\n"),
@@ -90,6 +156,18 @@ pub fn call(
         }
         Err(message) => Output::err(message),
     }
+}
+
+pub fn read_stdin() -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|err| format!("webmcp-call: failed to read stdin: {err}\n"))?;
+    if buf.trim().is_empty() {
+        return Err("webmcp-call: stdin is empty (expected JSON)\n".to_string());
+    }
+    Ok(buf)
 }
 
 fn visible_pages(cdp: &mut Cdp, state: &Session) -> Result<Vec<PageInfo>, String> {
@@ -217,6 +295,7 @@ enum CallOutcome {
     Result(String),
     Absent,
     Unknown(Vec<String>),
+    Consequential(String),
     Threw(String),
 }
 
@@ -236,6 +315,9 @@ fn evaluate_call(
   if (!tool) {{
     return {{ __webmcp_error: 'unknown', tools: tools.map(t => t.name) }};
   }}
+  if (tool.annotations && tool.annotations.consequentialHint) {{
+    return {{ __webmcp_error: 'consequential', description: tool.description || '' }};
+  }}
   try {{
     const input = {input_json};
     const result = await document.modelContext.executeTool(tool, typeof input === 'string' ? input : JSON.stringify(input));
@@ -247,6 +329,41 @@ fn evaluate_call(
         name_json = json!(name),
         input_json = input
     );
+    parse_call_result(cdp, session, &expression)
+}
+
+fn evaluate_call_force(
+    cdp: &mut Cdp,
+    session: &str,
+    name: &str,
+    input: &Value,
+) -> Result<CallOutcome, String> {
+    let expression = format!(
+        r#"(async () => {{
+  const tools = await document.modelContext.getTools();
+  const tool = tools.find(t => t.name === {name_json});
+  if (!tool) {{
+    return {{ __webmcp_error: 'unknown', tools: tools.map(t => t.name) }};
+  }}
+  try {{
+    const input = {input_json};
+    const result = await document.modelContext.executeTool(tool, typeof input === 'string' ? input : JSON.stringify(input));
+    return {{ __webmcp_result: String(result) }};
+  }} catch (err) {{
+    return {{ __webmcp_error: 'threw', message: String(err) }};
+  }}
+}})()"#,
+        name_json = json!(name),
+        input_json = input
+    );
+    parse_call_result(cdp, session, &expression)
+}
+
+fn parse_call_result(
+    cdp: &mut Cdp,
+    session: &str,
+    expression: &str,
+) -> Result<CallOutcome, String> {
     let result = cdp.call(
         "Runtime.evaluate",
         json!({
@@ -283,6 +400,14 @@ fn evaluate_call(
                     })
                     .unwrap_or_default();
                 Ok(CallOutcome::Unknown(tools))
+            }
+            "consequential" => {
+                let desc = value
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(CallOutcome::Consequential(desc))
             }
             "threw" => {
                 let message = value
@@ -386,7 +511,7 @@ mod tests {
     #[test]
     fn call_expression_absent() {
         let mut cdp = fake_cdp(vec![eval_result(json!({ "__webmcp_error": "absent" }))]);
-        match evaluate_call(&mut cdp, "S1", "foo", &json!({})).unwrap() {
+        match parse_call_result(&mut cdp, "S1", "").unwrap() {
             CallOutcome::Absent => {}
             _ => panic!("expected Absent"),
         }
@@ -395,7 +520,7 @@ mod tests {
     #[test]
     fn call_expression_unknown() {
         let mut cdp = fake_cdp(vec![eval_result(json!({ "__webmcp_error": "unknown", "tools": ["bar", "baz"] }))]);
-        match evaluate_call(&mut cdp, "S1", "foo", &json!({})).unwrap() {
+        match parse_call_result(&mut cdp, "S1", "").unwrap() {
             CallOutcome::Unknown(tools) => assert_eq!(tools, vec!["bar", "baz"]),
             _ => panic!("expected Unknown"),
         }
@@ -404,7 +529,7 @@ mod tests {
     #[test]
     fn call_expression_threw() {
         let mut cdp = fake_cdp(vec![eval_result(json!({ "__webmcp_error": "threw", "message": "boom" }))]);
-        match evaluate_call(&mut cdp, "S1", "foo", &json!({})).unwrap() {
+        match parse_call_result(&mut cdp, "S1", "").unwrap() {
             CallOutcome::Threw(msg) => assert_eq!(msg, "boom"),
             _ => panic!("expected Threw"),
         }
@@ -413,9 +538,18 @@ mod tests {
     #[test]
     fn call_expression_success() {
         let mut cdp = fake_cdp(vec![eval_result(json!({ "__webmcp_result": "Item added to cart" }))]);
-        match evaluate_call(&mut cdp, "S1", "add-to-cart", &json!({"id": "123"})).unwrap() {
+        match parse_call_result(&mut cdp, "S1", "").unwrap() {
             CallOutcome::Result(text) => assert_eq!(text, "Item added to cart"),
             _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn call_expression_consequential() {
+        let mut cdp = fake_cdp(vec![eval_result(json!({ "__webmcp_error": "consequential", "description": "Deletes data" }))]);
+        match parse_call_result(&mut cdp, "S1", "").unwrap() {
+            CallOutcome::Consequential(desc) => assert_eq!(desc, "Deletes data"),
+            _ => panic!("expected Consequential"),
         }
     }
 
@@ -423,7 +557,7 @@ mod tests {
     fn call_invalid_json_exit_code_2() {
         let mut cdp = fake_cdp(vec![]);
         let mut state = Session::default();
-        let output = call(&mut cdp, &mut state, "foo", "not json", None);
+        let output = call(&mut cdp, &mut state, "foo", "not json", None, false);
         assert_eq!(output.code, 2);
         assert!(output.stderr.contains("invalid JSON"));
     }
@@ -435,7 +569,7 @@ mod tests {
             json!({ "result": { "targetInfo": { "targetId": "SEVEN", "type": "page", "url": "https://seven.sliccy.ai/", "title": "Seven" } } }),
         ]);
         let mut state = Session::default();
-        let output = call(&mut cdp, &mut state, "foo", "{}", Some("SEVEN"));
+        let output = call(&mut cdp, &mut state, "foo", "{}", Some("SEVEN"), false);
         assert_eq!(output.code, 1);
         assert!(output.stderr.contains("refused"));
     }
@@ -470,6 +604,8 @@ mod tests {
         assert!(output.stdout.contains("webmcp-call"));
         assert!(output.stdout.contains("executeTool"));
         assert!(output.stdout.contains("Exit codes"));
+        assert!(output.stdout.contains("--allow-consequential"));
+        assert!(output.stdout.contains("stdin"));
     }
 
     #[test]
@@ -487,5 +623,52 @@ mod tests {
         let pending = output.stdout.split("Not implemented yet:").nth(1).unwrap_or("");
         assert!(!pending.contains("webmcp-list"));
         assert!(!pending.contains("webmcp-call"));
+    }
+
+    #[test]
+    fn format_list_empty() {
+        assert_eq!(format_list(&json!([])), "No WebMCP tools on this page\n");
+    }
+
+    #[test]
+    fn format_list_renders_name_and_description() {
+        let tools = json!([
+            { "name": "greet", "description": "Says hello", "annotations": { "readOnlyHint": true } },
+            { "name": "delete", "description": "Remove item", "annotations": { "consequentialHint": true } }
+        ]);
+        let text = format_list(&tools);
+        assert!(text.contains("greet"), "{text}");
+        assert!(text.contains("Says hello"), "{text}");
+        assert!(text.contains("[read-only]"), "{text}");
+        assert!(text.contains("delete"), "{text}");
+        assert!(text.contains("[consequential]"), "{text}");
+    }
+
+    #[test]
+    fn stdin_dash_is_recognized() {
+        let output = crate::execute(
+            &["webmcp-call".to_string(), "tool-name".to_string(), "-".to_string()],
+            None,
+        );
+        assert_ne!(output.code, 0);
+        assert!(!output.stderr.contains("requires"));
+    }
+
+    #[test]
+    fn call_invalid_json_on_stdin_exit_2() {
+        let mut cdp = fake_cdp(vec![]);
+        let mut state = Session::default();
+        let output = call(&mut cdp, &mut state, "foo", "  {bad  ", None, false);
+        assert_eq!(output.code, 2);
+        assert!(output.stderr.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn call_empty_string_exit_2() {
+        let mut cdp = fake_cdp(vec![]);
+        let mut state = Session::default();
+        let output = call(&mut cdp, &mut state, "foo", "", None, false);
+        assert_eq!(output.code, 2);
+        assert!(output.stderr.contains("invalid JSON"));
     }
 }
