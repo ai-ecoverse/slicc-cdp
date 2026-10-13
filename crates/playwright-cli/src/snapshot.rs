@@ -134,10 +134,28 @@ fn build_ref_selector(role: &str, name: &str) -> String {
 }
 
 pub fn escape_yaml(value: &str) -> String {
-    value
+    let escaped = value
         .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+        .replace('"', "\\\"");
+    let mut result = String::with_capacity(escaped.len());
+    for ch in escaped.chars() {
+        match ch {
+            '\n' => result.push_str("\\n"),
+            '\t' => result.push_str("\\t"),
+            '\x1b' => result.push_str("\\x1b"),
+            '\x07' => result.push_str("\\x07"),
+            '\r' => result.push_str("\\r"),
+            '\x7f' => result.push_str("\\x7f"),
+            c if c.is_control() && (c as u32) < 0x20 => {
+                result.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if (0x80..=0x9f).contains(&(c as u32)) => {
+                result.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
 }
 
 fn escape_css(value: &str) -> String {
@@ -512,5 +530,29 @@ mod tests {
             });
         assert!(text.contains("[ref=f1e5]"));
         assert_eq!(assigned, vec![("f1".to_string(), "child".to_string())]);
+    }
+
+    #[test]
+    fn escape_yaml_sanitizes_control_chars() {
+        assert_eq!(escape_yaml("hello\x1bworld"), "hello\\x1bworld");
+        assert_eq!(escape_yaml("bell\x07here"), "bell\\x07here");
+        assert_eq!(escape_yaml("cr\rhere"), "cr\\rhere");
+        assert_eq!(escape_yaml("del\x7fhere"), "del\\x7fhere");
+        assert_eq!(escape_yaml("c1\u{0080}here"), "c1\\u{80}here");
+        assert_eq!(escape_yaml("tab\there"), "tab\\there");
+    }
+
+    #[test]
+    fn snapshot_escapes_terminal_injection_in_name() {
+        let node = AxNode {
+            role: "button".to_string(),
+            name: "Click \x1b[2J me".to_string(),
+            value: String::new(),
+            backend_node_id: Some(1),
+            children: vec![],
+        };
+        let (text, _refs) = render_tree(&node, "");
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(text.contains("\\x1b"), "{text}");
     }
 }

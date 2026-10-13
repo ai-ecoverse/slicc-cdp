@@ -1,6 +1,7 @@
 use crate::args::Output;
 use crate::browser::{self, PageInfo};
 use crate::cdp::Cdp;
+use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
@@ -40,12 +41,13 @@ fn format_list(tools: &Value) -> String {
     };
     let mut lines = Vec::new();
     for tool in arr {
-        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        let desc = tool
-            .get("description")
-            .and_then(|v| v.as_str())
-            .or_else(|| tool.get("title").and_then(|v| v.as_str()))
-            .unwrap_or("");
+        let name = sanitize::terminal(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+        let desc = sanitize::terminal(
+            tool.get("description")
+                .and_then(|v| v.as_str())
+                .or_else(|| tool.get("title").and_then(|v| v.as_str()))
+                .unwrap_or(""),
+        );
         let mut flags = Vec::new();
         if let Some(ann) = tool.get("annotations") {
             if ann.get("consequentialHint").and_then(|v| v.as_bool()) == Some(true) {
@@ -109,10 +111,11 @@ pub fn call(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = evaluate_call(cdp, &session, name, &parsed);
+    let chrome_major = chrome_major_version(cdp);
+    let result = evaluate_call(cdp, &session, name, &parsed, chrome_major);
     let outcome = match result {
-        Ok(CallOutcome::Consequential(desc)) if allow_consequential => {
-            evaluate_call_force(cdp, &session, name, &parsed)
+        Ok(CallOutcome::Consequential(_)) if allow_consequential => {
+            evaluate_call_force(cdp, &session, name, &parsed, chrome_major)
         }
         other => other,
     };
@@ -121,7 +124,7 @@ pub fn call(
         Ok(outcome) => {
             state.current = Some(target);
             match outcome {
-                CallOutcome::Result(text) => Output::ok(format!("{text}\n")),
+                CallOutcome::Result(text) => Output::ok(format!("{}\n", sanitize::terminal(&text))),
                 CallOutcome::Absent => Output {
                     stdout: String::new(),
                     stderr: "webmcp-call: page does not support WebMCP (document.modelContext is absent)\n".into(),
@@ -131,7 +134,8 @@ pub fn call(
                     let list = if available.is_empty() {
                         String::new()
                     } else {
-                        format!("\navailable tools: {}", available.join(", "))
+                        let safe: Vec<String> = available.iter().map(|n| sanitize::terminal(n)).collect();
+                        format!("\navailable tools: {}", safe.join(", "))
                     };
                     Output {
                         stdout: String::new(),
@@ -143,7 +147,7 @@ pub fn call(
                     let hint = if desc.is_empty() {
                         String::new()
                     } else {
-                        format!(": {desc}")
+                        format!(": {}", sanitize::terminal(&desc))
                     };
                     Output {
                         stdout: String::new(),
@@ -153,7 +157,7 @@ pub fn call(
                 }
                 CallOutcome::Threw(message) => Output {
                     stdout: String::new(),
-                    stderr: format!("webmcp-call: tool \"{name}\" threw: {message}\n"),
+                    stderr: format!("webmcp-call: tool \"{name}\" threw: {}\n", sanitize::terminal(&message)),
                     code: 1,
                 },
             }
@@ -278,6 +282,23 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     Ok(value)
 }
 
+fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
+    let result = cdp.call("Browser.getVersion", json!({}), None).ok()?;
+    let product = result.pointer("/product").and_then(|v| v.as_str()).unwrap_or("");
+    let version_part = product
+        .strip_prefix("Chrome/")
+        .or_else(|| product.strip_prefix("HeadlessChrome/"))?;
+    version_part.split('.').next()?.parse().ok()
+}
+
+fn input_expression(input: &Value, chrome_major: Option<u32>) -> String {
+    if chrome_major.is_some_and(|v| v >= 156) {
+        format!("{input}")
+    } else {
+        format!("JSON.stringify({input})")
+    }
+}
+
 enum CallOutcome {
     Result(String),
     Absent,
@@ -291,7 +312,9 @@ fn evaluate_call(
     session: &str,
     name: &str,
     input: &Value,
+    chrome_major: Option<u32>,
 ) -> Result<CallOutcome, String> {
+    let input_expr = input_expression(input, chrome_major);
     let expression = format!(
         r#"(async () => {{
   if (!('modelContext' in document) || !document.modelContext) {{
@@ -306,14 +329,13 @@ fn evaluate_call(
     return {{ __webmcp_error: 'consequential', description: tool.description || '' }};
   }}
   try {{
-    const result = await document.modelContext.executeTool(tool, JSON.stringify({input_json}));
+    const result = await document.modelContext.executeTool(tool, {input_expr});
     return {{ __webmcp_result: String(result) }};
   }} catch (err) {{
     return {{ __webmcp_error: 'threw', message: String(err) }};
   }}
 }})()"#,
         name_json = json!(name),
-        input_json = input
     );
     parse_call_result(cdp, session, &expression)
 }
@@ -323,7 +345,9 @@ fn evaluate_call_force(
     session: &str,
     name: &str,
     input: &Value,
+    chrome_major: Option<u32>,
 ) -> Result<CallOutcome, String> {
+    let input_expr = input_expression(input, chrome_major);
     let expression = format!(
         r#"(async () => {{
   const tools = await document.modelContext.getTools();
@@ -332,14 +356,13 @@ fn evaluate_call_force(
     return {{ __webmcp_error: 'unknown', tools: tools.map(t => t.name) }};
   }}
   try {{
-    const result = await document.modelContext.executeTool(tool, JSON.stringify({input_json}));
+    const result = await document.modelContext.executeTool(tool, {input_expr});
     return {{ __webmcp_result: String(result) }};
   }} catch (err) {{
     return {{ __webmcp_error: 'threw', message: String(err) }};
   }}
 }})()"#,
         name_json = json!(name),
-        input_json = input
     );
     parse_call_result(cdp, session, &expression)
 }
@@ -591,6 +614,7 @@ mod tests {
         assert!(output.stdout.contains("Exit codes"));
         assert!(output.stdout.contains("--allow-consequential"));
         assert!(output.stdout.contains("stdin"));
+        assert!(output.stdout.contains("advisory"));
     }
 
     #[test]
@@ -666,5 +690,96 @@ mod tests {
             assert_eq!(output.code, 2, "input {input}");
             assert!(output.stderr.contains("must be a JSON object"), "input {input}: {}", output.stderr);
         }
+    }
+
+    #[test]
+    fn result_sanitizes_terminal_escapes() {
+        let mut cdp = fake_cdp(vec![eval_result(json!({ "__webmcp_result": "pwned\x1b[2J\x07" }))]);
+        match parse_call_result(&mut cdp, "S1", "").unwrap() {
+            CallOutcome::Result(text) => {
+                assert!(text.contains('\x1b'));
+                assert!(text.contains('\x07'));
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn call_result_output_is_sanitized() {
+        let text = "pwned\x1b[2J\x07done";
+        let sanitized = sanitize::terminal(text);
+        let output = format!("{}\n", sanitized);
+        assert!(!output.contains('\x1b'));
+        assert!(!output.contains('\x07'));
+        assert!(output.contains("\\x1b"));
+        assert!(output.contains("\\x07"));
+    }
+
+    #[test]
+    fn threw_message_is_sanitized() {
+        let message = "Error: \x1b[2Jboom";
+        let sanitized = sanitize::terminal(message);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(sanitized.contains("\\x1b"));
+    }
+
+    #[test]
+    fn unknown_tool_names_are_sanitized() {
+        let names = vec!["safe".to_string(), "\x1b[2Jevil".to_string()];
+        let safe: Vec<String> = names.iter().map(|n| sanitize::terminal(n)).collect();
+        let joined = safe.join(", ");
+        assert!(!joined.contains('\x1b'));
+        assert!(joined.contains("\\x1b"));
+    }
+
+    #[test]
+    fn format_list_sanitizes_names_and_descriptions() {
+        let tools = json!([
+            { "name": "\x1b[2Jevil", "description": "desc\x07bel" }
+        ]);
+        let text = format_list(&tools);
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(!text.contains('\x07'), "{text}");
+        assert!(text.contains("\\x1b"), "{text}");
+        assert!(text.contains("\\x07"), "{text}");
+    }
+
+    #[test]
+    fn chrome_major_version_parses_product() {
+        let mut cdp = fake_cdp(vec![json!({ "result": { "product": "Chrome/155.0.6785.0" } })]);
+        assert_eq!(chrome_major_version(&mut cdp), Some(155));
+    }
+
+    #[test]
+    fn chrome_major_version_headless() {
+        let mut cdp = fake_cdp(vec![json!({ "result": { "product": "HeadlessChrome/156.0.0.0" } })]);
+        assert_eq!(chrome_major_version(&mut cdp), Some(156));
+    }
+
+    #[test]
+    fn chrome_major_version_missing() {
+        let mut cdp = fake_cdp(vec![json!({ "result": { "product": "Firefox/120" } })]);
+        assert_eq!(chrome_major_version(&mut cdp), None);
+    }
+
+    #[test]
+    fn input_expression_string_below_156() {
+        let input = json!({"key": "value"});
+        let expr = input_expression(&input, Some(155));
+        assert!(expr.starts_with("JSON.stringify("));
+    }
+
+    #[test]
+    fn input_expression_object_at_156() {
+        let input = json!({"key": "value"});
+        let expr = input_expression(&input, Some(156));
+        assert!(!expr.contains("JSON.stringify"));
+    }
+
+    #[test]
+    fn input_expression_string_when_unknown() {
+        let input = json!({"key": "value"});
+        let expr = input_expression(&input, None);
+        assert!(expr.starts_with("JSON.stringify("));
     }
 }

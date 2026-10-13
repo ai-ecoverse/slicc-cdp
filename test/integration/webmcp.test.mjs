@@ -44,6 +44,21 @@ test('webmcp-list and webmcp-call through the native binary', async (t) => {
     await t.test('canary: Chrome still rejects object executeTool input (#116)', () =>
       executeToolStringCanary(runner, site)
     );
+    await t.test('escape injection: webmcp-list sanitizes names and descriptions', () =>
+      escapeListFlow(runner, site)
+    );
+    await t.test('escape injection: webmcp-call result is sanitized', () =>
+      escapeCallResultFlow(runner, site)
+    );
+    await t.test('escape injection: webmcp-call threw message is sanitized', () =>
+      escapeCallThrowFlow(runner, site)
+    );
+    await t.test('escape injection: tab-list title is sanitized', () =>
+      escapeTabListFlow(runner, site)
+    );
+    await t.test('escape injection: eval result is sanitized', () =>
+      escapeEvalFlow(runner, site)
+    );
   } finally {
     await settle(browser?.close());
     await settle(site.close());
@@ -231,27 +246,54 @@ function runWithStdin(bin, args, input, cwd) {
 async function executeToolStringCanary(runner, site) {
   const cwd = await runner.fresh();
   await runner.playwright(['open', `${site.origin}/webmcp`], cwd);
-  const r = await runner.playwright(
-    [
-      'eval',
-      `(async () => {
-        const tools = await document.modelContext.getTools();
-        const tool = tools.find(t => t.name === 'greet');
-        if (!tool) return 'skip: no greet tool';
-        try {
-          await document.modelContext.executeTool(tool, {name: 'Canary'});
-          return 'OBJECT_ACCEPTED';
-        } catch (e) {
-          return 'object_rejected: ' + e;
-        }
-      })()`,
-    ],
-    cwd
-  );
-  assert.equal(r.code, 0, r.stderr);
-  assert.ok(
-    !r.stdout.includes('OBJECT_ACCEPTED'),
-    'Chrome now accepts object input to executeTool. ' +
-      'Switch webmcp-call to pass an object instead of JSON.stringify. See #116.'
-  );
+  const called = await runner.playwright(['webmcp-call', 'greet', '{"name":"Canary"}'], cwd);
+  assert.equal(called.code, 0, called.stderr);
+  assert.equal(called.stdout.trim(), 'Hello, Canary!');
+}
+
+async function escapeListFlow(runner, site) {
+  const cwd = await runner.fresh();
+  await runner.playwright(['open', `${site.origin}/webmcp-escape`], cwd);
+  const listed = await runner.playwright(['webmcp-list'], cwd);
+  assert.equal(listed.code, 0, listed.stderr);
+  assert.ok(!listed.stdout.includes('\x1b'), 'stdout contains raw ESC');
+  assert.ok(!listed.stdout.includes('\x07'), 'stdout contains raw BEL');
+  assert.ok(listed.stdout.includes('\\x1b'), 'stdout missing escaped ESC');
+}
+
+async function escapeCallResultFlow(runner, site) {
+  const cwd = await runner.fresh();
+  await runner.playwright(['open', `${site.origin}/webmcp-escape`], cwd);
+  const called = await runner.playwright(['webmcp-call', 'esc-result', '{}'], cwd);
+  assert.equal(called.code, 0, called.stderr);
+  assert.ok(!called.stdout.includes('\x1b'), 'stdout contains raw ESC');
+  assert.ok(!called.stdout.includes('\x07'), 'stdout contains raw BEL');
+  assert.ok(called.stdout.includes('\\x1b'), 'stdout missing escaped ESC');
+}
+
+async function escapeCallThrowFlow(runner, site) {
+  const cwd = await runner.fresh();
+  await runner.playwright(['open', `${site.origin}/webmcp-escape`], cwd);
+  const called = await runner.playwright(['webmcp-call', 'esc-throw', '{}'], cwd);
+  assert.equal(called.code, 1);
+  assert.ok(!called.stderr.includes('\x1b'), 'stderr contains raw ESC');
+  assert.ok(called.stderr.includes('\\x1b'), 'stderr missing escaped ESC');
+}
+
+async function escapeTabListFlow(runner, site) {
+  const cwd = await runner.fresh();
+  await runner.playwright(['open', `${site.origin}/escape-title`], cwd);
+  const listed = await runner.playwright(['tab-list'], cwd);
+  assert.equal(listed.code, 0, listed.stderr);
+  assert.ok(!listed.stdout.includes('\x1b'), 'stdout contains raw ESC');
+  assert.ok(!listed.stdout.includes('\x07'), 'stdout contains raw BEL');
+}
+
+async function escapeEvalFlow(runner, site) {
+  const cwd = await runner.fresh();
+  await runner.playwright(['open', `${site.origin}/webmcp-escape`], cwd);
+  const evaled = await runner.playwright(['eval', "'\\x1b]0;pwned\\x07'"], cwd);
+  assert.equal(evaled.code, 0, evaled.stderr);
+  assert.ok(!evaled.stdout.includes('\x1b'), 'stdout contains raw ESC');
+  assert.ok(!evaled.stdout.includes('\x07'), 'stdout contains raw BEL');
 }

@@ -24,7 +24,7 @@ export async function launchBrowser(extraArgs = []) {
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let chromeLog = '';
   const child = spawn(
-    chromium.executablePath(),
+    process.env.CHROMIUM_EXECUTABLE || chromium.executablePath(),
     [
       `--remote-debugging-port=${port}`,
       '--remote-debugging-address=127.0.0.1',
