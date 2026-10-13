@@ -11,6 +11,7 @@ if (version === '0.0.0') {
 }
 const manifests = [
   'crates/cdp-client/Cargo.toml',
+  'crates/discovery/Cargo.toml',
   'crates/playwright-cli/Cargo.toml',
   'crates/curlwright/Cargo.toml',
 ];

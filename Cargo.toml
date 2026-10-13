@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/cdp-client", "crates/playwright-cli", "crates/curlwright"]
+members = ["crates/cdp-client", "crates/discovery", "crates/playwright-cli", "crates/curlwright"]

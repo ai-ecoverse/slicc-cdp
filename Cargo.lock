@@ -624,6 +624,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slicc-discovery"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

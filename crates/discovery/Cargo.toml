@@ -1,0 +1,20 @@
+[package]
+name = "slicc-discovery"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+description = "Discovery engine for agent-facing web standards"
+repository = "https://github.com/ai-ecoverse/slicc-cdp"
+homepage = "https://github.com/ai-ecoverse/slicc-cdp"
+keywords = ["discovery", "web-standards", "link-header", "well-known"]
+categories = ["web-programming", "parser-implementations"]
+publish = true
+
+[lib]
+name = "discovery"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2.5"
