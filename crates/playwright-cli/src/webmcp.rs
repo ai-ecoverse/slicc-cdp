@@ -111,8 +111,7 @@ pub fn call(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let _chrome_major = chrome_major_version(cdp);
-    let native = native_webmcp(cdp, &session);
+    let native = native_webmcp_object_input(cdp, &session);
     let result = evaluate_call(cdp, &session, name, &parsed, native);
     let outcome = match result {
         Ok(CallOutcome::Consequential(_)) if allow_consequential => {
@@ -292,7 +291,11 @@ fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     version_part.split('.').next()?.parse().ok()
 }
 
-fn native_webmcp(cdp: &mut Cdp, session: &str) -> bool {
+fn native_webmcp_object_input(cdp: &mut Cdp, session: &str) -> bool {
+    let chrome = chrome_major_version(cdp);
+    if chrome.is_some_and(|v| v < 155) {
+        return false;
+    }
     let result = cdp.call(
         "Runtime.evaluate",
         json!({
@@ -301,10 +304,11 @@ fn native_webmcp(cdp: &mut Cdp, session: &str) -> bool {
         }),
         Some(session),
     );
-    result
+    let native = result
         .ok()
         .and_then(|v| v.pointer("/result/value").and_then(|v| v.as_bool()))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    native && chrome.is_some_and(|v| v >= 155)
 }
 
 fn input_expression(input: &Value, native: bool) -> String {
@@ -779,15 +783,29 @@ mod tests {
     }
 
     #[test]
-    fn native_webmcp_true_when_model_context_present() {
-        let mut cdp = fake_cdp(vec![eval_result(json!(true))]);
-        assert!(native_webmcp(&mut cdp, "S1"));
+    fn native_webmcp_object_input_true_for_new_chrome() {
+        let mut cdp = fake_cdp(vec![
+            json!({ "result": { "product": "Chrome/155.0.0.0" } }),
+            eval_result(json!(true)),
+        ]);
+        assert!(native_webmcp_object_input(&mut cdp, "S1"));
     }
 
     #[test]
-    fn native_webmcp_false_when_absent() {
-        let mut cdp = fake_cdp(vec![eval_result(json!(false))]);
-        assert!(!native_webmcp(&mut cdp, "S1"));
+    fn native_webmcp_object_input_false_for_old_chrome() {
+        let mut cdp = fake_cdp(vec![
+            json!({ "result": { "product": "Chrome/153.0.0.0" } }),
+        ]);
+        assert!(!native_webmcp_object_input(&mut cdp, "S1"));
+    }
+
+    #[test]
+    fn native_webmcp_object_input_false_when_polyfill() {
+        let mut cdp = fake_cdp(vec![
+            json!({ "result": { "product": "Chrome/155.0.0.0" } }),
+            eval_result(json!(false)),
+        ]);
+        assert!(!native_webmcp_object_input(&mut cdp, "S1"));
     }
 
     #[test]
