@@ -2,7 +2,6 @@ use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::launch;
-use crate::sanitize;
 use crate::session;
 use discovery::{
     classify_response, default_classifiers, default_probes, fingerprint, known_link_rels,
@@ -1159,17 +1158,6 @@ fn emit_event(state: &mut WatcherState, event: &DiscoveryEvent) -> String {
     }
 }
 
-#[allow(dead_code)]
-fn format_via(via: Via) -> &'static str {
-    match via {
-        Via::LinkHeader => "link-header",
-        Via::HtmlLink => "html-link",
-        Via::WellKnown => "well-known",
-        Via::PageApi => "page-api",
-        Via::Response => "response",
-    }
-}
-
 fn ensure_lick_dirs(slicc_dir: &str) {
     let discoveries = format!("{slicc_dir}/discoveries");
     let watches = format!("{slicc_dir}/watches");
@@ -1378,15 +1366,6 @@ mod tests {
     #[test]
     fn extract_origin_about_blank() {
         assert_eq!(extract_origin("about:blank"), None);
-    }
-
-    #[test]
-    fn format_via_all_variants() {
-        assert_eq!(format_via(Via::LinkHeader), "link-header");
-        assert_eq!(format_via(Via::HtmlLink), "html-link");
-        assert_eq!(format_via(Via::WellKnown), "well-known");
-        assert_eq!(format_via(Via::PageApi), "page-api");
-        assert_eq!(format_via(Via::Response), "response");
     }
 
     #[test]
