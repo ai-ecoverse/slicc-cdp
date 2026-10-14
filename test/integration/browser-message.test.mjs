@@ -91,10 +91,7 @@ async function evalRedaction(runner, site) {
   const result = await runner.playwright(['eval', expr], cwd);
   assert.notEqual(result.code, 0);
   const combined = result.stdout + result.stderr;
-  assert.ok(
-    !combined.includes('PW_EVAL_SECRET'),
-    `password leaked in eval:\n${combined}`
-  );
+  assert.ok(!combined.includes('PW_EVAL_SECRET'), `password leaked in eval:\n${combined}`);
   assert.ok(combined.includes('127.0.0.1'), `host should still appear:\n${combined}`);
 
   const full = await runner.playwright(['--full-urls', 'eval', expr], cwd);
