@@ -1036,6 +1036,7 @@ pub fn detect_nlweb_entries(summary: &Value) -> Option<Value> {
     let entries = summary.get("entries").and_then(|v| v.as_array())?;
     let mut ask_url: Option<String> = None;
     let mut mcp_url: Option<String> = None;
+    let mut generic_url: Option<String> = None;
     for entry in entries {
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -1051,22 +1052,20 @@ pub fn detect_nlweb_entries(summary: &Value) -> Option<Value> {
         if url.is_empty() {
             continue;
         }
-        if type_lower == NLWEB_ASK_TYPE || url.contains("/ask") {
-            if ask_url.is_none() {
-                ask_url = Some(url.to_string());
-            }
-        }
-        if url.contains("/mcp") {
-            if mcp_url.is_none() {
-                mcp_url = Some(url.to_string());
-            }
-        }
-        if ask_url.is_none() && mcp_url.is_none() {
+        let explicit_ask = type_lower == NLWEB_ASK_TYPE || url.contains("/ask");
+        let explicit_mcp = url.contains("/mcp");
+        if explicit_ask && ask_url.is_none() {
             ask_url = Some(url.to_string());
+        }
+        if explicit_mcp && mcp_url.is_none() {
+            mcp_url = Some(url.to_string());
+        }
+        if !explicit_ask && !explicit_mcp && generic_url.is_none() {
+            generic_url = Some(url.to_string());
         }
     }
     if ask_url.is_none() && mcp_url.is_none() {
-        return None;
+        ask_url = Some(generic_url?);
     }
     let mut map = serde_json::Map::new();
     if let Some(ref u) = ask_url {
@@ -2531,5 +2530,26 @@ mod tests {
         let found = detect_nlweb_entries(&summary).unwrap();
         assert_eq!(found["askUrl"], "https://example.com/search");
         assert!(found.get("mcpUrl").is_none());
+    }
+
+    #[test]
+    fn detect_nlweb_entries_prefers_an_explicit_ask_over_an_earlier_generic_entry() {
+        let summary = serde_json::json!({ "entries": [
+            { "displayName": "NLWeb service", "url": "https://example.com/service" },
+            { "identifier": "urn:nlweb:search", "type": "application/nlweb+json", "url": "https://example.com/ask" }
+        ] });
+        let found = detect_nlweb_entries(&summary).unwrap();
+        assert_eq!(found["askUrl"], "https://example.com/ask");
+    }
+
+    #[test]
+    fn detect_nlweb_entries_does_not_fall_back_when_only_mcp_is_explicit() {
+        let summary = serde_json::json!({ "entries": [
+            { "displayName": "NLWeb service", "url": "https://example.com/service" },
+            { "identifier": "urn:nlweb:mcp", "url": "https://example.com/mcp" }
+        ] });
+        let found = detect_nlweb_entries(&summary).unwrap();
+        assert!(found.get("askUrl").is_none());
+        assert_eq!(found["mcpUrl"], "https://example.com/mcp");
     }
 }

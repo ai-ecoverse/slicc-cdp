@@ -2243,8 +2243,12 @@ fn json_ok_body(status: u16, content_type: &str, body: String) -> Option<String>
 
 fn mcp_init_payload(status: u16, content_type: &str, body: String) -> Option<String> {
     let media = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    if status != 200 || media != "text/event-stream" {
-        return json_ok_body(status, content_type, body);
+    if media != "text/event-stream" {
+        let body = json_ok_body(status, content_type, body)?;
+        return initialize_response(&serde_json::from_str(&body).ok()?);
+    }
+    if status != 200 {
+        return None;
     }
     body.replace("\r\n", "\n")
         .split("\n\n")
@@ -2256,7 +2260,15 @@ fn mcp_init_payload(status: u16, content_type: &str, body: String) -> Option<Str
                 .collect::<Vec<_>>()
                 .join("\n")
         })
-        .find(|data| serde_json::from_str::<Value>(data).is_ok_and(|value| value.get("result").is_some()))
+        .find_map(|data| initialize_response(&serde_json::from_str::<Value>(&data).ok()?))
+}
+
+fn initialize_response(message: &Value) -> Option<String> {
+    let found = match message {
+        Value::Array(batch) => batch.iter().find(|item| item.get("result").is_some())?,
+        single => single.get("result").map(|_| single)?,
+    };
+    Some(found.to_string())
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -4515,8 +4527,14 @@ mod tests {
         let payload = mcp_init_payload(200, "text/event-stream; charset=utf-8", sse.into()).unwrap();
         assert_eq!(classify_nlweb_mcp_init(&payload).unwrap()["serverInfo"]["name"], "NLWeb");
         assert_eq!(mcp_init_payload(200, "text/event-stream", "data: nope\n\n".into()), None);
+        let batched = "data: [{\"jsonrpc\":\"2.0\",\"method\":\"ping\"},{\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"NLWeb\"}}}]\n\n";
+        let payload = mcp_init_payload(200, "text/event-stream", batched.into()).unwrap();
+        assert_eq!(classify_nlweb_mcp_init(&payload).unwrap()["serverInfo"]["name"], "NLWeb");
+        assert_eq!(mcp_init_payload(200, "text/event-stream", "data: [{\"method\":\"ping\"}]\n\n".into()), None);
         assert_eq!(mcp_init_payload(406, "text/event-stream", sse.into()), None);
-        assert_eq!(mcp_init_payload(200, "application/json", "{}".into()).as_deref(), Some("{}"));
+        assert_eq!(mcp_init_payload(200, "application/json", "{}".into()), None);
+        assert_eq!(mcp_init_payload(200, "application/json", "nope".into()), None);
+        assert_eq!(mcp_init_payload(200, "application/json", "[{\"result\":{}}]".into()).as_deref(), Some("{\"result\":{}}"));
     }
 
     #[test]

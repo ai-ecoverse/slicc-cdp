@@ -517,6 +517,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--json", "emit JSON instead of human-readable text"),
                 ("--no-probe", "skip well-known probe requests"),
                 ("--probe robots", "also probe /robots.txt for Agentmap: lines"),
+                ("--probe nlweb", "also probe /ask and POST an MCP initialize to /mcp for NLWeb"),
                 ("--follow", "fetch nested ARD catalogs one level deep and follow link targets"),
                 ("--exec <cmd>", "run a command for each event (not available in wasm)"),
                 ("--exec-timeout <seconds>", "timeout for --exec commands (default: 10)"),
@@ -629,4 +630,14 @@ fn arg_optional(spec: &Spec, index: usize) -> bool {
             | ("record", 0)
             | ("highlight", 0)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn discover_help_lists_both_opt_in_probes() {
+        let text = super::implemented_page("discover").unwrap();
+        assert!(text.contains("--probe robots"));
+        assert!(text.contains("--probe nlweb"));
+    }
 }
