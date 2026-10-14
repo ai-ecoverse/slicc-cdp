@@ -6,7 +6,7 @@ use crate::session;
 use discovery::{
     classify_response, classify_slicc_handoff, default_classifiers,
     default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
-    parse_link_header, classify_ard_body, parse_robots_txt_agentmap,
+    parse_link_header, classify_ard_body, classify_ai_catalog_body, parse_robots_txt_agentmap,
     ClassifierRegistry, DedupSet, DiscoveryEvent,
     ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
@@ -819,6 +819,7 @@ fn handle_response(
                         let event = DiscoveryEvent {
                             v: EVENT_VERSION,
                             standard: "slicc-handoff".into(),
+                            aliases: None,
                             origin: origin.clone(),
                             url: link.href.clone(),
                             via: Via::LinkHeader,
@@ -845,6 +846,7 @@ fn handle_response(
                 let event = DiscoveryEvent {
                     v: EVENT_VERSION,
                     standard,
+                    aliases: None,
                     origin: origin.clone(),
                     url: link.href.clone(),
                     via: Via::LinkHeader,
@@ -867,6 +869,7 @@ fn handle_response(
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: signal.standard.clone(),
+            aliases: None,
             origin: origin.clone(),
             url: url.clone(),
             via: Via::Response,
@@ -996,6 +999,7 @@ fn emit_page_signals(
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard,
+            aliases: None,
             origin: origin.clone(),
             url: dedup_url,
             via,
@@ -1042,6 +1046,14 @@ fn run_probes(
     let target_id = sess.target_id.clone();
 
     let probe_requests = state.probes.probes_for_origin(origin);
+    let mut ard_body: Option<String> = None;
+    let mut ai_catalog_body: Option<String> = None;
+    struct PendingProbe {
+        standard: String,
+        url: String,
+        body: String,
+    }
+    let mut pending: Vec<PendingProbe> = Vec::new();
     for probe_req in &probe_requests {
         if cdp.guard().url(&probe_req.url) {
             continue;
@@ -1066,42 +1078,69 @@ fn run_probes(
 
         if let Some(probe_match) = probe_match_result
         {
-            let classification = if probe_match.probe.standard == "ard" {
-                Some(classify_ard_body(&probe_match.body, Some(origin)))
-            } else {
-                state
-                    .classifiers
-                    .classify(&probe_match.probe.standard, &probe_match.body)
-            };
-            let (validity, summary, reason) = match classification {
-                Some(c) => (c.status, c.summary, c.reason),
-                None => (
-                    Validity::Valid,
-                    json!({ "url": probe_match.url }),
-                    None,
-                ),
-            };
-            if !state.dedup.is_new(origin, &probe_match.probe.standard, &probe_match.url) {
-                continue;
+            if probe_match.probe.standard == "ard" {
+                ard_body = Some(probe_match.body.clone());
+            } else if probe_match.probe.standard == "ai-catalog" {
+                ai_catalog_body = Some(probe_match.body.clone());
             }
-            let event = DiscoveryEvent {
-                v: EVENT_VERSION,
+            pending.push(PendingProbe {
                 standard: probe_match.probe.standard.clone(),
-                origin: origin.to_string(),
                 url: probe_match.url,
-                via: Via::WellKnown,
-                page: page_url.clone(),
-                target_id: target_id.clone(),
-                status: validity,
-                summary: summary.clone(),
-                reason,
-            };
-            output.push_str(&emit_event(state, &event));
-            if state.follow_mode && event.standard == "ard" {
-                output.push_str(&follow_ard_catalogs(
-                    cdp, state, session_id, origin, &frame_id, &page_url, &target_id, &summary,
-                ));
-            }
+                body: probe_match.body,
+            });
+        }
+    }
+
+    let alias_merge = match (&ard_body, &ai_catalog_body) {
+        (Some(a), Some(b)) if a == b => true,
+        _ => false,
+    };
+
+    for p in &pending {
+        if alias_merge && p.standard == "ai-catalog" {
+            continue;
+        }
+        let classification = if p.standard == "ard" {
+            Some(classify_ard_body(&p.body, Some(origin)))
+        } else if p.standard == "ai-catalog" {
+            Some(classify_ai_catalog_body(&p.body, Some(origin)))
+        } else {
+            state.classifiers.classify(&p.standard, &p.body)
+        };
+        let (validity, summary, reason) = match classification {
+            Some(c) => (c.status, c.summary, c.reason),
+            None => (
+                Validity::Valid,
+                json!({ "url": p.url }),
+                None,
+            ),
+        };
+        if !state.dedup.is_new(origin, &p.standard, &p.url) {
+            continue;
+        }
+        let aliases = if alias_merge && p.standard == "ard" {
+            Some(vec!["ai-catalog".to_string()])
+        } else {
+            None
+        };
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: p.standard.clone(),
+            aliases,
+            origin: origin.to_string(),
+            url: p.url.clone(),
+            via: Via::WellKnown,
+            page: page_url.clone(),
+            target_id: target_id.clone(),
+            status: validity,
+            summary: summary.clone(),
+            reason,
+        };
+        output.push_str(&emit_event(state, &event));
+        if state.follow_mode && (event.standard == "ard" || event.standard == "ai-catalog") {
+            output.push_str(&follow_ard_catalogs(
+                cdp, state, session_id, origin, &frame_id, &page_url, &target_id, &summary,
+            ));
         }
     }
 
@@ -1149,6 +1188,7 @@ fn run_probes(
                         let event = DiscoveryEvent {
                             v: EVENT_VERSION,
                             standard: "ard".into(),
+                            aliases: None,
                             origin: origin.to_string(),
                             url: resolved,
                             via: Via::WellKnown,
@@ -1453,7 +1493,7 @@ fn write_lick_file(slicc_dir: &str, original: &DiscoveryEvent, display: &Discove
     let fp = fingerprint(&original.origin, &original.standard, &original.url);
     let hash = cdp_client::hash::sha256_hex(fp.as_bytes());
     let path = format!("{slicc_dir}/discoveries/{hash}.json");
-    let raw = serde_json::to_string_pretty(&json!({
+    let mut obj = json!({
         "v": display.v,
         "standard": display.standard,
         "origin": display.origin,
@@ -1463,7 +1503,11 @@ fn write_lick_file(slicc_dir: &str, original: &DiscoveryEvent, display: &Discove
         "targetId": display.target_id,
         "status": display.status,
         "summary": display.summary,
-    }))
+    });
+    if let Some(ref aliases) = display.aliases {
+        obj["aliases"] = json!(aliases);
+    }
+    let raw = serde_json::to_string_pretty(&obj)
     .unwrap_or_default();
     let content = safe_json_str(&raw);
     atomic_write(&path, content.as_bytes());
@@ -1670,6 +1714,8 @@ fn follow_links(
 
         let classification = if standard == "ard" {
             Some(classify_ard_body(&body, Some(&origin)))
+        } else if standard == "ai-catalog" {
+            Some(classify_ai_catalog_body(&body, Some(&origin)))
         } else {
             state.classifiers.classify(&standard, &body)
         };
@@ -1690,6 +1736,7 @@ fn follow_links(
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: standard.clone(),
+            aliases: None,
             origin: origin.clone(),
             url: link.href.clone(),
             via: Via::LinkHeader,
@@ -1700,7 +1747,7 @@ fn follow_links(
             reason,
         };
         output.push_str(&emit_event(state, &event));
-        if standard == "ard" && state.follow_mode {
+        if (standard == "ard" || standard == "ai-catalog") && state.follow_mode {
             output.push_str(&follow_ard_catalogs(
                 cdp, state, session_id, &origin, &frame_id, &page_url, &target_id, &summary,
             ));
@@ -1713,6 +1760,7 @@ fn follow_links(
             let event = DiscoveryEvent {
                 v: EVENT_VERSION,
                 standard: "follow-failures".into(),
+                aliases: None,
                 origin: origin.clone(),
                 url: page_url.clone(),
                 via: Via::LinkHeader,
@@ -1775,6 +1823,7 @@ fn follow_ard_catalogs(
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: cat_origin,
             url: cat_url,
             via: Via::WellKnown,
@@ -1870,6 +1919,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -1904,6 +1954,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2269,6 +2320,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://evil.com".into(),
             url: "https://evil.com/\x1b[31mred\x1b[0m".into(),
             via: Via::LinkHeader,
@@ -2299,6 +2351,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://evil.com".into(),
             url: "https://evil.com/\x1b[31m".into(),
             via: Via::LinkHeader,
@@ -2363,6 +2416,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2392,6 +2446,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://evil.com".into(),
             url: "https://evil.com/$(rm -rf /)".into(),
             via: Via::WellKnown,
@@ -2464,6 +2519,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2493,6 +2549,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://evil.com".into(),
             url: "https://evil.com/$(touch /tmp/pwned)\"'`backtick`".into(),
             via: Via::WellKnown,
@@ -2520,6 +2577,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2544,6 +2602,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/".into(),
             via: Via::WellKnown,
@@ -2574,6 +2633,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2605,6 +2665,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2631,6 +2692,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://evil.com".into(),
             url: "https://evil.com/$(touch /tmp/pwned2)\"'`backtick`".into(),
             via: Via::WellKnown,
@@ -2663,6 +2725,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2788,6 +2851,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://user:pass@example.com".into(),
             url: "https://user:pass@example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -2835,6 +2899,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/\x7f".into(),
             via: Via::WellKnown,

@@ -1190,3 +1190,307 @@ test('discover ARD html-link without probe', { timeout: 60_000 }, async () => {
     htmlLinkServer.close();
   }
 });
+
+test('discover ai-catalog', { timeout: 120_000 }, async (t) => {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+
+    await t.test('well-known ai-catalog.json probe', async () => {
+      const catServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        const origin = `http://127.0.0.1:${catServer.address().port}`;
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>AI Catalog</title><p>hello</p>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ai-catalog.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Catalog Only',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:search`,
+                  displayName: 'Search MCP',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/mcp/search.json`,
+                  capabilities: ['SearchTool'],
+                },
+                {
+                  identifier: `urn:air:127.0.0.1:dataset:prices`,
+                  displayName: 'Price Dataset',
+                  type: 'application/dataset+json',
+                  url: `${origin}/data/prices.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => catServer.listen(0, '127.0.0.1', r));
+      const catOrigin = `http://127.0.0.1:${catServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${catOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        const events = parseEvents(result.stdout);
+        const aiCat = events.find((e) => e.standard === 'ai-catalog' && e.via === 'well-known');
+        assert.ok(aiCat, `ai-catalog well-known event: ${result.stdout}`);
+        assert.equal(aiCat.status, 'valid');
+        assert.ok(Array.isArray(aiCat.summary.entries), 'summary.entries is array');
+        assert.equal(aiCat.summary.entries.length, 2, 'two entries');
+        const types = aiCat.summary.types;
+        assert.ok(types, 'types present');
+        assert.ok(types['application/mcp-server-card+json'], 'MCP server type counted');
+        assert.ok(types['application/dataset+json'], 'dataset type counted');
+      } finally {
+        catServer.closeAllConnections();
+        catServer.close();
+      }
+    });
+
+    await t.test('alias rule: identical ard and ai-catalog give one event with aliases', async () => {
+      const sharedPayload = JSON.stringify({
+        name: 'Shared',
+        entries: [
+          {
+            identifier: 'urn:air:127.0.0.1:server:tool1',
+            displayName: 'Tool One',
+            type: 'application/mcp-server-card+json',
+            url: 'http://127.0.0.1/mcp.json',
+          },
+        ],
+      });
+      const aliasServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Alias</title><p>hi</p>');
+          return;
+        }
+        if (
+          url.pathname === '/.well-known/ard.json' ||
+          url.pathname === '/.well-known/ai-catalog.json'
+        ) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(sharedPayload);
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => aliasServer.listen(0, '127.0.0.1', r));
+      const aliasOrigin = `http://127.0.0.1:${aliasServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${aliasOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        const events = parseEvents(result.stdout);
+        const ardEvents = events.filter((e) => e.standard === 'ard' && e.via === 'well-known');
+        const aiCatEvents = events.filter(
+          (e) => e.standard === 'ai-catalog' && e.via === 'well-known'
+        );
+        assert.equal(
+          ardEvents.length,
+          1,
+          `exactly one ard event: ${result.stdout}`
+        );
+        assert.equal(
+          aiCatEvents.length,
+          0,
+          `no separate ai-catalog event when alias: ${result.stdout}`
+        );
+        const ard = ardEvents[0];
+        assert.ok(
+          Array.isArray(ard.aliases) && ard.aliases.includes('ai-catalog'),
+          `aliases must include ai-catalog: ${JSON.stringify(ard.aliases)}`
+        );
+      } finally {
+        aliasServer.closeAllConnections();
+        aliasServer.close();
+      }
+    });
+
+    await t.test('alias rule: different ard and ai-catalog give two events', async () => {
+      const diffServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        const origin = `http://127.0.0.1:${diffServer.address().port}`;
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Diff</title><p>hi</p>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'ARD Only',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:ard-tool`,
+                  displayName: 'ARD Tool',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/ard-mcp.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        if (url.pathname === '/.well-known/ai-catalog.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Catalog Only',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:agent:cat-agent`,
+                  displayName: 'Cat Agent',
+                  type: 'application/a2a-agent-card+json',
+                  url: `${origin}/cat-agent.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => diffServer.listen(0, '127.0.0.1', r));
+      const diffOrigin = `http://127.0.0.1:${diffServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${diffOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        const events = parseEvents(result.stdout);
+        const ardEvents = events.filter((e) => e.standard === 'ard' && e.via === 'well-known');
+        const aiCatEvents = events.filter(
+          (e) => e.standard === 'ai-catalog' && e.via === 'well-known'
+        );
+        assert.equal(ardEvents.length, 1, `one ard event: ${result.stdout}`);
+        assert.equal(aiCatEvents.length, 1, `one ai-catalog event: ${result.stdout}`);
+        assert.equal(ardEvents[0].summary.name, 'ARD Only');
+        assert.equal(aiCatEvents[0].summary.name, 'Catalog Only');
+        assert.ok(
+          !ardEvents[0].aliases || ardEvents[0].aliases.length === 0,
+          'no aliases when different'
+        );
+      } finally {
+        diffServer.closeAllConnections();
+        diffServer.close();
+      }
+    });
+
+    await t.test('Link rel=ai-catalog header', async () => {
+      const linkCatServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            link: '</.well-known/ai-catalog.json>; rel="ai-catalog"',
+          });
+          res.end('<!doctype html><title>Link AI Cat</title><p>hi</p>');
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => linkCatServer.listen(0, '127.0.0.1', r));
+      const linkCatOrigin = `http://127.0.0.1:${linkCatServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${linkCatOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        const events = parseEvents(result.stdout);
+        const aiCatLink = events.find(
+          (e) => e.standard === 'ai-catalog' && e.via === 'link-header'
+        );
+        assert.ok(aiCatLink, `ai-catalog link-header event: ${result.stdout}`);
+        assert.ok(
+          aiCatLink.url.includes('/.well-known/ai-catalog.json'),
+          `href resolved: ${aiCatLink.url}`
+        );
+      } finally {
+        linkCatServer.closeAllConnections();
+        linkCatServer.close();
+      }
+    });
+
+    await t.test('html link rel=ai-catalog from page scan', async () => {
+      const htmlCatServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            link: '</catalog.json>; rel="ai-catalog"',
+          });
+          res.end(
+            '<!doctype html><html><head><link rel="ai-catalog" href="/catalog.json"><title>HTML Cat</title></head><body><p>hi</p></body></html>'
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => htmlCatServer.listen(0, '127.0.0.1', r));
+      const htmlCatOrigin = `http://127.0.0.1:${htmlCatServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--no-probe', '--once', `${htmlCatOrigin}/`],
+          cwd
+        );
+        assert.equal(
+          result.code,
+          0,
+          `exit ${result.code}, stderr: ${result.stderr}, stdout: ${result.stdout}`
+        );
+        const events = parseEvents(result.stdout);
+        const catEvent = events.find((e) => e.standard === 'ai-catalog');
+        assert.ok(catEvent, `ai-catalog event expected: ${result.stdout}`);
+        assert.ok(
+          catEvent.via === 'html-link' || catEvent.via === 'link-header',
+          `via must be html-link or link-header: ${catEvent.via}`
+        );
+        assert.ok(catEvent.url.includes('/catalog.json'), `href resolved: ${catEvent.url}`);
+      } finally {
+        htmlCatServer.closeAllConnections();
+        htmlCatServer.close();
+      }
+    });
+  } finally {
+    await settle(browser?.close());
+  }
+});
