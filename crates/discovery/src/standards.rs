@@ -1030,6 +1030,90 @@ fn classify_poppy_value(value: &Value, origin_domain: Option<&str>) -> Classific
     }
 }
 
+const NLWEB_ASK_TYPE: &str = "application/nlweb+json";
+
+pub fn detect_nlweb_entries(summary: &Value) -> Option<Value> {
+    let entries = summary.get("entries").and_then(|v| v.as_array())?;
+    let mut ask_url: Option<String> = None;
+    let mut mcp_url: Option<String> = None;
+    for entry in entries {
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let url = entry.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let id_lower = entry.get("identifier").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+        let name_lower = entry.get("displayName").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+        let type_lower = entry_type.to_ascii_lowercase();
+        let is_nlweb = type_lower.contains("nlweb")
+            || id_lower.contains("nlweb")
+            || name_lower.contains("nlweb");
+        if !is_nlweb {
+            continue;
+        }
+        if url.is_empty() {
+            continue;
+        }
+        if type_lower == NLWEB_ASK_TYPE || url.contains("/ask") {
+            if ask_url.is_none() {
+                ask_url = Some(url.to_string());
+            }
+        }
+        if url.contains("/mcp") {
+            if mcp_url.is_none() {
+                mcp_url = Some(url.to_string());
+            }
+        }
+        if ask_url.is_none() && mcp_url.is_none() {
+            ask_url = Some(url.to_string());
+        }
+    }
+    if ask_url.is_none() && mcp_url.is_none() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    if let Some(ref u) = ask_url {
+        map.insert("askUrl".into(), Value::String(u.clone()));
+    }
+    if let Some(ref u) = mcp_url {
+        map.insert("mcpUrl".into(), Value::String(u.clone()));
+    }
+    Some(Value::Object(map))
+}
+
+pub fn classify_nlweb_ask(body: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let is_nlweb_shape = parsed.get("response").is_some()
+        || parsed.get("results").is_some()
+        || parsed.get("answer").is_some();
+    if !is_nlweb_shape {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    if let Some(name) = parsed.get("name").and_then(|v| v.as_str()) {
+        map.insert("serverName".into(), Value::String(truncate(name, TITLE_CAP)));
+    }
+    Some(Value::Object(map))
+}
+
+pub fn classify_nlweb_mcp_init(body: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let server_info = parsed.get("result")
+        .and_then(|r| r.get("serverInfo"));
+    let server_name = server_info
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    if server_name.to_ascii_lowercase().contains("nlweb") {
+        let mut map = serde_json::Map::new();
+        let mut si = serde_json::Map::new();
+        si.insert("name".into(), Value::String(truncate(server_name, TITLE_CAP)));
+        if let Some(version) = server_info.and_then(|s| s.get("version")).and_then(|v| v.as_str()) {
+            si.insert("version".into(), Value::String(truncate(version, TITLE_CAP)));
+        }
+        map.insert("serverInfo".into(), Value::Object(si));
+        return Some(Value::Object(map));
+    }
+    None
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -2346,5 +2430,95 @@ mod tests {
     fn find_url_in_line_none_when_absent() {
         let url = find_url_in_line("No URL here");
         assert!(url.is_none());
+    }
+
+    #[test]
+    fn detect_nlweb_entries_found() {
+        let summary = serde_json::json!({
+            "name": "Test",
+            "entries": [
+                {
+                    "identifier": "urn:nlweb:example",
+                    "displayName": "NLWeb Search",
+                    "type": "application/nlweb+json",
+                    "url": "https://example.com/ask"
+                }
+            ]
+        });
+        let result = detect_nlweb_entries(&summary);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(val.get("askUrl").and_then(|v| v.as_str()), Some("https://example.com/ask"));
+    }
+
+    #[test]
+    fn detect_nlweb_entries_mcp() {
+        let summary = serde_json::json!({
+            "entries": [
+                {
+                    "identifier": "urn:nlweb:mcp",
+                    "displayName": "NLWeb MCP",
+                    "type": "application/mcp",
+                    "url": "https://example.com/mcp"
+                }
+            ]
+        });
+        let result = detect_nlweb_entries(&summary);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(val.get("mcpUrl").and_then(|v| v.as_str()), Some("https://example.com/mcp"));
+    }
+
+    #[test]
+    fn detect_nlweb_entries_none_without_nlweb() {
+        let summary = serde_json::json!({
+            "entries": [
+                {
+                    "identifier": "urn:example:api",
+                    "displayName": "Regular API",
+                    "type": "application/json",
+                    "url": "https://example.com/api"
+                }
+            ]
+        });
+        assert!(detect_nlweb_entries(&summary).is_none());
+    }
+
+    #[test]
+    fn classify_nlweb_ask_valid() {
+        let body = r#"{"response":"hello","results":[]}"#;
+        let result = classify_nlweb_ask(body);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn classify_nlweb_ask_not_nlweb() {
+        let body = r#"{"data":{"items":[]}}"#;
+        assert!(classify_nlweb_ask(body).is_none());
+    }
+
+    #[test]
+    fn classify_nlweb_ask_invalid_json() {
+        assert!(classify_nlweb_ask("not json").is_none());
+    }
+
+    #[test]
+    fn classify_nlweb_mcp_init_valid() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"NLWeb Server","version":"0.5"},"protocolVersion":"2025-03-26"}}"#;
+        let result = classify_nlweb_mcp_init(body);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(val.get("serverInfo").and_then(|s| s.get("name")).and_then(|n| n.as_str()), Some("NLWeb Server"));
+    }
+
+    #[test]
+    fn classify_nlweb_mcp_init_not_nlweb() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"Generic MCP","version":"1.0"},"protocolVersion":"2025-03-26"}}"#;
+        assert!(classify_nlweb_mcp_init(body).is_none());
+    }
+
+    #[test]
+    fn classify_nlweb_mcp_init_invalid_json() {
+        assert!(classify_nlweb_mcp_init("not json").is_none());
     }
 }

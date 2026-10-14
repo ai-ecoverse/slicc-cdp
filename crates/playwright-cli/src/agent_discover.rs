@@ -8,6 +8,7 @@ use discovery::{
     default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
     parse_link_header, classify_ard_body, classify_ai_catalog_body,
     classify_poppy_body, registrable_domain, parse_robots_txt_agentmap,
+    detect_nlweb_entries, classify_nlweb_ask, classify_nlweb_mcp_init,
     ClassifierRegistry, DedupSet, DiscoveryEvent,
     ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
@@ -131,6 +132,7 @@ struct WatcherState {
     json_mode: bool,
     follow_mode: bool,
     robots_probe: bool,
+    nlweb_probe: bool,
     no_probe: bool,
     events_emitted: usize,
     event_cursor: usize,
@@ -161,6 +163,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let no_probe = invocation.flags.contains_key("no-probe");
     let follow_mode = invocation.flags.contains_key("follow");
     let robots_probe = invocation.flags.get("probe").map_or(false, |v| v == "robots");
+    let nlweb_probe = invocation.flags.get("probe").map_or(false, |v| v == "nlweb");
     let exec_cmd = invocation.flags.get("exec").cloned();
     let lick_mode = invocation.flags.contains_key("lick");
     let exec_timeout = invocation
@@ -227,6 +230,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         json_mode,
         follow_mode,
         robots_probe,
+        nlweb_probe,
         no_probe,
         events_emitted: 0,
         event_cursor: 0,
@@ -1338,6 +1342,9 @@ fn run_probes(
             reason,
         };
         output.push_str(&emit_event(state, &event));
+        if event.standard == "ard" || event.standard == "ai-catalog" {
+            output.push_str(&emit_nlweb_from_catalog(state, origin, &page_url, &target_id, &summary));
+        }
         if state.follow_mode && (event.standard == "ard" || event.standard == "ai-catalog") {
             output.push_str(&follow_ard_catalogs(
                 cdp, state, session_id, origin, &frame_id, &page_url, &target_id, &summary,
@@ -1400,6 +1407,7 @@ fn run_probes(
                             reason: classification.reason,
                         };
                         output.push_str(&emit_event(state, &event));
+                        output.push_str(&emit_nlweb_from_catalog(state, origin, &page_url, &target_id, &summary_clone));
                         if state.follow_mode {
                             output.push_str(&follow_ard_catalogs(
                                 cdp, state, session_id, origin, &frame_id, &page_url, &target_id, &summary_clone,
@@ -1409,6 +1417,10 @@ fn run_probes(
                 }
             }
         }
+    }
+
+    if state.nlweb_probe {
+        output.push_str(&run_nlweb_probes(cdp, state, session_id, origin));
     }
 
     output
@@ -2009,6 +2021,9 @@ fn follow_links(
             reason,
         };
         output.push_str(&emit_event(state, &event));
+        if standard == "ard" || standard == "ai-catalog" {
+            output.push_str(&emit_nlweb_from_catalog(state, &origin, &page_url, &target_id, &summary));
+        }
         if (standard == "ard" || standard == "ai-catalog") && state.follow_mode {
             output.push_str(&follow_ard_catalogs(
                 cdp, state, session_id, &origin, &frame_id, &page_url, &target_id, &summary,
@@ -2037,6 +2052,239 @@ fn follow_links(
     }
 
     output
+}
+
+fn emit_nlweb_from_catalog(
+    state: &mut WatcherState,
+    origin: &str,
+    page_url: &str,
+    target_id: &str,
+    summary: &Value,
+) -> String {
+    let mut output = String::new();
+    let nlweb = match discovery::detect_nlweb_entries(summary) {
+        Some(s) => s,
+        None => return output,
+    };
+    let ask_url = nlweb.get("askUrl").and_then(|v| v.as_str()).unwrap_or("");
+    let mcp_url = nlweb.get("mcpUrl").and_then(|v| v.as_str()).unwrap_or("");
+    let dedup_key = format!("nlweb-catalog:{}{}", ask_url, mcp_url);
+    if !state.dedup.is_new(origin, "nlweb", &dedup_key) {
+        return output;
+    }
+    let url = if !ask_url.is_empty() { ask_url.to_string() } else { mcp_url.to_string() };
+    let event = DiscoveryEvent {
+        v: EVENT_VERSION,
+        standard: "nlweb".into(),
+        aliases: None,
+        origin: origin.to_string(),
+        url,
+        via: Via::Catalog,
+        page: page_url.to_string(),
+        target_id: target_id.to_string(),
+        status: Validity::Valid,
+        summary: nlweb,
+        reason: None,
+    };
+    output.push_str(&emit_event(state, &event));
+    output
+}
+
+fn run_nlweb_probes(
+    cdp: &mut Cdp,
+    state: &mut WatcherState,
+    session_id: &str,
+    origin: &str,
+) -> String {
+    let mut output = String::new();
+    let dedup_key = format!("nlweb-probe:{origin}");
+    if !state.dedup.is_new(origin, "nlweb-probe", &dedup_key) {
+        return output;
+    }
+    if cdp.guard().url(origin) || is_reserved_cdp_origin(origin) {
+        return output;
+    }
+    let sess = match state.sessions.get(session_id) {
+        Some(s) => s,
+        None => return output,
+    };
+    let frame_id = match &sess.top_frame_id {
+        Some(id) => id.clone(),
+        None => return output,
+    };
+    let page_url = sess.page_url.clone();
+    let target_id = sess.target_id.clone();
+    let mut ask_summary: Option<Value> = None;
+    let mut mcp_summary: Option<Value> = None;
+    let ask_url = format!("{}/ask?query=", origin.trim_end_matches('/'));
+    if !cdp.guard().url(&ask_url) {
+        let ask_result = isolated_world_probe(cdp, session_id, &frame_id, &ask_url);
+        let body = match ask_result {
+            IsolatedProbeResult::Ok(status, ct, body) => {
+                if status == 200 && is_json_content_type(&ct) {
+                    Some(body)
+                } else {
+                    None
+                }
+            }
+            IsolatedProbeResult::Final => None,
+            IsolatedProbeResult::Unavailable => {
+                match native_probe(&ask_url, "application/json") {
+                    Some((s, ct, b)) if s == 200 && is_json_content_type(&ct) => Some(b),
+                    _ => None,
+                }
+            }
+        };
+        if let Some(ref b) = body {
+            ask_summary = discovery::classify_nlweb_ask(b);
+        }
+    }
+    let mcp_url = format!("{}/mcp", origin.trim_end_matches('/'));
+    if !cdp.guard().url(&mcp_url) {
+        let mcp_body = nlweb_mcp_probe(cdp, session_id, &frame_id, &mcp_url)
+            .or_else(|| nlweb_mcp_probe_native(&mcp_url));
+        if let Some(ref b) = mcp_body {
+            mcp_summary = discovery::classify_nlweb_mcp_init(b);
+        }
+    }
+    if ask_summary.is_none() && mcp_summary.is_none() {
+        return output;
+    }
+    let mut map = serde_json::Map::new();
+    map.insert("askUrl".into(), Value::String(ask_url.clone()));
+    map.insert("mcpUrl".into(), Value::String(mcp_url.clone()));
+    if let Some(ref ask) = ask_summary {
+        if let Some(name) = ask.get("serverName") {
+            map.insert("serverName".into(), name.clone());
+        }
+    }
+    if let Some(ref mcp) = mcp_summary {
+        if let Some(si) = mcp.get("serverInfo") {
+            map.insert("serverInfo".into(), si.clone());
+        }
+    }
+    let event = DiscoveryEvent {
+        v: EVENT_VERSION,
+        standard: "nlweb".into(),
+        aliases: None,
+        origin: origin.to_string(),
+        url: ask_url,
+        via: Via::WellKnown,
+        page: page_url,
+        target_id,
+        status: Validity::Valid,
+        summary: Value::Object(map),
+        reason: None,
+    };
+    output.push_str(&emit_event(state, &event));
+    output
+}
+
+fn nlweb_mcp_probe(
+    cdp: &mut Cdp,
+    session_id: &str,
+    frame_id: &str,
+    url: &str,
+) -> Option<String> {
+    let init_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "slicc-discover", "version": "0.1" }
+        }
+    });
+    let body_str = serde_json::to_string(&init_body).ok()?;
+    let world = cdp.call(
+        "Page.createIsolatedWorld",
+        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+        Some(session_id),
+    ).ok()?;
+    let ctx_id = world.get("executionContextId").and_then(|v| v.as_u64())?;
+    let js = format!(
+        r#"(async () => {{
+  const cap = 1048576;
+  let r;
+  try {{
+    r = await fetch({url}, {{method:'POST',credentials:'omit',redirect:'manual',cache:'no-store',headers:{{'Content-Type':'application/json','Accept':'application/json'}},body:{body}}});
+  }} catch(e) {{ return JSON.stringify({{err:e.message}}); }}
+  if (r.type === 'opaqueredirect') return JSON.stringify({{err:'redirect'}});
+  const ct = r.headers.get('content-type') || '';
+  let text = '';
+  if (r.body) {{
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let total = 0;
+    while (true) {{
+      const {{done, value}} = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      text += dec.decode(value, {{stream:true}});
+      if (total > cap) {{ reader.cancel(); text = text.slice(0, cap); break; }}
+    }}
+  }}
+  return JSON.stringify({{status:r.status,ct,body:text}});
+}})()
+"#,
+        url = serde_json::to_string(url).unwrap_or_default(),
+        body = serde_json::to_string(&body_str).unwrap_or_default(),
+    );
+    let result = cdp.call_for(
+        "Runtime.evaluate",
+        json!({
+            "expression": js,
+            "contextId": ctx_id,
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+        Some(session_id),
+        Duration::from_secs(5),
+    ).ok()?;
+    let value_str = result.pointer("/result/value").and_then(|v| v.as_str())?;
+    let parsed: Value = serde_json::from_str(value_str).ok()?;
+    if parsed.get("err").is_some() {
+        return None;
+    }
+    let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    if status != 200 {
+        return None;
+    }
+    let ct = parsed.get("ct").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_json_content_type(ct) {
+        return None;
+    }
+    parsed.get("body").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn nlweb_mcp_probe_native(url: &str) -> Option<String> {
+    let init_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "slicc-discover", "version": "0.1" }
+        }
+    });
+    let body_str = serde_json::to_string(&init_body).ok()?;
+    let resp = cdp_client::net::http_post_json(url, &body_str).ok()?;
+    if resp.status != 200 {
+        return None;
+    }
+    let ct = resp.content_type().to_string();
+    if !is_json_content_type(&ct) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&resp.body).into_owned())
+}
+
+#[cfg(target_os = "wasi")]
+fn nlweb_mcp_probe_native(_url: &str) -> Option<String> {
+    None
 }
 
 fn follow_ard_catalogs(
@@ -2173,7 +2421,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             
             
@@ -2209,7 +2457,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             
             
@@ -2244,7 +2492,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             
             
@@ -2272,7 +2520,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             
             
@@ -2308,7 +2556,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             
             
@@ -2396,7 +2644,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -2432,7 +2680,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -2468,7 +2716,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -2584,7 +2832,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -2616,7 +2864,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -2785,7 +3033,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() },
         };
@@ -2992,7 +3240,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3119,7 +3367,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3168,7 +3416,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3255,7 +3503,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3296,7 +3544,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3335,7 +3583,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3373,7 +3621,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3432,7 +3680,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3481,7 +3729,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3674,7 +3922,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3713,7 +3961,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3755,7 +4003,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3791,7 +4039,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3834,7 +4082,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3875,7 +4123,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3916,7 +4164,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3953,7 +4201,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
-            robots_probe: false,
+            robots_probe: false, nlweb_probe: false,
             no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
@@ -3978,5 +4226,97 @@ mod tests {
         let output = handle_response(&mut cdp, &mut state, "S1", &params);
         assert!(output.is_empty(), "401 from reserved CDP port must produce no event: {output}");
         assert!(!state.probed_origins.contains("http://127.0.0.1:9222"), "must not probe reserved CDP port");
+    }
+
+    #[test]
+    fn emit_nlweb_from_catalog_with_nlweb_entry() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false, nlweb_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        let summary = json!({
+            "name": "Test",
+            "entries": [{
+                "identifier": "urn:nlweb:search",
+                "displayName": "NLWeb Search",
+                "type": "application/nlweb+json",
+                "url": "https://example.com/ask"
+            }]
+        });
+        let output = emit_nlweb_from_catalog(
+            &mut state,
+            "https://example.com",
+            "https://example.com/",
+            "T1",
+            &summary,
+        );
+        assert!(output.contains("nlweb"), "expected nlweb event: {output}");
+        let parsed: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["standard"], "nlweb");
+        assert_eq!(parsed["via"], "catalog");
+        assert!(parsed["summary"]["askUrl"].as_str().unwrap().contains("/ask"));
+    }
+
+    #[test]
+    fn emit_nlweb_from_catalog_no_nlweb_entries() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false, nlweb_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        let summary = json!({
+            "name": "Test",
+            "entries": [{
+                "identifier": "urn:example:api",
+                "displayName": "Regular API",
+                "type": "application/json",
+                "url": "https://example.com/api"
+            }]
+        });
+        let output = emit_nlweb_from_catalog(
+            &mut state,
+            "https://example.com",
+            "https://example.com/",
+            "T1",
+            &summary,
+        );
+        assert!(output.is_empty(), "no nlweb entry should produce no event: {output}");
+    }
+
+    #[test]
+    fn nlweb_probe_flag_parsed() {
+        let mut flags = BTreeMap::new();
+        flags.insert("off".to_string(), "true".to_string());
+        flags.insert("probe".to_string(), "nlweb".to_string());
+        let invocation = Invocation {
+            command: Some("discover".to_string()),
+            positionals: vec![],
+            flags,
+            multi: BTreeMap::new(),
+            cdp: None,
+            runtime: None,
+            session: None,
+            full_urls: false,
+            help: false,
+            command_help: false,
+            version: false,
+        };
+        let output = run(&invocation, None);
+        assert_eq!(output.code, 0);
     }
 }

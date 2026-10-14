@@ -275,7 +275,25 @@ pub fn accessibility_tree(cdp: &mut Cdp, session: &str, frame_id: Option<&str>) 
 
 pub fn frame_tree(cdp: &mut Cdp, session: &str) -> Result<Vec<FrameRec>, String> {
     let result = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
-    Ok(snapshot::flatten_frame_tree(&result))
+    let frames = snapshot::flatten_frame_tree(&result);
+    let has_empty_child = frames.iter().any(|f| f.parent_frame_id.is_some() && f.url.is_empty());
+    if !has_empty_child {
+        return Ok(frames);
+    }
+    let _ = cdp.call("Page.enable", json!({}), Some(session));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    while std::time::Instant::now() < deadline {
+        let _ = cdp.pump(std::time::Instant::now() + std::time::Duration::from_millis(100));
+        let retry = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
+        let retried = snapshot::flatten_frame_tree(&retry);
+        if !retried.iter().any(|f| f.parent_frame_id.is_some() && f.url.is_empty()) {
+            let _ = cdp.call("Page.disable", json!({}), Some(session));
+            return Ok(retried);
+        }
+    }
+    let _ = cdp.call("Page.disable", json!({}), Some(session));
+    let final_result = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
+    Ok(snapshot::flatten_frame_tree(&final_result))
 }
 
 pub fn evaluate(cdp: &mut Cdp, session: &str, expression: &str, await_promise: bool) -> Result<EvalValue, String> {

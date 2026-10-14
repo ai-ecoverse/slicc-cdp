@@ -146,6 +146,60 @@ pub fn http_probe(_url: &str, _accept: &str) -> Result<ProbeResponse, String> {
     Err("probes are not available in this build\n".to_string())
 }
 
+#[cfg(not(target_os = "wasi"))]
+pub fn http_post_json(url: &str, body: &str) -> Result<ProbeResponse, String> {
+    let parts = parse_url(url)?;
+    if parts.scheme != "http" && parts.scheme != "https" {
+        return Err(format!("POST URL must be http or https: {url}\n"));
+    }
+    #[cfg(test)]
+    if reserved_loopback(&parts) {
+        panic!("test dialed {}:{}", parts.host, parts.port);
+    }
+    let addr = resolve(&parts.host, parts.port)?;
+    if is_reserved_cdp_socket(addr, parts.port) {
+        return Err(format!("POST refused for reserved CDP address: {url}\n"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let connect_timeout = Duration::from_secs(3).min(
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
+        .map_err(|err| format!("POST connect failed for {url}: {err}\n"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|err| format!("POST timeout setup failed: {err}\n"))?;
+    tcp.set_nodelay(true).ok();
+    let mut stream: Box<dyn ReadWrite> = if parts.scheme == "https" {
+        wrap_tls(&parts.host, tcp)?
+    } else {
+        Box::new(tcp)
+    };
+    let host_hdr = host_header(&parts);
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        parts.path, host_hdr, body.len(), body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("POST write failed for {url}: {err}\n"))?;
+    if Instant::now() >= deadline {
+        return Err(format!("POST deadline exceeded for {url}\n"));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    tcp_set_read_deadline(stream.as_mut(), remaining);
+    let (status, headers, resp_body, _rest) = read_http_capped(stream.as_mut(), Some(PROBE_MAX_BODY), Some(deadline))?;
+    Ok(ProbeResponse {
+        status,
+        headers,
+        body: resp_body,
+    })
+}
+
+#[cfg(target_os = "wasi")]
+pub fn http_post_json(_url: &str, _body: &str) -> Result<ProbeResponse, String> {
+    Err("http_post_json not available on wasi\n".to_string())
+}
+
 pub fn ws_connect(url: &str) -> Result<Ws, String> {
     let parts = parse_url(url)?;
     if parts.scheme != "ws" && parts.scheme != "wss" {

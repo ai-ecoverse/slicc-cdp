@@ -413,6 +413,12 @@ async function basicsBatchFlow(runner, site) {
   );
   assert.equal(afterUncheck.stdout, 'false\n');
 
+  const iframeLoaded = await runner.playwright(
+    ['eval', '--await', 'new Promise(r=>{const f=document.querySelector("iframe");if(f.contentDocument&&f.contentDocument.readyState==="complete"&&f.contentWindow.location.href!=="about:blank")return r("ready");f.addEventListener("load",()=>r("ready"))})'],
+    cwd
+  );
+  assert.equal(iframeLoaded.code, 0, iframeLoaded.stderr);
+
   const frames = await runner.playwright(['frames'], cwd);
   assert.equal(frames.code, 0, frames.stderr);
   assert.match(frames.stdout, /Frame IDs/);

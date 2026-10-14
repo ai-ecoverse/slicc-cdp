@@ -13,6 +13,7 @@ pub enum Via {
     WellKnown,
     PageApi,
     Response,
+    Catalog,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,6 +86,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Via::Response).unwrap(),
             r#""response""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Via::Catalog).unwrap(),
+            r#""catalog""#
         );
     }
 
