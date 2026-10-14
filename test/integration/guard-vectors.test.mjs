@@ -838,16 +838,17 @@ async function readStorage(raw, origin) {
   const tab = await raw.open(`${origin}/canary/final`);
   try {
     const { sessionId } = await raw.send('Target.attachToTarget', { targetId: tab, flatten: true });
-    const value = await raw.send(
-      'Runtime.evaluate',
-      {
-        expression:
-          "JSON.stringify({ canary: localStorage.getItem('canary'), probe: localStorage.getItem('probe') })",
-        returnByValue: true,
-      },
-      sessionId
-    );
-    return JSON.parse(value.result.value);
+    const expression = `location.href.startsWith(${JSON.stringify(origin)}) && document.readyState === 'complete' ? JSON.stringify({ canary: localStorage.getItem('canary'), probe: localStorage.getItem('probe') }) : ''`;
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      const value = await raw
+        .send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)
+        .catch(() => null);
+      const text = value?.result?.value;
+      if (text) return JSON.parse(text);
+      if (Date.now() > deadline) throw new Error(`${origin}/canary/final never loaded`);
+      await delay(200);
+    }
   } finally {
     await raw.send('Target.closeTarget', { targetId: tab });
   }
