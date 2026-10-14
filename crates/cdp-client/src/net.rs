@@ -94,6 +94,20 @@ const PROBE_MAX_BODY: usize = 1024 * 1024;
 
 #[cfg(not(target_os = "wasi"))]
 pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
+    probe_request("GET", url, &format!("Accept: {accept}\r\n"), "")
+}
+
+#[cfg(not(target_os = "wasi"))]
+pub fn http_post_json(url: &str, body: &str) -> Result<ProbeResponse, String> {
+    let headers = format!(
+        "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    probe_request("POST", url, &headers, body)
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn probe_request(method: &str, url: &str, headers: &str, body: &str) -> Result<ProbeResponse, String> {
     let parts = parse_url(url)?;
     if parts.scheme != "http" && parts.scheme != "https" {
         return Err(format!("probe URL must be http or https: {url}\n"));
@@ -122,8 +136,8 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
     };
     let host_hdr = host_header(&parts);
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\n\r\n",
-        parts.path, host_hdr, accept
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+        parts.path, host_hdr
     );
     stream
         .write_all(request.as_bytes())
@@ -144,6 +158,11 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
 #[cfg(target_os = "wasi")]
 pub fn http_probe(_url: &str, _accept: &str) -> Result<ProbeResponse, String> {
     Err("probes are not available in this build\n".to_string())
+}
+
+#[cfg(target_os = "wasi")]
+pub fn http_post_json(_url: &str, _body: &str) -> Result<ProbeResponse, String> {
+    Err("http_post_json not available on wasi\n".to_string())
 }
 
 pub fn ws_connect(url: &str) -> Result<Ws, String> {
@@ -832,6 +851,9 @@ fn read_chunked_capped(
                     if err.kind() == std::io::ErrorKind::TimedOut
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Ok(body);
+                    }
                     continue;
                 }
                 Err(err) => return Err(format!("chunked read failed: {err}\n")),
@@ -854,6 +876,9 @@ fn read_chunked_capped(
                     if err.kind() == std::io::ErrorKind::TimedOut
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Ok(body);
+                    }
                     continue;
                 }
                 Err(err) => return Err(format!("chunked read failed: {err}\n")),
@@ -1238,6 +1263,80 @@ mod tests {
             resp.body.len()
         );
         server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_json_post_sends_its_body_through_the_probe_path() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while !String::from_utf8_lossy(&request).ends_with("{\"a\":1}") {
+                let n = sock.read(&mut tmp).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&tmp[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        let resp = http_post_json(&format!("http://{addr}/mcp"), "{\"a\":1}").unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"{}");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /mcp HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), "{request}");
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_chunked_reply_left_open_returns_what_arrived_by_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            let event = b"data: {}\n\n";
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            sock.write_all(format!("{:x}\r\n", event.len()).as_bytes()).unwrap();
+            sock.write_all(event).unwrap();
+            sock.write_all(b"\r\n").unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(20));
+        });
+        let started = Instant::now();
+        let resp = http_post_json(&format!("http://{addr}/mcp"), "{}").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_eq!(resp.body, b"data: {}\n\n");
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_chunk_cut_short_and_left_open_returns_by_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc").unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(20));
+        });
+        let started = Instant::now();
+        let resp = http_probe(&format!("http://{addr}/x"), "*/*").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(resp.body.is_empty());
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_json_post_refuses_non_http_urls() {
+        assert!(http_post_json("ftp://example.com/mcp", "{}").is_err());
     }
 
     #[cfg(not(target_os = "wasi"))]

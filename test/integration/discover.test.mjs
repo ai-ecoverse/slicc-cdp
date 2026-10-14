@@ -1968,3 +1968,199 @@ test('discover poppy', { timeout: 120_000 }, async (t) => {
     await settle(browser?.close());
   }
 });
+
+test('discover NLWeb', { timeout: 120_000 }, async (t) => {
+  let browser;
+  let nlwebServer;
+  let catalogServer;
+  let plainMcpServer;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+
+    nlwebServer = createServer((req, res) => {
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      if (url.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>NLWeb</title>');
+        return;
+      }
+      if (url.pathname === '/ask') {
+        if (!url.searchParams.get('query')) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'query is required' }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ response: 'hello', results: [] }));
+        return;
+      }
+      if (url.pathname === '/mcp' && req.method === 'POST') {
+        const accept = req.headers.accept || '';
+        if (!accept.includes('application/json') || !accept.includes('text/event-stream')) {
+          res.writeHead(406, { 'content-type': 'text/plain' });
+          res.end('not acceptable');
+          return;
+        }
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          const result = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              serverInfo: { name: 'NLWeb Server', version: '0.5' },
+              protocolVersion: '2025-03-26',
+            },
+          });
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          const note = JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'notifications/message',
+            params: { level: 'info', data: '"result"' },
+          });
+          res.write(`event: message\ndata: ${note}\n\n`);
+          setTimeout(() => res.write(`event: message\ndata: ${result}\n\n`), 200);
+        });
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => nlwebServer.listen(0, '127.0.0.1', resolve));
+    const nlwebOrigin = `http://127.0.0.1:${nlwebServer.address().port}`;
+
+    catalogServer = createServer((req, res) => {
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      if (url.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Catalog</title>');
+        return;
+      }
+      if (url.pathname === '/.well-known/ard.json') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            name: 'NLWeb Catalog',
+            entries: [
+              {
+                identifier: 'urn:nlweb:search',
+                displayName: 'NLWeb Search',
+                type: 'application/nlweb+json',
+                url: `${nlwebOrigin}/ask`,
+              },
+            ],
+          })
+        );
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => catalogServer.listen(0, '127.0.0.1', resolve));
+    const catalogOrigin = `http://127.0.0.1:${catalogServer.address().port}`;
+
+    plainMcpServer = createServer((req, res) => {
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      if (url.pathname === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Plain MCP</title>');
+        return;
+      }
+      if (url.pathname === '/mcp' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              result: {
+                serverInfo: { name: 'Generic MCP', version: '1.0' },
+                protocolVersion: '2025-03-26',
+              },
+            })
+          );
+        });
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => plainMcpServer.listen(0, '127.0.0.1', resolve));
+    const plainMcpOrigin = `http://127.0.0.1:${plainMcpServer.address().port}`;
+
+    await t.test('catalog-pointed NLWeb hit', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${catalogOrigin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const nlweb = events.find((e) => e.standard === 'nlweb');
+      assert.ok(nlweb, `nlweb event expected: ${result.stdout}`);
+      assert.equal(nlweb.via, 'catalog');
+      assert.ok(nlweb.summary.askUrl, 'askUrl expected');
+    });
+
+    await t.test('--probe nlweb hit', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--probe', 'nlweb', '--once', `${nlwebOrigin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const nlweb = events.find((e) => e.standard === 'nlweb' && e.via === 'well-known');
+      assert.ok(nlweb, `nlweb probe event expected: ${result.stdout}`);
+      assert.equal(nlweb.summary.askUrl, `${nlwebOrigin}/ask`, result.stdout);
+      assert.equal(nlweb.url, `${nlwebOrigin}/ask`);
+      assert.ok(nlweb.summary.mcpUrl, `mcpUrl expected: ${result.stdout}`);
+      assert.equal(nlweb.summary.serverInfo.name, 'NLWeb Server');
+    });
+
+    await t.test('no probe without the flag', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${nlwebOrigin}/`],
+        cwd
+      );
+      const events = result.stdout.trim() ? parseEvents(result.stdout) : [];
+      const nlwebProbe = events.find((e) => e.standard === 'nlweb' && e.via === 'well-known');
+      assert.ok(!nlwebProbe, `nlweb probe should not fire without --probe nlweb: ${result.stdout}`);
+    });
+
+    await t.test('plain MCP server is not NLWeb', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--probe', 'nlweb', '--once', `${plainMcpOrigin}/`],
+        cwd
+      );
+      const events = result.stdout.trim() ? parseEvents(result.stdout) : [];
+      const nlweb = events.find((e) => e.standard === 'nlweb');
+      assert.ok(!nlweb, `plain MCP should not produce nlweb event: ${result.stdout}`);
+    });
+  } finally {
+    nlwebServer?.closeAllConnections();
+    nlwebServer?.close();
+    catalogServer?.closeAllConnections();
+    catalogServer?.close();
+    plainMcpServer?.closeAllConnections();
+    plainMcpServer?.close();
+    await settle(browser?.close());
+  }
+});
