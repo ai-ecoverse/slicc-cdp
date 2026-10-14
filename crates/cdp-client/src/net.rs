@@ -851,6 +851,9 @@ fn read_chunked_capped(
                     if err.kind() == std::io::ErrorKind::TimedOut
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Ok(body);
+                    }
                     continue;
                 }
                 Err(err) => return Err(format!("chunked read failed: {err}\n")),
@@ -873,6 +876,9 @@ fn read_chunked_capped(
                     if err.kind() == std::io::ErrorKind::TimedOut
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Ok(body);
+                    }
                     continue;
                 }
                 Err(err) => return Err(format!("chunked read failed: {err}\n")),
@@ -1283,6 +1289,48 @@ mod tests {
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /mcp HTTP/1.1\r\n"), "{request}");
         assert!(request.contains("\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), "{request}");
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_chunked_reply_left_open_returns_what_arrived_by_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            let event = b"data: {}\n\n";
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            sock.write_all(format!("{:x}\r\n", event.len()).as_bytes()).unwrap();
+            sock.write_all(event).unwrap();
+            sock.write_all(b"\r\n").unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(20));
+        });
+        let started = Instant::now();
+        let resp = http_post_json(&format!("http://{addr}/mcp"), "{}").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_eq!(resp.body, b"data: {}\n\n");
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_chunk_cut_short_and_left_open_returns_by_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc").unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(20));
+        });
+        let started = Instant::now();
+        let resp = http_probe(&format!("http://{addr}/x"), "*/*").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(resp.body.is_empty());
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[cfg(not(target_os = "wasi"))]

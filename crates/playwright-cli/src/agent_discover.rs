@@ -1563,6 +1563,14 @@ fn isolated_world_fetch(
         r#"(async () => {{
   const cap = 1048576;
   const sseUntil = {sse_until};
+  const carries = (message) => message !== null && typeof message === 'object' && Object.hasOwn(message, sseUntil);
+  const sseDone = (text) => text.replace(/\r\n?/g, '\n').split('\n\n').slice(0, -1).some((event) => {{
+    const data = event.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).replace(/^ /, '')).join('\n');
+    try {{
+      const message = JSON.parse(data);
+      return Array.isArray(message) ? message.some(carries) : carries(message);
+    }} catch (e) {{ return false; }}
+  }});
   let r;
   try {{
     r = await fetch({url}, {options});
@@ -1580,7 +1588,7 @@ fn isolated_world_fetch(
       total += value.byteLength;
       body += dec.decode(value, {{stream:true}});
       if (total > cap) {{ reader.cancel(); body = body.slice(0, cap); break; }}
-      if (sseUntil && /text\/event-stream/i.test(ct) && body.replace(/\r\n?/g, '\n').split('\n\n').slice(0, -1).some((event) => event.includes(sseUntil))) {{ reader.cancel(); break; }}
+      if (sseUntil && /text\/event-stream/i.test(ct) && sseDone(body)) {{ reader.cancel(); break; }}
     }}
   }}
   return JSON.stringify({{status:r.status,ct,body}});
@@ -2178,7 +2186,7 @@ fn run_nlweb_probes(
         method: Some("POST"),
         headers: NLWEB_MCP_HEADERS,
         body: Some(&init_body),
-        sse_until: Some("\"result\""),
+        sse_until: Some("result"),
     };
     let mcp_body = match isolated_world_fetch(cdp, session_id, &frame_id, &mcp_url, &init) {
         IsolatedProbeResult::Ok(status, ct, body) => mcp_init_payload(status, &ct, body),
@@ -4395,7 +4403,7 @@ mod tests {
         assert!(expressions[1].contains(r#""Accept":"application/json, text/event-stream""#));
         assert!(expressions[0].contains("/ask?query=nlweb&streaming=false"));
         assert!(expressions[0].contains("const sseUntil = null;"));
-        assert!(expressions[1].contains(r#"const sseUntil = "\"result\"";"#), "{}", expressions[1]);
+        assert!(expressions[1].contains(r#"const sseUntil = "result";"#), "{}", expressions[1]);
         assert!(expressions[1].contains("initialize"));
         for expression in &expressions {
             assert!(expression.contains(r#""credentials":"omit""#));

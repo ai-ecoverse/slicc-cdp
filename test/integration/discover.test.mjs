@@ -2022,7 +2022,13 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
             },
           });
           res.writeHead(200, { 'content-type': 'text/event-stream' });
-          res.write(`event: message\ndata: ${result}\n\n`);
+          const note = JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'notifications/message',
+            params: { level: 'info', data: '"result"' },
+          });
+          res.write(`event: message\ndata: ${note}\n\n`);
+          setTimeout(() => res.write(`event: message\ndata: ${result}\n\n`), 200);
         });
         return;
       }
