@@ -1994,25 +1994,35 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
         return;
       }
       if (url.pathname === '/ask') {
+        if (!url.searchParams.get('query')) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'query is required' }));
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ response: 'hello', results: [] }));
         return;
       }
       if (url.pathname === '/mcp' && req.method === 'POST') {
+        const accept = req.headers.accept || '';
+        if (!accept.includes('application/json') || !accept.includes('text/event-stream')) {
+          res.writeHead(406, { 'content-type': 'text/plain' });
+          res.end('not acceptable');
+          return;
+        }
         let body = '';
         req.on('data', (c) => (body += c));
         req.on('end', () => {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              id: 1,
-              result: {
-                serverInfo: { name: 'NLWeb Server', version: '0.5' },
-                protocolVersion: '2025-03-26',
-              },
-            })
-          );
+          const result = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              serverInfo: { name: 'NLWeb Server', version: '0.5' },
+              protocolVersion: '2025-03-26',
+            },
+          });
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(`event: message\ndata: ${result}\n\n`);
         });
         return;
       }
@@ -2109,7 +2119,9 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
       const events = parseEvents(result.stdout);
       const nlweb = events.find((e) => e.standard === 'nlweb' && e.via === 'well-known');
       assert.ok(nlweb, `nlweb probe event expected: ${result.stdout}`);
-      assert.ok(nlweb.summary.askUrl || nlweb.summary.mcpUrl, 'URL expected');
+      assert.ok(nlweb.summary.askUrl, `askUrl expected: ${result.stdout}`);
+      assert.ok(nlweb.summary.mcpUrl, `mcpUrl expected: ${result.stdout}`);
+      assert.equal(nlweb.summary.serverInfo.name, 'NLWeb Server');
     });
 
     await t.test('no probe without the flag', async () => {

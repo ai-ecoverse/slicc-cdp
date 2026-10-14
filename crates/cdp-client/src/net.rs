@@ -100,7 +100,7 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
 #[cfg(not(target_os = "wasi"))]
 pub fn http_post_json(url: &str, body: &str) -> Result<ProbeResponse, String> {
     let headers = format!(
-        "Content-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n",
+        "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\n",
         body.len()
     );
     probe_request("POST", url, &headers, body)
@@ -1282,7 +1282,7 @@ mod tests {
         assert_eq!(resp.body, b"{}");
         let request = server.join().unwrap();
         assert!(request.starts_with("POST /mcp HTTP/1.1\r\n"), "{request}");
-        assert!(request.contains("\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), "{request}");
+        assert!(request.contains("\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), "{request}");
     }
 
     #[cfg(not(target_os = "wasi"))]

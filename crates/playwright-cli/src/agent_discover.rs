@@ -2157,7 +2157,7 @@ fn run_nlweb_probes(
     };
     let page_url = sess.page_url.clone();
     let target_id = sess.target_id.clone();
-    let ask_url = format!("{}/ask?query=", origin.trim_end_matches('/'));
+    let ask_url = format!("{}/ask?query=nlweb&streaming=false", origin.trim_end_matches('/'));
     let ask_body = match isolated_world_fetch(cdp, session_id, &frame_id, &ask_url, &NLWEB_ASK) {
         IsolatedProbeResult::Ok(status, ct, body) => json_ok_body(status, &ct, body),
         IsolatedProbeResult::Final => None,
@@ -2173,7 +2173,7 @@ fn run_nlweb_probes(
         body: Some(&init_body),
     };
     let mcp_body = match isolated_world_fetch(cdp, session_id, &frame_id, &mcp_url, &init) {
-        IsolatedProbeResult::Ok(status, ct, body) => json_ok_body(status, &ct, body),
+        IsolatedProbeResult::Ok(status, ct, body) => mcp_init_payload(status, &ct, body),
         IsolatedProbeResult::Final => None,
         IsolatedProbeResult::Unavailable => nlweb_mcp_probe_native(&mcp_url, &init_body),
     };
@@ -2220,7 +2220,7 @@ const NLWEB_ASK: FetchInit<'static> = FetchInit {
 
 const NLWEB_MCP_HEADERS: &[(&str, &str)] = &[
     ("Content-Type", "application/json"),
-    ("Accept", "application/json"),
+    ("Accept", "application/json, text/event-stream"),
 ];
 
 fn nlweb_mcp_init_body() -> String {
@@ -2241,10 +2241,28 @@ fn json_ok_body(status: u16, content_type: &str, body: String) -> Option<String>
     (status == 200 && is_json_content_type(content_type)).then_some(body)
 }
 
+fn mcp_init_payload(status: u16, content_type: &str, body: String) -> Option<String> {
+    let media = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if status != 200 || media != "text/event-stream" {
+        return json_ok_body(status, content_type, body);
+    }
+    body.replace("\r\n", "\n")
+        .split("\n\n")
+        .map(|event| {
+            event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|data| data.strip_prefix(' ').unwrap_or(data))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .find(|data| serde_json::from_str::<Value>(data).is_ok_and(|value| value.get("result").is_some()))
+}
+
 #[cfg(not(target_os = "wasi"))]
 fn nlweb_mcp_probe_native(url: &str, body: &str) -> Option<String> {
     let resp = cdp_client::net::http_post_json(url, body).ok()?;
-    json_ok_body(
+    mcp_init_payload(
         resp.status,
         resp.content_type(),
         String::from_utf8_lossy(&resp.body).into_owned(),
@@ -4351,6 +4369,8 @@ mod tests {
         assert!(!expressions[0].contains("POST"));
         assert!(expressions[1].contains(r#""method":"POST""#), "{}", expressions[1]);
         assert!(expressions[1].contains(r#""Content-Type":"application/json""#));
+        assert!(expressions[1].contains(r#""Accept":"application/json, text/event-stream""#));
+        assert!(expressions[0].contains("/ask?query=nlweb&streaming=false"));
         assert!(expressions[1].contains("initialize"));
         for expression in &expressions {
             assert!(expression.contains(r#""credentials":"omit""#));
@@ -4401,7 +4421,7 @@ mod tests {
                     ("200 OK", "Agentmap: /agentmap.json\n".to_string())
                 } else if line.starts_with("GET /.well-known/ard.json ") || line.starts_with("GET /agentmap.json ") {
                     ("200 OK", catalog.clone())
-                } else if line.starts_with("GET /ask?query= ") {
+                } else if line.starts_with("GET /ask?query=nlweb&streaming=false ") {
                     ("200 OK", r#"{"name":"Shop","results":[]}"#.to_string())
                 } else if line.starts_with("POST /mcp ") {
                     ("200 OK", r#"{"result":{"serverInfo":{"name":"NLWeb Server","version":"0.5"}}}"#.to_string())
@@ -4487,6 +4507,16 @@ mod tests {
         let event: Value = serde_json::from_str(first.trim()).unwrap();
         assert_eq!(event["url"], "https://example.com/mcp");
         assert!(emit_nlweb_from_catalog(&mut state, "https://example.com", "https://example.com/", "T1", &summary).is_empty());
+    }
+
+    #[test]
+    fn an_sse_initialize_reply_yields_its_json_rpc_result() {
+        let sse = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\r\n\r\nevent: message\r\ndata: {\"result\":\r\ndata:{\"serverInfo\":{\"name\":\"NLWeb\"}}}\r\n\r\n";
+        let payload = mcp_init_payload(200, "text/event-stream; charset=utf-8", sse.into()).unwrap();
+        assert_eq!(classify_nlweb_mcp_init(&payload).unwrap()["serverInfo"]["name"], "NLWeb");
+        assert_eq!(mcp_init_payload(200, "text/event-stream", "data: nope\n\n".into()), None);
+        assert_eq!(mcp_init_payload(406, "text/event-stream", sse.into()), None);
+        assert_eq!(mcp_init_payload(200, "application/json", "{}".into()).as_deref(), Some("{}"));
     }
 
     #[test]
