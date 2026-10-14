@@ -1,3 +1,64 @@
+pub fn redact_urls_in_text(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, url, after)) = find_next_url(rest) {
+        result.push_str(before);
+        result.push_str(&redact_url(url));
+        rest = after;
+    }
+    result.push_str(rest);
+    result
+}
+
+const URL_SCHEMES: &[&str] = &["https://", "http://", "wss://", "ws://"];
+
+fn find_next_url(text: &str) -> Option<(&str, &str, &str)> {
+    let mut best: Option<(usize, usize)> = None;
+    for &scheme in URL_SCHEMES {
+        for (_blob, start) in scheme_positions(text, scheme) {
+            if best.is_none() || start < best.unwrap().0 {
+                let authority_start = start + if text[start..].starts_with("blob:") {
+                    5 + scheme.len()
+                } else {
+                    scheme.len()
+                };
+                best = Some((start, authority_start));
+            }
+        }
+    }
+    let (start, authority_start) = best?;
+    if authority_start >= text.len() {
+        return None;
+    }
+    let url_end = text[authority_start..]
+        .find(|c: char| is_url_delimiter(c))
+        .map(|i| authority_start + i)
+        .unwrap_or(text.len());
+    if url_end <= authority_start {
+        return None;
+    }
+    let url = &text[start..url_end];
+    Some((&text[..start], url, &text[url_end..]))
+}
+
+fn scheme_positions(text: &str, scheme: &str) -> Vec<(bool, usize)> {
+    let mut hits = Vec::new();
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(scheme) {
+        let abs = search_from + pos;
+        let blob = abs >= 5 && &text[abs - 5..abs] == "blob:";
+        let start = if blob { abs - 5 } else { abs };
+        hits.push((blob, start));
+        search_from = abs + scheme.len();
+    }
+    hits
+}
+
+fn is_url_delimiter(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '"' | '\'' | '<' | '>' | '`' | '{' | '}' | '|' | '\\' | '^')
+        || c.is_control()
+}
+
 pub fn redact_url(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
@@ -424,5 +485,79 @@ mod tests {
         let result = redact_url("https://example.com/?SECRET_TOKEN&state=x");
         assert!(!result.contains("SECRET_TOKEN"), "{result}");
         assert!(result.contains("state="), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_no_urls() {
+        assert_eq!(redact_urls_in_text("no urls here"), "no urls here");
+    }
+
+    #[test]
+    fn redact_urls_in_text_single_url() {
+        let input = "TypeError: Failed to fetch https://u:PW@host.example.com/path";
+        let result = redact_urls_in_text(input);
+        assert!(!result.contains("PW"), "{result}");
+        assert!(result.contains("host.example.com/path"), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_multiple_urls() {
+        let input = "Redirect from https://a:b@one.com/x to https://c:d@two.com/y failed";
+        let result = redact_urls_in_text(input);
+        assert!(!result.contains("a:b"), "{result}");
+        assert!(!result.contains("c:d"), "{result}");
+        assert!(result.contains("one.com"), "{result}");
+        assert!(result.contains("two.com"), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_query_redacted() {
+        let input = "Failed: https://host.com/cb?token=SECRET end";
+        let result = redact_urls_in_text(input);
+        assert!(!result.contains("SECRET"), "{result}");
+        assert!(result.contains("token="), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_blob() {
+        let input = "Error at blob:https://u:p@host.com/abc end";
+        let result = redact_urls_in_text(input);
+        assert!(!result.contains("u:p"), "{result}");
+        assert!(result.starts_with("Error at blob:"), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_ws_scheme() {
+        let input = "Connection to ws://admin:secret@host:8080/ws failed";
+        let result = redact_urls_in_text(input);
+        assert!(!result.contains("secret"), "{result}");
+        assert!(result.contains("host:8080/ws"), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_wss_scheme() {
+        let input = "Connecting wss://user:pw@h.io/s";
+        let result = redact_urls_in_text(input);
+        assert!(!result.contains("pw"), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_preserves_surrounding() {
+        let input = "[error] https://u:PW@h.com/x (details)";
+        let result = redact_urls_in_text(input);
+        assert!(result.starts_with("[error] "), "{result}");
+        assert!(result.ends_with(" (details)"), "{result}");
+        assert!(!result.contains("PW"), "{result}");
+    }
+
+    #[test]
+    fn redact_urls_in_text_no_scheme_untouched() {
+        let input = "user:pass@host.com/path";
+        assert_eq!(redact_urls_in_text(input), input);
+    }
+
+    #[test]
+    fn redact_urls_in_text_empty() {
+        assert_eq!(redact_urls_in_text(""), "");
     }
 }

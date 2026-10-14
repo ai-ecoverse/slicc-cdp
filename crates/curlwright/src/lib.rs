@@ -180,7 +180,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     };
     let trace = if opts.verbose { format_request_trace(&request, opts.full_urls, Some(&effective_base)) } else { String::new() };
     let started = Instant::now();
-    let fetched = page::run_fetch(&mut cdp, &session, &request, context);
+    let fetched = page::run_fetch(&mut cdp, &session, &request, context, opts.full_urls);
     let elapsed = started.elapsed().as_secs_f64();
     page::detach(&mut cdp, &session);
     let output = match fetched {

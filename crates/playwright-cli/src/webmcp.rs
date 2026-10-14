@@ -41,8 +41,8 @@ fn format_list(tools: &Value) -> String {
     };
     let mut lines = Vec::new();
     for tool in arr {
-        let name = sanitize::terminal(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
-        let desc = sanitize::terminal(
+        let name = sanitize::browser_message(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+        let desc = sanitize::browser_message(
             tool.get("description")
                 .and_then(|v| v.as_str())
                 .or_else(|| tool.get("title").and_then(|v| v.as_str()))
@@ -124,7 +124,7 @@ pub fn call(
         Ok(outcome) => {
             state.current = Some(target);
             match outcome {
-                CallOutcome::Result(text) => Output::ok(format!("{}\n", sanitize::terminal(&text))),
+                CallOutcome::Result(text) => Output::ok(format!("{}\n", sanitize::browser_message(&text))),
                 CallOutcome::Absent => Output {
                     stdout: String::new(),
                     stderr: "webmcp-call: page does not support WebMCP (document.modelContext is absent)\n".into(),
@@ -134,7 +134,7 @@ pub fn call(
                     let list = if available.is_empty() {
                         String::new()
                     } else {
-                        let safe: Vec<String> = available.iter().map(|n| sanitize::terminal(n)).collect();
+                        let safe: Vec<String> = available.iter().map(|n| sanitize::browser_message(n)).collect();
                         format!("\navailable tools: {}", safe.join(", "))
                     };
                     Output {
@@ -147,7 +147,7 @@ pub fn call(
                     let hint = if desc.is_empty() {
                         String::new()
                     } else {
-                        format!(": {}", sanitize::terminal(&desc))
+                        format!(": {}", sanitize::browser_message(&desc))
                     };
                     Output {
                         stdout: String::new(),
@@ -157,7 +157,7 @@ pub fn call(
                 }
                 CallOutcome::Threw(message) => Output {
                     stdout: String::new(),
-                    stderr: format!("webmcp-call: tool \"{name}\" threw: {}\n", sanitize::terminal(&message)),
+                    stderr: format!("webmcp-call: tool \"{name}\" threw: {}\n", sanitize::browser_message(&message)),
                     code: 1,
                 },
             }
@@ -273,7 +273,7 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
             .and_then(|v| v.as_str())
             .or_else(|| details.get("text").and_then(|v| v.as_str()))
             .unwrap_or("evaluation failed");
-        return Err(format!("{}\n", crate::sanitize::terminal(description)));
+        return Err(format!("{}\n", crate::sanitize::browser_message(description)));
     }
     let value = result
         .pointer("/result/value")
@@ -408,7 +408,7 @@ fn parse_call_result(
             .and_then(|v| v.as_str())
             .or_else(|| details.get("text").and_then(|v| v.as_str()))
             .unwrap_or("evaluation failed");
-        return Err(format!("{}\n", crate::sanitize::terminal(description)));
+        return Err(format!("{}\n", crate::sanitize::browser_message(description)));
     }
     let value = result
         .pointer("/result/value")
