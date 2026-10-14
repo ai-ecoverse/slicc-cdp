@@ -167,6 +167,7 @@ mod tests {
             "  open [url]                  open the browser",
             "  close                       close the browser",
             "  goto <url>                  navigate to a url",
+            "  navigate <url>              navigate to a url",
             "  type <text>                 type text into editable element",
             "  click <target> [button]     perform click on a web page",
             "  fill <target> <text>        fill text into editable element",
@@ -198,6 +199,7 @@ mod tests {
             "open",
             "close",
             "goto",
+            "navigate",
             "snapshot",
             "click",
             "fill",
@@ -234,7 +236,7 @@ mod tests {
         ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
-        for name in ["dialog-accept", "keydown", "navigate"] {
+        for name in ["dialog-accept", "keydown"] {
             assert!(pending_names.contains(&name), "{name}");
         }
 
@@ -565,6 +567,7 @@ mod tests {
             "drag",
             "frames",
             "pdf",
+            "navigate",
         ] {
             let output = execute(&[command.to_string(), "--help".to_string()], None);
             assert_eq!(output.code, 0, "{command}");
@@ -596,6 +599,7 @@ mod tests {
             "drag",
             "frames",
             "pdf",
+            "navigate",
         ] {
             let spec = spec::lookup(command);
             assert!(spec.is_some(), "{command} not in spec");
@@ -624,6 +628,7 @@ mod tests {
             "drag",
             "frames",
             "pdf",
+            "navigate",
         ] {
             assert!(
                 !pending.contains(command),
@@ -646,6 +651,7 @@ mod tests {
             "  check <ref>",
             "  uncheck <ref>",
             "  upload <ref> <file...>",
+            "  navigate <url>",
             "  drag <startRef> <endRef>",
             "  pdf",
             "  frames",
@@ -655,6 +661,14 @@ mod tests {
         assert!(output.stdout.contains("Pointer and form:"));
         assert!(output.stdout.contains("Navigation:"));
         assert!(output.stdout.contains("SLICC-only:"));
+    }
+
+    #[test]
+    fn navigate_help_page() {
+        let output = execute(&["navigate".to_string(), "--help".to_string()], None);
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.starts_with("playwright-cli navigate <url>"), "{}", output.stdout);
+        assert!(output.stdout.contains("Navigate to a URL"), "{}", output.stdout);
     }
 
     #[test]

@@ -95,7 +95,7 @@ static SPECS: &[Spec] = &[
     spec("generate-locator", &["target"], false, &[("tab", S)], false, RefMode::None),
     spec("highlight", &["target"], false, &[("tab", S), ("hide", B), ("style", S)], false, RefMode::None),
     spec("eval-file", &["path"], false, &[("tab", S), ("frame", S), ("output", S)], false, RefMode::None),
-    spec("navigate", &["url"], false, &[("tab", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], false, RefMode::None),
+    spec("navigate", &["url"], false, &[("tab", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),
     spec("teleport", &[], false, &[("tab", S), ("start", S), ("return", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("runtime", S), ("off", B), ("list", B)], false, RefMode::None),
     spec("fetch", &["url"], false, &[("tab", S), ("method", S)], false, RefMode::None),
     spec("frames", &[], false, &[("tab", S)], true, RefMode::None),
