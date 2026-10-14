@@ -19,6 +19,8 @@ pub enum Via {
 pub struct DiscoveryEvent {
     pub v: u8,
     pub standard: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
     pub origin: String,
     pub url: String,
     pub via: Via,
@@ -47,6 +49,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "ard".into(),
+            aliases: None,
             origin: "https://example.com".into(),
             url: "https://example.com/.well-known/ard.json".into(),
             via: Via::WellKnown,
@@ -90,6 +93,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "test".into(),
+            aliases: None,
             origin: "https://x.com".into(),
             url: "https://x.com/f".into(),
             via: Via::Response,
@@ -108,6 +112,7 @@ mod tests {
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: "test".into(),
+            aliases: None,
             origin: "https://x.com".into(),
             url: "https://x.com/f".into(),
             via: Via::Response,
@@ -124,5 +129,65 @@ mod tests {
     #[test]
     fn event_version_is_one() {
         assert_eq!(EVENT_VERSION, 1);
+    }
+
+    #[test]
+    fn aliases_omitted_when_none() {
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            aliases: None,
+            origin: "https://x.com".into(),
+            url: "https://x.com/f".into(),
+            via: Via::WellKnown,
+            page: "https://x.com/".into(),
+            target_id: "t".into(),
+            status: Validity::Valid,
+            summary: serde_json::json!({}),
+            reason: None,
+        };
+        let json = event.to_json();
+        assert!(!json.contains("aliases"));
+    }
+
+    #[test]
+    fn aliases_included_when_present() {
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            aliases: Some(vec!["ai-catalog".into()]),
+            origin: "https://x.com".into(),
+            url: "https://x.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://x.com/".into(),
+            target_id: "t".into(),
+            status: Validity::Valid,
+            summary: serde_json::json!({"name": "test"}),
+            reason: None,
+        };
+        let json = event.to_json();
+        assert!(json.contains("\"aliases\":[\"ai-catalog\"]"));
+        let parsed: DiscoveryEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.aliases, Some(vec!["ai-catalog".to_string()]));
+    }
+
+    #[test]
+    fn aliases_roundtrip() {
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            aliases: Some(vec!["ai-catalog".into()]),
+            origin: "https://example.com".into(),
+            url: "https://example.com/.well-known/ard.json".into(),
+            via: Via::WellKnown,
+            page: "https://example.com/".into(),
+            target_id: "t".into(),
+            status: Validity::Valid,
+            summary: serde_json::json!({}),
+            reason: None,
+        };
+        let json = event.to_json();
+        let parsed: DiscoveryEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
     }
 }

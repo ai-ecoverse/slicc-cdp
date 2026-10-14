@@ -49,6 +49,12 @@ pub fn default_probes() -> ProbeRegistry {
         content_type_prefix: "application/json".into(),
     });
     registry.register(Probe {
+        standard: "ai-catalog".into(),
+        path: "/.well-known/ai-catalog.json".into(),
+        accept: "application/json".into(),
+        content_type_prefix: "application/json".into(),
+    });
+    registry.register(Probe {
         standard: "api-catalog".into(),
         path: "/.well-known/api-catalog".into(),
         accept: "application/linkset+json, application/json;q=0.9".into(),
@@ -66,6 +72,7 @@ pub fn default_probes() -> ProbeRegistry {
 pub fn default_classifiers() -> ClassifierRegistry {
     let mut registry = ClassifierRegistry::new();
     registry.register("ard", classify_ard);
+    registry.register("ai-catalog", classify_ai_catalog);
     registry.register("api-catalog", classify_api_catalog);
     registry.register("llms-txt", classify_llms_txt);
     registry
@@ -118,6 +125,33 @@ fn classify_ard_with_origin(body: &str, origin: Option<&str>) -> Classification 
 
 pub fn classify_ard_body(body: &str, origin: Option<&str>) -> Classification {
     classify_ard_with_origin(body, origin)
+}
+
+fn classify_ai_catalog(body: &str) -> Classification {
+    classify_ai_catalog_with_origin(body, None)
+}
+
+fn classify_ai_catalog_with_origin(body: &str, origin: Option<&str>) -> Classification {
+    let origin_domain = origin.and_then(|o| {
+        Url::parse(o).ok().and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+    });
+    match serde_json::from_str::<Value>(body) {
+        Ok(value) => {
+            let mut c = classify_ard_value(&value, origin_domain.as_deref());
+            c.standard = "ai-catalog".into();
+            c
+        }
+        Err(e) => Classification {
+            standard: "ai-catalog".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some(e.to_string()),
+        },
+    }
+}
+
+pub fn classify_ai_catalog_body(body: &str, origin: Option<&str>) -> Classification {
+    classify_ai_catalog_with_origin(body, origin)
 }
 
 fn classify_ard_value(value: &Value, origin_domain: Option<&str>) -> Classification {
@@ -589,6 +623,14 @@ mod tests {
     }
 
     #[test]
+    fn default_probes_has_ai_catalog() {
+        let registry = default_probes();
+        let probes = registry.probes_for_origin("https://example.com");
+        let aic = probes.iter().find(|p| p.probe.standard == "ai-catalog").unwrap();
+        assert_eq!(aic.url, "https://example.com/.well-known/ai-catalog.json");
+    }
+
+    #[test]
     fn default_probes_has_llms_txt() {
         let registry = default_probes();
         let probes = registry.probes_for_origin("https://example.com");
@@ -610,6 +652,49 @@ mod tests {
         let result = registry.classify("api-catalog", r#"{"linkset":[{"anchor":"/"}]}"#).unwrap();
         assert_eq!(result.status, Validity::Valid);
         assert_eq!(result.summary["format"], "linkset");
+    }
+
+    #[test]
+    fn default_classifiers_has_ai_catalog() {
+        let registry = default_classifiers();
+        let result = registry.classify("ai-catalog", r#"{"name":"Test Catalog","entries":[{"identifier":"urn:air:example.com:mcp","displayName":"MCP Server","type":"application/mcp-server-card+json","url":"https://example.com/mcp"}]}"#).unwrap();
+        assert_eq!(result.status, Validity::Valid);
+        assert_eq!(result.standard, "ai-catalog");
+        assert_eq!(result.summary["name"], "Test Catalog");
+    }
+
+    #[test]
+    fn ai_catalog_classifier_invalid_json() {
+        let registry = default_classifiers();
+        let result = registry.classify("ai-catalog", "not json").unwrap();
+        assert_eq!(result.status, Validity::Invalid);
+        assert_eq!(result.standard, "ai-catalog");
+        assert!(result.reason.is_some());
+    }
+
+    #[test]
+    fn ai_catalog_body_with_origin() {
+        let body = r#"{"name":"Cat","entries":[{"identifier":"urn:air:example.com:agent","displayName":"Agent","type":"application/a2a-agent-card+json","url":"https://example.com/agent"},{"identifier":"urn:air:example.com:ds","displayName":"Dataset","type":"application/dataset+json","url":"https://example.com/ds"},{"identifier":"urn:air:evil.com:mcp","displayName":"Evil","type":"application/mcp-server-card+json","url":"https://evil.com/mcp"}]}"#;
+        let c = classify_ai_catalog_body(body, Some("https://example.com"));
+        assert_eq!(c.standard, "ai-catalog");
+        assert_eq!(c.status, Validity::Valid);
+        let entries = c.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let warnings = c.summary["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("evil.com")));
+        let types = c.summary["types"].as_object().unwrap();
+        assert!(types.contains_key("application/a2a-agent-card+json"));
+        assert!(types.contains_key("application/dataset+json"));
+    }
+
+    #[test]
+    fn ai_catalog_nested_catalog_entries() {
+        let body = r#"{"name":"Root","entries":[{"identifier":"urn:air:example.com:cat","displayName":"Sub","type":"application/ai-catalog+json","url":"https://example.com/sub.json"}]}"#;
+        let c = classify_ai_catalog_body(body, Some("https://example.com"));
+        assert_eq!(c.standard, "ai-catalog");
+        let catalogs = c.summary["catalogs"].as_array().unwrap();
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0]["url"], "https://example.com/sub.json");
     }
 
     #[test]

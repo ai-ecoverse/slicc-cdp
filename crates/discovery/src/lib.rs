@@ -16,6 +16,6 @@ pub use standards::{
     default_classifiers, default_llmstxtignore_entries, default_probes,
     known_link_rels, ResponseSignal, classify_response, classify_slicc_handoff,
     is_slicc_handoff_rel, parse_llms_txt_summary,
-    parse_robots_txt_agentmap, classify_ard_body,
+    parse_robots_txt_agentmap, classify_ard_body, classify_ai_catalog_body,
     HANDOFF_REL, UPSKILL_REL, LLMS_TXT_REL,
 };
