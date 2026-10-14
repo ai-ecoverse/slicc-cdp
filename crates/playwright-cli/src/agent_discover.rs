@@ -162,8 +162,9 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let once_tab = invocation.flags.get("tab").cloned();
     let no_probe = invocation.flags.contains_key("no-probe");
     let follow_mode = invocation.flags.contains_key("follow");
-    let robots_probe = invocation.flags.get("probe").map_or(false, |v| v == "robots");
-    let nlweb_probe = invocation.flags.get("probe").map_or(false, |v| v == "nlweb");
+    let probes = invocation.repeated("probe");
+    let robots_probe = probes.contains(&"robots");
+    let nlweb_probe = probes.contains(&"nlweb");
     let exec_cmd = invocation.flags.get("exec").cloned();
     let lick_mode = invocation.flags.contains_key("lick");
     let exec_timeout = invocation
@@ -1498,12 +1499,14 @@ struct FetchInit<'a> {
     method: Option<&'a str>,
     headers: &'a [(&'a str, &'a str)],
     body: Option<&'a str>,
+    sse_until: Option<&'a str>,
 }
 
 const PLAIN_GET: FetchInit<'static> = FetchInit {
     method: None,
     headers: &[],
     body: None,
+    sse_until: None,
 };
 
 fn fetch_options(init: &FetchInit) -> Value {
@@ -1559,6 +1562,7 @@ fn isolated_world_fetch(
     let js = format!(
         r#"(async () => {{
   const cap = 1048576;
+  const sseUntil = {sse_until};
   let r;
   try {{
     r = await fetch({url}, {options});
@@ -1576,13 +1580,15 @@ fn isolated_world_fetch(
       total += value.byteLength;
       body += dec.decode(value, {{stream:true}});
       if (total > cap) {{ reader.cancel(); body = body.slice(0, cap); break; }}
+      if (sseUntil && /text\/event-stream/i.test(ct) && body.replace(/\r\n/g, '\n').split('\n\n').slice(0, -1).some((event) => event.includes(sseUntil))) {{ reader.cancel(); break; }}
     }}
   }}
   return JSON.stringify({{status:r.status,ct,body}});
 }})()
 "#,
         url = serde_json::to_string(url).unwrap_or_default(),
-        options = fetch_options(init)
+        options = fetch_options(init),
+        sse_until = json!(init.sse_until)
     );
     let result = match cdp.call_for(
         "Runtime.evaluate",
@@ -2171,6 +2177,7 @@ fn run_nlweb_probes(
         method: Some("POST"),
         headers: NLWEB_MCP_HEADERS,
         body: Some(&init_body),
+        sse_until: Some("\"result\""),
     };
     let mcp_body = match isolated_world_fetch(cdp, session_id, &frame_id, &mcp_url, &init) {
         IsolatedProbeResult::Ok(status, ct, body) => mcp_init_payload(status, &ct, body),
@@ -2216,6 +2223,7 @@ const NLWEB_ASK: FetchInit<'static> = FetchInit {
     method: None,
     headers: &[("Accept", "application/json")],
     body: None,
+    sse_until: None,
 };
 
 const NLWEB_MCP_HEADERS: &[(&str, &str)] = &[
@@ -4383,6 +4391,8 @@ mod tests {
         assert!(expressions[1].contains(r#""Content-Type":"application/json""#));
         assert!(expressions[1].contains(r#""Accept":"application/json, text/event-stream""#));
         assert!(expressions[0].contains("/ask?query=nlweb&streaming=false"));
+        assert!(expressions[0].contains("const sseUntil = null;"));
+        assert!(expressions[1].contains(r#"const sseUntil = "\"result\"";"#), "{}", expressions[1]);
         assert!(expressions[1].contains("initialize"));
         for expression in &expressions {
             assert!(expression.contains(r#""credentials":"omit""#));
@@ -4550,7 +4560,7 @@ mod tests {
             fetch_options(&PLAIN_GET),
             json!({ "credentials": "omit", "redirect": "manual", "cache": "no-store" })
         );
-        let options = fetch_options(&FetchInit { method: Some("PUT"), headers: &[("X", "1")], body: Some("b") });
+        let options = fetch_options(&FetchInit { method: Some("PUT"), headers: &[("X", "1")], body: Some("b"), sse_until: None });
         assert_eq!(options["method"], "PUT");
         assert_eq!(options["headers"], json!({ "X": "1" }));
         assert_eq!(options["body"], "b");
@@ -4585,5 +4595,20 @@ mod tests {
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn repeated_probe_options_reach_the_connection_step() {
+        let argv: Vec<String> = [
+            "discover", "--json", "--cdp", "ws://127.0.0.1:1/devtools/browser/x",
+            "--probe", "robots", "--probe", "nlweb",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let invocation = crate::args::parse(&argv).unwrap();
+        assert_eq!(invocation.repeated("probe"), ["robots", "nlweb"]);
+        let output = run(&invocation, None);
+        assert_ne!(output.code, 0);
     }
 }

@@ -2022,7 +2022,7 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
             },
           });
           res.writeHead(200, { 'content-type': 'text/event-stream' });
-          res.end(`event: message\ndata: ${result}\n\n`);
+          res.write(`event: message\ndata: ${result}\n\n`);
         });
         return;
       }
