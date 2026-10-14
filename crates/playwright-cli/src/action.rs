@@ -12,7 +12,7 @@ impl Report {
     pub fn for_command(command: &str) -> Self {
         let kind = match command {
             "open" | "tab-new" => "open",
-            "goto" => "goto",
+            "goto" | "navigate" => "goto",
             "close" | "tab-close" => "close",
             "tab-select" => "select",
             "snapshot" => "snapshot",
