@@ -45,6 +45,7 @@ pub struct Cdp {
     discovering: bool,
     requests: BTreeMap<String, bool>,
     handed: BTreeSet<(String, String)>,
+    answering: BTreeMap<i64, (String, String)>,
     held: BTreeMap<String, Vec<Value>>,
     streams: BTreeSet<String>,
     contexts: BTreeSet<String>,
@@ -75,6 +76,7 @@ impl Cdp {
             discovering: false,
             requests: BTreeMap::new(),
             handed: BTreeSet::new(),
+            answering: BTreeMap::new(),
             held: BTreeMap::new(),
             streams: BTreeSet::new(),
             contexts: BTreeSet::new(),
@@ -156,6 +158,13 @@ impl Cdp {
             return self.create_target(params, timeout);
         }
         let result = self.raw_call(method, params.clone(), session_id, timeout)?;
+        if let (true, Some(session), Some(id)) = (
+            shield::answers_interception(method),
+            session_id,
+            shield::request_key(&params),
+        ) {
+            self.settle(session, &id);
+        }
         if let Some(session) = session_id {
             if self.blocked.contains(session) && !harmless(method, &params) {
                 return Err(self.refusal());
@@ -175,7 +184,14 @@ impl Cdp {
         if matches!(method, "Target.createTarget" | "Target.attachToTarget") {
             return Err(format!("{method} must be a call, not a notify\n"));
         }
-        self.send(method, params, session_id)?;
+        let answered = shield::answers_interception(method)
+            .then(|| shield::request_key(&params))
+            .flatten()
+            .zip(session_id.map(str::to_string));
+        let sent = self.send(method, params, session_id)?;
+        if let Some((id, session)) = answered {
+            self.answering.insert(sent, (session, id));
+        }
         Ok(())
     }
 
@@ -259,10 +275,6 @@ impl Cdp {
                 .is_some_and(|session| self.handed.contains(&(session.to_string(), id.clone())));
             if !handed || self.request_state(&id) == Some(true) {
                 return Err(UNSEEN.into());
-            }
-            if shield::answers_interception(method) {
-                let session = session_id.unwrap_or("").to_string();
-                self.settle(&session, &id);
             }
         }
         if shield::body_method(method) {
@@ -1014,6 +1026,11 @@ impl Cdp {
 
     fn absorb(&mut self, value: Value) {
         if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
+            if let Some((session, request)) = self.answering.remove(&id) {
+                if value.get("error").is_none() {
+                    self.settle(&session, &request);
+                }
+            }
             if let Some((session, request)) = self.decided.remove(&id) {
                 if let Some(error) = value.get("error") {
                     let text = error

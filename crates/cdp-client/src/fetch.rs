@@ -1001,6 +1001,47 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_chrome_rejects_leaves_the_id_issued() {
+        let reject = |message: &Value| {
+            if message["params"]["responseCode"] == 0 {
+                vec![json!({ "id": message["id"], "error": { "message": "Invalid http status code" } })]
+            } else {
+                vec![ok(message)]
+            }
+        };
+        let (mut cdp, log) = fake(
+            vec![
+                paused_event("S", "R1", "https://app.example/a"),
+                paused_event("S", "R2", "https://app.example/b"),
+            ],
+            Box::new(reject),
+        );
+        while cdp.next_paused(Some("S"), Duration::from_millis(10)).unwrap().is_some() {}
+        let bad = json!({ "requestId": "R1", "responseCode": 0 });
+        let good = json!({ "requestId": "R1", "responseCode": 200 });
+        assert!(cdp.call("Fetch.fulfillRequest", bad.clone(), Some("S")).unwrap_err().contains("Invalid http status"));
+        cdp.call("Fetch.fulfillRequest", good.clone(), Some("S")).unwrap();
+        assert!(refused(cdp.call("Fetch.fulfillRequest", good, Some("S"))));
+        let bad = json!({ "requestId": "R2", "responseCode": 0 });
+        cdp.notify("Fetch.fulfillRequest", bad, Some("S")).unwrap();
+        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        cdp.notify("Fetch.continueRequest", json!({ "requestId": "R2" }), Some("S")).unwrap();
+        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        assert!(refused(cdp.call("Fetch.continueRequest", json!({ "requestId": "R2" }), Some("S"))));
+        assert_eq!(
+            methods(&log),
+            [
+                "Fetch.fulfillRequest",
+                "Fetch.fulfillRequest",
+                "Fetch.fulfillRequest",
+                "Runtime.evaluate",
+                "Fetch.continueRequest",
+                "Runtime.evaluate"
+            ]
+        );
+    }
+
+    #[test]
     fn an_id_a_decider_answered_is_not_issued_again() {
         let (mut cdp, log) = fake(
             vec![paused_event("S", "R1", "https://app.example/x")],
