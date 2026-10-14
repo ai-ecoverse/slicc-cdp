@@ -8,7 +8,7 @@ use discovery::{
     default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
     parse_link_header, classify_ard_body, classify_ai_catalog_body,
     classify_poppy_body, registrable_domain, parse_robots_txt_agentmap,
-    detect_nlweb_entries, classify_nlweb_ask, classify_nlweb_mcp_init,
+    classify_nlweb_ask, classify_nlweb_mcp_init,
     ClassifierRegistry, DedupSet, DiscoveryEvent,
     ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
@@ -1493,11 +1493,53 @@ enum IsolatedProbeResult {
     Unavailable,
 }
 
+#[derive(Default)]
+struct FetchInit<'a> {
+    method: Option<&'a str>,
+    headers: &'a [(&'a str, &'a str)],
+    body: Option<&'a str>,
+}
+
+const PLAIN_GET: FetchInit<'static> = FetchInit {
+    method: None,
+    headers: &[],
+    body: None,
+};
+
+fn fetch_options(init: &FetchInit) -> Value {
+    let mut options = json!({ "credentials": "omit", "redirect": "manual", "cache": "no-store" });
+    if let Some(method) = init.method {
+        options["method"] = json!(method);
+    }
+    if !init.headers.is_empty() {
+        let headers: serde_json::Map<String, Value> = init
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), json!(value)))
+            .collect();
+        options["headers"] = Value::Object(headers);
+    }
+    if let Some(body) = init.body {
+        options["body"] = json!(body);
+    }
+    options
+}
+
 fn isolated_world_probe(
     cdp: &mut Cdp,
     session_id: &str,
     frame_id: &str,
     url: &str,
+) -> IsolatedProbeResult {
+    isolated_world_fetch(cdp, session_id, frame_id, url, &PLAIN_GET)
+}
+
+fn isolated_world_fetch(
+    cdp: &mut Cdp,
+    session_id: &str,
+    frame_id: &str,
+    url: &str,
+    init: &FetchInit,
 ) -> IsolatedProbeResult {
     let world = match cdp.call(
         "Page.createIsolatedWorld",
@@ -1519,7 +1561,7 @@ fn isolated_world_probe(
   const cap = 1048576;
   let r;
   try {{
-    r = await fetch({url}, {{credentials:'omit',redirect:'manual',cache:'no-store'}});
+    r = await fetch({url}, {options});
   }} catch(e) {{ return JSON.stringify({{err:e.message}}); }}
   if (r.type === 'opaqueredirect') return JSON.stringify({{err:'redirect'}});
   const ct = r.headers.get('content-type') || '';
@@ -1539,7 +1581,8 @@ fn isolated_world_probe(
   return JSON.stringify({{status:r.status,ct,body}});
 }})()
 "#,
-        url = serde_json::to_string(url).unwrap_or_default()
+        url = serde_json::to_string(url).unwrap_or_default(),
+        options = fetch_options(init)
     );
     let result = match cdp.call_for(
         "Runtime.evaluate",
@@ -2114,32 +2157,27 @@ fn run_nlweb_probes(
     };
     let page_url = sess.page_url.clone();
     let target_id = sess.target_id.clone();
-    let mut ask_summary: Option<Value> = None;
-    let mut mcp_summary: Option<Value> = None;
     let ask_url = format!("{}/ask?query=", origin.trim_end_matches('/'));
-    if !cdp.guard().url(&ask_url) {
-        let ask_result = nlweb_ask_probe(cdp, session_id, &frame_id, &ask_url);
-        let body = match ask_result {
-            Some(b) => Some(b),
-            None => {
-                match native_probe(&ask_url, "application/json") {
-                    Some((s, ct, b)) if s == 200 && is_json_content_type(&ct) => Some(b),
-                    _ => None,
-                }
-            }
-        };
-        if let Some(ref b) = body {
-            ask_summary = classify_nlweb_ask(b);
-        }
-    }
+    let ask_body = match isolated_world_fetch(cdp, session_id, &frame_id, &ask_url, &NLWEB_ASK) {
+        IsolatedProbeResult::Ok(status, ct, body) => json_ok_body(status, &ct, body),
+        IsolatedProbeResult::Final => None,
+        IsolatedProbeResult::Unavailable => native_probe(&ask_url, "application/json")
+            .and_then(|(status, ct, body)| json_ok_body(status, &ct, body)),
+    };
+    let ask_summary = ask_body.as_deref().and_then(classify_nlweb_ask);
     let mcp_url = format!("{}/mcp", origin.trim_end_matches('/'));
-    if !cdp.guard().url(&mcp_url) {
-        let mcp_body = nlweb_mcp_probe(cdp, session_id, &frame_id, &mcp_url)
-            .or_else(|| nlweb_mcp_probe_native(&mcp_url));
-        if let Some(ref b) = mcp_body {
-            mcp_summary = classify_nlweb_mcp_init(b);
-        }
-    }
+    let init_body = nlweb_mcp_init_body();
+    let init = FetchInit {
+        method: Some("POST"),
+        headers: NLWEB_MCP_HEADERS,
+        body: Some(&init_body),
+    };
+    let mcp_body = match isolated_world_fetch(cdp, session_id, &frame_id, &mcp_url, &init) {
+        IsolatedProbeResult::Ok(status, ct, body) => json_ok_body(status, &ct, body),
+        IsolatedProbeResult::Final => None,
+        IsolatedProbeResult::Unavailable => nlweb_mcp_probe_native(&mcp_url, &init_body),
+    };
+    let mcp_summary = mcp_body.as_deref().and_then(classify_nlweb_mcp_init);
     if ask_summary.is_none() && mcp_summary.is_none() {
         return output;
     }
@@ -2150,15 +2188,11 @@ fn run_nlweb_probes(
     if mcp_summary.is_some() {
         map.insert("mcpUrl".into(), Value::String(mcp_url.clone()));
     }
-    if let Some(ref ask) = ask_summary {
-        if let Some(name) = ask.get("serverName") {
-            map.insert("serverName".into(), name.clone());
-        }
+    if let Some(name) = ask_summary.as_ref().and_then(|ask| ask.get("serverName")) {
+        map.insert("serverName".into(), name.clone());
     }
-    if let Some(ref mcp) = mcp_summary {
-        if let Some(si) = mcp.get("serverInfo") {
-            map.insert("serverInfo".into(), si.clone());
-        }
+    if let Some(info) = mcp_summary.as_ref().and_then(|mcp| mcp.get("serverInfo")) {
+        map.insert("serverInfo".into(), info.clone());
     }
     let event_url = if ask_summary.is_some() { ask_url } else { mcp_url };
     let event = DiscoveryEvent {
@@ -2178,79 +2212,19 @@ fn run_nlweb_probes(
     output
 }
 
-fn nlweb_ask_probe(
-    cdp: &mut Cdp,
-    session_id: &str,
-    frame_id: &str,
-    url: &str,
-) -> Option<String> {
-    let world = cdp.call(
-        "Page.createIsolatedWorld",
-        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
-        Some(session_id),
-    ).ok()?;
-    let ctx_id = world.get("executionContextId").and_then(|v| v.as_u64())?;
-    let js = format!(
-        r#"(async () => {{
-  const cap = 1048576;
-  let r;
-  try {{
-    r = await fetch({url}, {{credentials:'omit',redirect:'manual',cache:'no-store',headers:{{'Accept':'application/json'}}}});
-  }} catch(e) {{ return JSON.stringify({{err:e.message}}); }}
-  if (r.type === 'opaqueredirect') return JSON.stringify({{err:'redirect'}});
-  const ct = r.headers.get('content-type') || '';
-  let body = '';
-  if (r.body) {{
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let total = 0;
-    while (true) {{
-      const {{done, value}} = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      body += dec.decode(value, {{stream:true}});
-      if (total > cap) {{ reader.cancel(); body = body.slice(0, cap); break; }}
-    }}
-  }}
-  return JSON.stringify({{status:r.status,ct,body}});
-}})()
-"#,
-        url = serde_json::to_string(url).unwrap_or_default(),
-    );
-    let result = cdp.call_for(
-        "Runtime.evaluate",
-        json!({
-            "expression": js,
-            "contextId": ctx_id,
-            "returnByValue": true,
-            "awaitPromise": true
-        }),
-        Some(session_id),
-        Duration::from_secs(5),
-    ).ok()?;
-    let value_str = result.pointer("/result/value").and_then(|v| v.as_str())?;
-    let parsed: Value = serde_json::from_str(value_str).ok()?;
-    if parsed.get("err").is_some() {
-        return None;
-    }
-    let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-    if status != 200 {
-        return None;
-    }
-    let ct = parsed.get("ct").and_then(|v| v.as_str()).unwrap_or("");
-    if !is_json_content_type(ct) {
-        return None;
-    }
-    parsed.get("body").and_then(|v| v.as_str()).map(str::to_string)
-}
+const NLWEB_ASK: FetchInit<'static> = FetchInit {
+    method: None,
+    headers: &[("Accept", "application/json")],
+    body: None,
+};
 
-fn nlweb_mcp_probe(
-    cdp: &mut Cdp,
-    session_id: &str,
-    frame_id: &str,
-    url: &str,
-) -> Option<String> {
-    let init_body = serde_json::json!({
+const NLWEB_MCP_HEADERS: &[(&str, &str)] = &[
+    ("Content-Type", "application/json"),
+    ("Accept", "application/json"),
+];
+
+fn nlweb_mcp_init_body() -> String {
+    json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
@@ -2259,95 +2233,26 @@ fn nlweb_mcp_probe(
             "capabilities": {},
             "clientInfo": { "name": "slicc-discover", "version": "0.1" }
         }
-    });
-    let body_str = serde_json::to_string(&init_body).ok()?;
-    let world = cdp.call(
-        "Page.createIsolatedWorld",
-        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
-        Some(session_id),
-    ).ok()?;
-    let ctx_id = world.get("executionContextId").and_then(|v| v.as_u64())?;
-    let js = format!(
-        r#"(async () => {{
-  const cap = 1048576;
-  let r;
-  try {{
-    r = await fetch({url}, {{method:'POST',credentials:'omit',redirect:'manual',cache:'no-store',headers:{{'Content-Type':'application/json','Accept':'application/json'}},body:{body}}});
-  }} catch(e) {{ return JSON.stringify({{err:e.message}}); }}
-  if (r.type === 'opaqueredirect') return JSON.stringify({{err:'redirect'}});
-  const ct = r.headers.get('content-type') || '';
-  let text = '';
-  if (r.body) {{
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let total = 0;
-    while (true) {{
-      const {{done, value}} = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      text += dec.decode(value, {{stream:true}});
-      if (total > cap) {{ reader.cancel(); text = text.slice(0, cap); break; }}
-    }}
-  }}
-  return JSON.stringify({{status:r.status,ct,body:text}});
-}})()
-"#,
-        url = serde_json::to_string(url).unwrap_or_default(),
-        body = serde_json::to_string(&body_str).unwrap_or_default(),
-    );
-    let result = cdp.call_for(
-        "Runtime.evaluate",
-        json!({
-            "expression": js,
-            "contextId": ctx_id,
-            "returnByValue": true,
-            "awaitPromise": true
-        }),
-        Some(session_id),
-        Duration::from_secs(5),
-    ).ok()?;
-    let value_str = result.pointer("/result/value").and_then(|v| v.as_str())?;
-    let parsed: Value = serde_json::from_str(value_str).ok()?;
-    if parsed.get("err").is_some() {
-        return None;
-    }
-    let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-    if status != 200 {
-        return None;
-    }
-    let ct = parsed.get("ct").and_then(|v| v.as_str()).unwrap_or("");
-    if !is_json_content_type(ct) {
-        return None;
-    }
-    parsed.get("body").and_then(|v| v.as_str()).map(str::to_string)
+    })
+    .to_string()
+}
+
+fn json_ok_body(status: u16, content_type: &str, body: String) -> Option<String> {
+    (status == 200 && is_json_content_type(content_type)).then_some(body)
 }
 
 #[cfg(not(target_os = "wasi"))]
-fn nlweb_mcp_probe_native(url: &str) -> Option<String> {
-    let init_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": { "name": "slicc-discover", "version": "0.1" }
-        }
-    });
-    let body_str = serde_json::to_string(&init_body).ok()?;
-    let resp = cdp_client::net::http_post_json(url, &body_str).ok()?;
-    if resp.status != 200 {
-        return None;
-    }
-    let ct = resp.content_type().to_string();
-    if !is_json_content_type(&ct) {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&resp.body).into_owned())
+fn nlweb_mcp_probe_native(url: &str, body: &str) -> Option<String> {
+    let resp = cdp_client::net::http_post_json(url, body).ok()?;
+    json_ok_body(
+        resp.status,
+        resp.content_type(),
+        String::from_utf8_lossy(&resp.body).into_owned(),
+    )
 }
 
 #[cfg(target_os = "wasi")]
-fn nlweb_mcp_probe_native(_url: &str) -> Option<String> {
+fn nlweb_mcp_probe_native(_url: &str, _body: &str) -> Option<String> {
     None
 }
 
@@ -4360,6 +4265,256 @@ mod tests {
             &summary,
         );
         assert!(output.is_empty(), "no nlweb entry should produce no event: {output}");
+    }
+
+    struct ScriptedTransport {
+        incoming: std::collections::VecDeque<String>,
+        sent: std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
+    }
+
+    impl cdp_client::cdp::Transport for ScriptedTransport {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            self.sent.borrow_mut().push(serde_json::from_str(text).unwrap());
+            Ok(())
+        }
+
+        fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+            Ok(self.incoming.pop_front())
+        }
+    }
+
+    fn scripted_cdp(replies: Vec<Value>) -> (Cdp, std::rc::Rc<std::cell::RefCell<Vec<Value>>>) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let incoming = replies
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| json!({ "id": i as i64 + 1, "result": result }).to_string())
+            .collect();
+        let transport = ScriptedTransport { incoming, sent: sent.clone() };
+        (Cdp::from_transport(Box::new(transport)), sent)
+    }
+
+    fn fetched(status: u16, ct: &str, body: &str) -> Value {
+        json!({ "result": { "type": "string", "value": json!({ "status": status, "ct": ct, "body": body }).to_string() } })
+    }
+
+    fn nlweb_state() -> WatcherState {
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".into(),
+                top_frame_id: Some("F1".into()),
+                page_url: "https://example.com/".into(),
+            },
+        );
+        WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions,
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false, nlweb_probe: true,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        }
+    }
+
+    #[test]
+    fn nlweb_probes_go_through_the_guarded_isolated_fetch() {
+        let info = json!({ "targetInfo": { "targetId": "F1", "type": "page", "url": "https://example.com/" } });
+        let world = json!({ "executionContextId": 7 });
+        let (mut cdp, sent) = scripted_cdp(vec![
+            info.clone(),
+            world.clone(),
+            fetched(200, "application/json", r#"{"name":"Shop","results":[]}"#),
+            info,
+            world,
+            fetched(200, "application/json", r#"{"result":{"serverInfo":{"name":"nlweb-mcp","version":"1"}}}"#),
+        ]);
+        let mut state = nlweb_state();
+        let output = run_nlweb_probes(&mut cdp, &mut state, "S1", "https://example.com");
+        let event: Value = serde_json::from_str(output.trim()).unwrap();
+        assert!(event["url"].as_str().unwrap().starts_with("https://example.com/ask"));
+        assert_eq!(event["summary"]["mcpUrl"], "https://example.com/mcp");
+        assert_eq!(event["summary"]["serverName"], "Shop");
+        let expressions: Vec<String> = sent
+            .borrow()
+            .iter()
+            .filter(|m| m["method"] == "Runtime.evaluate")
+            .map(|m| m["params"]["expression"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(expressions.len(), 2);
+        assert!(expressions[0].contains(r#""headers":{"Accept":"application/json"}"#), "{}", expressions[0]);
+        assert!(!expressions[0].contains("POST"));
+        assert!(expressions[1].contains(r#""method":"POST""#), "{}", expressions[1]);
+        assert!(expressions[1].contains(r#""Content-Type":"application/json""#));
+        assert!(expressions[1].contains("initialize"));
+        for expression in &expressions {
+            assert!(expression.contains(r#""credentials":"omit""#));
+            assert!(expression.contains(r#""redirect":"manual""#));
+        }
+    }
+
+    #[test]
+    fn a_refused_nlweb_fetch_does_not_fall_back_to_native() {
+        let info = json!({ "targetInfo": { "targetId": "F1", "type": "page", "url": "http://127.0.0.1:1/" } });
+        let world = json!({ "executionContextId": 7 });
+        let refused = json!({ "result": { "type": "string", "value": r#"{"err":"redirect"}"# } });
+        let (mut cdp, sent) = scripted_cdp(vec![info.clone(), world.clone(), refused.clone(), info, world, refused]);
+        let mut state = nlweb_state();
+        let output = run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1");
+        assert!(output.is_empty(), "{output}");
+        let evaluations = sent.borrow().iter().filter(|m| m["method"] == "Runtime.evaluate").count();
+        assert_eq!(evaluations, 2);
+    }
+
+    #[test]
+    fn an_unavailable_isolated_world_falls_back_to_native() {
+        let (mut cdp, _) = scripted_cdp(vec![]);
+        let mut state = nlweb_state();
+        let output = run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1");
+        assert!(output.is_empty(), "{output}");
+    }
+
+    fn serve_nlweb() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let catalog = json!({
+            "name": "NLWeb Catalog",
+            "entries": [{ "identifier": "urn:nlweb:search", "displayName": "NLWeb Search", "type": "application/nlweb+json", "url": format!("{origin}/ask") }]
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = request.lines().next().unwrap_or("").to_string();
+                let mut content_type = "application/json";
+                let (status, body) = if line.starts_with("GET /robots.txt ") {
+                    content_type = "text/plain";
+                    ("200 OK", "Agentmap: /agentmap.json\n".to_string())
+                } else if line.starts_with("GET /.well-known/ard.json ") || line.starts_with("GET /agentmap.json ") {
+                    ("200 OK", catalog.clone())
+                } else if line.starts_with("GET /ask?query= ") {
+                    ("200 OK", r#"{"name":"Shop","results":[]}"#.to_string())
+                } else if line.starts_with("POST /mcp ") {
+                    ("200 OK", r#"{"result":{"serverInfo":{"name":"NLWeb Server","version":"0.5"}}}"#.to_string())
+                } else {
+                    ("404 Not Found", "{}".to_string())
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        origin
+    }
+
+    #[test]
+    fn native_probes_report_catalog_and_verified_nlweb_endpoints() {
+        let origin = serve_nlweb();
+        let (mut cdp, _) = scripted_cdp(vec![]);
+        let mut state = nlweb_state();
+        state.robots_probe = true;
+        state.sessions.get_mut("S1").unwrap().page_url = format!("{origin}/");
+        let output = run_probes(&mut cdp, &mut state, "S1", &origin);
+        let events: Vec<Value> = output.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(events.iter().any(|e| e["standard"] == "ard" && e["url"].as_str().unwrap().ends_with("/agentmap.json")), "{output}");
+        let nlweb: Vec<&Value> = events.iter().filter(|e| e["standard"] == "nlweb").collect();
+        assert_eq!(nlweb.len(), 2, "{output}");
+        assert_eq!(nlweb[0]["via"], "catalog");
+        assert_eq!(nlweb[1]["summary"]["serverInfo"]["name"], "NLWeb Server");
+        assert_eq!(nlweb[1]["summary"]["serverName"], "Shop");
+    }
+
+    #[test]
+    fn a_catalog_link_header_reports_its_nlweb_entry() {
+        let catalog = json!({
+            "name": "NLWeb Catalog",
+            "entries": [{ "identifier": "urn:nlweb:search", "displayName": "NLWeb Search", "type": "application/nlweb+json", "url": "https://example.com/ask" }]
+        })
+        .to_string();
+        let link = json!({
+            "method": "Network.responseReceived",
+            "sessionId": "S1",
+            "params": { "response": { "headers": { "Link": "</.well-known/ard.json>; rel=\"ard\"" } } }
+        });
+        let replies = [
+            json!({ "targetInfo": { "targetId": "F1", "type": "page", "url": "https://example.com/" } }),
+            json!({ "executionContextId": 7 }),
+            fetched(200, "application/json", &catalog),
+        ];
+        let mut incoming: std::collections::VecDeque<String> = replies
+            .iter()
+            .enumerate()
+            .map(|(i, result)| json!({ "id": i as i64 + 1, "result": result }).to_string())
+            .collect();
+        incoming.push_front(link.to_string());
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut cdp = Cdp::from_transport(Box::new(ScriptedTransport { incoming, sent }));
+        cdp.pump(Instant::now()).unwrap();
+        let mut state = nlweb_state();
+        let output = follow_links(&mut cdp, &mut state, "S1");
+        assert!(output.lines().any(|l| l.contains(r#""standard":"nlweb""#) && l.contains(r#""via":"catalog""#)), "{output}");
+    }
+
+    #[test]
+    fn nlweb_probes_run_once_and_skip_guarded_or_unknown_sessions() {
+        let (mut cdp, _) = scripted_cdp(vec![]);
+        let mut state = nlweb_state();
+        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1").is_empty());
+        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1").is_empty());
+        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "https://vault.sliccy.ai").is_empty());
+        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:9222").is_empty());
+        assert!(run_nlweb_probes(&mut cdp, &mut state, "NONE", "http://127.0.0.1:2").is_empty());
+        state.sessions.get_mut("S1").unwrap().top_frame_id = None;
+        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:3").is_empty());
+    }
+
+    #[test]
+    fn a_catalog_nlweb_event_is_emitted_once() {
+        let mut state = nlweb_state();
+        let summary = json!({ "entries": [{ "type": "application/nlweb+json", "url": "https://example.com/mcp" }] });
+        let first = emit_nlweb_from_catalog(&mut state, "https://example.com", "https://example.com/", "T1", &summary);
+        let event: Value = serde_json::from_str(first.trim()).unwrap();
+        assert_eq!(event["url"], "https://example.com/mcp");
+        assert!(emit_nlweb_from_catalog(&mut state, "https://example.com", "https://example.com/", "T1", &summary).is_empty());
+    }
+
+    #[test]
+    fn a_non_json_nlweb_reply_is_not_verified() {
+        assert_eq!(json_ok_body(200, "application/json; charset=utf-8", "{}".into()).as_deref(), Some("{}"));
+        assert_eq!(json_ok_body(200, "text/html", "{}".into()), None);
+        assert_eq!(json_ok_body(404, "application/json", "{}".into()), None);
+    }
+
+    #[test]
+    fn a_plain_get_sends_only_the_guards() {
+        assert_eq!(
+            fetch_options(&PLAIN_GET),
+            json!({ "credentials": "omit", "redirect": "manual", "cache": "no-store" })
+        );
+        let options = fetch_options(&FetchInit { method: Some("PUT"), headers: &[("X", "1")], body: Some("b") });
+        assert_eq!(options["method"], "PUT");
+        assert_eq!(options["headers"], json!({ "X": "1" }));
+        assert_eq!(options["body"], "b");
+        assert_eq!(options["credentials"], "omit");
+        assert!(FetchInit::default().method.is_none());
+    }
+
+    #[test]
+    fn the_mcp_initialize_body_is_json_rpc() {
+        let body: Value = serde_json::from_str(&nlweb_mcp_init_body()).unwrap();
+        assert_eq!(body["method"], "initialize");
+        assert_eq!(body["jsonrpc"], "2.0");
     }
 
     #[test]

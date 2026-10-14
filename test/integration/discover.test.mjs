@@ -2003,14 +2003,16 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
         req.on('data', (c) => (body += c));
         req.on('end', () => {
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            result: {
-              serverInfo: { name: 'NLWeb Server', version: '0.5' },
-              protocolVersion: '2025-03-26',
-            },
-          }));
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              result: {
+                serverInfo: { name: 'NLWeb Server', version: '0.5' },
+                protocolVersion: '2025-03-26',
+              },
+            })
+          );
         });
         return;
       }
@@ -2029,15 +2031,19 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
       }
       if (url.pathname === '/.well-known/ard.json') {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({
-          name: 'NLWeb Catalog',
-          entries: [{
-            identifier: 'urn:nlweb:search',
-            displayName: 'NLWeb Search',
-            type: 'application/nlweb+json',
-            url: `${nlwebOrigin}/ask`,
-          }],
-        }));
+        res.end(
+          JSON.stringify({
+            name: 'NLWeb Catalog',
+            entries: [
+              {
+                identifier: 'urn:nlweb:search',
+                displayName: 'NLWeb Search',
+                type: 'application/nlweb+json',
+                url: `${nlwebOrigin}/ask`,
+              },
+            ],
+          })
+        );
         return;
       }
       res.writeHead(404, { 'content-type': 'text/plain' });
@@ -2058,14 +2064,16 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
         req.on('data', (c) => (body += c));
         req.on('end', () => {
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            result: {
-              serverInfo: { name: 'Generic MCP', version: '1.0' },
-              protocolVersion: '2025-03-26',
-            },
-          }));
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              result: {
+                serverInfo: { name: 'Generic MCP', version: '1.0' },
+                protocolVersion: '2025-03-26',
+              },
+            })
+          );
         });
         return;
       }
@@ -2111,9 +2119,7 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
         ['discover', '--json', '--once', `${nlwebOrigin}/`],
         cwd
       );
-      const events = result.stdout.trim()
-        ? parseEvents(result.stdout)
-        : [];
+      const events = result.stdout.trim() ? parseEvents(result.stdout) : [];
       const nlwebProbe = events.find((e) => e.standard === 'nlweb' && e.via === 'well-known');
       assert.ok(!nlwebProbe, `nlweb probe should not fire without --probe nlweb: ${result.stdout}`);
     });
@@ -2125,9 +2131,7 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
         ['discover', '--json', '--probe', 'nlweb', '--once', `${plainMcpOrigin}/`],
         cwd
       );
-      const events = result.stdout.trim()
-        ? parseEvents(result.stdout)
-        : [];
+      const events = result.stdout.trim() ? parseEvents(result.stdout) : [];
       const nlweb = events.find((e) => e.standard === 'nlweb');
       assert.ok(!nlweb, `plain MCP should not produce nlweb event: ${result.stdout}`);
     });

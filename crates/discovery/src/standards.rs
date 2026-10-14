@@ -2521,4 +2521,15 @@ mod tests {
     fn classify_nlweb_mcp_init_invalid_json() {
         assert!(classify_nlweb_mcp_init("not json").is_none());
     }
+
+    #[test]
+    fn detect_nlweb_entries_skips_urlless_and_keeps_an_other_endpoint() {
+        let summary = serde_json::json!({ "entries": [
+            { "identifier": "urn:nlweb:a", "url": "" },
+            { "identifier": "urn:nlweb:b", "url": "https://example.com/search" }
+        ] });
+        let found = detect_nlweb_entries(&summary).unwrap();
+        assert_eq!(found["askUrl"], "https://example.com/search");
+        assert!(found.get("mcpUrl").is_none());
+    }
 }

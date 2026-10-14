@@ -94,6 +94,20 @@ const PROBE_MAX_BODY: usize = 1024 * 1024;
 
 #[cfg(not(target_os = "wasi"))]
 pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
+    probe_request("GET", url, &format!("Accept: {accept}\r\n"), "")
+}
+
+#[cfg(not(target_os = "wasi"))]
+pub fn http_post_json(url: &str, body: &str) -> Result<ProbeResponse, String> {
+    let headers = format!(
+        "Content-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    probe_request("POST", url, &headers, body)
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn probe_request(method: &str, url: &str, headers: &str, body: &str) -> Result<ProbeResponse, String> {
     let parts = parse_url(url)?;
     if parts.scheme != "http" && parts.scheme != "https" {
         return Err(format!("probe URL must be http or https: {url}\n"));
@@ -122,8 +136,8 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
     };
     let host_hdr = host_header(&parts);
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\n\r\n",
-        parts.path, host_hdr, accept
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+        parts.path, host_hdr
     );
     stream
         .write_all(request.as_bytes())
@@ -144,55 +158,6 @@ pub fn http_probe(url: &str, accept: &str) -> Result<ProbeResponse, String> {
 #[cfg(target_os = "wasi")]
 pub fn http_probe(_url: &str, _accept: &str) -> Result<ProbeResponse, String> {
     Err("probes are not available in this build\n".to_string())
-}
-
-#[cfg(not(target_os = "wasi"))]
-pub fn http_post_json(url: &str, body: &str) -> Result<ProbeResponse, String> {
-    let parts = parse_url(url)?;
-    if parts.scheme != "http" && parts.scheme != "https" {
-        return Err(format!("POST URL must be http or https: {url}\n"));
-    }
-    #[cfg(test)]
-    if reserved_loopback(&parts) {
-        panic!("test dialed {}:{}", parts.host, parts.port);
-    }
-    let addr = resolve(&parts.host, parts.port)?;
-    if is_reserved_cdp_socket(addr, parts.port) {
-        return Err(format!("POST refused for reserved CDP address: {url}\n"));
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let connect_timeout = Duration::from_secs(3).min(
-        deadline.saturating_duration_since(Instant::now()),
-    );
-    let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
-        .map_err(|err| format!("POST connect failed for {url}: {err}\n"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|err| format!("POST timeout setup failed: {err}\n"))?;
-    tcp.set_nodelay(true).ok();
-    let mut stream: Box<dyn ReadWrite> = if parts.scheme == "https" {
-        wrap_tls(&parts.host, tcp)?
-    } else {
-        Box::new(tcp)
-    };
-    let host_hdr = host_header(&parts);
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        parts.path, host_hdr, body.len(), body
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|err| format!("POST write failed for {url}: {err}\n"))?;
-    if Instant::now() >= deadline {
-        return Err(format!("POST deadline exceeded for {url}\n"));
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    tcp_set_read_deadline(stream.as_mut(), remaining);
-    let (status, headers, resp_body, _rest) = read_http_capped(stream.as_mut(), Some(PROBE_MAX_BODY), Some(deadline))?;
-    Ok(ProbeResponse {
-        status,
-        headers,
-        body: resp_body,
-    })
 }
 
 #[cfg(target_os = "wasi")]
@@ -1292,6 +1257,38 @@ mod tests {
             resp.body.len()
         );
         server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_json_post_sends_its_body_through_the_probe_path() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while !String::from_utf8_lossy(&request).ends_with("{\"a\":1}") {
+                let n = sock.read(&mut tmp).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&tmp[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        let resp = http_post_json(&format!("http://{addr}/mcp"), "{\"a\":1}").unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"{}");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /mcp HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}"), "{request}");
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn a_json_post_refuses_non_http_urls() {
+        assert!(http_post_json("ftp://example.com/mcp", "{}").is_err());
     }
 
     #[cfg(not(target_os = "wasi"))]
