@@ -414,10 +414,14 @@ async function basicsBatchFlow(runner, site) {
   assert.equal(afterUncheck.stdout, 'false\n');
 
   const iframeLoaded = await runner.playwright(
-    ['eval', '--await', 'new Promise(r=>{const f=document.querySelector("iframe");if(f.contentDocument&&f.contentDocument.readyState==="complete"&&f.contentWindow.location.href!=="about:blank")return r("ready");f.addEventListener("load",()=>r("ready"))})'],
+    [
+      'eval',
+      'new Promise((resolve) => { const frame = document.querySelector("iframe"); const doc = frame.contentDocument; if (doc && doc.readyState === "complete" && doc.location.href !== "about:blank") return resolve("ready"); frame.addEventListener("load", () => resolve("ready"), { once: true }); })',
+    ],
     cwd
   );
   assert.equal(iframeLoaded.code, 0, iframeLoaded.stderr);
+  assert.equal(iframeLoaded.stdout, 'ready\n');
 
   const frames = await runner.playwright(['frames'], cwd);
   assert.equal(frames.code, 0, frames.stderr);

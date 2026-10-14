@@ -273,27 +273,66 @@ pub fn accessibility_tree(cdp: &mut Cdp, session: &str, frame_id: Option<&str>) 
     Ok(snapshot::ax_from_cdp(&nodes))
 }
 
+const PENDING_FRAME_URL: &str = "(navigating)";
+
+const FRAME_COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn frame_tree(cdp: &mut Cdp, session: &str) -> Result<Vec<FrameRec>, String> {
+    let from = cdp.events().len();
+    enable_page(cdp, session)?;
     let result = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
-    let frames = snapshot::flatten_frame_tree(&result);
-    let has_empty_child = frames.iter().any(|f| f.parent_frame_id.is_some() && f.url.is_empty());
-    if !has_empty_child {
-        return Ok(frames);
-    }
-    let _ = cdp.call("Page.enable", json!({}), Some(session));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-    while std::time::Instant::now() < deadline {
-        let _ = cdp.pump(std::time::Instant::now() + std::time::Duration::from_millis(100));
-        let retry = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
-        let retried = snapshot::flatten_frame_tree(&retry);
-        if !retried.iter().any(|f| f.parent_frame_id.is_some() && f.url.is_empty()) {
-            let _ = cdp.call("Page.disable", json!({}), Some(session));
-            return Ok(retried);
+    let mut frames = snapshot::flatten_frame_tree(&result);
+    await_child_commits(cdp, session, from, &mut frames, FRAME_COMMIT_WAIT)?;
+    Ok(frames)
+}
+
+fn await_child_commits(
+    cdp: &mut Cdp,
+    session: &str,
+    from: usize,
+    frames: &mut [FrameRec],
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    for frame in frames
+        .iter_mut()
+        .filter(|frame| frame.parent_frame_id.is_some() && frame.url.is_empty())
+    {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let id = frame.frame_id.clone();
+        let event = cdp.wait_event(from, remaining, |event| {
+            committed_frame_url(event, session, &id).is_some()
+        })?;
+        if let Some(url) = event.and_then(|event| committed_frame_url(&event, session, &id)) {
+            frame.url = url;
         }
     }
-    let _ = cdp.call("Page.disable", json!({}), Some(session));
-    let final_result = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
-    Ok(snapshot::flatten_frame_tree(&final_result))
+    Ok(())
+}
+
+fn committed_frame_url(event: &Value, session: &str, frame_id: &str) -> Option<String> {
+    if event.get("method").and_then(|v| v.as_str()) != Some("Page.frameNavigated")
+        || event.get("sessionId").and_then(|v| v.as_str()) != Some(session)
+    {
+        return None;
+    }
+    let frame = event.pointer("/params/frame")?;
+    if frame.get("id").and_then(|v| v.as_str()) != Some(frame_id) {
+        return None;
+    }
+    frame
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+pub fn frame_display_url(url: &str) -> String {
+    if url.is_empty() {
+        PENDING_FRAME_URL.to_string()
+    } else {
+        crate::sanitize::display_url(url)
+    }
 }
 
 pub fn evaluate(cdp: &mut Cdp, session: &str, expression: &str, await_promise: bool) -> Result<EvalValue, String> {
@@ -1371,8 +1410,123 @@ pub fn lookup_ref<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{cdp_error_response, mime_from_name, navigation_commits, upload_call_args, upload_entry, validate_upload_path, MAX_UPLOAD_BYTES};
-    use serde_json::json;
+    use super::{await_child_commits, cdp_error_response, committed_frame_url, frame_display_url, frame_tree, mime_from_name, navigation_commits, upload_call_args, upload_entry, validate_upload_path, MAX_UPLOAD_BYTES};
+    use crate::cdp::{Cdp, Transport};
+    use crate::snapshot::FrameRec;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    struct Scripted {
+        incoming: VecDeque<String>,
+        sent: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl Transport for Scripted {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            self.sent.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+
+        fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+            Ok(self.incoming.pop_front())
+        }
+    }
+
+    fn scripted(messages: Vec<Value>) -> (Cdp, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let transport = Scripted {
+            incoming: messages.into_iter().map(|m| m.to_string()).collect(),
+            sent: sent.clone(),
+        };
+        (Cdp::from_transport(Box::new(transport)), sent)
+    }
+
+    fn navigated(session: &str, frame: &str, url: &str) -> Value {
+        json!({ "method": "Page.frameNavigated", "sessionId": session, "params": { "frame": { "id": frame, "url": url } } })
+    }
+
+    fn tree(child_url: &str) -> Value {
+        json!({ "frameTree": { "frame": { "id": "M", "url": "http://a/page" }, "childFrames": [ { "frame": { "id": "C", "parentId": "M", "url": child_url } } ] } })
+    }
+
+    #[test]
+    fn frame_tree_enables_page_before_reading_a_committed_tree() {
+        let (mut cdp, sent) = scripted(vec![
+            json!({ "id": 1, "result": {} }),
+            json!({ "id": 2, "result": tree("http://a/child.html") }),
+        ]);
+        let frames = frame_tree(&mut cdp, "S").unwrap();
+        assert_eq!(frames[1].url, "http://a/child.html");
+        let methods: Vec<String> = sent
+            .borrow()
+            .iter()
+            .map(|text| serde_json::from_str::<Value>(text).unwrap()["method"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(methods, ["Page.enable", "Page.getFrameTree"]);
+    }
+
+    #[test]
+    fn frame_tree_waits_for_an_uncommitted_child_to_navigate() {
+        let (mut cdp, _) = scripted(vec![
+            json!({ "id": 1, "result": {} }),
+            json!({ "id": 2, "result": tree("") }),
+            navigated("OTHER", "C", "http://a/wrong"),
+            navigated("S", "M", "http://a/main"),
+            navigated("S", "C", "http://a/child.html"),
+        ]);
+        let frames = frame_tree(&mut cdp, "S").unwrap();
+        assert_eq!(frames[1].url, "http://a/child.html");
+    }
+
+    #[test]
+    fn frame_tree_takes_a_commit_seen_before_the_tree_reply() {
+        let (mut cdp, _) = scripted(vec![
+            json!({ "id": 1, "result": {} }),
+            navigated("S", "C", "http://a/child.html"),
+            json!({ "id": 2, "result": tree("") }),
+        ]);
+        let frames = frame_tree(&mut cdp, "S").unwrap();
+        assert_eq!(frames[1].url, "http://a/child.html");
+    }
+
+    #[test]
+    fn a_child_that_never_commits_stays_pending() {
+        let (mut cdp, _) = scripted(vec![]);
+        let mut frames = vec![
+            FrameRec { frame_id: "M".into(), parent_frame_id: None, url: String::new() },
+            FrameRec { frame_id: "C".into(), parent_frame_id: Some("M".into()), url: String::new() },
+        ];
+        let started = Instant::now();
+        await_child_commits(&mut cdp, "S", 0, &mut frames, Duration::from_millis(50)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(frames[1].url, "");
+        assert_eq!(frame_display_url(&frames[1].url), "(navigating)");
+    }
+
+    #[test]
+    fn frame_tree_surfaces_a_failed_tree_read() {
+        let (mut cdp, _) = scripted(vec![
+            json!({ "id": 1, "result": {} }),
+            json!({ "id": 2, "error": { "message": "No frame" } }),
+        ]);
+        assert!(frame_tree(&mut cdp, "S").is_err());
+    }
+
+    #[test]
+    fn only_a_matching_committed_navigation_counts() {
+        assert_eq!(committed_frame_url(&navigated("S", "C", "http://a/x"), "S", "C").as_deref(), Some("http://a/x"));
+        assert_eq!(committed_frame_url(&navigated("S", "C", ""), "S", "C"), None);
+        assert_eq!(committed_frame_url(&navigated("S", "D", "http://a/x"), "S", "C"), None);
+        assert_eq!(committed_frame_url(&navigated("T", "C", "http://a/x"), "S", "C"), None);
+        assert_eq!(committed_frame_url(&json!({ "method": "Page.loadEventFired", "sessionId": "S" }), "S", "C"), None);
+        assert_eq!(committed_frame_url(&json!({ "method": "Page.frameNavigated", "sessionId": "S" }), "S", "C"), None);
+    }
+
+    #[test]
+    fn a_committed_frame_url_is_displayed() {
+        assert_eq!(frame_display_url("about:blank"), "about:blank");
+    }
 
     #[test]
     fn page_enable_ignores_only_a_cdp_error_response() {

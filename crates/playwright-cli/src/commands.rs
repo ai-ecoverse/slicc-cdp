@@ -1517,7 +1517,7 @@ fn cmd_frames(
                 };
                 lines.push(format!(
                     "  [{kind}] frameId={}{parent} - {}",
-                    frame.frame_id, sanitize::display_url(&frame.url)
+                    frame.frame_id, browser::frame_display_url(&frame.url)
                 ));
             }
             Output::ok(format!(
