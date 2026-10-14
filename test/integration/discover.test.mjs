@@ -1267,71 +1267,70 @@ test('discover ai-catalog', { timeout: 120_000 }, async (t) => {
       }
     });
 
-    await t.test('alias rule: identical ard and ai-catalog give one event with aliases', async () => {
-      const sharedPayload = JSON.stringify({
-        name: 'Shared',
-        entries: [
-          {
-            identifier: 'urn:air:127.0.0.1:server:tool1',
-            displayName: 'Tool One',
-            type: 'application/mcp-server-card+json',
-            url: 'http://127.0.0.1/mcp.json',
-          },
-        ],
-      });
-      const aliasServer = createServer((req, res) => {
-        const url = new URL(req.url || '/', 'http://127.0.0.1');
-        if (url.pathname === '/') {
-          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-          res.end('<!doctype html><title>Alias</title><p>hi</p>');
-          return;
+    await t.test(
+      'alias rule: identical ard and ai-catalog give one event with aliases',
+      async () => {
+        const sharedPayload = JSON.stringify({
+          name: 'Shared',
+          entries: [
+            {
+              identifier: 'urn:air:127.0.0.1:server:tool1',
+              displayName: 'Tool One',
+              type: 'application/mcp-server-card+json',
+              url: 'http://127.0.0.1/mcp.json',
+            },
+          ],
+        });
+        const aliasServer = createServer((req, res) => {
+          const url = new URL(req.url || '/', 'http://127.0.0.1');
+          if (url.pathname === '/') {
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+            res.end('<!doctype html><title>Alias</title><p>hi</p>');
+            return;
+          }
+          if (
+            url.pathname === '/.well-known/ard.json' ||
+            url.pathname === '/.well-known/ai-catalog.json'
+          ) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(sharedPayload);
+            return;
+          }
+          res.writeHead(404, { 'content-type': 'text/plain' });
+          res.end('not found');
+        });
+        await new Promise((r) => aliasServer.listen(0, '127.0.0.1', r));
+        const aliasOrigin = `http://127.0.0.1:${aliasServer.address().port}`;
+        try {
+          const cwd = await runner.fresh();
+          await runner.clearSession(cwd);
+          const result = await runner.playwright(
+            ['discover', '--json', '--once', `${aliasOrigin}/`],
+            cwd
+          );
+          assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+          const events = parseEvents(result.stdout);
+          const ardEvents = events.filter((e) => e.standard === 'ard' && e.via === 'well-known');
+          const aiCatEvents = events.filter(
+            (e) => e.standard === 'ai-catalog' && e.via === 'well-known'
+          );
+          assert.equal(ardEvents.length, 1, `exactly one ard event: ${result.stdout}`);
+          assert.equal(
+            aiCatEvents.length,
+            0,
+            `no separate ai-catalog event when alias: ${result.stdout}`
+          );
+          const ard = ardEvents[0];
+          assert.ok(
+            Array.isArray(ard.aliases) && ard.aliases.includes('ai-catalog'),
+            `aliases must include ai-catalog: ${JSON.stringify(ard.aliases)}`
+          );
+        } finally {
+          aliasServer.closeAllConnections();
+          aliasServer.close();
         }
-        if (
-          url.pathname === '/.well-known/ard.json' ||
-          url.pathname === '/.well-known/ai-catalog.json'
-        ) {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(sharedPayload);
-          return;
-        }
-        res.writeHead(404, { 'content-type': 'text/plain' });
-        res.end('not found');
-      });
-      await new Promise((r) => aliasServer.listen(0, '127.0.0.1', r));
-      const aliasOrigin = `http://127.0.0.1:${aliasServer.address().port}`;
-      try {
-        const cwd = await runner.fresh();
-        await runner.clearSession(cwd);
-        const result = await runner.playwright(
-          ['discover', '--json', '--once', `${aliasOrigin}/`],
-          cwd
-        );
-        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
-        const events = parseEvents(result.stdout);
-        const ardEvents = events.filter((e) => e.standard === 'ard' && e.via === 'well-known');
-        const aiCatEvents = events.filter(
-          (e) => e.standard === 'ai-catalog' && e.via === 'well-known'
-        );
-        assert.equal(
-          ardEvents.length,
-          1,
-          `exactly one ard event: ${result.stdout}`
-        );
-        assert.equal(
-          aiCatEvents.length,
-          0,
-          `no separate ai-catalog event when alias: ${result.stdout}`
-        );
-        const ard = ardEvents[0];
-        assert.ok(
-          Array.isArray(ard.aliases) && ard.aliases.includes('ai-catalog'),
-          `aliases must include ai-catalog: ${JSON.stringify(ard.aliases)}`
-        );
-      } finally {
-        aliasServer.closeAllConnections();
-        aliasServer.close();
       }
-    });
+    );
 
     await t.test('alias rule: different ard and ai-catalog give two events', async () => {
       const diffServer = createServer((req, res) => {
