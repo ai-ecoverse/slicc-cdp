@@ -14,8 +14,8 @@ for arg in "$@"; do
 done
 
 if [ -z "${APPLE_CERTIFICATE_BASE64:-}" ] || [ -z "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
-  echo "::warning::no Apple signing certificate; the darwin binaries stay unsigned"
-  exit 0
+  echo "::error::APPLE_CERTIFICATE_BASE64 or APPLE_CERTIFICATE_PASSWORD is not set"
+  exit 1
 fi
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "::error::signing the darwin binaries needs a macOS runner"
@@ -70,8 +70,8 @@ for i in "${!bins[@]}"; do
 done
 
 if [ -z "${APPLE_API_KEY_P8_BASE64:-}" ] || [ -z "${APPLE_API_KEY_ID:-}" ] || [ -z "${APPLE_API_KEY_ISSUER_ID:-}" ]; then
-  echo "::warning::no App Store Connect API key; the darwin binaries are signed but not notarized"
-  exit 0
+  echo "::error::App Store Connect API key secrets are not set"
+  exit 1
 fi
 key="$work/AuthKey.p8"
 zip="$work/notarize.zip"

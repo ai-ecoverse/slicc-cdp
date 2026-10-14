@@ -171,7 +171,11 @@ jobs:
         run: codesign --verify --strict "${{ matrix.bin }}"
 
       - name: Verify notarisation
-        run: spctl -a -v "${{ matrix.bin }}" 2>&1 | tee /dev/stderr | grep -q "accepted"
+        run: |
+          output=$(spctl -a -vv -t install "${{ matrix.bin }}" 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "accepted"
+          echo "$output" | grep -q "source=Notarized Developer ID"
 
   publish-release:
     needs: [release, upload-assets, verify-signatures]
