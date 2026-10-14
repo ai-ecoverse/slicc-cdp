@@ -2118,17 +2118,10 @@ fn run_nlweb_probes(
     let mut mcp_summary: Option<Value> = None;
     let ask_url = format!("{}/ask?query=", origin.trim_end_matches('/'));
     if !cdp.guard().url(&ask_url) {
-        let ask_result = isolated_world_probe(cdp, session_id, &frame_id, &ask_url);
+        let ask_result = nlweb_ask_probe(cdp, session_id, &frame_id, &ask_url);
         let body = match ask_result {
-            IsolatedProbeResult::Ok(status, ct, body) => {
-                if status == 200 && is_json_content_type(&ct) {
-                    Some(body)
-                } else {
-                    None
-                }
-            }
-            IsolatedProbeResult::Final => None,
-            IsolatedProbeResult::Unavailable => {
+            Some(b) => Some(b),
+            None => {
                 match native_probe(&ask_url, "application/json") {
                     Some((s, ct, b)) if s == 200 && is_json_content_type(&ct) => Some(b),
                     _ => None,
@@ -2136,7 +2129,7 @@ fn run_nlweb_probes(
             }
         };
         if let Some(ref b) = body {
-            ask_summary = discovery::classify_nlweb_ask(b);
+            ask_summary = classify_nlweb_ask(b);
         }
     }
     let mcp_url = format!("{}/mcp", origin.trim_end_matches('/'));
@@ -2144,15 +2137,19 @@ fn run_nlweb_probes(
         let mcp_body = nlweb_mcp_probe(cdp, session_id, &frame_id, &mcp_url)
             .or_else(|| nlweb_mcp_probe_native(&mcp_url));
         if let Some(ref b) = mcp_body {
-            mcp_summary = discovery::classify_nlweb_mcp_init(b);
+            mcp_summary = classify_nlweb_mcp_init(b);
         }
     }
     if ask_summary.is_none() && mcp_summary.is_none() {
         return output;
     }
     let mut map = serde_json::Map::new();
-    map.insert("askUrl".into(), Value::String(ask_url.clone()));
-    map.insert("mcpUrl".into(), Value::String(mcp_url.clone()));
+    if ask_summary.is_some() {
+        map.insert("askUrl".into(), Value::String(ask_url.clone()));
+    }
+    if mcp_summary.is_some() {
+        map.insert("mcpUrl".into(), Value::String(mcp_url.clone()));
+    }
     if let Some(ref ask) = ask_summary {
         if let Some(name) = ask.get("serverName") {
             map.insert("serverName".into(), name.clone());
@@ -2163,12 +2160,13 @@ fn run_nlweb_probes(
             map.insert("serverInfo".into(), si.clone());
         }
     }
+    let event_url = if ask_summary.is_some() { ask_url } else { mcp_url };
     let event = DiscoveryEvent {
         v: EVENT_VERSION,
         standard: "nlweb".into(),
         aliases: None,
         origin: origin.to_string(),
-        url: ask_url,
+        url: event_url,
         via: Via::WellKnown,
         page: page_url,
         target_id,
@@ -2178,6 +2176,72 @@ fn run_nlweb_probes(
     };
     output.push_str(&emit_event(state, &event));
     output
+}
+
+fn nlweb_ask_probe(
+    cdp: &mut Cdp,
+    session_id: &str,
+    frame_id: &str,
+    url: &str,
+) -> Option<String> {
+    let world = cdp.call(
+        "Page.createIsolatedWorld",
+        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+        Some(session_id),
+    ).ok()?;
+    let ctx_id = world.get("executionContextId").and_then(|v| v.as_u64())?;
+    let js = format!(
+        r#"(async () => {{
+  const cap = 1048576;
+  let r;
+  try {{
+    r = await fetch({url}, {{credentials:'omit',redirect:'manual',cache:'no-store',headers:{{'Accept':'application/json'}}}});
+  }} catch(e) {{ return JSON.stringify({{err:e.message}}); }}
+  if (r.type === 'opaqueredirect') return JSON.stringify({{err:'redirect'}});
+  const ct = r.headers.get('content-type') || '';
+  let body = '';
+  if (r.body) {{
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let total = 0;
+    while (true) {{
+      const {{done, value}} = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      body += dec.decode(value, {{stream:true}});
+      if (total > cap) {{ reader.cancel(); body = body.slice(0, cap); break; }}
+    }}
+  }}
+  return JSON.stringify({{status:r.status,ct,body}});
+}})()
+"#,
+        url = serde_json::to_string(url).unwrap_or_default(),
+    );
+    let result = cdp.call_for(
+        "Runtime.evaluate",
+        json!({
+            "expression": js,
+            "contextId": ctx_id,
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+        Some(session_id),
+        Duration::from_secs(5),
+    ).ok()?;
+    let value_str = result.pointer("/result/value").and_then(|v| v.as_str())?;
+    let parsed: Value = serde_json::from_str(value_str).ok()?;
+    if parsed.get("err").is_some() {
+        return None;
+    }
+    let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    if status != 200 {
+        return None;
+    }
+    let ct = parsed.get("ct").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_json_content_type(ct) {
+        return None;
+    }
+    parsed.get("body").and_then(|v| v.as_str()).map(str::to_string)
 }
 
 fn nlweb_mcp_probe(
