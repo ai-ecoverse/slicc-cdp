@@ -915,38 +915,40 @@ fn collect_page_signals(cdp: &mut Cdp, session: &str) -> Vec<(String, Value)> {
         json!({ "expression": js, "returnByValue": true, "awaitPromise": true }),
         Some(session),
     );
-    if let Ok(result) = result {
-        let value_str = result
-            .pointer("/result/value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("{}");
-        if let Ok(parsed) = serde_json::from_str::<Value>(value_str) {
-            if parsed.get("webmcp").and_then(|v| v.as_bool()) == Some(true) {
-                let tools = parsed.get("tools").cloned().unwrap_or(json!([]));
-                let has_tools = tools.as_array().map_or(false, |a| !a.is_empty());
-                if has_tools {
-                    signals.push(("webmcp".to_string(), json!({ "tools": tools })));
-                }
-            }
-            if let Some(links) = parsed.get("links").and_then(|v| v.as_array()) {
-                for link in links {
-                    let rel = link
-                        .get("rel")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    let href = link
-                        .get("href")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if known_link_rels().contains(&rel.as_str()) && !href.is_empty() && !cdp.guard().url(&href) {
-                        signals.push((
-                            "html-link".to_string(),
-                            json!({ "rel": rel, "href": href }),
-                        ));
-                    }
-                }
+    let parsed = match result {
+        Ok(ref r) => {
+            let value_str = r
+                .pointer("/result/value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            serde_json::from_str::<Value>(value_str).unwrap_or(Value::Object(serde_json::Map::new()))
+        }
+        Err(_) => Value::Object(serde_json::Map::new()),
+    };
+    if parsed.get("webmcp").and_then(|v| v.as_bool()) == Some(true) {
+        let tools = parsed.get("tools").cloned().unwrap_or(json!([]));
+        let has_tools = tools.as_array().map_or(false, |a| !a.is_empty());
+        if has_tools {
+            signals.push(("webmcp".to_string(), json!({ "tools": tools })));
+        }
+    }
+    if let Some(links) = parsed.get("links").and_then(|v| v.as_array()) {
+        for link in links {
+            let rel = link
+                .get("rel")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let href = link
+                .get("href")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if known_link_rels().contains(&rel.as_str()) && !href.is_empty() && !cdp.guard().url(&href) {
+                signals.push((
+                    "html-link".to_string(),
+                    json!({ "rel": rel, "href": href }),
+                ));
             }
         }
     }

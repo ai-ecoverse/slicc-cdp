@@ -1126,3 +1126,67 @@ test('discover ARD', { timeout: 120_000 }, async (t) => {
     await settle(browser?.close());
   }
 });
+
+test('discover ARD html-link without probe', { timeout: 60_000 }, async () => {
+  let wellKnownHit = false;
+  const htmlLinkServer = createServer((req, res) => {
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    if (url.pathname === '/') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        link: '</ard-manifest.json>; rel="ard"',
+      });
+      res.end(
+        '<!doctype html><html><head><link rel="ard" href="/ard-manifest.json"><title>HTML Link ARD</title></head><body><p>hi</p></body></html>'
+      );
+      return;
+    }
+    if (url.pathname === '/.well-known/ard.json') {
+      wellKnownHit = true;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ name: 'Should Not Reach' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found');
+  });
+  await new Promise((r) => htmlLinkServer.listen(0, '127.0.0.1', r));
+  const htmlLinkOrigin = `http://127.0.0.1:${htmlLinkServer.address().port}`;
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+    const cwd = await runner.fresh();
+    await runner.clearSession(cwd);
+    const result = await runner.playwright(
+      ['discover', '--json', '--no-probe', '--once', `${htmlLinkOrigin}/`],
+      cwd
+    );
+    assert.equal(
+      result.code,
+      0,
+      `exit ${result.code}, stderr: ${result.stderr}, stdout: ${result.stdout}`
+    );
+    const events = parseEvents(result.stdout);
+    const ardEvent = events.find((e) => e.standard === 'ard');
+    assert.ok(ardEvent, `ard event expected: ${result.stdout}`);
+    assert.ok(
+      ardEvent.via === 'html-link' || ardEvent.via === 'link-header',
+      `via must be html-link or link-header: ${ardEvent.via}`
+    );
+    assert.ok(ardEvent.url.includes('/ard-manifest.json'), `href resolved: ${ardEvent.url}`);
+    assert.ok(!wellKnownHit, '/.well-known/ard.json must not be fetched when --no-probe is set');
+  } finally {
+    await settle(browser?.close());
+    htmlLinkServer.closeAllConnections();
+    htmlLinkServer.close();
+  }
+});
