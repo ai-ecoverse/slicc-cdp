@@ -2,6 +2,7 @@
 
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -449,7 +450,7 @@ pub fn plan_launch(
         ));
     }
     let browser_args = if kind == Kind::Chromium {
-        chromium_args(&user_data_dir, request.headed)
+        chromium_args(&user_data_dir, request.headed, &env.temp_dir)
     } else {
         electron_args(electron_port, &user_data_dir)
     };
@@ -923,7 +924,62 @@ fn data_dir(
     }
 }
 
-fn chromium_args(user_data_dir: &str, headed: bool) -> Vec<String> {
+fn resolve_fs_path(p: &str) -> PathBuf {
+    let path = PathBuf::from(p);
+    match std::fs::canonicalize(&path) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            let mut cur = path.clone();
+            let mut rest = PathBuf::new();
+            loop {
+                if let Ok(resolved) = std::fs::canonicalize(&cur) {
+                    return resolved.join(rest);
+                }
+                let name = match cur.file_name() {
+                    Some(n) => PathBuf::from(n),
+                    None => return path,
+                };
+                let parent = match cur.parent() {
+                    Some(p) if p != cur => p.to_path_buf(),
+                    _ => return path,
+                };
+                rest = name.join(rest);
+                cur = parent;
+            }
+        }
+    }
+}
+
+fn is_throwaway_profile(user_data_dir: &str, temp_dir: &str) -> bool {
+    if user_data_dir.is_empty() || temp_dir.is_empty() {
+        return false;
+    }
+    let dir = resolve_fs_path(user_data_dir);
+    let root = resolve_fs_path(temp_dir);
+    let dir_lower;
+    let root_lower;
+    let (d, r) = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        dir_lower = dir.to_string_lossy().to_lowercase();
+        root_lower = root.to_string_lossy().to_lowercase();
+        (dir_lower.as_str(), root_lower.as_str())
+    } else {
+        dir_lower = dir.to_string_lossy().into_owned();
+        root_lower = root.to_string_lossy().into_owned();
+        (dir_lower.as_str(), root_lower.as_str())
+    };
+    if d == r {
+        return false;
+    }
+    let sep = std::path::MAIN_SEPARATOR;
+    let root_prefix = if r.ends_with(sep) {
+        r.to_string()
+    } else {
+        format!("{r}{sep}")
+    };
+    d.starts_with(&root_prefix)
+}
+
+fn chromium_args(user_data_dir: &str, headed: bool, temp_dir: &str) -> Vec<String> {
     let mut args = vec![
         "--remote-debugging-port=0".to_string(),
         format!("--user-data-dir={user_data_dir}"),
@@ -937,6 +993,10 @@ fn chromium_args(user_data_dir: &str, headed: bool) -> Vec<String> {
     ];
     if !headed {
         args.push("--headless=new".to_string());
+    }
+    if is_throwaway_profile(user_data_dir, temp_dir) {
+        args.push("--use-mock-keychain".to_string());
+        args.push("--password-store=basic".to_string());
     }
     args
 }
@@ -3728,5 +3788,118 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn throwaway_profile_gets_mock_keychain_flags() {
+        let host = env("macos");
+        let request = open_request(None, false, Some("/tmp/my-throwaway"));
+        let plan = plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+        assert!(plan.args.contains(&"--use-mock-keychain".to_string()));
+        assert!(plan.args.contains(&"--password-store=basic".to_string()));
+        assert_eq!(plan.user_data_dir, "/tmp/my-throwaway");
+    }
+
+    #[test]
+    fn throwaway_headed_profile_gets_mock_keychain_flags() {
+        let host = env("linux");
+        let request = open_request(None, true, Some("/tmp/headed-profile"));
+        let plan = plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+        assert!(plan.args.contains(&"--use-mock-keychain".to_string()));
+        assert!(plan.args.contains(&"--password-store=basic".to_string()));
+        assert!(!plan.args.iter().any(|arg| arg.contains("headless")));
+    }
+
+    #[test]
+    fn throwaway_nested_temp_profile_gets_flags() {
+        let host = env("linux");
+        let request = open_request(None, false, Some("/tmp/deep/nested/profile"));
+        let plan = plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+        assert!(plan.args.contains(&"--use-mock-keychain".to_string()));
+        assert!(plan.args.contains(&"--password-store=basic".to_string()));
+    }
+
+    #[test]
+    fn seven_profiles_never_get_mock_keychain() {
+        for platform in ["macos", "linux", "windows"] {
+            let mut host = env(platform);
+            if platform == "windows" {
+                host.local_app_data = Some("C:\\Users\\me\\AppData\\Local".to_string());
+                host.app_data = Some("C:\\Users\\me\\AppData\\Roaming".to_string());
+            }
+            let request = open_request(None, false, None);
+            let plan =
+                plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+            assert!(
+                !plan.args.contains(&"--use-mock-keychain".to_string()),
+                "{platform}"
+            );
+            assert!(
+                !plan.args.contains(&"--password-store=basic".to_string()),
+                "{platform}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_supplied_profile_outside_temp_has_no_mock_keychain() {
+        let host = env("macos");
+        let request = open_request(None, false, Some("/Users/me/my-profile"));
+        let plan = plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+        assert!(!plan.args.contains(&"--use-mock-keychain".to_string()));
+        assert!(!plan.args.contains(&"--password-store=basic".to_string()));
+    }
+
+    #[test]
+    fn explicit_seven_profiles_path_has_no_mock_keychain() {
+        let host = env("macos");
+        let path = "/Users/me/Library/Application Support/slicc/seven-profiles/chrome";
+        let request = open_request(None, false, Some(path));
+        let plan = plan_launch(&request, &host, 9333, &installed, &no_mdfind, &no_plist).unwrap();
+        assert!(!plan.args.contains(&"--use-mock-keychain".to_string()));
+        assert!(!plan.args.contains(&"--password-store=basic".to_string()));
+    }
+
+    #[test]
+    fn is_throwaway_profile_logic() {
+        assert!(is_throwaway_profile("/tmp/my-profile", "/tmp"));
+        assert!(is_throwaway_profile("/tmp/deep/nested", "/tmp"));
+        assert!(!is_throwaway_profile("/tmp", "/tmp"));
+        assert!(!is_throwaway_profile("/home/me/profile", "/tmp"));
+        assert!(!is_throwaway_profile("/tmpextra/profile", "/tmp"));
+        assert!(!is_throwaway_profile("", "/tmp"));
+        assert!(!is_throwaway_profile("/tmp/profile", ""));
+        assert!(!is_throwaway_profile(
+            "/Users/me/Library/Application Support/slicc/seven-profiles/chrome",
+            "/tmp"
+        ));
+    }
+
+    #[test]
+    fn electron_does_not_get_mock_keychain_args() {
+        let host = env("macos");
+        let request = LaunchRequest {
+            command: "open",
+            browser: Some("Slack"),
+            headed: false,
+            profile: None,
+        };
+        let plan = plan_launch(
+            &request,
+            &host,
+            9333,
+            &|path| path == "/Applications/Slack.app/Contents/MacOS/Slack",
+            &|bundle| {
+                if bundle == "com.tinyspeck.slackmacgap" {
+                    vec!["/Applications/Slack.app".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            &|path| (path.ends_with("Info.plist")).then(|| "Slack".to_string()),
+        )
+        .unwrap();
+        assert!(!plan.args.contains(&"--use-mock-keychain".to_string()));
+        assert!(!plan.args.contains(&"--password-store=basic".to_string()));
     }
 }
