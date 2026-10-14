@@ -2267,7 +2267,9 @@ fn mcp_init_payload(status: u16, content_type: &str, body: String) -> Option<Str
     if status != 200 {
         return None;
     }
-    body.replace("\r\n", "\n")
+    body.strip_prefix('\u{feff}')
+        .unwrap_or(&body)
+        .replace("\r\n", "\n")
         .replace('\r', "\n")
         .split("\n\n")
         .map(|event| {
@@ -4577,6 +4579,8 @@ mod tests {
         assert_eq!(mcp_init_payload(200, "text/event-stream", "data: nope\n\n".into()), None);
         let bare_cr = "event: message\rdata: {\"result\":{\"serverInfo\":{\"name\":\"NLWeb\"}}}\r\r";
         assert!(mcp_init_payload(200, "text/event-stream", bare_cr.into()).is_some());
+        let bom = "\u{feff}data: {\"result\":{}}\n\n";
+        assert_eq!(mcp_init_payload(200, "text/event-stream", bom.into()).as_deref(), Some("{\"result\":{}}"));
         let batched = "data: [{\"jsonrpc\":\"2.0\",\"method\":\"ping\"},{\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"NLWeb\"}}}]\n\n";
         let payload = mcp_init_payload(200, "text/event-stream", batched.into()).unwrap();
         assert_eq!(classify_nlweb_mcp_init(&payload).unwrap()["serverInfo"]["name"], "NLWeb");
