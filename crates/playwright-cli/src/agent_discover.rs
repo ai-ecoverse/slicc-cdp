@@ -301,11 +301,20 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 }
             }
             if loaded {
-                let committed_url = cdp
+                let frame_tree_result = cdp
                     .call("Page.getFrameTree", json!({}), Some(&session))
-                    .ok()
+                    .ok();
+                let committed_url = frame_tree_result
+                    .as_ref()
                     .and_then(|r| {
                         r.pointer("/frameTree/frame/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                let committed_frame_id = frame_tree_result
+                    .as_ref()
+                    .and_then(|r| {
+                        r.pointer("/frameTree/frame/id")
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                     });
@@ -314,7 +323,20 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                         sess.page_url = url.clone();
                     }
                 }
-                let page_signals = collect_page_signals(&mut cdp, &session);
+                if let Some(ref fid) = committed_frame_id {
+                    if let Some(sess) = state.sessions.get_mut(&session) {
+                        sess.top_frame_id = Some(fid.clone());
+                    }
+                }
+                let frame_id = state
+                    .sessions
+                    .get(&session)
+                    .and_then(|s| s.top_frame_id.clone());
+                let page_signals = collect_page_signals(
+                    &mut cdp,
+                    &session,
+                    frame_id.as_deref(),
+                );
                 output.push_str(&emit_page_signals(
                     &mut state,
                     &session,
@@ -419,11 +441,20 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
             }
             let load_events = check_load_events(&cdp, &state);
             for (session_id, _origin) in &load_events {
-                let committed_url = cdp
+                let frame_tree_result = cdp
                     .call("Page.getFrameTree", json!({}), Some(session_id))
-                    .ok()
+                    .ok();
+                let committed_url = frame_tree_result
+                    .as_ref()
                     .and_then(|r| {
                         r.pointer("/frameTree/frame/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                let committed_frame_id = frame_tree_result
+                    .as_ref()
+                    .and_then(|r| {
+                        r.pointer("/frameTree/frame/id")
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                     });
@@ -432,12 +463,25 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                         sess.page_url = url.clone();
                     }
                 }
+                if let Some(ref fid) = committed_frame_id {
+                    if let Some(sess) = state.sessions.get_mut(session_id.as_str()) {
+                        sess.top_frame_id = Some(fid.clone());
+                    }
+                }
                 let origin = state
                     .sessions
                     .get(session_id.as_str())
                     .and_then(|s| extract_origin(&s.page_url))
                     .unwrap_or_default();
-                let page_signals = collect_page_signals(&mut cdp, session_id);
+                let frame_id = state
+                    .sessions
+                    .get(session_id.as_str())
+                    .and_then(|s| s.top_frame_id.clone());
+                let page_signals = collect_page_signals(
+                    &mut cdp,
+                    session_id,
+                    frame_id.as_deref(),
+                );
                 let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
                 if !signals_out.is_empty() {
                     eprint_flush(&signals_out);
@@ -475,11 +519,20 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         }
         let load_events = check_load_events(&cdp, &state);
             for (session_id, _origin) in &load_events {
-                let committed_url = cdp
+                let frame_tree_result = cdp
                     .call("Page.getFrameTree", json!({}), Some(session_id))
-                    .ok()
+                    .ok();
+                let committed_url = frame_tree_result
+                    .as_ref()
                     .and_then(|r| {
                         r.pointer("/frameTree/frame/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                let committed_frame_id = frame_tree_result
+                    .as_ref()
+                    .and_then(|r| {
+                        r.pointer("/frameTree/frame/id")
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                     });
@@ -488,12 +541,25 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                         sess.page_url = url.clone();
                     }
                 }
+                if let Some(ref fid) = committed_frame_id {
+                    if let Some(sess) = state.sessions.get_mut(session_id.as_str()) {
+                        sess.top_frame_id = Some(fid.clone());
+                    }
+                }
                 let origin = state
                     .sessions
                     .get(session_id.as_str())
                     .and_then(|s| extract_origin(&s.page_url))
                     .unwrap_or_default();
-                let page_signals = collect_page_signals(&mut cdp, session_id);
+                let frame_id = state
+                    .sessions
+                    .get(session_id.as_str())
+                    .and_then(|s| s.top_frame_id.clone());
+                let page_signals = collect_page_signals(
+                    &mut cdp,
+                    session_id,
+                    frame_id.as_deref(),
+                );
                 let signals_out = emit_page_signals(&mut state, session_id, &page_signals);
                 if !signals_out.is_empty() {
                     eprint_flush(&signals_out);
@@ -882,9 +948,20 @@ fn handle_response(
     output
 }
 
-fn collect_page_signals(cdp: &mut Cdp, session: &str) -> Vec<(String, Value)> {
+fn collect_page_signals(cdp: &mut Cdp, session: &str, frame_id: Option<&str>) -> Vec<(String, Value)> {
     let mut signals = Vec::new();
     let js = r#"(function() {
+  var r = {};
+  var links = [];
+  var els = document.querySelectorAll('link[rel]');
+  for (var i = 0; i < els.length; i++) {
+    links.push({ rel: els[i].getAttribute('rel'), href: els[i].href });
+  }
+  if (links.length) r.links = links;
+  return JSON.stringify(r);
+})()
+"#;
+    let webmcp_js = r#"(function() {
   var r = {};
   if (typeof document !== 'undefined' && document.modelContext) {
     r.webmcp = true;
@@ -901,32 +978,13 @@ fn collect_page_signals(cdp: &mut Cdp, session: &str) -> Vec<(String, Value)> {
       } catch(e) {}
     }
   }
-  var links = [];
-  var els = document.querySelectorAll('link[rel]');
-  for (var i = 0; i < els.length; i++) {
-    links.push({ rel: els[i].getAttribute('rel'), href: els[i].href });
-  }
-  if (links.length) r.links = links;
   return JSON.stringify(r);
 })()
 "#;
-    let result = cdp.call(
-        "Runtime.evaluate",
-        json!({ "expression": js, "returnByValue": true, "awaitPromise": true }),
-        Some(session),
-    );
-    let parsed = match result {
-        Ok(ref r) => {
-            let value_str = r
-                .pointer("/result/value")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            serde_json::from_str::<Value>(value_str).unwrap_or(Value::Object(serde_json::Map::new()))
-        }
-        Err(_) => Value::Object(serde_json::Map::new()),
-    };
-    if parsed.get("webmcp").and_then(|v| v.as_bool()) == Some(true) {
-        let tools = parsed.get("tools").cloned().unwrap_or(json!([]));
+    let parsed = eval_in_isolated_world(cdp, session, frame_id, js);
+    let webmcp_parsed = eval_in_page_context(cdp, session, webmcp_js);
+    if webmcp_parsed.get("webmcp").and_then(|v| v.as_bool()) == Some(true) {
+        let tools = webmcp_parsed.get("tools").cloned().unwrap_or(json!([]));
         let has_tools = tools.as_array().map_or(false, |a| !a.is_empty());
         if has_tools {
             signals.push(("webmcp".to_string(), json!({ "tools": tools })));
@@ -953,6 +1011,87 @@ fn collect_page_signals(cdp: &mut Cdp, session: &str) -> Vec<(String, Value)> {
         }
     }
     signals
+}
+
+fn eval_in_isolated_world(
+    cdp: &mut Cdp,
+    session: &str,
+    frame_id: Option<&str>,
+    js: &str,
+) -> Value {
+    let fid = match frame_id {
+        Some(f) => f.to_string(),
+        None => {
+            return eval_in_page_context(cdp, session, js);
+        }
+    };
+    for _attempt in 0..2 {
+        let world = match cdp.call(
+            "Page.createIsolatedWorld",
+            json!({ "frameId": fid, "worldName": "__slicc_discover", "grantUniveralAccess": true }),
+            Some(session),
+        ) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let ctx_id = match world.get("executionContextId").and_then(|v| v.as_u64()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let result = cdp.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": js,
+                "contextId": ctx_id,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+            Some(session),
+        );
+        match result {
+            Ok(ref r) => {
+                let err_msg = r
+                    .pointer("/exceptionDetails/exception/description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if err_msg.contains("Cannot find context") || err_msg.contains("destroyed") {
+                    continue;
+                }
+                let value_str = r
+                    .pointer("/result/value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+                return serde_json::from_str::<Value>(value_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+            }
+            Err(e) => {
+                if e.contains("Cannot find context") || e.contains("destroyed") {
+                    continue;
+                }
+                return Value::Object(serde_json::Map::new());
+            }
+        }
+    }
+    Value::Object(serde_json::Map::new())
+}
+
+fn eval_in_page_context(cdp: &mut Cdp, session: &str, js: &str) -> Value {
+    let result = cdp.call(
+        "Runtime.evaluate",
+        json!({ "expression": js, "returnByValue": true, "awaitPromise": true }),
+        Some(session),
+    );
+    match result {
+        Ok(ref r) => {
+            let value_str = r
+                .pointer("/result/value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            serde_json::from_str::<Value>(value_str)
+                .unwrap_or(Value::Object(serde_json::Map::new()))
+        }
+        Err(_) => Value::Object(serde_json::Map::new()),
+    }
 }
 
 fn emit_page_signals(

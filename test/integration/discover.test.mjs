@@ -181,6 +181,116 @@ test('playwright-cli discover --once', { timeout: 60_000 }, async (t) => {
       assert.ok(webmcp.summary.tools.length > 0);
     });
 
+    await t.test('html-link ard without probe', async () => {
+      const ardLinkServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>ARD Link</title><link rel="ard" href="/ard.json">');
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      try {
+        await new Promise((r) => ardLinkServer.listen(0, '127.0.0.1', r));
+        const ardOrigin = `http://127.0.0.1:${ardLinkServer.address().port}`;
+        const result = await runner.playwright(
+          ['discover', '--json', '--no-probe', '--once', `${ardOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}\n${result.stdout}`);
+        const events = parseEvents(result.stdout);
+        const ardLink = events.find((e) => e.via === 'html-link' && e.standard === 'ard');
+        assert.ok(ardLink, `ard html-link event expected: ${result.stdout}`);
+        const wellKnown = events.filter((e) => e.via === 'well-known');
+        assert.equal(wellKnown.length, 0, `no well-known request expected: ${result.stdout}`);
+      } finally {
+        ardLinkServer.closeAllConnections();
+        ardLinkServer.close();
+      }
+    });
+
+    await t.test('html-link api-catalog without probe', async () => {
+      const apiCatServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(
+            '<!doctype html><title>API Catalog</title><link rel="api-catalog" href="/catalog.json">'
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      try {
+        await new Promise((r) => apiCatServer.listen(0, '127.0.0.1', r));
+        const apiCatOrigin = `http://127.0.0.1:${apiCatServer.address().port}`;
+        const result = await runner.playwright(
+          ['discover', '--json', '--no-probe', '--once', `${apiCatOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}\n${result.stdout}`);
+        const events = parseEvents(result.stdout);
+        const apiCat = events.find((e) => e.via === 'html-link' && e.standard === 'api-catalog');
+        assert.ok(apiCat, `api-catalog html-link event expected: ${result.stdout}`);
+        const wellKnown = events.filter((e) => e.via === 'well-known');
+        assert.equal(wellKnown.length, 0, `no well-known request expected: ${result.stdout}`);
+      } finally {
+        apiCatServer.closeAllConnections();
+        apiCatServer.close();
+      }
+    });
+
+    await t.test('webmcp page signal in once mode', async () => {
+      const webmcpOnlyServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(`<!doctype html><title>WebMCP Only</title><script>
+if (document.modelContext && document.modelContext.registerTool) {
+  document.modelContext.registerTool({
+    name: 'lookup',
+    description: 'Lookup something',
+    inputSchema: { type: 'object', properties: { q: { type: 'string' } } },
+    execute: async () => 'ok'
+  });
+} else {
+  document.modelContext = {
+    async getTools() {
+      return [{ name: 'lookup', description: 'Lookup something', inputSchema: { type: 'object' }, origin: location.origin }];
+    },
+    async executeTool() { return 'ok'; }
+  };
+}
+</script>`);
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      try {
+        await new Promise((r) => webmcpOnlyServer.listen(0, '127.0.0.1', r));
+        const webmcpOrigin = `http://127.0.0.1:${webmcpOnlyServer.address().port}`;
+        const result = await runner.playwright(
+          ['discover', '--json', '--no-probe', '--once', `${webmcpOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}\n${result.stdout}`);
+        const events = parseEvents(result.stdout);
+        const webmcp = events.find((e) => e.standard === 'webmcp');
+        assert.ok(webmcp, `webmcp event expected: ${result.stdout}`);
+        assert.equal(webmcp.via, 'page-api');
+        assert.ok(webmcp.summary.tools.length > 0);
+        const wellKnown = events.filter((e) => e.via === 'well-known');
+        assert.equal(wellKnown.length, 0, `no well-known request expected: ${result.stdout}`);
+      } finally {
+        webmcpOnlyServer.closeAllConnections();
+        webmcpOnlyServer.close();
+      }
+    });
+
     await t.test('plain page yields nothing', async () => {
       const plainServer = createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'text/html' });
