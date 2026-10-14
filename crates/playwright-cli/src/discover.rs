@@ -1515,7 +1515,11 @@ pub(crate) fn seven_origin(url: &str) -> bool {
     let Some(label) = host.strip_suffix(".sliccy.ai") else {
         return false;
     };
-    if label.is_empty() || label == "www" || label.contains('.') {
+    if label.is_empty() || label.contains('.') {
+        return false;
+    }
+    let seven = &slicc_browsers::catalog().seven;
+    if !seven.is_seven_label(label) {
         return false;
     }
     let mut chars = label.chars();
@@ -3958,5 +3962,31 @@ mod tests {
                 line[..kind].to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn seven_origin_excluded_labels() {
+        assert!(!seven_origin("https://vault.sliccy.ai/"));
+        assert!(!seven_origin("https://vault-preview.sliccy.ai/"));
+        assert!(!seven_origin("https://get.sliccy.ai/"));
+        assert!(!seven_origin("https://mcpcat.sliccy.ai/"));
+        assert!(!seven_origin("https://www.sliccy.ai/"));
+        assert!(!seven_origin("https://vault-x.sliccy.ai/"));
+    }
+
+    #[test]
+    fn seven_origin_apex_is_not_seven() {
+        assert!(!seven_origin("https://sliccy.ai/"));
+    }
+
+    #[test]
+    fn seven_origin_valid_labels() {
+        assert!(seven_origin("https://seven.sliccy.ai/"));
+        assert!(seven_origin("https://link-websockets.sliccy.ai/"));
+    }
+
+    #[test]
+    fn seven_origin_case_insensitive() {
+        assert!(seven_origin("HTTPS://SEVEN.SLICCY.AI/"));
     }
 }

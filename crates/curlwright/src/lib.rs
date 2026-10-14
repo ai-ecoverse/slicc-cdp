@@ -5,6 +5,7 @@ mod parse;
 mod profiles;
 mod request;
 mod response;
+mod sanitize;
 mod tab;
 mod write_out;
 

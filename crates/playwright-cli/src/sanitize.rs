@@ -45,6 +45,19 @@ pub fn terminal(s: &str) -> String {
     out
 }
 
+pub fn json_c1(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if cp == 0x7f || (0x80..=0x9f).contains(&cp) {
+            out.push_str(&format!("\\u{:04x}", cp));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +206,29 @@ mod tests {
         assert!(!output.contains('\x1b'));
         assert!(output.contains("\\x1b"));
         set_full_urls(false);
+    }
+
+    #[test]
+    fn json_c1_escapes_del() {
+        assert_eq!(json_c1("a\x7fb"), "a\\u007fb");
+    }
+
+    #[test]
+    fn json_c1_escapes_csi() {
+        assert_eq!(json_c1("a\u{009b}b"), "a\\u009bb");
+    }
+
+    #[test]
+    fn json_c1_preserves_normal_text() {
+        assert_eq!(json_c1("hello world"), "hello world");
+    }
+
+    #[test]
+    fn json_c1_roundtrips_through_serde() {
+        let input = "hello\x7fworld\u{0080}end";
+        let serialized = serde_json::to_string(input).unwrap();
+        let safe = json_c1(&serialized);
+        let parsed: String = serde_json::from_str(&safe).unwrap();
+        assert_eq!(parsed, input);
     }
 }
