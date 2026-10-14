@@ -4,9 +4,10 @@ use crate::cdp::{self, Cdp};
 use crate::launch;
 use crate::session;
 use discovery::{
-    classify_response, default_classifiers, default_probes, fingerprint, known_link_rels,
-    parse_link_header, ClassifierRegistry, DedupSet, DiscoveryEvent, ProbeRegistry, Validity, Via,
-    EVENT_VERSION,
+    classify_response, classify_slicc_handoff, default_classifiers,
+    default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
+    parse_link_header, ClassifierRegistry, DedupSet, DiscoveryEvent,
+    ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,6 +127,7 @@ struct WatcherState {
     classifiers: ClassifierRegistry,
     sessions: BTreeMap<String, SessionState>,
     json_mode: bool,
+    follow_mode: bool,
     events_emitted: usize,
     event_cursor: usize,
     sink: Sink,
@@ -153,6 +155,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let once_url = invocation.flags.get("once").cloned();
     let once_tab = invocation.flags.get("tab").cloned();
     let no_probe = invocation.flags.contains_key("no-probe");
+    let follow_mode = invocation.flags.contains_key("follow");
     let exec_cmd = invocation.flags.get("exec").cloned();
     let lick_mode = invocation.flags.contains_key("lick");
     let exec_timeout = invocation
@@ -217,6 +220,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         classifiers: default_classifiers(),
         sessions: BTreeMap::new(),
         json_mode,
+        follow_mode,
         events_emitted: 0,
         event_cursor: 0,
         sink: sink.clone(),
@@ -318,6 +322,9 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                     .unwrap_or_default();
                 if !origin.is_empty() && !no_probe {
                     output.push_str(&run_probes(&mut cdp, &mut state, &session, &origin));
+                }
+                if state.follow_mode {
+                    output.push_str(&follow_links(&mut cdp, &mut state, &session));
                 }
                 break;
             }
@@ -798,12 +805,42 @@ fn handle_response(
                 if cdp.guard().url(&link.href) {
                     continue;
                 }
-                if !state.dedup.is_new(&origin, &link.rel, &link.href) {
+
+                if is_slicc_handoff_rel(&link.rel) {
+                    let dedup_key = format!("slicc-handoff:{}", link.href);
+                    if !state.dedup.is_new(&origin, "slicc-handoff", &dedup_key) {
+                        continue;
+                    }
+                    if let Some(summary) = classify_slicc_handoff(&link) {
+                        let event = DiscoveryEvent {
+                            v: EVENT_VERSION,
+                            standard: "slicc-handoff".into(),
+                            origin: origin.clone(),
+                            url: link.href.clone(),
+                            via: Via::LinkHeader,
+                            page: page_url.clone(),
+                            target_id: target_id.clone(),
+                            status: Validity::Valid,
+                            summary,
+                            reason: None,
+                        };
+                        output.push_str(&emit_event(state, &event));
+                    }
+                    continue;
+                }
+
+                let standard = if link.rel == LLMS_TXT_REL {
+                    "llms-txt".to_string()
+                } else {
+                    link.rel.clone()
+                };
+
+                if !state.dedup.is_new(&origin, &standard, &link.href) {
                     continue;
                 }
                 let event = DiscoveryEvent {
                     v: EVENT_VERSION,
-                    standard: link.rel.clone(),
+                    standard,
                     origin: origin.clone(),
                     url: link.href.clone(),
                     via: Via::LinkHeader,
@@ -1437,6 +1474,171 @@ fn kill_process_group(child: &std::process::Child) {
 #[cfg(not(unix))]
 fn run_exec_sink(_cmd: &str, _timeout: Duration, _event: &DiscoveryEvent) {}
 
+fn follow_links(
+    cdp: &mut Cdp,
+    state: &mut WatcherState,
+    session_id: &str,
+) -> String {
+    let mut output = String::new();
+    let sess = match state.sessions.get(session_id) {
+        Some(s) => s,
+        None => return output,
+    };
+    let frame_id = match &sess.top_frame_id {
+        Some(id) => id.clone(),
+        None => return output,
+    };
+    let page_url = sess.page_url.clone();
+    let target_id = sess.target_id.clone();
+    let origin = extract_origin(&page_url).unwrap_or_default();
+    if origin.is_empty() {
+        return output;
+    }
+
+    let link_header_raw = {
+        let mut raw = String::new();
+        for event in cdp.events().iter().rev().take(200) {
+            let method = event.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if method != "Network.responseReceived" {
+                continue;
+            }
+            let sid = event.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+            if sid != session_id {
+                continue;
+            }
+            let resp = event.get("params")
+                .and_then(|p| p.get("response"));
+            if let Some(resp) = resp {
+                if let Some(headers) = resp.get("headers").and_then(|h| h.as_object()) {
+                    for (name, val) in headers {
+                        if name.eq_ignore_ascii_case("link") {
+                            if !raw.is_empty() {
+                                raw.push('\n');
+                            }
+                            raw.push_str(val.as_str().unwrap_or(""));
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        raw
+    };
+
+    if link_header_raw.is_empty() {
+        return output;
+    }
+
+    let base = match Url::parse(&page_url) {
+        Ok(b) => b,
+        Err(_) => return output,
+    };
+    let links = parse_link_header(&link_header_raw, &base);
+    let followable: Vec<_> = links.iter()
+        .filter(|l| {
+            let rels = known_link_rels();
+            rels.contains(&l.rel.as_str()) && !is_slicc_handoff_rel(&l.rel)
+        })
+        .collect();
+
+    let mut seen_rels = BTreeSet::new();
+    let mut failures: Vec<Value> = Vec::new();
+
+    for link in followable {
+        let standard = if link.rel == LLMS_TXT_REL {
+            "llms-txt".to_string()
+        } else {
+            link.rel.clone()
+        };
+        if !seen_rels.insert(standard.clone()) {
+            continue;
+        }
+        if cdp.guard().url(&link.href) {
+            continue;
+        }
+        if is_reserved_cdp_origin(&link.href) {
+            continue;
+        }
+
+        let probe_result = isolated_world_probe(cdp, session_id, &frame_id, &link.href);
+        let (status, content_type, body) = match probe_result {
+            IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
+            IsolatedProbeResult::Final | IsolatedProbeResult::Unavailable => {
+                failures.push(json!({
+                    "rel": link.rel,
+                    "href": link.href,
+                    "error": "fetch failed"
+                }));
+                continue;
+            }
+        };
+
+        if status < 200 || status >= 300 {
+            failures.push(json!({
+                "rel": link.rel,
+                "href": link.href,
+                "error": format!("HTTP {status}")
+            }));
+            continue;
+        }
+
+        let dedup_key = format!("follow:{}", link.href);
+        if !state.dedup.is_new(&origin, &standard, &dedup_key) {
+            continue;
+        }
+
+        let classification = state.classifiers.classify(&standard, &body);
+        let (validity, summary, reason) = match classification {
+            Some(c) => (c.status, c.summary, c.reason),
+            None => (
+                Validity::Valid,
+                json!({
+                    "rel": link.rel,
+                    "href": link.href,
+                    "type": link.media_type,
+                    "contentType": content_type
+                }),
+                None,
+            ),
+        };
+
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: standard.clone(),
+            origin: origin.clone(),
+            url: link.href.clone(),
+            via: Via::LinkHeader,
+            page: page_url.clone(),
+            target_id: target_id.clone(),
+            status: validity,
+            summary,
+            reason,
+        };
+        output.push_str(&emit_event(state, &event));
+    }
+
+    if !failures.is_empty() {
+        let dedup_key = format!("follow-failures:{origin}");
+        if state.dedup.is_new(&origin, "follow-failures", &dedup_key) {
+            let event = DiscoveryEvent {
+                v: EVENT_VERSION,
+                standard: "follow-failures".into(),
+                origin: origin.clone(),
+                url: page_url.clone(),
+                via: Via::LinkHeader,
+                page: page_url.clone(),
+                target_id: target_id.clone(),
+                status: Validity::Valid,
+                summary: json!({ "failures": failures }),
+                reason: None,
+            };
+            output.push_str(&emit_event(state, &event));
+        }
+    }
+
+    output
+}
+
 pub fn extract_origin(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
     let origin = parsed.origin();
@@ -1504,6 +1706,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1536,6 +1739,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
+            follow_mode: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1567,6 +1771,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
+            follow_mode: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1592,6 +1797,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
+            follow_mode: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1625,6 +1831,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
+            follow_mode: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1710,6 +1917,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -1743,6 +1951,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -1776,6 +1985,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -1889,6 +2099,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -1917,6 +2128,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2080,6 +2292,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: false,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() },
         };
         let event = DiscoveryEvent {
@@ -2277,6 +2490,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2400,6 +2614,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2445,6 +2660,7 @@ mod tests {
             classifiers: default_classifiers(),
             sessions: BTreeMap::new(),
             json_mode: true,
+            follow_mode: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2517,5 +2733,374 @@ mod tests {
         let r = IsolatedProbeResult::Final;
         let fell_through = matches!(r, IsolatedProbeResult::Unavailable);
         assert!(!fell_through, "Final must not trigger the native fallback path");
+    }
+
+    #[test]
+    fn link_header_slicc_handoff_emits_slicc_handoff_standard() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/page",
+                "status": 200,
+                "headers": { "link": "<https://github.com/o/r>; rel=\"https://www.sliccy.ai/rel/upskill\"; branch=main; path=\"skills/foo\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("slicc-handoff"), "expected slicc-handoff standard: {output}");
+        let parsed: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["standard"], "slicc-handoff");
+        assert_eq!(parsed["summary"]["verb"], "upskill");
+        assert_eq!(parsed["summary"]["branch"], "main");
+        assert_eq!(parsed["summary"]["path"], "skills/foo");
+    }
+
+    #[test]
+    fn link_header_handoff_rel_emits_handoff_verb() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/page",
+                "status": 200,
+                "headers": { "link": "<>; rel=\"https://www.sliccy.ai/rel/handoff\"; title=\"Continue the signup flow\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("slicc-handoff"), "expected slicc-handoff: {output}");
+        let parsed: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["summary"]["verb"], "handoff");
+        assert_eq!(parsed["summary"]["instruction"], "Continue the signup flow");
+    }
+
+    #[test]
+    fn link_header_llms_txt_rel_maps_to_llms_txt_standard() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/page",
+                "status": 200,
+                "headers": { "link": "</llms.txt>; rel=\"https://llmstxt.org/rel/llms-txt\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("llms-txt"), "expected llms-txt standard: {output}");
+        let parsed: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["standard"], "llms-txt");
+    }
+
+    #[test]
+    fn link_header_rfc_rels_emit_with_summary() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let header = [
+            "</.well-known/api-catalog>; rel=\"api-catalog\"",
+            "</openapi.json>; rel=\"service-desc\"",
+            "</status>; rel=\"status\"",
+            "</meta>; rel=\"service-meta\"",
+            "</doc>; rel=\"service-doc\"",
+        ].join(", ");
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/page",
+                "status": 200,
+                "headers": { "link": header }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        let events: Vec<Value> = output.trim().split('\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 5);
+        let standards: Vec<&str> = events.iter()
+            .map(|e| e["standard"].as_str().unwrap())
+            .collect();
+        assert!(standards.contains(&"api-catalog"));
+        assert!(standards.contains(&"service-desc"));
+        assert!(standards.contains(&"status"));
+        assert!(standards.contains(&"service-meta"));
+        assert!(standards.contains(&"service-doc"));
+        for e in &events {
+            assert!(e["summary"]["rel"].is_string());
+            assert!(e["summary"]["href"].is_string());
+        }
+    }
+
+    #[test]
+    fn link_header_protected_origin_silently_dropped() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/page",
+                "status": 200,
+                "headers": { "link": "<https://vault.sliccy.ai/api>; rel=\"api-catalog\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.is_empty(), "protected origin link should be silently dropped: {output}");
+    }
+
+    #[test]
+    fn follow_skips_reserved_cdp_port_links() {
+        assert!(is_reserved_cdp_origin("http://127.0.0.1:9222"));
+        assert!(is_reserved_cdp_origin("http://localhost:9225"));
+    }
+
+    #[test]
+    fn follow_skips_protected_origin_links() {
+        let guard = cdp_client::protected::Protected::default();
+        assert!(guard.url("https://vault.sliccy.ai/api"));
+        assert!(guard.url("https://seven.sliccy.ai/.well-known/api-catalog"));
+    }
+
+    #[test]
+    fn link_header_upskill_unsafe_branch_dropped() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/page",
+                "status": 200,
+                "headers": { "link": "<https://github.com/o/r>; rel=\"https://www.sliccy.ai/rel/upskill\"; branch=\"main;rm -rf /\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        let parsed: Value = serde_json::from_str(output.trim()).unwrap();
+        assert!(parsed["summary"].get("branch").is_none(), "unsafe branch must be dropped");
+    }
+
+    #[test]
+    fn llms_txt_probe_content_type_accepted() {
+        let probes = default_probes();
+        for ct in &["text/plain", "text/plain; charset=utf-8", "text/markdown"] {
+            let m = probes.check_response("llms-txt", 200, ct, "# Title".into(), "u".into());
+            assert!(m.is_some(), "content-type {ct} should match llms-txt probe");
+        }
+    }
+
+    #[test]
+    fn llms_txt_probe_html_rejected() {
+        let probes = default_probes();
+        let m = probes.check_response("llms-txt", 200, "text/html", "<html>".into(), "u".into());
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn api_catalog_probe_linkset_accepted() {
+        let probes = default_probes();
+        let m = probes.check_response("api-catalog", 200, "application/linkset+json", "{}".into(), "u".into());
+        assert!(m.is_some());
+    }
+
+    #[test]
+    fn api_catalog_probe_json_accepted() {
+        let probes = default_probes();
+        let m = probes.check_response("api-catalog", 200, "application/json", "{}".into(), "u".into());
+        assert!(m.is_some());
+    }
+
+    #[test]
+    fn api_catalog_probe_html_rejected() {
+        let probes = default_probes();
+        let m = probes.check_response("api-catalog", 200, "text/html", "<html>".into(), "u".into());
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn follow_mode_flag_parsed() {
+        let mut flags = BTreeMap::new();
+        flags.insert("off".to_string(), "true".to_string());
+        flags.insert("follow".to_string(), "true".to_string());
+        let invocation = Invocation {
+            command: Some("discover".to_string()),
+            positionals: vec![],
+            flags,
+            multi: BTreeMap::new(),
+            cdp: None,
+            runtime: None,
+            session: None,
+            full_urls: false,
+            help: false,
+            command_help: false,
+            version: false,
+        };
+        let output = run(&invocation, None);
+        assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn link_header_multiple_rels_comma_separated() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let links = parse_link_header(
+            "</.well-known/api-catalog>; rel=\"api-catalog\", </openapi.json>; rel=\"service-desc\", </status>; rel=\"status\", </llms.txt>; rel=\"https://llmstxt.org/rel/llms-txt\"",
+            &base,
+        );
+        assert_eq!(links.len(), 4);
+        assert_eq!(links[0].rel, "api-catalog");
+        assert_eq!(links[1].rel, "service-desc");
+        assert_eq!(links[2].rel, "status");
+        assert_eq!(links[3].rel, LLMS_TXT_REL);
+    }
+
+    #[test]
+    fn link_header_params_branch_path() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let links = parse_link_header(
+            "<https://github.com/o/r>; rel=\"https://www.sliccy.ai/rel/upskill\"; branch=main; path=\"skills/foo\"",
+            &base,
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].params.get("branch").map(String::as_str), Some("main"));
+        assert_eq!(links[0].params.get("path").map(String::as_str), Some("skills/foo"));
+    }
+
+    #[test]
+    fn link_header_ext_value_branch() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let links = parse_link_header(
+            "<https://github.com/o/r>; rel=\"https://www.sliccy.ai/rel/upskill\"; branch*=UTF-8''feature%2Ffix",
+            &base,
+        );
+        assert_eq!(links[0].params.get("branch").map(String::as_str), Some("feature/fix"));
+    }
+
+    #[test]
+    fn discover_links_p0_rels_recognized() {
+        let rels = known_link_rels();
+        for rel in &["api-catalog", "service-desc", "service-meta", "status", "service-doc", LLMS_TXT_REL] {
+            assert!(rels.contains(rel), "missing {rel}");
+        }
+    }
+
+    #[test]
+    fn discover_links_first_occurrence_wins_dedup() {
+        let mut dedup = DedupSet::new();
+        assert!(dedup.is_new("https://example.com", "api-catalog", "https://example.com/a"));
+        assert!(!dedup.is_new("https://example.com", "api-catalog", "https://example.com/a"));
+        assert!(dedup.is_new("https://example.com", "api-catalog", "https://example.com/b"));
+    }
+
+    #[test]
+    fn llmstxtignore_defaults_contain_expected_hosts() {
+        let defaults = discovery::default_llmstxtignore_entries();
+        assert!(defaults.contains(&"github.com"));
+        assert!(defaults.contains(&"app.slack.com"));
     }
 }

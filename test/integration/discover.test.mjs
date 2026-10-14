@@ -17,9 +17,21 @@ function startDiscoverServer() {
     if (pathname === '/') {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
-        link: '</api>; rel="api-catalog"',
+        link: '</api>; rel="api-catalog", </llms.txt>; rel="https://llmstxt.org/rel/llms-txt", <https://github.com/o/r>; rel="https://www.sliccy.ai/rel/upskill"; branch=main; path="skills/foo"',
       });
       res.end('<!doctype html><title>Fixture</title><p>hello</p>');
+      return;
+    }
+
+    if (pathname === '/.well-known/api-catalog') {
+      res.writeHead(200, { 'content-type': 'application/linkset+json' });
+      res.end(JSON.stringify({ linkset: [{ anchor: '/' }] }));
+      return;
+    }
+
+    if (pathname === '/llms.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('# Test Site\n> A test summary\n## Section One\n## Section Two\nBody text.\n');
       return;
     }
 
@@ -119,11 +131,28 @@ test('playwright-cli discover --once', { timeout: 60_000 }, async (t) => {
       const apiCatalog = events.find(
         (e) => e.via === 'link-header' && e.standard === 'api-catalog'
       );
-      assert.ok(apiCatalog, `api-catalog: ${result.stdout}`);
+      assert.ok(apiCatalog, `api-catalog link-header: ${result.stdout}`);
       const ard = events.find((e) => e.via === 'well-known' && e.standard === 'ard');
       assert.ok(ard, `ard: ${result.stdout}`);
       assert.equal(ard.status, 'valid');
       assert.equal(ard.summary.name, 'Test ARD');
+
+      const handoff = events.find((e) => e.standard === 'slicc-handoff');
+      assert.ok(handoff, `slicc-handoff: ${result.stdout}`);
+      assert.equal(handoff.summary.verb, 'upskill');
+      assert.equal(handoff.summary.branch, 'main');
+      assert.equal(handoff.summary.path, 'skills/foo');
+
+      const llmsLink = events.find((e) => e.via === 'link-header' && e.standard === 'llms-txt');
+      assert.ok(llmsLink, `llms-txt link-header: ${result.stdout}`);
+
+      const wellKnownStandards = events
+        .filter((e) => e.via === 'well-known')
+        .map((e) => e.standard);
+      assert.ok(
+        wellKnownStandards.includes('llms-txt') || wellKnownStandards.includes('api-catalog'),
+        `llms-txt or api-catalog well-known probe expected: ${result.stdout}`
+      );
     });
 
     await t.test('402 response', async () => {

@@ -6,6 +6,7 @@ pub struct Link {
     pub rel: String,
     pub media_type: Option<String>,
     pub title: Option<String>,
+    pub params: std::collections::BTreeMap<String, String>,
 }
 
 #[must_use]
@@ -45,6 +46,7 @@ fn parse_header_value(input: &str, base: &Url, out: &mut Vec<Link>) {
         let mut title = None;
         let mut title_star_seen = false;
         let mut has_anchor = false;
+        let mut extra_params = std::collections::BTreeMap::new();
 
         loop {
             remaining = remaining.trim_start();
@@ -82,7 +84,17 @@ fn parse_header_value(input: &str, base: &Url, out: &mut Vec<Link>) {
                     }
                 }
                 "anchor" => has_anchor = true,
-                _ => {}
+                other => {
+                    let norm = other.strip_suffix('*').unwrap_or(other);
+                    if !extra_params.contains_key(norm) {
+                        let decoded = if other.ends_with('*') {
+                            decode_ext_value(&value).unwrap_or(value)
+                        } else {
+                            value
+                        };
+                        extra_params.insert(norm.to_string(), decoded);
+                    }
+                }
             }
         }
 
@@ -101,6 +113,7 @@ fn parse_header_value(input: &str, base: &Url, out: &mut Vec<Link>) {
                     rel: r.to_ascii_lowercase(),
                     media_type: media_type.clone(),
                     title: title.clone(),
+                    params: extra_params.clone(),
                 });
             }
         }
