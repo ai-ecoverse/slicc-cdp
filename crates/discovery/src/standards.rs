@@ -66,6 +66,12 @@ pub fn default_probes() -> ProbeRegistry {
         accept: "text/plain, text/markdown".into(),
         content_type_prefix: "text/".into(),
     });
+    registry.register(Probe {
+        standard: "poppy".into(),
+        path: "/.well-known/poppy.json".into(),
+        accept: "application/json".into(),
+        content_type_prefix: "application/json".into(),
+    });
     registry
 }
 
@@ -75,6 +81,7 @@ pub fn default_classifiers() -> ClassifierRegistry {
     registry.register("ai-catalog", classify_ai_catalog);
     registry.register("api-catalog", classify_api_catalog);
     registry.register("llms-txt", classify_llms_txt);
+    registry.register("poppy", classify_poppy);
     registry
 }
 
@@ -278,7 +285,7 @@ fn classify_ard_value(value: &Value, origin_domain: Option<&str>) -> Classificat
     }
 }
 
-fn registrable_domain(host: &str) -> Option<String> {
+pub fn registrable_domain(host: &str) -> Option<String> {
     let host = host.strip_suffix('.').unwrap_or(host);
     let bytes = host.as_bytes();
     let suffix = psl::suffix(bytes)?;
@@ -475,6 +482,211 @@ pub fn parse_llms_txt_summary(body: &str) -> Value {
     Value::Object(map)
 }
 
+fn classify_poppy(body: &str) -> Classification {
+    classify_poppy_with_origin(body, None)
+}
+
+fn classify_poppy_with_origin(body: &str, origin: Option<&str>) -> Classification {
+    let origin_domain = origin.and_then(|o| {
+        Url::parse(o).ok().and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+    });
+    match serde_json::from_str::<Value>(body) {
+        Ok(value) => classify_poppy_value(&value, origin_domain.as_deref()),
+        Err(e) => Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some(e.to_string()),
+        },
+    }
+}
+
+pub fn classify_poppy_body(body: &str, origin: Option<&str>) -> Classification {
+    classify_poppy_with_origin(body, origin)
+}
+
+fn strip_www(host: &str) -> &str {
+    host.strip_prefix("www.").unwrap_or(host)
+}
+
+fn classify_poppy_value(value: &Value, origin_domain: Option<&str>) -> Classification {
+    let protocol_version = value.get("protocol_version").and_then(|v| v.as_str()).unwrap_or("");
+    if protocol_version.is_empty() {
+        return Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some("missing protocol_version".into()),
+        };
+    }
+    let parts: Vec<&str> = protocol_version.split('.').collect();
+    if parts.len() != 2
+        || parts[0].parse::<u32>().is_err()
+        || parts[1].parse::<u32>().is_err()
+    {
+        return Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some(format!("invalid protocol_version: {protocol_version}")),
+        };
+    }
+
+    let org = value.get("organization");
+    let org_domain = org
+        .and_then(|o| o.get("domain"))
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    if org_domain.is_empty() {
+        return Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some("missing organization.domain".into()),
+        };
+    }
+    if let Some(host) = origin_domain {
+        if !org_domain.is_empty() {
+            let org_lower = org_domain.to_ascii_lowercase();
+            let org_stripped = strip_www(&org_lower);
+            let host_stripped = strip_www(host);
+            let org_reg = registrable_domain(org_stripped);
+            let host_reg = registrable_domain(host_stripped);
+            let mismatch = match (org_reg, host_reg) {
+                (Some(o), Some(h)) => o != h,
+                _ => org_stripped != host_stripped,
+            };
+            if mismatch {
+                return Classification {
+                    standard: "poppy".into(),
+                    status: Validity::Invalid,
+                    summary: Value::Null,
+                    reason: Some(format!(
+                        "organization.domain {org_domain} does not match host {host}"
+                    )),
+                };
+            }
+        }
+    }
+
+    let has_agent = value.get("agent").is_some();
+    let has_apis = value.get("apis").is_some();
+    let has_web = value.get("web").is_some();
+    if !has_agent && !has_apis && !has_web {
+        return Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some("requires at least one of agent, apis, web".into()),
+        };
+    }
+
+    let has_browser_session = value
+        .get("web")
+        .and_then(|w| w.get("browser_session_endpoint"))
+        .and_then(|v| v.as_str())
+        .is_some();
+    let needs_auth = has_agent || has_apis || has_browser_session;
+    if needs_auth && value.get("auth").is_none() {
+        return Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some("auth required when agent, apis, or web.browser_session_endpoint is present".into()),
+        };
+    }
+
+    let org_name = org
+        .and_then(|o| o.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| truncate(s, TITLE_CAP));
+
+    let issuer = value.get("issuer").and_then(|v| v.as_str()).map(str::to_string);
+
+    let sign_in: Vec<String> = value
+        .get("auth")
+        .and_then(|a| a.get("sign_in_methods"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let apis: Vec<Value> = value
+        .get("apis")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let t = entry.get("type").and_then(|v| v.as_str())?;
+                    let url = entry.get("url").and_then(|v| v.as_str())?;
+                    Some(serde_json::json!({ "type": t, "url": url }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let agent_protocols: Vec<Value> = value
+        .get("agent")
+        .and_then(|a| a.get("protocols"))
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let t = entry.get("type").and_then(|v| v.as_str())?;
+                    let ep = entry.get("endpoint").and_then(|v| v.as_str())?;
+                    Some(serde_json::json!({ "type": t, "endpoint": ep }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let browser_session_endpoint = value
+        .get("web")
+        .and_then(|w| w.get("browser_session_endpoint"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let mut summary = serde_json::Map::new();
+    summary.insert("protocolVersion".into(), Value::String(protocol_version.to_string()));
+    if let Some(name) = org_name {
+        let mut org_map = serde_json::Map::new();
+        org_map.insert("name".into(), Value::String(name));
+        org_map.insert("domain".into(), Value::String(org_domain.to_string()));
+        summary.insert("organization".into(), Value::Object(org_map));
+    } else if !org_domain.is_empty() {
+        let mut org_map = serde_json::Map::new();
+        org_map.insert("domain".into(), Value::String(org_domain.to_string()));
+        summary.insert("organization".into(), Value::Object(org_map));
+    }
+    if let Some(iss) = issuer {
+        summary.insert("issuer".into(), Value::String(iss));
+    }
+    if !sign_in.is_empty() {
+        summary.insert("signIn".into(), Value::Array(
+            sign_in.into_iter().map(Value::String).collect(),
+        ));
+    }
+    if !apis.is_empty() {
+        summary.insert("apis".into(), Value::Array(apis));
+    }
+    if !agent_protocols.is_empty() {
+        summary.insert("agentProtocols".into(), Value::Array(agent_protocols));
+    }
+    if let Some(bse) = browser_session_endpoint {
+        summary.insert("browserSessionEndpoint".into(), Value::String(bse));
+    }
+
+    Classification {
+        standard: "poppy".into(),
+        status: Validity::Valid,
+        summary: Value::Object(summary),
+        reason: None,
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -639,6 +851,15 @@ mod tests {
     }
 
     #[test]
+    fn default_probes_has_poppy() {
+        let registry = default_probes();
+        let probes = registry.probes_for_origin("https://example.com");
+        let p = probes.iter().find(|p| p.probe.standard == "poppy").unwrap();
+        assert_eq!(p.url, "https://example.com/.well-known/poppy.json");
+        assert_eq!(p.probe.accept, "application/json");
+    }
+
+    #[test]
     fn default_classifiers_has_ard() {
         let registry = default_classifiers();
         let result = registry.classify("ard", r#"{"name":"Test"}"#).unwrap();
@@ -716,6 +937,19 @@ mod tests {
         assert_eq!(headings.len(), 2);
         assert_eq!(headings[0], "Section One");
         assert_eq!(headings[1], "Section Two");
+    }
+
+    #[test]
+    fn default_classifiers_has_poppy() {
+        let registry = default_classifiers();
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "name": "Test", "domain": "example.com" },
+            "web": { "home": "/" }
+        }).to_string();
+        let result = registry.classify("poppy", &body).unwrap();
+        assert_eq!(result.status, Validity::Valid);
+        assert_eq!(result.summary["protocolVersion"], "0.1");
     }
 
     #[test]
@@ -1366,5 +1600,205 @@ mod tests {
         });
         let warn = check_trust_identity(&entry, Some("www.acme.com"));
         assert!(warn.is_none());
+    }
+
+    #[test]
+    fn poppy_valid_minimal() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "name": "Acme", "domain": "example.com" },
+            "web": { "home": "https://example.com" }
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Valid);
+        assert_eq!(result.summary["protocolVersion"], "0.1");
+        assert_eq!(result.summary["organization"]["name"], "Acme");
+    }
+
+    #[test]
+    fn poppy_spec_example() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": {
+                "name": "Acme Corp",
+                "domain": "acme.com"
+            },
+            "issuer": "https://auth.acme.com",
+            "auth": {
+                "sign_in_methods": [
+                    { "type": "direct" },
+                    { "type": "device" }
+                ]
+            },
+            "agent": {
+                "protocols": [
+                    { "type": "a2a", "endpoint": "https://api.acme.com/a2a" }
+                ]
+            },
+            "apis": [
+                { "type": "mcp", "url": "https://api.acme.com/mcp" },
+                { "type": "rest", "url": "https://api.acme.com/v1" }
+            ],
+            "web": {
+                "browser_session_endpoint": "https://acme.com/session"
+            }
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://acme.com"));
+        assert_eq!(result.status, Validity::Valid);
+        assert_eq!(result.summary["protocolVersion"], "0.1");
+        assert_eq!(result.summary["organization"]["name"], "Acme Corp");
+        assert_eq!(result.summary["issuer"], "https://auth.acme.com");
+        let sign_in = result.summary["signIn"].as_array().unwrap();
+        assert_eq!(sign_in.len(), 2);
+        let apis = result.summary["apis"].as_array().unwrap();
+        assert_eq!(apis.len(), 2);
+        assert_eq!(apis[0]["type"], "mcp");
+        let protocols = result.summary["agentProtocols"].as_array().unwrap();
+        assert_eq!(protocols.len(), 1);
+        assert_eq!(protocols[0]["type"], "a2a");
+        assert_eq!(result.summary["browserSessionEndpoint"], "https://acme.com/session");
+    }
+
+    #[test]
+    fn poppy_missing_protocol_version() {
+        let body = serde_json::json!({
+            "organization": { "domain": "example.com" },
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("protocol_version"));
+    }
+
+    #[test]
+    fn poppy_invalid_protocol_version() {
+        let body = serde_json::json!({
+            "protocol_version": "1",
+            "organization": { "domain": "example.com" },
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("invalid protocol_version"));
+    }
+
+    #[test]
+    fn poppy_domain_mismatch() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "evil.com" },
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("does not match"));
+    }
+
+    #[test]
+    fn poppy_domain_www_stripped() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "www.example.com" },
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Valid);
+    }
+
+    #[test]
+    fn poppy_no_sections() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "example.com" }
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("at least one of"));
+    }
+
+    #[test]
+    fn poppy_missing_org_domain() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("organization.domain"));
+    }
+
+    #[test]
+    fn poppy_auth_required_with_agent() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "example.com" },
+            "agent": { "protocols": [] }
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("auth required"));
+    }
+
+    #[test]
+    fn poppy_auth_required_with_apis() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "example.com" },
+            "apis": []
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("auth required"));
+    }
+
+    #[test]
+    fn poppy_auth_required_with_browser_session() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "example.com" },
+            "web": { "browser_session_endpoint": "https://example.com/session" }
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("auth required"));
+    }
+
+    #[test]
+    fn poppy_web_only_no_auth_needed() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "example.com" },
+            "web": { "home": "https://example.com" }
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Valid);
+    }
+
+    #[test]
+    fn poppy_invalid_json() {
+        let result = classify_poppy_body("not json", Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+    }
+
+    #[test]
+    fn poppy_no_origin() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "any.com" },
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, None);
+        assert_eq!(result.status, Validity::Valid);
+    }
+
+    #[test]
+    fn poppy_subdomain_matches() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "organization": { "domain": "api.acme.com" },
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://www.acme.com"));
+        assert_eq!(result.status, Validity::Valid);
     }
 }

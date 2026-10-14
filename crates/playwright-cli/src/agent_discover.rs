@@ -6,7 +6,8 @@ use crate::session;
 use discovery::{
     classify_response, classify_slicc_handoff, default_classifiers,
     default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
-    parse_link_header, classify_ard_body, classify_ai_catalog_body, parse_robots_txt_agentmap,
+    parse_link_header, classify_ard_body, classify_ai_catalog_body,
+    classify_poppy_body, registrable_domain, parse_robots_txt_agentmap,
     ClassifierRegistry, DedupSet, DiscoveryEvent,
     ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
@@ -1201,11 +1202,27 @@ fn run_probes(
         let probe_result = isolated_world_probe(cdp, session_id, &frame_id, &probe_req.url);
         let (status, content_type, body) = match probe_result {
             IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
-            IsolatedProbeResult::Final => continue,
+            IsolatedProbeResult::Final => {
+                if probe_req.probe.standard == "poppy" {
+                    match poppy_redirect_probe(&probe_req.url, &probe_req.probe.accept, origin, cdp) {
+                        Some((s, ct, b)) => (s, ct, b),
+                        None => continue,
+                    }
+                } else {
+                    continue
+                }
+            }
             IsolatedProbeResult::Unavailable => {
-                match native_probe(&probe_req.url, &probe_req.probe.accept) {
-                    Some((ns, nct, nbody)) => (ns, nct, nbody),
-                    None => continue,
+                if probe_req.probe.standard == "poppy" {
+                    match poppy_redirect_probe(&probe_req.url, &probe_req.probe.accept, origin, cdp) {
+                        Some((s, ct, b)) => (s, ct, b),
+                        None => continue,
+                    }
+                } else {
+                    match native_probe(&probe_req.url, &probe_req.probe.accept) {
+                        Some((ns, nct, nbody)) => (ns, nct, nbody),
+                        None => continue,
+                    }
                 }
             }
         };
@@ -1243,6 +1260,8 @@ fn run_probes(
             Some(classify_ard_body(&p.body, Some(origin)))
         } else if p.standard == "ai-catalog" {
             Some(classify_ai_catalog_body(&p.body, Some(origin)))
+        } else if p.standard == "poppy" {
+            Some(classify_poppy_body(&p.body, Some(origin)))
         } else {
             state.classifiers.classify(&p.standard, &p.body)
         };
@@ -1350,6 +1369,67 @@ fn run_probes(
     }
 
     output
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn poppy_redirect_probe(
+    url: &str,
+    accept: &str,
+    origin: &str,
+    cdp: &Cdp,
+) -> Option<(u16, String, String)> {
+    let resp = cdp_client::net::http_probe(url, accept).ok()?;
+    if resp.status == 200 {
+        let ct = resp.content_type().to_string();
+        let body = String::from_utf8_lossy(&resp.body).into_owned();
+        return Some((resp.status, ct, body));
+    }
+    if !(300..400).contains(&resp.status) {
+        return None;
+    }
+    let location = resp
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone())?;
+    let resolved = Url::parse(&location)
+        .or_else(|_| Url::parse(url).and_then(|base| base.join(&location)))
+        .ok()?;
+    let resolved_str = resolved.to_string();
+    let resolved_host = resolved.host_str()?.to_ascii_lowercase();
+    let origin_parsed = Url::parse(origin).ok()?;
+    let origin_host = origin_parsed.host_str()?.to_ascii_lowercase();
+    let same_site = match (registrable_domain(&resolved_host), registrable_domain(&origin_host)) {
+        (Some(r), Some(o)) => r == o,
+        _ => resolved_host == origin_host,
+    };
+    if !same_site {
+        return None;
+    }
+    if is_reserved_cdp_origin(&resolved_str) {
+        return None;
+    }
+    if cdp.guard().url(&resolved_str) {
+        return None;
+    }
+    let origin_of_resolved = extract_origin(&resolved_str)?;
+    if is_reserved_cdp_origin(&origin_of_resolved) {
+        return None;
+    }
+    let resp2 = cdp_client::net::http_probe(&resolved_str, accept).ok()?;
+    let ct = resp2.content_type().to_string();
+    let body = String::from_utf8_lossy(&resp2.body).into_owned();
+    Some((resp2.status, ct, body))
+}
+
+#[cfg(target_os = "wasi")]
+fn poppy_redirect_probe(
+    _url: &str,
+    _accept: &str,
+    _origin: &str,
+    _cdp: &Cdp,
+) -> Option<(u16, String, String)> {
+    None
 }
 
 enum IsolatedProbeResult {
