@@ -996,5 +996,87 @@ mod tests {
                 assert!(!rendered.contains(secret), "{rendered}");
             }
         }
+
+        #[test]
+        fn upload_rejects_directory() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-upload-dir-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            seed(&root, None);
+            let peer = Peer::start(SliccReply::Silent, true);
+            let dir_path = std::env::temp_dir().join(format!("slicc-upload-target-dir-{}", std::process::id()));
+            std::fs::create_dir_all(&dir_path).unwrap();
+            let output = {
+                let _dir = DirGuard::enter(&root);
+                run(peer.port, &["upload", "e1", dir_path.to_str().unwrap()])
+            };
+            assert_ne!(output.code, 0);
+            assert!(output.stderr.contains("directory"), "{}", output.stderr);
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&dir_path);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn upload_rejects_unreadable_file() {
+            use std::os::unix::fs::PermissionsExt;
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-upload-unread-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            seed(&root, None);
+            let peer = Peer::start(SliccReply::Silent, true);
+            let file_path = std::env::temp_dir().join(format!("slicc-upload-unreadable-{}", std::process::id()));
+            std::fs::write(&file_path, b"secret").unwrap();
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let output = {
+                let _dir = DirGuard::enter(&root);
+                run(peer.port, &["upload", "e1", file_path.to_str().unwrap()])
+            };
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::remove_file(&file_path);
+            assert_ne!(output.code, 0);
+            assert!(output.stderr.contains("cannot read"), "{}", output.stderr);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn upload_rejects_missing_file() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-upload-miss-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            seed(&root, None);
+            let peer = Peer::start(SliccReply::Silent, true);
+            let output = {
+                let _dir = DirGuard::enter(&root);
+                run(peer.port, &["upload", "e1", "/tmp/nonexistent-slicc-upload-xyz"])
+            };
+            assert_ne!(output.code, 0);
+            assert!(output.stderr.contains("not found"), "{}", output.stderr);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn upload_succeeds_with_valid_file() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-upload-ok-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            seed(&root, None);
+            let peer = Peer::start(SliccReply::Silent, true);
+            let file_path = std::env::temp_dir().join(format!("slicc-upload-valid-{}.txt", std::process::id()));
+            std::fs::write(&file_path, b"hello world").unwrap();
+            let output = {
+                let _dir = DirGuard::enter(&root);
+                run(peer.port, &["upload", "e1", file_path.to_str().unwrap()])
+            };
+            assert_eq!(output.code, 0, "{}", output.stderr);
+            assert!(output.stdout.contains("Uploaded 1 file(s)"), "{}", output.stdout);
+            let log = peer.log.lock().unwrap().clone();
+            let set_file = log.iter().find(|call| {
+                call.get("method").and_then(|v| v.as_str()) == Some("DOM.setFileInputFiles")
+            });
+            assert!(set_file.is_some(), "expected DOM.setFileInputFiles call");
+            let _ = std::fs::remove_file(&file_path);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

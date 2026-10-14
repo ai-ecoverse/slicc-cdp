@@ -1401,8 +1401,8 @@ fn cmd_upload(
     let id = &invocation.positionals[0];
     let files: Vec<String> = invocation.positionals[1..].to_vec();
     for file in &files {
-        if !PathBuf::from(file).exists() {
-            return Output::err(format!("upload: file not found: {file}\n"));
+        if let Err(message) = browser::validate_upload_path(file) {
+            return Output::err(message);
         }
     }
     with_ref(cdp, state, invocation, report, id, |cdp, session, rec| {

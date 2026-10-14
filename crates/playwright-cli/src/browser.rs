@@ -1,5 +1,7 @@
 use crate::cdp::{self, Cdp};
 use crate::net::base64_decode;
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::net::base64_encode;
 use crate::route;
 use crate::session::{self, Session};
 use crate::snapshot::{self, AxNode, FrameRec, RefRec};
@@ -1142,6 +1144,136 @@ fn frame_element_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<
     Ok((x, y))
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug)]
+struct UploadEntry {
+    name: String,
+    mime: String,
+    base64: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn upload_entry(path_str: &str, data: &[u8]) -> Result<UploadEntry, String> {
+    if data.len() > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "upload: {path_str} is {} bytes, exceeding the 25 MiB limit\n",
+            data.len()
+        ));
+    }
+    let name = std::path::Path::new(path_str)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path_str)
+        .to_string();
+    let mime = mime_from_name(&name);
+    Ok(UploadEntry {
+        name,
+        mime,
+        base64: base64_encode(data),
+    })
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn upload_call_args(entries: &[UploadEntry]) -> (String, Vec<Value>) {
+    let file_array_js = entries
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("files[{i}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let func = format!(
+        "function(...args) {{ \
+            const dt = new DataTransfer(); \
+            const files = []; \
+            for (let i = 0; i < args.length; i += 3) {{ \
+                const bytes = Uint8Array.from(atob(args[i+2]), c => c.charCodeAt(0)); \
+                files.push(new File([bytes], args[i], {{ type: args[i+1] }})); \
+            }} \
+            for (const f of [{file_array_js}]) dt.items.add(f); \
+            this.files = dt.files; \
+            this.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+            this.dispatchEvent(new Event('change', {{ bubbles: true }})); \
+        }}"
+    );
+    let mut arguments: Vec<Value> = Vec::new();
+    for entry in entries {
+        arguments.push(json!({ "value": entry.name }));
+        arguments.push(json!({ "value": entry.mime }));
+        arguments.push(json!({ "value": entry.base64 }));
+    }
+    (func, arguments)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn upload_files(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+    files: &[String],
+) -> Result<(), String> {
+    let backend = rec
+        .backend_node_id
+        .ok_or_else(|| "element has no backend node\n".to_string())?;
+    let mut entries: Vec<UploadEntry> = Vec::new();
+    for path_str in files {
+        let data = std::fs::read(path_str)
+            .map_err(|err| format!("upload: cannot read {path_str}: {err}\n"))?;
+        entries.push(upload_entry(path_str, &data)?);
+    }
+    let _ = cdp.call("DOM.enable", json!({}), Some(session));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(session));
+    let frame_id = rec
+        .frame_id
+        .clone()
+        .or_else(|| {
+            cdp.call("Page.getFrameTree", json!({}), Some(session))
+                .ok()
+                .and_then(|r| {
+                    r.pointer("/frameTree/frame/id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+        })
+        .ok_or_else(|| "upload: could not determine frame id\n".to_string())?;
+    let world = cdp.call(
+        "Page.createIsolatedWorld",
+        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+        Some(session),
+    )?;
+    let context_id = world
+        .get("executionContextId")
+        .ok_or_else(|| "upload: isolated world returned no context\n".to_string())?;
+    let resolved = cdp.call(
+        "DOM.resolveNode",
+        json!({ "backendNodeId": backend, "executionContextId": context_id }),
+        Some(session),
+    )?;
+    let object_id = resolved
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("could not resolve backend node {backend}\n"))?
+        .to_string();
+    let (func, arguments) = upload_call_args(&entries);
+    let result = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": func,
+            "arguments": arguments,
+            "returnByValue": true,
+        }),
+        Some(session),
+    )?;
+    if let Some(details) = result.get("exceptionDetails") {
+        return Err(format!("upload: JS error: {}\n", exception_message(details)));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn upload_files(
     cdp: &mut Cdp,
     session: &str,
@@ -1160,6 +1292,44 @@ pub fn upload_files(
         Some(session),
     )?;
     Ok(())
+}
+
+pub fn validate_upload_path(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(format!("upload: file not found: {path}\n"));
+    }
+    if p.is_dir() {
+        return Err(format!("upload: path is a directory: {path}\n"));
+    }
+    match std::fs::File::open(p) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(format!("upload: cannot read {path}: {err}\n")),
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn mime_from_name(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 pub fn print_to_pdf(cdp: &mut Cdp, session: &str) -> Result<Vec<u8>, String> {
@@ -1183,7 +1353,7 @@ pub fn lookup_ref<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{cdp_error_response, navigation_commits};
+    use super::{cdp_error_response, mime_from_name, navigation_commits, upload_call_args, upload_entry, validate_upload_path, MAX_UPLOAD_BYTES};
     use serde_json::json;
 
     #[test]
@@ -1204,5 +1374,116 @@ mod tests {
         assert!(!navigation_commits(
             &json!({ "loaderId": "ABC", "isDownload": true })
         ));
+    }
+
+    #[test]
+    fn validate_upload_rejects_directory() {
+        let dir = std::env::temp_dir().join(format!("upload-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = validate_upload_path(dir.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("directory"));
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn validate_upload_rejects_missing_file() {
+        let result = validate_upload_path("/tmp/nonexistent-upload-test-file-xyz");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_upload_rejects_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("upload-unreadable-{}", std::process::id()));
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = validate_upload_path(path.to_str().unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot read"));
+    }
+
+    #[test]
+    fn validate_upload_accepts_regular_file() {
+        let path = std::env::temp_dir().join(format!("upload-valid-{}", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(validate_upload_path(path.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mime_from_name_common_types() {
+        assert_eq!(mime_from_name("photo.png"), "image/png");
+        assert_eq!(mime_from_name("page.html"), "text/html");
+        assert_eq!(mime_from_name("data.json"), "application/json");
+        assert_eq!(mime_from_name("archive.zip"), "application/zip");
+        assert_eq!(mime_from_name("unknown.xyz"), "application/octet-stream");
+        assert_eq!(mime_from_name("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn upload_entry_builds_name_type_base64() {
+        let entry = upload_entry("/home/user/photo.png", b"PNG-DATA").unwrap();
+        assert_eq!(entry.name, "photo.png");
+        assert_eq!(entry.mime, "image/png");
+        let decoded = crate::net::base64_decode(&entry.base64).unwrap();
+        assert_eq!(decoded, b"PNG-DATA");
+    }
+
+    #[test]
+    fn upload_entry_extracts_filename_from_path() {
+        let entry = upload_entry("/a/b/c/report.csv", b"col1,col2").unwrap();
+        assert_eq!(entry.name, "report.csv");
+        assert_eq!(entry.mime, "text/csv");
+    }
+
+    #[test]
+    fn upload_entry_rejects_oversized_data() {
+        let big = vec![0u8; MAX_UPLOAD_BYTES + 1];
+        let result = upload_entry("huge.bin", &big);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("25 MiB"), "{err}");
+        assert!(err.contains("huge.bin"), "{err}");
+    }
+
+    #[test]
+    fn upload_entry_accepts_exactly_max_size() {
+        let data = vec![0u8; MAX_UPLOAD_BYTES];
+        assert!(upload_entry("exact.bin", &data).is_ok());
+    }
+
+    #[test]
+    fn upload_call_args_single_file() {
+        let entry = upload_entry("hello.txt", b"world").unwrap();
+        let (func, args) = upload_call_args(&[entry]);
+        assert!(func.contains("DataTransfer"));
+        assert!(func.contains("new File"));
+        assert!(func.contains("dispatchEvent"));
+        assert!(func.contains("files[0]"));
+        assert!(!func.contains("files[1]"));
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0]["value"], "hello.txt");
+        assert_eq!(args[1]["value"], "text/plain");
+        let decoded = crate::net::base64_decode(args[2]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, b"world");
+    }
+
+    #[test]
+    fn upload_call_args_multiple_files() {
+        let e1 = upload_entry("a.png", b"img1").unwrap();
+        let e2 = upload_entry("b.json", b"{}").unwrap();
+        let (func, args) = upload_call_args(&[e1, e2]);
+        assert!(func.contains("files[0]"));
+        assert!(func.contains("files[1]"));
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0]["value"], "a.png");
+        assert_eq!(args[1]["value"], "image/png");
+        assert_eq!(args[3]["value"], "b.json");
+        assert_eq!(args[4]["value"], "application/json");
     }
 }
