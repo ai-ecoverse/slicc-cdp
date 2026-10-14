@@ -1028,7 +1028,7 @@ fn eval_in_isolated_world(
     for _attempt in 0..2 {
         let world = match cdp.call(
             "Page.createIsolatedWorld",
-            json!({ "frameId": fid, "grantUniveralAccess": true }),
+            json!({ "frameId": fid, "worldName": "__slicc_discover", "grantUniveralAccess": true }),
             Some(session),
         ) {
             Ok(w) => w,
