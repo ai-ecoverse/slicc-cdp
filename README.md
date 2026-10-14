@@ -66,6 +66,54 @@ Inside the kernel the browser socket is `SLICC_CDP_URL`: `ws://127.0.0.1:9222/de
 
 Routes in the kernel use these CDP methods through the facade, always with a tab's `sessionId`: `Fetch.enable`, `Fetch.disable`, `Fetch.continueRequest`, `Fetch.fulfillRequest`, the `Fetch.requestPaused` event, and `Target.getTargetInfo`. The `slicc-cdp-client` API can also send `Fetch.failRequest`, `Fetch.getResponseBody` and `Fetch.continueResponse`; `playwright-cli` doesn't.
 
+## Backend contract
+
+This is what `playwright-cli`, `curlwright`, `slicc-cdp-client` and the JS `CDPClient` need from any CDP backend: Chrome itself, the slicc-extension `sliccExtension.cdp` backend, bios's link, or slicc-node. It was taken from the code at `f6d43e8`. `crates/cdp-client/src/contract.rs` keeps the same lists, and its unit test checks them against every call in `crates/*/src` that sends no `sessionId` and against this section.
+
+One browser WebSocket carries everything. Requests are `{id, method, params}` with an optional top-level `sessionId`. Replies are `{id, result}` or `{id, error: {message}}`. Events are `{method, params}`, with `sessionId` when they come from a session. Replies to ids the client didn't send are dropped.
+
+### Browser-level methods
+
+These are sent with no `sessionId`.
+
+- `Target.getTargets` with `{}`. The client reads `targetInfos[]` and, in each one, `targetId`, `type`, `url`, `title` and `openerId`. Only `type: "page"` is listed as a tab.
+- `Target.getTargetInfo` with `{targetId}`. The client reads `targetInfo.type`, `targetInfo.url` and `targetInfo.openerId`. It asks about openers, and about a `frameId` the caller named; an error for a frame id is fine.
+- `Target.setDiscoverTargets` with `{discover: true}`, once per connection, before the first attach.
+- `Target.createTarget` with `{url: "about:blank"}`, and `background` from `playwright-cli`. It must return `targetId`. The client always creates a blank tab, attaches its guard, and only then navigates it over the guard session. Any other `url` is never sent here.
+- `Target.attachToTarget` with `{targetId, flatten: true}`. It must return `sessionId`. Every later command for that tab carries that `sessionId` at the top level. Non-flat attach is refused before it is sent.
+- `Target.detachFromTarget` with `{sessionId}`.
+- `Target.closeTarget` with `{targetId}`.
+- `Target.activateTarget` with `{targetId}`. `open` ignores an error; `tab-select` reports it.
+- `Browser.getVersion` with `{}`. It is optional and only `webmcp-call` uses it. `product` is read as `Chrome/NNN` or `HeadlessChrome/NNN`. On an error or any other product, `executeTool` input is passed as a string.
+- `Slicc.action` with `{phase, kind, ...}`. It is an optional notification for the slicc panel. The client never waits for the reply, so a backend may ignore it or answer with an error.
+
+### Browser-level events
+
+- `Target.targetCreated` with `targetInfo`: `targetId`, `type`, `url`, `openerId`.
+- `Target.targetInfoChanged` with the same `targetInfo`. It must fire on every committed navigation, because the protected-origin guard depends on it.
+- `Target.targetDestroyed` with `targetId`.
+- `Target.detachedFromTarget` with `sessionId`.
+
+### Protected tabs
+
+A backend may leave out of `Target.getTargets` the tabs the client has never seen, such as seven's and the vault's. A tab the client could see that later becomes protected must produce `Target.targetInfoChanged` with its real `url`, or `Target.targetDestroyed`. It must never go silent.
+
+The guard on a tab is its own flat session. On it the client sends `Fetch.enable` for `Document` requests at the `Request` stage, `Network.enable` and `Network.setBypassServiceWorker`, which must succeed, and `Page.enable` and `Runtime.enable`, which may fail with an error message.
+
+### Session-level domains
+
+Everything else goes over a flattened session, with a top-level `sessionId`:
+
+- `Page`
+- `Runtime`
+- `DOM`
+- `Input`
+- `Network`
+- `Fetch`
+- `Accessibility`
+
+The CLIs send no `Emulation` or `IO` command. `slicc-cdp-client` lets a caller `IO.read` a stream that one of the session replies above handed out.
+
 ## Package
 
 Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on `main`. Git `package.json` stays `0.0.0`. The published version is the release tag.
