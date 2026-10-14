@@ -1141,7 +1141,7 @@ fn run_probes(
                             }
                         }
                     };
-                    if am_status == 200 && am_ct.starts_with("application/json") {
+                    if am_status == 200 && is_json_content_type(&am_ct) {
                         let classification = classify_ard_body(&am_body, Some(origin));
                         let summary_clone = classification.summary.clone();
                         let event = DiscoveryEvent {
@@ -1757,14 +1757,15 @@ fn follow_ard_catalogs(
         let probe_result = isolated_world_probe(cdp, session_id, frame_id, &cat_url);
         let (cat_status, cat_ct, cat_body) = match probe_result {
             IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
-            IsolatedProbeResult::Final | IsolatedProbeResult::Unavailable => {
+            IsolatedProbeResult::Final => continue,
+            IsolatedProbeResult::Unavailable => {
                 match native_probe(&cat_url, "application/json") {
                     Some((s, ct, b)) => (s, ct, b),
                     None => continue,
                 }
             }
         };
-        if cat_status != 200 || !cat_ct.starts_with("application/json") {
+        if cat_status != 200 || !is_json_content_type(&cat_ct) {
             continue;
         }
         let cat_origin = extract_origin(&cat_url).unwrap_or_else(|| origin.to_string());
@@ -1784,6 +1785,11 @@ fn follow_ard_catalogs(
         output.push_str(&emit_event(state, &event));
     }
     output
+}
+fn is_json_content_type(ct: &str) -> bool {
+    let lower = ct.to_ascii_lowercase();
+    let media = lower.split(';').next().unwrap_or("").trim();
+    media == "application/json" || media.ends_with("+json")
 }
 
 pub fn extract_origin(url: &str) -> Option<String> {
@@ -3210,6 +3216,44 @@ mod tests {
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn probe_robots_flag_parsed() {
+        let mut flags = BTreeMap::new();
+        flags.insert("off".to_string(), "true".to_string());
+        flags.insert("probe".to_string(), "robots".to_string());
+        let invocation = Invocation {
+            command: Some("discover".to_string()),
+            positionals: vec![],
+            flags,
+            multi: BTreeMap::new(),
+            cdp: None,
+            runtime: None,
+            session: None,
+            full_urls: false,
+            help: false,
+            command_help: false,
+            version: false,
+        };
+        let output = run(&invocation, None);
+        assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn is_json_content_type_matches() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(is_json_content_type("application/ai-catalog+json"));
+        assert!(is_json_content_type("application/ai-registry+json"));
+        assert!(is_json_content_type("APPLICATION/JSON"));
+    }
+
+    #[test]
+    fn is_json_content_type_rejects() {
+        assert!(!is_json_content_type("text/html"));
+        assert!(!is_json_content_type("text/plain"));
+        assert!(!is_json_content_type("application/xml"));
     }
 
     #[test]

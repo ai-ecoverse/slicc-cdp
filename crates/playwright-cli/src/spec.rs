@@ -42,7 +42,7 @@ static SPECS: &[Spec] = &[
     spec("tab-select", &["index"], false, &[], true, RefMode::None),
     spec("tab-close", &["index"], false, &[("tab", S)], true, RefMode::None),
     spec("list", &[], false, &[("json", B)], true, RefMode::None),
-    spec("discover", &[], false, &[("tab", S), ("json", B), ("once", S), ("only", S), ("skip", S), ("no-probe", B), ("exec", S), ("exec-timeout", S), ("lick", B), ("off", B)], true, RefMode::None),
+    spec("discover", &[], false, &[("tab", S), ("json", B), ("once", S), ("only", S), ("skip", S), ("no-probe", B), ("probe", S), ("follow", B), ("exec", S), ("exec-timeout", S), ("lick", B), ("off", B)], true, RefMode::None),
     spec("dblclick", &["ref", "button"], false, &[("tab", S), ("modifiers", S)], true, RefMode::Element),
     spec("drag", &["startRef", "endRef"], false, &[("tab", S)], true, RefMode::Element),
     spec("hover", &["ref"], false, &[("tab", S)], true, RefMode::Element),
