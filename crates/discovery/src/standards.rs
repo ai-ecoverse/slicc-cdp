@@ -10,6 +10,9 @@ pub const LLMS_TXT_REL: &str = "https://llmstxt.org/rel/llms-txt";
 const TITLE_CAP: usize = 200;
 const HEADINGS_CAP: usize = 50;
 const HEADING_LEN_CAP: usize = 200;
+const CHALLENGE_CAP: usize = 500;
+const AUTH_MD_METHODS_CAP: usize = 20;
+const AUTH_MD_METHOD_LEN_CAP: usize = 200;
 
 const ENTRY_TYPE_CATALOG: &str = "application/ai-catalog+json";
 const ENTRY_TYPE_REGISTRY: &str = "application/ai-registry+json";
@@ -37,6 +40,9 @@ pub fn known_link_rels() -> &'static [&'static str] {
         LLMS_TXT_REL,
         HANDOFF_REL,
         UPSKILL_REL,
+        "auth-md",
+        "oauth-authorization-server",
+        "oauth-protected-resource",
     ]
 }
 
@@ -72,6 +78,12 @@ pub fn default_probes() -> ProbeRegistry {
         accept: "application/json".into(),
         content_type_prefix: "application/json".into(),
     });
+    registry.register(Probe {
+        standard: "auth-md".into(),
+        path: "/auth.md".into(),
+        accept: "text/markdown, text/plain".into(),
+        content_type_prefix: "text/".into(),
+    });
     registry
 }
 
@@ -82,6 +94,7 @@ pub fn default_classifiers() -> ClassifierRegistry {
     registry.register("api-catalog", classify_api_catalog);
     registry.register("llms-txt", classify_llms_txt);
     registry.register("poppy", classify_poppy);
+    registry.register("auth-md", classify_auth_md);
     registry
 }
 
@@ -95,8 +108,24 @@ pub struct ResponseSignal {
     pub summary: Value,
 }
 
-pub fn classify_response(status: u16, headers: &[(String, String)]) -> Vec<ResponseSignal> {
+pub fn classify_response(status: u16, headers: &[(String, String)], response_url: Option<&str>) -> Vec<ResponseSignal> {
     let mut signals = Vec::new();
+    if status == 401 {
+        let schemes = parse_www_authenticate_headers(headers);
+        let auth_links = extract_auth_links(headers, response_url);
+        let mut summary = serde_json::Map::new();
+        summary.insert("status".into(), Value::Number(401.into()));
+        if !schemes.is_empty() {
+            summary.insert("schemes".into(), Value::Array(schemes));
+        }
+        if !auth_links.is_empty() {
+            summary.insert("links".into(), Value::Array(auth_links));
+        }
+        signals.push(ResponseSignal {
+            standard: "auth-md".into(),
+            summary: Value::Object(summary),
+        });
+    }
     if status == 402 {
         let challenge = headers
             .iter()
@@ -109,6 +138,320 @@ pub fn classify_response(status: u16, headers: &[(String, String)]) -> Vec<Respo
         });
     }
     signals
+}
+
+
+fn parse_www_authenticate_headers(headers: &[(String, String)]) -> Vec<Value> {
+    let mut schemes = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("www-authenticate") {
+            continue;
+        }
+        let capped = truncate(value, CHALLENGE_CAP);
+        for challenge in split_challenges(&capped) {
+            if let Some(parsed) = parse_single_challenge(&challenge) {
+                schemes.push(parsed);
+            }
+        }
+    }
+    schemes
+}
+
+fn split_challenges(raw: &str) -> Vec<String> {
+    let mut challenges = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '\\' if in_quotes => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ',' if !in_quotes => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    let has_scheme = trimmed.split_ascii_whitespace().next()
+                        .map_or(false, |w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+                    let looks_like_param = trimmed.contains('=') && !trimmed.contains(' ');
+                    if has_scheme && !looks_like_param {
+                        challenges.push(trimmed);
+                        current = String::new();
+                    } else if let Some(last) = challenges.last_mut() {
+                        last.push(',');
+                        last.push_str(&trimmed);
+                        current = String::new();
+                    } else {
+                        challenges.push(trimmed);
+                        current = String::new();
+                    }
+                } else {
+                    current = String::new();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        let looks_like_param = trimmed.contains('=') && !trimmed.contains(' ');
+        if looks_like_param {
+            if let Some(last) = challenges.last_mut() {
+                last.push(',');
+                last.push_str(&trimmed);
+            } else {
+                challenges.push(trimmed);
+            }
+        } else {
+            challenges.push(trimmed);
+        }
+    }
+    challenges
+}
+
+fn parse_single_challenge(challenge: &str) -> Option<Value> {
+    let trimmed = challenge.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let space = trimmed.find(|c: char| c.is_ascii_whitespace());
+    let scheme = match space {
+        Some(pos) => &trimmed[..pos],
+        None => trimmed,
+    };
+    if !scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    map.insert("scheme".into(), Value::String(scheme.to_string()));
+    if let Some(pos) = space {
+        let params_str = &trimmed[pos..].trim();
+        let params = parse_challenge_params(params_str);
+        if let Some(realm) = params.get("realm") {
+            map.insert("realm".into(), Value::String(truncate(realm, TITLE_CAP)));
+        }
+        for key in &["resource_metadata", "as_uri"] {
+            if let Some(url_val) = params.get(*key) {
+                let safe = strip_userinfo_val(url_val);
+                map.insert((*key).into(), Value::String(safe));
+            }
+        }
+    }
+    Some(Value::Object(map))
+}
+
+fn parse_challenge_params(raw: &str) -> std::collections::BTreeMap<String, String> {
+    let mut params = std::collections::BTreeMap::new();
+    let mut remaining = raw.trim();
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start_matches([' ', ',']);
+        if remaining.is_empty() {
+            break;
+        }
+        let eq_pos = match remaining.find('=') {
+            Some(p) => p,
+            None => break,
+        };
+        let key = remaining[..eq_pos].trim().to_ascii_lowercase();
+        remaining = &remaining[eq_pos + 1..];
+        let value = if remaining.starts_with('"') {
+            let (val, rest) = extract_quoted(remaining);
+            remaining = rest;
+            val
+        } else {
+            let end = remaining.find([',', ' ']).unwrap_or(remaining.len());
+            let val = remaining[..end].to_string();
+            remaining = &remaining[end..];
+            val
+        };
+        if !params.contains_key(&key) {
+            params.insert(key, value);
+        }
+    }
+    params
+}
+
+fn extract_quoted(input: &str) -> (String, &str) {
+    let mut chars = input[1..].chars();
+    let mut value = String::new();
+    let mut consumed = 1;
+    loop {
+        match chars.next() {
+            None => break,
+            Some('"') => {
+                consumed += 1;
+                break;
+            }
+            Some('\\') => {
+                consumed += 1;
+                if let Some(c) = chars.next() {
+                    value.push(c);
+                    consumed += c.len_utf8();
+                }
+            }
+            Some(c) => {
+                value.push(c);
+                consumed += c.len_utf8();
+            }
+        }
+    }
+    (value, &input[consumed..])
+}
+
+fn extract_auth_links(headers: &[(String, String)], response_url: Option<&str>) -> Vec<Value> {
+    let mut links = Vec::new();
+    let auth_rels = [
+        "auth-md",
+        "oauth-authorization-server",
+        "oauth-protected-resource",
+    ];
+    let fallback_base = Url::parse("http://placeholder.invalid/").unwrap();
+    let base = response_url
+        .and_then(|u| Url::parse(u).ok())
+        .unwrap_or(fallback_base);
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("link") {
+            continue;
+        }
+        let parsed = crate::link::parse_link_header(value, &base);
+        for link in parsed {
+            if auth_rels.contains(&link.rel.as_str()) {
+                let safe_href = strip_userinfo_val(&link.href);
+                let mut entry = serde_json::Map::new();
+                entry.insert("rel".into(), Value::String(link.rel.clone()));
+                entry.insert("href".into(), Value::String(safe_href));
+                links.push(Value::Object(entry));
+            }
+        }
+    }
+    links
+}
+
+fn strip_userinfo_val(url_str: &str) -> String {
+    match Url::parse(url_str) {
+        Ok(mut parsed) => {
+            if parsed.username().is_empty() && parsed.password().is_none() {
+                return url_str.to_string();
+            }
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => url_str.to_string(),
+    }
+}
+
+fn classify_auth_md(body: &str) -> Classification {
+    if body.trim_start().starts_with('<') {
+        return Classification {
+            standard: "auth-md".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some("looks like HTML".into()),
+        };
+    }
+    let summary = parse_auth_md_summary(body);
+    Classification {
+        standard: "auth-md".into(),
+        status: Validity::Valid,
+        summary,
+        reason: None,
+    }
+}
+
+pub fn parse_auth_md_summary(body: &str) -> Value {
+    let mut title: Option<String> = None;
+    let mut methods: Vec<String> = Vec::new();
+    let mut oauth_metadata: Vec<String> = Vec::new();
+    let mut claim_window: Option<String> = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+
+        if title.is_none() {
+            if let Some(rest) = trimmed.strip_prefix("# ") {
+                let t = rest.trim();
+                if !t.is_empty() {
+                    title = Some(truncate(t, TITLE_CAP));
+                }
+                continue;
+            }
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if (lower.starts_with("- ") || lower.starts_with("* ")) && methods.len() < AUTH_MD_METHODS_CAP {
+            let item = trimmed[2..].trim();
+            let item_lower = item.to_ascii_lowercase();
+            if item_lower.contains("oauth") || item_lower.contains("openid")
+                || item_lower.contains("api key") || item_lower.contains("api_key")
+                || item_lower.contains("apikey") || item_lower.contains("bearer")
+                || item_lower.contains("signup") || item_lower.contains("sign up")
+                || item_lower.contains("sign-up") || item_lower.contains("register")
+                || item_lower.contains("email") || item_lower.contains("anonymous")
+                || item_lower.contains("vouched") || item_lower.contains("token")
+            {
+                methods.push(truncate(item, AUTH_MD_METHOD_LEN_CAP));
+            }
+        }
+
+        if lower.contains("claim_window") || lower.contains("claim window") || lower.contains("claimwindow") {
+            if claim_window.is_none() {
+                claim_window = Some(truncate(trimmed, TITLE_CAP));
+            }
+        }
+
+        if let Some(url_start) = find_url_in_line(trimmed) {
+            let url_lower = url_start.to_ascii_lowercase();
+            if url_lower.contains("oauth") || url_lower.contains("openid")
+                || url_lower.contains(".well-known/oauth-authorization-server")
+                || url_lower.contains(".well-known/openid-configuration")
+            {
+                let safe = strip_userinfo_val(url_start);
+                if !oauth_metadata.contains(&safe) {
+                    oauth_metadata.push(safe);
+                }
+            }
+        }
+    }
+
+    let mut map = serde_json::Map::new();
+    if let Some(t) = title {
+        map.insert("title".into(), Value::String(t));
+    }
+    if !methods.is_empty() {
+        map.insert(
+            "methods".into(),
+            Value::Array(methods.into_iter().map(Value::String).collect()),
+        );
+    }
+    if !oauth_metadata.is_empty() {
+        map.insert(
+            "oauth_metadata".into(),
+            Value::Array(oauth_metadata.into_iter().map(Value::String).collect()),
+        );
+    }
+    if let Some(cw) = claim_window {
+        map.insert("claim_window".into(), Value::String(cw));
+    }
+    Value::Object(map)
+}
+
+fn find_url_in_line(line: &str) -> Option<&str> {
+    for prefix in ["https://", "http://"] {
+        if let Some(start) = line.find(prefix) {
+            let rest = &line[start..];
+            let end = rest.find(|c: char| c.is_ascii_whitespace() || c == ')' || c == '>' || c == '"' || c == '\'')
+                .unwrap_or(rest.len());
+            return Some(&rest[..end]);
+        }
+    }
+    None
 }
 
 fn classify_ard(body: &str) -> Classification {
@@ -966,7 +1309,7 @@ mod tests {
             ("Content-Type".into(), "text/html".into()),
             ("X-Payment".into(), "required".into()),
         ];
-        let signals = classify_response(402, &headers);
+        let signals = classify_response(402, &headers, None);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].standard, "x402");
         assert_eq!(signals[0].summary["status"], 402);
@@ -975,21 +1318,22 @@ mod tests {
 
     #[test]
     fn classify_response_402_no_header() {
-        let signals = classify_response(402, &[]);
+        let signals = classify_response(402, &[], None);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].summary["challenge"], Value::Null);
     }
 
     #[test]
     fn classify_response_200_no_signal() {
-        let signals = classify_response(200, &[]);
+        let signals = classify_response(200, &[], None);
         assert!(signals.is_empty());
     }
 
     #[test]
-    fn classify_response_401_no_signal() {
-        let signals = classify_response(401, &[]);
-        assert!(signals.is_empty());
+    fn classify_response_401_emits_signal() {
+        let signals = classify_response(401, &[], None);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].standard, "auth-md");
     }
 
     #[test]
@@ -1800,5 +2144,207 @@ mod tests {
         }).to_string();
         let result = classify_poppy_body(&body, Some("https://www.acme.com"));
         assert_eq!(result.status, Validity::Valid);
+    }
+
+    #[test]
+    fn known_link_rels_includes_auth_rels() {
+        let rels = known_link_rels();
+        assert!(rels.contains(&"auth-md"));
+        assert!(rels.contains(&"oauth-authorization-server"));
+        assert!(rels.contains(&"oauth-protected-resource"));
+    }
+
+    #[test]
+    fn default_probes_has_auth_md() {
+        let registry = default_probes();
+        let probes = registry.probes_for_origin("https://example.com");
+        assert!(probes.iter().any(|p| p.probe.standard == "auth-md"));
+        assert!(probes.iter().any(|p| p.url == "https://example.com/auth.md"));
+    }
+
+    #[test]
+    fn classify_response_401_emits_auth_md() {
+        let headers = vec![
+            ("www-authenticate".into(), "Bearer realm=\"api\"".into()),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].standard, "auth-md");
+        assert_eq!(signals[0].summary["status"], 401);
+        let schemes = signals[0].summary["schemes"].as_array().unwrap();
+        assert_eq!(schemes.len(), 1);
+        assert_eq!(schemes[0]["scheme"], "Bearer");
+        assert_eq!(schemes[0]["realm"], "api");
+    }
+
+    #[test]
+    fn classify_response_401_with_resource_metadata() {
+        let headers = vec![
+            ("www-authenticate".into(), "Bearer realm=\"api\", resource_metadata=\"https://api.example.com/.well-known/oauth-protected-resource\"".into()),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        let schemes = signals[0].summary["schemes"].as_array().unwrap();
+        assert_eq!(schemes[0]["resource_metadata"], "https://api.example.com/.well-known/oauth-protected-resource");
+    }
+
+    #[test]
+    fn classify_response_401_with_as_uri() {
+        let headers = vec![
+            ("www-authenticate".into(), "Bearer realm=\"api\", as_uri=\"https://auth.example.com/.well-known/oauth-authorization-server\"".into()),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        let schemes = signals[0].summary["schemes"].as_array().unwrap();
+        assert_eq!(schemes[0]["as_uri"], "https://auth.example.com/.well-known/oauth-authorization-server");
+    }
+
+    #[test]
+    fn classify_response_401_strips_userinfo_from_urls() {
+        let headers = vec![
+            ("www-authenticate".into(), "Bearer resource_metadata=\"https://user:pass@api.example.com/.well-known/oauth-protected-resource\"".into()),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        let schemes = signals[0].summary["schemes"].as_array().unwrap();
+        let rm = schemes[0]["resource_metadata"].as_str().unwrap();
+        assert!(!rm.contains("user"));
+        assert!(!rm.contains("pass"));
+    }
+
+    #[test]
+    fn classify_response_401_challenge_capped_at_500() {
+        let long_realm = "x".repeat(600);
+        let header = format!("Bearer realm=\"{long_realm}\"");
+        let headers = vec![
+            ("www-authenticate".into(), header),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        let schemes = signals[0].summary["schemes"].as_array().unwrap();
+        assert_eq!(schemes[0]["scheme"], "Bearer");
+    }
+
+    #[test]
+    fn classify_response_401_no_www_auth() {
+        let headers: Vec<(String, String)> = vec![];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].standard, "auth-md");
+        assert!(signals[0].summary.get("schemes").is_none());
+    }
+
+    #[test]
+    fn classify_response_401_with_auth_link() {
+        let headers = vec![
+            ("www-authenticate".into(), "Bearer realm=\"api\"".into()),
+            ("link".into(), "</auth.md>; rel=\"auth-md\"".into()),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        let links = signals[0].summary["links"].as_array().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["rel"], "auth-md");
+        assert_eq!(links[0]["href"], "https://api.example.com/auth.md");
+    }
+
+    #[test]
+    fn classify_response_401_with_oauth_link() {
+        let headers = vec![
+            ("link".into(), "<https://auth.example.com/.well-known/oauth-authorization-server>; rel=\"oauth-authorization-server\"".into()),
+        ];
+        let signals = classify_response(401, &headers, Some("https://api.example.com/data"));
+        let links = signals[0].summary["links"].as_array().unwrap();
+        assert_eq!(links[0]["rel"], "oauth-authorization-server");
+    }
+
+    #[test]
+    fn classify_response_200_no_auth_signal() {
+        let headers = vec![
+            ("www-authenticate".into(), "Bearer realm=\"api\"".into()),
+        ];
+        let signals = classify_response(200, &headers, None);
+        assert!(signals.iter().all(|s| s.standard != "auth-md"));
+    }
+
+    #[test]
+    fn classify_auth_md_valid_markdown() {
+        let body = "# Auth\n\n- OAuth 2.0 with PKCE\n- API Key for testing\n\nclaim_window: 7 days\n";
+        let classifiers = default_classifiers();
+        let c = classifiers.classify("auth-md", body).unwrap();
+        assert_eq!(c.status, Validity::Valid);
+        assert_eq!(c.summary["title"], "Auth");
+        let methods = c.summary["methods"].as_array().unwrap();
+        assert!(methods.len() >= 2);
+        assert!(c.summary["claim_window"].as_str().is_some());
+    }
+
+    #[test]
+    fn classify_auth_md_rejects_html() {
+        let body = "<html><body>not markdown</body></html>";
+        let classifiers = default_classifiers();
+        let c = classifiers.classify("auth-md", body).unwrap();
+        assert_eq!(c.status, Validity::Invalid);
+    }
+
+    #[test]
+    fn classify_auth_md_extracts_oauth_metadata_url() {
+        let body = "# Auth\n\nOAuth metadata: https://auth.example.com/.well-known/oauth-authorization-server\n";
+        let classifiers = default_classifiers();
+        let c = classifiers.classify("auth-md", body).unwrap();
+        let urls = c.summary["oauth_metadata"].as_array().unwrap();
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].as_str().unwrap().contains("oauth-authorization-server"));
+    }
+
+    #[test]
+    fn auth_md_probe_content_type_accepted() {
+        let probes = default_probes();
+        for ct in &["text/plain", "text/plain; charset=utf-8", "text/markdown"] {
+            let m = probes.check_response("auth-md", 200, ct, "# Auth".into(), "u".into());
+            assert!(m.is_some(), "content-type {ct} should match auth-md probe");
+        }
+    }
+
+    #[test]
+    fn auth_md_probe_html_rejected() {
+        let probes = default_probes();
+        let m = probes.check_response("auth-md", 200, "text/html", "<html>".into(), "u".into());
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn parse_www_authenticate_multiple_schemes() {
+        let headers = vec![
+            ("www-authenticate".into(), "Basic realm=\"site\"".into()),
+            ("www-authenticate".into(), "Bearer realm=\"api\"".into()),
+        ];
+        let schemes = parse_www_authenticate_headers(&headers);
+        assert_eq!(schemes.len(), 2);
+        assert_eq!(schemes[0]["scheme"], "Basic");
+        assert_eq!(schemes[1]["scheme"], "Bearer");
+    }
+
+    #[test]
+    fn extract_auth_links_filters_non_auth_rels() {
+        let headers = vec![
+            ("link".into(), "</api>; rel=\"api-catalog\", </auth.md>; rel=\"auth-md\"".into()),
+        ];
+        let links = extract_auth_links(&headers, Some("https://example.com/"));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["rel"], "auth-md");
+    }
+
+    #[test]
+    fn parse_auth_md_summary_empty() {
+        let summary = parse_auth_md_summary("");
+        assert!(summary.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_url_in_line_extracts_https() {
+        let url = find_url_in_line("See https://example.com/path for details");
+        assert_eq!(url, Some("https://example.com/path"));
+    }
+
+    #[test]
+    fn find_url_in_line_none_when_absent() {
+        let url = find_url_in_line("No URL here");
+        assert!(url.is_none());
     }
 }

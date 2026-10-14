@@ -50,6 +50,44 @@ function startDiscoverServer() {
       return;
     }
 
+    if (pathname === '/auth.md') {
+      const accept = req.headers['accept'] || '';
+      if (url.searchParams.get('html') === '1') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><title>Auth</title><p>not markdown</p>');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8' });
+      res.end(
+        '# Auth\n\n- OAuth 2.0 with PKCE\n- API Key for testing\n\nclaim_window: 7 days\n\nhttps://auth.example.com/.well-known/oauth-authorization-server\n'
+      );
+      return;
+    }
+
+    if (pathname === '/api/protected') {
+      res.writeHead(401, {
+        'content-type': 'application/json',
+        'www-authenticate':
+          'Bearer realm="api", resource_metadata="' +
+          `http://127.0.0.1:${server.address().port}/.well-known/oauth-protected-resource` +
+          '"',
+        link: '</auth.md>; rel="auth-md"',
+        'access-control-allow-origin': '*',
+        'access-control-expose-headers': 'www-authenticate, link',
+      });
+      res.end('{"error":"unauthorized"}');
+      return;
+    }
+
+    if (pathname === '/auth-page') {
+      const port = server.address().port;
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(
+        `<!doctype html><title>Auth Page</title><script>fetch('http://127.0.0.1:${port}/api/protected').catch(()=>{})</script>`
+      );
+      return;
+    }
+
     if (pathname === '/webmcp') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(`<!doctype html><title>WebMCP</title><script>
@@ -166,6 +204,133 @@ test('playwright-cli discover --once', { timeout: 60_000 }, async (t) => {
       assert.ok(x402, `x402: ${result.stdout}`);
       assert.equal(x402.via, 'response');
       assert.equal(x402.summary.status, 402);
+    });
+
+    await t.test('401 response with auth-md pointer', async () => {
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${site.origin}/auth-page`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const authMdProbe = events.find((e) => e.standard === 'auth-md' && e.via === 'well-known');
+      assert.ok(authMdProbe, `auth-md well-known probe expected: ${result.stdout}`);
+      assert.equal(authMdProbe.status, 'valid');
+      const authMdResponse = events.find((e) => e.standard === 'auth-md' && e.via === 'response');
+      if (authMdResponse) {
+        assert.equal(authMdResponse.summary.status, 401);
+        if (authMdResponse.summary.schemes) {
+          assert.equal(authMdResponse.summary.schemes[0].scheme, 'Bearer');
+        }
+      }
+      assert.ok(
+        !result.stdout.includes('Authorization') && !result.stdout.includes('Cookie'),
+        'must not leak request headers'
+      );
+    });
+
+    await t.test('auth.md probe on page origin', async () => {
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${site.origin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const authProbe = events.find((e) => e.standard === 'auth-md' && e.via === 'well-known');
+      assert.ok(authProbe, `auth-md well-known probe: ${result.stdout}`);
+      assert.equal(authProbe.status, 'valid');
+    });
+
+    await t.test('auth.md HTML probe rejected', async () => {
+      const htmlAuthServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Site</title><p>hello</p>');
+          return;
+        }
+        if (url.pathname === '/auth.md') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Auth</title><p>not markdown</p>');
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      try {
+        await new Promise((r) => htmlAuthServer.listen(0, '127.0.0.1', r));
+        const htmlOrigin = `http://127.0.0.1:${htmlAuthServer.address().port}`;
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${htmlOrigin}/`],
+          cwd
+        );
+        const events = parseEvents(result.stdout);
+        const authProbe = events.find(
+          (e) => e.standard === 'auth-md' && e.via === 'well-known' && e.status === 'valid'
+        );
+        assert.ok(!authProbe, `HTML auth.md must not be classified as valid: ${result.stdout}`);
+      } finally {
+        await new Promise((r) => {
+          htmlAuthServer.closeAllConnections();
+          htmlAuthServer.close(r);
+        });
+      }
+    });
+
+    await t.test('401 from stand-in: no probe with --no-probe', async () => {
+      let standInHits = 0;
+      const standIn = createServer((req, res) => {
+        standInHits++;
+        res.writeHead(401, {
+          'content-type': 'application/json',
+          'www-authenticate': 'Bearer realm="api"',
+          'access-control-allow-origin': '*',
+          'access-control-expose-headers': 'www-authenticate',
+        });
+        res.end('{"error":"unauthorized"}');
+      });
+      await new Promise((r) => standIn.listen(0, '127.0.0.1', r));
+      const standInOrigin = `http://127.0.0.1:${standIn.address().port}`;
+      const pageServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(
+            `<!doctype html><title>No-Probe 401</title><script>fetch('${standInOrigin}/api').catch(()=>{})</script>`
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => pageServer.listen(0, '127.0.0.1', r));
+      const pageOrigin = `http://127.0.0.1:${pageServer.address().port}`;
+      try {
+        const freshCwd = await runner.fresh();
+        await runner.clearSession(freshCwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--no-probe', '--once', `${pageOrigin}/`],
+          freshCwd
+        );
+        const events = parseEvents(result.stdout);
+        const probeEvents = events.filter(
+          (e) => e.origin === standInOrigin && e.via === 'well-known'
+        );
+        assert.equal(
+          probeEvents.length,
+          0,
+          `no probes to stand-in with --no-probe: ${result.stdout}`
+        );
+        assert.ok(
+          standInHits <= 1,
+          `stand-in must see at most the page fetch (got ${standInHits} hits)`
+        );
+      } finally {
+        pageServer.closeAllConnections();
+        pageServer.close();
+        standIn.closeAllConnections();
+        standIn.close();
+      }
     });
 
     await t.test('webmcp page signal', async () => {
