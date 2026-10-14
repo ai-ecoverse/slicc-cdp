@@ -131,6 +131,7 @@ struct WatcherState {
     json_mode: bool,
     follow_mode: bool,
     robots_probe: bool,
+    no_probe: bool,
     events_emitted: usize,
     event_cursor: usize,
     sink: Sink,
@@ -226,6 +227,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         json_mode,
         follow_mode,
         robots_probe,
+        no_probe,
         events_emitted: 0,
         event_cursor: 0,
         sink: sink.clone(),
@@ -788,6 +790,34 @@ fn handle_target_destroyed(state: &mut WatcherState, params: &Value) {
     }
 }
 
+fn filter_protected_auth_urls(cdp: &Cdp, summary: &Value) -> Value {
+    let mut s = summary.clone();
+    if let Some(obj) = s.as_object_mut() {
+        if let Some(schemes) = obj.get_mut("schemes").and_then(|v| v.as_array_mut()) {
+            for scheme in schemes.iter_mut() {
+                if let Some(m) = scheme.as_object_mut() {
+                    for key in &["resource_metadata", "as_uri"] {
+                        let drop = m.get(*key)
+                            .and_then(|v| v.as_str())
+                            .map_or(false, |u| cdp.guard().url(u) || is_reserved_cdp_origin(u));
+                        if drop {
+                            m.remove(*key);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(links) = obj.get_mut("links").and_then(|v| v.as_array_mut()) {
+            links.retain(|link| {
+                link.get("href")
+                    .and_then(|v| v.as_str())
+                    .map_or(true, |u| !cdp.guard().url(u) && !is_reserved_cdp_origin(u))
+            });
+        }
+    }
+    s
+}
+
 fn handle_response(
     cdp: &mut Cdp,
     state: &mut WatcherState,
@@ -812,26 +842,33 @@ fn handle_response(
             .and_then(|s| s.top_frame_id.as_deref())
             .map_or(false, |top| top == frame_id);
 
-    if !is_top_frame_document {
-        return output;
-    }
-
     let url = response
         .get("url")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    if let Some(sess) = state.sessions.get_mut(session_id) {
-        if sess.page_url.is_empty() || sess.page_url == "about:blank" {
-            sess.page_url = url.clone();
-        }
-    }
-
     let status = response
         .get("status")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u16;
+
+    if !is_top_frame_document && status != 401 {
+        return output;
+    }
+
+    if cdp.guard().url(&url) || is_reserved_cdp_origin(&url) {
+        return output;
+    }
+
+    if is_top_frame_document {
+        if let Some(sess) = state.sessions.get_mut(session_id) {
+            if sess.page_url.is_empty() || sess.page_url == "about:blank" {
+                sess.page_url = url.clone();
+            }
+        }
+    }
+
     let headers_obj = response
         .get("headers")
         .and_then(|v| v.as_object())
@@ -859,80 +896,83 @@ fn handle_response(
         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
         .collect();
 
-    let link_header_raw: String = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("link"))
-        .map(|(_, val)| val.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    if is_top_frame_document {
+        let link_header_raw: String = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("link"))
+            .map(|(_, val)| val.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    if !link_header_raw.is_empty() {
-        if let Ok(base) = Url::parse(&url) {
-            let links = parse_link_header(&link_header_raw, &base);
-            for link in links {
-                if !known_link_rels().contains(&link.rel.as_str()) {
-                    continue;
-                }
-                if cdp.guard().url(&link.href) {
-                    continue;
-                }
-
-                if is_slicc_handoff_rel(&link.rel) {
-                    let dedup_key = format!("slicc-handoff:{}", link.href);
-                    if !state.dedup.is_new(&origin, "slicc-handoff", &dedup_key) {
+        if !link_header_raw.is_empty() {
+            if let Ok(base) = Url::parse(&url) {
+                let links = parse_link_header(&link_header_raw, &base);
+                for link in links {
+                    if !known_link_rels().contains(&link.rel.as_str()) {
                         continue;
                     }
-                    if let Some(summary) = classify_slicc_handoff(&link) {
-                        let event = DiscoveryEvent {
-                            v: EVENT_VERSION,
-                            standard: "slicc-handoff".into(),
-                            aliases: None,
-                            origin: origin.clone(),
-                            url: link.href.clone(),
-                            via: Via::LinkHeader,
-                            page: page_url.clone(),
-                            target_id: target_id.clone(),
-                            status: Validity::Valid,
-                            summary,
-                            reason: None,
-                        };
-                        output.push_str(&emit_event(state, &event));
+                    if cdp.guard().url(&link.href) {
+                        continue;
                     }
-                    continue;
-                }
 
-                let standard = if link.rel == LLMS_TXT_REL {
-                    "llms-txt".to_string()
-                } else {
-                    link.rel.clone()
-                };
+                    if is_slicc_handoff_rel(&link.rel) {
+                        let dedup_key = format!("slicc-handoff:{}", link.href);
+                        if !state.dedup.is_new(&origin, "slicc-handoff", &dedup_key) {
+                            continue;
+                        }
+                        if let Some(summary) = classify_slicc_handoff(&link) {
+                            let event = DiscoveryEvent {
+                                v: EVENT_VERSION,
+                                standard: "slicc-handoff".into(),
+                                aliases: None,
+                                origin: origin.clone(),
+                                url: link.href.clone(),
+                                via: Via::LinkHeader,
+                                page: page_url.clone(),
+                                target_id: target_id.clone(),
+                                status: Validity::Valid,
+                                summary,
+                                reason: None,
+                            };
+                            output.push_str(&emit_event(state, &event));
+                        }
+                        continue;
+                    }
 
-                if !state.dedup.is_new(&origin, &standard, &link.href) {
-                    continue;
+                    let standard = if link.rel == LLMS_TXT_REL {
+                        "llms-txt".to_string()
+                    } else {
+                        link.rel.clone()
+                    };
+
+                    if !state.dedup.is_new(&origin, &standard, &link.href) {
+                        continue;
+                    }
+                    let event = DiscoveryEvent {
+                        v: EVENT_VERSION,
+                        standard,
+                        aliases: None,
+                        origin: origin.clone(),
+                        url: link.href.clone(),
+                        via: Via::LinkHeader,
+                        page: page_url.clone(),
+                        target_id: target_id.clone(),
+                        status: Validity::Valid,
+                        summary: json!({ "rel": link.rel, "href": link.href, "type": link.media_type }),
+                        reason: None,
+                    };
+                    output.push_str(&emit_event(state, &event));
                 }
-                let event = DiscoveryEvent {
-                    v: EVENT_VERSION,
-                    standard,
-                    aliases: None,
-                    origin: origin.clone(),
-                    url: link.href.clone(),
-                    via: Via::LinkHeader,
-                    page: page_url.clone(),
-                    target_id: target_id.clone(),
-                    status: Validity::Valid,
-                    summary: json!({ "rel": link.rel, "href": link.href, "type": link.media_type }),
-                    reason: None,
-                };
-                output.push_str(&emit_event(state, &event));
             }
         }
     }
 
-    let response_signals = classify_response(status, &headers);
+    let response_signals = classify_response(status, &headers, Some(&url));
     for signal in response_signals {
         if !state.dedup.is_new(&origin, &signal.standard, &url) {
             continue;
         }
+        let filtered_summary = filter_protected_auth_urls(cdp, &signal.summary);
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
             standard: signal.standard.clone(),
@@ -943,10 +983,13 @@ fn handle_response(
             page: page_url.clone(),
             target_id: target_id.clone(),
             status: Validity::Valid,
-            summary: signal.summary,
+            summary: filtered_summary,
             reason: None,
         };
         output.push_str(&emit_event(state, &event));
+        if signal.standard == "auth-md" && !state.no_probe && !state.probed_origins.contains(&origin) {
+            output.push_str(&run_probes(cdp, state, session_id, &origin));
+        }
     }
 
     output
@@ -2131,6 +2174,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -2166,6 +2210,7 @@ mod tests {
             json_mode: false,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -2200,6 +2245,7 @@ mod tests {
             json_mode: false,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -2227,6 +2273,7 @@ mod tests {
             json_mode: false,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -2262,6 +2309,7 @@ mod tests {
             json_mode: false,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -2349,6 +2397,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2384,6 +2433,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2419,6 +2469,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2534,6 +2585,7 @@ mod tests {
             json_mode: false,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2565,6 +2617,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2733,6 +2786,7 @@ mod tests {
             json_mode: false,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() },
         };
         let event = DiscoveryEvent {
@@ -2939,6 +2993,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -3065,6 +3120,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -3113,6 +3169,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -3199,6 +3256,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3239,6 +3297,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3277,6 +3336,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3314,6 +3374,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3372,6 +3433,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3420,6 +3482,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false,
+            no_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3599,5 +3662,321 @@ mod tests {
         let defaults = discovery::default_llmstxtignore_entries();
         assert!(defaults.contains(&"github.com"));
         assert!(defaults.contains(&"app.slack.com"));
+    }
+
+    #[test]
+    fn handle_response_401_xhr_emits_auth_md() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "XHR",
+            "frameId": "F1",
+            "response": {
+                "url": "https://api.example.com/data",
+                "status": 401,
+                "headers": { "www-authenticate": "Bearer realm=\"api\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("auth-md"), "expected auth-md event from XHR 401: {output}");
+        let parsed: Value = serde_json::from_str(output.trim_end().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["standard"], "auth-md");
+        assert_eq!(parsed["via"], "response");
+    }
+
+    #[test]
+    fn handle_response_401_fetch_emits_auth_md() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Fetch",
+            "frameId": "F1",
+            "response": {
+                "url": "https://api.example.com/resource",
+                "status": 401,
+                "headers": {
+                    "www-authenticate": "Bearer realm=\"api\"",
+                    "link": "</auth.md>; rel=\"auth-md\""
+                }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("auth-md"), "expected auth-md event from Fetch 401: {output}");
+        let parsed: Value = serde_json::from_str(output.trim_end().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["summary"]["status"], 401);
+        assert!(parsed["summary"]["links"].as_array().unwrap().len() >= 1);
+    }
+
+    #[test]
+    fn handle_response_non_401_xhr_still_skipped() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "XHR",
+            "frameId": "F1",
+            "response": {
+                "url": "https://api.example.com/data",
+                "status": 200,
+                "headers": {}
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.is_empty(), "200 XHR should not emit events: {output}");
+    }
+
+    #[test]
+    fn handle_response_401_never_leaks_request_headers() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "XHR",
+            "frameId": "F1",
+            "response": {
+                "url": "https://api.example.com/data",
+                "status": 401,
+                "headers": {
+                    "www-authenticate": "Bearer realm=\"api\""
+                }
+            },
+            "requestHeaders": {
+                "authorization": "Bearer SECRET_TOKEN",
+                "cookie": "session=mysecret"
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(!output.contains("SECRET_TOKEN"), "must not leak Authorization header");
+        assert!(!output.contains("mysecret"), "must not leak Cookie");
+    }
+
+    #[test]
+    fn handle_response_401_document_emits_auth_md() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Document",
+            "frameId": "F1",
+            "response": {
+                "url": "https://example.com/protected",
+                "status": 401,
+                "headers": {
+                    "www-authenticate": "Bearer realm=\"site\", resource_metadata=\"https://example.com/.well-known/oauth-protected-resource\""
+                }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("auth-md"), "expected auth-md: {output}");
+        let parsed: Value = serde_json::from_str(output.trim_end().lines().next().unwrap()).unwrap();
+        let schemes = parsed["summary"]["schemes"].as_array().unwrap();
+        assert!(schemes[0]["resource_metadata"].as_str().unwrap().contains("oauth-protected-resource"));
+    }
+
+    #[test]
+    fn handle_response_401_filters_protected_auth_links() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "XHR",
+            "frameId": "F1",
+            "response": {
+                "url": "https://api.example.com/data",
+                "status": 401,
+                "headers": {
+                    "www-authenticate": "Bearer resource_metadata=\"https://vault.sliccy.ai/secret\"",
+                    "link": "<https://seven.sliccy.ai/auth.md>; rel=\"auth-md\""
+                }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.contains("auth-md"), "auth-md event expected: {output}");
+        assert!(!output.contains("vault.sliccy.ai"), "protected resource_metadata must be filtered: {output}");
+        assert!(!output.contains("seven.sliccy.ai"), "protected auth link must be filtered: {output}");
+    }
+
+    #[test]
+    fn handle_response_401_from_protected_url_produces_nothing() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "XHR",
+            "frameId": "F1",
+            "response": {
+                "url": "https://vault.sliccy.ai/secret",
+                "status": 401,
+                "headers": { "www-authenticate": "Bearer realm=\"vault\"" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.is_empty(), "401 from protected URL must produce no event: {output}");
+        assert!(!state.probed_origins.contains("https://vault.sliccy.ai"), "must not probe protected origin");
+    }
+
+    #[test]
+    fn handle_response_401_from_reserved_cdp_port_produces_nothing() {
+        let mut state = WatcherState {
+            dedup: DedupSet::new(),
+            probed_origins: BTreeSet::new(),
+            probes: default_probes(),
+            classifiers: default_classifiers(),
+            sessions: BTreeMap::new(),
+            json_mode: true,
+            follow_mode: false,
+            robots_probe: false,
+            no_probe: false,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+        };
+        state.sessions.insert(
+            "S1".to_string(),
+            SessionState {
+                target_id: "T1".to_string(),
+                top_frame_id: Some("F1".to_string()),
+                page_url: "https://example.com/".to_string(),
+            },
+        );
+        let params = json!({
+            "type": "Fetch",
+            "frameId": "F1",
+            "response": {
+                "url": "http://127.0.0.1:9222/json",
+                "status": 401,
+                "headers": { "www-authenticate": "Bearer" }
+            }
+        });
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        assert!(output.is_empty(), "401 from reserved CDP port must produce no event: {output}");
+        assert!(!state.probed_origins.contains("http://127.0.0.1:9222"), "must not probe reserved CDP port");
     }
 }
