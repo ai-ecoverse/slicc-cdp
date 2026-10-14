@@ -35,12 +35,14 @@ test('chromium through the native binaries and the kernel', async (t) => {
     await t.test('native route', () => routeFlow(native, site));
     await t.test('native protected tabs', () => protectedFlow(native, site, browser.wsUrl));
     await t.test('native navigation guard', () => navigationGuardFlow(native, site, browser.wsUrl));
+    await t.test('native upload validation', () => nativeUploadValidationFlow(native, site));
     await t.test('kernel playwright-cli', () => playwrightFlow(kernel, site));
     await t.test('kernel basics batch', () => basicsBatchFlow(kernel, site));
     await t.test('kernel curlwright', () => curlFlow(kernel, site, browser.wsUrl));
     await t.test('kernel route', () => routeFlow(kernel, site));
     await t.test('kernel protected tabs', () => protectedFlow(kernel, site, browser.wsUrl));
     await t.test('kernel navigation guard', () => navigationGuardFlow(kernel, site, browser.wsUrl));
+    await t.test('kernel upload vfs isolation', () => kernelUploadFlow(kernel, site));
   } finally {
     await settle(kernel?.close());
     await settle(browser?.close());
@@ -610,4 +612,83 @@ function refOf(stdout, role, name) {
 
 function escapeReg(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function kernelUploadFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+  const snap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap.code, 0, `${snap.stderr}\n${snap.stdout}`);
+  const fileInput = refOf(snap.stdout, 'button', 'Avatar');
+  const { mkdirSync, writeFileSync, unlinkSync } = await import('node:fs');
+  const hostProbe = `/tmp/slicc-upload-probe-${process.pid}.txt`;
+  mkdirSync(path.dirname(hostProbe), { recursive: true });
+  writeFileSync(hostProbe, 'HOST_SECRET');
+  try {
+    await runner.write('/tmp', `slicc-upload-probe-${process.pid}.txt`, 'VFS_BYTES');
+    const uploaded = await runner.playwright(['upload', fileInput, hostProbe], cwd);
+    assert.equal(uploaded.code, 0, uploaded.stderr);
+    assert.match(uploaded.stdout, /Uploaded/);
+    const deadline = Date.now() + 5000;
+    let content = '';
+    while (Date.now() < deadline) {
+      const ev = await runner.playwright(
+        ['eval', "document.getElementById('out').textContent"],
+        cwd
+      );
+      content = ev.stdout.trim();
+      if (content.startsWith('file:')) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(content.startsWith('file:'), `page did not read the file: ${content}`);
+    assert.ok(content.includes('VFS_BYTES'), `expected VFS_BYTES in: ${content}`);
+    assert.ok(!content.includes('HOST_SECRET'), `host content leaked: ${content}`);
+  } finally {
+    try {
+      unlinkSync(hostProbe);
+    } catch {}
+  }
+}
+
+async function nativeUploadValidationFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+  const snap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap.code, 0, `${snap.stderr}\n${snap.stdout}`);
+  const fileInput = refOf(snap.stdout, 'button', 'Avatar');
+
+  const dirResult = await runner.playwright(['upload', fileInput, cwd], cwd);
+  assert.notEqual(dirResult.code, 0);
+  assert.match(dirResult.stderr, /directory/);
+
+  const missingResult = await runner.playwright(
+    ['upload', fileInput, path.join(cwd, 'nonexistent-file.txt')],
+    cwd
+  );
+  assert.notEqual(missingResult.code, 0);
+  assert.match(missingResult.stderr, /not found/);
+
+  if (process.platform !== 'win32') {
+    const { writeFile, chmod } = await import('node:fs/promises');
+    const unreadable = path.join(cwd, 'noperm.txt');
+    await writeFile(unreadable, 'secret');
+    await chmod(unreadable, 0o000);
+    const unreadResult = await runner.playwright(['upload', fileInput, unreadable], cwd);
+    await chmod(unreadable, 0o644);
+    assert.notEqual(unreadResult.code, 0);
+    assert.match(unreadResult.stderr, /cannot read/);
+  }
+
+  const afterSnap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(afterSnap.code, 0, `${afterSnap.stderr}\n${afterSnap.stdout}`);
+  const pageContent = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.ok(
+    !pageContent.stdout.includes('file:'),
+    `page input should be empty but got: ${pageContent.stdout}`
+  );
 }
