@@ -20,6 +20,14 @@ pub fn display_url(raw: &str) -> String {
     }
 }
 
+pub fn browser_message(s: &str) -> String {
+    if full_urls_enabled() {
+        terminal(s)
+    } else {
+        terminal(&cdp_client::sanitize::redact_urls_in_text(s))
+    }
+}
+
 pub fn url(raw: &str) -> String {
     cdp_client::sanitize::redact_url(raw)
 }
@@ -230,5 +238,37 @@ mod tests {
         let safe = json_c1(&serialized);
         let parsed: String = serde_json::from_str(&safe).unwrap();
         assert_eq!(parsed, input);
+    }
+
+    #[test]
+    fn browser_message_redacts_userinfo() {
+        set_full_urls(false);
+        let input = "TypeError: Failed to fetch https://u:PW@host.com/x";
+        let result = browser_message(input);
+        assert!(!result.contains("PW"), "{result}");
+        assert!(result.contains("host.com/x"), "{result}");
+    }
+
+    #[test]
+    fn browser_message_full_urls_keeps_userinfo() {
+        set_full_urls(true);
+        let result = browser_message("TypeError: Failed to fetch https://u:PW@host.com/x");
+        assert!(result.contains("PW"), "{result}");
+        set_full_urls(false);
+    }
+
+    #[test]
+    fn browser_message_escapes_terminal() {
+        set_full_urls(false);
+        let input = "Error: \x1b[2J https://u:PW@h.com/x";
+        let result = browser_message(input);
+        assert!(!result.contains('\x1b'), "{result}");
+        assert!(!result.contains("PW"), "{result}");
+    }
+
+    #[test]
+    fn browser_message_no_urls() {
+        set_full_urls(false);
+        assert_eq!(browser_message("plain text"), "plain text");
     }
 }

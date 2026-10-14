@@ -535,7 +535,7 @@ pub fn render_console(entries: &[ConsoleEntry], min_level: &str) -> Result<Strin
         lines.push(format!(
             "[{}] {} @ {}:{}",
             entry.kind.to_ascii_uppercase(),
-            sanitize::terminal(&entry.text),
+            sanitize::browser_message(&entry.text),
             sanitize::display_url(&entry.url),
             entry.line
         ));
@@ -612,10 +612,10 @@ fn render_request_line(request: &NetRequest) -> String {
         if request.status_text.is_empty() {
             line.push_str(&format!(" => [{status}]"));
         } else {
-            line.push_str(&format!(" => [{status}] {}", sanitize::terminal(&request.status_text)));
+            line.push_str(&format!(" => [{status}] {}", sanitize::browser_message(&request.status_text)));
         }
     } else if let Some(failed) = &request.failed {
-        line.push_str(&format!(" => [FAILED] {}", sanitize::terminal(failed)));
+        line.push_str(&format!(" => [FAILED] {}", sanitize::browser_message(failed)));
     }
     line
 }
@@ -642,11 +642,11 @@ fn render_details(index: usize, request: &NetRequest) -> String {
         let text = if request.status_text.is_empty() {
             format!("[{status}]")
         } else {
-            format!("[{status}] {}", sanitize::terminal(&request.status_text))
+            format!("[{status}] {}", sanitize::browser_message(&request.status_text))
         };
         lines.push(general("status", &text));
     } else if let Some(failed) = &request.failed {
-        lines.push(general("status", &format!("[FAILED] {}", sanitize::terminal(failed))));
+        lines.push(general("status", &format!("[FAILED] {}", sanitize::browser_message(failed))));
     }
     lines.push(general("type", &request.resource_type));
     if !request.mime.is_empty() {

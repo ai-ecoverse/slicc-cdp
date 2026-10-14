@@ -116,6 +116,7 @@ pub fn evaluate(
     expression: &str,
     context_id: Option<i64>,
     timeout: Duration,
+    full_urls: bool,
 ) -> Result<Value, String> {
     let mut params = serde_json::Map::new();
     params.insert("expression".into(), json!(expression));
@@ -131,7 +132,7 @@ pub fn evaluate(
             .and_then(|value| value.as_str())
             .or_else(|| details.get("text").and_then(|value| value.as_str()))
             .unwrap_or("evaluation failed");
-        return Err(format!("{}\n", crate::sanitize::terminal(description)));
+        return Err(format!("{}\n", crate::sanitize::browser_message(description, full_urls)));
     }
     Ok(result.pointer("/result/value").cloned().unwrap_or(Value::Null))
 }
@@ -166,13 +167,14 @@ pub fn run_fetch(
     session: &str,
     request: &PreparedRequest,
     context_id: Option<i64>,
+    full_urls: bool,
 ) -> Result<FetchResult, String> {
     let script = fetch_script(request);
     let timeout = match request.timeout_ms {
         Some(ms) if ms > 0 => Duration::from_millis(ms.saturating_add(1_000)),
         _ => Duration::from_secs(30),
     };
-    let value = evaluate(cdp, session, &script, context_id, timeout)?;
+    let value = evaluate(cdp, session, &script, context_id, timeout, full_urls)?;
     parse_fetch_result(&value)
 }
 

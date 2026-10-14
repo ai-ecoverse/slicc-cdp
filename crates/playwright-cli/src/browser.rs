@@ -337,7 +337,7 @@ fn exception_message(details: &Value) -> String {
         .and_then(|v| v.as_str())
         .or_else(|| details.get("text").and_then(|v| v.as_str()))
         .unwrap_or("evaluation failed");
-    format!("{}\n", crate::sanitize::terminal(description))
+    format!("{}\n", crate::sanitize::browser_message(description))
 }
 
 pub fn click_ref(

@@ -383,7 +383,7 @@ fn cmd_tab_list(cdp: &mut Cdp, state: &Session) -> Output {
             index + 1,
             page.target_id,
             sanitize::display_url(&page.url),
-            sanitize::terminal(&page.title)
+            sanitize::browser_message(&page.title)
         ));
     }
     Output::ok(format!("{}\n", lines.join("\n")))
@@ -481,7 +481,7 @@ fn build_snapshot(
 ) -> Result<(String, BTreeMap<String, RefRec>), String> {
     let (url, title) = browser::page_location(cdp, session)?;
     let url = sanitize::display_url(&url);
-    let title = sanitize::terminal(&title);
+    let title = sanitize::browser_message(&title);
     if let Some(frame_id) = invocation.flags.get("frame") {
         let frames = browser::frame_tree(cdp, session)?;
         if !frames.iter().any(|frame| frame.frame_id == *frame_id) {
@@ -815,7 +815,7 @@ fn cmd_eval(
                     Err(message) => Output::err(message),
                 };
             }
-            Output::ok(format!("{}\n", sanitize::terminal(&text)))
+            Output::ok(format!("{}\n", sanitize::browser_message(&text)))
         }
         Err(message) => Output::err(message),
     }
