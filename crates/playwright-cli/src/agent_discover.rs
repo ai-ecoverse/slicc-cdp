@@ -1580,7 +1580,7 @@ fn isolated_world_fetch(
       total += value.byteLength;
       body += dec.decode(value, {{stream:true}});
       if (total > cap) {{ reader.cancel(); body = body.slice(0, cap); break; }}
-      if (sseUntil && /text\/event-stream/i.test(ct) && body.replace(/\r\n/g, '\n').split('\n\n').slice(0, -1).some((event) => event.includes(sseUntil))) {{ reader.cancel(); break; }}
+      if (sseUntil && /text\/event-stream/i.test(ct) && body.replace(/\r\n?/g, '\n').split('\n\n').slice(0, -1).some((event) => event.includes(sseUntil))) {{ reader.cancel(); break; }}
     }}
   }}
   return JSON.stringify({{status:r.status,ct,body}});
@@ -2163,11 +2163,12 @@ fn run_nlweb_probes(
     };
     let page_url = sess.page_url.clone();
     let target_id = sess.target_id.clone();
-    let ask_url = format!("{}/ask?query=nlweb&streaming=false", origin.trim_end_matches('/'));
-    let ask_body = match isolated_world_fetch(cdp, session_id, &frame_id, &ask_url, &NLWEB_ASK) {
+    let ask_url = format!("{}/ask", origin.trim_end_matches('/'));
+    let ask_probe = format!("{ask_url}?query=nlweb&streaming=false");
+    let ask_body = match isolated_world_fetch(cdp, session_id, &frame_id, &ask_probe, &NLWEB_ASK) {
         IsolatedProbeResult::Ok(status, ct, body) => json_ok_body(status, &ct, body),
         IsolatedProbeResult::Final => None,
-        IsolatedProbeResult::Unavailable => native_probe(&ask_url, "application/json")
+        IsolatedProbeResult::Unavailable => native_probe(&ask_probe, "application/json")
             .and_then(|(status, ct, body)| json_ok_body(status, &ct, body)),
     };
     let ask_summary = ask_body.as_deref().and_then(classify_nlweb_ask);
@@ -2259,6 +2260,7 @@ fn mcp_init_payload(status: u16, content_type: &str, body: String) -> Option<Str
         return None;
     }
     body.replace("\r\n", "\n")
+        .replace('\r', "\n")
         .split("\n\n")
         .map(|event| {
             event
@@ -4375,7 +4377,8 @@ mod tests {
         let mut state = nlweb_state();
         let output = run_nlweb_probes(&mut cdp, &mut state, "S1", "https://example.com");
         let event: Value = serde_json::from_str(output.trim()).unwrap();
-        assert!(event["url"].as_str().unwrap().starts_with("https://example.com/ask"));
+        assert_eq!(event["url"], "https://example.com/ask");
+        assert_eq!(event["summary"]["askUrl"], "https://example.com/ask");
         assert_eq!(event["summary"]["mcpUrl"], "https://example.com/mcp");
         assert_eq!(event["summary"]["serverName"], "Shop");
         let expressions: Vec<String> = sent
@@ -4537,6 +4540,8 @@ mod tests {
         let payload = mcp_init_payload(200, "text/event-stream; charset=utf-8", sse.into()).unwrap();
         assert_eq!(classify_nlweb_mcp_init(&payload).unwrap()["serverInfo"]["name"], "NLWeb");
         assert_eq!(mcp_init_payload(200, "text/event-stream", "data: nope\n\n".into()), None);
+        let bare_cr = "event: message\rdata: {\"result\":{\"serverInfo\":{\"name\":\"NLWeb\"}}}\r\r";
+        assert!(mcp_init_payload(200, "text/event-stream", bare_cr.into()).is_some());
         let batched = "data: [{\"jsonrpc\":\"2.0\",\"method\":\"ping\"},{\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"NLWeb\"}}}]\n\n";
         let payload = mcp_init_payload(200, "text/event-stream", batched.into()).unwrap();
         assert_eq!(classify_nlweb_mcp_init(&payload).unwrap()["serverInfo"]["name"], "NLWeb");

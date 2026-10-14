@@ -2119,7 +2119,8 @@ test('discover NLWeb', { timeout: 120_000 }, async (t) => {
       const events = parseEvents(result.stdout);
       const nlweb = events.find((e) => e.standard === 'nlweb' && e.via === 'well-known');
       assert.ok(nlweb, `nlweb probe event expected: ${result.stdout}`);
-      assert.ok(nlweb.summary.askUrl, `askUrl expected: ${result.stdout}`);
+      assert.equal(nlweb.summary.askUrl, `${nlwebOrigin}/ask`, result.stdout);
+      assert.equal(nlweb.url, `${nlwebOrigin}/ask`);
       assert.ok(nlweb.summary.mcpUrl, `mcpUrl expected: ${result.stdout}`);
       assert.equal(nlweb.summary.serverInfo.name, 'NLWeb Server');
     });
