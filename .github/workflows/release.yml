@@ -98,6 +98,13 @@ jobs:
     uses: ./.github/workflows/build-binaries.yml
     with:
       version: ${{ needs.release.outputs.version }}
+      signing: true
+    secrets:
+      APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+      APPLE_DEVELOPER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_KEY_ISSUER_ID: ${{ secrets.APPLE_API_KEY_ISSUER_ID }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
 
   upload-assets:
     needs: [release, build-binaries]
@@ -108,11 +115,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: artifacts
           pattern: binaries-*
           merge-multiple: true
+
+      - name: Generate licence notices
+        run: |
+          bash scripts/generate-notices.sh artifacts/THIRD-PARTY-NOTICES
+          cp LICENSE artifacts/LICENSE
 
       - name: Generate checksums
         working-directory: artifacts
@@ -126,12 +143,55 @@ jobs:
           cp install.sh artifacts/install.sh
           gh release upload "$tag" artifacts/* --clobber
 
-      - name: Verify and publish
+  verify-signatures:
+    needs: [release, build-binaries]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { label: darwin-amd64, identifier: ai.sliccy.playwright-cli, bin: playwright-cli-darwin-amd64 }
+          - { label: darwin-amd64, identifier: ai.sliccy.curlwright, bin: curlwright-darwin-amd64 }
+          - { label: darwin-arm64, identifier: ai.sliccy.playwright-cli, bin: playwright-cli-darwin-arm64 }
+          - { label: darwin-arm64, identifier: ai.sliccy.curlwright, bin: curlwright-darwin-arm64 }
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: binaries-${{ matrix.label }}
+
+      - name: Verify codesign identity
+        run: |
+          output=$(codesign -dv --verbose=2 "${{ matrix.bin }}" 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "Authority=Developer ID Application"
+          echo "$output" | grep -q "Identifier=${{ matrix.identifier }}"
+
+      - name: Verify codesign strict
+        run: codesign --verify --strict "${{ matrix.bin }}"
+
+      - name: Verify notarisation
+        run: |
+          output=$(spctl -a -vv -t install "${{ matrix.bin }}" 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "accepted"
+          echo "$output" | grep -q "source=Notarized Developer ID"
+
+  publish-release:
+    needs: [release, upload-assets, verify-signatures]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Verify all assets and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ needs.release.outputs.tag }}"
-          expected="playwright-cli-darwin-amd64 playwright-cli-darwin-arm64 playwright-cli-linux-amd64 playwright-cli-linux-arm64 playwright-cli-windows-amd64.exe playwright-cli-windows-arm64.exe curlwright-darwin-amd64 curlwright-darwin-arm64 curlwright-linux-amd64 curlwright-linux-arm64 curlwright-windows-amd64.exe curlwright-windows-arm64.exe SHA256SUMS install.sh"
+          expected="playwright-cli-darwin-amd64 playwright-cli-darwin-arm64 playwright-cli-linux-amd64 playwright-cli-linux-arm64 playwright-cli-windows-amd64.exe playwright-cli-windows-arm64.exe curlwright-darwin-amd64 curlwright-darwin-arm64 curlwright-linux-amd64 curlwright-linux-arm64 curlwright-windows-amd64.exe curlwright-windows-arm64.exe SHA256SUMS install.sh LICENSE THIRD-PARTY-NOTICES"
           assets=$(gh release view "$tag" --json assets -q '.assets[].name' | sort | tr '\n' ' ' | sed 's/ $//')
           for name in $expected; do
             if ! echo "$assets" | grep -qw "$name"; then
@@ -142,7 +202,7 @@ jobs:
           gh release edit "$tag" --draft=false --latest
 
   smoke:
-    needs: upload-assets
+    needs: publish-release
     strategy:
       matrix:
         include:
