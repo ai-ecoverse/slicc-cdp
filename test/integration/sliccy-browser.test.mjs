@@ -148,6 +148,7 @@ test('sliccy:browser over CDP', async () => {
     console.log = originalLog;
     const child = await runJsh(chrome.wsUrl, page);
     assert.equal(child.code, 0, `${child.stderr}\n${child.stdout}`);
+    assert.equal(child.stdout, 'done\n');
   } finally {
     console.log = originalLog;
     await settle(logSink?.close());
@@ -268,7 +269,6 @@ sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 try {
   await vm.runInContext('(async () => {\\n' + code + '\\n})()', sandbox, { filename: scriptPath });
-  process.exit(0);
 } catch (error) {
   console.error(error);
   process.exit(1);
@@ -282,6 +282,10 @@ if (typeof browser.findTab !== 'function') {
 const tab = await browser.ensureTab(process.env.PAGE_URL, { matchUrl: '/page$' });
 const title = await browser.eval(tab, 'document.title');
 if (title !== 'Fixture') throw new Error('title ' + String(title));
+await new Promise((resolve) => setTimeout(resolve, 200));
+const again = await browser.eval(tab, 'document.title');
+if (again !== 'Fixture') throw new Error('after idle ' + String(again));
+console.log('done');
 `;
 
 function runJsh(wsUrl, pageUrl) {
@@ -298,7 +302,7 @@ function runJsh(wsUrl, pageUrl) {
         });
         let stdout = '';
         let stderr = '';
-        const timer = setTimeout(() => child.kill('SIGKILL'), 60000);
+        const timer = setTimeout(() => child.kill('SIGKILL'), 20000);
         child.stdout.on('data', (chunk) => {
           stdout += chunk.toString('utf8');
         });

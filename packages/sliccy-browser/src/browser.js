@@ -13,6 +13,8 @@ const routers = new Set();
 const subscribers = new Map();
 let seq = 1;
 let listening = false;
+let active = 0;
+let idle;
 
 function openClient() {
   if (!opening) {
@@ -22,6 +24,37 @@ function openClient() {
     });
   }
   return opening;
+}
+
+async function using(work) {
+  active += 1;
+  clearTimeout(idle);
+  idle = undefined;
+  try {
+    return await work();
+  } finally {
+    active -= 1;
+    release();
+  }
+}
+
+function release() {
+  if (active > 0 || subscribers.size > 0 || !opening || idle) return;
+  idle = setTimeout(closeIdle, 0);
+}
+
+function closeIdle() {
+  idle = undefined;
+  if (active > 0 || subscribers.size > 0 || !opening) return;
+  const closing = opening;
+  opening = undefined;
+  sessions.clear();
+  routers.clear();
+  listening = false;
+  closing.then(
+    (client) => client.close(),
+    () => undefined
+  );
 }
 
 function ignoreMethod(prefix) {
@@ -113,7 +146,11 @@ async function listTabs() {
     }));
 }
 
-export async function findTab(query = {}) {
+export async function findTab(query) {
+  return using(() => findTabNow(query));
+}
+
+async function findTabNow(query = {}) {
   const domain = typeof query.domain === 'string' ? query.domain : undefined;
   const urlMatch = patternOf(query.urlMatch);
   if (domain === undefined && urlMatch === undefined) {
@@ -128,7 +165,11 @@ export async function findTab(query = {}) {
   return tabs.find((tab) => re.test(tab.url)) ?? null;
 }
 
-export async function ensureTab(url, options = {}) {
+export async function ensureTab(url, options) {
+  return using(() => ensureTabNow(url, options));
+}
+
+async function ensureTabNow(url, options = {}) {
   if (typeof url !== 'string' || url.length === 0) {
     throw new TypeError('browser.ensureTab: url must be a string');
   }
@@ -168,7 +209,11 @@ function evalSourceAsync(tab, source) {
 
 export { evalSource as eval, evalSourceAsync as evalAsync };
 
-async function evaluate(tab, source, awaitPromise) {
+function evaluate(tab, source, awaitPromise) {
+  return using(() => evaluateNow(tab, source, awaitPromise));
+}
+
+async function evaluateNow(tab, source, awaitPromise) {
   const { client, sessionId } = await sessionFor(targetIdOf(tab));
   const result = await client.send(
     'Runtime.evaluate',
@@ -187,6 +232,10 @@ async function evaluate(tab, source, awaitPromise) {
 
 export async function cookie(tab, name) {
   if (typeof name !== 'string') throw new TypeError('browser.cookie: name must be a string');
+  return using(() => cookieNow(tab, name));
+}
+
+async function cookieNow(tab, name) {
   const { client, sessionId } = await sessionFor(targetIdOf(tab));
   const result = await client.send('Network.getCookies', {}, sessionId);
   const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
@@ -425,9 +474,11 @@ function makeHandle(sub) {
               : patch.urlMatch;
       }
       if (patch.filter !== undefined) wire.filter = patch.filter;
-      await callRouter(
-        sub.targetId,
-        `globalThis.__sliccWsRouter.update(${JSON.stringify(sub.id)}, ${JSON.stringify(wire)})`
+      await using(() =>
+        callRouter(
+          sub.targetId,
+          `globalThis.__sliccWsRouter.update(${JSON.stringify(sub.id)}, ${JSON.stringify(wire)})`
+        )
       );
       if (wire.urlMatch === null) delete sub.urlMatch;
       else if (wire.urlMatch !== undefined) sub.urlMatch = wire.urlMatch;
@@ -438,9 +489,8 @@ function makeHandle(sub) {
     async close() {
       if (!subscribers.has(sub.id)) return false;
       subscribers.delete(sub.id);
-      await callRouter(
-        sub.targetId,
-        `globalThis.__sliccWsRouter.unregister(${JSON.stringify(sub.id)})`
+      await using(() =>
+        callRouter(sub.targetId, `globalThis.__sliccWsRouter.unregister(${JSON.stringify(sub.id)})`)
       );
       return true;
     },
@@ -481,27 +531,30 @@ export const websocket = {
       },
       async forward(sink) {
         validateSink(sink);
-        await installRouter(targetId);
-        const id = `wssub-${seq++}-${Date.now().toString(36)}`;
-        const sub = {
-          id,
-          targetId,
-          forward: sink,
-          createdAt: new Date().toISOString(),
-        };
-        if (urlMatch !== undefined) sub.urlMatch = urlMatch;
-        if (selector !== undefined) sub.filter = selector;
-        const registered = { id };
-        if (urlMatch !== undefined) registered.urlMatch = urlMatch;
-        if (selector !== undefined) registered.filter = selector;
-        await callRouter(
-          targetId,
-          `globalThis.__sliccWsRouter.register(${JSON.stringify(registered)})`
-        );
-        subscribers.set(id, sub);
-        return makeHandle(sub);
+        return using(() => subscribe(sink));
       },
     };
+    async function subscribe(sink) {
+      await installRouter(targetId);
+      const id = `wssub-${seq++}-${Date.now().toString(36)}`;
+      const sub = {
+        id,
+        targetId,
+        forward: sink,
+        createdAt: new Date().toISOString(),
+      };
+      if (urlMatch !== undefined) sub.urlMatch = urlMatch;
+      if (selector !== undefined) sub.filter = selector;
+      const registered = { id };
+      if (urlMatch !== undefined) registered.urlMatch = urlMatch;
+      if (selector !== undefined) registered.filter = selector;
+      await callRouter(
+        targetId,
+        `globalThis.__sliccWsRouter.register(${JSON.stringify(registered)})`
+      );
+      subscribers.set(id, sub);
+      return makeHandle(sub);
+    }
     return builder;
   },
   async list() {
