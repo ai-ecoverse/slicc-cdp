@@ -950,6 +950,120 @@ mod tests {
         assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.failRequest"]);
     }
 
+    fn auth_event(session: &str, id: &str, url: &str) -> Value {
+        json!({
+            "method": "Fetch.authRequired",
+            "sessionId": session,
+            "params": {
+                "requestId": id,
+                "frameId": "F1",
+                "resourceType": "Fetch",
+                "request": { "url": url, "method": "GET", "headers": {} },
+                "authChallenge": { "source": "Server", "origin": url, "scheme": "basic", "realm": "r" }
+            }
+        })
+    }
+
+    fn refused(result: Result<Value, String>) -> bool {
+        result.is_err_and(|message| message == crate::cdp::UNSEEN)
+    }
+
+    #[test]
+    fn an_issued_id_is_good_on_its_session_until_it_is_answered() {
+        let mut xhr = paused_event("S", "R1", "https://app.example/api");
+        xhr["params"]["resourceType"] = json!("XHR");
+        let mut response = xhr.clone();
+        response["params"]["responseStatusCode"] = json!(200);
+        let (mut cdp, log) = fake(vec![xhr], Box::new(|message| vec![ok(message)]));
+        let got = cdp.next_paused(Some("S"), Duration::from_millis(50)).unwrap().unwrap();
+        assert_eq!(got.request_id, "R1");
+        assert!(refused(cdp.call("Fetch.fulfillRequest", json!({ "requestId": "R2", "responseCode": 200 }), Some("S"))));
+        assert!(refused(cdp.call("Fetch.continueRequest", json!({ "requestId": "R1" }), Some("T"))));
+        assert!(refused(cdp.call("Fetch.continueRequest", json!({}), Some("S"))));
+        cdp.call("Fetch.getResponseBody", json!({ "requestId": "R1" }), Some("S")).unwrap();
+        cdp.call("Fetch.continueRequest", json!({ "requestId": "R1" }), Some("S")).unwrap();
+        for (method, params) in [
+            ("Fetch.failRequest", json!({ "requestId": "R1", "errorReason": "Failed" })),
+            ("Fetch.fulfillRequest", json!({ "requestId": "R1", "responseCode": 200 })),
+            ("Fetch.continueResponse", json!({ "requestId": "R1" })),
+            ("Fetch.continueWithAuth", json!({ "requestId": "R1", "authChallengeResponse": { "response": "Default" } })),
+        ] {
+            assert!(refused(cdp.call(method, params, Some("S"))), "{method}");
+        }
+        assert!(refused(cdp.notify("Fetch.continueRequest", json!({ "requestId": "R1" }), Some("S")).map(|_| Value::Null)));
+        assert_eq!(methods(&log), ["Fetch.getResponseBody", "Fetch.continueRequest"]);
+        let (mut cdp, log) = fake(vec![response], Box::new(|message| vec![ok(message)]));
+        let again = cdp.next_paused(Some("S"), Duration::from_millis(50)).unwrap().unwrap();
+        assert!(again.is_response());
+        cdp.call("Fetch.continueResponse", json!({ "requestId": "R1" }), Some("S")).unwrap();
+        assert!(refused(cdp.call("Fetch.continueResponse", json!({ "requestId": "R1" }), Some("S"))));
+        assert_eq!(methods(&log), ["Fetch.continueResponse"]);
+    }
+
+    #[test]
+    fn an_id_a_decider_answered_is_not_issued_again() {
+        let (mut cdp, log) = fake(
+            vec![paused_event("S", "R1", "https://app.example/x")],
+            Box::new(|message| vec![ok(message)]),
+        );
+        cdp.set_decider("S", Some(Box::new(|_: &Paused| Decision::default())));
+        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        assert!(refused(cdp.call("Fetch.fulfillRequest", json!({ "requestId": "R1", "responseCode": 200 }), Some("S"))));
+        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.continueRequest"]);
+    }
+
+    #[test]
+    fn a_protected_id_is_never_issued_even_when_guessed() {
+        let mut xhr = paused_event("S", "R1", "https://seven.sliccy.ai/data");
+        xhr["params"]["resourceType"] = json!("XHR");
+        let (mut cdp, log) = fake(vec![xhr], Box::new(|message| vec![ok(message)]));
+        assert!(cdp.next_paused(Some("S"), Duration::from_millis(50)).unwrap().is_none());
+        for method in [
+            "Fetch.fulfillRequest",
+            "Fetch.failRequest",
+            "Fetch.continueRequest",
+            "Fetch.continueWithAuth",
+            "Fetch.continueResponse",
+            "Fetch.getResponseBody",
+            "Fetch.takeResponseBodyAsStream",
+            "Network.continueInterceptedRequest",
+            "Network.getResponseBodyForInterception",
+        ] {
+            assert!(refused(cdp.call(method, json!({ "requestId": "R1", "interceptionId": "R1" }), Some("S"))), "{method}");
+        }
+        assert_eq!(methods(&log), ["Fetch.continueRequest"]);
+        let old = cdp
+            .call("Network.setRequestInterception", json!({ "patterns": [{ "urlPattern": "*" }] }), Some("S"))
+            .unwrap_err();
+        assert!(old.starts_with("slicc: refused"), "{old}");
+        assert_eq!(methods(&log), ["Fetch.continueRequest"]);
+    }
+
+    #[test]
+    fn a_protected_auth_challenge_gets_the_default_and_its_id_is_refused() {
+        let (mut cdp, log) = fake(
+            vec![
+                auth_event("S", "A1", "https://vault.sliccy.ai/auth"),
+                auth_event("S", "A2", "https://app.example/auth"),
+            ],
+            Box::new(|message| vec![ok(message)]),
+        );
+        while cdp.pump(Instant::now() + Duration::from_millis(10)).unwrap() {}
+        let sent = log.borrow().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["method"], "Fetch.continueWithAuth");
+        assert_eq!(sent[0]["params"]["requestId"], "A1");
+        assert_eq!(sent[0]["params"]["authChallengeResponse"], json!({ "response": "Default" }));
+        let delivered: Vec<&Value> = cdp.events().iter().collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0]["params"]["requestId"], "A2");
+        let answer = json!({ "response": "ProvideCredentials", "username": "u", "password": "p" });
+        assert!(refused(cdp.call("Fetch.continueWithAuth", json!({ "requestId": "A1", "authChallengeResponse": answer }), Some("S"))));
+        cdp.call("Fetch.continueWithAuth", json!({ "requestId": "A2", "authChallengeResponse": answer }), Some("S")).unwrap();
+        assert!(refused(cdp.call("Fetch.continueWithAuth", json!({ "requestId": "A2", "authChallengeResponse": answer }), Some("S"))));
+        assert_eq!(methods(&log), ["Fetch.continueWithAuth", "Fetch.continueWithAuth"]);
+    }
+
     fn panic_decider() -> Option<crate::cdp::Decider> {
         Some(Box::new(|paused: &Paused| {
             panic!("the agent saw {} paused", paused.url)

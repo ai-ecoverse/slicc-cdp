@@ -44,6 +44,7 @@ pub struct Cdp {
     guard_sessions: BTreeSet<String>,
     discovering: bool,
     requests: BTreeMap<String, bool>,
+    handed: BTreeSet<(String, String)>,
     held: BTreeMap<String, Vec<Value>>,
     streams: BTreeSet<String>,
     contexts: BTreeSet<String>,
@@ -73,6 +74,7 @@ impl Cdp {
             guard_sessions: BTreeSet::new(),
             discovering: false,
             requests: BTreeMap::new(),
+            handed: BTreeSet::new(),
             held: BTreeMap::new(),
             streams: BTreeSet::new(),
             contexts: BTreeSet::new(),
@@ -249,6 +251,18 @@ impl Cdp {
                         return Err(self.refusal());
                     }
                 }
+            }
+        }
+        if shield::interception_method(method) {
+            let id = shield::request_key(params).unwrap_or_default();
+            let handed = session_id
+                .is_some_and(|session| self.handed.contains(&(session.to_string(), id.clone())));
+            if !handed || self.request_state(&id) == Some(true) {
+                return Err(UNSEEN.into());
+            }
+            if shield::answers_interception(method) {
+                let session = session_id.unwrap_or("").to_string();
+                self.settle(&session, &id);
             }
         }
         if shield::body_method(method) {
@@ -677,6 +691,7 @@ impl Cdp {
     }
 
     fn answer_protected(&mut self, paused: &Paused) {
+        self.settle(&paused.session_id, &paused.request_id);
         if paused.resource_type == "Document" {
             let _ = self.send(
                 "Fetch.failRequest",
@@ -689,6 +704,7 @@ impl Cdp {
     }
 
     fn continue_plain(&mut self, session_id: &str, request_id: &str) {
+        self.settle(session_id, request_id);
         let _ = self.send(
             "Fetch.continueRequest",
             json!({ "requestId": request_id }),
@@ -803,6 +819,33 @@ impl Cdp {
         }
     }
 
+    fn hand(&mut self, session_id: &str, request_id: &str) {
+        self.handed
+            .insert((session_id.to_string(), request_id.to_string()));
+    }
+
+    fn settle(&mut self, session_id: &str, request_id: &str) {
+        self.handed
+            .remove(&(session_id.to_string(), request_id.to_string()));
+    }
+
+    fn challenge_protected(&self, value: &Value) -> bool {
+        let session = value.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+        let text = |pointer: &str| params.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("");
+        self.requests.get(id) == Some(&true)
+            || self.blocked.contains(session)
+            || self.guard_sessions.contains(session)
+            || self.frame_protected(text("/frameId"))
+            || self
+                .session_target(session)
+                .is_some_and(|target| self.protected_targets.contains(&target))
+            || ["/request/url", "/authChallenge/origin"]
+                .iter()
+                .any(|pointer| self.guard.url(text(pointer)))
+    }
+
     fn hidden(&self, value: &Value) -> bool {
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(session) = value.get("sessionId").and_then(|v| v.as_str()) {
@@ -837,6 +880,11 @@ impl Cdp {
             .pointer("/params/requestId")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let session = value.get("sessionId").and_then(|v| v.as_str());
+        if let (true, Some(session), Some(id)) = (method.starts_with("Fetch."), session, &id) {
+            let session = session.to_string();
+            self.hand(&session, id);
+        }
         if method.ends_with("ExtraInfo") {
             if let Some(id) = id.clone() {
                 shield::strip_protected_associated(&self.guard, &mut value);
@@ -978,6 +1026,21 @@ impl Cdp {
             }
             return;
         }
+        if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.authRequired")
+            && self.challenge_protected(&value)
+        {
+            let id = value.pointer("/params/requestId").cloned().unwrap_or(Value::Null);
+            if let Some(key) = id.as_str() {
+                self.requests.insert(key.to_string(), true);
+            }
+            let session = value.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let _ = self.send(
+                "Fetch.continueWithAuth",
+                json!({ "requestId": id, "authChallengeResponse": { "response": "Default" } }),
+                Some(&session),
+            );
+            return;
+        }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
             let Some(paused) = Paused::from_event(&value) else {
                 return;
@@ -1005,6 +1068,7 @@ impl Cdp {
                 self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
             }
+            self.hand(&paused.session_id, &paused.request_id);
             if self.deciders.contains_key(&paused.session_id) {
                 self.decide_inline(paused);
             } else {
@@ -1035,6 +1099,7 @@ impl Cdp {
                     .expect("a plain continue is always allowed")
             }
         };
+        self.settle(&paused.session_id, &paused.request_id);
         if let Ok(id) = self.send(method, params, Some(&paused.session_id)) {
             self.decided
                 .insert(id, (paused.session_id.clone(), paused.request_id.clone()));

@@ -10,6 +10,8 @@ struct Run {
     target: String,
     session: String,
     rule: Option<Value>,
+    auth: Option<Value>,
+    seen_events: usize,
     paused: Vec<Value>,
     steps: Vec<Value>,
 }
@@ -58,8 +60,28 @@ impl Run {
             }
             "intercept" => {
                 self.rule = step.get("rule").cloned();
+                self.auth = step.get("auth").cloned();
                 json!({ "ok": true })
             }
+            "launch" => {
+                let slot = step
+                    .get("slot")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("vector");
+                let expression = step
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                self.evaluate(&format!("globalThis[{slot:?}] = ({expression}); true"))
+            }
+            "read" => {
+                let slot = step
+                    .get("slot")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("vector");
+                self.evaluate(&format!("globalThis[{slot:?}]"))
+            }
+            "guess" => self.guess(step),
             "wait" => {
                 let ms = step.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 self.wait(Duration::from_millis(ms))
@@ -69,6 +91,68 @@ impl Run {
         let mut entry = step.clone();
         entry["outcome"] = record;
         self.steps.push(entry);
+    }
+
+    fn evaluate(&mut self, expression: &str) -> Value {
+        let session = self.session.clone();
+        outcome(self.cdp.call_for(
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+            Some(&session),
+            Duration::from_secs(30),
+        ))
+    }
+
+    fn id_for(&self, needle: &str) -> Option<String> {
+        self.paused
+            .iter()
+            .find(|seen| {
+                seen["url"].as_str().is_some_and(|url| url.contains(needle))
+                    && seen["stage"] == json!("Request")
+            })
+            .and_then(|seen| seen["requestId"].as_str().map(str::to_string))
+    }
+
+    fn guess(&mut self, step: &Value) -> Value {
+        self.drain();
+        let split = |id: &str| -> Option<(String, u64)> {
+            let stem = id.strip_suffix(".0")?;
+            let digits = stem.len() - stem.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+            let (prefix, number) = stem.split_at(stem.len() - digits);
+            Some((prefix.to_string(), number.parse().ok()?))
+        };
+        let before = step.get("before").and_then(|v| v.as_str()).unwrap_or("");
+        let after = step.get("after").and_then(|v| v.as_str()).unwrap_or("");
+        let bounds = self
+            .id_for(before)
+            .and_then(|id| split(&id))
+            .zip(self.id_for(after).and_then(|id| split(&id)));
+        let Some(((prefix, low), (_, high))) = bounds else {
+            return json!({ "ok": false, "error": "no bracketing request ids" });
+        };
+        let session = self.session.clone();
+        let calls = step
+            .get("calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut attempts = Vec::new();
+        for call in &calls {
+            for number in low + 1..high {
+                let id = format!("{prefix}{number}.0");
+                let method = call.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let mut params = call.get("params").cloned().unwrap_or(json!({}));
+                params["requestId"] = json!(id);
+                let result = outcome(self.cdp.call_for(
+                    method,
+                    params,
+                    Some(&session),
+                    Duration::from_secs(5),
+                ));
+                attempts.push(json!({ "method": method, "requestId": id, "outcome": result }));
+            }
+        }
+        json!({ "ok": true, "attempts": attempts })
     }
 
     fn open(&mut self) -> Value {
@@ -118,13 +202,30 @@ impl Run {
     fn drain(&mut self) {
         let session = self.session.clone();
         while let Ok(Some(paused)) = self.cdp.next_paused(Some(&session), Duration::ZERO) {
-            let mut seen = json!({ "url": paused.url, "resourceType": paused.resource_type });
+            let stage = if paused.is_response() {
+                "Response"
+            } else {
+                "Request"
+            };
+            let mut seen = json!({
+                "url": paused.url,
+                "resourceType": paused.resource_type,
+                "requestId": paused.request_id,
+                "stage": stage,
+            });
             let rule = self.rule.clone().filter(|rule| {
                 rule.get("match")
                     .and_then(|v| v.as_str())
                     .is_some_and(|needle| paused.url.contains(needle))
+                    && rule
+                        .get("stage")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|want| want == stage)
             });
             match rule {
+                Some(rule) if rule.get("hold").and_then(|v| v.as_bool()) == Some(true) => {
+                    seen["held"] = json!(true);
+                }
                 Some(rule) => {
                     let method = rule.get("method").and_then(|v| v.as_str()).unwrap_or("");
                     let mut params = rule.get("params").cloned().unwrap_or(json!({}));
@@ -140,6 +241,40 @@ impl Run {
                 }
             }
             self.paused.push(seen);
+        }
+        let challenges: Vec<Value> = self.cdp.events()[self.seen_events..]
+            .iter()
+            .filter(|event| {
+                event["method"] == json!("Fetch.authRequired")
+                    && event["sessionId"].as_str() == Some(session.as_str())
+            })
+            .cloned()
+            .collect();
+        self.seen_events = self.cdp.events().len();
+        for event in challenges {
+            let url = event
+                .pointer("/params/request/url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let id = event
+                .pointer("/params/requestId")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let response = self
+                .auth
+                .as_ref()
+                .filter(|auth| {
+                    auth.get("match")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|needle| url.contains(needle))
+                })
+                .and_then(|auth| auth.get("response").cloned())
+                .unwrap_or(json!({ "response": "Default" }));
+            let _ = self.cdp.notify(
+                "Fetch.continueWithAuth",
+                json!({ "requestId": id, "authChallengeResponse": response }),
+                Some(&session),
+            );
         }
     }
 }
@@ -197,6 +332,8 @@ fn execute(ws: &str, plan: &Value) -> Value {
         target: String::new(),
         session: String::new(),
         rule: None,
+        auth: None,
+        seen_events: 0,
         paused: Vec::new(),
         steps: Vec::new(),
     };
