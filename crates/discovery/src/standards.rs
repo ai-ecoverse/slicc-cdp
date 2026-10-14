@@ -1,6 +1,7 @@
 use crate::classifier::{Classification, ClassifierRegistry, Validity};
 use crate::probe::{Probe, ProbeRegistry};
 use serde_json::Value;
+use url::Url;
 
 pub const HANDOFF_REL: &str = "https://www.sliccy.ai/rel/handoff";
 pub const UPSKILL_REL: &str = "https://www.sliccy.ai/rel/upskill";
@@ -9,6 +10,17 @@ pub const LLMS_TXT_REL: &str = "https://llmstxt.org/rel/llms-txt";
 const TITLE_CAP: usize = 200;
 const HEADINGS_CAP: usize = 50;
 const HEADING_LEN_CAP: usize = 200;
+
+const ENTRY_TYPE_CATALOG: &str = "application/ai-catalog+json";
+const ENTRY_TYPE_REGISTRY: &str = "application/ai-registry+json";
+
+const ENTRIES_CAP: usize = 200;
+const DISPLAY_NAME_CAP: usize = 200;
+const IDENTIFIER_CAP: usize = 500;
+const QUERIES_CAP: usize = 10;
+const QUERY_LEN_CAP: usize = 200;
+const CAPABILITIES_CAP: usize = 50;
+const CAPABILITY_LEN_CAP: usize = 100;
 
 pub fn known_link_rels() -> &'static [&'static str] {
     &[
@@ -86,20 +98,15 @@ pub fn classify_response(status: u16, headers: &[(String, String)]) -> Vec<Respo
 }
 
 fn classify_ard(body: &str) -> Classification {
+    classify_ard_with_origin(body, None)
+}
+
+fn classify_ard_with_origin(body: &str, origin: Option<&str>) -> Classification {
+    let origin_domain = origin.and_then(|o| {
+        Url::parse(o).ok().and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+    });
     match serde_json::from_str::<Value>(body) {
-        Ok(value) => {
-            let name = value
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Classification {
-                standard: "ard".into(),
-                status: Validity::Valid,
-                summary: serde_json::json!({ "name": name }),
-                reason: None,
-            }
-        }
+        Ok(value) => classify_ard_value(&value, origin_domain.as_deref()),
         Err(e) => Classification {
             standard: "ard".into(),
             status: Validity::Invalid,
@@ -107,6 +114,228 @@ fn classify_ard(body: &str) -> Classification {
             reason: Some(e.to_string()),
         },
     }
+}
+
+pub fn classify_ard_body(body: &str, origin: Option<&str>) -> Classification {
+    classify_ard_with_origin(body, origin)
+}
+
+fn classify_ard_value(value: &Value, origin_domain: Option<&str>) -> Classification {
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = truncate(&name, TITLE_CAP);
+
+    let entries = match value.get("entries").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => {
+            return Classification {
+                standard: "ard".into(),
+                status: Validity::Valid,
+                summary: serde_json::json!({ "name": name, "entries": [], "warnings": ["no entries array"] }),
+                reason: None,
+            };
+        }
+    };
+
+    let mut valid_entries: Vec<Value> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut type_groups: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut catalogs: Vec<Value> = Vec::new();
+
+    for (idx, entry) in entries.iter().take(ENTRIES_CAP).enumerate() {
+        let identifier = entry.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
+        let display_name = entry.get("displayName").and_then(|v| v.as_str()).unwrap_or("");
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let has_url = entry.get("url").and_then(|v| v.as_str()).is_some();
+        let has_data = entry.get("data").is_some();
+
+        if identifier.is_empty() || display_name.is_empty() || entry_type.is_empty() {
+            warnings.push(format!("entry {idx}: missing required field (identifier, displayName, or type)"));
+            continue;
+        }
+        if !has_url && !has_data {
+            warnings.push(format!("entry {idx}: missing url and data"));
+            continue;
+        }
+        if has_url && has_data {
+            warnings.push(format!("entry {idx}: has both url and data"));
+            continue;
+        }
+
+        let urn_check = check_urn_publisher(identifier, origin_domain);
+        let trust_check = check_trust_identity(entry, origin_domain);
+
+        if let Some(ref warn) = urn_check {
+            warnings.push(format!("entry {idx}: {warn}"));
+            continue;
+        }
+        if let Some(ref warn) = trust_check {
+            warnings.push(format!("entry {idx}: {warn}"));
+        }
+
+        *type_groups.entry(entry_type.to_string()).or_insert(0) += 1;
+
+        if entry_type == ENTRY_TYPE_CATALOG || entry_type == ENTRY_TYPE_REGISTRY {
+            let mut cat = serde_json::Map::new();
+            cat.insert("identifier".into(), Value::String(truncate(identifier, IDENTIFIER_CAP)));
+            cat.insert("displayName".into(), Value::String(truncate(display_name, DISPLAY_NAME_CAP)));
+            cat.insert("type".into(), Value::String(entry_type.to_string()));
+            if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+                cat.insert("url".into(), Value::String(url.to_string()));
+            }
+            catalogs.push(Value::Object(cat));
+        }
+
+        let mut summary_entry = serde_json::Map::new();
+        summary_entry.insert("identifier".into(), Value::String(truncate(identifier, IDENTIFIER_CAP)));
+        summary_entry.insert("displayName".into(), Value::String(truncate(display_name, DISPLAY_NAME_CAP)));
+        summary_entry.insert("type".into(), Value::String(entry_type.to_string()));
+        if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
+            summary_entry.insert("url".into(), Value::String(url.to_string()));
+        }
+        if let Some(caps) = entry.get("capabilities").and_then(|v| v.as_array()) {
+            let capped: Vec<Value> = caps.iter()
+                .take(CAPABILITIES_CAP)
+                .filter_map(|c| c.as_str().map(|s| Value::String(truncate(s, CAPABILITY_LEN_CAP))))
+                .collect();
+            if !capped.is_empty() {
+                summary_entry.insert("capabilities".into(), Value::Array(capped));
+            }
+        }
+        if let Some(queries) = entry.get("representativeQueries").and_then(|v| v.as_array()) {
+            let capped: Vec<Value> = queries.iter()
+                .take(QUERIES_CAP)
+                .filter_map(|q| q.as_str().map(|s| Value::String(truncate(s, QUERY_LEN_CAP))))
+                .collect();
+            if !capped.is_empty() {
+                summary_entry.insert("representativeQueries".into(), Value::Array(capped));
+            }
+        }
+        valid_entries.push(Value::Object(summary_entry));
+    }
+
+    let mut summary = serde_json::Map::new();
+    summary.insert("name".into(), Value::String(name));
+    summary.insert("entries".into(), Value::Array(valid_entries));
+    if !type_groups.is_empty() {
+        let groups: serde_json::Map<String, Value> = type_groups
+            .into_iter()
+            .map(|(k, v)| (k, Value::Number(serde_json::Number::from(v))))
+            .collect();
+        summary.insert("types".into(), Value::Object(groups));
+    }
+    if !catalogs.is_empty() {
+        summary.insert("catalogs".into(), Value::Array(catalogs));
+    }
+    if !warnings.is_empty() {
+        summary.insert("warnings".into(), Value::Array(
+            warnings.into_iter().map(Value::String).collect()
+        ));
+    }
+
+    Classification {
+        standard: "ard".into(),
+        status: Validity::Valid,
+        summary: Value::Object(summary),
+        reason: None,
+    }
+}
+
+fn registrable_domain(host: &str) -> Option<String> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let bytes = host.as_bytes();
+    let suffix = psl::suffix(bytes)?;
+    if suffix.is_known() {
+        let domain = psl::domain(bytes)?;
+        Some(std::str::from_utf8(domain.as_bytes()).ok()?.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn check_urn_publisher(identifier: &str, origin_domain: Option<&str>) -> Option<String> {
+    let origin_domain = origin_domain?;
+    let prefix = "urn:air:";
+    if !identifier.starts_with(prefix) {
+        return None;
+    }
+    let rest = &identifier[prefix.len()..];
+    let publisher = rest.split(':').next().unwrap_or("");
+    if publisher.is_empty() {
+        return Some("URN has empty publisher".into());
+    }
+    let publisher_lower = publisher.to_ascii_lowercase();
+    let publisher_reg = registrable_domain(&publisher_lower);
+    let origin_reg = registrable_domain(origin_domain);
+    match (publisher_reg, origin_reg) {
+        (Some(p), Some(o)) if p == o => None,
+        (Some(p), Some(o)) => Some(format!(
+            "URN publisher {publisher} (registrable: {p}) does not match origin (registrable: {o})"
+        )),
+        _ => {
+            if publisher_lower == origin_domain.to_ascii_lowercase() {
+                None
+            } else {
+                Some(format!("URN publisher {publisher} does not match origin {origin_domain}"))
+            }
+        }
+    }
+}
+
+fn check_trust_identity(entry: &Value, origin_domain: Option<&str>) -> Option<String> {
+    let origin_domain = origin_domain?;
+    let identity = entry
+        .get("trustManifest")
+        .and_then(|tm| tm.get("identity"))
+        .and_then(|id| id.as_str())?;
+    let identity_lower = identity.to_ascii_lowercase();
+    let identity_reg = registrable_domain(&identity_lower);
+    let origin_reg = registrable_domain(origin_domain);
+    match (identity_reg, origin_reg) {
+        (Some(i), Some(o)) if i == o => None,
+        (Some(i), Some(o)) => Some(format!(
+            "trustManifest.identity {identity} (registrable: {i}) does not match origin (registrable: {o})"
+        )),
+        _ => {
+            if identity_lower == origin_domain.to_ascii_lowercase() {
+                None
+            } else {
+                Some(format!("trustManifest.identity {identity} does not match origin {origin_domain}"))
+            }
+        }
+    }
+}
+
+pub fn parse_robots_txt_agentmap(body: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Agentmap:") {
+            let url = rest.trim();
+            if !url.is_empty() {
+                urls.push(url.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("agentmap:") {
+            let url = rest.trim();
+            if !url.is_empty() {
+                urls.push(url.to_string());
+            }
+        } else {
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(rest_lower) = lower.strip_prefix("agentmap:") {
+                let colon_pos = trimmed.find(':').unwrap();
+                let url = trimmed[colon_pos + 1..].trim();
+                let _ = rest_lower;
+                if !url.is_empty() {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+    }
+    urls
 }
 
 fn classify_api_catalog(body: &str) -> Classification {
@@ -646,5 +875,411 @@ mod tests {
             params: Default::default(),
         };
         assert!(classify_slicc_handoff(&link).is_none());
+    }
+
+    #[test]
+    fn ard_valid_entries_grouped_by_type() {
+        let body = serde_json::json!({
+            "name": "Acme Corp",
+            "entries": [
+                {
+                    "identifier": "urn:air:acme.com:server:weather",
+                    "displayName": "Weather Server",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://api.acme.com/mcp/weather.json",
+                    "capabilities": ["WeatherTool"],
+                    "representativeQueries": ["what is the weather"]
+                },
+                {
+                    "identifier": "urn:air:acme.com:skill:pptx",
+                    "displayName": "PPTX Creator",
+                    "type": "application/agent-skills+md",
+                    "url": "https://acme.com/skills/pptx"
+                }
+            ]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://acme.com"));
+        assert_eq!(result.status, Validity::Valid);
+        assert_eq!(result.summary["name"], "Acme Corp");
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["type"], "application/mcp-server-card+json");
+        assert_eq!(entries[1]["type"], "application/agent-skills+md");
+        let types = result.summary["types"].as_object().unwrap();
+        assert_eq!(types["application/mcp-server-card+json"], 1);
+        assert_eq!(types["application/agent-skills+md"], 1);
+    }
+
+    #[test]
+    fn ard_squatted_urn_produces_warning() {
+        let body = serde_json::json!({
+            "name": "Evil",
+            "entries": [
+                {
+                    "identifier": "urn:air:google.com:server:search",
+                    "displayName": "Fake Google",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://evil.com/fake"
+                },
+                {
+                    "identifier": "urn:air:evil.com:server:legit",
+                    "displayName": "Legit Server",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://evil.com/legit"
+                }
+            ]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://evil.com"));
+        assert_eq!(result.status, Validity::Valid);
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["displayName"], "Legit Server");
+        let warnings = result.summary["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("google.com")));
+    }
+
+    #[test]
+    fn ard_trust_identity_mismatch_warns() {
+        let body = serde_json::json!({
+            "name": "Test",
+            "entries": [
+                {
+                    "identifier": "urn:air:example.com:server:api",
+                    "displayName": "API",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://example.com/api",
+                    "trustManifest": {
+                        "identity": "other-corp.com"
+                    }
+                }
+            ]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://example.com"));
+        let warnings = result.summary["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("trustManifest.identity")));
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn ard_nested_catalogs_reported() {
+        let body = serde_json::json!({
+            "name": "Hub",
+            "entries": [
+                {
+                    "identifier": "urn:air:hub.com:catalog:partners",
+                    "displayName": "Partners Catalog",
+                    "type": "application/ai-catalog+json",
+                    "url": "https://hub.com/partners.json"
+                },
+                {
+                    "identifier": "urn:air:hub.com:registry:search",
+                    "displayName": "Search Registry",
+                    "type": "application/ai-registry+json",
+                    "url": "https://hub.com/search"
+                }
+            ]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://hub.com"));
+        let catalogs = result.summary["catalogs"].as_array().unwrap();
+        assert_eq!(catalogs.len(), 2);
+        assert_eq!(catalogs[0]["type"], "application/ai-catalog+json");
+        assert_eq!(catalogs[1]["type"], "application/ai-registry+json");
+    }
+
+    #[test]
+    fn ard_missing_required_field_skipped() {
+        let body = serde_json::json!({
+            "name": "Bad",
+            "entries": [
+                {
+                    "displayName": "No Identifier",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://bad.com/x"
+                },
+                {
+                    "identifier": "urn:air:bad.com:x",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://bad.com/x"
+                },
+                {
+                    "identifier": "urn:air:bad.com:y",
+                    "displayName": "No URL or Data",
+                    "type": "application/mcp-server-card+json"
+                }
+            ]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://bad.com"));
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 0);
+        let warnings = result.summary["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn ard_both_url_and_data_rejected() {
+        let body = serde_json::json!({
+            "name": "Both",
+            "entries": [{
+                "identifier": "urn:air:both.com:x",
+                "displayName": "Both Fields",
+                "type": "application/mcp-server-card+json",
+                "url": "https://both.com/x",
+                "data": {}
+            }]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://both.com"));
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn ard_no_entries_array_warns() {
+        let body = r#"{"name":"Empty"}"#;
+        let result = classify_ard_body(body, None);
+        assert_eq!(result.status, Validity::Valid);
+        assert_eq!(result.summary["name"], "Empty");
+        let warnings = result.summary["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| w.as_str().unwrap().contains("no entries")));
+    }
+
+    #[test]
+    fn ard_invalid_json() {
+        let result = classify_ard_body("not json", None);
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.is_some());
+    }
+
+    #[test]
+    fn ard_no_origin_skips_urn_check() {
+        let body = serde_json::json!({
+            "name": "No Origin",
+            "entries": [{
+                "identifier": "urn:air:google.com:server:search",
+                "displayName": "Search",
+                "type": "application/mcp-server-card+json",
+                "url": "https://google.com/mcp"
+            }]
+        }).to_string();
+        let result = classify_ard_body(&body, None);
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn ard_subdomain_urn_matches_registrable() {
+        let body = serde_json::json!({
+            "name": "Sub",
+            "entries": [{
+                "identifier": "urn:air:acme.com:server:api",
+                "displayName": "API",
+                "type": "application/mcp-server-card+json",
+                "url": "https://api.acme.com/mcp"
+            }]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://api.acme.com"));
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(result.summary.get("warnings").is_none());
+    }
+
+    #[test]
+    fn ard_capabilities_and_queries_in_summary() {
+        let body = serde_json::json!({
+            "name": "Rich",
+            "entries": [{
+                "identifier": "urn:air:rich.com:server:api",
+                "displayName": "API",
+                "type": "application/mcp-server-card+json",
+                "url": "https://rich.com/mcp",
+                "capabilities": ["FooTool", "BarTool"],
+                "representativeQueries": ["how do I foo", "bar something"]
+            }]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://rich.com"));
+        let entry = &result.summary["entries"][0];
+        let caps = entry["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 2);
+        let queries = entry["representativeQueries"].as_array().unwrap();
+        assert_eq!(queries.len(), 2);
+    }
+
+    #[test]
+    fn ard_display_name_capped() {
+        let long_name = "x".repeat(300);
+        let body = serde_json::json!({
+            "name": "Cap",
+            "entries": [{
+                "identifier": "urn:air:cap.com:x",
+                "displayName": long_name,
+                "type": "application/mcp-server-card+json",
+                "url": "https://cap.com/x"
+            }]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://cap.com"));
+        let entry = &result.summary["entries"][0];
+        assert!(entry["displayName"].as_str().unwrap().len() <= 200);
+    }
+
+    #[test]
+    fn ard_data_entry_accepted() {
+        let body = serde_json::json!({
+            "name": "Inline",
+            "entries": [{
+                "identifier": "urn:air:inline.com:x",
+                "displayName": "Inline",
+                "type": "application/agent-skills+md",
+                "data": "# My Skill\nSome content"
+            }]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://inline.com"));
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn ard_fixture_mcp_skill_squatted() {
+        let body = serde_json::json!({
+            "name": "Fixture Site",
+            "entries": [
+                {
+                    "identifier": "urn:air:fixture.com:server:weather",
+                    "displayName": "Weather MCP",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://fixture.com/mcp/weather.json",
+                    "capabilities": ["WeatherTool"]
+                },
+                {
+                    "identifier": "urn:air:fixture.com:skill:pptx",
+                    "displayName": "PPTX Skill",
+                    "type": "application/agent-skills+md",
+                    "url": "https://fixture.com/skills/pptx"
+                },
+                {
+                    "identifier": "urn:air:google.com:server:search",
+                    "displayName": "Squatted Google",
+                    "type": "application/mcp-server-card+json",
+                    "url": "https://fixture.com/fake-google"
+                }
+            ]
+        }).to_string();
+        let result = classify_ard_body(&body, Some("https://fixture.com"));
+        assert_eq!(result.status, Validity::Valid);
+        let entries = result.summary["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let types: Vec<&str> = entries.iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"application/mcp-server-card+json"));
+        assert!(types.contains(&"application/agent-skills+md"));
+        let warnings = result.summary["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| {
+            let s = w.as_str().unwrap();
+            s.contains("google.com") && s.contains("URN publisher")
+        }));
+    }
+
+    #[test]
+    fn robots_txt_agentmap_parses() {
+        let robots = "User-agent: *\nDisallow: /private\nAgentmap: https://example.com/entries.json\n";
+        let urls = parse_robots_txt_agentmap(robots);
+        assert_eq!(urls, vec!["https://example.com/entries.json"]);
+    }
+
+    #[test]
+    fn robots_txt_agentmap_case_insensitive() {
+        let robots = "AGENTMAP: https://example.com/a.json\nagentmap: https://example.com/b.json\n";
+        let urls = parse_robots_txt_agentmap(robots);
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn robots_txt_agentmap_empty() {
+        let robots = "User-agent: *\nDisallow: /\n";
+        let urls = parse_robots_txt_agentmap(robots);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn robots_txt_agentmap_multiple() {
+        let robots = "Agentmap: https://a.com/1.json\nAgentmap: https://b.com/2.json\n";
+        let urls = parse_robots_txt_agentmap(robots);
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn registrable_domain_works() {
+        assert_eq!(registrable_domain("www.example.com"), Some("example.com".into()));
+        assert_eq!(registrable_domain("api.acme.co.uk"), Some("acme.co.uk".into()));
+        assert_eq!(registrable_domain("example.com"), Some("example.com".into()));
+    }
+
+    #[test]
+    fn registrable_domain_tld_only() {
+        assert_eq!(registrable_domain("com"), None);
+    }
+
+    #[test]
+    fn urn_check_cross_origin() {
+        let warn = check_urn_publisher("urn:air:google.com:server:x", Some("evil.com"));
+        assert!(warn.is_some());
+    }
+
+    #[test]
+    fn urn_check_same_origin() {
+        let warn = check_urn_publisher("urn:air:acme.com:server:x", Some("acme.com"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn urn_check_subdomain_matches() {
+        let warn = check_urn_publisher("urn:air:acme.com:server:x", Some("api.acme.com"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn urn_check_no_origin() {
+        let warn = check_urn_publisher("urn:air:google.com:server:x", None);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn urn_check_non_urn_identifier() {
+        let warn = check_urn_publisher("some-other-id", Some("evil.com"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn trust_identity_matching() {
+        let entry = serde_json::json!({
+            "trustManifest": { "identity": "example.com" }
+        });
+        let warn = check_trust_identity(&entry, Some("example.com"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn trust_identity_mismatch() {
+        let entry = serde_json::json!({
+            "trustManifest": { "identity": "other.com" }
+        });
+        let warn = check_trust_identity(&entry, Some("example.com"));
+        assert!(warn.is_some());
+    }
+
+    #[test]
+    fn trust_identity_no_manifest() {
+        let entry = serde_json::json!({});
+        let warn = check_trust_identity(&entry, Some("example.com"));
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn trust_identity_subdomain() {
+        let entry = serde_json::json!({
+            "trustManifest": { "identity": "api.acme.com" }
+        });
+        let warn = check_trust_identity(&entry, Some("www.acme.com"));
+        assert!(warn.is_none());
     }
 }

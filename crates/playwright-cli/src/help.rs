@@ -516,6 +516,8 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--tab <targetId>", "tab to use with --once"),
                 ("--json", "emit JSON instead of human-readable text"),
                 ("--no-probe", "skip well-known probe requests"),
+                ("--probe robots", "also probe /robots.txt for Agentmap: lines"),
+                ("--follow", "fetch nested ARD catalogs one level deep and follow link targets"),
                 ("--exec <cmd>", "run a command for each event (not available in wasm)"),
                 ("--exec-timeout <seconds>", "timeout for --exec commands (default: 10)"),
                 ("--lick", "write events as slicc lick files under ~/.slicc/"),

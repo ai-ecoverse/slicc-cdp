@@ -6,7 +6,8 @@ use crate::session;
 use discovery::{
     classify_response, classify_slicc_handoff, default_classifiers,
     default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
-    parse_link_header, ClassifierRegistry, DedupSet, DiscoveryEvent,
+    parse_link_header, classify_ard_body, parse_robots_txt_agentmap,
+    ClassifierRegistry, DedupSet, DiscoveryEvent,
     ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
 use serde_json::{json, Value};
@@ -128,6 +129,7 @@ struct WatcherState {
     sessions: BTreeMap<String, SessionState>,
     json_mode: bool,
     follow_mode: bool,
+    robots_probe: bool,
     events_emitted: usize,
     event_cursor: usize,
     sink: Sink,
@@ -156,6 +158,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let once_tab = invocation.flags.get("tab").cloned();
     let no_probe = invocation.flags.contains_key("no-probe");
     let follow_mode = invocation.flags.contains_key("follow");
+    let robots_probe = invocation.flags.get("probe").map_or(false, |v| v == "robots");
     let exec_cmd = invocation.flags.get("exec").cloned();
     let lick_mode = invocation.flags.contains_key("lick");
     let exec_timeout = invocation
@@ -221,6 +224,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         sessions: BTreeMap::new(),
         json_mode,
         follow_mode,
+        robots_probe,
         events_emitted: 0,
         event_cursor: 0,
         sink: sink.clone(),
@@ -911,38 +915,40 @@ fn collect_page_signals(cdp: &mut Cdp, session: &str) -> Vec<(String, Value)> {
         json!({ "expression": js, "returnByValue": true, "awaitPromise": true }),
         Some(session),
     );
-    if let Ok(result) = result {
-        let value_str = result
-            .pointer("/result/value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("{}");
-        if let Ok(parsed) = serde_json::from_str::<Value>(value_str) {
-            if parsed.get("webmcp").and_then(|v| v.as_bool()) == Some(true) {
-                let tools = parsed.get("tools").cloned().unwrap_or(json!([]));
-                let has_tools = tools.as_array().map_or(false, |a| !a.is_empty());
-                if has_tools {
-                    signals.push(("webmcp".to_string(), json!({ "tools": tools })));
-                }
-            }
-            if let Some(links) = parsed.get("links").and_then(|v| v.as_array()) {
-                for link in links {
-                    let rel = link
-                        .get("rel")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    let href = link
-                        .get("href")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if known_link_rels().contains(&rel.as_str()) && !href.is_empty() && !cdp.guard().url(&href) {
-                        signals.push((
-                            "html-link".to_string(),
-                            json!({ "rel": rel, "href": href }),
-                        ));
-                    }
-                }
+    let parsed = match result {
+        Ok(ref r) => {
+            let value_str = r
+                .pointer("/result/value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            serde_json::from_str::<Value>(value_str).unwrap_or(Value::Object(serde_json::Map::new()))
+        }
+        Err(_) => Value::Object(serde_json::Map::new()),
+    };
+    if parsed.get("webmcp").and_then(|v| v.as_bool()) == Some(true) {
+        let tools = parsed.get("tools").cloned().unwrap_or(json!([]));
+        let has_tools = tools.as_array().map_or(false, |a| !a.is_empty());
+        if has_tools {
+            signals.push(("webmcp".to_string(), json!({ "tools": tools })));
+        }
+    }
+    if let Some(links) = parsed.get("links").and_then(|v| v.as_array()) {
+        for link in links {
+            let rel = link
+                .get("rel")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let href = link
+                .get("href")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if known_link_rels().contains(&rel.as_str()) && !href.is_empty() && !cdp.guard().url(&href) {
+                signals.push((
+                    "html-link".to_string(),
+                    json!({ "rel": rel, "href": href }),
+                ));
             }
         }
     }
@@ -1060,9 +1066,13 @@ fn run_probes(
 
         if let Some(probe_match) = probe_match_result
         {
-            let classification = state
-                .classifiers
-                .classify(&probe_match.probe.standard, &probe_match.body);
+            let classification = if probe_match.probe.standard == "ard" {
+                Some(classify_ard_body(&probe_match.body, Some(origin)))
+            } else {
+                state
+                    .classifiers
+                    .classify(&probe_match.probe.standard, &probe_match.body)
+            };
             let (validity, summary, reason) = match classification {
                 Some(c) => (c.status, c.summary, c.reason),
                 None => (
@@ -1083,12 +1093,83 @@ fn run_probes(
                 page: page_url.clone(),
                 target_id: target_id.clone(),
                 status: validity,
-                summary,
+                summary: summary.clone(),
                 reason,
             };
             output.push_str(&emit_event(state, &event));
+            if state.follow_mode && event.standard == "ard" {
+                output.push_str(&follow_ard_catalogs(
+                    cdp, state, session_id, origin, &frame_id, &page_url, &target_id, &summary,
+                ));
+            }
         }
     }
+
+    if state.robots_probe {
+        let robots_url = format!("{origin}/robots.txt");
+        if !cdp.guard().url(&robots_url) && !is_reserved_cdp_origin(&robots_url) {
+            let robots_result = isolated_world_probe(cdp, session_id, &frame_id, &robots_url);
+            let (r_status, r_ct, r_body) = match robots_result {
+                IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
+                IsolatedProbeResult::Final => (0, String::new(), String::new()),
+                IsolatedProbeResult::Unavailable => {
+                    match native_probe(&robots_url, "text/plain") {
+                        Some((s, ct, b)) => (s, ct, b),
+                        None => (0, String::new(), String::new()),
+                    }
+                }
+            };
+            if r_status == 200 && r_ct.starts_with("text/") {
+                let agentmap_urls = parse_robots_txt_agentmap(&r_body);
+                for am_url in agentmap_urls {
+                    let resolved = match Url::parse(&am_url).or_else(|_| Url::parse(origin).and_then(|base| base.join(&am_url))) {
+                        Ok(u) => u.to_string(),
+                        Err(_) => continue,
+                    };
+                    if cdp.guard().url(&resolved) || is_reserved_cdp_origin(&resolved) {
+                        continue;
+                    }
+                    if !state.dedup.is_new(origin, "ard", &resolved) {
+                        continue;
+                    }
+                    let am_result = isolated_world_probe(cdp, session_id, &frame_id, &resolved);
+                    let (am_status, am_ct, am_body) = match am_result {
+                        IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
+                        IsolatedProbeResult::Final => continue,
+                        IsolatedProbeResult::Unavailable => {
+                            match native_probe(&resolved, "application/json") {
+                                Some((s, ct, b)) => (s, ct, b),
+                                None => continue,
+                            }
+                        }
+                    };
+                    if am_status == 200 && is_json_content_type(&am_ct) {
+                        let classification = classify_ard_body(&am_body, Some(origin));
+                        let summary_clone = classification.summary.clone();
+                        let event = DiscoveryEvent {
+                            v: EVENT_VERSION,
+                            standard: "ard".into(),
+                            origin: origin.to_string(),
+                            url: resolved,
+                            via: Via::WellKnown,
+                            page: page_url.clone(),
+                            target_id: target_id.clone(),
+                            status: classification.status,
+                            summary: classification.summary,
+                            reason: classification.reason,
+                        };
+                        output.push_str(&emit_event(state, &event));
+                        if state.follow_mode {
+                            output.push_str(&follow_ard_catalogs(
+                                cdp, state, session_id, origin, &frame_id, &page_url, &target_id, &summary_clone,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     output
 }
 
@@ -1587,9 +1668,13 @@ fn follow_links(
             continue;
         }
 
-        let classification = state.classifiers.classify(&standard, &body);
+        let classification = if standard == "ard" {
+            Some(classify_ard_body(&body, Some(&origin)))
+        } else {
+            state.classifiers.classify(&standard, &body)
+        };
         let (validity, summary, reason) = match classification {
-            Some(c) => (c.status, c.summary, c.reason),
+            Some(c) => (c.status, c.summary.clone(), c.reason),
             None => (
                 Validity::Valid,
                 json!({
@@ -1611,10 +1696,15 @@ fn follow_links(
             page: page_url.clone(),
             target_id: target_id.clone(),
             status: validity,
-            summary,
+            summary: summary.clone(),
             reason,
         };
         output.push_str(&emit_event(state, &event));
+        if standard == "ard" && state.follow_mode {
+            output.push_str(&follow_ard_catalogs(
+                cdp, state, session_id, &origin, &frame_id, &page_url, &target_id, &summary,
+            ));
+        }
     }
 
     if !failures.is_empty() {
@@ -1637,6 +1727,71 @@ fn follow_links(
     }
 
     output
+}
+
+fn follow_ard_catalogs(
+    cdp: &mut Cdp,
+    state: &mut WatcherState,
+    session_id: &str,
+    origin: &str,
+    frame_id: &str,
+    page_url: &str,
+    target_id: &str,
+    summary: &Value,
+) -> String {
+    let mut output = String::new();
+    let catalogs = match summary.get("catalogs").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => return output,
+    };
+    for catalog in &catalogs {
+        let cat_url = match catalog.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        if cdp.guard().url(&cat_url) || is_reserved_cdp_origin(&cat_url) {
+            continue;
+        }
+        let dedup_key = format!("follow-catalog:{cat_url}");
+        if !state.dedup.is_new(origin, "ard-catalog", &dedup_key) {
+            continue;
+        }
+        let probe_result = isolated_world_probe(cdp, session_id, frame_id, &cat_url);
+        let (cat_status, cat_ct, cat_body) = match probe_result {
+            IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
+            IsolatedProbeResult::Final => continue,
+            IsolatedProbeResult::Unavailable => {
+                match native_probe(&cat_url, "application/json") {
+                    Some((s, ct, b)) => (s, ct, b),
+                    None => continue,
+                }
+            }
+        };
+        if cat_status != 200 || !is_json_content_type(&cat_ct) {
+            continue;
+        }
+        let cat_origin = extract_origin(&cat_url).unwrap_or_else(|| origin.to_string());
+        let classification = classify_ard_body(&cat_body, Some(&cat_origin));
+        let event = DiscoveryEvent {
+            v: EVENT_VERSION,
+            standard: "ard".into(),
+            origin: cat_origin,
+            url: cat_url,
+            via: Via::WellKnown,
+            page: page_url.to_string(),
+            target_id: target_id.to_string(),
+            status: classification.status,
+            summary: classification.summary,
+            reason: classification.reason,
+        };
+        output.push_str(&emit_event(state, &event));
+    }
+    output
+}
+fn is_json_content_type(ct: &str) -> bool {
+    let lower = ct.to_ascii_lowercase();
+    let media = lower.split(';').next().unwrap_or("").trim();
+    media == "application/json" || media.ends_with("+json")
 }
 
 pub fn extract_origin(url: &str) -> Option<String> {
@@ -1707,6 +1862,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1740,6 +1896,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
+            robots_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1772,6 +1929,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
+            robots_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1798,6 +1956,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
+            robots_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1832,6 +1991,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
+            robots_probe: false,
             
             
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
@@ -1918,6 +2078,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -1952,6 +2113,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -1986,6 +2148,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2100,6 +2263,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2129,6 +2293,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2293,6 +2458,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: false,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() },
         };
         let event = DiscoveryEvent {
@@ -2491,6 +2657,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2615,6 +2782,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2661,6 +2829,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         let event = DiscoveryEvent {
@@ -2745,6 +2914,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2784,6 +2954,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2821,6 +2992,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2857,6 +3029,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2914,6 +3087,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -2961,6 +3135,7 @@ mod tests {
             sessions: BTreeMap::new(),
             json_mode: true,
             follow_mode: false,
+            robots_probe: false,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -3043,6 +3218,44 @@ mod tests {
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn probe_robots_flag_parsed() {
+        let mut flags = BTreeMap::new();
+        flags.insert("off".to_string(), "true".to_string());
+        flags.insert("probe".to_string(), "robots".to_string());
+        let invocation = Invocation {
+            command: Some("discover".to_string()),
+            positionals: vec![],
+            flags,
+            multi: BTreeMap::new(),
+            cdp: None,
+            runtime: None,
+            session: None,
+            full_urls: false,
+            help: false,
+            command_help: false,
+            version: false,
+        };
+        let output = run(&invocation, None);
+        assert_eq!(output.code, 0);
+    }
+
+    #[test]
+    fn is_json_content_type_matches() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(is_json_content_type("application/ai-catalog+json"));
+        assert!(is_json_content_type("application/ai-registry+json"));
+        assert!(is_json_content_type("APPLICATION/JSON"));
+    }
+
+    #[test]
+    fn is_json_content_type_rejects() {
+        assert!(!is_json_content_type("text/html"));
+        assert!(!is_json_content_type("text/plain"));
+        assert!(!is_json_content_type("application/xml"));
     }
 
     #[test]

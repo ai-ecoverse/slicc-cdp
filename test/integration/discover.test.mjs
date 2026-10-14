@@ -792,3 +792,401 @@ Object.defineProperty(document, 'modelContext', {
     await settle(browser?.close());
   }
 });
+
+test('discover ARD', { timeout: 120_000 }, async (t) => {
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+
+    await t.test('well-known ard.json with MCP, skill and squatted URN', async () => {
+      const ardServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>ARD Fixture</title><p>hello</p>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          const origin = `http://127.0.0.1:${ardServer.address().port}`;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Fixture Site',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:weather`,
+                  displayName: 'Weather MCP',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/mcp/weather.json`,
+                  capabilities: ['WeatherTool'],
+                  representativeQueries: ['what is the weather'],
+                },
+                {
+                  identifier: `urn:air:127.0.0.1:skill:pptx`,
+                  displayName: 'PPTX Skill',
+                  type: 'application/agent-skills+md',
+                  url: `${origin}/skills/pptx`,
+                },
+                {
+                  identifier: 'urn:air:google.com:server:search',
+                  displayName: 'Squatted Google',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/fake-google`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => ardServer.listen(0, '127.0.0.1', r));
+      const ardOrigin = `http://127.0.0.1:${ardServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${ardOrigin}/`],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        const events = parseEvents(result.stdout);
+        const ardEvents = events.filter((e) => e.standard === 'ard' && e.via === 'well-known');
+        assert.equal(ardEvents.length, 1, `exactly one ard well-known event: ${result.stdout}`);
+        const ard = ardEvents[0];
+        assert.equal(ard.status, 'valid');
+        const entries = ard.summary.entries;
+        assert.ok(Array.isArray(entries), 'summary.entries must be an array');
+        assert.equal(
+          entries.length,
+          2,
+          `two usable entries (squatted excluded): ${JSON.stringify(entries)}`
+        );
+        for (const entry of entries) {
+          assert.ok(entry.type, 'each entry has a type field');
+          assert.ok(entry.identifier, 'each entry has an identifier');
+          assert.ok(entry.displayName, 'each entry has a displayName');
+        }
+        const mcpEntry = entries.find((e) => e.type === 'application/mcp-server-card+json');
+        assert.ok(mcpEntry, 'MCP server card entry present');
+        assert.ok(mcpEntry.capabilities, 'MCP entry has capabilities');
+        const skillEntry = entries.find((e) => e.type === 'application/agent-skills+md');
+        assert.ok(skillEntry, 'skill entry present');
+        const warnings = ard.summary.warnings;
+        assert.ok(Array.isArray(warnings) && warnings.length > 0, 'warnings present');
+        assert.ok(
+          warnings.some((w) => w.includes('google.com')),
+          `squatted URN warning mentions google.com: ${JSON.stringify(warnings)}`
+        );
+      } finally {
+        ardServer.closeAllConnections();
+        ardServer.close();
+      }
+    });
+
+    await t.test('link rel=ard in HTML head found from page scan', async () => {
+      const linkServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            link: '</ard-manifest.json>; rel="ard"',
+          });
+          res.end(
+            '<!doctype html><html><head><title>Link ARD</title></head><body><p>hi</p></body></html>'
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => linkServer.listen(0, '127.0.0.1', r));
+      const linkOrigin = `http://127.0.0.1:${linkServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${linkOrigin}/`],
+          cwd
+        );
+        assert.equal(
+          result.code,
+          0,
+          `exit ${result.code}, stderr: ${result.stderr}, stdout: ${result.stdout}`
+        );
+        const events = parseEvents(result.stdout);
+        const ardLink = events.find((e) => e.standard === 'ard' && e.via === 'link-header');
+        assert.ok(ardLink, `ard link-header event from Link header: ${result.stdout}`);
+        assert.ok(ardLink.url.includes('/ard-manifest.json'), `href resolved: ${ardLink.url}`);
+        const ardWellKnown = events.find((e) => e.standard === 'ard' && e.via === 'well-known');
+        assert.ok(!ardWellKnown, 'well-known probe returned 404, so no well-known ard event');
+      } finally {
+        linkServer.closeAllConnections();
+        linkServer.close();
+      }
+    });
+
+    await t.test('--probe robots fetches Agentmap, omitted without flag', async () => {
+      let robotsHitCount = 0;
+      const robotsServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Robots</title><p>hi</p>');
+          return;
+        }
+        if (url.pathname === '/robots.txt') {
+          robotsHitCount++;
+          const ardUrl = `http://127.0.0.1:${robotsServer.address().port}/entries.json`;
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end(`User-agent: *\nDisallow: /private\nAgentmap: ${ardUrl}\n`);
+          return;
+        }
+        if (url.pathname === '/entries.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Robots ARD',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:from-robots`,
+                  displayName: 'From Robots',
+                  type: 'application/mcp-server-card+json',
+                  url: `http://127.0.0.1:${robotsServer.address().port}/mcp.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(404, { 'content-type': 'text/plain' });
+          res.end('not found');
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => robotsServer.listen(0, '127.0.0.1', r));
+      const robotsOrigin = `http://127.0.0.1:${robotsServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        robotsHitCount = 0;
+        const withoutFlag = await runner.playwright(
+          ['discover', '--json', '--once', `${robotsOrigin}/`],
+          cwd
+        );
+        const eventsWithout = parseEvents(withoutFlag.stdout);
+        const robotsArdWithout = eventsWithout.filter(
+          (e) => e.standard === 'ard' && e.summary?.name === 'Robots ARD'
+        );
+        assert.equal(
+          robotsArdWithout.length,
+          0,
+          `no robots ARD without --probe robots: ${withoutFlag.stdout}`
+        );
+        assert.equal(robotsHitCount, 0, 'robots.txt not fetched without flag');
+
+        const cwd2 = await runner.fresh();
+        await runner.clearSession(cwd2);
+        robotsHitCount = 0;
+        const withFlag = await runner.playwright(
+          ['discover', '--json', '--once', `${robotsOrigin}/`, '--probe', 'robots'],
+          cwd2
+        );
+        assert.equal(withFlag.code, 0, `stderr: ${withFlag.stderr}`);
+        const eventsWith = parseEvents(withFlag.stdout);
+        const robotsArd = eventsWith.filter(
+          (e) => e.standard === 'ard' && e.summary?.name === 'Robots ARD'
+        );
+        assert.equal(robotsArd.length, 1, `one ARD from robots: ${withFlag.stdout}`);
+        assert.ok(robotsHitCount > 0, 'robots.txt was fetched with --probe robots');
+      } finally {
+        robotsServer.closeAllConnections();
+        robotsServer.close();
+      }
+    });
+
+    await t.test('--follow fetches nested catalog one level only', async () => {
+      let level2Hit = false;
+      const catalogServer = createServer((req, res) => {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        const origin = `http://127.0.0.1:${catalogServer.address().port}`;
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><title>Catalog</title><p>hi</p>');
+          return;
+        }
+        if (url.pathname === '/.well-known/ard.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Root',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:root-tool`,
+                  displayName: 'Root Tool',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/mcp.json`,
+                },
+                {
+                  identifier: `urn:air:127.0.0.1:catalog:nested`,
+                  displayName: 'Nested Catalog',
+                  type: 'application/ai-catalog+json',
+                  url: `${origin}/nested.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        if (url.pathname === '/nested.json') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Nested',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:nested-tool`,
+                  displayName: 'Nested Tool',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/nested-mcp.json`,
+                },
+                {
+                  identifier: `urn:air:127.0.0.1:catalog:deeper`,
+                  displayName: 'Deeper Catalog',
+                  type: 'application/ai-catalog+json',
+                  url: `${origin}/deeper.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        if (url.pathname === '/deeper.json') {
+          level2Hit = true;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              name: 'Deeper',
+              entries: [
+                {
+                  identifier: `urn:air:127.0.0.1:server:deep-tool`,
+                  displayName: 'Deep Tool',
+                  type: 'application/mcp-server-card+json',
+                  url: `${origin}/deep-mcp.json`,
+                },
+              ],
+            })
+          );
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end('not found');
+      });
+      await new Promise((r) => catalogServer.listen(0, '127.0.0.1', r));
+      const catalogOrigin = `http://127.0.0.1:${catalogServer.address().port}`;
+      try {
+        const cwd = await runner.fresh();
+        await runner.clearSession(cwd);
+        const result = await runner.playwright(
+          ['discover', '--json', '--once', `${catalogOrigin}/`, '--follow'],
+          cwd
+        );
+        assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+        const events = parseEvents(result.stdout);
+        const ardEvents = events.filter((e) => e.standard === 'ard');
+        assert.ok(ardEvents.length >= 2, `at least root + nested ARD events: ${result.stdout}`);
+        const rootArd = ardEvents.find((e) => e.summary?.name === 'Root');
+        assert.ok(rootArd, `root ARD event: ${result.stdout}`);
+        assert.ok(rootArd.summary.catalogs?.length > 0, 'root reports nested catalogs');
+        const nestedArd = ardEvents.find((e) => e.summary?.name === 'Nested');
+        assert.ok(nestedArd, `nested catalog followed: ${result.stdout}`);
+        assert.ok(
+          !level2Hit,
+          'deeper.json (level 2) must NOT be fetched — follow is one level only'
+        );
+      } finally {
+        catalogServer.closeAllConnections();
+        catalogServer.close();
+      }
+    });
+  } finally {
+    await settle(browser?.close());
+  }
+});
+
+test('discover ARD html-link without probe', { timeout: 60_000 }, async () => {
+  let wellKnownHit = false;
+  const htmlLinkServer = createServer((req, res) => {
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    if (url.pathname === '/') {
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        link: '</ard-manifest.json>; rel="ard"',
+      });
+      res.end(
+        '<!doctype html><html><head><link rel="ard" href="/ard-manifest.json"><title>HTML Link ARD</title></head><body><p>hi</p></body></html>'
+      );
+      return;
+    }
+    if (url.pathname === '/.well-known/ard.json') {
+      wellKnownHit = true;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ name: 'Should Not Reach' }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found');
+  });
+  await new Promise((r) => htmlLinkServer.listen(0, '127.0.0.1', r));
+  const htmlLinkOrigin = `http://127.0.0.1:${htmlLinkServer.address().port}`;
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+    const cwd = await runner.fresh();
+    await runner.clearSession(cwd);
+    const result = await runner.playwright(
+      ['discover', '--json', '--no-probe', '--once', `${htmlLinkOrigin}/`],
+      cwd
+    );
+    assert.equal(
+      result.code,
+      0,
+      `exit ${result.code}, stderr: ${result.stderr}, stdout: ${result.stdout}`
+    );
+    const events = parseEvents(result.stdout);
+    const ardEvent = events.find((e) => e.standard === 'ard');
+    assert.ok(ardEvent, `ard event expected: ${result.stdout}`);
+    assert.ok(
+      ardEvent.via === 'html-link' || ardEvent.via === 'link-header',
+      `via must be html-link or link-header: ${ardEvent.via}`
+    );
+    assert.ok(ardEvent.url.includes('/ard-manifest.json'), `href resolved: ${ardEvent.url}`);
+    assert.ok(!wellKnownHit, '/.well-known/ard.json must not be fetched when --no-probe is set');
+  } finally {
+    await settle(browser?.close());
+    htmlLinkServer.closeAllConnections();
+    htmlLinkServer.close();
+  }
+});
