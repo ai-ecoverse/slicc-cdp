@@ -2361,6 +2361,7 @@ fn follow_ard_catalogs(
             reason: classification.reason,
         };
         output.push_str(&emit_event(state, &event));
+        output.push_str(&emit_nlweb_from_catalog(state, &event.origin, page_url, target_id, &event.summary));
     }
     output
 }
@@ -4517,6 +4518,32 @@ mod tests {
         let mut state = nlweb_state();
         let output = follow_links(&mut cdp, &mut state, "S1");
         assert!(output.lines().any(|l| l.contains(r#""standard":"nlweb""#) && l.contains(r#""via":"catalog""#)), "{output}");
+    }
+
+    #[test]
+    fn a_followed_catalog_reports_its_nlweb_entry() {
+        let child = json!({
+            "name": "Child",
+            "entries": [{ "identifier": "urn:nlweb:search", "displayName": "NLWeb Search", "type": "application/nlweb+json", "url": "https://example.com/ask" }]
+        })
+        .to_string();
+        let (mut cdp, _) = scripted_cdp(vec![
+            json!({ "targetInfo": { "targetId": "F1", "type": "page", "url": "https://example.com/" } }),
+            json!({ "executionContextId": 7 }),
+            fetched(200, "application/json", &child),
+        ]);
+        let mut state = nlweb_state();
+        let parent = json!({ "catalogs": [{ "url": "https://example.com/child.json" }] });
+        let output = follow_ard_catalogs(
+            &mut cdp, &mut state, "S1", "https://example.com", "F1", "https://example.com/", "T1", &parent,
+        );
+        let nlweb: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["standard"] == "nlweb")
+            .collect();
+        assert_eq!(nlweb.len(), 1, "{output}");
+        assert_eq!(nlweb[0]["summary"]["askUrl"], "https://example.com/ask");
     }
 
     #[test]
