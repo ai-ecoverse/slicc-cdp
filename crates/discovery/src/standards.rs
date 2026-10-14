@@ -537,6 +537,14 @@ fn classify_poppy_value(value: &Value, origin_domain: Option<&str>) -> Classific
         .and_then(|o| o.get("domain"))
         .and_then(|d| d.as_str())
         .unwrap_or("");
+    if org_domain.is_empty() {
+        return Classification {
+            standard: "poppy".into(),
+            status: Validity::Invalid,
+            summary: Value::Null,
+            reason: Some("missing organization.domain".into()),
+        };
+    }
     if let Some(host) = origin_domain {
         if !org_domain.is_empty() {
             let org_lower = org_domain.to_ascii_lowercase();
@@ -1706,6 +1714,17 @@ mod tests {
         let result = classify_poppy_body(&body, Some("https://example.com"));
         assert_eq!(result.status, Validity::Invalid);
         assert!(result.reason.unwrap().contains("at least one of"));
+    }
+
+    #[test]
+    fn poppy_missing_org_domain() {
+        let body = serde_json::json!({
+            "protocol_version": "0.1",
+            "web": {}
+        }).to_string();
+        let result = classify_poppy_body(&body, Some("https://example.com"));
+        assert_eq!(result.status, Validity::Invalid);
+        assert!(result.reason.unwrap().contains("organization.domain"));
     }
 
     #[test]
