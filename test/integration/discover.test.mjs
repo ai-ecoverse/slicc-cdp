@@ -1603,3 +1603,203 @@ test('discover ai-catalog', { timeout: 120_000 }, async (t) => {
     await settle(browser?.close());
   }
 });
+
+test('discover poppy', { timeout: 120_000 }, async (t) => {
+  let browser;
+  let poppyServer;
+  let redirectServer;
+  let crossSiteServer;
+  let protectedServer;
+  let mismatchServer;
+  try {
+    browser = await launchBrowser();
+    const cli = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+    );
+    const curl = path.join(
+      nativeDir,
+      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+    );
+    const runner = nativeRunner(cli, curl, browser.wsUrl);
+
+    const validPoppy = JSON.stringify({
+      protocol_version: '0.1',
+      organization: { name: 'Acme Corp', domain: '127.0.0.1' },
+      web: { home: '/' },
+    });
+
+    poppyServer = createServer((req, res) => {
+      if (req.url === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Poppy</title>');
+        return;
+      }
+      if (req.url === '/.well-known/poppy.json') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(validPoppy);
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => poppyServer.listen(0, '127.0.0.1', resolve));
+    const poppyOrigin = `http://127.0.0.1:${poppyServer.address().port}`;
+
+    await t.test('direct poppy.json hit', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${poppyOrigin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const poppy = events.find((e) => e.standard === 'poppy' && e.via === 'well-known');
+      assert.ok(poppy, `poppy event expected: ${result.stdout}`);
+      assert.equal(poppy.status, 'valid');
+      assert.equal(poppy.summary.protocolVersion, '0.1');
+      assert.equal(poppy.summary.organization.name, 'Acme Corp');
+    });
+
+    redirectServer = createServer((req, res) => {
+      if (req.url === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Redirect</title>');
+        return;
+      }
+      if (req.url === '/.well-known/poppy.json') {
+        res.writeHead(302, { location: `${poppyOrigin}/.well-known/poppy.json` });
+        res.end();
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => redirectServer.listen(0, '127.0.0.1', resolve));
+    const redirectOrigin = `http://127.0.0.1:${redirectServer.address().port}`;
+
+    await t.test('same-site redirect hit', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${redirectOrigin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const poppy = events.find((e) => e.standard === 'poppy');
+      assert.ok(poppy, `poppy after redirect expected: ${result.stdout}`);
+      assert.equal(poppy.status, 'valid');
+    });
+
+    let crossSiteRequests = 0;
+    crossSiteServer = createServer((req, res) => {
+      if (req.url === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Cross</title>');
+        return;
+      }
+      if (req.url === '/.well-known/poppy.json') {
+        res.writeHead(302, { location: 'http://evil.test/.well-known/poppy.json' });
+        res.end();
+        return;
+      }
+      crossSiteRequests++;
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => crossSiteServer.listen(0, '127.0.0.1', resolve));
+    const crossSiteOrigin = `http://127.0.0.1:${crossSiteServer.address().port}`;
+
+    await t.test('cross-site redirect refused', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${crossSiteOrigin}/`],
+        cwd
+      );
+      const events = parseEvents(result.stdout);
+      const poppy = events.find((e) => e.standard === 'poppy');
+      assert.ok(!poppy, `no poppy event after cross-site redirect: ${result.stdout}`);
+    });
+
+    protectedServer = createServer((req, res) => {
+      if (req.url === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Protected</title>');
+        return;
+      }
+      if (req.url === '/.well-known/poppy.json') {
+        res.writeHead(302, { location: 'http://127.0.0.1:9222/.well-known/poppy.json' });
+        res.end();
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => protectedServer.listen(0, '127.0.0.1', resolve));
+    const protectedOrigin = `http://127.0.0.1:${protectedServer.address().port}`;
+
+    await t.test('redirect to protected origin refused', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${protectedOrigin}/`],
+        cwd
+      );
+      const events = parseEvents(result.stdout);
+      const poppy = events.find((e) => e.standard === 'poppy');
+      assert.ok(!poppy, `no poppy after redirect to protected: ${result.stdout}`);
+    });
+
+    const mismatchPoppy = JSON.stringify({
+      protocol_version: '0.1',
+      organization: { name: 'Evil', domain: 'evil.com' },
+      web: { home: '/' },
+    });
+    mismatchServer = createServer((req, res) => {
+      if (req.url === '/') {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<title>Mismatch</title>');
+        return;
+      }
+      if (req.url === '/.well-known/poppy.json') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(mismatchPoppy);
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('not found');
+    });
+    await new Promise((resolve) => mismatchServer.listen(0, '127.0.0.1', resolve));
+    const mismatchOrigin = `http://127.0.0.1:${mismatchServer.address().port}`;
+
+    await t.test('domain mismatch flagged', async () => {
+      const cwd = await runner.fresh();
+      await runner.clearSession(cwd);
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${mismatchOrigin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const poppy = events.find((e) => e.standard === 'poppy');
+      assert.ok(poppy, `poppy event expected: ${result.stdout}`);
+      assert.equal(poppy.status, 'invalid');
+      assert.ok(poppy.reason.includes('does not match'), `reason: ${poppy.reason}`);
+    });
+  } finally {
+    poppyServer?.closeAllConnections();
+    poppyServer?.close();
+    redirectServer?.closeAllConnections();
+    redirectServer?.close();
+    crossSiteServer?.closeAllConnections();
+    crossSiteServer?.close();
+    protectedServer?.closeAllConnections();
+    protectedServer?.close();
+    mismatchServer?.closeAllConnections();
+    mismatchServer?.close();
+    await settle(browser?.close());
+  }
+});
