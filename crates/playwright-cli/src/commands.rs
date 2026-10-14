@@ -129,7 +129,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let result = match command {
         "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report, &mut started),
         "close" | "tab-close" => cmd_close(&mut cdp, &mut state, invocation, &mut report),
-        "goto" => cmd_goto(&mut cdp, &mut state, invocation, &mut report),
+        "goto" | "navigate" => cmd_goto(&mut cdp, &mut state, invocation, &mut report),
         "snapshot" => cmd_snapshot(&mut cdp, &mut state, invocation, &mut report),
         "click" => cmd_click(&mut cdp, &mut state, invocation, &mut report),
         "fill" => cmd_fill(&mut cdp, &mut state, invocation, &mut report),
@@ -332,8 +332,9 @@ fn cmd_goto(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
+    let command = invocation.command.as_deref().unwrap_or("goto");
     let Some(url) = invocation.positionals.first() else {
-        return Output::err("goto requires a URL\n");
+        return Output::err(format!("{command} requires a URL\n"));
     };
     report.url(url.as_str());
     let pages = match visible_pages(cdp, state) {

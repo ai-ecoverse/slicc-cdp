@@ -20,6 +20,7 @@ pub fn global_help() -> String {
         row("open [url]", "open the browser"),
         row("close", "close the browser"),
         row("goto <url>", "navigate to a url"),
+        row("navigate <url>", "navigate to a url"),
         row("type <text>", "type text into editable element"),
         row("click <target> [button]", "perform click on a web page"),
         row("fill <target> <text>", "fill text into editable element"),
@@ -154,6 +155,12 @@ fn implemented_page(name: &str) -> Option<String> {
         "close" => page("close ", &["Close the browser"], &[], &[]),
         "goto" => page(
             "goto <url>",
+            &["Navigate to a URL"],
+            &[("<url>", "the url to navigate to")],
+            &[],
+        ),
+        "navigate" => page(
+            "navigate <url>",
             &["Navigate to a URL"],
             &[("<url>", "the url to navigate to")],
             &[],

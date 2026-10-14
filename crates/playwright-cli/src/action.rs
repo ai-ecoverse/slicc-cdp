@@ -12,7 +12,7 @@ impl Report {
     pub fn for_command(command: &str) -> Self {
         let kind = match command {
             "open" | "tab-new" => "open",
-            "goto" => "goto",
+            "goto" | "navigate" => "goto",
             "close" | "tab-close" => "close",
             "tab-select" => "select",
             "snapshot" => "snapshot",
@@ -1076,6 +1076,53 @@ mod tests {
             });
             assert!(set_file.is_some(), "expected DOM.setFileInputFiles call");
             let _ = std::fs::remove_file(&file_path);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn navigate_works_like_goto() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-navigate-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let peer = Peer::start(SliccReply::Silent, true);
+            let output = {
+                let _dir = DirGuard::enter(&root);
+                run(peer.port, &["navigate", "http://example.com/test"])
+            };
+            assert_eq!(output.code, 0, "{}", output.stderr);
+            assert!(output.stdout.contains("Navigated to"), "{}", output.stdout);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn navigate_requires_url() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-nav-nourl-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let peer = Peer::start(SliccReply::Silent, true);
+            let output = {
+                let _dir = DirGuard::enter(&root);
+                run(peer.port, &["navigate"])
+            };
+            assert_eq!(output.code, 1);
+            assert!(output.stderr.contains("navigate requires a URL"), "{}", output.stderr);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn navigate_refuses_teleport_flags() {
+            let _lock = CWD.lock().unwrap();
+            let root = std::env::temp_dir().join(format!("slicc-nav-teleport-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let peer = Peer::start(SliccReply::Silent, true);
+            for flag in ["--teleport-start=x", "--teleport-return=x", "--teleport-runtime=x"] {
+                let output = {
+                    let _dir = DirGuard::enter(&root);
+                    run(peer.port, &["navigate", flag, "http://example.com/"])
+                };
+                assert_eq!(output.code, 1, "{flag}");
+                assert!(output.stderr.contains("not implemented yet"), "{flag}: {}", output.stderr);
+            }
             let _ = std::fs::remove_dir_all(&root);
         }
     }
