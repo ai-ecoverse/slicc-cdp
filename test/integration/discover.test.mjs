@@ -17,9 +17,21 @@ function startDiscoverServer() {
     if (pathname === '/') {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
-        link: '</api>; rel="api-catalog"',
+        link: '</api>; rel="api-catalog", </llms.txt>; rel="https://llmstxt.org/rel/llms-txt", <https://github.com/o/r>; rel="https://www.sliccy.ai/rel/upskill"; branch=main; path="skills/foo"',
       });
       res.end('<!doctype html><title>Fixture</title><p>hello</p>');
+      return;
+    }
+
+    if (pathname === '/.well-known/api-catalog') {
+      res.writeHead(200, { 'content-type': 'application/linkset+json' });
+      res.end(JSON.stringify({ linkset: [{ anchor: '/' }] }));
+      return;
+    }
+
+    if (pathname === '/llms.txt') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('# Test Site\n> A test summary\n## Section One\n## Section Two\nBody text.\n');
       return;
     }
 
@@ -124,6 +136,56 @@ test('playwright-cli discover --once', { timeout: 60_000 }, async (t) => {
       assert.ok(ard, `ard: ${result.stdout}`);
       assert.equal(ard.status, 'valid');
       assert.equal(ard.summary.name, 'Test ARD');
+    });
+
+    await t.test('llms.txt well-known probe', async () => {
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${site.origin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const llmsTxt = events.find((e) => e.via === 'well-known' && e.standard === 'llms-txt');
+      assert.ok(llmsTxt, `llms-txt well-known probe: ${result.stdout}`);
+      assert.equal(llmsTxt.status, 'valid');
+      assert.ok(llmsTxt.summary.title, `llms-txt should have title`);
+    });
+
+    await t.test('api-catalog well-known probe', async () => {
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${site.origin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const apiCat = events.find((e) => e.via === 'well-known' && e.standard === 'api-catalog');
+      assert.ok(apiCat, `api-catalog well-known probe: ${result.stdout}`);
+      assert.equal(apiCat.status, 'valid');
+    });
+
+    await t.test('slicc-handoff upskill rel', async () => {
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${site.origin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const handoff = events.find((e) => e.standard === 'slicc-handoff');
+      assert.ok(handoff, `slicc-handoff: ${result.stdout}`);
+      assert.equal(handoff.summary.verb, 'upskill');
+      assert.equal(handoff.summary.branch, 'main');
+      assert.equal(handoff.summary.path, 'skills/foo');
+    });
+
+    await t.test('llms-txt link rel mapped', async () => {
+      const result = await runner.playwright(
+        ['discover', '--json', '--once', `${site.origin}/`],
+        cwd
+      );
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      const events = parseEvents(result.stdout);
+      const llmsLink = events.find((e) => e.via === 'link-header' && e.standard === 'llms-txt');
+      assert.ok(llmsLink, `llms-txt link-header: ${result.stdout}`);
     });
 
     await t.test('402 response', async () => {
