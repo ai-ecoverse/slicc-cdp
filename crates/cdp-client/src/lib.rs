@@ -5,6 +5,8 @@ pub mod hash;
 pub mod net;
 pub mod protected;
 #[cfg(test)]
+mod race;
+#[cfg(test)]
 mod raw;
 pub mod sanitize;
 pub mod shield;

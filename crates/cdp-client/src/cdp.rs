@@ -42,6 +42,8 @@ pub struct Cdp {
     protected_targets: BTreeSet<String>,
     guards: BTreeMap<String, String>,
     guard_sessions: BTreeSet<String>,
+    guarding: BTreeSet<String>,
+    abandoned: BTreeSet<String>,
     discovering: bool,
     requests: BTreeMap<String, bool>,
     handed: BTreeSet<(String, String)>,
@@ -73,6 +75,8 @@ impl Cdp {
             protected_targets: BTreeSet::new(),
             guards: BTreeMap::new(),
             guard_sessions: BTreeSet::new(),
+            guarding: BTreeSet::new(),
+            abandoned: BTreeSet::new(),
             discovering: false,
             requests: BTreeMap::new(),
             handed: BTreeSet::new(),
@@ -207,6 +211,13 @@ impl Cdp {
             if self.guard_sessions.contains(session) {
                 return Err(self.refusal());
             }
+        }
+        if params
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|target| self.abandoned.contains(target))
+        {
+            return Err(UNGUARDED.to_string());
         }
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
@@ -572,19 +583,27 @@ impl Cdp {
             .map_err(unguarded)?;
             self.discovering = true;
         }
-        let attached = self
-            .raw_call(
-                "Target.attachToTarget",
-                json!({ "targetId": target_id, "flatten": true }),
-                None,
-                Duration::from_secs(10),
-            )
-            .map_err(unguarded)?;
-        let session = attached
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| UNGUARDED.to_string())?
-            .to_string();
+        self.guarding.insert(target_id.to_string());
+        let attached = self.raw_call(
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+            None,
+            Duration::from_secs(10),
+        );
+        self.guarding.remove(target_id);
+        let session = match attached
+            .map(|value| value.get("sessionId").and_then(|v| v.as_str()).map(str::to_string))
+        {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                self.abandon(target_id);
+                return Err(UNGUARDED.to_string());
+            }
+            Err(message) => {
+                self.abandon(target_id);
+                return Err(unguarded(message));
+            }
+        };
         self.guard_sessions.insert(session.clone());
         self.guards.insert(target_id.to_string(), session.clone());
         let setup = [
@@ -606,17 +625,45 @@ impl Cdp {
             };
             if let Some(message) = failed {
                 self.guards.remove(target_id);
+                self.abandon(target_id);
                 let _ = self.raw_call(
                     "Target.detachFromTarget",
                     json!({ "sessionId": session }),
                     None,
                     Duration::from_secs(5),
                 );
-                self.guard_sessions.remove(&session);
                 return Err(unguarded(message));
             }
         }
         Ok(())
+    }
+
+    fn abandon(&mut self, target_id: &str) {
+        self.abandoned.insert(target_id.to_string());
+        self.protect_target(target_id);
+    }
+
+    fn adopt_guard_attach(&mut self, value: &Value) {
+        if value.get("method").and_then(|v| v.as_str()) != Some("Target.attachedToTarget") {
+            return;
+        }
+        let target = value
+            .pointer("/params/targetInfo/targetId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let Some(session) = value.pointer("/params/sessionId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if self.guarding.contains(target) {
+            self.guard_sessions.insert(session.to_string());
+        } else if self.abandoned.contains(target) {
+            self.guard_sessions.insert(session.to_string());
+            let _ = self.send(
+                "Target.detachFromTarget",
+                json!({ "sessionId": session }),
+                None,
+            );
+        }
     }
 
     fn block(&mut self, session_id: &str) {
@@ -810,7 +857,9 @@ impl Cdp {
                 if self.info_protected(&info, &[]) {
                     self.protect_target(&target);
                     value["params"]["targetInfo"] = shield::redacted(&info);
-                } else if !self.guard.target(url, false, Opener::Unknown) {
+                } else if !self.guard.target(url, false, Opener::Unknown)
+                    && !self.abandoned.contains(&target)
+                {
                     self.protected_targets.remove(&target);
                 }
             }
@@ -883,6 +932,7 @@ impl Cdp {
     }
 
     fn deliver(&mut self, mut value: Value) {
+        self.adopt_guard_attach(&value);
         self.watch(&mut value);
         if self.hidden(&value) {
             return;
