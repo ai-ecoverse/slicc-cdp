@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { chromium } from 'playwright-core';
+import { findBrowser } from '../../src/browser.js';
 
 export function freePort() {
   return new Promise((resolve, reject) => {
@@ -24,7 +24,7 @@ export async function launchBrowser(extraArgs = []) {
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let chromeLog = '';
   const child = spawn(
-    process.env.CHROMIUM_EXECUTABLE || chromium.executablePath(),
+    process.env.CHROMIUM_EXECUTABLE || (await findBrowser())?.executable,
     [
       `--remote-debugging-port=${port}`,
       '--remote-debugging-address=127.0.0.1',
