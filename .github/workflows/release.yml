@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: ${{ inputs.cert-only && 'release-cert' || 'release' }}
   cancel-in-progress: false
 
 jobs:
