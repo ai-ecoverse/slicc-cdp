@@ -83,7 +83,8 @@ impl Run {
                     .and_then(|v| v.as_str())
                     .unwrap_or("vector");
                 let ms = step.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                self.until(slot, Duration::from_millis(ms))
+                let paused = step.get("paused").and_then(|v| v.as_str());
+                self.until(slot, paused, Duration::from_millis(ms))
             }
             "read" => {
                 let slot = step
@@ -211,12 +212,15 @@ impl Run {
         }
     }
 
-    fn until(&mut self, slot: &str, span: Duration) -> Value {
+    fn until(&mut self, slot: &str, paused: Option<&str>, span: Duration) -> Value {
         let deadline = Instant::now() + span;
         let check = format!("globalThis[{:?}] === true", format!("{slot}:done"));
         let session = self.session.clone();
         loop {
             self.drain();
+            if paused.is_some_and(|needle| self.id_for(needle).is_some()) {
+                return json!({ "ok": true, "paused": true });
+            }
             let settled = self.cdp.call_for(
                 "Runtime.evaluate",
                 json!({ "expression": check, "returnByValue": true }),

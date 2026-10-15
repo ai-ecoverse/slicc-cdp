@@ -18,6 +18,7 @@ const spec = JSON.parse(await readFile(path.join(here, 'guard-vectors.json'), 'u
 const settleMs = 1500;
 const cliWaitMs = 6000;
 const fetchWaitMs = 5000;
+const probeSettleMs = 7000;
 const rowSeconds = 180;
 const tall = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
@@ -478,7 +479,7 @@ function fetchRun(ctx, c, side) {
       launch(probes.fetch.run(bracket('before')), 'before'),
       { op: 'until', slot: 'before', ms: fetchWaitMs },
       launch(probe.run(url), 'probe'),
-      { op: 'until', slot: 'probe', ms: fetchWaitMs },
+      { op: 'until', slot: 'probe', ms: probeSettleMs },
       launch(probes.fetch.run(bracket('after')), 'after'),
       { op: 'until', slot: 'after', ms: fetchWaitMs },
       { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
@@ -493,11 +494,16 @@ function fetchRun(ctx, c, side) {
         rule: { match, method: 'Fetch.continueRequest', params: {}, hold: true },
       },
       launch(probes.fetch.run(bracket('before')), 'before'),
-      { op: 'wait', ms: 500 },
+      { op: 'until', slot: 'before', ms: fetchWaitMs },
       launch(probe.run(url), 'probe', 20000),
-      { op: 'wait', ms: 500 },
+      {
+        op: 'until',
+        slot: 'probe',
+        paused: match,
+        ms: probeSettleMs,
+      },
       launch(probes.fetch.run(bracket('after')), 'after'),
-      { op: 'wait', ms: 500 },
+      { op: 'until', slot: 'after', ms: fetchWaitMs },
       { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
       { op: 'wait', ms: fetchWaitMs },
       { op: 'read', slot: 'probe' }
@@ -542,6 +548,9 @@ function judgeFetch(ctx, run, out) {
     if (!ok) problems.push(text);
   };
   if (failed) problems.push(`${failed.method}: ${String(failed.outcome.error).trim()}`);
+  for (const step of out.steps.filter((item) => item.op === 'until' && !item.outcome.ok)) {
+    problems.push(`until ${step.slot}: ${String(step.outcome.error).trim()}`);
+  }
   if (c.expect === 'subresource') {
     if (side === 'control') {
       want(paused.length > 0, 'no requestPaused for the ordinary url');
