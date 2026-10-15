@@ -8,5 +8,6 @@ pub mod protected;
 mod raw;
 pub mod sanitize;
 pub mod shield;
+pub mod state;
 #[cfg(test)]
 mod vectors;

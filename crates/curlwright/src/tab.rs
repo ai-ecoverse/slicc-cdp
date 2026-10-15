@@ -97,33 +97,35 @@ fn session_current() -> Option<String> {
 
 fn session_file() -> Option<PathBuf> {
     #[cfg(target_arch = "wasm32")]
-    {
-        Some(PathBuf::from(".playwright-cli").join("session.json"))
-    }
+    let cwd = cdp_client::state::wasm_cwd(|name| std::env::var(name).ok())?;
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        let cwd = std::env::current_dir().ok()?;
-        let canonical = cwd.canonicalize().unwrap_or(cwd);
-        session_path(&config_root(), &canonical)
-    }
+    let cwd = std::env::current_dir().ok()?;
+    let canonical = cwd.canonicalize().unwrap_or(cwd);
+    session_path(&config_root()?, &canonical)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn config_root() -> Option<String> {
+    cdp_client::state::wasm_config_root(|name| std::env::var(name).ok())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn config_root() -> String {
+fn config_root() -> Option<String> {
     #[cfg(test)]
     {
-        std::env::temp_dir()
-            .join("slicc-cdp-session-tests")
-            .to_string_lossy()
-            .into_owned()
+        Some(
+            std::env::temp_dir()
+                .join("slicc-cdp-session-tests")
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
     #[cfg(not(test))]
     {
-        crate::profiles::user_config_dir()
+        Some(crate::profiles::user_config_dir())
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn session_path(config_dir: &str, cwd: &std::path::Path) -> Option<PathBuf> {
     let root = std::path::Path::new(config_dir);
     if !root.is_absolute() {
@@ -258,7 +260,7 @@ mod tests {
             r#"{"current":"PLANTED","endpoint":"https://evil.example/json/version"}"#,
         )
         .unwrap();
-        let stored = super::session_path(&super::config_root(), &canonical).unwrap();
+        let stored = super::session_path(&super::config_root().unwrap(), &canonical).unwrap();
         if let Some(parent) = stored.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
