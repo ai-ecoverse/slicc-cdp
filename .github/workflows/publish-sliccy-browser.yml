@@ -67,7 +67,7 @@ jobs:
             echo "::error::no gitHead for ${NAME}@${VERSION}"
             exit 1
           fi
-          existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha 2>/dev/null || true)"
+          existing="$(git ls-remote origin "refs/tags/${tag}" | cut -f1)"
           if [ -n "$existing" ]; then
             if [ "$existing" != "$sha" ]; then
               echo "::warning::${tag} already points at ${existing}, not ${sha}; leaving it"
