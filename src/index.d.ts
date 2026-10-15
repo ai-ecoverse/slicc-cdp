@@ -90,6 +90,7 @@ export declare function launchBrowser(options?: {
   userDataDir?: string;
   port?: number;
   headless?: boolean;
+  sandbox?: boolean;
   args?: string[];
   env?: Record<string, string | undefined>;
   timeout?: number;

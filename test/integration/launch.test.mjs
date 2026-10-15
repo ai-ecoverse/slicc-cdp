@@ -17,6 +17,7 @@ const run = promisify(execFile);
 const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const pinned = pkg.config.chrome;
 const { CHROME_PATH: _, ...clean } = process.env;
+const sandbox = false;
 
 async function version(port) {
   return (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
@@ -39,7 +40,7 @@ test('the pinned Chrome for Testing is installed, found and reported by the bin'
 
 test('launchBrowser runs it on a throwaway profile on port 0 and removes the profile', async () => {
   const { executable } = await findBrowser({ env: clean, version: pinned });
-  const browser = await launchBrowser({ executable });
+  const browser = await launchBrowser({ executable, sandbox });
   try {
     assert.match(path.basename(browser.userDataDir), /^slicc-cdp-profile-/);
     assert.ok(browser.userDataDir.startsWith(tmpdir()));
@@ -55,12 +56,12 @@ test('launchBrowser runs it on a throwaway profile on port 0 and removes the pro
 test('a fixed port is waited on over /json/version, and a busy one is refused', async () => {
   const { executable } = await findBrowser({ env: clean, version: pinned });
   const port = await freePort();
-  const browser = await launchBrowser({ executable, port });
+  const browser = await launchBrowser({ executable, port, sandbox });
   try {
     assert.equal(browser.port, port);
     assert.equal((await version(port)).webSocketDebuggerUrl, browser.wsUrl);
     await assert.rejects(
-      launchBrowser({ executable, port }),
+      launchBrowser({ executable, port, sandbox }),
       new RegExp(`a browser already listens on 127.0.0.1:${port}`)
     );
   } finally {
@@ -73,7 +74,7 @@ test('a stale DevToolsActivePort in a given profile is not trusted, and the prof
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-stale-'));
   try {
     await writeFile(path.join(userDataDir, 'DevToolsActivePort'), '1\n/devtools/browser/stale\n');
-    const browser = await launchBrowser({ executable, userDataDir });
+    const browser = await launchBrowser({ executable, userDataDir, sandbox });
     try {
       assert.notEqual(browser.port, 1);
       assert.equal((await version(browser.port)).webSocketDebuggerUrl, browser.wsUrl);

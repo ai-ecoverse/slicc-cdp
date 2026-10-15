@@ -324,12 +324,13 @@ export const LAUNCH_FLAGS = [
   '--use-mock-keychain',
 ];
 
-export function launchArgs({ userDataDir, port = 0, headless = true, args = [] }) {
+export function launchArgs({ userDataDir, port = 0, headless = true, sandbox = true, args = [] }) {
   return [
     `--remote-debugging-port=${port}`,
     '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${userDataDir}`,
     ...(headless ? ['--headless'] : []),
+    ...(sandbox ? [] : ['--no-sandbox']),
     ...LAUNCH_FLAGS,
     ...args,
     'about:blank',
@@ -385,6 +386,7 @@ export async function launchBrowser({
   userDataDir,
   port = 0,
   headless = true,
+  sandbox = true,
   args = [],
   env = process.env,
   timeout = 30000,
@@ -410,7 +412,7 @@ export async function launchBrowser({
   const profile = userDataDir ?? (await mkdtemp(join(tmpdir(), PROFILE_PREFIX)));
   await rm(join(profile, 'DevToolsActivePort'), { force: true });
   let log = '';
-  const child = spawn(path, launchArgs({ userDataDir: profile, port, headless, args }), {
+  const child = spawn(path, launchArgs({ userDataDir: profile, port, headless, sandbox, args }), {
     env,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
