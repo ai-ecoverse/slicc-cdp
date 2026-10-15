@@ -625,7 +625,7 @@ impl Cdp {
             };
             if let Some(message) = failed {
                 self.guards.remove(target_id);
-                self.protect_target(target_id);
+                self.abandon(target_id);
                 let _ = self.raw_call(
                     "Target.detachFromTarget",
                     json!({ "sessionId": session }),
