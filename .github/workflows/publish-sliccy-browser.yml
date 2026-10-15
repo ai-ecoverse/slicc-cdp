@@ -52,7 +52,6 @@ jobs:
 
       - name: Tag the published commit
         env:
-          GH_TOKEN: ${{ github.token }}
           NAME: ${{ steps.publish.outputs.name }}
           VERSION: ${{ steps.publish.outputs.version }}
           PUBLISHED: ${{ steps.publish.outputs.published }}
@@ -76,6 +75,7 @@ jobs:
             fi
             exit 0
           fi
-          gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${tag}" -f "sha=${sha}" >/dev/null
+          git fetch --no-tags origin "$sha"
+          git push origin "${sha}:refs/tags/${tag}"
           echo "tagged ${tag} at ${sha}"
           echo "tagged \`${tag}\` at \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
