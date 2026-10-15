@@ -4,17 +4,22 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      cert-only:
+        description: Skip the release and append the cert line for the latest npm version to its GitHub release
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: ${{ inputs.cert-only && 'release-cert' || 'release' }}
   cancel-in-progress: false
 
 jobs:
   release:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && !inputs.cert-only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -91,6 +96,48 @@ jobs:
             exit 1
           fi
           sh scripts/publish-crates.sh "${{ steps.version.outputs.version }}"
+
+  cert:
+    needs: release
+    if: always() && (needs.release.outputs.released == 'true' || inputs.cert-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - name: Append the npm pack sha256 to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME: '@ai-ecoverse/slicc-cdp'
+          RELEASED: ${{ needs.release.outputs.version }}
+        run: |
+          version="${RELEASED:-$(npm view "$NAME" version)}"
+          deadline=$(( $(date +%s) + 600 ))
+          until head="$(npm view "${NAME}@${version}" gitHead 2>/dev/null)" && [ -n "$head" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::${NAME}@${version} has no gitHead on the registry"
+              exit 1
+            fi
+            sleep 10
+          done
+          dir="$(mktemp -d)"
+          file="$(cd "$dir" && npm pack "${NAME}@${version}" --silent)"
+          sha="$(sha256sum "${dir}/${file}" | cut -d' ' -f1)"
+          line="cert: ${NAME}@${version} sha256=${sha} gitHead=${head}"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          tag="v${version}"
+          body="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json body -q .body)"
+          if printf '%s\n' "$body" | grep -qxF "$line"; then
+            echo "${tag} already carries the cert line"
+            exit 0
+          fi
+          printf '%s\n\n%s\n' "$body" "$line" > "${dir}/notes.md"
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --notes-file "${dir}/notes.md"
 
   build-binaries:
     needs: release
@@ -189,7 +236,7 @@ jobs:
           exit "$failed"
 
   publish-release:
-    needs: [release, upload-assets, verify-signatures]
+    needs: [release, upload-assets, verify-signatures, cert]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
