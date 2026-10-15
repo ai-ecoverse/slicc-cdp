@@ -16,5 +16,21 @@
       "commitMessageTopic": "slicc-shared-web reusable workflows",
       "semanticCommitType": "ci"
     }
+  ],
+  "customDatasources": {
+    "chrome-for-testing-beta": {
+      "defaultRegistryUrlTemplate": "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json",
+      "transformTemplates": ["{\"releases\": [{\"version\": channels.Beta.version}]}"]
+    }
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^package\\.json$/"],
+      "matchStrings": ["\"chrome\":\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+\\.\\d+)\""],
+      "depNameTemplate": "chrome-for-testing",
+      "datasourceTemplate": "custom.chrome-for-testing-beta",
+      "versioningTemplate": "loose"
+    }
   ]
 }
