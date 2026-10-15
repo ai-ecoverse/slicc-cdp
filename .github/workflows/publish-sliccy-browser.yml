@@ -75,7 +75,11 @@ jobs:
             fi
             exit 0
           fi
-          git fetch --no-tags origin "$sha"
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::notice::dry run: would tag ${tag} at ${sha}; only the run that publishes from ${sha} can push it"
+            echo "dry run: would tag \`${tag}\` at \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           git push origin "${sha}:refs/tags/${tag}"
           echo "tagged ${tag} at ${sha}"
           echo "tagged \`${tag}\` at \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
