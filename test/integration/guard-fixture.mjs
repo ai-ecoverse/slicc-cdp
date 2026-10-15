@@ -27,6 +27,12 @@ export function browserArgs() {
   return [
     `--host-resolver-rules=${hosts.map((host) => `MAP ${host} 127.0.0.1`).join(', ')}`,
     '--no-proxy-server',
+    '--disable-extensions',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--password-store=basic',
+    '--use-mock-keychain',
     '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
   ];
 }

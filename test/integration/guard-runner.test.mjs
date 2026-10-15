@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
-import { run } from '@ai-ecoverse/slicc-browsers/guard-runner';
+import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, origins } from './guard-fixture.mjs';
@@ -62,15 +62,12 @@ function codedSkips(results) {
   return results.map((row) => {
     if (row.control !== 'skip') return row;
     const vector = set.vectors.find((v) => v.id === row.id);
-    const missing = vector.requires?.find((cap) => cap === 'autoAttach');
     const reason =
       vector.skip?.target === row.target
         ? vector.skip.reason
-        : missing
-          ? `not-supported:${missing}`
-          : vector.observable?.[row.target] === false
-            ? 'not-applicable:unobservable-target'
-            : row.reason;
+        : vector.observable?.[row.target] === false
+          ? 'not-applicable:unobservable-target'
+          : row.reason;
     return { ...row, reason };
   });
 }
@@ -80,81 +77,113 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',
   });
-  const fixture = await fixtureServer();
-  const targets = origins(fixture);
-  const browsers = new Map();
-  try {
-    const execution = await run(set, {
-      fixture,
-      targets,
-      capabilities: {
-        scope: 'slicc-cdp',
-        autoAttach: false,
-        browserSession: true,
-        browserContexts: true,
-      },
-      variant: Object.keys(set.variants),
-      parallel: process.platform === 'linux' ? 16 : 6,
-      clientFactory: async ({ slot, variant, detachDelay, vector, target }) => {
-        if (
-          vector.kind === 'text' ||
-          vector.requires?.includes('autoAttach') ||
-          vector.observable?.[target] === false ||
-          vector.skip?.target === target
-        )
-          return {};
-        const pool = slot;
-        if (!browsers.has(pool)) browsers.set(pool, launchBrowser(browserArgs()));
-        const browser = await browsers.get(pool);
-        const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
-        const unguarded = await observer(browser.wsUrl);
-        return {
-          client,
-          unguarded,
-          close: async () => {
+  const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 6);
+  const executeTarget = async (target) => {
+    const fixture = await fixtureServer();
+    const targets = origins(fixture);
+    const browsers = new Map();
+    const selected = {
+      ...set,
+      vectors: set.vectors
+        .filter((vector) => vector.targets.includes(target))
+        .map((vector) => ({ ...vector, targets: [target] })),
+    };
+    try {
+      const execution = await run(selected, {
+        fixture,
+        targets,
+        capabilities: {
+          scope: 'slicc-cdp',
+          autoAttach: true,
+          browserSession: true,
+          browserContexts: true,
+        },
+        variant: Object.keys(set.variants),
+        parallel,
+        clientFactory: async ({ slot, variant, detachDelay, vector }) => {
+          t.signal.throwIfAborted();
+          if (
+            vector.kind === 'text' ||
+            vector.observable?.[target] === false ||
+            vector.skip?.target === target
+          )
+            return {};
+          if (!browsers.has(slot)) browsers.set(slot, launchBrowser(browserArgs()));
+          const browser = await browsers.get(slot);
+          const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
+          let unguarded;
+          try {
+            unguarded = await observer(browser.wsUrl);
+          } catch (error) {
             await client.close();
-            await unguarded.close();
-          },
-        };
-      },
-      log: (row) => {
-        if ([row.control, row.guarded, row.live].includes('fail'))
-          process.stdout.write(`${JSON.stringify(row)}\n`);
-      },
-    });
-    const report = execution.summary({
-      guard: 'slicc-cdp',
-      sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
-    });
-    report.results = codedSkips(report.results);
-    report.skipped = report.results
-      .filter((row) => row.control === 'skip')
-      .map(({ id, target, variant, reason }) => ({ id, target, variant, reason }));
-    const parity = report.results.filter(
-      (row) => parityIds.has(row.id) && ['seven', 'vault'].includes(row.target)
+            throw error;
+          }
+          return {
+            client,
+            unguarded,
+            close: async () => {
+              await client.close();
+              await unguarded.close();
+            },
+          };
+        },
+        log: (row) => {
+          if ([row.control, row.guarded, row.live].includes('fail'))
+            process.stdout.write(`${JSON.stringify(row)}\n`);
+        },
+      });
+      return execution.results;
+    } finally {
+      await Promise.all([...browsers.values()].map(async (browser) => (await browser).close()));
+      await fixture.close();
+    }
+  };
+  const settled = await Promise.allSettled(
+    ['seven', 'vault', 'vault-x', 'apex', 'own'].map(executeTarget)
+  );
+  const rejected = settled.filter((value) => value.status === 'rejected');
+  if (rejected.length)
+    throw new AggregateError(
+      rejected.map((value) => value.reason),
+      'target invocations failed'
     );
-    const passing = parity.filter((row) =>
-      [row.control, row.guarded].every((status) => status === 'pass')
-    ).length;
-    const skipped = parity.filter((row) => row.control === 'skip').length;
-    const ms = Date.now() - started;
-    const output = `${report.line}\nRuntime: ${(ms / 1000).toFixed(1)}s\nParity: ${passing}/${parity.length - skipped} executed; ${skipped} coded skips (${parity.length} recorded rows; before: 104/108; expected after C5.auth: 108/108)\n\n${table(report.results)}\n`;
-    const file =
-      process.env.SLICC_GUARD_REPORT ?? path.join(tmpdir(), 'slicc-cdp-guard-runner-report.md');
-    await writeFile(file, output);
-    await writeFile(
-      `${file}.json`,
-      JSON.stringify({ ...report, ms, parity: { passing, skipped, total: parity.length } }, null, 2)
-    );
-    process.stdout.write(output);
-    t.diagnostic(`report: ${file}`);
-    assert.deepEqual(report.missing, [], 'all published rows must be present');
-    assert.equal(report.observerSkipped, 0);
-    assert.equal(report.pass, true, report.line);
-    assert.equal(parity.length, 108, 'recorded parity subset');
-    assert.equal(passing + skipped, 108);
-  } finally {
-    await Promise.all([...browsers.values()].map(async (browser) => (await browser).close()));
-    await fixture.close();
-  }
+  const results = settled.flatMap((value) => value.value);
+  const report = summary({
+    set,
+    results,
+    guard: 'slicc-cdp',
+    sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+  });
+  report.results = codedSkips(report.results);
+  report.skipped = report.results
+    .filter((row) => row.control === 'skip')
+    .map(({ id, target, variant, reason }) => ({ id, target, variant, reason }));
+  const parity = report.results.filter(
+    (row) => parityIds.has(row.id) && ['seven', 'vault'].includes(row.target)
+  );
+  const passing = parity.filter((row) =>
+    [row.control, row.guarded].every((status) => status === 'pass')
+  ).length;
+  const skipped = parity.filter((row) => row.control === 'skip').length;
+  const ms = Date.now() - started;
+  const output = `${report.line}\nRuntime: ${(ms / 1000).toFixed(1)}s\nParity: ${passing}/${parity.length}; ${skipped} coded skips (before: 104/108)\nParallel: five target invocations, ${parallel} slots each\n\n${table(report.results)}\n`;
+  const file =
+    process.env.SLICC_GUARD_REPORT ?? path.join(tmpdir(), 'slicc-cdp-guard-runner-report.md');
+  await writeFile(file, output);
+  await writeFile(
+    `${file}.json`,
+    JSON.stringify(
+      { ...report, ms, parallel, parity: { passing, skipped, total: parity.length } },
+      null,
+      2
+    )
+  );
+  process.stdout.write(output);
+  t.diagnostic(`report: ${file}`);
+  assert.deepEqual(report.missing, [], 'all published rows must be present');
+  assert.equal(report.observerSkipped, 0);
+  assert.equal(parity.length, 108, 'recorded parity subset');
+  assert.equal(skipped, 0);
+  assert.equal(passing, 108);
+  assert.equal(report.pass, true, report.line);
 });
