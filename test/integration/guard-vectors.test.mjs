@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { plantOrigins } from './plant.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import { deadline, killTree, progress } from './watchdog.mjs';
 
@@ -889,16 +890,7 @@ function judgeCookie(ctx, run, out) {
 }
 
 async function plant(ctx) {
-  const raw = await rawSocket(ctx.wsUrl);
-  try {
-    for (const origin of [ctx.ordinary, ctx.alt, ...Object.values(spec.targets)]) {
-      const tab = await raw.open(`${origin}/plant`);
-      await delay(300);
-      await raw.send('Target.closeTarget', { targetId: tab });
-    }
-  } finally {
-    raw.close();
-  }
+  await plantOrigins(ctx.wsUrl, [ctx.ordinary, ctx.alt, ...Object.values(spec.targets)]);
 }
 
 async function readStorage(raw, origin) {
