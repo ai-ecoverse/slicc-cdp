@@ -84,7 +84,8 @@ impl Run {
                     .unwrap_or("vector");
                 let ms = step.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 let paused = step.get("paused").and_then(|v| v.as_str());
-                self.until(slot, paused, Duration::from_millis(ms))
+                let soft = step.get("soft").and_then(|v| v.as_bool()) == Some(true);
+                self.until(slot, paused, soft, Duration::from_millis(ms))
             }
             "read" => {
                 let slot = step
@@ -212,31 +213,43 @@ impl Run {
         }
     }
 
-    fn until(&mut self, slot: &str, paused: Option<&str>, span: Duration) -> Value {
+    fn until(&mut self, slot: &str, paused: Option<&str>, soft: bool, span: Duration) -> Value {
         let deadline = Instant::now() + span;
         let check = format!("globalThis[{:?}] === true", format!("{slot}:done"));
         let session = self.session.clone();
+        let mut last = String::new();
         loop {
             self.drain();
             if paused.is_some_and(|needle| self.id_for(needle).is_some()) {
                 return json!({ "ok": true, "paused": true });
             }
+            let now = Instant::now();
             let settled = self.cdp.call_for(
                 "Runtime.evaluate",
                 json!({ "expression": check, "returnByValue": true }),
                 Some(&session),
-                Duration::from_secs(5),
+                deadline
+                    .saturating_duration_since(now)
+                    .max(Duration::from_millis(100)),
             );
             match settled {
                 Ok(value) if value["result"]["value"] == json!(true) => {
                     return json!({ "ok": true })
                 }
                 Ok(_) => {}
-                Err(message) => return json!({ "ok": false, "error": message }),
+                Err(message) => last = message.trim().to_string(),
             }
             let now = Instant::now();
             if now >= deadline {
-                return json!({ "ok": false, "error": format!("{slot} did not settle within {}ms", span.as_millis()) });
+                if soft {
+                    return json!({ "ok": true, "settled": false });
+                }
+                let detail = if last.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({last})")
+                };
+                return json!({ "ok": false, "error": format!("{slot} did not settle within {}ms{detail}", span.as_millis()) });
             }
             let slice = (now + Duration::from_millis(100)).min(deadline);
             if let Err(message) = self.cdp.pump(slice) {
