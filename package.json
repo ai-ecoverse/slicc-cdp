@@ -30,6 +30,9 @@
       "default": "./src/index.js"
     }
   },
+  "bin": {
+    "slicc-cdp": "src/cli.js"
+  },
   "files": [
     "src",
     "bin/playwright-cli.wasm",
@@ -51,21 +54,24 @@
     "build:wasm": "cargo build --release --target wasm32-wasip1 -p slicc-cdp -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
     "prepublishOnly": "npm run build:wasm",
     "lint": "slicc-lint",
-    "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js && node --check src/page.js && node --check packages/sliccy-browser/src/browser.js && node --check packages/sliccy-browser/src/fetch-script.js",
+    "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js && node --check src/page.js && node --check src/browser.js && node --check src/cli.js && node --check packages/sliccy-browser/src/browser.js && node --check packages/sliccy-browser/src/fetch-script.js",
     "format": "biome check --write .",
     "test": "true",
-    "test:integration": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build -p slicc-cdp -p curlwright && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --target wasm32-wasip1 -p slicc-cdp -p curlwright && npx playwright-core install chromium && node --test --test-timeout=600000 test/integration/*.test.mjs",
+    "test:integration": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build -p slicc-cdp -p curlwright && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --target wasm32-wasip1 -p slicc-cdp -p curlwright && npm run -s browser >/dev/null && node --test --test-timeout=600000 test/integration/*.test.mjs",
     "test:unit": "mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node --test 'test/unit/**/*.test.mjs'",
     "trust": "npx fledgling sync -y --skip-publish",
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",
-    "release": "semantic-release"
+    "release": "semantic-release",
+    "browser": "node src/cli.js install-browser --version \"$npm_package_config_chrome\""
+  },
+  "config": {
+    "chrome": "156.0.8078.4"
   },
   "devDependencies": {
     "@ai-ecoverse/slicc-kernel": "1.92.0",
-    "@ai-ecoverse/slicc-shared-web": "1.14.0",
+    "@ai-ecoverse/slicc-shared-web": "1.15.1",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.2.0",
-    "playwright-core": "1.64.0",
     "semantic-release": "25.0.9"
   }
 }
