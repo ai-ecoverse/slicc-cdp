@@ -138,6 +138,10 @@ test('sliccy:browser over CDP', async () => {
       })`
     );
     assert.equal(frame.data, '{"kind":"tick","n":1}');
+    assert.equal(
+      await browser.eval(tab, 'typeof __sliccWsRouterReport + typeof __sliccWsRouter'),
+      'undefinedundefined'
+    );
     await waitFor(() => logged.includes('{"n":1}'), `log sink missed ${JSON.stringify(logged)}`);
     const vfsText = await readWhen(vfsPath);
     assert.match(vfsText, /\{"n":1\}\n/);

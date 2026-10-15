@@ -2,14 +2,13 @@ import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { connect } from '@ai-ecoverse/slicc-cdp';
 import { buildBrowserFetchScript } from './fetch-script.js';
-import { routerSource } from './ws-router.js';
 
-const BINDING = '__sliccWsRouterReport';
 const LOAD_TIMEOUT_MS = 15000;
 
 let opening;
 const sessions = new Map();
-const routers = new Set();
+const tabsBySession = new Map();
+const sockets = new Map();
 const subscribers = new Map();
 let seq = 1;
 let listening = false;
@@ -49,7 +48,8 @@ function closeIdle() {
   const closing = opening;
   opening = undefined;
   sessions.clear();
-  routers.clear();
+  tabsBySession.clear();
+  sockets.clear();
   listening = false;
   closing.then(
     (client) => client.close(),
@@ -74,6 +74,7 @@ async function sessionFor(targetId) {
   await client.send('Runtime.enable', {}, sessionId).catch(ignoreMethod('Runtime.enable:'));
   await client.send('Network.enable', {}, sessionId).catch(ignoreMethod('Network.enable:'));
   sessions.set(targetId, sessionId);
+  tabsBySession.set(sessionId, targetId);
   listen(client);
   return { client, sessionId };
 }
@@ -81,18 +82,77 @@ async function sessionFor(targetId) {
 function listen(client) {
   if (listening) return;
   listening = true;
-  client.on('Runtime.bindingCalled', (message) => {
-    const params = message?.params;
-    if (!params || params.name !== BINDING || typeof params.payload !== 'string') return;
-    let body;
-    try {
-      body = JSON.parse(params.payload);
-    } catch {
-      return;
-    }
-    if (!body || typeof body.subId !== 'string') return;
-    void deliver(body.subId, body.payload);
+  client.on('Network.webSocketCreated', (message) => {
+    const { requestId, url } = message?.params ?? {};
+    if (typeof requestId !== 'string' || typeof url !== 'string') return;
+    sockets.set(socketKey(message.sessionId, requestId), url);
   });
+  client.on('Network.webSocketClosed', (message) => {
+    sockets.delete(socketKey(message?.sessionId, message?.params?.requestId));
+  });
+  client.on('Network.webSocketFrameReceived', (message) => dispatchFrame(message));
+}
+
+function socketKey(sessionId, requestId) {
+  return `${sessionId ?? ''} ${requestId ?? ''}`;
+}
+
+function dispatchFrame(message) {
+  const params = message?.params;
+  const response = params?.response;
+  if (response?.opcode !== 1 || typeof response.payloadData !== 'string') return;
+  const targetId = tabsBySession.get(message.sessionId);
+  if (targetId === undefined) return;
+  const url = sockets.get(socketKey(message.sessionId, params.requestId));
+  for (const sub of subscribers.values()) {
+    if (sub.targetId !== targetId || !urlMatches(sub, url)) continue;
+    const body = parseFrame(response.payloadData, sub.filter?.parseAs);
+    if (body === undefined || !whereMatches(sub.filter?.where, body)) continue;
+    deliver(sub, project(body, sub.filter?.project));
+  }
+}
+
+function urlMatches(sub, url) {
+  if (sub.urlMatch === undefined) return true;
+  return typeof url === 'string' && sub.urlMatchRe.test(url);
+}
+
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function subsetMatch(value, template) {
+  for (const key of Object.keys(template)) {
+    const expected = template[key];
+    const actual = value[key];
+    if (isPlainObject(expected)) {
+      if (!isPlainObject(actual) || !subsetMatch(actual, expected)) return false;
+    } else if (!Object.is(actual, expected)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function whereMatches(where, body) {
+  if (!isPlainObject(where) || Object.keys(where).length === 0) return true;
+  return isPlainObject(body) && subsetMatch(body, where);
+}
+
+function parseFrame(raw, parseAs) {
+  if (parseAs === 'text') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function project(body, fields) {
+  if (!Array.isArray(fields) || fields.length === 0 || !isPlainObject(body)) return body;
+  const out = {};
+  for (const field of fields) if (field in body) out[field] = body[field];
+  return out;
 }
 
 function targetIdOf(tab) {
@@ -415,39 +475,6 @@ function validateSink(forward) {
   }
 }
 
-async function installRouter(targetId) {
-  if (routers.has(targetId)) return;
-  const { client, sessionId } = await sessionFor(targetId);
-  try {
-    await client.send('Runtime.addBinding', { name: BINDING }, sessionId);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes('already exists')) throw error;
-  }
-  await client.send('Page.addScriptToEvaluateOnNewDocument', { source: routerSource }, sessionId);
-  const installed = await client.send(
-    'Runtime.evaluate',
-    { expression: routerSource, returnByValue: true },
-    sessionId
-  );
-  if (installed?.exceptionDetails) {
-    throw new Error(exceptionMessage(installed.exceptionDetails));
-  }
-  routers.add(targetId);
-}
-
-async function callRouter(targetId, expression) {
-  const { client, sessionId } = await sessionFor(targetId);
-  const result = await client.send(
-    'Runtime.evaluate',
-    { expression, returnByValue: true },
-    sessionId
-  );
-  if (result?.exceptionDetails) {
-    throw new Error(exceptionMessage(result.exceptionDetails));
-  }
-}
-
 function toInfo(sub) {
   const info = {
     id: sub.id,
@@ -464,24 +491,14 @@ function makeHandle(sub) {
   return {
     ...toInfo(sub),
     async update(patch = {}) {
-      const wire = {};
-      if (patch.urlMatch !== undefined) {
-        wire.urlMatch =
-          patch.urlMatch === null
-            ? null
-            : patch.urlMatch instanceof RegExp
-              ? patch.urlMatch.source
-              : patch.urlMatch;
+      if (patch.urlMatch === null) {
+        delete sub.urlMatch;
+        delete sub.urlMatchRe;
+      } else if (patch.urlMatch !== undefined) {
+        const next = patternOf(patch.urlMatch);
+        sub.urlMatchRe = compilePattern(next, 'browser.websocket');
+        sub.urlMatch = next;
       }
-      if (patch.filter !== undefined) wire.filter = patch.filter;
-      await using(() =>
-        callRouter(
-          sub.targetId,
-          `globalThis.__sliccWsRouter.update(${JSON.stringify(sub.id)}, ${JSON.stringify(wire)})`
-        )
-      );
-      if (wire.urlMatch === null) delete sub.urlMatch;
-      else if (wire.urlMatch !== undefined) sub.urlMatch = wire.urlMatch;
       if (patch.filter === null) delete sub.filter;
       else if (patch.filter !== undefined) sub.filter = patch.filter;
       return toInfo(sub);
@@ -489,28 +506,23 @@ function makeHandle(sub) {
     async close() {
       if (!subscribers.has(sub.id)) return false;
       subscribers.delete(sub.id);
-      await using(() =>
-        callRouter(sub.targetId, `globalThis.__sliccWsRouter.unregister(${JSON.stringify(sub.id)})`)
-      );
+      await sub.writing;
+      release();
       return true;
     },
   };
 }
 
-async function deliver(subId, payload) {
-  const sub = subscribers.get(subId);
-  if (!sub) return;
-  try {
-    if (sub.forward.sink === 'log') {
-      console.log(typeof payload === 'string' ? payload : JSON.stringify(payload));
-      return;
-    }
-    if (sub.forward.sink === 'vfs') {
-      const line = `${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n`;
-      await appendFile(sub.forward.path, line);
-    }
-  } catch {
+function deliver(sub, payload) {
+  const line = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  if (sub.forward.sink === 'log') {
+    console.log(line);
     return;
+  }
+  if (sub.forward.sink === 'vfs') {
+    sub.writing = sub.writing
+      .then(() => appendFile(sub.forward.path, `${line}\n`))
+      .catch(() => undefined);
   }
 }
 
@@ -535,23 +547,22 @@ export const websocket = {
       },
     };
     async function subscribe(sink) {
-      await installRouter(targetId);
+      const urlMatchRe =
+        urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
+      await sessionFor(targetId);
       const id = `wssub-${seq++}-${Date.now().toString(36)}`;
       const sub = {
         id,
         targetId,
         forward: sink,
         createdAt: new Date().toISOString(),
+        writing: Promise.resolve(),
       };
-      if (urlMatch !== undefined) sub.urlMatch = urlMatch;
+      if (urlMatch !== undefined) {
+        sub.urlMatch = urlMatch;
+        sub.urlMatchRe = urlMatchRe;
+      }
       if (selector !== undefined) sub.filter = selector;
-      const registered = { id };
-      if (urlMatch !== undefined) registered.urlMatch = urlMatch;
-      if (selector !== undefined) registered.filter = selector;
-      await callRouter(
-        targetId,
-        `globalThis.__sliccWsRouter.register(${JSON.stringify(registered)})`
-      );
       subscribers.set(id, sub);
       return makeHandle(sub);
     }
