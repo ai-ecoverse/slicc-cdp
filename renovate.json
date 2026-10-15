@@ -6,7 +6,8 @@
       "matchFileNames": ["packages/sliccy-browser/package.json"],
       "matchPackageNames": ["@ai-ecoverse/slicc-cdp"],
       "semanticCommitType": "chore",
-      "semanticCommitScope": "sliccy-browser"
+      "semanticCommitScope": "sliccy-browser",
+      "bumpVersion": "patch"
     }
   ]
 }
