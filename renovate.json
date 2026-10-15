@@ -8,6 +8,13 @@
       "semanticCommitType": "chore",
       "semanticCommitScope": "sliccy-browser",
       "bumpVersion": "patch"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["ai-ecoverse/slicc-shared-web"],
+      "additionalBranchPrefix": "workflow-",
+      "commitMessageTopic": "slicc-shared-web reusable workflows",
+      "semanticCommitType": "ci"
     }
   ]
 }
