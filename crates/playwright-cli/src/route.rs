@@ -131,7 +131,7 @@ pub fn is_route_command(command: &str) -> bool {
 
 pub fn run(invocation: &Invocation) -> Output {
     let command = invocation.command.as_deref().unwrap_or("");
-    let mut state = session::load_named(invocation.session.as_deref());
+    let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
     let output = match command {
         "route" => add(&mut state, invocation),
         "route-list" => return list(&state),

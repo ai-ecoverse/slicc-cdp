@@ -3598,6 +3598,7 @@ mod tests {
             help: false,
             command_help: false,
             version: false,
+            cwd: None,
         }
     }
 

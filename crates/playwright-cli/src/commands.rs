@@ -53,7 +53,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let remembered = if explicit || profile.is_some() {
         None
     } else {
-        launch::remembered_endpoint_named(invocation.session.as_deref())
+        launch::remembered_endpoint_named(invocation.session.as_deref(), invocation.cwd.as_deref())
     };
     let mut from_memory = remembered.is_some();
     let active = profile.clone().or(remembered);
@@ -105,7 +105,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         connect::Start::Direct(url) | connect::Start::Discover(url) => url.clone(),
     };
     let mut cdp = connected;
-    let mut state = session::load_named(invocation.session.as_deref());
+    let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,

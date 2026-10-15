@@ -1,6 +1,7 @@
 use crate::help;
 use crate::spec::{self, Spec};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Invocation {
@@ -15,6 +16,7 @@ pub struct Invocation {
     pub help: bool,
     pub command_help: bool,
     pub version: bool,
+    pub cwd: Option<PathBuf>,
 }
 
 impl Invocation {
@@ -172,6 +174,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             help: help || command.is_none(),
             command_help: false,
             version,
+            cwd: None,
         });
     }
     let spec = spec::lookup(command.as_deref().unwrap());
@@ -194,6 +197,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             help,
             command_help,
             version,
+            cwd: None,
         });
     }
     while index < after.len() {
@@ -260,6 +264,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         help,
         command_help,
         version,
+        cwd: None,
     })
 }
 

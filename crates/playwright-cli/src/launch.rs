@@ -226,13 +226,16 @@ fn remembered_endpoint_unreachable(message: &str) -> bool {
 
 #[allow(dead_code)]
 pub fn remembered_endpoint() -> Option<String> {
-    remembered_endpoint_named(None)
+    remembered_endpoint_named(None, None)
 }
 
-pub fn remembered_endpoint_named(session_name: Option<&str>) -> Option<String> {
+pub fn remembered_endpoint_named(
+    session_name: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        let session = crate::session::load_named(session_name);
+        let session = crate::session::load_in(session_name, cwd);
         let endpoint = session.endpoint.as_deref()?;
         let provenance = session.provenance.as_deref()?;
         let body = if provenance == "probe" {
@@ -245,6 +248,7 @@ pub fn remembered_endpoint_named(session_name: Option<&str>) -> Option<String> {
     }
     #[cfg(any(test, target_arch = "wasm32"))]
     {
+        let _ = (session_name, cwd);
         None
     }
 }

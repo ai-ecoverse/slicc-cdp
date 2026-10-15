@@ -24,8 +24,18 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
 }
 
 pub fn execute_with_session(argv: &[String], cdp_env: Option<&str>, session_env: Option<&str>) -> Output {
+    execute_in(argv, cdp_env, session_env, None)
+}
+
+pub fn execute_in(
+    argv: &[String],
+    cdp_env: Option<&str>,
+    session_env: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> Output {
     let invocation = match args::parse(argv) {
         Ok(mut invocation) => {
+            invocation.cwd = cwd.map(std::path::Path::to_path_buf);
             if invocation.session.is_none() {
                 invocation.session = session_env.map(str::to_string);
             }

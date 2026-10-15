@@ -138,7 +138,7 @@ mod tests {
         use serde_json::{json, Value};
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
         use std::thread::{self, JoinHandle};
@@ -480,30 +480,10 @@ mod tests {
             out
         }
 
-        struct DirGuard {
-            prev: PathBuf,
-        }
-
-        impl DirGuard {
-            fn enter(dir: &Path) -> Self {
-                let prev = std::env::current_dir().unwrap();
-                std::env::set_current_dir(dir).unwrap();
-                Self { prev }
-            }
-        }
-
-        impl Drop for DirGuard {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.prev);
-            }
-        }
-
-        static CWD: Mutex<()> = Mutex::new(());
-
-        fn run(port: u16, args: &[&str]) -> Output {
+        fn run(dir: &Path, port: u16, args: &[&str]) -> Output {
             let mut argv = vec!["--cdp".to_string(), format!("http://127.0.0.1:{port}")];
             argv.extend(args.iter().copied().map(str::to_string));
-            crate::execute(&argv, None)
+            crate::execute_in(&argv, None, None, Some(dir))
         }
 
         fn actions(log: &[Value]) -> Vec<&Value> {
@@ -542,7 +522,6 @@ mod tests {
 
         #[test]
         fn a_missing_action_reply_does_not_change_open() {
-            let _lock = CWD.lock().unwrap();
             let root =
                 std::env::temp_dir().join(format!("slicc-action-open-{}", std::process::id()));
             let missing_dir = root.join("missing");
@@ -553,12 +532,10 @@ mod tests {
             let silent = Peer::start(SliccReply::Silent, true);
             let started = Instant::now();
             let left = {
-                let _dir = DirGuard::enter(&missing_dir);
-                run(missing.port, &["open", "http://a.test/"])
+                run(&missing_dir, missing.port, &["open", "http://a.test/"])
             };
             let right = {
-                let _dir = DirGuard::enter(&silent_dir);
-                run(silent.port, &["open", "http://a.test/"])
+                run(&silent_dir, silent.port, &["open", "http://a.test/"])
             };
             assert_pair(&left, &right, started);
             assert_eq!(left.code, 0);
@@ -608,7 +585,6 @@ mod tests {
 
         #[test]
         fn tab_list_sends_nothing_and_a_failed_click_keeps_its_stderr() {
-            let _lock = CWD.lock().unwrap();
             let root =
                 std::env::temp_dir().join(format!("slicc-action-fail-{}", std::process::id()));
             let missing_dir = root.join("missing");
@@ -617,8 +593,7 @@ mod tests {
             std::fs::create_dir_all(&silent_dir).unwrap();
             let listed = Peer::start(SliccReply::NotFound, true);
             let listed_out = {
-                let _dir = DirGuard::enter(&missing_dir);
-                run(listed.port, &["tab-list"])
+                run(&missing_dir, listed.port, &["tab-list"])
             };
             assert_eq!(listed_out.code, 0, "{}", listed_out.stderr);
             assert!(listed_out.stdout.contains("[TAB1]"));
@@ -629,12 +604,10 @@ mod tests {
             let silent = Peer::start(SliccReply::Silent, false);
             let started = Instant::now();
             let left = {
-                let _dir = DirGuard::enter(&missing_dir);
-                run(missing.port, &["click", "e1"])
+                run(&missing_dir, missing.port, &["click", "e1"])
             };
             let right = {
-                let _dir = DirGuard::enter(&silent_dir);
-                run(silent.port, &["click", "e1"])
+                run(&silent_dir, silent.port, &["click", "e1"])
             };
             assert_pair(&left, &right, started);
             let expected = "Error: --tab <targetId> is required. Run 'playwright-cli tab-list' to get tab IDs.\n";
@@ -690,7 +663,6 @@ mod tests {
 
         #[test]
         fn fill_reports_length_and_label_without_the_text() {
-            let _lock = CWD.lock().unwrap();
             let root =
                 std::env::temp_dir().join(format!("slicc-action-fill-{}", std::process::id()));
             let missing_dir = root.join("missing");
@@ -706,12 +678,10 @@ mod tests {
             let silent = Peer::start(SliccReply::Silent, true);
             let started = Instant::now();
             let left = {
-                let _dir = DirGuard::enter(&missing_dir);
-                run(missing.port, &["fill", "e1", "secret-text"])
+                run(&missing_dir, missing.port, &["fill", "e1", "secret-text"])
             };
             let right = {
-                let _dir = DirGuard::enter(&silent_dir);
-                run(silent.port, &["fill", "e1", "secret-text"])
+                run(&silent_dir, silent.port, &["fill", "e1", "secret-text"])
             };
             assert_pair(&left, &right, started);
             assert_eq!(left.code, 0, "{}", left.stderr);
@@ -755,8 +725,7 @@ mod tests {
             }
             let old = Peer::start(SliccReply::NotFound, true);
             let old_out = {
-                let _dir = DirGuard::enter(&old_dir);
-                run(old.port, &["fill", "e1", "secret-text"])
+                run(&old_dir, old.port, &["fill", "e1", "secret-text"])
             };
             assert_eq!(old_out.stdout, left.stdout);
             assert_eq!(old_out.code, 0, "{}", old_out.stderr);
@@ -770,27 +739,23 @@ mod tests {
 
         #[test]
         fn a_takeover_prints_the_close_frame_not_a_guard_refusal() {
-            let _lock = CWD.lock().unwrap();
             let root =
                 std::env::temp_dir().join(format!("slicc-action-takeover-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
-            let _dir = DirGuard::enter(&root);
             let expected = format!("websocket closed 1011 {TAKEOVER}\n");
             let held = Peer::start(SliccReply::NotFound, true);
-            let output = run(held.port, &["eval", "new Promise(() => { TAKEOVER })"]);
+            let output = run(&root, held.port, &["eval", "new Promise(() => { TAKEOVER })"]);
             assert_eq!(output.code, 1);
             assert_eq!(output.stderr, expected);
             let guarding = Peer::start(SliccReply::Takeover, true);
-            let output = run(guarding.port, &["eval", "1"]);
+            let output = run(&root, guarding.port, &["eval", "1"]);
             assert_eq!(output.code, 1);
             assert_eq!(output.stderr, expected);
-            drop(_dir);
             let _ = std::fs::remove_dir_all(&root);
         }
 
         #[test]
         fn eval_does_not_send_the_expression() {
-            let _lock = CWD.lock().unwrap();
             let root =
                 std::env::temp_dir().join(format!("slicc-action-eval-{}", std::process::id()));
             let missing_dir = root.join("missing");
@@ -801,12 +766,10 @@ mod tests {
             let silent = Peer::start(SliccReply::Silent, true);
             let started = Instant::now();
             let left = {
-                let _dir = DirGuard::enter(&missing_dir);
-                run(missing.port, &["eval", "secret-source"])
+                run(&missing_dir, missing.port, &["eval", "secret-source"])
             };
             let right = {
-                let _dir = DirGuard::enter(&silent_dir);
-                run(silent.port, &["eval", "secret-source"])
+                run(&silent_dir, silent.port, &["eval", "secret-source"])
             };
             assert_pair(&left, &right, started);
             assert_eq!(left.code, 0, "{}", left.stderr);
@@ -839,7 +802,6 @@ mod tests {
 
         #[test]
         fn annotation_frames_omit_query_fragment_userinfo_and_eval_text() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!(
                 "slicc-action-secrets-{}",
                 std::process::id()
@@ -853,8 +815,7 @@ mod tests {
             std::fs::create_dir_all(&eval_dir).unwrap();
             let opened_peer = Peer::start(SliccReply::Silent, false);
             let opened = {
-                let _dir = DirGuard::enter(&open_dir);
-                run(opened_peer.port, &["open", secret])
+                run(&open_dir, opened_peer.port, &["open", secret])
             };
             assert_eq!(opened.code, 0, "{}", opened.stderr);
             assert!(!opened.stdout.contains("QUERYSECRET"));
@@ -867,8 +828,7 @@ mod tests {
             assert_frames_clean(&opened_actions);
             let went_peer = Peer::start(SliccReply::Silent, true);
             let went = {
-                let _dir = DirGuard::enter(&goto_dir);
-                run(went_peer.port, &["goto", secret])
+                run(&goto_dir, went_peer.port, &["goto", secret])
             };
             assert_eq!(went.code, 0, "{}", went.stderr);
             assert!(!went.stdout.contains("QUERYSECRET"));
@@ -880,8 +840,7 @@ mod tests {
             assert_frames_clean(&went_actions);
             let failed_peer = Peer::start(SliccReply::Silent, true);
             let failed = {
-                let _dir = DirGuard::enter(&eval_dir);
-                run(
+                run(&eval_dir, 
                     failed_peer.port,
                     &["eval", "throw new Error('EVALSECRET-in-error')"],
                 )
@@ -900,7 +859,6 @@ mod tests {
 
         #[test]
         fn opaque_urls_keep_only_the_scheme_on_the_action() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!(
                 "slicc-action-opaque-{}",
                 std::process::id()
@@ -958,8 +916,7 @@ mod tests {
             let mut seen = 0usize;
             for (command, url, expect, secret) in cases {
                 let output = {
-                    let _dir = DirGuard::enter(&root);
-                    run(peer.port, &[command, url])
+                    run(&root, peer.port, &[command, url])
                 };
                 assert_eq!(output.code, 0, "{command} {url} {}", output.stderr);
                 if !secret.is_empty() {
@@ -999,7 +956,6 @@ mod tests {
 
         #[test]
         fn upload_rejects_directory() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-upload-dir-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             seed(&root, None);
@@ -1007,8 +963,7 @@ mod tests {
             let dir_path = std::env::temp_dir().join(format!("slicc-upload-target-dir-{}", std::process::id()));
             std::fs::create_dir_all(&dir_path).unwrap();
             let output = {
-                let _dir = DirGuard::enter(&root);
-                run(peer.port, &["upload", "e1", dir_path.to_str().unwrap()])
+                run(&root, peer.port, &["upload", "e1", dir_path.to_str().unwrap()])
             };
             assert_ne!(output.code, 0);
             assert!(output.stderr.contains("directory"), "{}", output.stderr);
@@ -1020,7 +975,6 @@ mod tests {
         #[test]
         fn upload_rejects_unreadable_file() {
             use std::os::unix::fs::PermissionsExt;
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-upload-unread-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             seed(&root, None);
@@ -1029,8 +983,7 @@ mod tests {
             std::fs::write(&file_path, b"secret").unwrap();
             std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o000)).unwrap();
             let output = {
-                let _dir = DirGuard::enter(&root);
-                run(peer.port, &["upload", "e1", file_path.to_str().unwrap()])
+                run(&root, peer.port, &["upload", "e1", file_path.to_str().unwrap()])
             };
             std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
             let _ = std::fs::remove_file(&file_path);
@@ -1041,14 +994,12 @@ mod tests {
 
         #[test]
         fn upload_rejects_missing_file() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-upload-miss-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             seed(&root, None);
             let peer = Peer::start(SliccReply::Silent, true);
             let output = {
-                let _dir = DirGuard::enter(&root);
-                run(peer.port, &["upload", "e1", "/tmp/nonexistent-slicc-upload-xyz"])
+                run(&root, peer.port, &["upload", "e1", "/tmp/nonexistent-slicc-upload-xyz"])
             };
             assert_ne!(output.code, 0);
             assert!(output.stderr.contains("not found"), "{}", output.stderr);
@@ -1057,7 +1008,6 @@ mod tests {
 
         #[test]
         fn upload_succeeds_with_valid_file() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-upload-ok-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             seed(&root, None);
@@ -1065,8 +1015,7 @@ mod tests {
             let file_path = std::env::temp_dir().join(format!("slicc-upload-valid-{}.txt", std::process::id()));
             std::fs::write(&file_path, b"hello world").unwrap();
             let output = {
-                let _dir = DirGuard::enter(&root);
-                run(peer.port, &["upload", "e1", file_path.to_str().unwrap()])
+                run(&root, peer.port, &["upload", "e1", file_path.to_str().unwrap()])
             };
             assert_eq!(output.code, 0, "{}", output.stderr);
             assert!(output.stdout.contains("Uploaded 1 file(s)"), "{}", output.stdout);
@@ -1081,13 +1030,11 @@ mod tests {
 
         #[test]
         fn navigate_works_like_goto() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-navigate-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             let peer = Peer::start(SliccReply::Silent, true);
             let output = {
-                let _dir = DirGuard::enter(&root);
-                run(peer.port, &["navigate", "http://example.com/test"])
+                run(&root, peer.port, &["navigate", "http://example.com/test"])
             };
             assert_eq!(output.code, 0, "{}", output.stderr);
             assert!(output.stdout.contains("Navigated to"), "{}", output.stdout);
@@ -1096,13 +1043,11 @@ mod tests {
 
         #[test]
         fn navigate_requires_url() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-nav-nourl-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             let peer = Peer::start(SliccReply::Silent, true);
             let output = {
-                let _dir = DirGuard::enter(&root);
-                run(peer.port, &["navigate"])
+                run(&root, peer.port, &["navigate"])
             };
             assert_eq!(output.code, 1);
             assert!(output.stderr.contains("navigate requires a URL"), "{}", output.stderr);
@@ -1111,14 +1056,12 @@ mod tests {
 
         #[test]
         fn navigate_refuses_teleport_flags() {
-            let _lock = CWD.lock().unwrap();
             let root = std::env::temp_dir().join(format!("slicc-nav-teleport-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             let peer = Peer::start(SliccReply::Silent, true);
             for flag in ["--teleport-start=x", "--teleport-return=x", "--teleport-runtime=x"] {
                 let output = {
-                    let _dir = DirGuard::enter(&root);
-                    run(peer.port, &["navigate", flag, "http://example.com/"])
+                    run(&root, peer.port, &["navigate", flag, "http://example.com/"])
                 };
                 assert_eq!(output.code, 1, "{flag}");
                 assert!(output.stderr.contains("not implemented yet"), "{flag}: {}", output.stderr);
