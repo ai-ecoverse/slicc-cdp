@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { browsersRoot, findBrowser, installBrowser } from './browser.js';
@@ -15,8 +15,13 @@ commands:
       --force                         download again even when installed
   find-browser      print the browser launchBrowser() uses: $CHROME_PATH, else the
                     newest installed Chrome for Testing, else a system Chrome
-      --version <x.y.z.w|milestone>   only that installed Chrome for Testing
+      --version <x.y.z.w|milestone>   only that installed Chrome for Testing ($CHROME_PATH is not used)
+  --version, -V     print the slicc-cdp version
 `;
+
+export const VERSION = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+).version;
 
 export async function main(
   argv,
@@ -26,6 +31,10 @@ export async function main(
   if (!command || command === '--help' || command === '-h' || command === 'help') {
     io.out.write(USAGE);
     return command ? 0 : 2;
+  }
+  if (command === '--version' || command === '-V') {
+    io.out.write(`slicc-cdp ${VERSION}\n`);
+    return 0;
   }
   if (command === 'install-browser') {
     const { values } = parseArgs({

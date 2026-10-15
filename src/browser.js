@@ -126,7 +126,7 @@ export async function findBrowser({
   candidates = systemCandidates(env, platform),
   version,
 } = {}) {
-  if (env.CHROME_PATH) {
+  if (env.CHROME_PATH && !version) {
     if (isFile(env.CHROME_PATH)) return { executable: env.CHROME_PATH, source: 'env' };
     throw new Error(`CHROME_PATH is ${env.CHROME_PATH}, which is not a file`);
   }
@@ -214,7 +214,11 @@ export async function extract(zip, dir, platform, run = execFile) {
 
 export async function verify(executable, version, platform, run = execFile) {
   if (!isFile(executable)) throw new Error(`${executable} is missing after extraction`);
-  if (platform.startsWith('win')) return;
+  if (platform.startsWith('win')) {
+    const manifest = join(executable, '..', `${version}.manifest`);
+    if (!isFile(manifest)) throw new Error(`${manifest} is missing, so this is not ${version}`);
+    return;
+  }
   const { stdout } = await run(executable, ['--version']);
   if (!stdout.includes(version)) {
     throw new Error(`${executable} --version printed "${stdout.trim()}", expected ${version}`);
@@ -332,16 +336,44 @@ export function launchArgs({ userDataDir, port = 0, headless = true, args = [] }
   ];
 }
 
+export const OWNED_SWITCHES = [
+  '--remote-debugging-port',
+  '--remote-debugging-address',
+  '--remote-debugging-pipe',
+  '--user-data-dir',
+];
+
+function owned(arg) {
+  return OWNED_SWITCHES.some((name) => arg === name || arg.startsWith(`${name}=`));
+}
+
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const reserved = (port) => port >= RESERVED_PORTS[0] && port <= RESERVED_PORTS[1];
 const gone = (child) => child.exitCode !== null || child.signalCode !== null;
 
-async function activePort(userDataDir, child, deadline) {
+async function versionAt(port, fetchImpl) {
+  try {
+    const response = await fetchImpl(`http://127.0.0.1:${port}/json/version`);
+    if (!response.ok) return null;
+    const { webSocketDebuggerUrl } = await response.json();
+    if (typeof webSocketDebuggerUrl !== 'string') return null;
+    return { port, path: new URL(webSocketDebuggerUrl).pathname };
+  } catch {
+    return null;
+  }
+}
+
+async function ready(userDataDir, port, child, deadline, fetchImpl) {
   const file = join(userDataDir, 'DevToolsActivePort');
   while (Date.now() < deadline) {
-    const text = await readFile(file, 'utf8').catch(() => '');
-    const [port, path] = text.split('\n');
-    if (port && path) return { port: Number(port), path: path.trim() };
+    if (port === 0) {
+      const text = await readFile(file, 'utf8').catch(() => '');
+      const [found, path] = text.split('\n');
+      if (found && path) return { port: Number(found), path: path.trim() };
+    } else {
+      const found = await versionAt(port, fetchImpl);
+      if (found) return found;
+    }
     if (gone(child)) return null;
     await pause(50);
   }
@@ -356,6 +388,7 @@ export async function launchBrowser({
   args = [],
   env = process.env,
   timeout = 30000,
+  fetch: fetchImpl = fetch,
 } = {}) {
   const path = executable ?? (await findBrowser({ env }))?.executable;
   if (!path) {
@@ -366,8 +399,16 @@ export async function launchBrowser({
   if (reserved(port)) {
     throw new Error(`refusing to bind port ${port} (9222-9229 belong to the kernel and the probe)`);
   }
-  const owned = userDataDir === undefined;
+  const taken = args.find(owned);
+  if (taken) {
+    throw new Error(`args may not set ${taken}: use the port and userDataDir options`);
+  }
+  if (port !== 0 && (await versionAt(port, fetchImpl))) {
+    throw new Error(`a browser already listens on 127.0.0.1:${port}`);
+  }
+  const temporary = userDataDir === undefined;
   const profile = userDataDir ?? (await mkdtemp(join(tmpdir(), PROFILE_PREFIX)));
+  await rm(join(profile, 'DevToolsActivePort'), { force: true });
   let log = '';
   const child = spawn(path, launchArgs({ userDataDir: profile, port, headless, args }), {
     env,
@@ -384,16 +425,16 @@ export async function launchBrowser({
       child.kill('SIGKILL');
       await exited;
     }
-    if (owned) await rm(profile, { recursive: true, force: true });
+    if (temporary) await rm(profile, { recursive: true, force: true });
   };
   const found = await Promise.race([
-    activePort(profile, child, Date.now() + timeout),
+    ready(profile, port, child, Date.now() + timeout, fetchImpl),
     spawned.then((error) => ({ error })),
   ]);
   if (!found || found.error) {
     const status = gone(child)
       ? `exited with ${child.signalCode ?? `code ${child.exitCode}`}`
-      : `no DevToolsActivePort after ${timeout} ms`;
+      : `no DevTools endpoint after ${timeout} ms`;
     await close();
     const reason = found?.error?.message ?? (log.trim() || status);
     throw new Error(`${path} did not start: ${reason}`);
