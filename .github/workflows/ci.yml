@@ -70,6 +70,7 @@ jobs:
     timeout-minutes: 30
     env:
       LEFTHOOK: '0'
+      SLICC_CARGO_FEATURES: ${{ needs.runner.outputs.runner != 'ubuntu-latest' && '--features cdp-client/vendored-openssl' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -93,6 +94,7 @@ jobs:
     timeout-minutes: 30
     env:
       LEFTHOOK: '0'
+      SLICC_CARGO_FEATURES: ${{ needs.runner.outputs.runner != 'ubuntu-latest' && '--features cdp-client/vendored-openssl' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -110,7 +112,7 @@ jobs:
           echo "CHROMIUM_EXECUTABLE=$(node src/cli.js install-browser --channel stable $deps)" >> "$GITHUB_ENV"
       - name: Run WebMCP integration tests
         run: |
-          cargo build -p slicc-cdp -p curlwright
+          cargo build -p slicc-cdp -p curlwright $SLICC_CARGO_FEATURES
           node --test --test-timeout=600000 test/integration/webmcp.test.mjs
 
   shellcheck:

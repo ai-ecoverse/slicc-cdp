@@ -57,7 +57,7 @@
     "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js && node --check src/page.js && node --check src/browser.js && node --check src/cli.js && node --check packages/sliccy-browser/src/browser.js && node --check packages/sliccy-browser/src/fetch-script.js",
     "format": "biome check --write .",
     "test": "true",
-    "test:integration": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build -p slicc-cdp -p curlwright && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --target wasm32-wasip1 -p slicc-cdp -p curlwright && npm run -s browser >/dev/null && node --test --test-timeout=600000 test/integration/*.test.mjs",
+    "test:integration": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace $SLICC_CARGO_FEATURES && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build -p slicc-cdp -p curlwright $SLICC_CARGO_FEATURES && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --target wasm32-wasip1 -p slicc-cdp -p curlwright && npm run -s browser >/dev/null && node --test --test-timeout=600000 test/integration/*.test.mjs",
     "test:unit": "mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node --test 'test/unit/**/*.test.mjs'",
     "trust": "npx fledgling sync -y --skip-publish",
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",

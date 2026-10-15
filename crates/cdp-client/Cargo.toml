@@ -15,6 +15,9 @@ publish = true
 [lib]
 name = "cdp_client"
 
+[features]
+vendored-openssl = ["native-tls/vendored"]
+
 [dependencies]
 serde_json = "1"
 slicc-browsers = { version = "1.5", features = ["serde"] }
