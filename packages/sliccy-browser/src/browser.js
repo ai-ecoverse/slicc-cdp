@@ -4,11 +4,33 @@ import { connect } from '@ai-ecoverse/slicc-cdp';
 import { buildBrowserFetchScript } from './fetch-script.js';
 
 const LOAD_TIMEOUT_MS = 15000;
+const HELD_FRAMES = 100;
+const RECORDER = `(() => {
+  if (globalThis.__sliccWsSent) return true;
+  const sent = [];
+  const send = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    if (typeof data === 'string') {
+      sent.push([this.url, data]);
+      if (sent.length > 64) sent.shift();
+    }
+    return send.call(this, data);
+  };
+  const take = (data) => {
+    const at = sent.findIndex((entry) => entry[1] === data);
+    return at < 0 ? null : sent.splice(at, 1)[0][0];
+  };
+  Object.defineProperty(globalThis, '__sliccWsSent', { value: Object.freeze({ take }) });
+  return true;
+})()`;
 
 let opening;
 const sessions = new Map();
 const tabsBySession = new Map();
 const sockets = new Map();
+const held = new Map();
+const recorders = new Map();
+const networkless = new Map();
 const subscribers = new Map();
 let seq = 1;
 let listening = false;
@@ -50,6 +72,9 @@ function closeIdle() {
   sessions.clear();
   tabsBySession.clear();
   sockets.clear();
+  held.clear();
+  recorders.clear();
+  networkless.clear();
   listening = false;
   closing.then(
     (client) => client.close(),
@@ -69,13 +94,16 @@ async function sessionFor(targetId) {
   const client = await openClient();
   const cached = sessions.get(targetId);
   if (cached) return { client, sessionId: cached };
+  listen(client);
   const sessionId = await client.attach(targetId);
+  tabsBySession.set(sessionId, targetId);
   await client.send('Page.enable', {}, sessionId).catch(ignoreMethod('Page.enable:'));
   await client.send('Runtime.enable', {}, sessionId).catch(ignoreMethod('Runtime.enable:'));
-  await client.send('Network.enable', {}, sessionId).catch(ignoreMethod('Network.enable:'));
+  await client.send('Network.enable', {}, sessionId).catch((error) => {
+    ignoreMethod('Network.enable:')(error);
+    networkless.set(sessionId, error.message);
+  });
   sessions.set(targetId, sessionId);
-  tabsBySession.set(sessionId, targetId);
-  listen(client);
   return { client, sessionId };
 }
 
@@ -88,9 +116,12 @@ function listen(client) {
     sockets.set(socketKey(message.sessionId, requestId), url);
   });
   client.on('Network.webSocketClosed', (message) => {
-    sockets.delete(socketKey(message?.sessionId, message?.params?.requestId));
+    const key = socketKey(message?.sessionId, message?.params?.requestId);
+    sockets.delete(key);
+    held.delete(key);
   });
   client.on('Network.webSocketFrameReceived', (message) => dispatchFrame(message));
+  client.on('Network.webSocketFrameSent', (message) => void learnUrl(client, message));
 }
 
 function socketKey(sessionId, requestId) {
@@ -103,13 +134,69 @@ function dispatchFrame(message) {
   if (response?.opcode !== 1 || typeof response.payloadData !== 'string') return;
   const targetId = tabsBySession.get(message.sessionId);
   if (targetId === undefined) return;
-  const url = sockets.get(socketKey(message.sessionId, params.requestId));
+  const key = socketKey(message.sessionId, params.requestId);
+  const url = sockets.get(key);
+  if (url !== undefined) return route(targetId, url, response.payloadData, () => true);
+  route(targetId, url, response.payloadData, (sub) => sub.urlMatch === undefined);
+  holdFrame(message.sessionId, targetId, key, response.payloadData);
+}
+
+function route(targetId, url, raw, which) {
   for (const sub of subscribers.values()) {
-    if (sub.targetId !== targetId || !urlMatches(sub, url)) continue;
-    const body = parseFrame(response.payloadData, sub.filter?.parseAs);
+    if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
+    const body = parseFrame(raw, sub.filter?.parseAs);
     if (body === undefined || !whereMatches(sub.filter?.where, body)) continue;
     deliver(sub, project(body, sub.filter?.project));
   }
+}
+
+function holdFrame(sessionId, targetId, key, raw) {
+  const wanted = [...subscribers.values()].some(
+    (sub) => sub.targetId === targetId && sub.urlMatch !== undefined
+  );
+  if (!wanted) return;
+  const frames = held.get(key) ?? [];
+  frames.push(raw);
+  if (frames.length > HELD_FRAMES) frames.shift();
+  held.set(key, frames);
+  record(sessionId);
+}
+
+function record(sessionId) {
+  if (recorders.has(sessionId)) return recorders.get(sessionId);
+  const installing = openClient()
+    .then((client) =>
+      client.send('Runtime.evaluate', { expression: RECORDER, returnByValue: true }, sessionId)
+    )
+    .catch(() => undefined);
+  recorders.set(sessionId, installing);
+  return installing;
+}
+
+async function learnUrl(client, message) {
+  const sessionId = message?.sessionId;
+  const { requestId, response } = message?.params ?? {};
+  const key = socketKey(sessionId, requestId);
+  if (sockets.has(key) || !recorders.has(sessionId)) return;
+  if (response?.opcode !== 1 || typeof response.payloadData !== 'string') return;
+  await recorders.get(sessionId);
+  const found = await client
+    .send(
+      'Runtime.evaluate',
+      {
+        expression: `globalThis.__sliccWsSent?.take(${JSON.stringify(response.payloadData)}) ?? null`,
+        returnByValue: true,
+      },
+      sessionId
+    )
+    .catch(() => undefined);
+  const url = found?.result?.value;
+  if (typeof url !== 'string' || sockets.has(key)) return;
+  sockets.set(key, url);
+  const frames = held.get(key) ?? [];
+  held.delete(key);
+  const targetId = tabsBySession.get(sessionId);
+  for (const raw of frames) route(targetId, url, raw, (sub) => sub.urlMatch !== undefined);
 }
 
 function urlMatches(sub, url) {
@@ -549,7 +636,11 @@ export const websocket = {
     async function subscribe(sink) {
       const urlMatchRe =
         urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
-      await sessionFor(targetId);
+      const { sessionId } = await sessionFor(targetId);
+      if (networkless.has(sessionId)) {
+        throw new Error(`browser.websocket: ${networkless.get(sessionId)}`);
+      }
+      if (urlMatch !== undefined) await record(sessionId);
       const id = `wssub-${seq++}-${Date.now().toString(36)}`;
       const sub = {
         id,
