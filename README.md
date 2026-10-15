@@ -1,6 +1,6 @@
 # slicc-cdp
 
-`@ai-ecoverse/slicc-cdp` publishes `playwright-cli` and `curlwright`, Rust clients for an already-running Chrome. They speak Chrome DevTools Protocol JSON. The package root exports `CDPClient` and `connect`, one browser DevTools socket. Host `connect()` does not dial port 9222 unless `options.url` or `SLICC_CDP_URL` names it.
+`@ai-ecoverse/slicc-cdp` publishes `playwright-cli` and `curlwright`, Rust clients for an already-running Chrome. They speak Chrome DevTools Protocol JSON. The package root exports `CDPClient` and `connect`, one browser DevTools socket, and `findBrowser`, `installBrowser` and `launchBrowser` (see [Browser](#browser)). Host `connect()` does not dial port 9222 unless `options.url` or `SLICC_CDP_URL` names it.
 
 `playwright-cli` is a playwright-cli-compatible command for SLICC and not affiliated with Microsoft Playwright.
 
@@ -57,6 +57,24 @@ A non-2xx discovery response prints the status and the body and exits non-zero. 
 ## curlwright
 
 `curlwright` is the Rust binary in `crates/curlwright`. It runs curl-style requests as a page-context `fetch()` in an already-open tab, so that tab's cookies, origin, and service worker apply. It uses `--cdp`, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort. On the host, if none of those exist, it exits without dialing port 9222. Ports 9222-9229 inside those files are not dialed. The wasm build still uses port 9222. The shared CDP client is `crates/cdp-client`. Without `--tab`, it uses the `current` target this tool saved for the working directory under the user config dir when that tab is still open, otherwise the single open tab on the request URL's origin. It does not read a `.playwright-cli/session.json` in the working directory and it does not read the saved endpoint. Any other case exits 2 and lists `--tab` choices. A tab on a different origin is not used unless `--tab` or that session names it. A request URL on a protected origin (any `sliccy.ai` host, the vault, or `//` to one) is refused before any tab is chosen, with `curlwright: slicc: refused: target is on seven's origin`, and so is `--tab` on a protected tab.
+
+## Browser
+
+On the host, the package can find, install and launch a Chrome for a test suite or a script. This is Node only, not in the wasm commands.
+
+- **`findBrowser({ version })`:** `$CHROME_PATH`, else the newest Chrome for Testing that `install-browser` put under the install root, else a system Chrome or Chromium (`/Applications`, `/usr/bin`, `/snap/bin`, Program Files). With `version` (a full version or a milestone) only that installed Chrome for Testing counts, and `$CHROME_PATH` is not used. Returns `{ executable, source, version? }` or `null`.
+- **`installBrowser({ version, channel, withDeps })`:** downloads Chrome for Testing for this platform, unzips it, checks that `--version` prints the expected version (on Windows, which prints nothing, that the build's `<version>.manifest` is there), and marks it with `.slicc-cdp-browser.json`. An exact version that is already installed is used without the network. The install root is `$SLICC_BROWSERS_PATH`, else `~/Library/Caches/slicc-cdp/browsers`, `$XDG_CACHE_HOME/slicc-cdp/browsers` (default `~/.cache`), or `%LOCALAPPDATA%\slicc-cdp\browsers`. `withDeps` is opt-in. On Linux it runs `apt-get satisfy` on the build's `deb.deps`, as root or with `sudo -n`, and otherwise fails saying so.
+- **`launchBrowser({ executable, userDataDir, port, headless, sandbox, args })`:** starts the browser with `--remote-debugging-port` (0 by default) on `127.0.0.1`. Without `userDataDir` the profile is a fresh `slicc-cdp-profile-*` directory in the temp dir, never the user's, and `close()` kills the browser and removes the profile. Ports 9222-9229 are refused, and so are `args` that set the debugging port, address, pipe or profile. A fixed `port` that already answers is refused. Returns `{ child, executable, userDataDir, port, wsUrl, close }`. With port 0 the `wsUrl` comes from a fresh `DevToolsActivePort`, which is removed before launch. Otherwise it comes from `/json/version` on that port. The sandbox stays on unless `sandbox: false`. Linux without unprivileged user namespaces (Ubuntu 23.10 and later, GitHub's `ubuntu-latest` included) needs that, or Chrome aborts with "No usable sandbox".
+
+The `slicc-cdp` bin does the same from a shell:
+
+```
+npx slicc-cdp install-browser --version 153.0.8010.12   # prints the executable
+npx slicc-cdp install-browser --channel stable --with-deps
+npx slicc-cdp find-browser
+```
+
+Trust: Chrome for Testing publishes no checksums or signatures for its zips. `installBrowser` downloads only over HTTPS, only from `googlechromelabs.github.io` (the version index) and `storage.googleapis.com` (the zips). Redirects are refused. The only checks are the byte count and the version, so you are trusting those Google hosts and TLS. Pin an exact version (`--version x.y.z.w`) in CI, so a run gets the build you tested.
 
 ## Kernel commands
 
