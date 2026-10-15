@@ -119,6 +119,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: ShellCheck v0.11.0
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          if command -v shellcheck >/dev/null; then exit 0; fi
+          curl -fsSL -o "$RUNNER_TEMP/shellcheck.tar.gz" https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz
+          echo "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  $RUNNER_TEMP/shellcheck.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/shellcheck.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
       - run: shellcheck -s sh install.sh
 
   build-binaries:
