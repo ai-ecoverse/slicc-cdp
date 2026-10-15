@@ -460,13 +460,14 @@ mod tests {
         }
     }
 
-    fn page_count(raw: &mut Raw) -> usize {
+    fn page_ids(raw: &mut Raw) -> std::collections::BTreeSet<String> {
         raw.call("Target.getTargets", json!({}), None).unwrap()["targetInfos"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|info| info["type"] == "page")
-            .count()
+            .filter_map(|info| info["targetId"].as_str().map(str::to_string))
+            .collect()
     }
 
     fn nothing_mentions(cdp: &Cdp, needle: &str) {
@@ -519,7 +520,7 @@ mod tests {
         let mut raw = Raw::open(&ws);
         let mut cdp = Cdp::connect(&ws).unwrap();
 
-        let before = page_count(&mut raw);
+        let before = page_ids(&mut raw);
         for url in [
             format!("{seven}/"),
             format!("{seven}/nowhere"),
@@ -537,11 +538,8 @@ mod tests {
             );
             assert_eq!(message, REFUSED, "{url}");
         }
-        assert_eq!(
-            page_count(&mut raw),
-            before,
-            "a refused createTarget made a page"
-        );
+        let made: Vec<String> = page_ids(&mut raw).difference(&before).cloned().collect();
+        assert!(made.is_empty(), "a refused createTarget made a page: {made:?}");
         let allowed = cdp
             .call(
                 "Target.createTarget",
