@@ -40,14 +40,26 @@ export async function launchBrowser(extraArgs = []) {
       ...extraArgs,
       'about:blank',
     ],
-    { stdio: ['ignore', 'ignore', 'pipe'] }
+    { stdio: ['ignore', 'ignore', 'pipe'], detached: process.platform !== 'win32' }
   );
+  const exited = new Promise((resolve) => child.once('exit', resolve));
   child.stderr.on('data', (chunk) => {
     chromeLog = (chromeLog + chunk.toString('utf8')).slice(-4000);
   });
-  const stop = () => {
-    if (child.exitCode !== null || child.signalCode) return;
-    child.kill('SIGKILL');
+  const stop = async () => {
+    const running = child.exitCode === null && !child.signalCode;
+    try {
+      if (process.platform === 'win32') child.kill('SIGKILL');
+      else process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      if (running) child.kill('SIGKILL');
+    }
+    if (running) {
+      let timer;
+      await Promise.race([exited, new Promise((resolve) => (timer = setTimeout(resolve, 5000)))]);
+      clearTimeout(timer);
+    }
+    child.stderr.destroy();
   };
   try {
     const version = await waitVersion(port, () => chromeStatus(child, chromeLog));
@@ -59,12 +71,12 @@ export async function launchBrowser(extraArgs = []) {
       port,
       wsUrl,
       async close() {
-        stop();
+        await stop();
         await rm(userDataDir, { recursive: true, force: true });
       },
     };
   } catch (error) {
-    stop();
+    await stop();
     await rm(userDataDir, { recursive: true, force: true });
     throw error;
   }
@@ -178,7 +190,20 @@ export async function rawSocket(wsUrl) {
   const send = (method, params = {}, sessionId) => {
     const id = ++next;
     return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${method} timed out`));
+      }, 30000);
+      pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
       const body = { id, method, params };
       if (sessionId) body.sessionId = sessionId;
       ws.send(JSON.stringify(body));

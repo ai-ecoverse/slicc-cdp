@@ -925,6 +925,7 @@ impl Cdp {
     ) -> Result<Value, String> {
         let id = self.send(method, params, session_id)?;
         let deadline = Instant::now() + timeout;
+        let was_blocked = session_id.is_some_and(|session| self.blocked.contains(session));
         loop {
             let text = match self.ws.recv_text(deadline)? {
                 Some(text) => text,
@@ -942,7 +943,15 @@ impl Cdp {
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
+            let detached = value.get("method").and_then(|v| v.as_str())
+                == Some("Target.detachedFromTarget")
+                && value.pointer("/params/sessionId").and_then(|v| v.as_str()) == session_id;
             self.absorb(value);
+            if let Some(session) = session_id {
+                if detached || (!was_blocked && self.blocked.contains(session)) {
+                    return Err(self.refusal());
+                }
+            }
         }
     }
 
@@ -1491,8 +1500,108 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
 
 #[cfg(test)]
 mod tests {
-    use super::{first_stderr_line, probe_is_settled, ActionNote};
-    use serde_json::json;
+    use super::{first_stderr_line, probe_is_settled, ActionNote, Cdp, Transport};
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    struct Pending {
+        inbox: VecDeque<String>,
+        answer: fn(&Value) -> Vec<Value>,
+    }
+
+    impl Transport for Pending {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            let message: Value = serde_json::from_str(text).unwrap();
+            for out in (self.answer)(&message) {
+                self.inbox.push_back(out.to_string());
+            }
+            Ok(())
+        }
+
+        fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+            Ok(self.inbox.pop_front())
+        }
+    }
+
+    fn pending(answer: fn(&Value) -> Vec<Value>) -> Cdp {
+        Cdp::from_transport(Box::new(Pending {
+            inbox: VecDeque::new(),
+            answer,
+        }))
+    }
+
+    fn evaluate(cdp: &mut Cdp) -> (Result<Value, String>, Duration) {
+        let started = Instant::now();
+        let result = cdp.call_for(
+            "Runtime.evaluate",
+            json!({ "expression": "1" }),
+            Some("S"),
+            Duration::from_secs(30),
+        );
+        (result, started.elapsed())
+    }
+
+    #[test]
+    fn a_call_fails_with_the_refusal_once_the_guard_blocks_its_session() {
+        let mut cdp = pending(|message| match message["method"].as_str() {
+            Some("Runtime.evaluate") => vec![json!({
+                "method": "Page.frameNavigated",
+                "sessionId": "S",
+                "params": { "frame": { "id": "F", "url": "https://seven.sliccy.ai/os/", "securityOrigin": "https://seven.sliccy.ai" } }
+            })],
+            _ => vec![],
+        });
+        let (result, spent) = evaluate(&mut cdp);
+        assert_eq!(result.unwrap_err(), format!("{}\n", cdp.guard().refusal()));
+        assert!(spent < Duration::from_secs(5), "{spent:?}");
+        assert!(cdp.session_blocked("S"));
+    }
+
+    #[test]
+    fn a_call_fails_with_the_refusal_once_its_session_detaches() {
+        let mut cdp = pending(|_| {
+            vec![
+                json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "other" } }),
+                json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "S" } }),
+            ]
+        });
+        let (result, spent) = evaluate(&mut cdp);
+        assert_eq!(result.unwrap_err(), format!("{}\n", cdp.guard().refusal()));
+        assert!(spent < Duration::from_secs(5), "{spent:?}");
+    }
+
+    #[test]
+    fn unrelated_events_do_not_end_a_call() {
+        let mut cdp = pending(|message| {
+            vec![
+                json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "other" } }),
+                json!({ "id": message["id"], "result": { "result": { "value": 1 } } }),
+            ]
+        });
+        let (result, _) = evaluate(&mut cdp);
+        assert_eq!(result.unwrap(), json!({ "result": { "value": 1 } }));
+    }
+
+    #[test]
+    fn a_harmless_call_on_an_already_blocked_session_still_waits_for_its_reply() {
+        let mut cdp = pending(|message| match message["method"].as_str() {
+            Some("Runtime.evaluate") => vec![json!({
+                "method": "Page.frameNavigated",
+                "sessionId": "S",
+                "params": { "frame": { "id": "F", "url": "https://seven.sliccy.ai/os/" } }
+            })],
+            Some("Fetch.disable") => vec![
+                json!({ "method": "Page.lifecycleEvent", "sessionId": "S", "params": { "name": "load" } }),
+                json!({ "id": message["id"], "result": {} }),
+            ],
+            _ => vec![],
+        });
+        let _ = evaluate(&mut cdp);
+        assert!(cdp.session_blocked("S"));
+        let disabled = cdp.call_for("Fetch.disable", json!({}), Some("S"), Duration::from_secs(30));
+        assert_eq!(disabled.unwrap(), json!({}));
+    }
 
     #[test]
     fn a_finished_document_does_not_wait_for_load() {

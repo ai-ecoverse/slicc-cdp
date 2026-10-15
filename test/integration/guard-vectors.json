@@ -136,6 +136,16 @@
       "setup": ["headers"],
       "expect": "header",
       "lanes": ["raw"]
+    },
+    {
+      "id": "X1.after-exit",
+      "trigger": "deferred",
+      "defer": 3000,
+      "setup": ["probe", "headers", "fetch"],
+      "intercept": "fulfill",
+      "exit": true,
+      "expect": "after-exit",
+      "lanes": ["raw"]
     }
   ],
   "cookies": [

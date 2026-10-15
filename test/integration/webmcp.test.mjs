@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
 import { nativeRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
+import './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const nativeDir = path.join(root, 'target/debug');
