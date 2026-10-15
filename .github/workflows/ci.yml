@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.18.0
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.18.1
     with:
       chromium: false
   integration:
