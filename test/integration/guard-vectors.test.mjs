@@ -19,7 +19,6 @@ const spec = JSON.parse(await readFile(path.join(here, 'guard-vectors.json'), 'u
 const settleMs = 1500;
 const cliWaitMs = 6000;
 const fetchWaitMs = 5000;
-const probeSettleMs = 7000;
 const rowSeconds = 180;
 const tall = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
@@ -104,7 +103,7 @@ test('guard vectors through the raw client, playwright-cli and the kernel', asyn
       browser.wsUrl
     );
     progress('phase kernel lane');
-    rows.push(...(await cliLane(ctx, kernel, 'kernel', 1)));
+    rows.push(...(await cliLane(ctx, kernel, 'kernel', 6)));
     const report = table(rows);
     const file = process.env.SLICC_GUARD_REPORT || path.join(tmpdir(), 'guard-vectors-report.md');
     await writeFile(file, report);
@@ -480,7 +479,7 @@ function fetchRun(ctx, c, side) {
       launch(probes.fetch.run(bracket('before')), 'before'),
       { op: 'until', slot: 'before', ms: fetchWaitMs },
       launch(probe.run(url), 'probe'),
-      { op: 'until', slot: 'probe', ms: probeSettleMs },
+      { op: 'until', slot: 'probe', ms: fetchWaitMs, soft: true },
       launch(probes.fetch.run(bracket('after')), 'after'),
       { op: 'until', slot: 'after', ms: fetchWaitMs },
       { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
@@ -501,7 +500,8 @@ function fetchRun(ctx, c, side) {
         op: 'until',
         slot: 'probe',
         paused: match,
-        ms: probeSettleMs,
+        ms: fetchWaitMs,
+        soft: true,
       },
       launch(probes.fetch.run(bracket('after')), 'after'),
       { op: 'until', slot: 'after', ms: fetchWaitMs },

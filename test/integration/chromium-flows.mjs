@@ -1,0 +1,721 @@
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { frameId, launchBrowser, rawSocket } from './browser.mjs';
+import { kernelRunner, nativeRunner } from './runners.mjs';
+import { startServer } from './server.mjs';
+import './watchdog.mjs';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const nativeDir = path.join(root, 'target/debug');
+const wasmDir = path.join(root, 'target/wasm32-wasip1/debug');
+
+const flows = {
+  'native playwright-cli': ({ native, site }) => playwrightFlow(native, site),
+  'native basics batch': ({ native, site }) => basicsBatchFlow(native, site),
+  'native curlwright': ({ native, site, browser }) => curlFlow(native, site, browser.wsUrl),
+  'native route': ({ native, site }) => routeFlow(native, site),
+  'native protected tabs': ({ native, site, browser }) =>
+    protectedFlow(native, site, browser.wsUrl),
+  'native navigation guard': ({ native, site, browser }) =>
+    navigationGuardFlow(native, site, browser.wsUrl),
+  'native upload validation': ({ native, site }) => nativeUploadValidationFlow(native, site),
+  'kernel playwright-cli': ({ kernel, site }) => playwrightFlow(kernel, site),
+  'kernel basics batch': ({ kernel, site }) => basicsBatchFlow(kernel, site),
+  'kernel curlwright': ({ kernel, site, browser }) => curlFlow(kernel, site, browser.wsUrl),
+  'kernel route': ({ kernel, site }) => routeFlow(kernel, site),
+  'kernel protected tabs': ({ kernel, site, browser }) =>
+    protectedFlow(kernel, site, browser.wsUrl),
+  'kernel navigation guard': ({ kernel, site, browser }) =>
+    navigationGuardFlow(kernel, site, browser.wsUrl),
+  'kernel upload vfs isolation': ({ kernel, site }) => kernelUploadFlow(kernel, site),
+};
+
+export function chromiumSuite(title, names) {
+  test(title, async (t) => {
+    const site = await startServer();
+    let browser;
+    let kernel;
+    try {
+      browser = await launchBrowser([
+        `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}, MAP vault.sliccy.ai 127.0.0.1:${site.port}`,
+        '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
+      ]);
+      const native = nativeRunner(
+        path.join(
+          nativeDir,
+          process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+        ),
+        path.join(nativeDir, process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'),
+        browser.wsUrl
+      );
+      if (names.some((name) => name.startsWith('kernel '))) {
+        kernel = await kernelRunner(
+          path.join(wasmDir, 'playwright-cli.wasm'),
+          path.join(wasmDir, 'curlwright.wasm'),
+          browser.wsUrl
+        );
+      }
+      const ctx = { site, browser, native, kernel };
+      for (const name of names) await t.test(name, () => flows[name](ctx));
+    } finally {
+      await settle(kernel?.close());
+      await settle(browser?.close());
+      await settle(site.close());
+    }
+  });
+}
+
+async function settle(value) {
+  try {
+    await value;
+  } catch {
+    return undefined;
+  }
+}
+
+async function playwrightFlow(runner, site) {
+  const bootDir = await runner.fresh();
+  const booted = await runner.playwright(['open', `${site.origin}/boot`], bootDir);
+  assert.equal(booted.code, 0, `${booted.stderr}\n${booted.stdout}`);
+  const bootList = await runner.playwright(['requests'], bootDir);
+  assert.equal(bootList.code, 0, `${bootList.stderr}\n${bootList.stdout}`);
+  assert.match(bootList.stdout, /\/api\/boot/);
+  const cwd = await runner.fresh();
+  const page = `${site.origin}/page`;
+  const opened = await runner.playwright(['open', page], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+  const openedId = targetOf(opened.stdout);
+  const shot = await runner.playwright(['snapshot'], cwd);
+  assert.equal(shot.code, 0, `${shot.stderr}\n${shot.stdout}`);
+  const button = refOf(shot.stdout, 'button', 'Go');
+  const clicked = await runner.playwright(['click', button], cwd);
+  assert.equal(clicked.code, 0, clicked.stderr);
+  const afterClick = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterClick.code, 0, afterClick.stderr);
+  assert.equal(afterClick.stdout, 'clicked\n');
+  const again = await runner.playwright(['snapshot'], cwd);
+  assert.equal(again.code, 0, again.stderr);
+  const box = refOf(again.stdout, 'textbox', 'Name');
+  const filled = await runner.playwright(['fill', box, 'ada'], cwd);
+  assert.equal(filled.code, 0, filled.stderr);
+  const typed = await runner.playwright(['type', 'x'], cwd);
+  assert.equal(typed.code, 0, typed.stderr);
+  const pressed = await runner.playwright(['press', 'Enter'], cwd);
+  assert.equal(pressed.code, 0, pressed.stderr);
+  const afterEnter = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterEnter.code, 0, `${afterEnter.stderr}\n${afterEnter.stdout}`);
+  assert.equal(afterEnter.stdout, 'enter:adax\n');
+  const image = await runner.playwright(['screenshot', '--filename', 'shot.png'], cwd);
+  assert.equal(image.code, 0, image.stderr);
+  const png = await runner.read(cwd, 'shot.png');
+  assert.equal(png[0], 0x89);
+  assert.equal(png[1], 0x50);
+  const listed = await runner.playwright(['tab-list'], cwd);
+  assert.equal(listed.code, 0, listed.stderr);
+  assert.match(listed.stdout, new RegExp(escapeReg(`[${openedId}]`)));
+  assert.match(listed.stdout, new RegExp(escapeReg(page)));
+  const extra = await runner.playwright(['tab-new', `${site.origin}/other`], cwd);
+  assert.equal(extra.code, 0, extra.stderr);
+  const extraId = targetOf(extra.stdout);
+  const againListed = await runner.playwright(['tab-list'], cwd);
+  const pageLine = againListed.stdout.split('\n').find((line) => line.includes(`[${openedId}]`));
+  const pageIndex = pageLine?.match(/^(\d+):/)?.[1];
+  assert.ok(pageIndex, againListed.stdout);
+  const selected = await runner.playwright(['tab-select', pageIndex], cwd);
+  assert.equal(selected.code, 0, selected.stderr);
+  assert.match(selected.stdout, new RegExp(escapeReg(openedId)));
+  const moved = await runner.playwright(['goto', `${site.origin}/one`], cwd);
+  assert.equal(moved.code, 0, moved.stderr);
+  const logged = await runner.playwright(['eval', "console.error('slicc-console-marker')"], cwd);
+  assert.equal(logged.code, 0, logged.stderr);
+  const messages = await runner.playwright(['console'], cwd);
+  assert.equal(messages.code, 0, `${messages.stderr}\n${messages.stdout}`);
+  assert.equal(markerCount(messages.stdout), 1, messages.stdout);
+  const reread = await runner.playwright(['snapshot'], cwd);
+  assert.equal(reread.code, 0, `${reread.stderr}\n${reread.stdout}`);
+  const replayed = await runner.playwright(['console'], cwd);
+  assert.equal(replayed.code, 0, `${replayed.stderr}\n${replayed.stdout}`);
+  assert.equal(markerCount(replayed.stdout), 1, replayed.stdout);
+  const fetched = await runner.playwright(
+    ['eval', `fetch('${site.origin}/api/me').then((response) => response.text())`],
+    cwd
+  );
+  assert.equal(fetched.code, 0, `${fetched.stderr}\n${fetched.stdout}`);
+  const requests = await runner.playwright(['requests'], cwd);
+  assert.equal(requests.code, 0, `${requests.stderr}\n${requests.stdout}`);
+  assert.match(requests.stdout, /\/api\/me/);
+  const requestIndex = requests.stdout
+    .split('\n')
+    .find((line) => line.includes('/api/me'))
+    ?.match(/^(\d+)\./)?.[1];
+  assert.ok(requestIndex, requests.stdout);
+  const one = await runner.playwright(['request', requestIndex], cwd);
+  assert.equal(one.code, 0, `${one.stderr}\n${one.stdout}`);
+  assert.match(one.stdout, /\/api\/me/);
+  const missing = await runner.playwright(['request', '9999'], cwd);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /not found/);
+  const closed = await runner.playwright(['tab-close', '--tab', extraId], cwd);
+  assert.equal(closed.code, 0, closed.stderr);
+  const spare = await runner.playwright(['tab-new', `${site.origin}/two`], cwd);
+  assert.equal(spare.code, 0, spare.stderr);
+  const spareId = targetOf(spare.stdout);
+  const withSpare = await runner.playwright(['tab-list'], cwd);
+  const spareIndex = withSpare.stdout
+    .split('\n')
+    .find((line) => line.includes(`[${spareId}]`))
+    ?.match(/^(\d+):/)?.[1];
+  assert.ok(spareIndex, withSpare.stdout);
+  const byIndex = await runner.playwright(['tab-close', spareIndex], cwd);
+  assert.equal(byIndex.code, 0, byIndex.stderr);
+  assert.equal(byIndex.stdout, `Closed tab ${spareId}\n`);
+  const outOfRange = await runner.playwright(['tab-close', '99'], cwd);
+  assert.equal(outOfRange.code, 1);
+  assert.match(outOfRange.stderr, /out of range/);
+  const remaining = await runner.playwright(['tab-list'], cwd);
+  const backIndex = remaining.stdout
+    .split('\n')
+    .find((line) => line.includes(`[${openedId}]`))
+    ?.match(/^(\d+):/)?.[1];
+  assert.ok(backIndex, remaining.stdout);
+  const back = await runner.playwright(['tab-select', backIndex], cwd);
+  assert.equal(back.code, 0, back.stderr);
+  const finished = await runner.playwright(['close'], cwd);
+  assert.equal(finished.code, 0, finished.stderr);
+}
+
+async function curlFlow(runner, site, wsUrl) {
+  const cwd = await runner.fresh();
+  const page = `${site.origin}/page`;
+  const opened = await runner.playwright(['open', page], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+  const tab = targetOf(opened.stdout);
+  const got = await runner.curl([`${site.origin}/api/me`], cwd);
+  assert.equal(got.code, 0, got.stderr);
+  assert.match(got.stdout, /session=from-tab/);
+  const posted = await runner.curl(['--json', '{"a":1}', `${site.origin}/json-post`], cwd);
+  assert.equal(posted.code, 0, `${posted.stderr}\n${posted.stdout}`);
+  assert.equal(posted.stdout, '{"ok":true}');
+  await runner.write(cwd, 'upload.bin', 'hello-bytes');
+  const uploaded = await runner.curl(
+    ['-F', 'up=@upload.bin;filename=up.bin', `${site.origin}/upload`],
+    cwd
+  );
+  assert.equal(uploaded.code, 0, `${uploaded.stderr}\n${uploaded.stdout}`);
+  assert.equal(uploaded.stdout, 'uploaded');
+  const shown = await runner.curl(['-i', `${site.origin}/show`], cwd);
+  assert.equal(shown.code, 0, shown.stderr);
+  assert.match(shown.stdout, /^HTTP\/1\.1 200/);
+  assert.match(shown.stdout, /x-test: yes/);
+  assert.match(shown.stdout, /\r\n\r\nhi$/);
+  const head = await runner.curl(['-I', `${site.origin}/only-head`], cwd);
+  assert.equal(head.code, 0, head.stderr);
+  assert.match(head.stdout, /HTTP\/1\.1 200/);
+  assert.doesNotMatch(head.stdout, /SECRET/);
+  const dumped = await runner.curl(['-D', 'headers.txt', `${site.origin}/dump`], cwd);
+  assert.equal(dumped.code, 0, dumped.stderr);
+  assert.equal(dumped.stdout, 'body-text');
+  const headers = Buffer.from(await runner.read(cwd, 'headers.txt')).toString('utf8');
+  assert.match(headers, /HTTP\/1\.1 200/);
+  assert.match(headers, /x-dump: 1/);
+  const code = await runner.curl(['-w', '%{http_code}', `${site.origin}/code`], cwd);
+  assert.equal(code.code, 0, code.stderr);
+  assert.equal(code.stdout, '201');
+  const failed = await runner.curl(['-f', `${site.origin}/nope`], cwd);
+  assert.equal(failed.code, 22, failed.stderr);
+  assert.match(failed.stderr, /\(22\)/);
+  const timed = await runner.curl(['-m', '1', '-w', '%{http_code}', `${site.origin}/slow`], cwd);
+  assert.equal(timed.code, 28, `${timed.stderr}\n${timed.stdout}`);
+  assert.match(timed.stderr, /\(28\)/);
+  const second = await runner.playwright(['open', `${site.origin}/two`], cwd);
+  assert.equal(second.code, 0, second.stderr);
+  const other = targetOf(second.stdout);
+  await runner.clearSession(cwd);
+  const ambiguous = await runner.curl([`${site.origin}/api/me`], cwd);
+  assert.equal(ambiguous.code, 2, ambiguous.stderr);
+  assert.match(ambiguous.stderr, new RegExp(escapeReg(tab)));
+  assert.match(ambiguous.stderr, new RegExp(escapeReg(other)));
+  const picked = await runner.curl(['--tab', tab, `${site.origin}/api/me`], cwd);
+  assert.equal(picked.code, 0, `${picked.stderr}\n${picked.stdout}`);
+  assert.match(picked.stdout, /session=from-tab/);
+  const frame = await frameId(wsUrl, tab);
+  const framed = await runner.curl(['--tab', tab, '--frame', frame, `${site.origin}/api/me`], cwd);
+  assert.equal(framed.code, 0, `${framed.stderr}\n${framed.stdout}`);
+  const missing = await runner.curl(
+    ['--tab', tab, '--frame', 'NOTAFRAME', `${site.origin}/api/me`],
+    cwd
+  );
+  assert.notEqual(missing.code, 0, missing.stdout);
+  assert.match(missing.stderr, /no frame/);
+  const closedPage = await runner.playwright(['tab-close', '--tab', tab], cwd);
+  assert.equal(closedPage.code, 0, closedPage.stderr);
+  const closedOther = await runner.playwright(['tab-close', '--tab', other], cwd);
+  assert.equal(closedOther.code, 0, closedOther.stderr);
+}
+
+async function routeFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const ok = (result) => assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+  const empty = await runner.playwright(['route-list'], cwd);
+  ok(empty);
+  assert.equal(empty.stdout, 'No active routes\n');
+  const refused = await runner.playwright(
+    ['route', 'https://vault.sliccy.ai/**', '--status=200'],
+    cwd
+  );
+  assert.equal(refused.code, 1);
+  assert.equal(refused.stderr, "slicc: refused: target is on seven's origin\n");
+  const mocked = await runner.playwright(
+    ['route', '**/api/me', '--body=mocked', '--content-type=text/plain', '--header', 'X-Mock: yes'],
+    cwd
+  );
+  ok(mocked);
+  assert.equal(mocked.stdout, 'Route added for pattern: **/api/me\n');
+  ok(
+    await runner.playwright(
+      ['route', '**/api/headers', '--header=X-Added: 1', '--remove-header=x-drop'],
+      cwd
+    )
+  );
+  await runner.write(cwd, 'mock.html', '<!doctype html><title>From file</title><p>file</p>');
+  ok(await runner.playwright(['route', '**/two', '--fulfill-file', 'mock.html'], cwd));
+  ok(await runner.playwright(['route', '*', '--status=418'], cwd));
+  ok(await runner.playwright(['route', '**/*', '--status=418'], cwd));
+  ok(await runner.playwright(['unroute', '**/*'], cwd));
+  const listed = await runner.playwright(['route-list'], cwd);
+  ok(listed);
+  assert.equal(
+    listed.stdout,
+    '1. **/api/me (body=mocked, contentType=text/plain, addHeaders={"X-Mock":"yes"})\n2. **/api/headers (addHeaders={"X-Added":"1"}, removeHeaders=x-drop)\n3. **/two (file=mock.html)\n4. * (status=418)\n'
+  );
+  ok(await runner.playwright(['unroute', '*'], cwd));
+  const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+  ok(opened);
+  const tab = targetOf(opened.stdout);
+  const me = await runner.playwright(
+    [
+      'eval',
+      "fetch('/api/me').then(async (r) => (await r.text()) + ':' + r.headers.get('x-mock'))",
+    ],
+    cwd
+  );
+  ok(me);
+  assert.equal(me.stdout, 'mocked:yes\n');
+  const edited = await runner.playwright(
+    ['eval', "fetch('/api/headers', { headers: { 'X-Drop': '1' } }).then((r) => r.text())"],
+    cwd
+  );
+  ok(edited);
+  assert.equal(edited.stdout, 'x-added=1 x-drop=none\n');
+  ok(await runner.playwright(['route', '**', '--status=418'], cwd));
+  const seven = await runner.playwright(
+    ['eval', "fetch('http://seven.sliccy.ai/ping').then((r) => r.status + ':' + r.statusText)"],
+    cwd
+  );
+  ok(seven);
+  assert.equal(seven.stdout, '200:OK\n');
+  ok(await runner.playwright(['unroute', '**'], cwd));
+  ok(await runner.playwright(['goto', `${site.origin}/two`], cwd));
+  const title = await runner.playwright(['eval', 'document.title'], cwd);
+  ok(title);
+  assert.equal(title.stdout, 'From file\n');
+  const removed = await runner.playwright(['unroute', '**/api/me'], cwd);
+  ok(removed);
+  assert.equal(removed.stdout, 'Removed 1 route(s) for pattern: **/api/me\n');
+  const real = await runner.playwright(['eval', "fetch('/api/me').then((r) => r.text())"], cwd);
+  ok(real);
+  assert.match(real.stdout, /session=from-tab/);
+  const all = await runner.playwright(['unroute'], cwd);
+  ok(all);
+  assert.equal(all.stdout, 'Removed all 2 route(s)\n');
+  ok(await runner.playwright(['tab-close', '--tab', tab], cwd));
+}
+
+async function basicsBatchFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const page = `${site.origin}/page`;
+  const opened = await runner.playwright(['open', page], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+
+  const nav1 = await runner.playwright(['goto', `${site.origin}/one`], cwd);
+  assert.equal(nav1.code, 0, nav1.stderr);
+  const back = await runner.playwright(['go-back'], cwd);
+  assert.equal(back.code, 0, back.stderr);
+  assert.equal(back.stdout, 'Navigated back\n');
+  const loc1 = await runner.playwright(['eval', 'location.pathname'], cwd);
+  assert.equal(loc1.code, 0, loc1.stderr);
+  assert.equal(loc1.stdout, '/page\n');
+  const forward = await runner.playwright(['go-forward'], cwd);
+  assert.equal(forward.code, 0, forward.stderr);
+  assert.equal(forward.stdout, 'Navigated forward\n');
+  const loc2 = await runner.playwright(['eval', 'location.pathname'], cwd);
+  assert.equal(loc2.code, 0, loc2.stderr);
+  assert.equal(loc2.stdout, '/one\n');
+
+  await runner.playwright(['goto', `${site.origin}/page`], cwd);
+  const reload = await runner.playwright(['reload'], cwd);
+  assert.equal(reload.code, 0, reload.stderr);
+  assert.equal(reload.stdout, 'Reloaded\n');
+
+  const snap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap.code, 0, `${snap.stderr}\n${snap.stdout}`);
+  const btn = refOf(snap.stdout, 'button', 'Go');
+
+  const hovered = await runner.playwright(['hover', btn], cwd);
+  assert.equal(hovered.code, 0, hovered.stderr);
+  assert.match(hovered.stdout, /Hovered/);
+  const afterHover = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterHover.stdout, 'hovered\n');
+
+  const snap2 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap2.code, 0, `${snap2.stderr}\n${snap2.stdout}`);
+  const btn2 = refOf(snap2.stdout, 'button', 'Go');
+  const dbl = await runner.playwright(['dblclick', btn2], cwd);
+  assert.equal(dbl.code, 0, dbl.stderr);
+  assert.match(dbl.stdout, /Double-clicked/);
+  const afterDbl = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterDbl.stdout, 'dblclicked\n');
+
+  const snap3 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap3.code, 0, `${snap3.stderr}\n${snap3.stdout}`);
+  const sel = refOf(snap3.stdout, 'combobox', 'Color');
+  const selected = await runner.playwright(['select', sel, 'green'], cwd);
+  assert.equal(selected.code, 0, selected.stderr);
+  assert.match(selected.stdout, /Selected/);
+  const afterSel = await runner.playwright(['eval', "document.getElementById('color').value"], cwd);
+  assert.equal(afterSel.stdout, 'green\n');
+
+  const snap4 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap4.code, 0, `${snap4.stderr}\n${snap4.stdout}`);
+  const cb = refOf(snap4.stdout, 'checkbox', 'Agree');
+  const checked = await runner.playwright(['check', cb], cwd);
+  assert.equal(checked.code, 0, checked.stderr);
+  assert.match(checked.stdout, /Checked/);
+  const afterCheck = await runner.playwright(
+    ['eval', "document.getElementById('agree').checked"],
+    cwd
+  );
+  assert.equal(afterCheck.stdout, 'true\n');
+
+  const snap5 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap5.code, 0, `${snap5.stderr}\n${snap5.stdout}`);
+  const cb2 = refOf(snap5.stdout, 'checkbox', 'Agree');
+  const already = await runner.playwright(['check', cb2], cwd);
+  assert.equal(already.code, 0, already.stderr);
+  assert.match(already.stdout, /already checked/);
+
+  const snap6 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap6.code, 0, `${snap6.stderr}\n${snap6.stdout}`);
+  const cb3 = refOf(snap6.stdout, 'checkbox', 'Agree');
+  const unchecked = await runner.playwright(['uncheck', cb3], cwd);
+  assert.equal(unchecked.code, 0, unchecked.stderr);
+  assert.match(unchecked.stdout, /Unchecked/);
+  const afterUncheck = await runner.playwright(
+    ['eval', "document.getElementById('agree').checked"],
+    cwd
+  );
+  assert.equal(afterUncheck.stdout, 'false\n');
+
+  const iframeLoaded = await runner.playwright(
+    [
+      'eval',
+      'new Promise((resolve) => { const frame = document.querySelector("iframe"); const doc = frame.contentDocument; if (doc && doc.readyState === "complete" && doc.location.href !== "about:blank") return resolve("ready"); frame.addEventListener("load", () => resolve("ready"), { once: true }); })',
+    ],
+    cwd
+  );
+  assert.equal(iframeLoaded.code, 0, iframeLoaded.stderr);
+  assert.equal(iframeLoaded.stdout, 'ready\n');
+
+  const frames = await runner.playwright(['frames'], cwd);
+  assert.equal(frames.code, 0, frames.stderr);
+  assert.match(frames.stdout, /Frame IDs/);
+  assert.match(frames.stdout, /\[main\]/);
+  assert.match(frames.stdout, /\[child\]/);
+  assert.match(frames.stdout, /\/child\.html/);
+
+  const pdf = await runner.playwright(['pdf', '--filename', 'test.pdf'], cwd);
+  assert.equal(pdf.code, 0, pdf.stderr);
+  assert.match(pdf.stdout, /Saved PDF/);
+  const pdfBytes = await runner.read(cwd, 'test.pdf');
+  assert.equal(pdfBytes[0], 0x25);
+  assert.equal(pdfBytes[1], 0x50);
+  assert.equal(pdfBytes[2], 0x44);
+  assert.equal(pdfBytes[3], 0x46);
+
+  await runner.write(cwd, 'upload.txt', 'hello-upload');
+  const snap7 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap7.code, 0, `${snap7.stderr}\n${snap7.stdout}`);
+  const fileInput = refOf(snap7.stdout, 'button', 'Avatar');
+  const uploaded = await runner.playwright(
+    ['upload', fileInput, path.join(cwd, 'upload.txt')],
+    cwd
+  );
+  assert.equal(uploaded.code, 0, uploaded.stderr);
+  assert.match(uploaded.stdout, /Uploaded/);
+
+  const snap8 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap8.code, 0, `${snap8.stderr}\n${snap8.stdout}`);
+  const reactCb = refOf(snap8.stdout, 'checkbox', 'React');
+  const reactChecked = await runner.playwright(['check', reactCb], cwd);
+  assert.equal(reactChecked.code, 0, reactChecked.stderr);
+  assert.match(reactChecked.stdout, /Checked/);
+  const afterReactCheck = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.equal(afterReactCheck.stdout, 'react-cb:true\n');
+
+  const snap9 = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap9.code, 0, `${snap9.stderr}\n${snap9.stdout}`);
+  const lockedCb = refOf(snap9.stdout, 'checkbox', 'Locked');
+  const lockedCheck = await runner.playwright(['check', lockedCb], cwd);
+  assert.equal(lockedCheck.code, 1, lockedCheck.stdout);
+  assert.match(lockedCheck.stderr, /disabled/);
+
+  const framesOut = await runner.playwright(['frames'], cwd);
+  assert.equal(framesOut.code, 0, framesOut.stderr);
+  const childFrameLine = framesOut.stdout
+    .split('\n')
+    .find((l) => l.includes('[child]') && l.includes('/child.html'));
+  assert.ok(childFrameLine, framesOut.stdout);
+  const childFrameId = childFrameLine.match(/frameId=(\S+)/)?.[1];
+  assert.ok(childFrameId, childFrameLine);
+  const frameSnap = await runner.playwright(['snapshot', `--frame=${childFrameId}`], cwd);
+  assert.equal(frameSnap.code, 0, `${frameSnap.stderr}\n${frameSnap.stdout}`);
+  const hoverTarget = frameSnap.stdout.match(/statictext "hover me" \[ref=(f\d+e\d+)\]/)?.[1];
+  assert.ok(hoverTarget, `hover-target not found in frame snapshot:\n${frameSnap.stdout}`);
+  const hoverFrame = await runner.playwright(['hover', hoverTarget], cwd);
+  assert.equal(hoverFrame.code, 0, hoverFrame.stderr);
+  assert.match(hoverFrame.stdout, /Hovered/);
+  const hoverAttr = await runner.playwright(
+    [
+      'eval',
+      `--frame=${childFrameId}`,
+      'document.getElementById("hover-target").getAttribute("data-hovered")',
+    ],
+    cwd
+  );
+  assert.equal(hoverAttr.code, 0, hoverAttr.stderr);
+  assert.equal(hoverAttr.stdout, 'true\n');
+
+  const closed = await runner.playwright(['close'], cwd);
+  assert.equal(closed.code, 0, closed.stderr);
+}
+
+async function navigationGuardFlow(runner, site, wsUrl) {
+  const raw = await rawSocket(wsUrl);
+  const refusal = /^slicc: refused: /;
+  try {
+    const cwd = await runner.fresh();
+    const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+    assert.equal(opened.code, 0, opened.stderr);
+    await runner.playwright(['goto', 'http://seven.sliccy.ai/landing'], cwd);
+    const goBack = await runner.playwright(['go-back'], cwd);
+    if (goBack.code === 0) {
+      const probe = await runner.playwright(['eval', 'location.href'], cwd);
+      if (probe.code !== 0) {
+        assert.match(probe.stderr, refusal, 'go-back landed on protected origin');
+      }
+    }
+    const cwd2 = await runner.fresh();
+    const opened2 = await runner.playwright(['open', 'http://seven.sliccy.ai/landing'], cwd2);
+    if (opened2.code === 0) {
+      const goTo = await runner.playwright(['goto', `${site.origin}/page`], cwd2);
+      const reloaded = await runner.playwright(['reload'], cwd2);
+      if (reloaded.code === 0) {
+        const probe2 = await runner.playwright(['eval', 'location.href'], cwd2);
+        assert.equal(probe2.code, 0, probe2.stderr);
+      }
+    }
+  } finally {
+    raw.close();
+  }
+}
+
+async function protectedFlow(runner, site, wsUrl) {
+  const raw = await rawSocket(wsUrl);
+  const refusal = /^slicc: refused: /;
+  const refused = async (args, cwd) => {
+    const result = await runner.playwright(args, cwd);
+    assert.equal(result.code, 1, `${args.join(' ')}\n${result.stdout}`);
+    assert.match(result.stderr, refusal, args.join(' '));
+    assert.doesNotMatch(result.stdout + result.stderr, /SECRET/);
+  };
+  try {
+    const seven = await raw.open('http://seven.sliccy.ai/landing?k=SEVENSECRET');
+    const vault = await raw.open('http://vault.sliccy.ai/landing?k=VAULTSECRET');
+    const cwd = await runner.fresh();
+    const listed = await runner.playwright(['tab-list'], cwd);
+    assert.equal(listed.code, 0, listed.stderr);
+    for (const hidden of [seven, vault, 'sliccy', 'SECRET']) {
+      assert.doesNotMatch(listed.stdout, new RegExp(escapeReg(hidden)), listed.stdout);
+    }
+    for (const tab of [seven, vault]) {
+      await refused(['eval', 'location.href', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
+      await refused(['screenshot', '--tab', tab, '--filename', 'x.png'], cwd);
+      await refused(['press', 'a', '--tab', tab], cwd);
+      await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+      await refused(['tab-close', '--tab', tab], cwd);
+      const curled = await runner.curl(['--tab', tab, `${site.origin}/api/me`], cwd);
+      assert.notEqual(curled.code, 0, curled.stdout);
+      assert.match(curled.stderr, /slicc: refused: /);
+      assert.ok((await raw.targetUrl(tab)).includes('SECRET'), 'the protected tab moved');
+    }
+    for (const url of ['http://vault.sliccy.ai/landing', '//seven.sliccy.ai/x']) {
+      const curled = await runner.curl([url], cwd);
+      assert.equal(curled.code, 1, curled.stdout);
+      assert.equal(curled.stderr, "curlwright: slicc: refused: target is on seven's origin\n");
+    }
+    await refused(['open', 'http://vault.sliccy.ai/'], cwd);
+    await refused(['open', 'https://seven.sliccy.ai/os/'], cwd);
+    const body =
+      '<!doctype html><meta http-equiv="refresh" content="0;url=http://vault.sliccy.ai/landing?n=refresh"><title>refresh</title>';
+    const routed = await runner.playwright(
+      ['route', '**/refresh', `--body=${body}`, '--content-type=text/html'],
+      cwd
+    );
+    assert.equal(routed.code, 0, routed.stderr);
+    const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+    assert.equal(opened.code, 0, opened.stderr);
+    const tab = targetOf(opened.stdout);
+    await runner.playwright(['goto', `${site.origin}/refresh`], cwd);
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      const probe = await runner.playwright(['eval', 'location.href'], cwd);
+      if (probe.code !== 0 && refusal.test(probe.stderr)) break;
+      assert.ok(
+        Date.now() < deadline,
+        `the refreshed tab was never refused: ${probe.stdout}${probe.stderr}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.match(await raw.targetUrl(tab), /^http:\/\/vault\.sliccy\.ai\//);
+    await refused(['eval', 'document.cookie', '--tab', tab], cwd);
+    await refused(['snapshot', '--tab', tab], cwd);
+    await refused(['screenshot', '--tab', tab, '--filename', 'y.png'], cwd);
+    await refused(['press', 'a', '--tab', tab], cwd);
+    await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+    const afterList = await runner.playwright(['tab-list'], cwd);
+    assert.doesNotMatch(afterList.stdout, new RegExp(escapeReg(tab)));
+    const requests = await runner.playwright(['requests', '--tab', tab], cwd);
+    assert.doesNotMatch(requests.stdout + requests.stderr, /vault|n=refresh/);
+    await runner.playwright(['unroute'], cwd);
+    for (const id of [seven, vault, tab]) await raw.send('Target.closeTarget', { targetId: id });
+  } finally {
+    raw.close();
+  }
+}
+
+function markerCount(stdout) {
+  return stdout.split('slicc-console-marker').length - 1;
+}
+
+function targetOf(stdout) {
+  const match = stdout.match(/\[targetId: ([^\]]+)\]/);
+  if (!match) throw new Error(stdout);
+  return match[1];
+}
+
+function refOf(stdout, role, name) {
+  const match = stdout.match(new RegExp(`(?<![A-Za-z])${role} "${name}" \\[ref=(e\\d+)\\]`));
+  if (!match) throw new Error(`missing ${role} ${name}\n${stdout}`);
+  return match[1];
+}
+
+function escapeReg(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function kernelUploadFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+  const snap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap.code, 0, `${snap.stderr}\n${snap.stdout}`);
+  const fileInput = refOf(snap.stdout, 'button', 'Avatar');
+  const { mkdirSync, writeFileSync, unlinkSync } = await import('node:fs');
+  const hostProbe = `/tmp/slicc-upload-probe-${process.pid}.txt`;
+  mkdirSync(path.dirname(hostProbe), { recursive: true });
+  writeFileSync(hostProbe, 'HOST_SECRET');
+  try {
+    await runner.write('/tmp', `slicc-upload-probe-${process.pid}.txt`, 'VFS_BYTES');
+    const uploaded = await runner.playwright(['upload', fileInput, hostProbe], cwd);
+    assert.equal(uploaded.code, 0, uploaded.stderr);
+    assert.match(uploaded.stdout, /Uploaded/);
+    const deadline = Date.now() + 5000;
+    let content = '';
+    while (Date.now() < deadline) {
+      const ev = await runner.playwright(
+        ['eval', "document.getElementById('out').textContent"],
+        cwd
+      );
+      content = ev.stdout.trim();
+      if (content.startsWith('file:')) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(content.startsWith('file:'), `page did not read the file: ${content}`);
+    assert.ok(content.includes('VFS_BYTES'), `expected VFS_BYTES in: ${content}`);
+    assert.ok(!content.includes('HOST_SECRET'), `host content leaked: ${content}`);
+  } finally {
+    try {
+      unlinkSync(hostProbe);
+    } catch {}
+  }
+}
+
+async function nativeUploadValidationFlow(runner, site) {
+  const cwd = await runner.fresh();
+  const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
+  assert.equal(opened.code, 0, opened.stderr);
+  const snap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(snap.code, 0, `${snap.stderr}\n${snap.stdout}`);
+  const fileInput = refOf(snap.stdout, 'button', 'Avatar');
+
+  const dirResult = await runner.playwright(['upload', fileInput, cwd], cwd);
+  assert.notEqual(dirResult.code, 0);
+  assert.match(dirResult.stderr, /directory/);
+
+  const missingResult = await runner.playwright(
+    ['upload', fileInput, path.join(cwd, 'nonexistent-file.txt')],
+    cwd
+  );
+  assert.notEqual(missingResult.code, 0);
+  assert.match(missingResult.stderr, /not found/);
+
+  if (process.platform !== 'win32') {
+    const { writeFile, chmod } = await import('node:fs/promises');
+    const unreadable = path.join(cwd, 'noperm.txt');
+    await writeFile(unreadable, 'secret');
+    await chmod(unreadable, 0o000);
+    const unreadResult = await runner.playwright(['upload', fileInput, unreadable], cwd);
+    await chmod(unreadable, 0o644);
+    assert.notEqual(unreadResult.code, 0);
+    assert.match(unreadResult.stderr, /cannot read/);
+  }
+
+  const afterSnap = await runner.playwright(['snapshot'], cwd);
+  assert.equal(afterSnap.code, 0, `${afterSnap.stderr}\n${afterSnap.stdout}`);
+  const pageContent = await runner.playwright(
+    ['eval', "document.getElementById('out').textContent"],
+    cwd
+  );
+  assert.ok(
+    !pageContent.stdout.includes('file:'),
+    `page input should be empty but got: ${pageContent.stdout}`
+  );
+}
