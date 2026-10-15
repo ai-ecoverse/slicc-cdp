@@ -111,6 +111,15 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
               (event) => event.method === 'Fetch.requestPaused' && event.params.request.url === url
             );
             assert.equal(paused.length > 0, target === 'ordinary');
+            if (target === 'ordinary') {
+              assert(!Array.isArray(paused[0].params.request.headers));
+              assert.equal(typeof paused[0].params.request.headers, 'object');
+              assert(
+                Object.keys(paused[0].params.request.headers).some(
+                  (name) => name.toLowerCase() === 'user-agent'
+                )
+              );
+            }
             if (target !== 'ordinary') assert(fixture.log().some((entry) => entry.url === url));
           } finally {
             await stop?.();

@@ -68,8 +68,9 @@ fn main() {
         }
         let _ = cdp.pump(Instant::now() + Duration::from_millis(5));
         while let Ok(Some(paused)) = cdp.next_paused(None, Duration::ZERO) {
+            let headers: BTreeMap<String, String> = paused.headers.into_iter().collect();
             emit(
-                json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"request":{"url":paused.url,"method":paused.method,"headers":paused.headers}}}}),
+                json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"request":{"url":paused.url,"method":paused.method,"headers":headers}}}}),
             );
         }
         for event in &cdp.events()[seen..] {

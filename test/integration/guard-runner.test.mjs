@@ -94,8 +94,8 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
         browserContexts: true,
       },
       variant: Object.keys(set.variants),
-      parallel: 16,
-      clientFactory: async ({ variant, detachDelay, vector, target }) => {
+      parallel: process.platform === 'linux' ? 16 : 6,
+      clientFactory: async ({ slot, variant, detachDelay, vector, target }) => {
         if (
           vector.kind === 'text' ||
           vector.requires?.includes('autoAttach') ||
@@ -103,7 +103,7 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
           vector.skip?.target === target
         )
           return {};
-        const pool = 0;
+        const pool = slot;
         if (!browsers.has(pool)) browsers.set(pool, launchBrowser(browserArgs()));
         const browser = await browsers.get(pool);
         const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
