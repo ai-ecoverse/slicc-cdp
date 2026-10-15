@@ -145,37 +145,48 @@ jobs:
 
   verify-signatures:
     needs: [release, build-binaries]
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - { label: darwin-amd64, identifier: ai.sliccy.playwright-cli, bin: playwright-cli-darwin-amd64 }
-          - { label: darwin-amd64, identifier: ai.sliccy.curlwright, bin: curlwright-darwin-amd64 }
-          - { label: darwin-arm64, identifier: ai.sliccy.playwright-cli, bin: playwright-cli-darwin-arm64 }
-          - { label: darwin-arm64, identifier: ai.sliccy.curlwright, bin: curlwright-darwin-arm64 }
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: binaries-${{ matrix.label }}
+          pattern: binaries-darwin-*
+          merge-multiple: true
 
-      - name: Verify codesign identity
+      - name: Verify codesign identity, strict signature and notarisation of every macOS binary
         run: |
-          output=$(codesign -dv --verbose=2 "${{ matrix.bin }}" 2>&1)
-          echo "$output"
-          echo "$output" | grep -q "Authority=Developer ID Application"
-          echo "$output" | grep -q "Identifier=${{ matrix.identifier }}"
-
-      - name: Verify codesign strict
-        run: codesign --verify --strict "${{ matrix.bin }}"
-
-      - name: Verify notarisation
-        run: |
-          output=$(spctl -a -vv -t install "${{ matrix.bin }}" 2>&1)
-          echo "$output"
-          echo "$output" | grep -q "accepted"
-          echo "$output" | grep -q "source=Notarized Developer ID"
+          failed=0
+          for entry in \
+            ai.sliccy.playwright-cli:playwright-cli-darwin-amd64 \
+            ai.sliccy.curlwright:curlwright-darwin-amd64 \
+            ai.sliccy.playwright-cli:playwright-cli-darwin-arm64 \
+            ai.sliccy.curlwright:curlwright-darwin-arm64; do
+            identifier="${entry%%:*}"
+            bin="${entry#*:}"
+            echo "::group::${bin}"
+            problems=""
+            if [ ! -f "$bin" ]; then
+              problems=" missing"
+            else
+              output=$(codesign -dv --verbose=2 "$bin" 2>&1)
+              echo "$output"
+              echo "$output" | grep -q "Authority=Developer ID Application" || problems="$problems no-developer-id"
+              echo "$output" | grep -q "Identifier=${identifier}" || problems="$problems wrong-identifier"
+              codesign --verify --strict "$bin" || problems="$problems codesign-strict"
+              output=$(spctl -a -vv -t install "$bin" 2>&1)
+              echo "$output"
+              echo "$output" | grep -q "accepted" || problems="$problems not-accepted"
+              echo "$output" | grep -q "source=Notarized Developer ID" || problems="$problems not-notarized"
+            fi
+            echo "::endgroup::"
+            if [ -n "$problems" ]; then
+              echo "::error::${bin}:${problems}"
+              failed=1
+            else
+              echo "${bin}: signed by Developer ID as ${identifier}, strict, notarised"
+            fi
+          done
+          exit "$failed"
 
   publish-release:
     needs: [release, upload-assets, verify-signatures]
