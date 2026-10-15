@@ -178,9 +178,14 @@ export async function rawSocket(wsUrl) {
     });
   });
   const pending = new Map();
+  const watchers = new Set();
   let next = 0;
   ws.addEventListener('message', (event) => {
     const message = JSON.parse(socketText(event.data));
+    if (message.method) {
+      for (const watcher of watchers) watcher(message);
+      return;
+    }
     const waiter = pending.get(message.id);
     if (!waiter) return;
     pending.delete(message.id);
@@ -213,9 +218,23 @@ export async function rawSocket(wsUrl) {
     const { targetInfo } = await send('Target.getTargetInfo', { targetId });
     return targetInfo.url;
   };
+  const event = (method, sessionId, matches = () => true) => {
+    let watcher;
+    const seen = new Promise((resolve) => {
+      watcher = (message) => {
+        if (message.method !== method || message.sessionId !== sessionId) return;
+        if (!matches(message.params ?? {})) return;
+        watchers.delete(watcher);
+        resolve(message.params ?? {});
+      };
+      watchers.add(watcher);
+    });
+    return { seen, cancel: () => watchers.delete(watcher) };
+  };
   return {
     send,
     targetUrl,
+    event,
     async open(url) {
       const { targetId } = await send('Target.createTarget', { url, background: true });
       const deadline = Date.now() + 15000;

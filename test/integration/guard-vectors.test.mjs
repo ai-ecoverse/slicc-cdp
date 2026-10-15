@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { plantOrigins } from './plant.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import { deadline, killTree, progress } from './watchdog.mjs';
 
@@ -889,38 +890,7 @@ function judgeCookie(ctx, run, out) {
 }
 
 async function plant(ctx) {
-  const raw = await rawSocket(ctx.wsUrl);
-  try {
-    for (const origin of [ctx.ordinary, ctx.alt, ...Object.values(spec.targets)]) {
-      const tab = await raw.open(`${origin}/plant`);
-      try {
-        await planted(raw, tab, origin);
-      } finally {
-        await raw.send('Target.closeTarget', { targetId: tab });
-      }
-    }
-  } finally {
-    raw.close();
-  }
-}
-
-async function planted(raw, tab, origin) {
-  const host = new URL(origin).hostname;
-  const { sessionId } = await raw.send('Target.attachToTarget', { targetId: tab, flatten: true });
-  const expression = `location.href.startsWith(${JSON.stringify(`${origin}/plant`)}) && document.readyState === 'complete' && localStorage.getItem('canary') === 'planted'`;
-  const deadline = Date.now() + 15000;
-  for (;;) {
-    const value = await raw
-      .send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)
-      .catch(() => null);
-    const { cookies } = await raw.send('Storage.getCookies', {});
-    const names = cookies.filter((cookie) => cookie.domain === host).map((cookie) => cookie.name);
-    if (value?.result?.value === true && names.includes('canary') && names.includes('del')) return;
-    if (Date.now() > deadline) {
-      throw new Error(`${origin}/plant never planted its cookies and localStorage (${names})`);
-    }
-    await delay(100);
-  }
+  await plantOrigins(ctx.wsUrl, [ctx.ordinary, ctx.alt, ...Object.values(spec.targets)]);
 }
 
 async function readStorage(raw, origin) {
