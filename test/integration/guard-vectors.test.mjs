@@ -476,11 +476,11 @@ function fetchRun(ctx, c, side) {
         },
       },
       launch(probes.fetch.run(bracket('before')), 'before'),
-      { op: 'wait', ms: 500 },
+      { op: 'until', slot: 'before', ms: fetchWaitMs },
       launch(probe.run(url), 'probe'),
-      { op: 'wait', ms: fetchWaitMs },
+      { op: 'until', slot: 'probe', ms: fetchWaitMs },
       launch(probes.fetch.run(bracket('after')), 'after'),
-      { op: 'wait', ms: 500 },
+      { op: 'until', slot: 'after', ms: fetchWaitMs },
       { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
       { op: 'read', slot: 'probe' }
     );

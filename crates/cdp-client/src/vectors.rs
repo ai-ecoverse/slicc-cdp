@@ -72,7 +72,18 @@ impl Run {
                     .get("expression")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                self.evaluate(&format!("globalThis[{slot:?}] = ({expression}); true"))
+                let done = format!("{slot}:done");
+                self.evaluate(&format!(
+                    "globalThis[{slot:?}] = ({expression}); Promise.resolve(globalThis[{slot:?}]).finally(() => {{ globalThis[{done:?}] = true; }}); true"
+                ))
+            }
+            "until" => {
+                let slot = step
+                    .get("slot")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("vector");
+                let ms = step.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.until(slot, Duration::from_millis(ms))
             }
             "read" => {
                 let slot = step
@@ -192,6 +203,36 @@ impl Run {
             let now = Instant::now();
             if now >= deadline {
                 return json!({ "ok": true });
+            }
+            let slice = (now + Duration::from_millis(100)).min(deadline);
+            if let Err(message) = self.cdp.pump(slice) {
+                return json!({ "ok": false, "error": message });
+            }
+        }
+    }
+
+    fn until(&mut self, slot: &str, span: Duration) -> Value {
+        let deadline = Instant::now() + span;
+        let check = format!("globalThis[{:?}] === true", format!("{slot}:done"));
+        let session = self.session.clone();
+        loop {
+            self.drain();
+            let settled = self.cdp.call_for(
+                "Runtime.evaluate",
+                json!({ "expression": check, "returnByValue": true }),
+                Some(&session),
+                Duration::from_secs(5),
+            );
+            match settled {
+                Ok(value) if value["result"]["value"] == json!(true) => {
+                    return json!({ "ok": true })
+                }
+                Ok(_) => {}
+                Err(message) => return json!({ "ok": false, "error": message }),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return json!({ "ok": false, "error": format!("{slot} did not settle within {}ms", span.as_millis()) });
             }
             let slice = (now + Duration::from_millis(100)).min(deadline);
             if let Err(message) = self.cdp.pump(slice) {
