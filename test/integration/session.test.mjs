@@ -135,3 +135,48 @@ test('per-agent sessions: two sessions in one cwd each eval in their own tab', {
     }
   }
 });
+
+test('sessions follow the invoking cwd: two cwds in parallel each keep their own tab', {
+  timeout: 60_000,
+}, async () => {
+  const cwdA = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-cwd-a-'));
+  const cwdB = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-cwd-b-'));
+  const sessA = await sessionFile(cwdA);
+  const sessB = await sessionFile(cwdB);
+  const cleanups = [cwdA, cwdB, sessA, sessB];
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const wsUrl = browser.wsUrl;
+    const [openA, openB] = await Promise.all([
+      run(['--cdp', wsUrl, 'open', 'about:blank'], cwdA),
+      run(['--cdp', wsUrl, 'open', 'about:blank'], cwdB),
+    ]);
+    assert.equal(openA.code, 0, `open A failed: ${openA.stderr}`);
+    assert.equal(openB.code, 0, `open B failed: ${openB.stderr}`);
+    const [evalA, evalB] = await Promise.all([
+      run(['--cdp', wsUrl, 'eval', 'document.title = "cwd-a"; document.title'], cwdA),
+      run(['--cdp', wsUrl, 'eval', 'document.title = "cwd-b"; document.title'], cwdB),
+    ]);
+    assert.equal(evalA.code, 0, `eval A failed: ${evalA.stderr}`);
+    assert.equal(evalB.code, 0, `eval B failed: ${evalB.stderr}`);
+    const fileA = JSON.parse(await readFile(sessA, 'utf8'));
+    const fileB = JSON.parse(await readFile(sessB, 'utf8'));
+    assert.ok(fileA.current, 'cwd A has no current tab');
+    assert.ok(fileB.current, 'cwd B has no current tab');
+    assert.notEqual(fileA.current, fileB.current, 'two cwds share the same current tab');
+    const [titleA, titleB] = await Promise.all([
+      run(['--cdp', wsUrl, 'eval', 'document.title'], cwdA),
+      run(['--cdp', wsUrl, 'eval', 'document.title'], cwdB),
+    ]);
+    assert.ok(titleA.stdout.includes('cwd-a'), `cwd A reads its own tab: ${titleA.stdout}`);
+    assert.ok(titleB.stdout.includes('cwd-b'), `cwd B reads its own tab: ${titleB.stdout}`);
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    for (const p of cleanups) {
+      await rm(p, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});

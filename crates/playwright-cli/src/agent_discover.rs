@@ -211,7 +211,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let remembered = if explicit || profile.is_some() {
         None
     } else {
-        launch::remembered_endpoint_named(invocation.session.as_deref())
+        launch::remembered_endpoint_named(invocation.session.as_deref(), invocation.cwd.as_deref())
     };
     let active = profile.or(remembered);
     let start = match launch::start_after_explicit(invocation.cdp.as_deref(), cdp_env, active) {
@@ -246,7 +246,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         return Output::err(message);
     }
 
-    let mut sess_state = session::load_named(invocation.session.as_deref());
+    let mut sess_state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
 
     if let Some(ref url) = once_url {
         let target = match resolve_once_tab(&mut cdp, &mut sess_state, once_tab.as_deref()) {
@@ -2921,6 +2921,7 @@ mod tests {
             help: false,
             command_help: false,
             version: false,
+            cwd: None,
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);
@@ -3830,6 +3831,7 @@ mod tests {
             help: false,
             command_help: false,
             version: false,
+            cwd: None,
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);
@@ -3852,6 +3854,7 @@ mod tests {
             help: false,
             command_help: false,
             version: false,
+            cwd: None,
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);
@@ -4636,6 +4639,7 @@ mod tests {
             help: false,
             command_help: false,
             version: false,
+            cwd: None,
         };
         let output = run(&invocation, None);
         assert_eq!(output.code, 0);

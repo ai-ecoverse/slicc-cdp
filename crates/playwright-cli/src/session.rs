@@ -19,6 +19,7 @@ pub struct Session {
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
     pub routes: Vec<Route>,
+    pub cwd: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -76,7 +77,10 @@ fn config_root() -> Option<String> {
     }
 }
 
-fn path_named(session_name: Option<&str>) -> Option<PathBuf> {
+fn path_named(session_name: Option<&str>, cwd: Option<&Path>) -> Option<PathBuf> {
+    if let Some(cwd) = cwd {
+        return storage_path_named(cwd, session_name);
+    }
     #[cfg(target_arch = "wasm32")]
     let cwd = cdp_client::state::wasm_cwd(|name| std::env::var(name).ok())?;
     #[cfg(not(target_arch = "wasm32"))]
@@ -84,12 +88,13 @@ fn path_named(session_name: Option<&str>) -> Option<PathBuf> {
     storage_path_named(&cwd, session_name)
 }
 
-pub fn load_named(session_name: Option<&str>) -> Session {
+pub fn load_in(session_name: Option<&str>, cwd: Option<&Path>) -> Session {
     let session_name = session_name.filter(|name| !name.is_empty());
-    let mut sess = path_named(session_name)
+    let mut sess = path_named(session_name, cwd)
         .as_deref()
         .map(load_at)
         .unwrap_or_default();
+    sess.cwd = cwd.map(Path::to_path_buf);
     if let Some(name) = session_name {
         if sess.session_name.as_deref() != Some(name) {
             sess.current = None;
@@ -188,6 +193,7 @@ fn decode(text: &str) -> Session {
             .and_then(|item| item.as_array())
             .map(|items| items.iter().filter_map(route::decode).collect())
             .unwrap_or_default(),
+        cwd: None,
     }
 }
 
@@ -321,7 +327,7 @@ pub fn save(session: &Session) -> Result<(), String> {
         stored.endpoint = None;
         stored.provenance = None;
     }
-    let Some(file) = path_named(stored.session_name.as_deref()) else {
+    let Some(file) = path_named(stored.session_name.as_deref(), stored.cwd.as_deref()) else {
         if cfg!(target_arch = "wasm32") {
             return Err("session: HOME is not set\n".into());
         }
