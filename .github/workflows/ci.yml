@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   runner:
-    runs-on: ${{ vars.CERT_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CERT_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
