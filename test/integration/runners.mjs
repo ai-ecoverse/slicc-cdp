@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createNodeKernel } from '@ai-ecoverse/slicc-kernel/node';
 import { bridge } from './browser.mjs';
+import { deadline, killTree } from './watchdog.mjs';
 
 const manifest = JSON.stringify({
   name: '@ai-ecoverse/slicc-cdp',
@@ -47,13 +48,13 @@ export function runProcess(file, args, cwd, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     delete env.SLICC_CDP_URL;
-    const child = spawn(file, args, { cwd, env });
+    const child = spawn(file, args, { cwd, env, detached: process.platform !== 'win32' });
     const out = [];
     const err = [];
     child.stdout.on('data', (chunk) => out.push(chunk));
     child.stderr.on('data', (chunk) => err.push(chunk));
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      killTree(child);
       reject(new Error(`timed out: ${path.basename(file)} ${args.join(' ')}`));
     }, timeoutMs);
     child.on('error', (error) => {
@@ -135,6 +136,6 @@ export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
 }
 
 async function kernelRun(kernel, argv, cwd) {
-  const result = await kernel.run(argv, { cwd });
+  const result = await deadline(`kernel ${argv.join(' ')}`, 300000, kernel.run(argv, { cwd }));
   return { code: result.status, stdout: result.stdout, stderr: result.stderr };
 }

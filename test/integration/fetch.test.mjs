@@ -5,6 +5,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
 import { startServer } from './server.mjs';
+import { killTree } from './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -49,13 +50,17 @@ function cargo(args, extra) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, ...extra };
     delete env.SLICC_CDP_URL;
-    const child = spawn('cargo', args, { cwd: root, env });
+    const child = spawn('cargo', args, {
+      cwd: root,
+      env,
+      detached: process.platform !== 'win32',
+    });
     const out = [];
     const err = [];
     child.stdout.on('data', (chunk) => out.push(chunk));
     child.stderr.on('data', (chunk) => err.push(chunk));
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      killTree(child);
       reject(new Error('cargo test timed out'));
     }, 600000);
     child.on('error', (error) => {

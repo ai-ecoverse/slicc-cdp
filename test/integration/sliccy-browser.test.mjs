@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import browser from '../../packages/sliccy-browser/src/browser.js';
 import { launchBrowser } from './browser.mjs';
 import { startServer } from './server.mjs';
+import './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 

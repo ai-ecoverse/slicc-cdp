@@ -8,6 +8,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser, rawSocket } from './browser.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
+import { deadline, killTree, progress } from './watchdog.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
@@ -17,6 +18,7 @@ const spec = JSON.parse(await readFile(path.join(here, 'guard-vectors.json'), 'u
 const settleMs = 1500;
 const cliWaitMs = 6000;
 const fetchWaitMs = 5000;
+const rowSeconds = 180;
 const tall = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
   'base64'
@@ -80,10 +82,14 @@ test('guard vectors through the raw client, playwright-cli and the kernel', asyn
       ordinary: site.origin,
       alt: `http://localhost:${site.port}`,
     };
-    await plant(ctx);
+    progress('phase plant');
+    await deadline('plant', 60000, plant(ctx));
+    progress('phase raw lane');
     rows.push(...(await rawLane(ctx)));
     process.stdout.write(table(rows.filter((row) => row.id.startsWith('C5.'))));
-    rows.push(...(await verifyStorage(ctx)));
+    progress('phase storage');
+    rows.push(...(await deadline('verifyStorage', 60000, verifyStorage(ctx))));
+    progress('phase playwright-cli lane');
     const native = nativeRunner(
       path.join(nativeDir, process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'),
       path.join(nativeDir, process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'),
@@ -95,6 +101,7 @@ test('guard vectors through the raw client, playwright-cli and the kernel', asyn
       path.join(wasmDir, 'curlwright.wasm'),
       browser.wsUrl
     );
+    progress('phase kernel lane');
     rows.push(...(await cliLane(ctx, kernel, 'kernel', 1)));
     const report = table(rows);
     const file = process.env.SLICC_GUARD_REPORT || path.join(tmpdir(), 'guard-vectors-report.md');
@@ -127,7 +134,14 @@ function startFixture() {
     const url = new URL(req.url || '/', 'http://fixture');
     const host = (req.headers.host || '').toLowerCase();
     const q = Object.fromEntries(url.searchParams);
-    log.push({ host, path: url.pathname, q, probe: req.headers['x-probe'] || null });
+    log.push({
+      at: Date.now(),
+      host,
+      path: url.pathname,
+      q,
+      probe: req.headers['x-probe'] || null,
+      headers: req.headers,
+    });
     answer(req, res, url, host, q);
   });
   return new Promise((resolve, reject) => {
@@ -597,6 +611,7 @@ async function rawLane(ctx) {
     JSON.stringify({
       ws: ctx.wsUrl,
       workers: 6,
+      rowSeconds,
       runs: runs.map(({ key, steps }) => ({ key, steps })),
     })
   );
@@ -750,8 +765,9 @@ function judgeNavigation(ctx, run, out) {
   if (text.includes('canary-marker') || text.includes(`${host}/canary`)) {
     problems.push('an event carried the guarded document');
   }
-  if (!['popup', 'iframe'].includes(c.expect) && served(ctx, key, host).length) {
-    problems.push('the server served the guarded page');
+  const hits = served(ctx, key, host);
+  if (!['popup', 'iframe'].includes(c.expect) && hits.length) {
+    problems.push(`the server served the guarded page: ${describeHits(hits, out)}`);
   }
   if (others.length) problems.push('attachedToTarget for another target');
   if (named('Runtime.bindingCalled').some((event) => event.params?.payload === encoded)) {
@@ -778,6 +794,22 @@ function judgeNavigation(ctx, run, out) {
     problems.push('the guarded page shows the client body');
   }
   return problems.length ? { ok: false, why: problems.join(', ') } : { ok: true };
+}
+
+function describeHits(hits, out) {
+  const last = out.steps.at(-1)?.at;
+  return hits
+    .map((hit) => {
+      const when = [
+        last ? `${hit.at - last}ms after the last step` : '',
+        out.detached ? `${hit.at - out.detached}ms after the client detached` : '',
+      ].filter(Boolean);
+      const headers = ['sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'referer']
+        .map((name) => `${name}=${hit.headers[name] ?? '-'}`)
+        .join(' ');
+      return `${when.join(', ')} (${headers})`;
+    })
+    .join('; ');
 }
 
 function cookieHosts(result) {
@@ -901,14 +933,22 @@ async function verifyStorage(ctx) {
 
 async function cliLane(ctx, runner, lane, width) {
   const jobs = [];
+  const guardedCase = async (c, side) => {
+    const what = `${lane} ${c.id} ${side}`;
+    const since = Date.now();
+    progress(`start ${what}`);
+    const result = await deadline(what, rowSeconds * 1000, cliCase(ctx, runner, lane, c, side));
+    progress(`done ${what} in ${Date.now() - since}ms: ${result.ok ? 'pass' : 'fail'}`);
+    return result;
+  };
   for (const c of [...spec.fetch, ...spec.navigation, ...spec.cookies].filter((item) =>
     item.lanes.includes(lane)
   )) {
     jobs.push(async () => {
-      const control = await cliCase(ctx, runner, lane, c, 'control');
+      const control = await guardedCase(c, 'control');
       const results = [];
       for (const side of Object.keys(spec.targets)) {
-        const guarded = await cliCase(ctx, runner, lane, c, side);
+        const guarded = await guardedCase(c, side);
         results.push({
           lane: lane === 'cli' ? 'playwright-cli' : 'kernel',
           id: c.id,
@@ -1126,13 +1166,20 @@ function cargo(args, extra) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, ...extra };
     delete env.SLICC_CDP_URL;
-    const child = spawn('cargo', args, { cwd: root, env });
+    const child = spawn('cargo', args, {
+      cwd: root,
+      env,
+      detached: process.platform !== 'win32',
+    });
     const out = [];
     const err = [];
     child.stdout.on('data', (chunk) => out.push(chunk));
-    child.stderr.on('data', (chunk) => err.push(chunk));
+    child.stderr.on('data', (chunk) => {
+      err.push(chunk);
+      process.stderr.write(chunk);
+    });
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+      killTree(child);
       reject(new Error('cargo test timed out'));
     }, 600000);
     child.on('error', (error) => {
