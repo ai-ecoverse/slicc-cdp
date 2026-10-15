@@ -211,7 +211,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let remembered = if explicit || profile.is_some() {
         None
     } else {
-        launch::remembered_endpoint_named(invocation.session.as_deref())
+        launch::remembered_endpoint_named(invocation.session.as_deref(), invocation.cwd.as_deref())
     };
     let active = profile.or(remembered);
     let start = match launch::start_after_explicit(invocation.cdp.as_deref(), cdp_env, active) {

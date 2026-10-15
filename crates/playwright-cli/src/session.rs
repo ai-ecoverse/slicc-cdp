@@ -88,11 +88,6 @@ fn path_named(session_name: Option<&str>, cwd: Option<&Path>) -> Option<PathBuf>
     storage_path_named(&cwd, session_name)
 }
 
-#[cfg(all(not(test), not(target_arch = "wasm32")))]
-pub fn load_named(session_name: Option<&str>) -> Session {
-    load_in(session_name, None)
-}
-
 pub fn load_in(session_name: Option<&str>, cwd: Option<&Path>) -> Session {
     let session_name = session_name.filter(|name| !name.is_empty());
     let mut sess = path_named(session_name, cwd)

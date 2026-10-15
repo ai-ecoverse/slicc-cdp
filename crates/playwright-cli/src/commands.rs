@@ -53,7 +53,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let remembered = if explicit || profile.is_some() {
         None
     } else {
-        launch::remembered_endpoint_named(invocation.session.as_deref())
+        launch::remembered_endpoint_named(invocation.session.as_deref(), invocation.cwd.as_deref())
     };
     let mut from_memory = remembered.is_some();
     let active = profile.clone().or(remembered);
