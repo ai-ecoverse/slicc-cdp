@@ -168,12 +168,12 @@ jobs:
             if [ ! -f "$bin" ]; then
               problems=" missing"
             else
-              output=$(codesign -dv --verbose=2 "$bin" 2>&1)
+              output=$(codesign -dv --verbose=2 "$bin" 2>&1) || problems="$problems codesign-display"
               echo "$output"
               echo "$output" | grep -q "Authority=Developer ID Application" || problems="$problems no-developer-id"
               echo "$output" | grep -q "Identifier=${identifier}" || problems="$problems wrong-identifier"
               codesign --verify --strict "$bin" || problems="$problems codesign-strict"
-              output=$(spctl -a -vv -t install "$bin" 2>&1)
+              output=$(spctl -a -vv -t install "$bin" 2>&1) || problems="$problems spctl-rejected"
               echo "$output"
               echo "$output" | grep -q "accepted" || problems="$problems not-accepted"
               echo "$output" | grep -q "source=Notarized Developer ID" || problems="$problems not-notarized"
