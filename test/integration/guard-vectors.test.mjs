@@ -104,7 +104,7 @@ test('guard vectors through the raw client, playwright-cli and the kernel', asyn
       browser.wsUrl
     );
     progress('phase kernel lane');
-    rows.push(...(await cliLane(ctx, kernel, 'kernel', 1)));
+    rows.push(...(await cliLane(ctx, kernel, 'kernel', 6)));
     const report = table(rows);
     const file = process.env.SLICC_GUARD_REPORT || path.join(tmpdir(), 'guard-vectors-report.md');
     await writeFile(file, report);
