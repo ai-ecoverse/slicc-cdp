@@ -81,6 +81,13 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - id: chrome
+        run: echo "version=$(node -p "require('./package.json').config.chrome")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/slicc-cdp/browsers
+          key: chrome-for-testing-${{ runner.os }}-${{ runner.arch }}-${{ steps.chrome.outputs.version }}
       - name: Chrome for Testing (pinned in package.json config.chrome)
         run: |
           if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
@@ -104,6 +111,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Chrome for Testing (latest)
         run: |
           if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
