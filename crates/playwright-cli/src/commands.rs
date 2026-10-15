@@ -161,6 +161,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
+        Err(message) if cfg!(target_arch = "wasm32") => session::without_state(result, &message),
         Err(message) if result.code == 0 => Output::err(message),
         _ => result,
     };

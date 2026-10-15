@@ -28,24 +28,10 @@ pub fn storage_path(cwd: &Path) -> Option<PathBuf> {
 
 pub fn storage_path_named(cwd: &Path, session_name: Option<&str>) -> Option<PathBuf> {
     let session_name = session_name.filter(|name| !name.is_empty());
-    #[cfg(target_arch = "wasm32")]
-    {
-        match session_name {
-            Some(name) => {
-                let key = cdp_client::hash::sha256_hex(name.as_bytes());
-                Some(cwd.join(".playwright-cli").join(format!("session-{key}.json")))
-            }
-            None => Some(cwd.join(".playwright-cli").join("session.json")),
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        session_path(&config_root(), &canonical, session_name)
-    }
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    session_path(&config_root()?, &canonical, session_name)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub fn session_path(config_dir: &str, cwd: &Path, session_name: Option<&str>) -> Option<PathBuf> {
     let root = Path::new(config_dir);
     if !root.is_absolute() {
@@ -68,22 +54,32 @@ pub fn session_path(config_dir: &str, cwd: &Path, session_name: Option<&str>) ->
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn config_root() -> Option<String> {
+    cdp_client::state::wasm_config_root(|name| std::env::var(name).ok())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-fn config_root() -> String {
+fn config_root() -> Option<String> {
     #[cfg(test)]
     {
-        std::env::temp_dir()
-            .join("slicc-cdp-session-tests")
-            .to_string_lossy()
-            .into_owned()
+        Some(
+            std::env::temp_dir()
+                .join("slicc-cdp-session-tests")
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        crate::launch::user_config_dir()
+        Some(crate::launch::user_config_dir())
     }
 }
 
 fn path_named(session_name: Option<&str>) -> Option<PathBuf> {
+    #[cfg(target_arch = "wasm32")]
+    let cwd = cdp_client::state::wasm_cwd(|name| std::env::var(name).ok())?;
+    #[cfg(not(target_arch = "wasm32"))]
     let cwd = std::env::current_dir().ok()?;
     storage_path_named(&cwd, session_name)
 }
@@ -326,12 +322,90 @@ pub fn save(session: &Session) -> Result<(), String> {
         stored.provenance = None;
     }
     let Some(file) = path_named(stored.session_name.as_deref()) else {
+        if cfg!(target_arch = "wasm32") {
+            return Err("session: HOME is not set\n".into());
+        }
         return Err("session: user config dir is not absolute\n".into());
     };
     write_at(&file, &stored)
 }
 
+pub fn without_state(mut output: crate::args::Output, message: &str) -> crate::args::Output {
+    let reason = message.trim_end().trim_start_matches("session: ");
+    output.stderr.push_str(&format!(
+        "playwright-cli: running without saved state ({reason})\n"
+    ));
+    output
+}
+
 pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
+    #[cfg(target_os = "wasi")]
+    {
+        let old = wasi_mode::set_umask(0o077);
+        let written = wasi_write(path, session);
+        if let Some(old) = old {
+            wasi_mode::set_umask(old);
+        }
+        written
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        host_write(path, session)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+fn wasi_write(path: &Path, session: &Session) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
+        for item in [Some(dir), dir.parent()].into_iter().flatten() {
+            if let Ok(handle) = fs::File::open(item) {
+                let _ = wasi_mode::chmod(handle.as_raw_fd(), 0o700);
+            }
+        }
+    }
+    let body = serde_json::to_string_pretty(&encode(session)).unwrap_or_else(|_| "{}".into());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|err| format!("session: {err}\n"))?;
+    wasi_mode::chmod(file.as_raw_fd(), 0o600)?;
+    std::io::Write::write_all(&mut file, body.as_bytes()).map_err(|err| format!("session: {err}\n"))
+}
+
+#[cfg(target_os = "wasi")]
+mod wasi_mode {
+    const ENOSYS: i32 = 52;
+
+    #[link(wasm_import_module = "slicc_fs")]
+    unsafe extern "C" {
+        #[link_name = "fd_chmod"]
+        fn slicc_fd_chmod(fd: i32, mode: i32) -> i32;
+        #[link_name = "umask"]
+        fn slicc_umask(mask: i32, old: *mut u32) -> i32;
+    }
+
+    pub fn chmod(fd: i32, mode: i32) -> Result<(), String> {
+        match unsafe { slicc_fd_chmod(fd, mode) } {
+            0 | ENOSYS => Ok(()),
+            errno => Err(format!("session: chmod failed (wasi errno {errno})\n")),
+        }
+    }
+
+    pub fn set_umask(mask: u32) -> Option<u32> {
+        let mut old = 0u32;
+        match unsafe { slicc_umask(mask as i32, &mut old) } {
+            0 => Some(old),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn host_write(path: &Path, session: &Session) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
         #[cfg(unix)]

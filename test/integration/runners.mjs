@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createNodeKernel } from '@ai-ecoverse/slicc-kernel/node';
+import { attachKernel, createNodeKernel } from '@ai-ecoverse/slicc-kernel/node';
 import { bridge } from './browser.mjs';
 import { deadline, killTree } from './watchdog.mjs';
 
@@ -114,11 +114,28 @@ export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
       await kernel.writeFile(`${dir}/.keep`, '');
       return dir;
     },
-    playwright(args, cwd) {
-      return kernelRun(kernel, ['playwright-cli', ...args], cwd);
+    playwright(args, cwd, options = {}) {
+      return kernelRun(kernel, ['playwright-cli', ...args], cwd, options);
     },
     curl(args, cwd) {
       return kernelRun(kernel, ['curlwright', ...args], cwd);
+    },
+    addUser(name) {
+      return kernel.users.add({ name });
+    },
+    writeFile(file, data) {
+      return kernel.writeFile(file, data);
+    },
+    readFile(file) {
+      return kernel.readFile(file);
+    },
+    async stat(file) {
+      const client = await attachKernel(await kernel.connect());
+      try {
+        return await client.fs.stat(file);
+      } finally {
+        await client.close();
+      }
     },
     write(cwd, name, data) {
       return kernel.writeFile(`${cwd}/${name}`, data);
@@ -127,7 +144,7 @@ export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
       return kernel.readFile(`${cwd}/${name}`);
     },
     clearSession(cwd) {
-      return kernel.writeFile(`${cwd}/.playwright-cli/session.json`, '{}\n');
+      return kernel.writeFile(kernelSessionFile('/root', cwd), '{}\n');
     },
     close() {
       kernel.terminate();
@@ -135,7 +152,16 @@ export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
   };
 }
 
-async function kernelRun(kernel, argv, cwd) {
-  const result = await deadline(`kernel ${argv.join(' ')}`, 300000, kernel.run(argv, { cwd }));
+export function kernelSessionFile(home, cwd) {
+  const key = createHash('sha256').update(cwd).digest('hex');
+  return `${home}/.config/slicc/playwright-cli/sessions/${key}.json`;
+}
+
+async function kernelRun(kernel, argv, cwd, options = {}) {
+  const result = await deadline(
+    `kernel ${argv.join(' ')}`,
+    300000,
+    kernel.run(argv, { cwd, ...options })
+  );
   return { code: result.status, stdout: result.stdout, stderr: result.stderr };
 }
