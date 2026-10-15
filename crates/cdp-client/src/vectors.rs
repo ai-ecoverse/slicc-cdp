@@ -347,30 +347,61 @@ fn execute_on(
         paused: Vec::new(),
         steps: Vec::new(),
     };
-    for (index, step) in plan["steps"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    let all = plan["steps"].as_array().cloned().unwrap_or_default();
+    let exit = all
         .iter()
-        .enumerate()
-    {
+        .position(|step| step["op"] == json!("exit"))
+        .unwrap_or(all.len());
+    for (index, step) in all[..exit].iter().enumerate() {
         note(&format!("step {index} {}", label(step)));
         run.step(step);
     }
     let events = run.cdp.events().to_vec();
-    let target = run.target.clone();
+    let Run {
+        cdp,
+        target,
+        mut steps,
+        paused,
+        ..
+    } = run;
+    let mut cdp = Some(cdp);
+    let mut detached = None;
+    if exit < all.len() {
+        cdp = None;
+        detached = Some(epoch_ms());
+        for (index, step) in all.iter().enumerate().skip(exit) {
+            note(&format!("step {index} {}", label(step)));
+            steps.push(after_exit(step));
+        }
+    }
     note("observe");
     let observed = observe(&target);
-    drop(run.cdp);
+    drop(cdp);
     json!({
         "key": plan["key"],
-        "detached": epoch_ms(),
+        "detached": detached.unwrap_or_else(epoch_ms),
         "target": target,
-        "steps": run.steps,
-        "paused": run.paused,
+        "steps": steps,
+        "paused": paused,
         "events": events,
         "observed": observed,
     })
+}
+
+fn after_exit(step: &Value) -> Value {
+    let outcome = match step.get("op").and_then(|v| v.as_str()) {
+        Some("exit") => json!({ "ok": true }),
+        Some("wait") => {
+            let ms = step.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(ms));
+            json!({ "ok": true })
+        }
+        _ => json!({ "ok": false, "error": "only wait can follow exit" }),
+    };
+    let mut entry = step.clone();
+    entry["outcome"] = outcome;
+    entry["at"] = json!(epoch_ms());
+    entry
 }
 
 fn epoch_ms() -> u64 {
@@ -703,6 +734,56 @@ mod tests {
         assert!(
             out["error"].as_str().is_some_and(|text| !text.is_empty()),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn an_exit_step_drops_the_client_before_the_target_is_observed() {
+        let open = Arc::new(Mutex::new(true));
+        let cdp = Cdp::from_transport(Box::new(Scripted {
+            inbox: VecDeque::new(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            open: Arc::clone(&open),
+        }));
+        let plan = json!({
+            "key": "X1.after-exit.seven.prompt.raw",
+            "steps": [
+                { "op": "open" },
+                { "op": "exit" },
+                { "op": "wait", "ms": 20 },
+                { "op": "eval", "expression": "1" },
+            ],
+        });
+        let notes = Mutex::new(Vec::new());
+        let mut seen = Vec::new();
+        let out = execute_on(
+            cdp,
+            &plan,
+            &|step: &str| notes.lock().unwrap().push(step.to_string()),
+            &mut |target: &str| {
+                seen.push((target.to_string(), *open.lock().unwrap()));
+                json!({})
+            },
+        );
+        assert_eq!(seen, vec![("T1".to_string(), false)]);
+        let steps = out["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[1]["outcome"], json!({ "ok": true }));
+        assert_eq!(steps[2]["outcome"], json!({ "ok": true }));
+        assert!(steps[2]["at"].as_u64().unwrap() >= out["detached"].as_u64().unwrap() + 20);
+        assert_eq!(
+            steps[3]["outcome"],
+            json!({ "ok": false, "error": "only wait can follow exit" })
+        );
+        assert_eq!(
+            *notes.lock().unwrap(),
+            vec![
+                "step 0 open",
+                "step 1 exit",
+                "step 2 wait",
+                "step 3 eval",
+                "observe"
+            ]
         );
     }
 

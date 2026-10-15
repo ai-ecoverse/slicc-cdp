@@ -207,7 +207,7 @@ function answer(req, res, url, host, q) {
       res.writeHead(204, { 'access-control-allow-origin': '*' });
       return res.end();
     case '/page':
-      return html(triggerPage(q.k || '', q.to || ''));
+      return html(triggerPage(q.k || '', q.to || '', Number(q.d || 0)));
     case '/hop': {
       const n = Number(q.n || '0');
       const next =
@@ -233,12 +233,13 @@ function answer(req, res, url, host, q) {
   }
 }
 
-function triggerPage(kind, to) {
+function triggerPage(kind, to, defer) {
   const frame = kind === 'iframe' ? `<iframe src="${escapeAttr(to)}"></iframe>` : '';
   return `<!doctype html><title>trigger</title><p id="out">trigger</p><button onclick="go()">Go</button>${frame}<script>
 const kind = ${JSON.stringify(kind)};
 const to = ${JSON.stringify(to)};
 function go() {
+  if (kind === 'deferred') setTimeout(() => { location.href = to; }, ${defer});
   if (kind === 'href') location.href = to;
   if (kind === 'replace') location.replace(to);
   if (kind === 'popup') window.open(to);
@@ -283,7 +284,8 @@ function urlsFor(ctx, c, key, origin) {
   const to = c.hop
     ? `${ctx.ordinary}/hop?n=${c.hop.n}&code=${c.hop.code}&to=${encodeURIComponent(dest)}`
     : dest;
-  const page = `${ctx.ordinary}/page?k=${c.trigger}&to=${encodeURIComponent(to)}&case=${key}`;
+  const deferred = c.defer ? `&d=${c.defer}` : '';
+  const page = `${ctx.ordinary}/page?k=${c.trigger}&to=${encodeURIComponent(to)}${deferred}&case=${key}`;
   return { dest, page };
 }
 
@@ -365,8 +367,12 @@ function navigationRun(ctx, c, side, variant) {
     { op: 'call', method: 'Page.navigate', params: { url: page }, session: 'page', notify: true },
     { op: 'wait', ms: settleMs },
     { op: 'eval', expression: 'go()' },
-    { op: 'wait', ms: spec.variants[variant] },
-    { op: 'eval', expression: "document.body ? document.body.innerText : ''" },
+    ...(c.exit
+      ? [{ op: 'exit' }, { op: 'wait', ms: c.defer + spec.variants[variant] }]
+      : [
+          { op: 'wait', ms: spec.variants[variant] },
+          { op: 'eval', expression: "document.body ? document.body.innerText : ''" },
+        ]),
   ];
   return { key, steps, meta: { c, side, variant, origin, dest } };
 }
@@ -754,6 +760,8 @@ function judgeNavigation(ctx, run, out) {
           : why('continueRequest with url did not render');
       case 'paused':
         return pausedTarget.length ? { ok: true } : why('no requestPaused for the target');
+      case 'after-exit':
+        return afterExit(ctx, run, out, true);
       default:
         return why(`unknown expectation ${c.expect}`);
     }
@@ -765,6 +773,7 @@ function judgeNavigation(ctx, run, out) {
   if (text.includes('canary-marker') || text.includes(`${host}/canary`)) {
     problems.push('an event carried the guarded document');
   }
+  if (c.exit) return afterExit(ctx, run, out, false);
   const hits = served(ctx, key, host);
   if (!['popup', 'iframe'].includes(c.expect) && hits.length) {
     problems.push(`the server served the guarded page: ${describeHits(hits, out)}`);
@@ -792,6 +801,32 @@ function judgeNavigation(ctx, run, out) {
   }
   if (body.includes('FULFILLED') || body.includes('REWRITTEN')) {
     problems.push('the guarded page shows the client body');
+  }
+  return problems.length ? { ok: false, why: problems.join(', ') } : { ok: true };
+}
+
+function afterExit(ctx, run, out, mustLoad) {
+  const { origin, dest } = run.meta;
+  const key = run.key;
+  const host = new URL(origin).host;
+  const hits = served(ctx, key, host);
+  const page = out.observed?.page || {};
+  const problems = [];
+  if (!page.href || page.href.startsWith(`${ctx.ordinary}/page`)) {
+    problems.push(`the deferred navigation never left the trigger page: ${page.href}`);
+  }
+  if (mustLoad && !hits.length) problems.push(`${dest} was never requested after the exit`);
+  if (beacons(ctx, key).some((hit) => hit.q.p === `/canary/${key}`)) {
+    problems.push('the init script ran after the exit');
+  }
+  if (hits.some((hit) => hit.probe)) problems.push('the request after the exit carried x-probe');
+  if ((out.paused || []).some((item) => item.url.includes(`${host}/canary`))) {
+    problems.push('requestPaused for the deferred navigation');
+  }
+  if (String(page.body || '').includes('FULFILLED'))
+    problems.push('the page shows the fulfilled body');
+  if (hits.length && !hits.every((hit) => hit.at >= out.detached)) {
+    problems.push(`requested before the exit: ${describeHits(hits, out)}`);
   }
   return problems.length ? { ok: false, why: problems.join(', ') } : { ok: true };
 }
