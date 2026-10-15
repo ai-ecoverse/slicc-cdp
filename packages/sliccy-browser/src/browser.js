@@ -2,14 +2,35 @@ import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { connect } from '@ai-ecoverse/slicc-cdp';
 import { buildBrowserFetchScript } from './fetch-script.js';
-import { routerSource } from './ws-router.js';
 
-const BINDING = '__sliccWsRouterReport';
 const LOAD_TIMEOUT_MS = 15000;
+const HELD_FRAMES = 100;
+const RECORDER = `(() => {
+  if (globalThis.__sliccWsSent) return true;
+  const sent = [];
+  const send = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    if (typeof data === 'string') {
+      sent.push([this.url, data]);
+      if (sent.length > 64) sent.shift();
+    }
+    return send.call(this, data);
+  };
+  const take = (data) => {
+    const at = sent.findIndex((entry) => entry[1] === data);
+    return at < 0 ? null : sent.splice(at, 1)[0][0];
+  };
+  Object.defineProperty(globalThis, '__sliccWsSent', { value: Object.freeze({ take }) });
+  return true;
+})()`;
 
 let opening;
 const sessions = new Map();
-const routers = new Set();
+const tabsBySession = new Map();
+const sockets = new Map();
+const held = new Map();
+const recorders = new Map();
+const networkless = new Map();
 const subscribers = new Map();
 let seq = 1;
 let listening = false;
@@ -49,7 +70,11 @@ function closeIdle() {
   const closing = opening;
   opening = undefined;
   sessions.clear();
-  routers.clear();
+  tabsBySession.clear();
+  sockets.clear();
+  held.clear();
+  recorders.clear();
+  networkless.clear();
   listening = false;
   closing.then(
     (client) => client.close(),
@@ -69,30 +94,152 @@ async function sessionFor(targetId) {
   const client = await openClient();
   const cached = sessions.get(targetId);
   if (cached) return { client, sessionId: cached };
+  listen(client);
   const sessionId = await client.attach(targetId);
+  tabsBySession.set(sessionId, targetId);
   await client.send('Page.enable', {}, sessionId).catch(ignoreMethod('Page.enable:'));
   await client.send('Runtime.enable', {}, sessionId).catch(ignoreMethod('Runtime.enable:'));
-  await client.send('Network.enable', {}, sessionId).catch(ignoreMethod('Network.enable:'));
+  await client.send('Network.enable', {}, sessionId).catch((error) => {
+    ignoreMethod('Network.enable:')(error);
+    networkless.set(sessionId, error.message);
+  });
   sessions.set(targetId, sessionId);
-  listen(client);
   return { client, sessionId };
 }
 
 function listen(client) {
   if (listening) return;
   listening = true;
-  client.on('Runtime.bindingCalled', (message) => {
-    const params = message?.params;
-    if (!params || params.name !== BINDING || typeof params.payload !== 'string') return;
-    let body;
-    try {
-      body = JSON.parse(params.payload);
-    } catch {
-      return;
-    }
-    if (!body || typeof body.subId !== 'string') return;
-    void deliver(body.subId, body.payload);
+  client.on('Network.webSocketCreated', (message) => {
+    const { requestId, url } = message?.params ?? {};
+    if (typeof requestId !== 'string' || typeof url !== 'string') return;
+    sockets.set(socketKey(message.sessionId, requestId), url);
   });
+  client.on('Network.webSocketClosed', (message) => {
+    const key = socketKey(message?.sessionId, message?.params?.requestId);
+    sockets.delete(key);
+    held.delete(key);
+  });
+  client.on('Network.webSocketFrameReceived', (message) => dispatchFrame(message));
+  client.on('Network.webSocketFrameSent', (message) => void learnUrl(client, message));
+}
+
+function socketKey(sessionId, requestId) {
+  return `${sessionId ?? ''} ${requestId ?? ''}`;
+}
+
+function dispatchFrame(message) {
+  const params = message?.params;
+  const response = params?.response;
+  if (response?.opcode !== 1 || typeof response.payloadData !== 'string') return;
+  const targetId = tabsBySession.get(message.sessionId);
+  if (targetId === undefined) return;
+  const key = socketKey(message.sessionId, params.requestId);
+  const url = sockets.get(key);
+  if (url !== undefined) return route(targetId, url, response.payloadData, () => true);
+  route(targetId, url, response.payloadData, (sub) => sub.urlMatch === undefined);
+  holdFrame(message.sessionId, targetId, key, response.payloadData);
+}
+
+function route(targetId, url, raw, which) {
+  for (const sub of subscribers.values()) {
+    if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
+    const body = parseFrame(raw, sub.filter?.parseAs);
+    if (body === undefined || !whereMatches(sub.filter?.where, body)) continue;
+    deliver(sub, project(body, sub.filter?.project));
+  }
+}
+
+function holdFrame(sessionId, targetId, key, raw) {
+  const wanted = [...subscribers.values()].some(
+    (sub) => sub.targetId === targetId && sub.urlMatch !== undefined
+  );
+  if (!wanted) return;
+  const frames = held.get(key) ?? [];
+  frames.push(raw);
+  if (frames.length > HELD_FRAMES) frames.shift();
+  held.set(key, frames);
+  record(sessionId);
+}
+
+function record(sessionId) {
+  if (recorders.has(sessionId)) return recorders.get(sessionId);
+  const installing = openClient()
+    .then((client) =>
+      client.send('Runtime.evaluate', { expression: RECORDER, returnByValue: true }, sessionId)
+    )
+    .catch(() => undefined);
+  recorders.set(sessionId, installing);
+  return installing;
+}
+
+async function learnUrl(client, message) {
+  const sessionId = message?.sessionId;
+  const { requestId, response } = message?.params ?? {};
+  const key = socketKey(sessionId, requestId);
+  if (sockets.has(key) || !recorders.has(sessionId)) return;
+  if (response?.opcode !== 1 || typeof response.payloadData !== 'string') return;
+  await recorders.get(sessionId);
+  const found = await client
+    .send(
+      'Runtime.evaluate',
+      {
+        expression: `globalThis.__sliccWsSent?.take(${JSON.stringify(response.payloadData)}) ?? null`,
+        returnByValue: true,
+      },
+      sessionId
+    )
+    .catch(() => undefined);
+  const url = found?.result?.value;
+  if (typeof url !== 'string' || sockets.has(key)) return;
+  sockets.set(key, url);
+  const frames = held.get(key) ?? [];
+  held.delete(key);
+  const targetId = tabsBySession.get(sessionId);
+  for (const raw of frames) route(targetId, url, raw, (sub) => sub.urlMatch !== undefined);
+}
+
+function urlMatches(sub, url) {
+  if (sub.urlMatch === undefined) return true;
+  return typeof url === 'string' && sub.urlMatchRe.test(url);
+}
+
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function subsetMatch(value, template) {
+  for (const key of Object.keys(template)) {
+    const expected = template[key];
+    const actual = value[key];
+    if (isPlainObject(expected)) {
+      if (!isPlainObject(actual) || !subsetMatch(actual, expected)) return false;
+    } else if (!Object.is(actual, expected)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function whereMatches(where, body) {
+  if (!isPlainObject(where) || Object.keys(where).length === 0) return true;
+  return isPlainObject(body) && subsetMatch(body, where);
+}
+
+function parseFrame(raw, parseAs) {
+  if (parseAs === 'text') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function project(body, fields) {
+  if (!Array.isArray(fields) || fields.length === 0 || !isPlainObject(body)) return body;
+  const out = {};
+  for (const field of fields) if (field in body) out[field] = body[field];
+  return out;
 }
 
 function targetIdOf(tab) {
@@ -415,39 +562,6 @@ function validateSink(forward) {
   }
 }
 
-async function installRouter(targetId) {
-  if (routers.has(targetId)) return;
-  const { client, sessionId } = await sessionFor(targetId);
-  try {
-    await client.send('Runtime.addBinding', { name: BINDING }, sessionId);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes('already exists')) throw error;
-  }
-  await client.send('Page.addScriptToEvaluateOnNewDocument', { source: routerSource }, sessionId);
-  const installed = await client.send(
-    'Runtime.evaluate',
-    { expression: routerSource, returnByValue: true },
-    sessionId
-  );
-  if (installed?.exceptionDetails) {
-    throw new Error(exceptionMessage(installed.exceptionDetails));
-  }
-  routers.add(targetId);
-}
-
-async function callRouter(targetId, expression) {
-  const { client, sessionId } = await sessionFor(targetId);
-  const result = await client.send(
-    'Runtime.evaluate',
-    { expression, returnByValue: true },
-    sessionId
-  );
-  if (result?.exceptionDetails) {
-    throw new Error(exceptionMessage(result.exceptionDetails));
-  }
-}
-
 function toInfo(sub) {
   const info = {
     id: sub.id,
@@ -464,24 +578,14 @@ function makeHandle(sub) {
   return {
     ...toInfo(sub),
     async update(patch = {}) {
-      const wire = {};
-      if (patch.urlMatch !== undefined) {
-        wire.urlMatch =
-          patch.urlMatch === null
-            ? null
-            : patch.urlMatch instanceof RegExp
-              ? patch.urlMatch.source
-              : patch.urlMatch;
+      if (patch.urlMatch === null) {
+        delete sub.urlMatch;
+        delete sub.urlMatchRe;
+      } else if (patch.urlMatch !== undefined) {
+        const next = patternOf(patch.urlMatch);
+        sub.urlMatchRe = compilePattern(next, 'browser.websocket');
+        sub.urlMatch = next;
       }
-      if (patch.filter !== undefined) wire.filter = patch.filter;
-      await using(() =>
-        callRouter(
-          sub.targetId,
-          `globalThis.__sliccWsRouter.update(${JSON.stringify(sub.id)}, ${JSON.stringify(wire)})`
-        )
-      );
-      if (wire.urlMatch === null) delete sub.urlMatch;
-      else if (wire.urlMatch !== undefined) sub.urlMatch = wire.urlMatch;
       if (patch.filter === null) delete sub.filter;
       else if (patch.filter !== undefined) sub.filter = patch.filter;
       return toInfo(sub);
@@ -489,28 +593,23 @@ function makeHandle(sub) {
     async close() {
       if (!subscribers.has(sub.id)) return false;
       subscribers.delete(sub.id);
-      await using(() =>
-        callRouter(sub.targetId, `globalThis.__sliccWsRouter.unregister(${JSON.stringify(sub.id)})`)
-      );
+      await sub.writing;
+      release();
       return true;
     },
   };
 }
 
-async function deliver(subId, payload) {
-  const sub = subscribers.get(subId);
-  if (!sub) return;
-  try {
-    if (sub.forward.sink === 'log') {
-      console.log(typeof payload === 'string' ? payload : JSON.stringify(payload));
-      return;
-    }
-    if (sub.forward.sink === 'vfs') {
-      const line = `${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n`;
-      await appendFile(sub.forward.path, line);
-    }
-  } catch {
+function deliver(sub, payload) {
+  const line = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  if (sub.forward.sink === 'log') {
+    console.log(line);
     return;
+  }
+  if (sub.forward.sink === 'vfs') {
+    sub.writing = sub.writing
+      .then(() => appendFile(sub.forward.path, `${line}\n`))
+      .catch(() => undefined);
   }
 }
 
@@ -535,23 +634,26 @@ export const websocket = {
       },
     };
     async function subscribe(sink) {
-      await installRouter(targetId);
+      const urlMatchRe =
+        urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
+      const { sessionId } = await sessionFor(targetId);
+      if (networkless.has(sessionId)) {
+        throw new Error(`browser.websocket: ${networkless.get(sessionId)}`);
+      }
+      if (urlMatch !== undefined) await record(sessionId);
       const id = `wssub-${seq++}-${Date.now().toString(36)}`;
       const sub = {
         id,
         targetId,
         forward: sink,
         createdAt: new Date().toISOString(),
+        writing: Promise.resolve(),
       };
-      if (urlMatch !== undefined) sub.urlMatch = urlMatch;
+      if (urlMatch !== undefined) {
+        sub.urlMatch = urlMatch;
+        sub.urlMatchRe = urlMatchRe;
+      }
       if (selector !== undefined) sub.filter = selector;
-      const registered = { id };
-      if (urlMatch !== undefined) registered.urlMatch = urlMatch;
-      if (selector !== undefined) registered.filter = selector;
-      await callRouter(
-        targetId,
-        `globalThis.__sliccWsRouter.register(${JSON.stringify(registered)})`
-      );
       subscribers.set(id, sub);
       return makeHandle(sub);
     }

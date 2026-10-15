@@ -8,6 +8,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import browser from '../../packages/sliccy-browser/src/browser.js';
+import { connect } from '../../src/index.js';
 import { launchBrowser } from './browser.mjs';
 import { startServer } from './server.mjs';
 
@@ -138,12 +139,55 @@ test('sliccy:browser over CDP', async () => {
       })`
     );
     assert.equal(frame.data, '{"kind":"tick","n":1}');
+    assert.equal(
+      await browser.eval(tab, 'typeof __sliccWsRouterReport + typeof __sliccWsRouter'),
+      'undefinedundefined'
+    );
     await waitFor(() => logged.includes('{"n":1}'), `log sink missed ${JSON.stringify(logged)}`);
     const vfsText = await readWhen(vfsPath);
     assert.match(vfsText, /\{"n":1\}\n/);
     assert.equal(await logSink.close(), true);
     assert.equal((await browser.websocket.list()).length, 1);
     assert.equal(await vfsSink.close(), true);
+
+    const raw = await connect();
+    let earlySink;
+    try {
+      const { targetId: early } = await raw.send('Target.createTarget', {
+        url: `${site.origin}/other`,
+      });
+      const rawSession = await raw.attach(early);
+      await waitFor(
+        async () =>
+          (
+            await raw.send(
+              'Runtime.evaluate',
+              { expression: 'document.readyState', returnByValue: true },
+              rawSession
+            )
+          ).result.value === 'complete',
+        'the early tab did not load'
+      );
+      await raw.send(
+        'Runtime.evaluate',
+        {
+          expression: `new Promise((resolve) => { window.early = new WebSocket(${JSON.stringify(socket.url)}); window.early.onopen = () => resolve(true); })`,
+          awaitPromise: true,
+        },
+        rawSession
+      );
+      const earlyPath = path.join(scratch, 'early.log');
+      earlySink = await browser.websocket
+        .on(early, { urlMatch: escapeRegExp(socket.url) })
+        .filter({ where: { kind: 'tick' }, project: ['n'] })
+        .forward({ sink: 'vfs', path: earlyPath });
+      await browser.eval(early, () => window.early.send('ping'));
+      assert.match(await readWhen(earlyPath), /^\{"n":1\}\n$/);
+      assert.equal(await earlySink.close(), true);
+    } finally {
+      await settle(earlySink?.close());
+      await settle(raw.close());
+    }
 
     console.log = originalLog;
     const child = await runJsh(chrome.wsUrl, page);
@@ -172,7 +216,7 @@ function delay(ms) {
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await delay(50);
   }
   throw new Error(label);
