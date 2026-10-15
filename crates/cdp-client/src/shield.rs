@@ -42,6 +42,19 @@ const BODY_METHODS: &[&str] = &[
     "Audits.getEncodedResponse",
 ];
 
+const INTERCEPTION_METHODS: &[&str] = &[
+    "Fetch.fulfillRequest",
+    "Fetch.failRequest",
+    "Fetch.continueRequest",
+    "Fetch.continueWithAuth",
+    "Fetch.continueResponse",
+    "Fetch.getResponseBody",
+    "Fetch.takeResponseBodyAsStream",
+    "Network.continueInterceptedRequest",
+    "Network.getResponseBodyForInterception",
+    "Network.takeResponseBodyForInterceptionAsStream",
+];
+
 const COOKIE_SETTERS: &[&str] = &[
     "Network.setCookie",
     "Network.setCookies",
@@ -89,6 +102,9 @@ pub fn browser_wide(
         {
             "browser-wide permissions would reach seven's origin"
         }
+        "Network.setRequestInterception" => {
+            "Network.setRequestInterception would hand out seven's requests; use Fetch on a page session"
+        }
         _ if method.starts_with("Fetch.") && session_id.is_none() => {
             "Fetch on the browser itself would intercept seven's requests; use a page session"
         }
@@ -99,6 +115,14 @@ pub fn browser_wide(
 
 pub fn body_method(method: &str) -> bool {
     BODY_METHODS.contains(&method)
+}
+
+pub fn interception_method(method: &str) -> bool {
+    INTERCEPTION_METHODS.contains(&method)
+}
+
+pub fn answers_interception(method: &str) -> bool {
+    interception_method(method) && !method.contains("ResponseBody")
 }
 
 pub fn cookie_method(method: &str) -> bool {

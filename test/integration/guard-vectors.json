@@ -199,5 +199,102 @@
       "lanes": ["raw"],
       "session": "page"
     }
+  ],
+  "fetch": [
+    {
+      "id": "C5.fetch",
+      "probe": "fetch",
+      "expect": "subresource",
+      "lanes": ["raw", "cli", "kernel"]
+    },
+    {
+      "id": "C5.xhr",
+      "probe": "xhr",
+      "expect": "subresource",
+      "lanes": ["raw", "cli", "kernel"]
+    },
+    {
+      "id": "C5.image",
+      "probe": "image",
+      "expect": "subresource",
+      "lanes": ["raw", "cli", "kernel"]
+    },
+    {
+      "id": "C5.script",
+      "probe": "script",
+      "expect": "subresource",
+      "lanes": ["raw", "cli", "kernel"]
+    },
+    {
+      "id": "C5.auth",
+      "probe": "auth",
+      "expect": "auth",
+      "lanes": ["raw"],
+      "calls": [
+        {
+          "method": "Fetch.continueWithAuth",
+          "params": {
+            "authChallengeResponse": {
+              "response": "ProvideCredentials",
+              "username": "u",
+              "password": "p"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "C5.guessed-id",
+      "probe": "fetch",
+      "expect": "guessed",
+      "lanes": ["raw"],
+      "calls": [
+        {
+          "method": "Fetch.fulfillRequest",
+          "params": {
+            "responseCode": 200,
+            "responseHeaders": [
+              {
+                "name": "content-type",
+                "value": "text/plain"
+              },
+              {
+                "name": "access-control-allow-origin",
+                "value": "*"
+              }
+            ],
+            "body": "Z3Vlc3NlZA=="
+          }
+        },
+        {
+          "method": "Fetch.failRequest",
+          "params": {
+            "errorReason": "Failed"
+          }
+        },
+        {
+          "method": "Fetch.continueRequest",
+          "params": {}
+        },
+        {
+          "method": "Fetch.continueWithAuth",
+          "params": {
+            "authChallengeResponse": {
+              "response": "ProvideCredentials",
+              "username": "u",
+              "password": "p"
+            }
+          }
+        },
+        {
+          "method": "Fetch.continueResponse",
+          "params": {}
+        },
+        {
+          "method": "Fetch.getResponseBody",
+          "params": {}
+        }
+      ]
+    }
   ]
 }

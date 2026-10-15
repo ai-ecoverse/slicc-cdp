@@ -16,6 +16,53 @@ const wasmDir = path.join(root, 'target/wasm32-wasip1/debug');
 const spec = JSON.parse(await readFile(path.join(here, 'guard-vectors.json'), 'utf8'));
 const settleMs = 1500;
 const cliWaitMs = 6000;
+const fetchWaitMs = 5000;
+const tall = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64'
+);
+const wide =
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4z8AARAAI/gH/xp559wAAAABJRU5ErkJggg==';
+const probes = {
+  fetch: {
+    path: 'data',
+    run: (url) => `fetch(${JSON.stringify(url)}).then((r) => r.text(), () => 'error')`,
+    fulfilled: 'fulfilled',
+    real: (key) => `real-${key}`,
+    type: 'text/plain',
+  },
+  xhr: {
+    path: 'data',
+    run: (url) =>
+      `new Promise((resolve) => { const x = new XMLHttpRequest(); x.open('GET', ${JSON.stringify(url)}); x.onload = () => resolve(x.responseText); x.onerror = () => resolve('error'); x.send(); })`,
+    fulfilled: 'fulfilled',
+    real: (key) => `real-${key}`,
+    type: 'text/plain',
+  },
+  image: {
+    path: 'img',
+    run: (url) =>
+      `new Promise((resolve) => { const i = new Image(); i.onload = () => resolve('width ' + i.naturalWidth); i.onerror = () => resolve('error'); i.src = ${JSON.stringify(url)}; })`,
+    fulfilled: 'width 2',
+    real: () => 'width 1',
+    type: 'image/png',
+    body: wide,
+  },
+  script: {
+    path: 'script',
+    run: (url) =>
+      `new Promise((resolve) => { const s = document.createElement('script'); s.onload = () => resolve(String(globalThis.vectorScript)); s.onerror = () => resolve('error'); s.src = ${JSON.stringify(url)}; document.head.append(s); })`,
+    fulfilled: 'fulfilled',
+    real: (key) => `real-${key}`,
+    type: 'text/javascript',
+    source: "globalThis.vectorScript = 'fulfilled'",
+  },
+  auth: {
+    path: 'auth',
+    run: (url) =>
+      `fetch(${JSON.stringify(url)}, { credentials: 'include' }).then(async (r) => r.status + ' ' + (await r.text()), () => 'error')`,
+  },
+};
 
 test('guard vectors through the raw client, playwright-cli and the kernel', async (t) => {
   const site = await startFixture();
@@ -35,6 +82,7 @@ test('guard vectors through the raw client, playwright-cli and the kernel', asyn
     };
     await plant(ctx);
     rows.push(...(await rawLane(ctx)));
+    process.stdout.write(table(rows.filter((row) => row.id.startsWith('C5.'))));
     rows.push(...(await verifyStorage(ctx)));
     const native = nativeRunner(
       path.join(nativeDir, process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'),
@@ -112,7 +160,35 @@ function answer(req, res, url, host, q) {
       q.csp ? { 'content-security-policy': "img-src 'none'" } : {}
     );
   }
+  const cors = () => {
+    const origin = req.headers.origin;
+    return origin
+      ? { 'access-control-allow-origin': origin, 'access-control-allow-credentials': 'true' }
+      : { 'access-control-allow-origin': '*' };
+  };
   switch (url.pathname) {
+    case '/data':
+      res.writeHead(200, { 'content-type': 'text/plain', ...cors() });
+      return res.end(`real-${q.n || ''}`);
+    case '/img':
+      res.writeHead(200, { 'content-type': 'image/png', ...cors() });
+      return res.end(tall);
+    case '/script':
+      res.writeHead(200, { 'content-type': 'text/javascript', ...cors() });
+      return res.end(`globalThis.vectorScript = ${JSON.stringify(`real-${q.n || ''}`)}`);
+    case '/auth': {
+      const header = req.headers.authorization || '';
+      if (header === `Basic ${Buffer.from('u:p').toString('base64')}`) {
+        res.writeHead(200, { 'content-type': 'text/plain', ...cors() });
+        return res.end('authed');
+      }
+      res.writeHead(401, {
+        'content-type': 'text/plain',
+        'www-authenticate': 'Basic realm="vector"',
+        ...cors(),
+      });
+      return res.end('unauthorized');
+    }
     case '/beacon':
       res.writeHead(204, { 'access-control-allow-origin': '*' });
       return res.end();
@@ -307,8 +383,201 @@ function cookieRun(ctx, c, side) {
   return { key, steps, meta: { c, side, variant: '-', origin } };
 }
 
+function bounded(expression, ms = 6000) {
+  return `Promise.race([${expression}, new Promise((resolve) => setTimeout(() => resolve('timeout'), ${ms}))])`;
+}
+
+function fetchUrls(ctx, c, origin, key) {
+  const probe = probes[c.probe];
+  return {
+    url: `${origin}/${probe.path}?n=${encodeURIComponent(key)}`,
+    page: `${ctx.ordinary}/page?k=none&case=${key}`,
+  };
+}
+
+const corsList = (type) => [
+  { name: 'content-type', value: type },
+  { name: 'access-control-allow-origin', value: '*' },
+];
+
+function fetchRun(ctx, c, side) {
+  const origin = side === 'control' ? ctx.ordinary : spec.targets[side];
+  const key = `${c.id}.${side}.raw`;
+  const probe = probes[c.probe];
+  const { url, page } = fetchUrls(ctx, c, origin, key);
+  const match = `/${probe.path}?n=${encodeURIComponent(key)}`;
+  const steps = [
+    { op: 'open' },
+    call('Page.enable', {}),
+    { op: 'call', method: 'Page.navigate', params: { url: page }, session: 'page', notify: true },
+    { op: 'wait', ms: settleMs },
+  ];
+  const bracket = (name) => `${ctx.ordinary}/data?n=${encodeURIComponent(`${name}.${key}`)}`;
+  const launch = (expression, slot, ms) => ({
+    op: 'launch',
+    slot,
+    expression: bounded(expression, ms),
+  });
+  if (c.expect === 'subresource') {
+    const body = probe.body || Buffer.from(probe.source || probe.fulfilled).toString('base64');
+    steps.push(
+      call('Fetch.enable', {
+        patterns: [
+          { urlPattern: '*', requestStage: 'Request' },
+          { urlPattern: '*', requestStage: 'Response' },
+        ],
+      }),
+      {
+        op: 'intercept',
+        rule: {
+          match,
+          stage: 'Request',
+          method: 'Fetch.fulfillRequest',
+          params: { responseCode: 200, responseHeaders: corsList(probe.type), body },
+        },
+      },
+      launch(probe.run(url), 'probe'),
+      { op: 'wait', ms: fetchWaitMs },
+      { op: 'read', slot: 'probe' }
+    );
+  }
+  if (c.expect === 'auth') {
+    steps.push(
+      launch(probe.run(`${url}&plain=1`), 'plain'),
+      { op: 'wait', ms: fetchWaitMs },
+      { op: 'read', slot: 'plain' },
+      call('Fetch.enable', { patterns: [{ urlPattern: '*' }], handleAuthRequests: true }),
+      {
+        op: 'intercept',
+        rule: { match: '/never-matches', method: 'Fetch.continueRequest', params: {} },
+        auth: {
+          match,
+          response: { response: 'ProvideCredentials', username: 'u', password: 'p' },
+        },
+      },
+      launch(probes.fetch.run(bracket('before')), 'before'),
+      { op: 'wait', ms: 500 },
+      launch(probe.run(url), 'probe'),
+      { op: 'wait', ms: fetchWaitMs },
+      launch(probes.fetch.run(bracket('after')), 'after'),
+      { op: 'wait', ms: 500 },
+      { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
+      { op: 'read', slot: 'probe' }
+    );
+  }
+  if (c.expect === 'guessed') {
+    steps.push(
+      call('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] }),
+      {
+        op: 'intercept',
+        rule: { match, method: 'Fetch.continueRequest', params: {}, hold: true },
+      },
+      launch(probes.fetch.run(bracket('before')), 'before'),
+      { op: 'wait', ms: 500 },
+      launch(probe.run(url), 'probe', 20000),
+      { op: 'wait', ms: 500 },
+      launch(probes.fetch.run(bracket('after')), 'after'),
+      { op: 'wait', ms: 500 },
+      { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
+      { op: 'wait', ms: fetchWaitMs },
+      { op: 'read', slot: 'probe' }
+    );
+  }
+  return { key, steps, meta: { c, side, variant: '-', origin, url } };
+}
+
+function readValue(out, slot) {
+  const read = (out?.steps || []).filter((step) => step.op === 'read' && step.slot === slot);
+  return read.at(-1)?.outcome?.result?.result?.value;
+}
+
+function isRefused(outcome) {
+  return !outcome.ok && String(outcome.error).startsWith('slicc: refused');
+}
+
+function judgeFetch(ctx, run, out) {
+  const { c, side, origin, url } = run.meta;
+  if (!out) return { ok: false, why: 'no output from the raw client' };
+  const opened = stepOf(out, 'open')?.outcome;
+  if (!opened?.ok) return { ok: false, why: `setup: ${opened?.error?.trim()}` };
+  const probe = probes[c.probe];
+  const key = run.key;
+  const host = new URL(origin).host;
+  const value = readValue(out, 'probe');
+  const paused = (out.paused || []).filter((item) => item.url === url);
+  const events = out.events || [];
+  const challenged = events.filter(
+    (event) => event.method === 'Fetch.authRequired' && event.params?.request?.url === url
+  );
+  const hits = ctx.site.log.filter(
+    (hit) => hit.host === host && hit.path === `/${probe.path}` && hit.q.n === key
+  );
+  const guess = stepOf(out, 'guess')?.outcome;
+  const attempts = guess?.attempts || [];
+  const failed = out.steps.find(
+    (step) => step.op === 'call' && !step.outcome.ok && step.method !== 'Page.navigate'
+  );
+  const problems = [];
+  const want = (ok, text) => {
+    if (!ok) problems.push(text);
+  };
+  if (failed) problems.push(`${failed.method}: ${String(failed.outcome.error).trim()}`);
+  if (c.expect === 'subresource') {
+    if (side === 'control') {
+      want(paused.length > 0, 'no requestPaused for the ordinary url');
+      want(value === probe.fulfilled, `the ordinary probe read ${value}, not the fulfilled body`);
+    } else {
+      want(paused.length === 0, 'requestPaused for the guarded url');
+      want(value === probe.real(key), `the guarded probe read ${value}, not the real body`);
+      want(hits.length > 0, 'the guarded server never answered the real request');
+    }
+  }
+  if (c.expect === 'auth') {
+    const plain = readValue(out, 'plain');
+    if (side === 'control') {
+      want(challenged.length > 0, 'no authRequired for the ordinary url');
+      want(paused.length > 0, 'no requestPaused for the ordinary url');
+      want(value === '200 authed', `the ordinary probe read ${value}, not 200 authed`);
+    } else {
+      want(challenged.length === 0, 'authRequired for the guarded url');
+      want(paused.length === 0, 'requestPaused for the guarded url');
+      want(plain !== undefined && plain !== '200 authed', `the plain probe read ${plain}`);
+      want(value === plain, `the guarded probe read ${value}, not the untouched ${plain}`);
+      want(attempts.length > 0, 'no candidate ids to continue with auth');
+      want(
+        attempts.every((item) => isRefused(item.outcome)),
+        'continueWithAuth was not refused'
+      );
+    }
+  }
+  if (c.expect === 'guessed') {
+    want(attempts.length > 0, `no candidate ids${guess?.error ? `: ${guess.error}` : ''}`);
+    if (side === 'control') {
+      want(value === 'guessed', `the ordinary probe read ${value}, not the guessed body`);
+    } else {
+      const passed = attempts.filter((item) => !isRefused(item.outcome));
+      want(
+        passed.length === 0,
+        `not refused: ${[...new Set(passed.map((item) => item.method))].join(', ')}`
+      );
+      want(value === `real-${key}`, `the guarded probe read ${value}, not the real body`);
+      want(hits.length > 0, 'the guarded server never answered the real request');
+    }
+  }
+  if (side !== 'control') {
+    const text = JSON.stringify(events);
+    if (text.includes(`${host}/${probe.path}`)) problems.push('an event carried the guarded url');
+  }
+  return problems.length ? { ok: false, why: problems.join(', ') } : { ok: true };
+}
+
 async function rawLane(ctx) {
   const runs = [];
+  for (const c of spec.fetch.filter((item) => item.lanes.includes('raw'))) {
+    for (const side of ['control', ...Object.keys(spec.targets)]) {
+      runs.push(fetchRun(ctx, c, side));
+    }
+  }
   for (const c of spec.navigation.filter((item) => item.lanes.includes('raw'))) {
     for (const variant of Object.keys(spec.variants)) {
       for (const side of ['control', ...Object.keys(spec.targets)]) {
@@ -354,7 +623,11 @@ async function rawLane(ctx) {
   for (const run of runs) {
     const { c, side, variant } = run.meta;
     const out = outputs.get(run.key);
-    const judged = c.method ? judgeCookie(ctx, run, out) : judgeNavigation(ctx, run, out);
+    const judged = c.probe
+      ? judgeFetch(ctx, run, out)
+      : c.method
+        ? judgeCookie(ctx, run, out)
+        : judgeNavigation(ctx, run, out);
     const group = `${c.id}|${variant}`;
     if (!grouped.has(group)) grouped.set(group, { control: null, guarded: [] });
     if (side === 'control') grouped.get(group).control = judged;
@@ -565,16 +838,17 @@ async function readStorage(raw, origin) {
   const tab = await raw.open(`${origin}/canary/final`);
   try {
     const { sessionId } = await raw.send('Target.attachToTarget', { targetId: tab, flatten: true });
-    const value = await raw.send(
-      'Runtime.evaluate',
-      {
-        expression:
-          "JSON.stringify({ canary: localStorage.getItem('canary'), probe: localStorage.getItem('probe') })",
-        returnByValue: true,
-      },
-      sessionId
-    );
-    return JSON.parse(value.result.value);
+    const expression = `location.href.startsWith(${JSON.stringify(origin)}) && document.readyState === 'complete' ? JSON.stringify({ canary: localStorage.getItem('canary'), probe: localStorage.getItem('probe') }) : ''`;
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      const value = await raw
+        .send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)
+        .catch(() => null);
+      const text = value?.result?.value;
+      if (text) return JSON.parse(text);
+      if (Date.now() > deadline) throw new Error(`${origin}/canary/final never loaded`);
+      await delay(200);
+    }
   } finally {
     await raw.send('Target.closeTarget', { targetId: tab });
   }
@@ -627,7 +901,7 @@ async function verifyStorage(ctx) {
 
 async function cliLane(ctx, runner, lane, width) {
   const jobs = [];
-  for (const c of [...spec.navigation, ...spec.cookies].filter((item) =>
+  for (const c of [...spec.fetch, ...spec.navigation, ...spec.cookies].filter((item) =>
     item.lanes.includes(lane)
   )) {
     jobs.push(async () => {
@@ -672,6 +946,7 @@ async function cliCase(ctx, runner, lane, c, side) {
   const raw = await rawSocket(ctx.wsUrl);
   let tab;
   try {
+    if (c.probe) return await cliFetch(ctx, runner, c, side, key, cwd, run, (id) => (tab = id));
     if (c.method) {
       const start = `${ctx.ordinary}/page?k=none&case=${key}`;
       let opened = await run(['open', start]);
@@ -756,6 +1031,45 @@ async function cliCase(ctx, runner, lane, c, side) {
     if (tab) await closeWithPopups(raw, tab);
     raw.close();
   }
+}
+
+async function cliFetch(ctx, runner, c, side, key, cwd, run, opened) {
+  const origin = side === 'control' ? ctx.ordinary : spec.targets[side];
+  const host = new URL(origin).host;
+  const probe = probes[c.probe];
+  const { url, page } = fetchUrls(ctx, c, origin, key);
+  let started = await run(['open', page]);
+  if (started.code !== 0) started = await run(['open', page]);
+  if (started.code !== 0) return { ok: false, why: `setup: ${started.stderr.trim()}` };
+  opened(targetOf(started.stdout));
+  const args = ['route', `**/${probe.path}*`, `--content-type=${probe.type}`];
+  args.push('--header=access-control-allow-origin: *');
+  if (probe.body) {
+    await runner.write(cwd, 'fulfilled.png', Buffer.from(probe.body, 'base64'));
+    args.push(`--fulfill-file=${cwd}/fulfilled.png`);
+  } else {
+    args.push(`--body=${probe.source || probe.fulfilled}`);
+  }
+  const routed = await run(args);
+  if (routed.code !== 0) return { ok: false, why: `route: ${routed.stderr.trim()}` };
+  const result = await run(['eval', bounded(probe.run(url))]);
+  await run(['unroute']);
+  const text = `${result.stdout}${result.stderr}`;
+  const hits = ctx.site.log.filter(
+    (hit) => hit.host === host && hit.path === `/${probe.path}` && hit.q.n === key
+  );
+  const fulfilled = text.includes(probe.fulfilled);
+  const real = text.includes(probe.real(key));
+  if (side === 'control') {
+    return fulfilled && !real
+      ? { ok: true }
+      : { ok: false, why: `the routed body never reached the probe: ${text.trim().slice(0, 300)}` };
+  }
+  const problems = [];
+  if (fulfilled) problems.push('the guarded probe read the routed body');
+  if (!real) problems.push(`the guarded probe missed the real body: ${text.trim().slice(0, 300)}`);
+  if (!hits.length) problems.push('the guarded server never answered the real request');
+  return problems.length ? { ok: false, why: problems.join(', ') } : { ok: true };
 }
 
 async function rawBody(raw, tab) {
