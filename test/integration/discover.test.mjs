@@ -1032,6 +1032,7 @@ Object.defineProperty(document, 'modelContext', {
     });
 
     await t.test('stalled body probe gives up within 6s', async () => {
+      let requested;
       const stallServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         if (url.pathname === '/') {
@@ -1044,6 +1045,7 @@ Object.defineProperty(document, 'modelContext', {
             'content-type': 'application/json',
             'content-length': '10000',
           });
+          requested ??= performance.now();
           res.write('{"name":"x');
           return;
         }
@@ -1055,10 +1057,10 @@ Object.defineProperty(document, 'modelContext', {
       try {
         const cwd = await runner.fresh();
         await runner.clearSession(cwd);
-        const start = Date.now();
         await runner.playwright(['discover', '--json', '--once', `${stallOrigin}/`], cwd);
-        const elapsed = Date.now() - start;
-        assert.ok(elapsed < 6000, `probe must give up within 6s, took ${elapsed}ms`);
+        assert.ok(requested !== undefined, 'the probe must request /.well-known/ard.json');
+        const elapsed = Math.round(performance.now() - requested);
+        assert.ok(elapsed < 6000, `probe must give up within 6s of its request, took ${elapsed}ms`);
       } finally {
         stallServer.closeAllConnections();
         stallServer.close();

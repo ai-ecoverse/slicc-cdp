@@ -105,7 +105,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         connect::Start::Direct(url) | connect::Start::Discover(url) => url.clone(),
     };
     let mut cdp = connected;
-    let mut state = session::load_named(invocation.session.as_deref());
+    let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
