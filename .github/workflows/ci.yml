@@ -14,12 +14,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner:
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CERT_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - id: pick
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          FORCED: ${{ vars.CI_RUNNER }}
+          POOL: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+        with:
+          script: |
+            const hosted = 'ubuntu-latest';
+            const pick = async (runner, why) => {
+              core.setOutput('runner', runner);
+              await core.summary.addRaw(`runner: ${runner} (${why})\n`).write();
+            };
+            if (process.env.FORCED) return await pick(process.env.FORCED, 'vars.CI_RUNNER');
+            const pool = process.env.POOL;
+            const { owner, repo } = context.repo;
+            if (context.eventName === 'pull_request') {
+              const head = context.payload.pull_request.head.repo;
+              const same = head && head.full_name === `${owner}/${repo}`;
+              return same ? await pick(pool, 'same-repo PR') : await pick(hosted, 'fork PR');
+            }
+            if (context.eventName === 'merge_group') {
+              const base = context.payload.merge_group.base_ref.replace('refs/heads/', '');
+              const q = await github.graphql(
+                `query($o:String!,$n:String!,$b:String!){repository(owner:$o,name:$n){mergeQueue(branch:$b){entries(first:100){nodes{pullRequest{number isCrossRepository}}}}}}`,
+                { o: owner, n: repo, b: base }
+              );
+              const entries = q.repository.mergeQueue?.entries?.nodes ?? [];
+              const forks = entries.filter((e) => e.pullRequest?.isCrossRepository !== false);
+              return forks.length === 0
+                ? await pick(pool, `merge group, ${entries.length} same-repo entries`)
+                : await pick(hosted, `merge group with a fork or unknown PR: ${forks.map((e) => e.pullRequest?.number).join(', ')}`);
+            }
+            if (context.eventName === 'push' && context.ref === 'refs/heads/main') return await pick(pool, 'push to main');
+            await pick(hosted, context.eventName);
+
   ci:
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.14.0
+    needs: runner
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.18.1
     with:
       chromium: false
+      runs-on: ${{ needs.runner.outputs.runner }}
   integration:
-    runs-on: ubuntu-latest
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner }}
     timeout-minutes: 30
     env:
       LEFTHOOK: '0'
@@ -35,11 +82,14 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Chrome for Testing (pinned in package.json config.chrome)
-        run: npm run -s browser -- --with-deps
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          npm run -s browser -- $deps
       - run: npm run test:integration
 
   integration-chrome-latest:
-    runs-on: ubuntu-latest
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner }}
     timeout-minutes: 30
     env:
       LEFTHOOK: '0'
@@ -55,14 +105,17 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Chrome for Testing (latest)
-        run: echo "CHROMIUM_EXECUTABLE=$(node src/cli.js install-browser --channel stable --with-deps)" >> "$GITHUB_ENV"
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          echo "CHROMIUM_EXECUTABLE=$(node src/cli.js install-browser --channel stable $deps)" >> "$GITHUB_ENV"
       - name: Run WebMCP integration tests
         run: |
           cargo build -p slicc-cdp -p curlwright
           node --test --test-timeout=600000 test/integration/webmcp.test.mjs
 
   shellcheck:
-    runs-on: ubuntu-latest
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -74,8 +127,8 @@ jobs:
       version: "99.0.0"
 
   installer-ubuntu:
-    needs: build-binaries
-    runs-on: ubuntu-latest
+    needs: [runner, build-binaries]
+    runs-on: ${{ needs.runner.outputs.runner }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

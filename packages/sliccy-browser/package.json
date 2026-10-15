@@ -1,6 +1,6 @@
 {
   "name": "@ai-ecoverse/sliccy-browser",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "sliccy:browser for jsh, over CDP",
   "type": "module",
   "license": "Apache-2.0",
@@ -29,6 +29,6 @@
     "src"
   ],
   "dependencies": {
-    "@ai-ecoverse/slicc-cdp": "1.25.2"
+    "@ai-ecoverse/slicc-cdp": "1.26.0"
   }
 }
