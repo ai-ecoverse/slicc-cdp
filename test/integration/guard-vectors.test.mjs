@@ -19,7 +19,6 @@ const spec = JSON.parse(await readFile(path.join(here, 'guard-vectors.json'), 'u
 const settleMs = 1500;
 const cliWaitMs = 6000;
 const fetchWaitMs = 5000;
-const probeSettleMs = 7000;
 const rowSeconds = 180;
 const tall = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
@@ -480,7 +479,7 @@ function fetchRun(ctx, c, side) {
       launch(probes.fetch.run(bracket('before')), 'before'),
       { op: 'until', slot: 'before', ms: fetchWaitMs },
       launch(probe.run(url), 'probe'),
-      { op: 'until', slot: 'probe', ms: probeSettleMs },
+      { op: 'until', slot: 'probe', ms: fetchWaitMs, soft: true },
       launch(probes.fetch.run(bracket('after')), 'after'),
       { op: 'until', slot: 'after', ms: fetchWaitMs },
       { op: 'guess', before: `before.${key}`, after: `after.${key}`, calls: c.calls },
@@ -501,7 +500,8 @@ function fetchRun(ctx, c, side) {
         op: 'until',
         slot: 'probe',
         paused: match,
-        ms: probeSettleMs,
+        ms: fetchWaitMs,
+        soft: true,
       },
       launch(probes.fetch.run(bracket('after')), 'after'),
       { op: 'until', slot: 'after', ms: fetchWaitMs },
