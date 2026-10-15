@@ -225,7 +225,7 @@ jobs:
           echo "$output" | grep -q "source=Notarized Developer ID"
 
   publish-release:
-    needs: [release, upload-assets, verify-signatures]
+    needs: [release, upload-assets, verify-signatures, cert]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
