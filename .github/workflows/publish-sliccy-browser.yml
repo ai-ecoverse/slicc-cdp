@@ -83,3 +83,23 @@ jobs:
           git push origin "${sha}:refs/tags/${tag}"
           echo "tagged ${tag} at ${sha}"
           echo "tagged \`${tag}\` at \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cert line in the job summary
+        env:
+          NAME: ${{ steps.publish.outputs.name }}
+          VERSION: ${{ steps.publish.outputs.version }}
+        run: |
+          deadline=$(( $(date +%s) + 600 ))
+          until head="$(npm view "${NAME}@${VERSION}" gitHead 2>/dev/null)" && [ -n "$head" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::${NAME}@${VERSION} has no gitHead on the registry"
+              exit 1
+            fi
+            sleep 10
+          done
+          dir="$(mktemp -d)"
+          file="$(cd "$dir" && npm pack "${NAME}@${VERSION}" --silent)"
+          sha="$(sha256sum "${dir}/${file}" | cut -d' ' -f1)"
+          line="cert: ${NAME}@${VERSION} sha256=${sha} gitHead=${head}"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
