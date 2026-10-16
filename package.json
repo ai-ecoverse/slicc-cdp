@@ -51,7 +51,7 @@
   },
   "scripts": {
     "prepare": "lefthook install && node scripts/allow-crate-readmes.mjs",
-    "build:wasm": "cargo build --release --target wasm32-wasip1 -p slicc-cdp -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
+    "build:wasm": "cargo build --locked --release --target wasm32-wasip1 -p slicc-cdp -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
     "prepublishOnly": "npm run build:wasm",
     "lint": "slicc-lint",
     "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js && node --check src/page.js && node --check src/browser.js && node --check src/cli.js && node --check packages/sliccy-browser/src/browser.js && node --check packages/sliccy-browser/src/fetch-script.js",
