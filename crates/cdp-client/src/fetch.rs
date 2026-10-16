@@ -1512,6 +1512,35 @@ mod tests {
             .to_string()
     }
 
+    fn unpaused(cdp: &mut Cdp, session: &str, app: &str, api: &str) -> String {
+        let page = cdp
+            .call_for(
+                "Runtime.evaluate",
+                json!({ "expression": "JSON.stringify({ href: location.href, readyState: document.readyState, got: window.__got ?? null })", "returnByValue": true }),
+                Some(session),
+                Duration::from_secs(5),
+            )
+            .map(|value| value.pointer("/result/value").cloned().unwrap_or(Value::Null).to_string())
+            .unwrap_or_else(|error| format!("evaluate failed: {}", error.trim()));
+        let path = url::form_urlencoded::byte_serialize(b"/api/headers").collect::<String>();
+        let hits = crate::net::http_probe(&format!("{app}/hits?path={path}"), "text/plain")
+            .map(|response| String::from_utf8_lossy(&response.body).into_owned())
+            .unwrap_or_else(|error| format!("unknown ({})", error.trim()));
+        let trail: Vec<String> = cdp
+            .paused_trail
+            .iter()
+            .filter(|(_, url, _)| url.starts_with(api))
+            .map(|(id, url, reason)| {
+                let whose = if id == session { "this session" } else { "another session" };
+                format!("{url} on {whose}: {reason}")
+            })
+            .collect();
+        format!(
+            "page {page}; fixture /api/headers hits {hits}; Fetch.requestPaused for it: {}",
+            if trail.is_empty() { "none".to_string() } else { trail.join(", ") }
+        )
+    }
+
     fn start_script(cdp: &mut Cdp, session: &str, expression: &str) {
         let _ = cdp.notify(
             "Runtime.evaluate",
@@ -1623,10 +1652,10 @@ mod tests {
                     json!(api)
                 ),
             );
-            let request = seen
-                .next(Duration::from_secs(10))
-                .unwrap()
-                .expect("the request paused");
+            let request = match seen.next(Duration::from_secs(10)).unwrap() {
+                Some(request) => request,
+                None => panic!("the request paused: {}", unpaused(&mut seen, &session, &app, &api)),
+            };
             assert!(!request.is_response());
             let mut headers = request.headers.clone();
             headers.push(("X-Added".into(), "1".into()));
