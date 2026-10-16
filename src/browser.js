@@ -412,7 +412,8 @@ export async function launchBrowser({
   if (reserved(port)) {
     throw new Error(`refusing to bind port ${port} (9222-9229 belong to the kernel and the probe)`);
   }
-  const taken = args.find((arg) => owned(arg, platform));
+  const end = args.indexOf('--');
+  const taken = (end < 0 ? args : args.slice(0, end)).find((arg) => owned(arg, platform));
   if (taken) {
     throw new Error(`args may not set ${taken}: use the port and userDataDir options`);
   }

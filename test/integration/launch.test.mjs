@@ -146,6 +146,11 @@ test('args are refused in every spelling Chrome parses, and a benign switch stil
       );
     }
     assert.equal(existsSync(path.join(alt, 'DevToolsActivePort')), false);
+    await assert.rejects(
+      launchBrowser({ executable, args: ['--', `-user-data-dir=${alt}`], sandbox, timeout: 5000 }),
+      /did not start: .*Multiple targets are not supported in headless mode/
+    );
+    assert.equal(existsSync(path.join(alt, 'DevToolsActivePort')), false);
     const browser = await launchBrowser({
       executable,
       args: ['-lang=en-US', '--window-size=800,600', '--user-data-dirs=1'],
@@ -154,6 +159,7 @@ test('args are refused in every spelling Chrome parses, and a benign switch stil
     try {
       assert.notEqual(browser.userDataDir, alt);
       assert.equal((await version(browser.port)).webSocketDebuggerUrl, browser.wsUrl);
+      assert.equal(existsSync(path.join(alt, 'DevToolsActivePort')), false);
     } finally {
       await browser.close();
     }
