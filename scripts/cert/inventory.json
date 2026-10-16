@@ -1,0 +1,17 @@
+[
+  "playwright-cli-darwin-amd64",
+  "playwright-cli-darwin-arm64",
+  "playwright-cli-linux-amd64",
+  "playwright-cli-linux-arm64",
+  "playwright-cli-windows-amd64.exe",
+  "playwright-cli-windows-arm64.exe",
+  "curlwright-darwin-amd64",
+  "curlwright-darwin-arm64",
+  "curlwright-linux-amd64",
+  "curlwright-linux-arm64",
+  "curlwright-windows-amd64.exe",
+  "curlwright-windows-arm64.exe",
+  "install.sh",
+  "LICENSE",
+  "THIRD-PARTY-NOTICES"
+]

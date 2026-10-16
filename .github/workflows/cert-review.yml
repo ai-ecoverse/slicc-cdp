@@ -1,0 +1,303 @@
+name: cert-review
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+    outputs:
+      certified:
+        value: ${{ jobs.record.outputs.certified }}
+      sha256:
+        value: ${{ jobs.record.outputs.sha256 }}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published version to certify
+        required: true
+        type: string
+      dry_run:
+        description: Record evidence without writing a release or status
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cert-review-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main' && github.repository == 'ai-ecoverse/slicc-cdp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: read
+      actions: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      rust: ${{ steps.plan.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: node scripts/cert/plan.mjs --version "$VERSION" --out evidence/plan.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence/plan.json
+          if-no-files-found: error
+          retention-days: 90
+
+  rebuild:
+    needs: plan
+    if: needs.plan.outputs.rust != ''
+    runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+    timeout-minutes: 30
+    env:
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence
+      - name: Exact Rust toolchain
+        env:
+          RUST: ${{ needs.plan.outputs.rust }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: node scripts/cert/rebuild.mjs --plan evidence/plan.json --out evidence/rebuild.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: cert-rebuild-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence/rebuild.json
+          if-no-files-found: error
+          retention-days: 90
+
+  guard:
+    needs: plan
+    if: needs.plan.outputs.rust != ''
+    runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+    timeout-minutes: 60
+    env:
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: bash scripts/cert/gh.sh
+      - name: Exact Rust toolchain
+        env:
+          RUST: ${{ needs.plan.outputs.rust }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Chromium dependencies
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          npm run -s browser -- $deps
+      - name: Shared guard suite and previous certified cdp-client NEGATIVE
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/cert/guard.mjs --plan evidence/plan.json --out evidence/guard.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: cert-guard-${{ inputs.version }}-${{ github.run_attempt }}
+          path: |
+            evidence/guard.json
+            .cert/guard-*/*.json
+            .cert/guard-*/*.jsonl
+            .cert/guard-*/*.log
+            .cert/guard-*/rows.md
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  integration:
+    needs: plan
+    if: needs.plan.outputs.rust != ''
+    runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+    timeout-minutes: 60
+    env:
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: bash scripts/cert/gh.sh
+      - name: Exact Rust toolchain
+        env:
+          RUST: ${{ needs.plan.outputs.rust }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Chromium dependencies
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          npm run -s browser -- $deps
+      - name: Public integration suites on published bytes and fix NEGATIVEs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/cert/integration.mjs --plan evidence/plan.json --out evidence/integration.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: cert-integration-${{ inputs.version }}-${{ github.run_attempt }}
+          path: |
+            evidence/integration.json
+            .cert/integration-*/*.json
+            .cert/integration-*/*.jsonl
+            .cert/integration-*/*.log
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  assets:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          CERT_APPLE_TEAM: ${{ vars.CERT_APPLE_TEAM || 'S8LB56P782' }}
+          PLATFORM: ${{ runner.os == 'macOS' && 'macos' || 'linux' }}
+        run: node scripts/cert/assets.mjs --plan evidence/plan.json --out "evidence/assets-$PLATFORM.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: cert-assets-${{ runner.os }}-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence/assets-*.json
+          if-no-files-found: error
+          retention-days: 90
+
+  record:
+    needs: [plan, rebuild, guard, integration, assets]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      certified: ${{ steps.record.outputs.certified }}
+      sha256: ${{ steps.record.outputs.sha256 }}
+      state: ${{ steps.record.outputs.state }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: cert-*-${{ inputs.version }}-${{ github.run_attempt }}
+          path: downloaded
+          merge-multiple: true
+      - name: Gather result documents without substituting missing evidence
+        run: |
+          mkdir -p evidence
+          find downloaded -type f -name '*.json' -maxdepth 3 -exec cp {} evidence/ \;
+      - name: Independent registry hash, signed provenance, crates and code-only record
+        id: record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CERT_UPSTREAM: ${{ toJSON(needs) }}
+        run: |
+          CERT_UPSTREAM=$(node -e 'const n=JSON.parse(process.env.CERT_UPSTREAM); console.log(JSON.stringify(Object.fromEntries(["rebuild","guard","integration","assets"].map(k=>[k,n[k].result]))))')
+          export CERT_UPSTREAM
+          node scripts/cert/record.mjs --evidence evidence --out record
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cert-record-${{ inputs.version }}-${{ github.run_attempt }}
+          path: |
+            record/
+            evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: [plan, record]
+    if: always() && needs.record.result == 'success' && github.ref == 'refs/heads/main' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cert-record-${{ inputs.version }}-${{ github.run_attempt }}
+          path: downloaded
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/cert/publish.mjs --record downloaded/record/record.json
+
+  result:
+    needs: record
+    if: always() && needs.record.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          CERTIFIED: ${{ needs.record.outputs.certified }}
+        run: test "$CERTIFIED" = true
