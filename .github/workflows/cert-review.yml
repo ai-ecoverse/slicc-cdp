@@ -38,6 +38,9 @@ concurrency:
   group: cert-review-${{ inputs.version }}
   cancel-in-progress: false
 
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
 jobs:
   plan:
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'ai-ecoverse/slicc-cdp' }}
