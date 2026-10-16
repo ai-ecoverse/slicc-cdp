@@ -78,7 +78,7 @@ jobs:
       - run: npm ci
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-wasip1
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Chrome for Testing (pinned in package.json config.chrome)
         run: |
@@ -111,7 +111,7 @@ jobs:
       - run: npm ci
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --target wasm32-wasip1
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Chrome for Testing (latest)
         run: |
