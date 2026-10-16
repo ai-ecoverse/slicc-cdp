@@ -53,6 +53,8 @@ pub struct Cdp {
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
     frames: BTreeMap<String, Vec<String>>,
+    #[cfg(test)]
+    pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
 impl Cdp {
@@ -86,6 +88,8 @@ impl Cdp {
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
             frames: BTreeMap::new(),
+            #[cfg(test)]
+            paused_trail: Vec::new(),
         }
     }
 
@@ -1127,6 +1131,24 @@ impl Cdp {
             if let Some(network) = &paused.network_id {
                 let entry = self.requests.entry(network.clone()).or_insert(false);
                 *entry = *entry || protected || initiated;
+            }
+            #[cfg(test)]
+            {
+                let reason = if self.guard_sessions.contains(&paused.session_id) {
+                    "guard session"
+                } else if protected {
+                    "reaches a protected origin"
+                } else if self.blocked.contains(&paused.session_id) {
+                    "blocked session"
+                } else if initiated {
+                    "initiated by protected"
+                } else if self.deciders.contains_key(&paused.session_id) {
+                    "decider"
+                } else {
+                    "queued"
+                };
+                self.paused_trail
+                    .push((paused.session_id.clone(), paused.url.clone(), reason));
             }
             if self.guard_sessions.contains(&paused.session_id) {
                 if protected && paused.resource_type == "Document" {
