@@ -106,6 +106,31 @@ test('named proof passing on the baseline is INCOMPLETE, not a known-gap waiver'
   assert.ok(result.record.line.includes('proof does not discriminate: fixed-behaviour'));
 });
 
+test('record lists eligible legacy replay checksums, while new release evidence stays strict', () => {
+  const documents = fixture();
+  documents.plan.mode = 'replay';
+  documents.plan.legacyChecksum = true;
+  for (const [key, value] of Object.entries(documents))
+    if (key !== 'plan') {
+      value.mode = 'replay';
+      value.legacyChecksum = true;
+    }
+  const installer = documents['assets-linux'].checksums.files.find(
+    (file) => file.file === 'install.sh'
+  );
+  installer.status = 'LEGACY';
+  delete installer.expected;
+  documents['assets-linux'].checksums.legacy = 'legacy: checksum set unavailable';
+  const result = conclude(documents);
+  assert.equal(result.record.status, 'PASS', result.record.line);
+  assert.ok(result.record.line.includes('legacy: checksum set unavailable'));
+  documents.plan.mode = 'release';
+  assert.equal(conclude(documents).record.status, 'INCOMPLETE');
+  documents.plan.mode = 'replay';
+  documents.plan.legacyChecksum = false;
+  assert.equal(conclude(documents).record.status, 'INCOMPLETE');
+});
+
 test('missing or mismatched required evidence is INCOMPLETE, never a candidate', async (t) => {
   const cases = {
     'missing guard document': (docs) => {

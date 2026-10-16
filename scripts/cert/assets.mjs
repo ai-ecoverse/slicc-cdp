@@ -34,6 +34,12 @@ function verifySignature(file, asset) {
   };
 }
 
+const checksumMode = (plan) => [
+  '--mode',
+  plan.mode ?? 'release',
+  ...(plan.legacyChecksum ? ['--legacy'] : []),
+];
+
 await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', async (plan) => {
   const dir = path.join(root, '.cert/assets');
   mkdirSync(dir, { recursive: true });
@@ -82,6 +88,7 @@ await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', 
       path.join(root, 'scripts/cert/asset-check.mjs'),
       '--directory',
       dir,
+      ...checksumMode(plan),
     ]);
     checksums = JSON.parse(output.stdout);
   }

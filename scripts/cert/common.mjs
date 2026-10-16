@@ -43,6 +43,8 @@ export function args(extra = {}) {
 export function identity(plan) {
   return {
     version: plan.version,
+    mode: plan.mode ?? 'release',
+    legacyChecksum: plan.legacyChecksum ?? false,
     commit: plan.commit,
     baseline: plan.baseline,
     harness: plan.harness,

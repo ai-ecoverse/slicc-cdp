@@ -12,6 +12,9 @@ on:
       caller_results:
         type: string
         default: '{}'
+      replay:
+        type: boolean
+        default: false
     outputs:
       certified:
         value: ${{ jobs.record.outputs.certified }}
@@ -60,6 +63,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          CERT_MODE: ${{ (github.event_name == 'workflow_dispatch' || inputs.replay) && 'replay' || 'release' }}
         run: node scripts/cert/plan.mjs --version "$VERSION" --out evidence/plan.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

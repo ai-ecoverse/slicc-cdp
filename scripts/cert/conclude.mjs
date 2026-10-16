@@ -20,7 +20,7 @@ if (vectorSet.setVersion !== plan.vectors) throw new Error('record runner pin di
 const incomplete = [...(plan.issues ?? [])];
 const failures = [];
 const flags = [];
-const known = plan.proofs?.known ?? [];
+const known = [...(plan.proofs?.known ?? [])];
 const read = (which) => {
   try {
     const item = json(path.join(values.evidence, `${which}.json`));
@@ -232,10 +232,20 @@ else {
 const inventory = json(path.join(import.meta.dirname, 'inventory.json'));
 if (
   !inventory.every((file) =>
-    linux?.checksums?.files?.some((row) => row.file === file && row.status === 'PASS')
+    linux?.checksums?.files?.some(
+      (row) =>
+        row.file === file &&
+        (row.status === 'PASS' ||
+          (row.status === 'LEGACY' &&
+            plan.mode === 'replay' &&
+            plan.legacyChecksum === true &&
+            /^[a-f0-9]{64}$/.test(row.sha256)))
+    )
   )
 )
   incomplete.push('assets-linux: missing complete release checksum evidence');
+if (plan.mode === 'replay' && plan.legacyChecksum === true && linux?.checksums?.legacy)
+  known.push('legacy: checksum set unavailable');
 if (
   !inventory
     .filter((file) => file.includes('-darwin-'))
