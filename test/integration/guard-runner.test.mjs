@@ -77,7 +77,7 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',
   });
-  const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 6);
+  const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
   const executeTarget = async (target) => {
     const fixture = await fixtureServer();
     const targets = origins(fixture);
