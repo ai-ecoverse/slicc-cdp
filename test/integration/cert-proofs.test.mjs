@@ -205,6 +205,13 @@ test('named proof verifier distinguishes an exact NEGATIVE, an unexpected failur
       )
     );
     assert.equal(check(suite([row('test:fail')])).status, 'INCOMPLETE');
+    writeFileSync(positive, JSON.stringify({ ...suite([row('test:pass')]), status: 'FAIL' }));
+    assert.equal(check(suite([row('test:fail')])).status, 'FAIL');
+    writeFileSync(
+      positive,
+      JSON.stringify(suite([row('test:pass'), row('test:fail', 'failed sibling')]))
+    );
+    assert.equal(check(suite([row('test:fail')])).status, 'FAIL');
     writeFileSync(positive, JSON.stringify(suite([row('test:pass')])));
     const exact = check(suite([row('test:fail')]));
     assert.equal(exact.status, 'PASS');
