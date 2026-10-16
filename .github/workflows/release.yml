@@ -177,17 +177,16 @@ jobs:
         run: |
           bash scripts/generate-notices.sh artifacts/THIRD-PARTY-NOTICES
           cp LICENSE artifacts/LICENSE
+          cp install.sh artifacts/install.sh
 
-      - name: Generate checksums
-        working-directory: artifacts
-        run: sha256sum * > SHA256SUMS
+      - name: Generate checksums for the complete asset set
+        run: node scripts/release-checksums.mjs artifacts
 
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ needs.release.outputs.tag }}"
-          cp install.sh artifacts/install.sh
           gh release upload "$tag" artifacts/* --clobber
 
   verify-signatures:
