@@ -83,6 +83,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       certified: ${{ steps.record.outputs.certified }}
+      status: ${{ steps.record.outputs.status }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -135,6 +136,7 @@ jobs:
         run: node scripts/cert/post-notes.mjs --record downloaded/record/record.json
 
   result:
+    name: ${{ needs.record.outputs.status == 'FAIL' && 'SUPPLY-CHAIN FAIL' || 'Supply-chain verdict' }}
     needs: [plan, assets, record, notes]
     if: ${{ always() }}
     runs-on: ubuntu-latest

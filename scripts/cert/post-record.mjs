@@ -185,5 +185,9 @@ save(path.join(options.out, 'record.json'), record);
 writeFileSync(path.join(options.out, 'line.txt'), `${line}\n`);
 if (process.env.GITHUB_OUTPUT)
   appendFileSync(process.env.GITHUB_OUTPUT, `certified=${record.certified}\nstatus=${status}\n`);
-if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
+if (process.env.GITHUB_STEP_SUMMARY)
+  appendFileSync(
+    process.env.GITHUB_STEP_SUMMARY,
+    `# ${status === 'FAIL' ? 'SUPPLY-CHAIN FAIL' : `Supply-chain ${status}`}\n\n${line}\n`
+  );
 console.log(line);
