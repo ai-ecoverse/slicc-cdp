@@ -39,6 +39,20 @@ test('cert record CLI accepts complete matching evidence and constructs the cand
   );
 });
 
+test('a declared baseline control regression is a NEGATIVE, not a current guard pass', () => {
+  const documents = fixture();
+  const row = documents.guard.executions.negative.report.results.find(
+    (row) => row.id === 'C1.href'
+  );
+  row.control = 'fail';
+  const key = `${row.id}/${row.target}/${row.variant}`;
+  documents.guard.expected = documents.guard.failures = [key];
+  documents.guard.executions.negative.status = 'FAIL';
+  const result = conclude(documents);
+  assert.equal(result.status, 0, result.record.line);
+  assert.equal(result.record.certified, true);
+});
+
 test('missing or mismatched required evidence is INCOMPLETE, never a candidate', async (t) => {
   const cases = {
     'missing guard document': (docs) => {
@@ -69,6 +83,18 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
     'undeclared failure in raw NEGATIVE rows': (docs) => {
       const row = docs.guard.executions.negative.report.results.find((row) => row.id === 'C1.href');
       row.guarded = 'fail';
+    },
+    'missing fresh tag verification': (docs) => {
+      delete docs.registry.tagCommit;
+    },
+    'signature audit did not complete': (docs) => {
+      docs.registry.signatures.exit = null;
+    },
+    'notarisation timed out': (docs) => {
+      docs['assets-macos'].files[0].signature.notarisation.exit = null;
+    },
+    'missing signer identity result': (docs) => {
+      delete docs['assets-macos'].files[0].signature.team;
     },
     'missing provenance results': (docs) => {
       delete docs.registry.provenance;
@@ -101,11 +127,12 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
 });
 
 test('a byte mismatch or coded supply-chain defect FAILs even with incomplete evidence', async (t) => {
-  for (const field of ['registry', 'rebuild'])
+  for (const field of ['registry', 'rebuild', 'tag'])
     await t.test(field, () => {
       const documents = fixture();
       delete documents.integration;
       if (field === 'registry') documents.registry.status = 'FAIL';
+      else if (field === 'tag') documents.registry.tagCommit = 'f'.repeat(40);
       else documents.rebuild.sha256 = 'f'.repeat(64);
       const result = conclude(documents);
       assert.equal(result.record.status, 'FAIL');

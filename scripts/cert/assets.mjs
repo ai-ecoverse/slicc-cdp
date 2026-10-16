@@ -20,7 +20,18 @@ function verifySignature(file, asset) {
     notarisation.exit === 0 &&
     notarisation.stderr.includes('source=Notarized Developer ID') &&
     /\baccepted\b/.test(notarisation.stderr);
-  return { valid, identifier, team, display, strict, notarisation };
+  const complete = [display, strict, notarisation].every(
+    (result) => result.exit !== null && !result.signal && !result.error
+  );
+  return {
+    valid,
+    status: !complete ? 'INCOMPLETE' : valid ? 'PASS' : 'FAIL',
+    identifier,
+    team,
+    display,
+    strict,
+    notarisation,
+  };
 }
 
 await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', async (plan) => {
@@ -60,7 +71,8 @@ await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', 
     };
     if (process.platform === 'darwin') {
       check.signature = verifySignature(file, asset.name);
-      if (!check.signature.valid) check.status = 'FAIL';
+      if (check.signature.status !== 'PASS' && check.status !== 'FAIL')
+        check.status = check.signature.status;
     }
     files.push(check);
   }

@@ -73,8 +73,12 @@ export function fixture() {
     plan: plan,
     registry: document('registry', {
       sha256: hash,
+      sha512: 'f'.repeat(128),
+      tagCommit: commit,
       gitHead: commit,
       provenance: {
+        commit,
+        builder: 'https://github.com/actions/runner/github-hosted',
         workflow: { ref: 'refs/heads/main', path: '.github/workflows/release.yml' },
         subject: { digest: { sha512: 'f'.repeat(128) } },
       },
@@ -133,7 +137,16 @@ export function fixture() {
         .filter((file) => file.includes('-darwin-'))
         .map((file) => ({
           file,
-          signature: { display: { exit: 0 }, strict: { exit: 0 }, notarisation: { exit: 0 } },
+          signature: {
+            valid: true,
+            identifier: file.startsWith('playwright-cli')
+              ? 'ai.sliccy.playwright-cli'
+              : 'ai.sliccy.curlwright',
+            team: 'S8LB56P782',
+            display: { exit: 0, stderr: 'Developer ID identity verified' },
+            strict: { exit: 0 },
+            notarisation: { exit: 0 },
+          },
         })),
     }),
   };

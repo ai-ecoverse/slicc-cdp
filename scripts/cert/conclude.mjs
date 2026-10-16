@@ -32,7 +32,8 @@ const read = (which) => {
     }
     if (item.status === 'INCOMPLETE')
       incomplete.push(`${which}: ${item.reason ?? 'required evidence incomplete'}`);
-    if (item.status === 'FAIL') failures.push(`${which}: ${item.reason ?? 'check failed'}`);
+    if (item.status === 'FAIL')
+      failures.push(`${which}: ${item.failures?.join('; ') || item.reason || 'check failed'}`);
     return item;
   } catch {
     incomplete.push(`${which}: missing results`);
@@ -53,6 +54,21 @@ if (
   registry?.crates?.length !== 4
 )
   incomplete.push('registry: missing provenance, signature or crate results');
+if (
+  !/^[a-f0-9]{128}$/.test(registry?.sha512 ?? '') ||
+  !registry?.tagCommit ||
+  !registry?.provenance?.commit ||
+  !registry?.provenance?.builder ||
+  !registry?.provenance?.subject?.digest?.sha512
+)
+  incomplete.push('registry: missing fresh tag or signed subject results');
+if (registry?.tagCommit && registry.tagCommit !== plan.commit)
+  failures.push('registry: fresh tag mismatch');
+if (
+  registry?.signatures &&
+  (registry.signatures.exit === null || registry.signatures.signal || registry.signatures.error)
+)
+  incomplete.push('registry: signature command did not complete');
 if (!/^[a-f0-9]{64}$/.test(registry?.sha256 ?? '') || registry?.gitHead !== plan.commit)
   incomplete.push('registry: missing authoritative hash/gitHead');
 for (const [which, item] of [
@@ -118,8 +134,12 @@ for (const leg of ['positive', 'negative']) {
         !(vector?.skip?.target === row.target || vector?.observable?.[row.target] === false)
       )
         incomplete.push(`guard: ${leg} skipped required row ${row.id}`);
-      if (leg === 'negative' && row.control === 'fail')
-        incomplete.push(`guard: negative control failed ${row.id}`);
+      if (
+        leg === 'negative' &&
+        row.control === 'fail' &&
+        !guard.expected.includes(`${row.id}/${row.target}/${row.variant}`)
+      )
+        incomplete.push(`guard: undeclared negative control failure ${row.id}`);
     }
     if (leg === 'negative') {
       const observed = report.results
@@ -212,6 +232,21 @@ if (
     )
 )
   incomplete.push('assets-macos: missing all four signature/notarisation results');
+for (const file of macos?.files ?? []) {
+  const signature = file.signature;
+  const steps = [signature?.display, signature?.strict, signature?.notarisation];
+  if (
+    typeof signature?.valid !== 'boolean' ||
+    !signature?.identifier ||
+    !signature?.team ||
+    typeof signature?.display?.stderr !== 'string'
+  )
+    incomplete.push(`assets-macos: missing signature identity result for ${file.file}`);
+  if (steps.some((step) => !step || !Number.isInteger(step.exit) || step.signal || step.error))
+    incomplete.push(`assets-macos: unfinished signature step for ${file.file}`);
+  else if (steps.some((step) => step.exit !== 0) || signature?.valid === false)
+    failures.push(`assets-macos: signature verification failed for ${file.file}`);
+}
 for (const [which, result] of Object.entries(plan.upstream ?? {}))
   if (result !== 'success') incomplete.push(`${which}: upstream ${result}`);
 if (!plan.upstream || Object.keys(plan.upstream).length !== 4)
