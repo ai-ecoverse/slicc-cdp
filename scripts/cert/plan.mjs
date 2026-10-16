@@ -1,6 +1,6 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { args, gh, identity, json, repo, root, run, save, semver } from './common.mjs';
+import { args, capture, gh, identity, json, repo, root, run, save, semver } from './common.mjs';
 
 const options = args({ version: { type: 'string' } });
 if (!semver.test(options.version ?? '')) throw new Error('--version must be x.y.z');
@@ -106,7 +106,14 @@ const declared = JSON.parse(
   )
 );
 const fixes = declared.fixes;
+const mode = process.env.CERT_MODE === 'replay' ? 'replay' : 'release';
+const checksumsFrom = 'dab966a0b357b83f21479080152407414c83e05a';
+const legacyChecksum =
+  mode === 'replay' &&
+  capture('git', ['merge-base', '--is-ancestor', checksumsFrom, commit], { cwd: root }).exit === 1;
 const plan = {
+  mode,
+  legacyChecksum,
   version: options.version,
   commit,
   baseline,

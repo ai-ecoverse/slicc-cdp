@@ -4,7 +4,12 @@ import { parseArgs } from 'node:util';
 import { digest, json, save } from './common.mjs';
 
 const { values } = parseArgs({
-  options: { directory: { type: 'string' }, out: { type: 'string' } },
+  options: {
+    directory: { type: 'string' },
+    out: { type: 'string' },
+    mode: { type: 'string', default: 'release' },
+    legacy: { type: 'boolean', default: false },
+  },
 });
 const expected = json(path.join(import.meta.dirname, 'inventory.json'));
 const sums = path.join(values.directory, 'SHA256SUMS');
@@ -24,7 +29,15 @@ const files = expected.map((file) => {
     file,
     sha256: actual,
     expected: expectedHash,
-    status: !actual || !expectedHash ? 'INCOMPLETE' : actual !== expectedHash ? 'FAIL' : 'PASS',
+    status: !actual
+      ? 'INCOMPLETE'
+      : !expectedHash
+        ? values.mode === 'replay' && values.legacy
+          ? 'LEGACY'
+          : 'INCOMPLETE'
+        : actual !== expectedHash
+          ? 'FAIL'
+          : 'PASS',
   };
 });
 const status = files.some((file) => file.status === 'FAIL')
@@ -32,7 +45,13 @@ const status = files.some((file) => file.status === 'FAIL')
   : files.some((file) => file.status === 'INCOMPLETE')
     ? 'INCOMPLETE'
     : 'PASS';
-const result = { status, files };
+const result = {
+  status,
+  files,
+  legacy: files.some((file) => file.status === 'LEGACY')
+    ? 'legacy: checksum set unavailable'
+    : null,
+};
 if (values.out) save(values.out, result);
 console.log(JSON.stringify(result));
 process.exitCode = status === 'PASS' ? 0 : 1;
