@@ -19,8 +19,7 @@ export function freePort() {
 
 export async function launchBrowser(extraArgs = []) {
   let port = await freePort();
-  if (port === 9222) port = await freePort();
-  if (port === 9222) throw new Error('refusing to bind the kernel CDP port');
+  while (port >= 9222 && port <= 9229) port = await freePort();
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let chromeLog = '';
   const child = spawn(
@@ -64,7 +63,7 @@ export async function launchBrowser(extraArgs = []) {
   try {
     const version = await waitVersion(port, () => chromeStatus(child, chromeLog));
     const wsUrl = version.webSocketDebuggerUrl;
-    if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || wsUrl.includes(':9222/')) {
+    if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || /:922[2-9]\//.test(wsUrl)) {
       throw new Error(`unexpected debugger url ${wsUrl}`);
     }
     return {
