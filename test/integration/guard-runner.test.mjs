@@ -78,6 +78,7 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
     stdio: 'inherit',
   });
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
+  const diagnostics = [];
   const executeTarget = async (target) => {
     const fixture = await fixtureServer();
     const targets = origins(fixture);
@@ -118,14 +119,62 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
             await client.close();
             throw error;
           }
+          let diagnostic;
+          if (vector.id === 'C5.guessed-id.continue-response') {
+            diagnostic = {
+              id: vector.id,
+              target,
+              variant,
+              slot,
+              events: client.events,
+              calls: [],
+              snapshots: [],
+              references: [],
+            };
+            diagnostics.push(diagnostic);
+            const send = client.send;
+            client.send = async (method, params = {}, sessionId) => {
+              const call = {
+                at: Date.now(),
+                eventCount: client.events.length,
+                method,
+                params: structuredClone(params),
+                sessionId,
+              };
+              diagnostic.calls.push(call);
+              try {
+                const result = await send(method, params, sessionId);
+                call.finished = Date.now();
+                call.result = structuredClone(result);
+                return result;
+              } catch (error) {
+                call.finished = Date.now();
+                call.error = error.cdp ?? { message: error.message };
+                throw error;
+              }
+            };
+          }
           return {
             client,
             unguarded,
             close: async () => {
+              if (diagnostic)
+                diagnostic.afterCleanup = diagnostic.references.map((details) =>
+                  structuredClone(details)
+                );
               await client.close();
               await unguarded.close();
             },
           };
+        },
+        debug: (details) => {
+          if (!details.events?.length) return;
+          const diagnostic = diagnostics.find((record) =>
+            record.events.includes(details.events[0])
+          );
+          if (!diagnostic) return;
+          diagnostic.snapshots.push({ at: Date.now(), ...structuredClone(details) });
+          diagnostic.references.push(details);
         },
         log: (row) => {
           if ([row.control, row.guarded, row.live].includes('fail'))
@@ -173,7 +222,13 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
   await writeFile(
     `${file}.json`,
     JSON.stringify(
-      { ...report, ms, parallel, parity: { passing, skipped, total: parity.length } },
+      {
+        ...report,
+        ms,
+        parallel,
+        parity: { passing, skipped, total: parity.length },
+        diagnostics: diagnostics.map(({ references, ...record }) => record),
+      },
       null,
       2
     )
