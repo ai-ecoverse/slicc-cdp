@@ -3,6 +3,7 @@ pub mod connect;
 pub mod fetch;
 pub mod hash;
 pub mod net;
+pub mod ports;
 pub mod protected;
 #[cfg(test)]
 mod race;

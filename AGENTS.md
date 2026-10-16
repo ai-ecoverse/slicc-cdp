@@ -4,6 +4,6 @@
 
 CLIs: `crates/playwright-cli`, `crates/curlwright`. Shared CDP: `crates/cdp-client`. Attach with `flatten: true` and a top-level `sessionId`. No `/devtools/page/<id>` socket. `--version` prints `package.json`.
 
-Connect: `--cdp`, else `SLICC_CDP_URL`, else a seven-profiles port, else a loopback session in the user config dir. Ignore a cwd session file. Saved state never dials remotely. Probe reuse needs a seven tab and hides the rest. Ports 9222-9229 stay read-only. Wasm uses 9222. `ws`/`wss` dial; `http` discovers. Non-2xx exits non-zero. WASI has no TLS.
+Connect: `--cdp`, else `SLICC_CDP_URL`, else a seven-profiles port, else a loopback session in the user config dir. Ignore a cwd session file. Saved state never dials remotely. Probes and launch use 9222-9229; tests use `SLICC_CDP_PORTS`. Wasm uses 9222. `ws`/`wss` dial; `http` discovers. Non-2xx exits non-zero. WASI has no TLS.
 
 Kernel wasm: `bin/playwright-cli.wasm`, `bin/curlwright.wasm` (`slicc.abi` `wasi`). `npm run build:wasm` writes both. Do not commit them.

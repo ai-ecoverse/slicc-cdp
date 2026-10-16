@@ -11,7 +11,7 @@ pub fn global_help() -> String {
         "Usage: playwright-cli --cdp=<url> <command> [args] [options]".to_string(),
         "Usage: playwright-cli -s=<session> <command> [args] [options]".to_string(),
         String::new(),
-        "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. A probe-derived session is reused only while that browser still has a seven tab, and follow-ups show only tabs this tool created. Host list, and open when that port is absent or unreachable, GET /json/version and /json/list on 127.0.0.1:9222-9229. Launch never binds those ports. The wasm build still uses port 9222.".to_string(),
+        "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when that port is absent or unreachable, attaches to the first of those ports whose /json/version answers, with or without a seven tab. A probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy. The wasm build still uses port 9222.".to_string(),
         "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
         "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.".to_string(),
@@ -482,7 +482,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "",
                 "Endpoint sources are `devtools-active-port`, `flag`, `process`, and `probe`.",
                 "",
-                "list does not launch a browser and does not open a websocket. An explicit --cdp or SLICC_CDP_URL whose HTTP discovery returns a non-2xx status prints that status and body on stderr and exits non-zero. Debug ports and launchables are still printed. On the host, list probes 127.0.0.1:9222-9229 with GET /json/version and GET /json/list, and drops every tab that is not a seven origin. Launch never binds 9222-9229. The wasm build still uses port 9222. A missing endpoint does not by itself exit non-zero.",
+                "list does not launch a browser and does not open a websocket. An explicit --cdp or SLICC_CDP_URL whose HTTP discovery returns a non-2xx status prints that status and body on stderr and exits non-zero. Debug ports and launchables are still printed. On the host, list probes 127.0.0.1:9222-9229 with GET /json/version and GET /json/list. In --json, an endpoint's tabs lists every page except those on protected origins, and sevenTabs the seven ones. The wasm build still uses port 9222. A missing endpoint does not by itself exit non-zero.",
             ],
             &[],
             &[(

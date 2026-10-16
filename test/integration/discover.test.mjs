@@ -1899,7 +1899,7 @@ test('discover poppy', { timeout: 120_000 }, async (t) => {
         return;
       }
       if (req.url === '/.well-known/poppy.json') {
-        res.writeHead(302, { location: 'http://127.0.0.1:9222/.well-known/poppy.json' });
+        res.writeHead(302, { location: 'http://vault.sliccy.ai/.well-known/poppy.json' });
         res.end();
         return;
       }
