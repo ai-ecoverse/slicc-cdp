@@ -162,7 +162,7 @@ mod tests {
         ));
         assert!(stdout.contains("Usage: playwright-cli --cdp=<url> <command> [args] [options]\n"));
         assert!(stdout.contains(
-            "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. A probe-derived session is reused only while that browser still has a seven tab, and follow-ups show only tabs this tool created. Host list, and open when that port is absent or unreachable, GET /json/version and /json/list on 127.0.0.1:9222-9229. Launch never binds those ports. The wasm build still uses port 9222.\n"
+            "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when that port is absent or unreachable, attaches to the first of those ports whose /json/version answers, with or without a seven tab. A probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy. The wasm build still uses port 9222.\n"
         ));
         assert!(stdout.contains(
             "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.\n"

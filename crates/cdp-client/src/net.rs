@@ -112,14 +112,9 @@ fn probe_request(method: &str, url: &str, headers: &str, body: &str) -> Result<P
     if parts.scheme != "http" && parts.scheme != "https" {
         return Err(format!("probe URL must be http or https: {url}\n"));
     }
-    #[cfg(test)]
-    if reserved_loopback(&parts) {
-        panic!("test dialed {}:{}", parts.host, parts.port);
-    }
+    refuse_real_debug_port(&parts);
     let addr = resolve(&parts.host, parts.port)?;
-    if is_reserved_cdp_socket(addr, parts.port) {
-        return Err(format!("probe refused for reserved CDP address: {url}\n"));
-    }
+    refuse_real_debug_addr(addr);
     let deadline = Instant::now() + Duration::from_secs(5);
     let connect_timeout = Duration::from_secs(3).min(
         deadline.saturating_duration_since(Instant::now()),
@@ -618,11 +613,9 @@ fn connect_error(parts: &Parts, err: &str) -> String {
 }
 
 fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
-    #[cfg(test)]
-    if reserved_loopback(parts) {
-        panic!("test dialed {}:{}", parts.host, parts.port);
-    }
+    refuse_real_debug_port(parts);
     let addr = resolve(&parts.host, parts.port)?;
+    refuse_real_debug_addr(addr);
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|err| {
         connect_error(parts, &err.to_string())
     })?;
@@ -636,29 +629,15 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
     }
 }
 
-#[cfg(test)]
-fn reserved_loopback(parts: &Parts) -> bool {
-    (9222..=9229).contains(&parts.port)
-        && matches!(
-            parts.host.to_ascii_lowercase().as_str(),
-            "127.0.0.1" | "localhost" | "::1"
-        )
+fn refuse_real_debug_port(parts: &Parts) {
+    if (cfg!(test) || crate::ports::testing()) && crate::ports::real_debug_port(&parts.host, parts.port) {
+        panic!("test dialed {}:{}", parts.host, parts.port);
+    }
 }
 
-pub fn is_reserved_cdp_socket(addr: SocketAddr, port: u16) -> bool {
-    if !(9222..=9229).contains(&port) {
-        return false;
-    }
-    match addr {
-        SocketAddr::V4(v4) => v4.ip().is_loopback() || v4.ip().is_unspecified(),
-        SocketAddr::V6(v6) => {
-            v6.ip().is_loopback()
-                || v6.ip().is_unspecified()
-                || match v6.ip().to_ipv4_mapped() {
-                    Some(v4) => v4.is_loopback() || v4.is_unspecified(),
-                    None => false,
-                }
-        }
+fn refuse_real_debug_addr(addr: SocketAddr) {
+    if (cfg!(test) || crate::ports::testing()) && crate::ports::real_debug_port(&addr.ip().to_string(), addr.port()) {
+        panic!("test dialed {addr}");
     }
 }
 
@@ -953,6 +932,14 @@ mod tests {
             let _ = ws_connect("ws://localhost:9229/devtools/browser/abc");
         });
         assert!(err.is_err());
+        for url in [
+            "http://127.1:9223/json/version",
+            "http://2130706433:9224/json/version",
+            "http://[::ffff:127.0.0.1]:9225/json/version",
+            "http://0.0.0.0:9226/json/version",
+        ] {
+            assert!(std::panic::catch_unwind(|| http_get(url)).is_err(), "{url}");
+        }
     }
 
     #[test]
@@ -1139,62 +1126,6 @@ mod tests {
             let _ = http_probe("http://127.0.0.1:9222/.well-known/ard.json", "application/json");
         });
         assert!(err.is_err(), "probe must not dial 9222");
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_loopback_v4() {
-        let addr: SocketAddr = "127.0.0.1:9222".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9222));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_unspec_v4() {
-        let addr: SocketAddr = "0.0.0.0:9222".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9222));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_loopback_v6() {
-        let addr: SocketAddr = "[::1]:9222".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9222));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_unspec_v6() {
-        let addr: SocketAddr = "[::]:9223".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9223));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_mapped_loopback() {
-        let addr: SocketAddr = "[::ffff:127.0.0.1]:9224".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9224));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_mapped_unspec() {
-        let addr: SocketAddr = "[::ffff:0.0.0.0]:9225".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9225));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_non_reserved() {
-        let addr: SocketAddr = "93.184.216.34:9222".parse().unwrap();
-        assert!(!is_reserved_cdp_socket(addr, 9222));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_wrong_port() {
-        let addr: SocketAddr = "127.0.0.1:9230".parse().unwrap();
-        assert!(!is_reserved_cdp_socket(addr, 9230));
-    }
-
-    #[test]
-    fn is_reserved_cdp_socket_127_range() {
-        let addr: SocketAddr = "127.0.0.2:9222".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9222));
-        let addr: SocketAddr = "127.255.255.254:9229".parse().unwrap();
-        assert!(is_reserved_cdp_socket(addr, 9229));
     }
 
     #[cfg(not(target_os = "wasi"))]

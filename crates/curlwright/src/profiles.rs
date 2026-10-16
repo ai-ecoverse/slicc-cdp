@@ -28,8 +28,21 @@ pub(crate) fn attached_port() -> Result<Option<String>, String> {
     }
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        select_port(&current_env(), &DiskFs, &mut |url| http_body(url))
+        let ports = cdp_client::ports::catalog();
+        attached_or_probed(&current_env(), &DiskFs, &ports, &mut |url| http_body(url))
     }
+}
+
+fn attached_or_probed<F: ScanFs>(
+    env: &HostEnv,
+    fs: &F,
+    ports: &[u16],
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    if let Some(url) = select_port(env, fs, probe)? {
+        return Ok(Some(url));
+    }
+    Ok(cdp_client::ports::first_live(ports, probe))
 }
 
 fn select_port<F: ScanFs>(
@@ -59,9 +72,6 @@ fn live_text(
     let Some((port, path)) = parse_active_port(text) else {
         return Ok(None);
     };
-    if (9222..=9229).contains(&port) {
-        return Ok(None);
-    }
     let url = version_url(port);
     match probe(&url) {
         Ok(body) if version_accepts(&body, &path) => Ok(Some(url)),
@@ -471,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_9333_file_wins_and_reserved_ports_are_not_probed() {
+    fn the_newest_live_file_wins_and_catalog_ports_in_files_are_probed() {
         let host = env("macos");
         let root = config_seven_root(&host);
         assert_eq!(
@@ -549,16 +559,23 @@ mod tests {
         let mut seen = Vec::new();
         let found = select_port(&host, &fs, &mut |url| {
             seen.push(url.to_string());
-            assert_high_port(url);
-            assert_eq!(url, "http://127.0.0.1:9333/json/version");
-            Ok(version_body(9333, "/devtools/browser/old"))
+            match url {
+                "http://127.0.0.1:9222/json/version" => Err("connection refused\n".to_string()),
+                "http://127.0.0.1:9223/json/version" => Ok(version_body(9223, "/devtools/browser/other")),
+                "http://127.0.0.1:9228/json/version" => Ok(version_body(9228, "/devtools/browser/nope")),
+                _ => panic!("{url}"),
+            }
         })
         .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9333/json/version"));
-        assert_eq!(seen, vec!["http://127.0.0.1:9333/json/version".to_string()]);
-        assert!(seen.iter().all(|url| !url.contains("9222")));
-        assert!(seen.iter().all(|url| !url.contains("9223")));
-        assert!(seen.iter().all(|url| !url.contains("9228")));
+        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9228/json/version"));
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9222/json/version".to_string(),
+                "http://127.0.0.1:9223/json/version".to_string(),
+                "http://127.0.0.1:9228/json/version".to_string(),
+            ]
+        );
         assert_no_six(&fs.reads.borrow());
         assert_no_six(&fs.lists.borrow());
         assert!(fs.reads.borrow().iter().all(|path| {
@@ -567,6 +584,54 @@ mod tests {
                 && !path.contains("chrome..old")
                 && !path.contains("has space")
         }));
+    }
+
+    #[test]
+    fn without_a_live_file_the_catalog_ports_are_probed_in_order() {
+        let host = env("linux");
+        let root = config_seven_root(&host);
+        let mut fs = ClockFs::new();
+        fs.dir(&root, &["chrome"]);
+        fs.file(
+            &port_file(&format!("{root}/chrome"), false),
+            5,
+            "9400\n/devtools/browser/gone\n",
+        );
+        let mut seen = Vec::new();
+        let found = attached_or_probed(&host, &fs, &[9222, 9223, 9224], &mut |url| {
+            seen.push(url.to_string());
+            match url {
+                "http://127.0.0.1:9223/json/version" => Ok(version_body(9223, "/devtools/browser/p")),
+                "http://127.0.0.1:9224/json/version" => panic!("probed past the first live port"),
+                _ => Err("connection refused\n".to_string()),
+            }
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9223/json/version"));
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9400/json/version".to_string(),
+                "http://127.0.0.1:9222/json/version".to_string(),
+                "http://127.0.0.1:9223/json/version".to_string(),
+            ]
+        );
+        let mut live = ClockFs::new();
+        live.dir(&root, &["chrome"]);
+        live.file(&port_file(&format!("{root}/chrome"), false), 5, "9400\n/devtools/browser/x\n");
+        let kept = attached_or_probed(&host, &live, &[9222], &mut |url| {
+            assert_eq!(url, "http://127.0.0.1:9400/json/version");
+            Ok(version_body(9400, "/devtools/browser/x"))
+        })
+        .unwrap();
+        assert_eq!(kept.as_deref(), Some("http://127.0.0.1:9400/json/version"));
+        let none = attached_or_probed(&host, &ClockFs::new(), &[9222], &mut |_| {
+            Err("connection refused\n".to_string())
+        })
+        .unwrap();
+        assert_eq!(none, None);
+        let failed = attached_or_probed(&host, &live, &[9222], &mut |_| Err("HTTP 500\n".to_string()));
+        assert_eq!(failed.unwrap_err(), "HTTP 500\n");
     }
 
     #[test]

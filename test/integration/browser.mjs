@@ -20,8 +20,8 @@ export function freePort() {
   });
 }
 
-export async function launchBrowser(extraArgs = []) {
-  let port = await freePort();
+export async function launchBrowser(extraArgs = [], options = {}) {
+  let port = options.port ?? (await freePort());
   while (port >= 9222 && port <= 9229) port = await freePort();
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let chromeLog = '';
