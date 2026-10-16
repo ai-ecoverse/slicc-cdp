@@ -190,9 +190,32 @@ for (const leg of ['positive', 'negative']) {
   if (leg === 'positive' && execution.status === 'FAIL')
     failures.push('integration: positive suite failed');
 }
-if (plan.fixes.length && !integration?.executions?.negative?.attempts?.length)
+if (
+  plan.fixes.some(
+    (fix) => !fix.tests.length || fix.tests.some((test) => test.source !== 'guard')
+  ) &&
+  !integration?.executions?.negative?.attempts?.length
+)
   incomplete.push('integration: NEGATIVE did not run');
 for (const fix of plan.fixes) {
+  if (fix.tests.length && fix.tests.every((test) => test.source === 'guard')) {
+    const results = fix.tests.map((test) => {
+      const find = (leg) =>
+        guard?.executions?.[leg]?.rows?.filter(
+          (row) => row.name === test.title && row.file?.endsWith(test.file)
+        ) ?? [];
+      return { current: find('positive'), previous: find('negative') };
+    });
+    const positive = results.every((test) =>
+      test.current.some((row) => row.type === 'test:pass' && !row.skip && !row.todo)
+    );
+    const negative = results.some((test) =>
+      test.previous.some((row) => row.type === 'test:fail' && row.failureType === 'testCodeFailure')
+    );
+    if (!positive || !negative)
+      incomplete.push(`guard: ${fix.commit} lacks its retained owner-test NEGATIVE`);
+    continue;
+  }
   const result = integration?.fixes?.find((item) => item.commit === fix.commit);
   if (
     result?.status !== 'PASS' ||

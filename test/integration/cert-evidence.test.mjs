@@ -53,6 +53,26 @@ test('a declared baseline control regression is a NEGATIVE, not a current guard 
   assert.equal(result.record.certified, true);
 });
 
+test('retained guard owner tests prove a historical fix without requesting a deleted integration file', () => {
+  const documents = fixture();
+  const file = 'test/integration/guard-native.test.mjs';
+  const title = 'X1.after-exit seven prompt';
+  documents.plan.fixes[0].tests = [{ file, title, source: 'guard' }];
+  documents.integration.fixes = [];
+  documents.integration.executions.negative.attempts = [];
+  documents.guard.executions.positive.rows.push({ file, name: title, type: 'test:pass' });
+  documents.guard.executions.negative.rows.push({
+    file,
+    name: title,
+    type: 'test:fail',
+    failureType: 'testCodeFailure',
+  });
+  const result = conclude(documents);
+  assert.equal(result.status, 0, result.record.line);
+  documents.guard.executions.negative.rows = [];
+  assert.equal(conclude(documents).record.status, 'INCOMPLETE');
+});
+
 test('missing or mismatched required evidence is INCOMPLETE, never a candidate', async (t) => {
   const cases = {
     'missing guard document': (docs) => {

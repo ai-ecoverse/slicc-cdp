@@ -25,8 +25,15 @@ await evidence('integration', async (plan) => {
     'integration-negative',
     positiveTree.source
   );
+  const integrationFixes = plan.fixes.filter(
+    (fix) => !fix.tests.length || fix.tests.some((test) => test.source !== 'guard')
+  );
   const negativeFiles = [
-    ...new Set(plan.fixes.flatMap((fix) => fix.tests.map((test) => test.file))),
+    ...new Set(
+      integrationFixes.flatMap((fix) =>
+        fix.tests.filter((test) => test.source !== 'guard').map((test) => test.file)
+      )
+    ),
   ];
   const negative = negativeFiles.length
     ? await suite({
@@ -42,7 +49,7 @@ await evidence('integration', async (plan) => {
         attempts: [],
         reason: 'no parsed fix integration files',
       };
-  const fixes = plan.fixes.map((fix) => {
+  const fixes = integrationFixes.map((fix) => {
     if (!fix.tests.length)
       return {
         ...fix,
