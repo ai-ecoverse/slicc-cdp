@@ -75,7 +75,7 @@ jobs:
   rebuild:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
-    runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+    runs-on: ${{ vars.CERT_RUNNER }}
     timeout-minutes: 30
     env:
       LEFTHOOK: '0'
@@ -109,7 +109,7 @@ jobs:
   guard:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
-    runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+    runs-on: ${{ vars.CERT_RUNNER }}
     timeout-minutes: 60
     env:
       LEFTHOOK: '0'
@@ -158,7 +158,7 @@ jobs:
   integration:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
-    runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+    runs-on: ${{ vars.CERT_RUNNER }}
     timeout-minutes: 60
     env:
       LEFTHOOK: '0'
