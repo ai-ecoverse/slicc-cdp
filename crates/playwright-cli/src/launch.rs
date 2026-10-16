@@ -2845,7 +2845,7 @@ mod tests {
             &mut |_| Ok(()),
         )
         .unwrap();
-        assert_eq!(seen.len(), slicc_browsers::catalog().discovery.probe_ports.len());
+        assert_eq!(seen.len(), cdp_client::ports::catalog().len());
         assert!(seen.iter().all(|url| url.ends_with("/json/version")));
         assert_eq!(resolved.discover, chrome_dir(&host));
         assert!(!resolved.from_probe);
@@ -2855,6 +2855,8 @@ mod tests {
     #[test]
     fn a_probe_port_without_a_seven_tab_is_reused() {
         let host = env("linux");
+        let p = cdp_client::ports::catalog();
+        let at = |index: usize| format!("http://127.0.0.1:{}/json/version", p[index]);
         let mut fs = MemFs::new();
         let mut seen = Vec::new();
         let resolved = run(
@@ -2865,12 +2867,12 @@ mod tests {
             &mut |url| {
                 seen.push(url.to_string());
                 assert!(catalog_probe_url(url), "{url}");
-                if url == "http://127.0.0.1:9222/json/version" {
+                if url == at(0) {
                     Err("connection refused\n".to_string())
-                } else if url == "http://127.0.0.1:9223/json/version" {
+                } else if url == at(1) {
                     Ok("{}".to_string())
-                } else if url == "http://127.0.0.1:9224/json/version" {
-                    Ok(version_body(9224, "/devtools/browser/personal"))
+                } else if url == at(2) {
+                    Ok(version_body(p[2], "/devtools/browser/personal"))
                 } else {
                     Err("connection refused\n".to_string())
                 }
@@ -2880,13 +2882,13 @@ mod tests {
         .unwrap();
         assert!(resolved.started.is_none());
         assert!(resolved.from_probe);
-        assert_eq!(resolved.discover, "http://127.0.0.1:9224/json/version");
+        assert_eq!(resolved.discover, at(2));
         assert_eq!(
             seen,
             vec![
-                "http://127.0.0.1:9222/json/version".to_string(),
-                "http://127.0.0.1:9223/json/version".to_string(),
-                "http://127.0.0.1:9224/json/version".to_string(),
+                at(0),
+                at(1),
+                at(2),
             ]
         );
         assert!(fs.0.borrow().writes.is_empty());
@@ -2895,6 +2897,8 @@ mod tests {
     #[test]
     fn a_missing_launch_target_reuses_a_probed_browser() {
         let host = env("linux");
+        let p = cdp_client::ports::catalog();
+        let at = |index: usize| format!("http://127.0.0.1:{}/json/version", p[index]);
         let mut fs = MemFs::new();
         let mut seen = Vec::new();
         let resolved = drive(
@@ -2908,8 +2912,8 @@ mod tests {
             &mut |url| {
                 seen.push(url.to_string());
                 assert!(catalog_probe_url(url), "{url}");
-                if url == "http://127.0.0.1:9222/json/version" {
-                    Ok(version_body(9222, "/devtools/browser/personal"))
+                if url == at(0) {
+                    Ok(version_body(p[0], "/devtools/browser/personal"))
                 } else {
                     Err("connection refused\n".to_string())
                 }
@@ -2920,8 +2924,8 @@ mod tests {
         .unwrap();
         assert!(resolved.started.is_none());
         assert!(resolved.from_probe);
-        assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
-        assert_eq!(seen, vec!["http://127.0.0.1:9222/json/version".to_string()]);
+        assert_eq!(resolved.discover, at(0));
+        assert_eq!(seen, vec![at(0)]);
         assert!(fs.0.borrow().writes.is_empty());
     }
 
@@ -2950,7 +2954,7 @@ mod tests {
         assert_eq!(err, "playwright-cli open: chrome was not found\n");
         assert_eq!(
             seen.len(),
-            slicc_browsers::catalog().discovery.probe_ports.len()
+            cdp_client::ports::catalog().len()
         );
         assert!(seen.iter().all(|url| url.ends_with("/json/version")));
         assert!(fs.0.borrow().writes.is_empty());
@@ -3251,10 +3255,7 @@ mod tests {
         let Ok(port) = port.parse::<u16>() else {
             return false;
         };
-        slicc_browsers::catalog()
-            .discovery
-            .probe_ports
-            .contains(&port)
+        cdp_client::ports::catalog().contains(&port)
             && (path == "json/version" || path == "json/list")
     }
 

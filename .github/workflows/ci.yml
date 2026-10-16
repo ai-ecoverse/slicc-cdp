@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -59,7 +62,7 @@ jobs:
 
   ci:
     needs: runner
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.22.1
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.23.0
     with:
       chromium: false
       runs-on: ${{ needs.runner.outputs.runner }}
