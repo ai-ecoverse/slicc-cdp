@@ -47,6 +47,13 @@ test('a declared baseline control regression is a NEGATIVE, not a current guard 
   row.control = 'fail';
   const key = `${row.id}/${row.target}/${row.variant}`;
   documents.guard.expected = documents.guard.failures = [key];
+  documents.plan.proofs.tests.push({
+    id: `vector:${key}`,
+    source: 'guard-vector',
+    vector: row.id,
+    target: row.target,
+    variant: row.variant,
+  });
   documents.guard.executions.negative.status = 'FAIL';
   const result = conclude(documents);
   assert.equal(result.status, 0, result.record.line);
@@ -57,7 +64,7 @@ test('retained guard owner tests prove a historical fix without requesting a del
   const documents = fixture();
   const file = 'test/integration/guard-native.test.mjs';
   const title = 'X1.after-exit seven prompt';
-  documents.plan.fixes[0].tests = [{ file, title, source: 'guard' }];
+  documents.plan.proofs.tests = [{ id: 'after-exit', file, title, source: 'guard' }];
   documents.integration.fixes = [];
   documents.integration.executions.negative.attempts = [];
   documents.guard.executions.positive.rows.push({ file, name: title, type: 'test:pass' });
@@ -71,6 +78,32 @@ test('retained guard owner tests prove a historical fix without requesting a del
   assert.equal(result.status, 0, result.record.line);
   documents.guard.executions.negative.rows = [];
   assert.equal(conclude(documents).record.status, 'INCOMPLETE');
+});
+
+test('unnamed fixes are known test gaps and unexpected NEGATIVE failures are flags, not missing proof', () => {
+  const documents = fixture();
+  documents.plan.proofs.known = ['known test gap: unproven fix #173'];
+  documents.integration.executions.negative.rows.push({
+    type: 'test:fail',
+    name: 'unrelated',
+    file: 'test/integration/behaviour.test.mjs',
+    failureType: 'testCodeFailure',
+  });
+  const result = conclude(documents);
+  assert.equal(result.status, 0, result.record.line);
+  assert.ok(result.record.line.includes('unproven fix #173'));
+  assert.ok(result.record.line.includes('unexpected NEGATIVE:'));
+  documents.plan.proofs.tests = [];
+  documents.integration.executions.negative = { rows: [], files: [], attempts: [] };
+  assert.equal(conclude(documents).record.status, 'PASS');
+});
+
+test('named proof passing on the baseline is INCOMPLETE, not a known-gap waiver', () => {
+  const documents = fixture();
+  documents.integration.executions.negative.rows[0].type = 'test:pass';
+  const result = conclude(documents);
+  assert.equal(result.record.status, 'INCOMPLETE');
+  assert.ok(result.record.line.includes('proof does not discriminate: fixed-behaviour'));
 });
 
 test('missing or mismatched required evidence is INCOMPLETE, never a candidate', async (t) => {
@@ -100,10 +133,6 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
       const row = docs.guard.executions.positive.report.results.find((row) => row.id === 'C1.href');
       row.control = row.guarded = row.live = 'skip';
     },
-    'undeclared failure in raw NEGATIVE rows': (docs) => {
-      const row = docs.guard.executions.negative.report.results.find((row) => row.id === 'C1.href');
-      row.guarded = 'fail';
-    },
     'missing fresh tag verification': (docs) => {
       delete docs.registry.tagCommit;
     },
@@ -128,10 +157,10 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
       );
     },
     'NEGATIVE lost its Rust test driver rather than exposing the fix': (docs) => {
-      docs.integration.fixes[0].results[0].previous[0].error = 'running 0 tests';
+      docs.integration.executions.negative.rows[0].error = 'running 0 tests';
     },
     'no positive/NEGATIVE finding for a fix': (docs) => {
-      docs.integration.fixes = [];
+      docs.integration.executions.proofs.rows = [];
     },
   };
   for (const [name, change] of Object.entries(cases))

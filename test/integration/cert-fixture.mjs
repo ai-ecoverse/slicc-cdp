@@ -22,7 +22,14 @@ export function fixture() {
     vectors: set.setVersion,
     run: '123',
     attempt: '1',
-    fixes: [{ commit: fix, tests: [{ file: testFile, title: 'fixed behaviour' }] }],
+    fixes: [{ commit: fix, pr: 1, proofIds: ['fixed-behaviour'] }],
+    proofs: {
+      tests: [
+        { id: 'fixed-behaviour', file: testFile, title: 'fixed behaviour', source: 'integration' },
+      ],
+      expected: ['fixed-behaviour'],
+      known: [],
+    },
     upstream: { rebuild: 'success', guard: 'success', integration: 'success', assets: 'success' },
   };
   const identity = { ...plan };
@@ -118,7 +125,11 @@ export function fixture() {
     }),
     integration: document('integration', {
       sha256: hash,
-      executions: { positive: execution('test:pass'), negative: execution('test:fail') },
+      executions: {
+        positive: execution('test:pass'),
+        proofs: execution('test:pass'),
+        negative: execution('test:fail'),
+      },
       fixes: [
         {
           commit: fix,

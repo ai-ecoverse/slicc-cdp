@@ -90,41 +90,22 @@ if (!rust) {
   }
 }
 const issues = rust ? [] : ['release has no recorded exact Rust toolchain'];
-const commits = run(
-  'git',
-  ['rev-list', '--no-merges', '--reverse', `${baseline.commit}..${commit}`],
-  {
-    cwd: root,
-  }
-)
-  .split('\n')
-  .filter(Boolean);
-const fixes = [];
-const expectations = json(path.join(root, 'scripts/cert/expectations.json'));
-for (const sha of commits) {
-  const subject = run('git', ['show', '-s', '--format=%s', sha], { cwd: root });
-  if (!/^fix(?:\([^)]*\))?!?:/.test(subject) || /^fix\(sliccy-browser\):/.test(subject)) continue;
-  const patch = run(
-    'git',
-    ['show', '--format=', '--unified=0', sha, '--', 'test/integration/*.test.mjs'],
-    {
-      cwd: root,
-    }
-  );
-  const tests = [];
-  let file;
-  for (const line of patch.split('\n')) {
-    if (line.startsWith('+++ b/')) file = line.slice(6);
-    const match = line.match(/^\+.*\b(?:test|t\.test)\(\s*(['"`])(.+?)\1/);
-    if (match && !match[2].includes('${')) tests.push({ file, title: match[2] });
-  }
-  fixes.push({
-    commit: sha,
-    subject,
-    tests: expectations[sha]?.tests ?? tests,
-    guardRows: expectations[sha]?.guardRows ?? [],
-  });
-}
+const declared = JSON.parse(
+  run(
+    process.execPath,
+    [
+      path.join(root, 'scripts/cert/proofs.mjs'),
+      '--base',
+      baseline.commit,
+      '--head',
+      commit,
+      '--out',
+      path.join(path.dirname(options.out), 'derived-proofs.json'),
+    ],
+    { cwd: root }
+  )
+);
+const fixes = declared.fixes;
 const plan = {
   version: options.version,
   commit,
@@ -139,6 +120,7 @@ const plan = {
   run: process.env.GITHUB_RUN_ID ?? 'local',
   attempt: process.env.GITHUB_RUN_ATTEMPT ?? '1',
   fixes,
+  proofs: declared,
 };
 if (!semver.test(plan.vectors ?? '')) throw new Error('shared guard runner must be exactly pinned');
 save(options.out, plan);

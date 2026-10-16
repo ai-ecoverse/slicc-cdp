@@ -99,6 +99,7 @@ jobs:
       contents: write
       statuses: write
       actions: read
+      pull-requests: read
     uses: ./.github/workflows/cert-review.yml
     with:
       version: ${{ needs.release.outputs.version }}
