@@ -116,6 +116,16 @@ test('named proof verifier distinguishes an exact NEGATIVE, an unexpected failur
       assert.equal(child.status, 0, child.stderr);
       return JSON.parse(readFileSync(out, 'utf8'));
     };
+    const interrupted = check({ ...suite([row('test:fail')]), status: 'INCOMPLETE' });
+    assert.equal(interrupted.status, 'INCOMPLETE');
+    assert.ok(interrupted.incomplete.includes('named proof NEGATIVE worker did not complete'));
+    const skipped = check(
+      suite([
+        row('test:fail'),
+        { type: 'test:pass', name: 'sibling', file: descriptor.file, skip: true },
+      ])
+    );
+    assert.equal(skipped.status, 'INCOMPLETE');
     const exact = check(suite([row('test:fail')]));
     assert.equal(exact.status, 'PASS');
     assert.deepEqual(exact.expected, exact.observed);

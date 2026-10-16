@@ -68,6 +68,18 @@ const results = tests.map((test) => {
 });
 if (expected.length && (!positive.attempts?.length || !negative.attempts?.length))
   incomplete.push('named proof NEGATIVE did not run');
+if (
+  expected.length &&
+  (negative.status === 'INCOMPLETE' ||
+    negative.missing?.length ||
+    previousRows.some(
+      (row) =>
+        row.skip ||
+        row.todo ||
+        ['cancelledByParent', 'testTimeoutFailure'].includes(row.failureType)
+    ))
+)
+  incomplete.push('named proof NEGATIVE worker did not complete');
 const observed = [
   ...new Set(
     previousRows
