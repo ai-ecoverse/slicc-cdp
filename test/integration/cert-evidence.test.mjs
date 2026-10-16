@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +10,7 @@ import { fixture } from './cert-fixture.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 
-function conclude(documents) {
+function conclude(documents, extra = []) {
   const dir = mkdtempSync(path.join(tmpdir(), 'slicc-cert-evidence-'));
   try {
     for (const [name, data] of Object.entries(documents))
@@ -18,7 +18,7 @@ function conclude(documents) {
     const out = path.join(dir, 'record.json');
     const result = spawnSync(
       process.execPath,
-      [path.join(root, 'scripts/cert/conclude.mjs'), '--evidence', dir, '--out', out],
+      [path.join(root, 'scripts/cert/conclude.mjs'), '--evidence', dir, '--out', out, ...extra],
       { encoding: 'utf8' }
     );
     assert.ok([0, 1].includes(result.status), result.stderr);
@@ -106,29 +106,64 @@ test('named proof passing on the baseline is INCOMPLETE, not a known-gap waiver'
   assert.ok(result.record.line.includes('proof does not discriminate: fixed-behaviour'));
 });
 
-test('record lists eligible legacy replay checksums, while new release evidence stays strict', () => {
-  const documents = fixture();
-  documents.plan.mode = 'replay';
-  documents.plan.legacyChecksum = true;
-  for (const [key, value] of Object.entries(documents))
-    if (key !== 'plan') {
-      value.mode = 'replay';
-      value.legacyChecksum = true;
-    }
-  const installer = documents['assets-linux'].checksums.files.find(
-    (file) => file.file === 'install.sh'
-  );
-  installer.status = 'LEGACY';
-  delete installer.expected;
-  documents['assets-linux'].checksums.legacy = 'legacy: checksum set unavailable';
-  const result = conclude(documents);
-  assert.equal(result.record.status, 'PASS', result.record.line);
-  assert.ok(result.record.line.includes('legacy: checksum set unavailable'));
-  documents.plan.mode = 'release';
-  assert.equal(conclude(documents).record.status, 'INCOMPLETE');
-  documents.plan.mode = 'replay';
-  documents.plan.legacyChecksum = false;
-  assert.equal(conclude(documents).record.status, 'INCOMPLETE');
+test('record recomputes real ancestry instead of trusting legacyChecksum on a replay plan', () => {
+  const history = mkdtempSync(path.join(tmpdir(), 'slicc-checksum-history-'));
+  try {
+    const git = (...args) => execFileSync('git', args, { cwd: history, encoding: 'utf8' }).trim();
+    git('init', '--quiet');
+    git('config', 'user.name', 'Fixture');
+    git('config', 'user.email', 'fixture@example.invalid');
+    const commit = (name) => {
+      git('commit', '--quiet', '--allow-empty', '-m', name);
+      return git('rev-parse', 'HEAD');
+    };
+    const before = commit('before checksums');
+    const cutoff = commit('complete checksums');
+    const after = commit('after checksums');
+    const documents = fixture();
+    const select = (sha) => {
+      documents.plan.commit = sha;
+      documents.plan.mode = 'replay';
+      documents.plan.legacyChecksum = true;
+      for (const [key, value] of Object.entries(documents))
+        if (key !== 'plan') {
+          value.commit = sha;
+          value.mode = 'replay';
+          value.legacyChecksum = true;
+        }
+      documents.registry.gitHead =
+        documents.registry.tagCommit =
+        documents.registry.provenance.commit =
+          sha;
+      documents.guard.executions.positive.commit = documents.guard.executions.positive.report.sha =
+        sha;
+    };
+    const installer = documents['assets-linux'].checksums.files.find(
+      (file) => file.file === 'install.sh'
+    );
+    installer.status = 'LEGACY';
+    delete installer.expected;
+    documents['assets-linux'].checksums.legacy = 'legacy: checksum set unavailable';
+    const args = ['--history', history, '--cutoff', cutoff];
+    select(before);
+    const eligible = conclude(documents, args);
+    assert.equal(eligible.record.status, 'PASS', eligible.record.line);
+    assert.ok(eligible.record.line.includes('legacy: checksum set unavailable'));
+    select(after);
+    const ineligible = conclude(documents, args);
+    assert.equal(ineligible.record.status, 'INCOMPLETE');
+    assert.ok(
+      ineligible.record.incomplete.includes(
+        'assets-linux: missing complete release checksum evidence'
+      )
+    );
+    assert.equal(
+      conclude(documents, ['--history', history, '--cutoff', 'f'.repeat(40)]).record.status,
+      'INCOMPLETE'
+    );
+  } finally {
+    rmSync(history, { recursive: true, force: true });
+  }
 });
 
 test('missing or mismatched required evidence is INCOMPLETE, never a candidate', async (t) => {

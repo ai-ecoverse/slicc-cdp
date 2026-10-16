@@ -2,10 +2,15 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
-import { identity, json, name, run, save, semver } from './common.mjs';
+import { identity, json, name, root, run, save, semver } from './common.mjs';
 
 const { values } = parseArgs({
-  options: { evidence: { type: 'string' }, out: { type: 'string' } },
+  options: {
+    evidence: { type: 'string' },
+    out: { type: 'string' },
+    history: { type: 'string', default: root },
+    cutoff: { type: 'string', default: 'dab966a0b357b83f21479080152407414c83e05a' },
+  },
 });
 const plan = json(path.join(values.evidence, 'plan.json'));
 if (!semver.test(plan.version) || !/^[a-f0-9]{40}$/.test(plan.commit))
@@ -17,6 +22,20 @@ const vectorSet = JSON.parse(
   )
 );
 if (vectorSet.setVersion !== plan.vectors) throw new Error('record runner pin differs from plan');
+const checksumPolicy = JSON.parse(
+  run(process.execPath, [
+    path.join(import.meta.dirname, 'checksum-policy.mjs'),
+    '--directory',
+    values.history,
+    '--commit',
+    plan.commit,
+    '--cutoff',
+    values.cutoff,
+    '--mode',
+    plan.mode ?? 'release',
+  ])
+);
+const eligibleLegacy = plan.legacyChecksum === true && checksumPolicy.legacy;
 const incomplete = [...(plan.issues ?? [])];
 const failures = [];
 const flags = [];
@@ -236,16 +255,12 @@ if (
       (row) =>
         row.file === file &&
         (row.status === 'PASS' ||
-          (row.status === 'LEGACY' &&
-            plan.mode === 'replay' &&
-            plan.legacyChecksum === true &&
-            /^[a-f0-9]{64}$/.test(row.sha256)))
+          (row.status === 'LEGACY' && eligibleLegacy && /^[a-f0-9]{64}$/.test(row.sha256)))
     )
   )
 )
   incomplete.push('assets-linux: missing complete release checksum evidence');
-if (plan.mode === 'replay' && plan.legacyChecksum === true && linux?.checksums?.legacy)
-  known.push('legacy: checksum set unavailable');
+if (eligibleLegacy && linux?.checksums?.legacy) known.push('legacy: checksum set unavailable');
 if (
   !inventory
     .filter((file) => file.includes('-darwin-'))
