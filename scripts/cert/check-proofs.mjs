@@ -85,6 +85,11 @@ for (const [leg, execution] of [
   )
     incomplete.push(`named proof ${leg} worker did not complete`);
 }
+if (
+  expected.length &&
+  (positive.status === 'FAIL' || (positive.rows ?? []).some((row) => row.type === 'test:fail'))
+)
+  failures.push('named proof candidate worker failed');
 const observed = [
   ...new Set(
     previousRows
