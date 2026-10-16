@@ -9,6 +9,9 @@ on:
       dry_run:
         type: boolean
         default: false
+      caller_results:
+        type: string
+        default: '{}'
     outputs:
       certified:
         value: ${{ jobs.record.outputs.certified }}
@@ -260,6 +263,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CERT_UPSTREAM: ${{ toJSON(needs) }}
+          CERT_CALLER: ${{ inputs.caller_results || '{}' }}
         run: |
           CERT_UPSTREAM=$(node -e 'const n=JSON.parse(process.env.CERT_UPSTREAM); console.log(JSON.stringify(Object.fromEntries(["rebuild","guard","integration","assets"].map(k=>[k,n[k].result]))))')
           export CERT_UPSTREAM

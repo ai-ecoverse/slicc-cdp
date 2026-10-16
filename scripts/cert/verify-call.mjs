@@ -8,6 +8,8 @@ if (process.env.UPSTREAM !== 'skipped')
   throw new Error('proof requires a skipped release ancestor');
 if (record.run !== process.env.GITHUB_RUN_ID)
   throw new Error('record came from another workflow run');
+if (record.certified !== false || record.caller?.['upload-assets'] !== 'skipped')
+  throw new Error('skipped caller prerequisite was not held in the record');
 const jobs = values.jobs
   ? json(values.jobs).jobs
   : gh(`repos/${repo}/actions/runs/${record.run}/jobs?per_page=100`).jobs;

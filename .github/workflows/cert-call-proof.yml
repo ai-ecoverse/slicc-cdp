@@ -57,6 +57,7 @@ jobs:
     uses: ./.github/workflows/cert-review.yml
     with:
       version: ${{ needs.release.outputs.version }}
+      caller_results: ${{ toJSON(needs) }}
       dry_run: true
 
   verify-call:

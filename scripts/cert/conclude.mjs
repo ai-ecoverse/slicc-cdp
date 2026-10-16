@@ -277,6 +277,8 @@ for (const [which, result] of Object.entries(plan.upstream ?? {}))
   if (result !== 'success') incomplete.push(`${which}: upstream ${result}`);
 if (!plan.upstream || Object.keys(plan.upstream).length !== 4)
   incomplete.push('missing required upstream job outcomes');
+for (const [job, result] of Object.entries(plan.caller ?? {}))
+  if (result !== 'success') incomplete.push(`caller ${job}: ${result}`);
 const status = failures.length ? 'FAIL' : incomplete.length ? 'INCOMPLETE' : 'PASS';
 const certified = status === 'PASS';
 const sha256 = registry?.sha256 ?? null;
@@ -292,6 +294,7 @@ const record = {
   line,
   failures,
   incomplete,
+  caller: plan.caller ?? {},
   evidence: values.evidence,
   runUrl: `https://github.com/ai-ecoverse/slicc-cdp/actions/runs/${plan.run}`,
 };

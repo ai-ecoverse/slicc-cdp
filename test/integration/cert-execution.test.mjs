@@ -94,7 +94,16 @@ test('workflow-call proof CLI requires execution despite a skipped caller ancest
   try {
     const record = path.join(dir, 'record.json');
     const jobs = path.join(dir, 'jobs.json');
-    writeFileSync(record, JSON.stringify({ run: '123', version: '1.26.2', status: 'INCOMPLETE' }));
+    writeFileSync(
+      record,
+      JSON.stringify({
+        run: '123',
+        version: '1.26.2',
+        status: 'INCOMPLETE',
+        certified: false,
+        caller: { 'upload-assets': 'skipped' },
+      })
+    );
     const required = [
       'plan',
       'rebuild',
