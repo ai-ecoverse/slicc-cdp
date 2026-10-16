@@ -59,7 +59,13 @@ function json(frame) {
   }
 }
 
-export async function cdpProxy(wsUrl, { delayGuardAttachMs = 0, failCloseTarget = false } = {}) {
+export async function cdpProxy(
+  wsUrl,
+  { delayGuardAttachMs = 0, failCloseTarget = false, browserEvents = true, delays = {} } = {}
+) {
+  const pending = Object.fromEntries(
+    Object.entries(delays).map(([method, { ms, times = 1 }]) => [method, { ms, times }])
+  );
   const upstream = new URL(wsUrl);
   const sockets = new Set();
   let delayed = false;
@@ -68,6 +74,7 @@ export async function cdpProxy(wsUrl, { delayGuardAttachMs = 0, failCloseTarget 
     const browser = net.connect(Number(upstream.port), upstream.hostname);
     sockets.add(browser);
     const held = new Set();
+    const slowed = new Map();
     let heldTarget = null;
     const upgraded = { up: false, down: false };
     let fromClient = Buffer.alloc(0);
@@ -96,6 +103,11 @@ export async function cdpProxy(wsUrl, { delayGuardAttachMs = 0, failCloseTarget 
           held.add(message.id);
           heldTarget = message.params?.targetId;
         }
+        const slow = message?.method ? pending[message.method] : undefined;
+        if (slow && slow.times > 0) {
+          slow.times -= 1;
+          slowed.set(message.id, slow.ms);
+        }
         if (failCloseTarget && message?.method === 'Target.closeTarget') {
           toClient(
             textFrame(
@@ -121,6 +133,13 @@ export async function cdpProxy(wsUrl, { delayGuardAttachMs = 0, failCloseTarget 
       fromBrowser = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
+        if (!browserEvents && message?.method && !message.sessionId) continue;
+        if (message?.id !== undefined && slowed.has(message.id)) {
+          const ms = slowed.get(message.id);
+          slowed.delete(message.id);
+          setTimeout(() => toClient(frame.raw), ms);
+          continue;
+        }
         const late =
           (message?.id !== undefined && held.has(message.id)) ||
           (message?.method === 'Target.attachedToTarget' &&

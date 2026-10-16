@@ -25,6 +25,8 @@ pub type Decider = Box<dyn FnMut(&Paused) -> Decision>;
 
 pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it could be seven's\n";
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
+pub const GUARD_SETUP: Duration = Duration::from_secs(30);
+const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
@@ -44,6 +46,7 @@ pub struct Cdp {
     guard_sessions: BTreeSet<String>,
     guarding: BTreeSet<String>,
     abandoned: BTreeSet<String>,
+    unguarded_optional: BTreeMap<String, BTreeSet<String>>,
     discovering: bool,
     requests: BTreeMap<String, bool>,
     handed: BTreeSet<(String, String)>,
@@ -79,6 +82,7 @@ impl Cdp {
             guard_sessions: BTreeSet::new(),
             guarding: BTreeSet::new(),
             abandoned: BTreeSet::new(),
+            unguarded_optional: BTreeMap::new(),
             discovering: false,
             requests: BTreeMap::new(),
             handed: BTreeSet::new(),
@@ -103,6 +107,13 @@ impl Cdp {
 
     pub fn protect_origins(&mut self, extra_origins: &[&str]) {
         self.guard = Protected::new(extra_origins);
+    }
+
+    pub fn unguarded_optional(&self, target_id: &str) -> Vec<String> {
+        self.unguarded_optional
+            .get(target_id)
+            .map(|steps| steps.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn session_blocked(&self, session_id: &str) -> bool {
@@ -588,11 +599,12 @@ impl Cdp {
             self.discovering = true;
         }
         self.guarding.insert(target_id.to_string());
+        let budget = Instant::now() + GUARD_SETUP;
         let attached = self.raw_call(
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
             None,
-            Duration::from_secs(10),
+            GUARD_SETUP,
         );
         self.guarding.remove(target_id);
         let session = match attached
@@ -622,8 +634,22 @@ impl Cdp {
         ];
         for (method, params) in setup {
             let optional = matches!(method, "Page.enable" | "Runtime.enable");
-            let failed = match self.raw_call(method, params, Some(&session), Duration::from_secs(10)) {
+            let left = budget.saturating_duration_since(Instant::now());
+            let span = if optional { left.min(OPTIONAL_STEP) } else { left };
+            let answer = if span.is_zero() {
+                Err(format!("{method} timed out\n"))
+            } else {
+                self.raw_call(method, params, Some(&session), span)
+            };
+            let failed = match answer {
                 Ok(_) => None,
+                Err(message) if optional && message == format!("{method} timed out\n") => {
+                    self.unguarded_optional
+                        .entry(target_id.to_string())
+                        .or_default()
+                        .insert(method.to_string());
+                    None
+                }
                 Err(message) if optional && message.starts_with(&format!("{method}:")) => None,
                 Err(message) => Some(message),
             };
@@ -1269,6 +1295,8 @@ pub fn transport_error(message: &str) -> bool {
 fn unguarded(message: String) -> String {
     if transport_error(&message) {
         message
+    } else if let Some(step) = message.strip_suffix(" timed out\n") {
+        format!("{}: {step} timed out\n", UNGUARDED.trim_end())
     } else {
         UNGUARDED.to_string()
     }
