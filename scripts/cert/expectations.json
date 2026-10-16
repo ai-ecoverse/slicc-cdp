@@ -1,0 +1,56 @@
+{
+  "1f8ec0534a5e3061df5e91bc78886233a2290b50": {
+    "tests": [
+      {
+        "file": "test/integration/guard-native.test.mjs",
+        "title": "X1.after-exit seven prompt",
+        "source": "guard"
+      },
+      {
+        "file": "test/integration/guard-native.test.mjs",
+        "title": "X1.after-exit vault prompt",
+        "source": "guard"
+      }
+    ]
+  },
+  "0640461ff6c151addc333b2b023331116416e544": {
+    "tests": [
+      {
+        "file": "test/integration/launch.test.mjs",
+        "title": "a fixed port is waited on over /json/version, and a busy one is refused"
+      },
+      {
+        "file": "test/integration/launch.test.mjs",
+        "title": "a stale DevToolsActivePort in a given profile is not trusted, and the profile is kept"
+      },
+      {
+        "file": "test/integration/launch.test.mjs",
+        "title": "args cannot move the debugging port, address, pipe or profile"
+      }
+    ]
+  },
+  "82f1b1e98b9a50c12288f8a2b9d523a3886ad9e2": {
+    "tests": [
+      {
+        "file": "test/integration/launch.test.mjs",
+        "title": "launchBrowser runs it on a throwaway profile on port 0 and removes the profile"
+      }
+    ]
+  },
+  "dbb94b81ce4a7393c0c523539d44948465dfa559": {
+    "tests": [
+      {
+        "file": "test/integration/session.test.mjs",
+        "title": "sessions follow the invoking cwd: two cwds in parallel each keep their own tab"
+      }
+    ]
+  },
+  "b0330ea3f74f5c9597f154613151727dfb837cf3": {
+    "tests": [
+      {
+        "file": "test/integration/guard-attach-race.test.mjs",
+        "title": "the guard attach race through a delaying CDP proxy"
+      }
+    ]
+  }
+}

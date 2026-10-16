@@ -7,3 +7,4 @@ target/
 bin/*.wasm
 .playwright-cli/
 .build/
+.cert/

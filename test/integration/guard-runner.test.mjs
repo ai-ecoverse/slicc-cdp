@@ -201,7 +201,9 @@ test('published guard set through the Rust guarded client', { timeout: 600000 },
     set,
     results,
     guard: 'slicc-cdp',
-    sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+    sha:
+      process.env.SLICC_GUARD_SHA ??
+      execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
   report.results = codedSkips(report.results);
   report.skipped = report.results
