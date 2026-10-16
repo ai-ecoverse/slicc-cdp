@@ -47,6 +47,9 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
       'a 12 s Network.enable fits in the shared budget': {
         delays: { 'Network.enable': { ms: 12000 } },
       },
+      'a 12 s Target.setDiscoverTargets fits in the shared budget': {
+        delays: { 'Target.setDiscoverTargets': { ms: 12000 } },
+      },
       'browser-level events never arrive and the tab still works': { browserEvents: false },
     };
     for (const [name, options] of Object.entries(flows)) {

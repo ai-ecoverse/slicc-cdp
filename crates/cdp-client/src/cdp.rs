@@ -588,24 +588,29 @@ impl Cdp {
         {
             return Ok(());
         }
+        let budget = Instant::now() + GUARD_SETUP;
         if !self.discovering {
             self.raw_call(
                 "Target.setDiscoverTargets",
                 json!({ "discover": true }),
                 None,
-                Duration::from_secs(10),
+                GUARD_SETUP,
             )
             .map_err(unguarded)?;
             self.discovering = true;
         }
         self.guarding.insert(target_id.to_string());
-        let budget = Instant::now() + GUARD_SETUP;
-        let attached = self.raw_call(
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-            None,
-            GUARD_SETUP,
-        );
+        let left = budget.saturating_duration_since(Instant::now());
+        let attached = if left.is_zero() {
+            Err("Target.attachToTarget timed out\n".to_string())
+        } else {
+            self.raw_call(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+                None,
+                left,
+            )
+        };
         self.guarding.remove(target_id);
         let session = match attached
             .map(|value| value.get("sessionId").and_then(|v| v.as_str()).map(str::to_string))
