@@ -1526,6 +1526,10 @@ mod tests {
         let hits = crate::net::http_probe(&format!("{app}/hits?path={path}"), "text/plain")
             .map(|response| String::from_utf8_lossy(&response.body).into_owned())
             .unwrap_or_else(|error| format!("unknown ({})", error.trim()));
+        while cdp
+            .pump(std::time::Instant::now() + Duration::from_millis(200))
+            .unwrap_or(false)
+        {}
         let trail: Vec<String> = cdp
             .paused_trail
             .iter()
