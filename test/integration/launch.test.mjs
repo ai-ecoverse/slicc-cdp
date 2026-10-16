@@ -99,3 +99,65 @@ test('args cannot move the debugging port, address, pipe or profile', async () =
   }
   await assert.rejects(launchBrowser({ executable, port: 9222 }), /refusing to bind port 9222/);
 });
+
+test('args are refused in every spelling Chrome parses, and a benign switch still launches', async () => {
+  const found = await run(process.execPath, [cli, 'find-browser', '--version', pinned], {
+    env: clean,
+  });
+  const executable = found.stdout.trim();
+  const alt = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-alt-'));
+  const port = String(await freePort());
+  const names = [
+    'user-data-dir',
+    'remote-debugging-port',
+    'remote-debugging-address',
+    'remote-debugging-pipe',
+    'profile-directory',
+  ];
+  const value = (name) =>
+    name === 'remote-debugging-port' ? port : name === 'remote-debugging-address' ? '0.0.0.0' : alt;
+  const mixed = (name) => name.replace(/(^|-)([a-z])/g, (_, dash, c) => dash + c.toUpperCase());
+  const cases = [];
+  for (const name of names) {
+    const v = value(name);
+    cases.push(
+      { args: [`--${name}=${v}`] },
+      { args: [`--${name}`, v] },
+      { args: [`-${name}=${v}`] },
+      { args: [`-${name}`, v] },
+      { args: [`--${mixed(name)}=${v}`] },
+      { args: [`-${name.toUpperCase()}=${v}`] },
+      { args: [`/${name}=${v}`], platform: 'win32' },
+      { args: [`/${mixed(name)}`, v], platform: 'win32' }
+    );
+  }
+  try {
+    for (const { args, platform } of cases) {
+      await assert.rejects(
+        launchBrowser({ executable, args, platform, sandbox, timeout: 5000 }),
+        (error) => {
+          assert.equal(
+            error.message,
+            `args may not set ${args[0]}: use the port and userDataDir options`,
+            `${platform ?? process.platform} ${args.join(' ')}`
+          );
+          return true;
+        }
+      );
+    }
+    assert.equal(existsSync(path.join(alt, 'DevToolsActivePort')), false);
+    const browser = await launchBrowser({
+      executable,
+      args: ['-lang=en-US', '--window-size=800,600', '--user-data-dirs=1'],
+      sandbox,
+    });
+    try {
+      assert.notEqual(browser.userDataDir, alt);
+      assert.equal((await version(browser.port)).webSocketDebuggerUrl, browser.wsUrl);
+    } finally {
+      await browser.close();
+    }
+  } finally {
+    await rm(alt, { recursive: true, force: true });
+  }
+});

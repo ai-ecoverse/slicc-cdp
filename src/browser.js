@@ -342,10 +342,20 @@ export const OWNED_SWITCHES = [
   '--remote-debugging-address',
   '--remote-debugging-pipe',
   '--user-data-dir',
+  '--profile-directory',
 ];
 
-function owned(arg) {
-  return OWNED_SWITCHES.some((name) => arg === name || arg.startsWith(`${name}=`));
+function switchName(arg, platform = process.platform) {
+  const text = String(arg);
+  const prefix =
+    /^--?/.exec(text)?.[0] ?? (platform === 'win32' && text.startsWith('/') ? '/' : '');
+  if (!prefix) return null;
+  return text.slice(prefix.length).split('=')[0].toLowerCase();
+}
+
+function owned(arg, platform) {
+  const name = switchName(arg, platform);
+  return name !== null && OWNED_SWITCHES.some((owned) => owned.slice(2) === name);
 }
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -391,6 +401,7 @@ export async function launchBrowser({
   env = process.env,
   timeout = 30000,
   fetch: fetchImpl = fetch,
+  platform = process.platform,
 } = {}) {
   const path = executable ?? (await findBrowser({ env }))?.executable;
   if (!path) {
@@ -401,7 +412,7 @@ export async function launchBrowser({
   if (reserved(port)) {
     throw new Error(`refusing to bind port ${port} (9222-9229 belong to the kernel and the probe)`);
   }
-  const taken = args.find(owned);
+  const taken = args.find((arg) => owned(arg, platform));
   if (taken) {
     throw new Error(`args may not set ${taken}: use the port and userDataDir options`);
   }
