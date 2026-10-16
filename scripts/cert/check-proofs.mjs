@@ -72,7 +72,7 @@ if (
   expected.length &&
   (negative.status === 'INCOMPLETE' ||
     negative.missing?.length ||
-    previousRows.some(
+    (negative.rows ?? []).some(
       (row) =>
         row.skip ||
         row.todo ||

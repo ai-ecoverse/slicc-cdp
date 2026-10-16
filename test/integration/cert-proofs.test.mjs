@@ -73,6 +73,71 @@ test('proof planner derives ids from genuine fix commit bodies and PR mappings, 
   }
 });
 
+test('non-executable shared-set descriptors do not make a completed named vector NEGATIVE incomplete', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'slicc-vector-proof-'));
+  try {
+    const id = 'vector:C1.href/seven/prompt';
+    const plan = write(dir, 'plan.json', {
+      proofs: {
+        tests: [
+          { id, source: 'guard-vector', vector: 'C1.href', target: 'seven', variant: 'prompt' },
+        ],
+      },
+    });
+    const vector = {
+      id: 'C1.href',
+      target: 'seven',
+      variant: 'prompt',
+      control: 'pass',
+      guarded: 'pass',
+      live: 'pass',
+    };
+    const text = {
+      id: 'E1',
+      target: 'seven',
+      variant: 'prompt',
+      control: 'not-run',
+      guarded: 'not-run',
+      live: 'not-run',
+    };
+    const positive = write(dir, 'positive.json', {
+      attempts: [{}],
+      rows: [],
+      report: { results: [vector, text] },
+    });
+    const negative = write(dir, 'negative.json', {
+      status: 'FAIL',
+      attempts: [{}],
+      rows: [],
+      report: { results: [{ ...vector, guarded: 'fail' }, text] },
+    });
+    const out = path.join(dir, 'result.json');
+    const child = spawnSync(
+      process.execPath,
+      [
+        path.join(root, 'scripts/cert/check-proofs.mjs'),
+        '--source',
+        'guard',
+        '--plan',
+        plan,
+        '--positive',
+        positive,
+        '--negative',
+        negative,
+        '--out',
+        out,
+      ],
+      { encoding: 'utf8' }
+    );
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(readFileSync(out, 'utf8'));
+    assert.equal(result.status, 'PASS');
+    assert.deepEqual(result.observed, [id]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('named proof verifier distinguishes an exact NEGATIVE, an unexpected failure, a missing run and a nondiscriminating test', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'slicc-proof-check-'));
   try {
