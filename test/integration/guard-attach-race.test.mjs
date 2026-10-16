@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +11,14 @@ import { killTree } from './watchdog.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const guardTimeoutMs = 10000;
 
-test('the guard attach race through a delaying CDP proxy', async () => {
+test('the guard attach race through a delaying CDP proxy', async (t) => {
+  const harness = path.join(root, '.build/guard-race');
+  mkdirSync(harness, { recursive: true });
+  writeFileSync(
+    path.join(harness, 'Cargo.toml'),
+    '[package]\nname = "cert-guard-race"\nversion = "0.0.0"\nedition = "2021"\n\n[workspace]\n\n[dependencies]\ncdp-client = { package = "slicc-cdp-client", path = "../../crates/cdp-client" }\nserde_json = "1"\n\n[[test]]\nname = "guard-race"\npath = "../../test/integration/guard-race.rs"\n'
+  );
+  copyFileSync(path.join(root, 'Cargo.lock'), path.join(harness, 'Cargo.lock'));
   let browser;
   const proxies = [];
   try {
@@ -22,25 +30,45 @@ test('the guard attach race through a delaying CDP proxy', async () => {
       failCloseTarget: true,
     });
     proxies.push(pass, delay, noClose);
-    const result = await cargo(
+    const env = {
+      SLICC_RACE_PASS_WS: pass.url,
+      SLICC_RACE_DELAY_WS: delay.url,
+      SLICC_RACE_NOCLOSE_WS: noClose.url,
+    };
+    const cases = [
       [
-        'test',
-        '-p',
-        'slicc-cdp-client',
-        '--lib',
-        '--',
-        '--ignored',
-        'race::live_',
-        '--test-threads=1',
+        'guard.attach.caller-session',
+        'live_a_guarded_create_or_attach_surfaces_only_the_callers_session',
       ],
-      {
-        SLICC_RACE_PASS_WS: pass.url,
-        SLICC_RACE_DELAY_WS: delay.url,
-        SLICC_RACE_NOCLOSE_WS: noClose.url,
-      }
-    );
-    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stdout, /3 passed/);
+      [
+        'guard.attach.timeout',
+        'live_b_a_timed_out_guard_attach_leaves_no_session_and_its_target_refused',
+      ],
+      [
+        'guard.attach.failed-close',
+        'live_c_a_timed_out_guard_attach_with_a_failed_close_stays_refused',
+      ],
+    ];
+    for (const [id, name] of cases)
+      await t.test(id, async () => {
+        const result = await cargo(
+          [
+            'test',
+            '--manifest-path',
+            path.join(harness, 'Cargo.toml'),
+            '--test',
+            'guard-race',
+            '--',
+            '--ignored',
+            '--exact',
+            name,
+            '--test-threads=1',
+          ],
+          env
+        );
+        assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+        assert.match(result.stdout, /1 passed/);
+      });
   } finally {
     for (const proxy of proxies) await proxy.close();
     await browser?.close();

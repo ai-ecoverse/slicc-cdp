@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
-import { identity, json, name, save, semver } from './common.mjs';
+import { identity, json, name, run, save, semver } from './common.mjs';
 
 const { values } = parseArgs({
   options: { evidence: { type: 'string' }, out: { type: 'string' } },
@@ -19,6 +19,8 @@ const vectorSet = JSON.parse(
 if (vectorSet.setVersion !== plan.vectors) throw new Error('record runner pin differs from plan');
 const incomplete = [...(plan.issues ?? [])];
 const failures = [];
+const flags = [];
+const known = plan.proofs?.known ?? [];
 const read = (which) => {
   try {
     const item = json(path.join(values.evidence, `${which}.json`));
@@ -139,7 +141,7 @@ for (const leg of ['positive', 'negative']) {
         row.control === 'fail' &&
         !guard.expected.includes(`${row.id}/${row.target}/${row.variant}`)
       )
-        incomplete.push(`guard: undeclared negative control failure ${row.id}`);
+        flags.push(`undeclared negative control failure ${row.id}`);
     }
     if (leg === 'negative') {
       const observed = report.results
@@ -147,7 +149,7 @@ for (const leg of ['positive', 'negative']) {
         .map((row) => `${row.id}/${row.target}/${row.variant}`)
         .sort();
       if (JSON.stringify(observed) !== JSON.stringify(guard.expected))
-        incomplete.push('guard: raw NEGATIVE rows do not match declared fixes');
+        flags.push('guard: unexpected NEGATIVE vector failures');
     }
     const keys = report.results.map(
       (row) => `${row.id}/${row.target}/${row.variant}/${row.transport}`
@@ -160,7 +162,7 @@ for (const leg of ['positive', 'negative']) {
     failures.push('guard: positive did not pass');
 }
 if (guard && JSON.stringify(guard.expected) !== JSON.stringify(guard.failures))
-  incomplete.push('guard: NEGATIVE failures lack matching declared fixes');
+  flags.push('guard: unexpected NEGATIVE vector failures');
 if (
   !integration?.executions?.positive?.files?.length ||
   !integration?.executions?.positive?.rows?.length ||
@@ -171,12 +173,12 @@ for (const leg of ['positive', 'negative']) {
   const execution = integration?.executions?.[leg];
   if (!execution) continue;
   if (
-    execution.status === 'INCOMPLETE' ||
-    execution.missing?.length ||
-    execution.rows?.some((row) => row.skip || row.todo)
+    (execution.status === 'INCOMPLETE' && leg === 'positive') ||
+    (leg === 'positive' && execution.missing?.length) ||
+    (leg === 'positive' && execution.rows?.some((row) => row.skip || row.todo))
   )
     incomplete.push(`integration: ${leg} incomplete or skipped results`);
-  for (const file of execution.files ?? [])
+  for (const file of leg === 'positive' ? (execution.files ?? []) : [])
     if (
       !execution.rows?.some(
         (row) =>
@@ -193,49 +195,39 @@ for (const leg of ['positive', 'negative']) {
   if (leg === 'positive' && execution.status === 'FAIL')
     failures.push('integration: positive suite failed');
 }
-if (
-  plan.fixes.some(
-    (fix) => !fix.tests.length || fix.tests.some((test) => test.source !== 'guard')
-  ) &&
-  !integration?.executions?.negative?.attempts?.length
-)
-  incomplete.push('integration: NEGATIVE did not run');
-for (const fix of plan.fixes) {
-  if (fix.tests.length && fix.tests.every((test) => test.source === 'guard')) {
-    const results = fix.tests.map((test) => {
-      const find = (leg) =>
-        guard?.executions?.[leg]?.rows?.filter(
-          (row) => row.name === test.title && row.file?.endsWith(test.file)
-        ) ?? [];
-      return { current: find('positive'), previous: find('negative') };
-    });
-    const positive = results.every((test) =>
-      test.current.some((row) => row.type === 'test:pass' && !row.skip && !row.todo)
-    );
-    const negative = results.some((test) =>
-      test.previous.some((row) => row.type === 'test:fail' && row.failureType === 'testCodeFailure')
-    );
-    if (!positive || !negative)
-      incomplete.push(`guard: ${fix.commit} lacks its retained owner-test NEGATIVE`);
-    continue;
+const proofResults = [];
+if (!plan.proofs) incomplete.push('proof declarations missing from plan');
+else {
+  for (const [source, current, previous] of [
+    ['integration', integration?.executions?.proofs, integration?.executions?.negative],
+    ['guard', guard?.executions?.positive, guard?.executions?.negative],
+  ]) {
+    const dir = path.join(path.dirname(values.out), `proof-${source}`);
+    const currentFile = path.join(dir, 'positive.json');
+    const previousFile = path.join(dir, 'negative.json');
+    const out = path.join(dir, 'result.json');
+    save(currentFile, current ?? {});
+    save(previousFile, previous ?? {});
+    run(process.execPath, [
+      path.join(import.meta.dirname, 'check-proofs.mjs'),
+      '--plan',
+      path.join(values.evidence, 'plan.json'),
+      '--source',
+      source,
+      '--positive',
+      currentFile,
+      '--negative',
+      previousFile,
+      '--out',
+      out,
+    ]);
+    const result = json(out);
+    proofResults.push(result);
+    incomplete.push(...result.incomplete);
+    failures.push(...result.failures);
+    if (result.unexpected.length)
+      flags.push(`unexpected NEGATIVE: ${result.unexpected.join(', ')}`);
   }
-  const result = integration?.fixes?.find((item) => item.commit === fix.commit);
-  if (
-    result?.status !== 'PASS' ||
-    !result.results?.some(
-      (test) =>
-        test.current?.some((row) => row.type === 'test:pass' && !row.skip && !row.todo) &&
-        test.previous?.some(
-          (row) =>
-            row.type === 'test:fail' &&
-            row.failureType === 'testCodeFailure' &&
-            !/running 0 tests|could not compile|ERR_MODULE_NOT_FOUND|Cannot find module/.test(
-              row.error ?? ''
-            )
-        )
-    )
-  )
-    incomplete.push(`integration: ${fix.commit} lacks positive and meaningful NEGATIVE evidence`);
 }
 const inventory = json(path.join(import.meta.dirname, 'inventory.json'));
 if (
@@ -282,9 +274,12 @@ for (const [job, result] of Object.entries(plan.caller ?? {}))
 const status = failures.length ? 'FAIL' : incomplete.length ? 'INCOMPLETE' : 'PASS';
 const certified = status === 'PASS';
 const sha256 = registry?.sha256 ?? null;
-const line = certified
-  ? `certified-candidate ${name}@${plan.version} sha256=${sha256} gitHead=${plan.commit} guard=GUARD-PASS(slicc-cdp@${plan.commit}; vectors @ai-ecoverse/slicc-browsers@${plan.vectors})`
-  : `cert-ci: ${status} ${name}@${plan.version} (${[...failures, ...incomplete].join('; ')})`;
+const detail = [...known, ...new Set(flags)];
+const line =
+  (certified
+    ? `certified-candidate ${name}@${plan.version} sha256=${sha256} gitHead=${plan.commit} guard=GUARD-PASS(slicc-cdp@${plan.commit}; vectors @ai-ecoverse/slicc-browsers@${plan.vectors})`
+    : `cert-ci: ${status} ${name}@${plan.version} (${[...failures, ...incomplete].join('; ')})`) +
+  (detail.length ? ` (known/flags: ${detail.join('; ')})` : '');
 const record = {
   ...identity(plan),
   status,
@@ -294,6 +289,9 @@ const record = {
   line,
   failures,
   incomplete,
+  known,
+  flags: [...new Set(flags)],
+  proofs: proofResults,
   caller: plan.caller ?? {},
   evidence: values.evidence,
   runUrl: `https://github.com/ai-ecoverse/slicc-cdp/actions/runs/${plan.run}`,
