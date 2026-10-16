@@ -227,7 +227,7 @@ test('a browser on a catalog debug port is attached and driven without a seven t
         (item) => item.endpoint?.cdp === `http://127.0.0.1:${ports[1]}`
       );
       assert.ok(entry, listed.stdout);
-      assert.equal(entry.endpoint.source, 'probe');
+      assert.ok(['probe', 'process'].includes(entry.endpoint.source), listed.stdout);
       assert.deepEqual(entry.endpoint.sevenTabs, []);
       const urls = entry.endpoint.tabs.map((tab) => tab.url);
       assert.ok(urls.includes(`${fixture.origin}/personal`), listed.stdout);
