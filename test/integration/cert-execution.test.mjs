@@ -47,6 +47,36 @@ test('cert suite counts an entry wrapper whose behavioural tests are defined in 
   }
 });
 
+test('a failed imported-helper worker is retried and its stale helper rows are replaced', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'slicc-cert-helper-retry-'));
+  try {
+    writeFileSync(path.join(dir, 'entry.test.mjs'), 'import "./helper.mjs";\n');
+    writeFileSync(
+      path.join(dir, 'helper.mjs'),
+      'import test from "node:test"; import assert from "node:assert/strict"; import {existsSync,writeFileSync} from "node:fs"; test("imported behaviour",()=>{const seen=existsSync("attempt");writeFileSync("attempt","same-version");assert.ok(seen);});\n'
+    );
+    const { process, result } = execute(dir, 'entry.test.mjs');
+    assert.equal(process.status, 0, process.stderr);
+    assert.equal(result.attempts.length, 2);
+    assert.equal(result.attempts[0].exit, 1);
+    assert.equal(result.attempts[1].exit, 0);
+    assert.ok(
+      result.attempts[0].rows.some(
+        (row) => row.type === 'test:fail' && row.file?.endsWith('helper.mjs')
+      )
+    );
+    assert.equal(
+      result.rows.some((row) => row.type === 'test:fail'),
+      false
+    );
+    assert.ok(
+      result.rows.some((row) => row.worker === 'entry.test.mjs' && row.type === 'test:pass')
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('cert suite keeps a module-load failure diagnostic instead of an empty stderr log', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'slicc-cert-diagnostic-'));
   try {
