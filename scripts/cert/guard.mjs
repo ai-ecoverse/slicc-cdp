@@ -1,5 +1,6 @@
 import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { evidence, json, root } from './common.mjs';
 import { stage } from './stage.mjs';
 import { suite } from './suite.mjs';
@@ -23,7 +24,12 @@ await evidence('guard', async (plan) => {
         cwd: staged.source,
         files: ['test/integration/guard-runner.test.mjs', 'test/integration/guard-native.test.mjs'],
         out: path.join(root, '.cert', `guard-${leg}/suite`),
-        env: { ...staged.env, SLICC_GUARD_REPORT: report, SLICC_GUARD_SHA: commit },
+        env: {
+          ...staged.env,
+          SLICC_GUARD_REPORT: report,
+          SLICC_GUARD_SHA: commit,
+          SLICC_FIXTURE_BROWSER_API: pathToFileURL(path.join(root, 'src/browser.js')).href,
+        },
       });
       let rows;
       try {

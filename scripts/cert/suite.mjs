@@ -8,6 +8,18 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
   const behaviour = (row) =>
     ['test:pass', 'test:fail'].includes(row.type) &&
     !(row.file && row.name && path.resolve(cwd, row.name) === path.resolve(row.file));
+  const completed = (rows, file) =>
+    rows.some(
+      (row) =>
+        row.file &&
+        path.resolve(row.file) === path.resolve(cwd, file) &&
+        (behaviour(row) ||
+          (row.type === 'test:summary' &&
+            row.counts?.tests > 0 &&
+            row.counts.cancelled === 0 &&
+            row.counts.skipped === 0 &&
+            row.counts.todo === 0))
+    );
   mkdirSync(path.dirname(out), { recursive: true });
   const attempts = [];
   const execute = async (selected) => {
@@ -65,7 +77,7 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
       (row) => row.file && path.resolve(row.file) === path.resolve(cwd, file)
     );
     return (
-      !rows.some(behaviour) ||
+      !completed(first.rows, file) ||
       rows.some(
         (row) =>
           row.skip ||
@@ -95,12 +107,7 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
           ),
           ...latest.rows,
         ];
-  const missing = files.filter(
-    (file) =>
-      !rows.some(
-        (row) => row.file && path.resolve(row.file) === path.resolve(cwd, file) && behaviour(row)
-      )
-  );
+  const missing = files.filter((file) => !completed(rows, file));
   const incomplete =
     missing.length ||
     rows.some(

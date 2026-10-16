@@ -181,9 +181,12 @@ for (const leg of ['positive', 'negative']) {
       !execution.rows?.some(
         (row) =>
           row.file?.endsWith(file) &&
-          row.name &&
-          row.name !== row.file &&
-          ['test:pass', 'test:fail'].includes(row.type)
+          ((row.name && row.name !== row.file && ['test:pass', 'test:fail'].includes(row.type)) ||
+            (row.type === 'test:summary' &&
+              row.counts?.tests > 0 &&
+              row.counts.cancelled === 0 &&
+              row.counts.skipped === 0 &&
+              row.counts.todo === 0))
       )
     )
       incomplete.push(`integration: ${leg} file without results ${file}`);

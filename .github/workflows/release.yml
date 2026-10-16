@@ -94,7 +94,7 @@ jobs:
 
   cert:
     needs: [release, upload-assets, verify-signatures]
-    if: github.ref == 'refs/heads/main' && needs.release.outputs.released == 'true'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.release.outputs.released == 'true' }}
     permissions:
       contents: write
       statuses: write
