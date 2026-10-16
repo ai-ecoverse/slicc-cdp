@@ -191,6 +191,21 @@ test('named proof verifier distinguishes an exact NEGATIVE, an unexpected failur
       ])
     );
     assert.equal(skipped.status, 'INCOMPLETE');
+    writeFileSync(positive, JSON.stringify({ ...suite([row('test:pass')]), status: 'INCOMPLETE' }));
+    const currentLost = check(suite([row('test:fail')]));
+    assert.equal(currentLost.status, 'INCOMPLETE');
+    assert.ok(currentLost.incomplete.includes('named proof candidate worker did not complete'));
+    writeFileSync(
+      positive,
+      JSON.stringify(
+        suite([
+          row('test:pass'),
+          { type: 'test:pass', name: 'sibling', file: descriptor.file, todo: true },
+        ])
+      )
+    );
+    assert.equal(check(suite([row('test:fail')])).status, 'INCOMPLETE');
+    writeFileSync(positive, JSON.stringify(suite([row('test:pass')])));
     const exact = check(suite([row('test:fail')]));
     assert.equal(exact.status, 'PASS');
     assert.deepEqual(exact.expected, exact.observed);

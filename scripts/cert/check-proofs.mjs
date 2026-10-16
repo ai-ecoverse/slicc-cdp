@@ -68,18 +68,23 @@ const results = tests.map((test) => {
 });
 if (expected.length && (!positive.attempts?.length || !negative.attempts?.length))
   incomplete.push('named proof NEGATIVE did not run');
-if (
-  expected.length &&
-  (negative.status === 'INCOMPLETE' ||
-    negative.missing?.length ||
-    (negative.rows ?? []).some(
-      (row) =>
-        row.skip ||
-        row.todo ||
-        ['cancelledByParent', 'testTimeoutFailure'].includes(row.failureType)
-    ))
-)
-  incomplete.push('named proof NEGATIVE worker did not complete');
+for (const [leg, execution] of [
+  ['candidate', positive],
+  ['NEGATIVE', negative],
+]) {
+  if (
+    expected.length &&
+    (execution.status === 'INCOMPLETE' ||
+      execution.missing?.length ||
+      (execution.rows ?? []).some(
+        (row) =>
+          row.skip ||
+          row.todo ||
+          ['cancelledByParent', 'testTimeoutFailure'].includes(row.failureType)
+      ))
+  )
+    incomplete.push(`named proof ${leg} worker did not complete`);
+}
 const observed = [
   ...new Set(
     previousRows
