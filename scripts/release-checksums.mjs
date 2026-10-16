@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const directory = process.argv[2];
@@ -15,5 +15,11 @@ const lines = files.map((file) => {
     .digest('hex');
   return `${sha256}  ${file.name}\n`;
 });
-writeFileSync(path.join(directory, 'SHA256SUMS'), lines.join(''));
+const temporary = path.join(directory, `.SHA256SUMS-${randomUUID()}`);
+try {
+  writeFileSync(temporary, lines.join(''), { flag: 'wx' });
+  renameSync(temporary, path.join(directory, 'SHA256SUMS'));
+} finally {
+  rmSync(temporary, { force: true });
+}
 console.log(`checksummed ${files.length} release assets`);
