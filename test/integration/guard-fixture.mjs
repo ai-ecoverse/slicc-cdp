@@ -33,6 +33,6 @@ export function browserArgs() {
     '--disable-sync',
     '--password-store=basic',
     '--use-mock-keychain',
-    '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
+    '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,WebUIOmniboxPopup,WebUIOmniboxFullPopup,WebUIOmniboxAimPopup',
   ];
 }
