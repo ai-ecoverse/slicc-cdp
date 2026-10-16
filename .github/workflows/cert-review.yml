@@ -34,12 +34,12 @@ on:
 permissions:
   contents: read
 
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
 concurrency:
   group: cert-review-${{ inputs.version }}
   cancel-in-progress: false
-
-env:
-  SLICC_CDP_PORTS: 9300-9309
 
 jobs:
   plan:

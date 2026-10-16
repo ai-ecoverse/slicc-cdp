@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
 jobs:
   release:
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
