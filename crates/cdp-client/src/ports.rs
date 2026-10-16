@@ -1,18 +1,24 @@
 pub const OVERRIDE: &str = "SLICC_CDP_PORTS";
 
 pub fn catalog() -> Vec<u16> {
-    overridden().unwrap_or_else(|| slicc_browsers::catalog().discovery.probe_ports)
+    catalog_from(overridden().as_deref())
 }
 
 pub fn testing() -> bool {
-    overridden().is_some()
+    overridden().as_deref().and_then(parse).is_some()
 }
 
-fn overridden() -> Option<Vec<u16>> {
+fn overridden() -> Option<String> {
     if cfg!(target_os = "wasi") {
         return None;
     }
-    parse(&std::env::var(OVERRIDE).ok()?)
+    std::env::var(OVERRIDE).ok()
+}
+
+fn catalog_from(value: Option<&str>) -> Vec<u16> {
+    value
+        .and_then(parse)
+        .unwrap_or_else(|| slicc_browsers::catalog().discovery.probe_ports)
 }
 
 pub fn parse(text: &str) -> Option<Vec<u16>> {
@@ -81,9 +87,17 @@ mod tests {
 
     #[test]
     fn without_the_override_the_catalog_ports_are_probed() {
-        assert!(std::env::var_os(OVERRIDE).is_none());
-        assert!(!testing());
-        assert_eq!(catalog(), (9222..=9229).collect::<Vec<u16>>());
+        let real: Vec<u16> = (9222..=9229).collect();
+        assert_eq!(catalog_from(None), real);
+        assert_eq!(catalog_from(Some("junk")), real);
+        assert_eq!(catalog_from(Some("9300-9302")), vec![9300, 9301, 9302]);
+    }
+
+    #[test]
+    fn cargo_test_runs_with_the_harness_range() {
+        assert_eq!(std::env::var(OVERRIDE).as_deref(), Ok("9300-9309"));
+        assert!(testing());
+        assert_eq!(catalog(), (9300..=9309).collect::<Vec<u16>>());
     }
 
     #[test]

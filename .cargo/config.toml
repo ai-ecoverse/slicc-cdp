@@ -1,0 +1,2 @@
+[env]
+SLICC_CDP_PORTS = "9300-9309"

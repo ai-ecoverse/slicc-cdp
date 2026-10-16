@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import './ports.mjs';
 
 const { findBrowser } = await import(
   process.env.SLICC_FIXTURE_BROWSER_API ?? '../../src/browser.js'

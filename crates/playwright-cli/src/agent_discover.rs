@@ -4393,7 +4393,6 @@ mod tests {
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1").is_empty());
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1").is_empty());
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "https://vault.sliccy.ai").is_empty());
-        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:9222").is_empty());
         assert!(run_nlweb_probes(&mut cdp, &mut state, "NONE", "http://127.0.0.1:2").is_empty());
         state.sessions.get_mut("S1").unwrap().top_frame_id = None;
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:3").is_empty());

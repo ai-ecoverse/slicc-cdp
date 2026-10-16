@@ -1,25 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import net from 'node:net';
 import path from 'node:path';
 import { after, afterEach, beforeEach } from 'node:test';
+import './ports.mjs';
 
 const rowMs = Number(process.env.SLICC_ROW_TIMEOUT_MS || 605000);
 const exitMs = Number(process.env.SLICC_EXIT_TIMEOUT_MS || 30000);
 const file = path.basename(process.argv[1] || 'test');
 const started = Date.now();
 const rows = new Map();
-
-if (!process.env.SLICC_CDP_PORTS) {
-  const port = await new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const { port: free } = server.address();
-      server.close(() => resolve(free));
-    });
-  });
-  process.env.SLICC_CDP_PORTS = `${port}-${port}`;
-}
 
 export function progress(text) {
   const at = ((Date.now() - started) / 1000).toFixed(1);
