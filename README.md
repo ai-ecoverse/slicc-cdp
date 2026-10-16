@@ -141,7 +141,7 @@ curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 
 ## Release certification
 
-`cert-review.yml` is reusable and runs after each release has published its npm package, crates and draft assets. Replay an exact version from main with `gh workflow run cert-review.yml --ref main -f version=1.26.2`; `-f dry_run=true` retains the evidence without writing a release or commit status. No job changes the npm `certified` tag.
+`cert-review.yml` is reusable and runs after each release has published its npm package, crates and draft assets. Replay an exact version from main with `gh workflow run cert-review.yml --ref main -f version=1.26.2`; `-f dry_run=true` retains the evidence without writing a release or commit status. No job changes the npm `certified` tag. Every reusable job has an explicit status-aware condition, so a skipped ancestor in the release caller does not silently skip evidence. `cert-call-proof.yml` makes a main-only dry-run call with the same release needs and a deliberately skipped asset ancestor; its verifier requires all seven evidence jobs and the resulting record. Shared browser fixtures use the current harness API independently of the older implementation under test, and per-worker summaries retain results defined in imported test helpers.
 
 Hosted planning chooses the newest earlier successful cert-review record, skipping failed and unreviewed releases, with `scripts/cert/base.json` as the lane-approved fallback. Rust is pinned by the tag's `rust-toolchain.toml`, a recorded historical release pin, or the compiler version in that exact release's CI log. The same resolved version, commit, baseline, harness, pins and workflow attempt identify every result document.
 

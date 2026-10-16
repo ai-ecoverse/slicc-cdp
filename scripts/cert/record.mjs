@@ -10,6 +10,12 @@ const { values } = parseArgs({
 const planFile = path.join(values.evidence, 'plan.json');
 const plan = json(planFile);
 plan.upstream = JSON.parse(process.env.CERT_UPSTREAM ?? '{}');
+plan.caller = Object.fromEntries(
+  Object.entries(JSON.parse(process.env.CERT_CALLER ?? '{}')).map(([job, value]) => [
+    job,
+    value.result,
+  ])
+);
 save(planFile, plan);
 let verification;
 try {

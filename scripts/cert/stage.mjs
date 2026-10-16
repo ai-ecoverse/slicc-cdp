@@ -1,5 +1,6 @@
 import { chmodSync, copyFileSync, cpSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { cleanEnv, json, repo, root, run, save, tree, unpackPackage } from './common.mjs';
 
 export async function stage(plan, version, commit, label, testsFrom) {
@@ -27,6 +28,7 @@ export async function stage(plan, version, commit, label, testsFrom) {
   const env = {
     ...cleanEnv(),
     RUSTUP_TOOLCHAIN: plan.rust,
+    SLICC_FIXTURE_BROWSER_API: pathToFileURL(path.join(root, 'src/browser.js')).href,
     CARGO_TARGET_DIR: path.join(source, 'target'),
   };
   run('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], {

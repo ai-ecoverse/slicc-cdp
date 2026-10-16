@@ -181,9 +181,12 @@ for (const leg of ['positive', 'negative']) {
       !execution.rows?.some(
         (row) =>
           row.file?.endsWith(file) &&
-          row.name &&
-          row.name !== row.file &&
-          ['test:pass', 'test:fail'].includes(row.type)
+          ((row.name && row.name !== row.file && ['test:pass', 'test:fail'].includes(row.type)) ||
+            (row.type === 'test:summary' &&
+              row.counts?.tests > 0 &&
+              row.counts.cancelled === 0 &&
+              row.counts.skipped === 0 &&
+              row.counts.todo === 0))
       )
     )
       incomplete.push(`integration: ${leg} file without results ${file}`);
@@ -274,6 +277,8 @@ for (const [which, result] of Object.entries(plan.upstream ?? {}))
   if (result !== 'success') incomplete.push(`${which}: upstream ${result}`);
 if (!plan.upstream || Object.keys(plan.upstream).length !== 4)
   incomplete.push('missing required upstream job outcomes');
+for (const [job, result] of Object.entries(plan.caller ?? {}))
+  if (result !== 'success') incomplete.push(`caller ${job}: ${result}`);
 const status = failures.length ? 'FAIL' : incomplete.length ? 'INCOMPLETE' : 'PASS';
 const certified = status === 'PASS';
 const sha256 = registry?.sha256 ?? null;
@@ -289,6 +294,7 @@ const record = {
   line,
   failures,
   incomplete,
+  caller: plan.caller ?? {},
   evidence: values.evidence,
   runUrl: `https://github.com/ai-ecoverse/slicc-cdp/actions/runs/${plan.run}`,
 };

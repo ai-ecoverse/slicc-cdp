@@ -146,6 +146,38 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
     });
 });
 
+test('every skipped or cancelled evidence producer is INCOMPLETE and names its job', async (t) => {
+  for (const job of ['rebuild', 'guard', 'integration', 'assets']) {
+    for (const state of ['skipped', 'cancelled'])
+      await t.test(`${job} ${state}`, () => {
+        const documents = fixture();
+        documents.plan.upstream[job] = state;
+        if (job === 'assets') {
+          delete documents['assets-linux'];
+          delete documents['assets-macos'];
+        } else delete documents[job];
+        const result = conclude(documents);
+        assert.equal(result.record.status, 'INCOMPLETE', result.record.line);
+        assert.equal(result.record.certified, false);
+        assert.ok(result.record.incomplete.includes(`${job}: upstream ${state}`));
+      });
+  }
+});
+
+test('a failed, skipped or cancelled release caller cannot certify independently passing evidence', async (t) => {
+  for (const job of ['release', 'upload-assets', 'verify-signatures']) {
+    for (const state of ['failure', 'skipped', 'cancelled'])
+      await t.test(`${job} ${state}`, () => {
+        const documents = fixture();
+        documents.plan.caller = { [job]: state };
+        const result = conclude(documents);
+        assert.equal(result.record.status, 'INCOMPLETE');
+        assert.equal(result.record.certified, false);
+        assert.ok(result.record.incomplete.includes(`caller ${job}: ${state}`));
+      });
+  }
+});
+
 test('a byte mismatch or coded supply-chain defect FAILs even with incomplete evidence', async (t) => {
   for (const field of ['registry', 'rebuild', 'tag'])
     await t.test(field, () => {

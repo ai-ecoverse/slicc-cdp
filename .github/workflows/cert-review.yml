@@ -6,6 +6,12 @@ on:
       version:
         required: true
         type: string
+      dry_run:
+        type: boolean
+        default: false
+      caller_results:
+        type: string
+        default: '{}'
     outputs:
       certified:
         value: ${{ jobs.record.outputs.certified }}
@@ -31,7 +37,7 @@ concurrency:
 
 jobs:
   plan:
-    if: github.ref == 'refs/heads/main' && github.repository == 'ai-ecoverse/slicc-cdp'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'ai-ecoverse/slicc-cdp' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -63,7 +69,7 @@ jobs:
 
   rebuild:
     needs: plan
-    if: needs.plan.outputs.rust != ''
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
     runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
     timeout-minutes: 30
     env:
@@ -97,7 +103,7 @@ jobs:
 
   guard:
     needs: plan
-    if: needs.plan.outputs.rust != ''
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
     runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
     timeout-minutes: 60
     env:
@@ -146,7 +152,7 @@ jobs:
 
   integration:
     needs: plan
-    if: needs.plan.outputs.rust != ''
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
     runs-on: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
     timeout-minutes: 60
     env:
@@ -194,6 +200,7 @@ jobs:
 
   assets:
     needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -226,7 +233,7 @@ jobs:
 
   record:
     needs: [plan, rebuild, guard, integration, assets]
-    if: always() && needs.plan.result == 'success'
+    if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -256,6 +263,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CERT_UPSTREAM: ${{ toJSON(needs) }}
+          CERT_CALLER: ${{ inputs.caller_results || '{}' }}
         run: |
           CERT_UPSTREAM=$(node -e 'const n=JSON.parse(process.env.CERT_UPSTREAM); console.log(JSON.stringify(Object.fromEntries(["rebuild","guard","integration","assets"].map(k=>[k,n[k].result]))))')
           export CERT_UPSTREAM
@@ -271,7 +279,7 @@ jobs:
 
   publish:
     needs: [plan, record]
-    if: always() && needs.record.result == 'success' && github.ref == 'refs/heads/main' && !inputs.dry_run
+    if: ${{ always() && needs.record.result == 'success' && github.ref == 'refs/heads/main' && !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -294,7 +302,7 @@ jobs:
 
   result:
     needs: record
-    if: always() && needs.record.result != 'skipped'
+    if: ${{ always() && needs.record.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

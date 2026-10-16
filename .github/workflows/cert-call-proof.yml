@@ -1,0 +1,85 @@
+name: cert-call-proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published version for the dry-run release caller
+        required: true
+        default: '1.26.2'
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cert-call-proof.yml
+      - .github/workflows/cert-review.yml
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: 'true'
+    steps:
+      - id: version
+        env:
+          VERSION: ${{ inputs.version || '1.26.2' }}
+        run: echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  upload-assets:
+    needs: release
+    if: ${{ !cancelled() && needs.release.outputs.released != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: exit 1
+
+  verify-signatures:
+    needs: release
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: true
+
+  cert:
+    needs: [release, upload-assets, verify-signatures]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.release.outputs.released == 'true' }}
+    permissions:
+      contents: write
+      statuses: write
+      actions: read
+    uses: ./.github/workflows/cert-review.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
+      caller_results: ${{ toJSON(needs) }}
+      dry_run: true
+
+  verify-call:
+    needs: [release, cert, upload-assets]
+    if: ${{ always() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cert-record-${{ needs.release.outputs.version }}-${{ github.run_attempt }}
+          path: evidence
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: ${{ needs.upload-assets.result }}
+        run: node scripts/cert/verify-call.mjs --record evidence/record/record.json
