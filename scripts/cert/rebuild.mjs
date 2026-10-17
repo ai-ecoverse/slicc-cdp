@@ -11,11 +11,15 @@ import {
   tree,
   unpackPackage,
 } from './common.mjs';
+import { unpackLocal } from './pr-subject.mjs';
 
 await evidence('rebuild', async (plan) => {
   const work = path.join(root, '.cert/rebuild');
   const source = tree(plan.commit, path.join(work, 'tree'));
-  const packed = unpackPackage(plan.version, path.join(work, 'registry'));
+  const packed =
+    plan.mode === 'pr'
+      ? unpackLocal(plan, plan.version, path.join(work, 'registry'))
+      : unpackPackage(plan.version, path.join(work, 'registry'));
   const pkg = json(path.join(source, 'package.json'));
   pkg.version = plan.version;
   save(path.join(source, 'package.json'), pkg);

@@ -1,0 +1,9 @@
+[
+  ".github/workflows/cert*.yml",
+  ".github/workflows/cert*.yaml",
+  "scripts/cert/**",
+  ".cert/proofs.json",
+  "scripts/sign-macos.sh",
+  "scripts/generate-notices.sh",
+  "scripts/release-checksums.mjs"
+]

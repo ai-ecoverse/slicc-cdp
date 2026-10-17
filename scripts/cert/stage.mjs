@@ -2,14 +2,22 @@ import { chmodSync, copyFileSync, cpSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { cleanEnv, json, repo, root, run, save, tree, unpackPackage } from './common.mjs';
+import { unpackLocal } from './pr-subject.mjs';
 
 export async function stage(plan, version, commit, label, testsFrom) {
   const dir = path.join(root, '.cert', label);
   const source = tree(commit, path.join(dir, 'tree'));
   if (testsFrom)
     cpSync(path.join(testsFrom, 'test'), path.join(source, 'test'), { recursive: true });
-  const packed = unpackPackage(version, path.join(dir, 'registry'));
-  if (version === plan.baseline.version && packed.sha256 !== plan.baseline.sha256)
+  const packed =
+    plan.mode === 'pr'
+      ? unpackLocal(plan, version, path.join(dir, 'registry'))
+      : unpackPackage(version, path.join(dir, 'registry'));
+  if (
+    plan.mode !== 'pr' &&
+    version === plan.baseline.version &&
+    packed.sha256 !== plan.baseline.sha256
+  )
     throw new Error('baseline published hash differs from certified record');
   cpSync(path.join(dir, 'registry/package/src'), path.join(source, 'src'), { recursive: true });
   const pkg = json(path.join(source, 'package.json'));
@@ -51,22 +59,25 @@ export async function stage(plan, version, commit, label, testsFrom) {
   for (const command of ['playwright-cli', 'curlwright']) {
     const binary = path.join(source, 'target/debug', command);
     const asset = `${command}-linux-${arch}`;
-    run(
-      'gh',
-      [
-        'release',
-        'download',
-        `v${version}`,
-        '--repo',
-        repo,
-        '--pattern',
-        asset,
-        '--dir',
-        dir,
-        '--clobber',
-      ],
-      { timeout: 300000 }
-    );
+    if (plan.mode === 'pr') {
+      copyFileSync(path.join(packed.native, `${command}-host`), path.join(dir, asset));
+    } else
+      run(
+        'gh',
+        [
+          'release',
+          'download',
+          `v${version}`,
+          '--repo',
+          repo,
+          '--pattern',
+          asset,
+          '--dir',
+          dir,
+          '--clobber',
+        ],
+        { timeout: 300000 }
+      );
     copyFileSync(path.join(dir, asset), binary);
     chmodSync(binary, 0o755);
     copyFileSync(
