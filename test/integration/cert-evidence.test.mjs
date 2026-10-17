@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url';
 import { fixture } from './cert-fixture.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
+const vectors = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).devDependencies[
+  '@ai-ecoverse/slicc-browsers'
+];
 
 function conclude(documents, extra = []) {
   const dir = mkdtempSync(path.join(tmpdir(), 'slicc-cert-evidence-'));
@@ -35,7 +38,7 @@ test('cert record CLI accepts complete matching evidence and constructs the cand
   assert.equal(result.record.certified, true);
   assert.equal(
     result.record.line,
-    `certified-candidate @ai-ecoverse/slicc-cdp@1.26.2 sha256=${'a'.repeat(64)} gitHead=${'b'.repeat(40)} guard=GUARD-PASS(slicc-cdp@${'b'.repeat(40)}; vectors @ai-ecoverse/slicc-browsers@1.7.3)`
+    `certified-candidate @ai-ecoverse/slicc-cdp@1.26.2 sha256=${'a'.repeat(64)} gitHead=${'b'.repeat(40)} guard=GUARD-PASS(slicc-cdp@${'b'.repeat(40)}; vectors @ai-ecoverse/slicc-browsers@${vectors})`
   );
 });
 
