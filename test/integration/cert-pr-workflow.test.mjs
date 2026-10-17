@@ -142,6 +142,19 @@ test('PR certification credentials are step-only and model has no execution or f
 
 test('PR certification preserves canonical plan and missing producer refusal', () => {
   const workflow = loadWorkflow();
+  const calls = Object.values(workflow.jobs).flatMap((job) =>
+    (job.steps ?? []).flatMap((step) =>
+      (step.run ?? '').split('\n').filter((line) => /node scripts\/cert\/[\w-]+\.mjs/.test(line))
+    )
+  );
+  assert.equal(calls.length, 18);
+  for (const call of calls) {
+    const gated = call.match(
+      /node scripts\/gate\.mjs "?([\w$-]+)"? --accept PASS,FAIL,INCOMPLETE -- node scripts\/cert\/([\w-]+)\.mjs/
+    );
+    assert.ok(gated, call);
+    assert.equal(gated[1], gated[2] === 'assets' ? 'assets-$PLATFORM' : gated[2]);
+  }
   const gather = steps('record').find((step) => step.name?.startsWith('Gather only canonical'));
   assert.match(
     gather.run,
