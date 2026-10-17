@@ -522,12 +522,13 @@ test('PR bios public input planner binds both local packs and labels without pin
   const result = await call();
   assert.equal(result.exit, 0, result.stderr);
   const inputs = read(output);
-  assert.equal(inputs.status, 'INCOMPLETE');
-  assert.equal(inputs.ready, false);
+  assert.equal(inputs.status, 'PASS');
+  assert.equal(inputs.ready, true);
   for (const side of ['base', 'candidate']) {
     const row = inputs.calls[side];
     assert.equal(row.label, side);
-    assert.equal(row['bios-ref'], null);
+    assert.equal(row['bios-ref'], '4025d6aabc2c06add216183064d81914a171cd64');
+    assert.equal(row.repeat, 3);
     assert.equal(row.runner, 'ubuntu-latest');
     assert.equal(row['candidate-package'], '@ai-ecoverse/slicc-cdp');
     assert.equal(row['candidate-repo'], repository);
@@ -545,7 +546,7 @@ test('PR bios public input planner binds both local packs and labels without pin
   assert.equal(read(output).ready, false);
 });
 
-test('PR bios slot stays INCOMPLETE until its pinned canary contract exists', async (t) => {
+test('PR bios slot stays INCOMPLETE without paired byte-bound packs and canary results', async (t) => {
   const f = fixture(t);
   const api = await server(t, f);
   const { out } = await planned(f, api);
@@ -555,13 +556,13 @@ test('PR bios slot stays INCOMPLETE until its pinned canary contract exists', as
   const bios = read(evidence);
   assert.equal(bios.status, 'INCOMPLETE');
   assert.equal(bios.pin.workflow, '.github/workflows/canary.yml');
-  assert.equal(bios.pin.commit, null);
+  assert.equal(bios.pin.commit, '4025d6aabc2c06add216183064d81914a171cd64');
   assert.deepEqual(bios.pin.shards, ['packages-update-cdp', 'guard']);
   assert.deepEqual(
     bios.subjects.map((item) => item.side),
     ['base', 'candidate']
   );
-  assert.match(bios.reason, /no guarded-path smoke executed/);
+  assert.match(bios.reason, /exact local PR packs unavailable/);
 });
 
 for (const scenario of [

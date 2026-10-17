@@ -1,4 +1,5 @@
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
+import { biosFindings } from './pr-bios-result.mjs';
 
 export function validateSuite(execution, label, emit, candidate = true) {
   if (
@@ -98,12 +99,12 @@ export function validateGuard(guard, plan, vectors, emit) {
   }
 }
 
-export function validateBios(bios, pin, emit) {
-  emit(
-    'INCOMPLETE',
-    `bios: pinned canary workflow_call evidence pending (${pin.shards.join(', ')} on base and candidate)`
-  );
+export function validateBios(bios, pin, emit, plan, subjects) {
+  const findings = biosFindings(bios, pin, plan, subjects);
+  for (const reason of findings.failures) emit('FAIL', reason);
+  for (const reason of findings.incomplete) emit('INCOMPLETE', reason);
   if (bios?.status === 'FAIL') emit('FAIL', 'bios: producer reported failure');
+  return findings.flags;
 }
 
 export function validateMac(macos, inventory, emit) {
