@@ -1500,6 +1500,26 @@ mod tests {
         panic!("{expression} stayed {last}, wanted {want}");
     }
 
+    fn committed(cdp: &mut Cdp, session: &str, url: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            last = match cdp.call("Page.getNavigationHistory", json!({}), Some(session)) {
+                Ok(history) => {
+                    let index = history["currentIndex"].as_u64().unwrap_or(0) as usize;
+                    let current = history["entries"][index]["url"].as_str().unwrap_or("");
+                    if current == url {
+                        return;
+                    }
+                    current.to_string()
+                }
+                Err(error) => error.trim().to_string(),
+            };
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+        }
+        panic!("the browser never committed {url}: {last}");
+    }
+
     fn new_tab(cdp: &mut Cdp, url: &str) -> String {
         cdp.call(
             "Target.createTarget",
@@ -1672,6 +1692,7 @@ mod tests {
             assert_eq!(found.url, landing);
             assert!(found.main_frame);
             assert_eq!(found.session_id, session);
+            committed(&mut cdp, &session, &landing);
             cdp::detach(&mut cdp, &session);
         }
 
