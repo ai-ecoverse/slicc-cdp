@@ -665,10 +665,12 @@ fn render_details(index: usize, request: &NetRequest) -> String {
             "Run `request-body {index}` to read the request body."
         ));
     }
-    if can_have_response_body(request) {
+    if request.response_body.is_some() {
         hints.push(format!(
             "Run `response-body {index}` to read the response body."
         ));
+    } else if expects_body(request) {
+        hints.push(UNSAVED_BODY.to_string());
     }
     if !hints.is_empty() {
         lines.push(String::new());
@@ -712,6 +714,8 @@ fn append_headers(lines: &mut Vec<String>, title: &str, headers: &[(String, Stri
     }
 }
 
+const UNSAVED_BODY: &str = "The response body is not kept in the saved session.";
+
 pub fn render_part(items: &[NetRequest], index: usize, part: &str) -> Result<Piece, String> {
     let request = lookup(items, index)?;
     match part {
@@ -722,6 +726,9 @@ pub fn render_part(items: &[NetRequest], index: usize, part: &str) -> Result<Pie
             .map(|body| text_piece(body))
             .unwrap_or(Piece::Empty)),
         "response-headers" => Ok(text_piece(&render_header_block(&request.response_headers, Some(&request.url)))),
+        "response-body" if request.response_body.is_none() && expects_body(request) => {
+            Err(format!("playwright-cli response-body: request #{index}: {UNSAVED_BODY}\n"))
+        }
         "response-body" => Ok(response_piece(request)),
         _ => Err(format!("playwright-cli: unknown request part \"{part}\"\n")),
     }
@@ -799,6 +806,10 @@ fn is_successful(request: &NetRequest) -> bool {
         return false;
     }
     matches!(request.status, Some(status) if status < 400)
+}
+
+fn expects_body(request: &NetRequest) -> bool {
+    !request.method.eq_ignore_ascii_case("HEAD") && can_have_response_body(request)
 }
 
 fn can_have_response_body(request: &NetRequest) -> bool {
@@ -1196,7 +1207,8 @@ mod tests {
         assert!(details.contains("    cookie: session=from-tab"));
         assert!(details.contains("    set-cookie: session=from-tab"));
         assert!(details.contains("Run `request-body 2`"));
-        assert!(details.contains("Run `response-body 2`"));
+        assert!(!details.contains("Run `response-body 2`"));
+        assert!(details.contains("The response body is not kept in the saved session."));
         match render_part(&items, 2, "request-headers").unwrap() {
             Piece::Text(text) => {
                 assert!(text.contains("cookie: session=from-tab"));
@@ -1208,10 +1220,25 @@ mod tests {
             Piece::Text(text) => assert_eq!(text, "{\"a\":1}"),
             other => panic!("{other:?}"),
         }
-        assert!(matches!(
-            render_part(&items, 2, "response-body").unwrap(),
-            Piece::Empty
-        ));
+        let unsaved = render_part(&items, 2, "response-body").unwrap_err();
+        assert_eq!(
+            unsaved,
+            "playwright-cli response-body: request #2: The response body is not kept in the saved session.\n"
+        );
+        let mut kept = items.clone();
+        kept[1].response_body = Some(String::new());
+        assert!(render_request(&kept, 2).unwrap().contains("Run `response-body 2`"));
+        assert!(matches!(render_part(&kept, 2, "response-body").unwrap(), Piece::Empty));
+        kept[1].response_body = None;
+        kept[1].method = "head".to_string();
+        let head = render_request(&kept, 2).unwrap();
+        assert!(!head.contains("response-body") && !head.contains("not kept"));
+        assert!(matches!(render_part(&kept, 2, "response-body").unwrap(), Piece::Empty));
+        kept[1].method = "GET".to_string();
+        kept[1].status = Some(204);
+        let empty = render_request(&kept, 2).unwrap();
+        assert!(!empty.contains("response-body") && !empty.contains("not kept"));
+        assert!(matches!(render_part(&kept, 2, "response-body").unwrap(), Piece::Empty));
         let err = render_request(&items, 9).unwrap_err();
         assert!(err.contains("Request #9 not found"));
         assert!(precheck("request", &[]).unwrap().contains("index is required"));
