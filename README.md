@@ -33,7 +33,7 @@ Payments over HTTP 402: every response in a watched tab, subresources included, 
   - `request is not base64url JSON`;
   - `no x402 payload`: a legacy `X-Payment` header, or a body without `x402Version`/`accepts`;
   - `body unavailable`: the body was evicted or the load failed.
-- **Limits:** events are deduplicated per origin, standard and resource, since each paid resource has its own price. A tab reports at most 50 events per payment standard, so a page that loops 402s can't flood the output. `--once` waits up to 2 s after the load event for the tab's requests to finish, so the 402s of subresources are reported.
+- **Limits:** events are deduplicated per origin, standard and resource, since each paid resource has its own price. A tab reports at most 50 events per payment standard, so a page that loops 402s can't flood the output. `--once` waits up to 2 s after the load event for the tab's requests to finish (and 402 bodies to be read), so the 402s of subresources are reported. A `--once` run can therefore take up to 2 s longer than the load.
 
 Sinks:
 

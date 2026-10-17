@@ -157,7 +157,7 @@ test('discover HTTP 402 payment challenges', { timeout: 120_000 }, async (t) => 
     await t.test('x402 V1 from the JSON body', () => {
       const [v1] = at('/x402-v1', 'x402');
       assert.ok(v1, result.stdout);
-      assert.equal(v1.status, 'valid');
+      assert.equal(v1.status, 'valid', JSON.stringify(v1));
       assert.equal(v1.via, 'response');
       assert.equal(v1.summary.version, 1);
       assert.equal(v1.summary.resource, 'https://paid.example/v1');

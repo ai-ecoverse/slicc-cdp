@@ -99,10 +99,10 @@ struct PendingBody {
 
 #[derive(Default)]
 struct Payments {
-    pending: BTreeMap<String, PendingBody>,
+    pending: BTreeMap<(String, String), PendingBody>,
     emitted: BTreeMap<(String, String), usize>,
-    inflight: BTreeSet<String>,
-    answered: BTreeSet<String>,
+    inflight: BTreeSet<(String, String)>,
+    answered: BTreeSet<(String, String)>,
 }
 
 struct SessionState {
@@ -639,21 +639,21 @@ fn process_events(cdp: &mut Cdp, state: &mut WatcherState) -> String {
             .unwrap_or("");
         let params = event.get("params").cloned().unwrap_or(Value::Null);
 
-        let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+        let request = request_key(state, session_id, &params);
         match method {
             "Network.requestWillBeSent" => {
-                state.payments.inflight.insert(request_id.to_string());
+                state.payments.inflight.insert(request);
             }
             "Network.responseReceived" => {
                 output.push_str(&handle_response(cdp, state, session_id, &params));
             }
             "Network.loadingFinished" => {
-                state.payments.inflight.remove(request_id);
-                output.push_str(&handle_payment_body(cdp, state, &params, true));
+                state.payments.inflight.remove(&request);
+                output.push_str(&handle_payment_body(cdp, state, session_id, &params, true));
             }
             "Network.loadingFailed" => {
-                state.payments.inflight.remove(request_id);
-                output.push_str(&handle_payment_body(cdp, state, &params, false));
+                state.payments.inflight.remove(&request);
+                output.push_str(&handle_payment_body(cdp, state, session_id, &params, false));
             }
             _ => {}
         }
@@ -961,6 +961,18 @@ fn handle_response(
     output
 }
 
+fn target_of(state: &WatcherState, session_id: &str) -> String {
+    state
+        .sessions
+        .get(session_id)
+        .map_or_else(|| session_id.to_string(), |sess| sess.target_id.clone())
+}
+
+fn request_key(state: &WatcherState, session_id: &str, params: &Value) -> (String, String) {
+    let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+    (target_of(state, session_id), request_id.to_string())
+}
+
 const DRAIN_AFTER_LOAD: Duration = Duration::from_secs(2);
 
 fn drain_requests(cdp: &mut Cdp, state: &mut WatcherState, deadline: Instant) -> String {
@@ -982,7 +994,11 @@ fn handle_payment(
     url: &str,
     headers: Vec<(String, String)>,
 ) -> String {
-    if !request_id.is_empty() && !state.payments.answered.insert(request_id.to_string()) {
+    if !state.sessions.contains_key(session_id) {
+        return String::new();
+    }
+    let key = (target_of(state, session_id), request_id.to_string());
+    if !request_id.is_empty() && !state.payments.answered.insert(key.clone()) {
         return String::new();
     }
     let classification = classify_payment(&headers, url);
@@ -992,7 +1008,7 @@ fn handle_payment(
     }
     if classification.read_body && !request_id.is_empty() {
         state.payments.pending.insert(
-            request_id.to_string(),
+            key,
             PendingBody {
                 session_id: session_id.to_string(),
                 url: url.to_string(),
@@ -1003,9 +1019,16 @@ fn handle_payment(
     output
 }
 
-fn handle_payment_body(cdp: &mut Cdp, state: &mut WatcherState, params: &Value, finished: bool) -> String {
-    let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
-    let Some(pending) = state.payments.pending.remove(request_id) else {
+fn handle_payment_body(
+    cdp: &mut Cdp,
+    state: &mut WatcherState,
+    session_id: &str,
+    params: &Value,
+    finished: bool,
+) -> String {
+    let key = request_key(state, session_id, params);
+    let request_id = key.1.clone();
+    let Some(pending) = state.payments.pending.remove(&key) else {
         return String::new();
     };
     if cdp.guard().url(&pending.url) {
@@ -4712,14 +4735,20 @@ mod tests {
         let mut cdp = Cdp::from_transport(Box::new(ScriptedTransport { incoming, sent: sent.clone() }));
         let headers = json!({ "content-type": "application/json" });
         assert!(handle_response(&mut cdp, &mut state, "S1", &payment_response("https://example.com/p1", "R1", headers.clone())).is_empty());
-        assert!(handle_payment_body(&mut cdp, &mut state, &json!({ "requestId": "other" }), true).is_empty());
-        let output = handle_payment_body(&mut cdp, &mut state, &json!({ "requestId": "R1" }), true);
+        state.sessions.insert(
+            "S1b".to_string(),
+            SessionState { target_id: "T1".into(), top_frame_id: Some("F1".into()), page_url: "https://example.com/".into() },
+        );
+        assert!(handle_response(&mut cdp, &mut state, "S1b", &payment_response("https://example.com/p1", "R1", headers.clone())).is_empty());
+        assert_eq!(state.payments.pending.len(), 1);
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "other" }), true).is_empty());
+        let output = handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R1" }), true);
         let events = events_of(&output);
         assert_eq!(events[0]["summary"]["version"], 1, "{output}");
         assert_eq!(events[0]["summary"]["offers"][0]["amount"], "10");
         assert_eq!(sent.borrow()[0]["method"], "Network.getResponseBody");
         handle_response(&mut cdp, &mut state, "S1", &payment_response("https://example.com/p2", "R2", headers));
-        let failed = handle_payment_body(&mut cdp, &mut state, &json!({ "requestId": "R2" }), false);
+        let failed = handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R2" }), false);
         assert_eq!(events_of(&failed)[0]["reason"], "body unavailable", "{failed}");
         assert_eq!(sent.borrow().len(), 1);
     }
@@ -4743,13 +4772,19 @@ mod tests {
             json!({ "content-type": "application/json", "payment-required": "x" }),
         );
         assert!(handle_response(&mut cdp, &mut state, "S1", &params).is_empty());
-        assert!(handle_payment_body(&mut cdp, &mut state, &json!({ "requestId": "R9" }), true).is_empty());
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R9" }), true).is_empty());
         assert!(sent.borrow().is_empty());
         state.payments.pending.insert(
-            "R8".into(),
+            ("T1".into(), "R8".into()),
             PendingBody { session_id: "S1".into(), url: "https://vault.sliccy.ai/late".into(), headers: vec![] },
         );
-        assert!(handle_payment_body(&mut cdp, &mut state, &json!({ "requestId": "R8" }), true).is_empty());
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R8" }), true).is_empty());
+        state.payments.pending.insert(
+            ("T2".into(), "R7".into()),
+            PendingBody { session_id: "S2".into(), url: "https://example.com/other-tab".into(), headers: vec![] },
+        );
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R7" }), true).is_empty());
+        assert!(state.payments.pending.contains_key(&("T2".to_string(), "R7".to_string())));
         assert!(sent.borrow().is_empty());
     }
 
@@ -4763,6 +4798,7 @@ mod tests {
             total += events_of(&handle_response(&mut cdp, &mut state, "S1", &params)).len();
         }
         assert_eq!(total, PAYMENT_EVENTS_PER_TAB);
+        assert!(handle_payment(&mut state, "S9", "R", "https://example.com/x", vec![("x-payment".into(), "l".into())]).is_empty());
         assert!(emit_payment(&mut state, "S9", "https://example.com/z", discovery::classify_payment(&[("x-payment".into(), "l".into())], "https://example.com/z").signals.remove(0)).is_empty());
         assert!(emit_payment(&mut state, "S1", "not a url", discovery::classify_payment(&[("x-payment".into(), "l".into())], "u").signals.remove(0)).is_empty());
     }
