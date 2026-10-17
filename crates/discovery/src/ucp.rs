@@ -178,7 +178,7 @@ mod tests {
                 "version": "2026-08-25",
                 "services": { "dev.ucp.shopping": [
                     { "version": "2026-08-25", "spec": "s", "transport": "rest", "endpoint": "https://u:p@shop.test/ucp" },
-                    { "version": "2026-08-25", "spec": "s", "transport": "mcp", "endpoint": "https://shop.test/mcp" },
+                    { "version": "2026-08-25", "spec": "s", "transport": "mcp", "endpoint": "https://user:pw@shop.test/mcp" },
                     { "version": "2026-08-25", "spec": "s", "transport": "a2a", "endpoint": "https://shop.test/agent-card.json" },
                     { "version": "2026-08-25", "spec": "s", "transport": "embedded", "schema": "https://x.test/e.json" }
                 ]},
@@ -199,6 +199,8 @@ mod tests {
         assert_eq!(s["services"]["dev.ucp.shopping"][0]["endpoint"], "https://shop.test/ucp");
         assert_eq!(s["services"]["dev.ucp.shopping"][3]["endpoint"], Value::Null);
         assert_eq!(s["mcp"], json!(["https://shop.test/mcp"]));
+        assert_eq!(s["services"]["dev.ucp.shopping"][1]["endpoint"], "https://shop.test/mcp");
+        assert!(!s.to_string().contains("pw@"));
         assert_eq!(s["a2a"], json!(["https://shop.test/agent-card.json"]));
         assert_eq!(s["capabilities"], json!(["dev.example.flag", "dev.ucp.common.payment.ap2_mandate@2026-08-25", "dev.ucp.shopping.checkout@2026-08-25"]));
         assert_eq!(s["paymentHandlers"], json!(["com.example.card"]));
