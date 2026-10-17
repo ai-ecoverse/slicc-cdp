@@ -1214,4 +1214,108 @@ mod tests {
         raw.close(&seven_tab);
         raw.close(&vault_tab);
     }
+
+    fn fixture_hits(app: &str, path: &str) -> String {
+        crate::net::http_probe(&format!("{app}/hits?path={path}"), "text/plain")
+            .map(|response| String::from_utf8_lossy(&response.body).into_owned())
+            .unwrap_or_else(|error| format!("unknown ({})", error.trim()))
+    }
+
+    fn guard_failed(cdp: &mut Cdp, url: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if cdp
+                .paused_trail
+                .iter()
+                .any(|(_, seen, reason)| seen.starts_with(url) && *reason == "guard session")
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    #[ignore = "needs SLICC_FETCH_LIVE_WS from test/integration/fetch.test.mjs"]
+    fn live_guard_armed_while_a_navigation_commits() {
+        let ws = live("SLICC_FETCH_LIVE_WS");
+        let app = live("SLICC_FETCH_LIVE_APP");
+        let idp = live("SLICC_FETCH_LIVE_IDP");
+        let seven = live("SLICC_FETCH_LIVE_SEVEN");
+        let mut raw = Raw::open(&ws);
+        let mut cdp = Cdp::connect(&ws).unwrap();
+        let tab = raw.create("about:blank");
+        let slow = raw.session(&tab);
+        raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
+        raw.call(
+            "Emulation.setCPUThrottlingRate",
+            json!({ "rate": 50 }),
+            Some(&slow),
+        )
+        .unwrap();
+        let landing = format!("{app}/landing?n=window");
+        let to: String = url::form_urlencoded::byte_serialize(landing.as_bytes()).collect();
+        raw.call(
+            "Page.navigate",
+            json!({ "url": format!("{idp}/js-redirect?to={to}") }),
+            Some(&slow),
+        )
+        .unwrap();
+        raw.wait_event(Duration::from_secs(30), |event| {
+            event["method"] == "Page.frameNavigated"
+                && event["params"]["frame"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("/landing"))
+        })
+        .expect("the renderer reported the landing");
+        let session = client::attach(&mut cdp, &tab).unwrap();
+        raw.call(
+            "Emulation.setCPUThrottlingRate",
+            json!({ "rate": 1 }),
+            Some(&slow),
+        )
+        .unwrap();
+        raw.wait_href(&slow, &landing);
+
+        let frame = format!("{seven}/code?n=frame");
+        cdp.call(
+            "Runtime.evaluate",
+            json!({ "expression": format!("const f = document.createElement('iframe'); f.src = {}; document.body.appendChild(f); true", json!(frame)) }),
+            Some(&session),
+        )
+        .unwrap();
+        assert!(
+            guard_failed(&mut cdp, &frame),
+            "the guard never saw the seven iframe"
+        );
+        assert_eq!(
+            fixture_hits(&app, "/code"),
+            "0",
+            "the seven iframe reached the network"
+        );
+
+        let main = format!("{seven}/dump?n=main");
+        cdp.call(
+            "Runtime.evaluate",
+            json!({ "expression": format!("setTimeout(() => {{ location.href = {}; }}, 50); true", json!(main)) }),
+            Some(&session),
+        )
+        .unwrap();
+        assert!(
+            guard_failed(&mut cdp, &main),
+            "the guard never saw the seven navigation"
+        );
+        until_blocked(&mut cdp, &session);
+        assert_eq!(
+            fixture_hits(&app, "/dump"),
+            "0",
+            "the seven navigation reached the network"
+        );
+        nothing_mentions(&cdp, "n=main");
+        nothing_mentions(&cdp, "n=frame");
+        raw.close(&tab);
+    }
 }

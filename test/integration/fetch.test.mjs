@@ -63,7 +63,24 @@ test('interception waits until the browser has committed a navigation the render
   });
 });
 
-async function throughProxy(options) {
+test('a guard armed while the browser has not committed a navigation still fails seven', async () => {
+  const proxy = await throughProxy(
+    {
+      before: [
+        {
+          method: 'Fetch.enable',
+          match: '"resourceType":"Document"',
+          send: { method: 'Page.getNavigationHistory' },
+        },
+      ],
+    },
+    'shield::tests::live_guard_armed_while_a_navigation_commits'
+  );
+  assert.equal(proxy.replies.length, 1);
+  assert.match(JSON.stringify(proxy.replies[0]), /Not attached to an active page/);
+});
+
+async function throughProxy(options, name = 'fetch::tests::live_chromium_interception') {
   const site = await startServer();
   let browser;
   let proxy;
@@ -82,7 +99,7 @@ async function throughProxy(options) {
         '--',
         '--ignored',
         '--exact',
-        'fetch::tests::live_chromium_interception',
+        name,
         '--test-threads=1',
       ],
       {
@@ -95,6 +112,7 @@ async function throughProxy(options) {
     );
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /1 passed/);
+    return proxy;
   } finally {
     await proxy?.close();
     await browser?.close();
