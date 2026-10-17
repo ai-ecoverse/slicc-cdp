@@ -3818,6 +3818,7 @@ mod tests {
             slicc_browsers::corpus::NEED_ORIGINS,
             slicc_browsers::corpus::NEED_INSTALLED,
             slicc_browsers::corpus::NEED_SIX,
+            slicc_browsers::corpus::NEED_TABS,
         ];
         let corpus = slicc_browsers::corpus::corpus();
         let applicable = corpus
@@ -3894,10 +3895,18 @@ mod tests {
             let mut actual: Value = serde_json::from_str(output.stdout.trim()).unwrap_or_else(|err| {
                 panic!("{}: {err}\n{}", case.name, output.stdout);
             });
+            let checks_tabs = case
+                .input
+                .needs
+                .iter()
+                .any(|need| need == slicc_browsers::corpus::NEED_TABS);
             for entry in actual["entries"].as_array_mut().unwrap() {
                 let Some(endpoint) = entry.get_mut("endpoint").and_then(Value::as_object_mut) else {
                     continue;
                 };
+                if checks_tabs {
+                    continue;
+                }
                 let tabs = endpoint.remove("tabs").unwrap();
                 for seven in endpoint["sevenTabs"].as_array().unwrap() {
                     assert!(!tabs.as_array().unwrap().contains(seven), "{}", case.name);

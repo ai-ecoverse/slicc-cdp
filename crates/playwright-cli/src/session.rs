@@ -252,8 +252,69 @@ fn encode(session: &Session) -> Value {
         "owned": session.owned,
         "snapshots": snapshots,
         "console": encode_lists(&session.console, trace::console_json),
-        "requests": encode_lists(&session.requests, trace::request_json),
+        "requests": encode_lists(&session.requests, stored_request),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
+    })
+}
+
+const REDACTED: &str = "[redacted]";
+const SECRET_HEADERS: &[&str] = &["token", "secret", "key", "auth", "session", "csrf", "cookie"];
+const SECRET_QUERY: &[&str] = &["token", "secret", "key", "auth", "code", "sig", "session", "password"];
+
+fn names_secret(name: &str, words: &[&str]) -> bool {
+    let name = name.to_ascii_lowercase();
+    words.iter().any(|word| name.contains(word))
+}
+
+fn stored_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let lowered = value.trim_start().to_ascii_lowercase();
+            if names_secret(name, SECRET_HEADERS) {
+                (name.clone(), REDACTED.to_string())
+            } else if lowered.starts_with("http://") || lowered.starts_with("https://") {
+                (name.clone(), stored_url(value))
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
+fn query_key(pair: &str) -> String {
+    let key = pair.split('=').next().unwrap_or("");
+    url::form_urlencoded::parse(key.as_bytes())
+        .next()
+        .map(|(key, _)| key.into_owned())
+        .unwrap_or_default()
+}
+
+fn stored_url(url: &str) -> String {
+    let url = url.split('#').next().unwrap_or("");
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            if pair.contains('=') && names_secret(&query_key(pair), SECRET_QUERY) {
+                format!("{}={REDACTED}", pair.split('=').next().unwrap_or(""))
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+    format!("{base}?{}", pairs.join("&"))
+}
+
+fn stored_request(request: &NetRequest) -> Value {
+    trace::request_json(&NetRequest {
+        url: stored_url(&request.url),
+        request_headers: stored_headers(&request.request_headers),
+        response_headers: stored_headers(&request.response_headers),
+        request_body: None,
+        ..request.clone()
     })
 }
 
@@ -619,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn console_and_requests_round_trip_with_query_and_cookie() {
+    fn console_and_requests_round_trip_with_secrets_redacted() {
         let mut session = Session::default();
         push_trace(
             &mut session,
@@ -633,20 +694,38 @@ mod tests {
             }],
             vec![NetRequest {
                 method: "GET".to_string(),
-                url: "https://example.test/a?token=1#x".to_string(),
+                url: "https://example.test/a?q=1&access_token=tok1&Code=c2&sig=s3#id_token=t4".to_string(),
                 resource_type: "fetch".to_string(),
                 status: Some(200),
                 status_text: "OK".to_string(),
                 failed: None,
                 mime: "text/plain".to_string(),
-                request_headers: vec![("cookie".to_string(), "session=secret".to_string())],
-                response_headers: vec![("set-cookie".to_string(), "a=b".to_string())],
+                request_headers: vec![
+                    ("cookie".to_string(), "session=secret".to_string()),
+                    ("Authorization".to_string(), "Bearer abc".to_string()),
+                    ("Proxy-Authorization".to_string(), "Basic def".to_string()),
+                    ("X-CSRF-Token".to_string(), "csrf1".to_string()),
+                    ("x-api-key".to_string(), "key1".to_string()),
+                    ("accept".to_string(), "text/plain".to_string()),
+                    ("Referer".to_string(), "https://example.test/?code=r5#x".to_string()),
+                ],
+                response_headers: vec![
+                    ("Set-Cookie".to_string(), "a=b".to_string()),
+                    ("x-session-id".to_string(), "sid1".to_string()),
+                    ("content-type".to_string(), "text/plain".to_string()),
+                    ("location".to_string(), "https://example.test/cb?state=1&code=l6".to_string()),
+                ],
                 request_body: Some("body".to_string()),
                 response_body: Some("ok".to_string()),
                 response_base64: false,
             }],
         );
-        let mut again = decode(&encode(&session).to_string());
+        let written = encode(&session).to_string();
+        for secret in ["session=secret", "Bearer abc", "Basic def", "csrf1", "key1", "a=b", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\""] {
+            assert!(!written.contains(secret), "{secret} was written: {written}");
+        }
+        assert_eq!(session.requests["T"][0].request_headers[0].1, "session=secret");
+        let mut again = decode(&written);
         assert_eq!(
             again.console["T"][0].url,
             "https://user:secret@example.test/a?q=1#h"
@@ -688,11 +767,33 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(again.console["T"].len(), 3);
-        assert_eq!(again.requests["T"][0].url, "https://example.test/a?token=1#x");
         assert_eq!(
-            again.requests["T"][0].request_headers[0].1,
-            "session=secret"
+            again.requests["T"][0].url,
+            "https://example.test/a?q=1&access_token=[redacted]&Code=[redacted]&sig=[redacted]"
         );
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        assert_eq!(
+            again.requests["T"][0].request_headers,
+            vec![
+                pair("cookie", "[redacted]"),
+                pair("Authorization", "[redacted]"),
+                pair("Proxy-Authorization", "[redacted]"),
+                pair("X-CSRF-Token", "[redacted]"),
+                pair("x-api-key", "[redacted]"),
+                pair("accept", "text/plain"),
+                pair("Referer", "https://example.test/?code=[redacted]"),
+            ]
+        );
+        assert_eq!(
+            again.requests["T"][0].response_headers,
+            vec![
+                pair("Set-Cookie", "[redacted]"),
+                pair("x-session-id", "[redacted]"),
+                pair("content-type", "text/plain"),
+                pair("location", "https://example.test/cb?state=1&code=[redacted]"),
+            ]
+        );
+        assert_eq!(again.requests["T"][0].request_body, None);
         assert_eq!(again.requests["T"][0].response_body.as_deref(), Some("ok"));
         clear_console(&mut again, "T");
         clear_requests(&mut again, "T");

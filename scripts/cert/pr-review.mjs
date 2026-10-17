@@ -2,6 +2,11 @@ import { readFileSync } from 'node:fs';
 import { args, identity, json, save } from './common.mjs';
 import { hash } from './pr-common.mjs';
 
+function toolUse(value) {
+  if (!value || typeof value !== 'object') return false;
+  return value.type === 'tool_use' || Object.values(value).some(toolUse);
+}
+
 const options = args({ verdict: { type: 'string' }, execution: { type: 'string' } });
 const plan = json(options.plan);
 let verdict;
@@ -11,6 +16,20 @@ try {
   const bytes = readFileSync(options.execution);
   const transcript = JSON.parse(bytes);
   const messages = Array.isArray(transcript) ? transcript : [transcript];
+  if (toolUse(transcript)) throw new Error('review model had tools');
+  const inits = messages.filter(
+    (message) => message?.type === 'system' && message.subtype === 'init'
+  );
+  if (
+    inits.some(
+      (init) =>
+        (Array.isArray(init.tools) && init.tools.length) ||
+        (Array.isArray(init.mcp_servers) && init.mcp_servers.length)
+    )
+  )
+    throw new Error('review model had tools');
+  if (inits.length !== 1 || !Array.isArray(inits[0].tools) || !Array.isArray(inits[0].mcp_servers))
+    throw new Error('review model tool receipt missing or malformed');
   const results = messages.filter((message) => message?.type === 'result');
   const result = results[0];
   if (
