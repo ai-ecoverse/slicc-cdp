@@ -205,6 +205,9 @@ test('playwright-cli discover --once', { timeout: 60_000 }, async (t) => {
       assert.ok(x402, `x402: ${result.stdout}`);
       assert.equal(x402.via, 'response');
       assert.equal(x402.summary.status, 402);
+      assert.equal(x402.status, 'invalid');
+      assert.equal(x402.reason, 'no x402 payload');
+      assert.equal(x402.summary.challenge, 'lightning');
     });
 
     await t.test('401 response with auth-md pointer', async () => {

@@ -24,6 +24,17 @@ Event JSON (NDJSON, one object per line):
 {"v":1,"standard":"ard","origin":"https://example.com","url":"https://example.com/.well-known/ard.json","via":"well-known","page":"https://example.com/","targetId":"...","status":"valid","summary":{...}}
 ```
 
+Payments over HTTP 402: every response in a watched tab, subresources included, with status 402 is decoded as a payment challenge. The watcher never pays, retries, or sends `PAYMENT-SIGNATURE` or `Authorization: Payment`; it only reads the response the page already got. A protected origin's response is never read.
+
+- **`x402`** ([x402](https://github.com/coinbase/x402/tree/main/specs)). V2 is read from the base64 JSON `PAYMENT-REQUIRED` header. V1 is read from the JSON body of a 402 with a JSON content type. The body is fetched once with `Network.getResponseBody` after it has loaded, up to 1 MiB. `summary` is `{status: 402, version, resource, offers: [{scheme, network, amount, asset, payTo, expires, maxTimeoutSeconds}]}`. `amount` is V2's `amount` or V1's `maxAmountRequired`, kept as the string the server sent.
+- **`mpp`** ([Machine Payments Protocol](https://datatracker.ietf.org/doc/draft-httpauth-payment/)). It is read from each `WWW-Authenticate: Payment` challenge, whose `request` parameter is decoded as base64url JSON. `summary` is `{status: 402, resource, offers: [{method, intent, realm, amount, asset, expires}]}`, with `amount` and `asset` (the request's `currency`) as sent. One response can carry both standards.
+- **Invalid challenges:** a challenge that doesn't decode is reported with `status: "invalid"` and a `reason`, and the watcher goes on. Its `summary` is only `{status: 402, challenge}`, the raw header capped at 1 KiB. Possible reasons:
+  - `PAYMENT-REQUIRED is not base64 JSON`;
+  - `request is not base64url JSON`;
+  - `no x402 payload`: a legacy `X-Payment` header, or a body without `x402Version`/`accepts`;
+  - `body unavailable`: the body was evicted or the load failed.
+- **Limits:** events are deduplicated per origin, standard and resource, since each paid resource has its own price. A tab reports at most 50 events per payment standard, so a page that loops 402s can't flood the output. `--once` waits up to 2 s after the load event for the tab's requests to finish (and 402 bodies to be read), so the 402s of subresources are reported. A `--once` run can therefore take up to 2 s longer than the load.
+
 Sinks:
 
 - **stdout** (default): NDJSON. Pipe into `jq` or an agent reader.

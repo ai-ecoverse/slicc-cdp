@@ -126,17 +126,6 @@ pub fn classify_response(status: u16, headers: &[(String, String)], response_url
             summary: Value::Object(summary),
         });
     }
-    if status == 402 {
-        let challenge = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-payment") || name.eq_ignore_ascii_case("payment-required"))
-            .map(|(_, value)| Value::String(value.clone()))
-            .unwrap_or(Value::Null);
-        signals.push(ResponseSignal {
-            standard: "x402".into(),
-            summary: serde_json::json!({ "status": 402, "challenge": challenge }),
-        });
-    }
     signals
 }
 
@@ -157,7 +146,7 @@ fn parse_www_authenticate_headers(headers: &[(String, String)]) -> Vec<Value> {
     schemes
 }
 
-fn split_challenges(raw: &str) -> Vec<String> {
+pub(crate) fn split_challenges(raw: &str) -> Vec<String> {
     let mut challenges = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -246,7 +235,7 @@ fn parse_single_challenge(challenge: &str) -> Option<Value> {
     Some(Value::Object(map))
 }
 
-fn parse_challenge_params(raw: &str) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn parse_challenge_params(raw: &str) -> std::collections::BTreeMap<String, String> {
     let mut params = std::collections::BTreeMap::new();
     let mut remaining = raw.trim();
     while !remaining.is_empty() {
@@ -1387,23 +1376,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_response_402() {
-        let headers = vec![
-            ("Content-Type".into(), "text/html".into()),
-            ("X-Payment".into(), "required".into()),
-        ];
-        let signals = classify_response(402, &headers, None);
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].standard, "x402");
-        assert_eq!(signals[0].summary["status"], 402);
-        assert_eq!(signals[0].summary["challenge"], "required");
-    }
-
-    #[test]
-    fn classify_response_402_no_header() {
-        let signals = classify_response(402, &[], None);
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].summary["challenge"], Value::Null);
+    fn classify_response_leaves_402_to_the_payment_observer() {
+        let headers = vec![("X-Payment".into(), "required".into())];
+        assert!(classify_response(402, &headers, None).is_empty());
     }
 
     #[test]
