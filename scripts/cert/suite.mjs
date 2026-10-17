@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { testArguments } from '../../test/integration/test-arguments.mjs';
 import { cleanEnv, save } from './common.mjs';
 
 export async function suite({ cwd, files, out, env = {}, retry = true }) {
@@ -36,9 +37,8 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
         const child = spawn(
           process.execPath,
           [
-            '--test',
+            ...testArguments,
             '--test-concurrency=1',
-            '--test-timeout=600000',
             `--test-reporter=${path.join(import.meta.dirname, 'reporter.mjs')}`,
             file,
           ],

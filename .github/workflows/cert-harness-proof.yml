@@ -1,0 +1,65 @@
+name: Certification harness preload regression
+
+on:
+  pull_request:
+    paths:
+      - package.json
+      - scripts/test-integration.mjs
+      - scripts/cert/suite.mjs
+      - test/integration/test-arguments.mjs
+      - test/integration/ports.mjs
+      - test/integration/cert-harness.test.mjs
+      - .github/workflows/cert-harness-proof.yml
+
+permissions:
+  contents: read
+
+env:
+  SLICC_CDP_PORTS: 9300-9309
+  LEFTHOOK: '0'
+
+jobs:
+  harness:
+    name: cert-harness-proof / public harness through cert runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Build native public CLIs without credentials
+        run: cargo build --locked -p slicc-cdp -p curlwright
+      - name: Candidate cert runner passes all three real harness-port tests
+        run: node --test --test-reporter=tap test/integration/cert-harness.test.mjs > positive.log
+      - name: Preserve exact base runner for the hosted NEGATIVE
+        env:
+          BASE: fd01175e64856d18d02a23f9f697f065cb284b5a
+        run: |
+          mkdir -p .cert/base-harness-runner/scripts/cert
+          for file in run-suite.mjs suite.mjs common.mjs reporter.mjs; do
+            git show "$BASE:scripts/cert/$file" > ".cert/base-harness-runner/scripts/cert/$file"
+          done
+      - name: Base cert runner must fail the actual public harness test, never a module import
+        run: |
+          set +e
+          SLICC_CERT_RUNNER_SOURCE="$PWD/.cert/base-harness-runner" node --test --test-reporter=tap test/integration/cert-harness.test.mjs > negative.log 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          grep -x '# tests 1' negative.log
+          grep -x '# fail 1' negative.log
+          grep 'Missing expected exception' negative.log
+          if grep -q 'ERR_MODULE_NOT_FOUND\|ENOENT' negative.log; then exit 1; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: cert-harness-cli-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            positive.log
+            negative.log
+          if-no-files-found: error
+          retention-days: 90
