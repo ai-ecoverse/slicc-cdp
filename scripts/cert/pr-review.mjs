@@ -8,17 +8,37 @@ let verdict;
 let execution;
 let reason;
 try {
-  verdict = json(options.verdict);
   const bytes = readFileSync(options.execution);
   const transcript = JSON.parse(bytes);
-  if (!bytes.length || !transcript || process.env.CERT_REVIEW_RESULT !== 'success')
-    throw new Error('review execution did not succeed');
+  const messages = Array.isArray(transcript) ? transcript : [transcript];
+  const results = messages.filter((message) => message?.type === 'result');
+  const result = results[0];
   if (
+    process.env.CERT_REVIEW_RESULT !== 'success' ||
+    results.length !== 1 ||
+    messages.at(-1) !== result ||
+    result.subtype !== 'success' ||
+    result.is_error !== false ||
+    typeof result.result !== 'string'
+  )
+    throw new Error('review execution did not succeed with one final result');
+  const text = result.result.trim();
+  const fenced = /^```json\s*\n([\s\S]*?)\n```$/.exec(text);
+  verdict = JSON.parse(fenced ? fenced[1] : text);
+  if (
+    !verdict ||
+    Array.isArray(verdict) ||
+    typeof verdict !== 'object' ||
+    Object.keys(verdict).some(
+      (key) => !['status', 'head', 'commit', 'reason', 'known'].includes(key)
+    ) ||
     !['PASS', 'FAIL', 'INCOMPLETE'].includes(verdict.status) ||
     verdict.head !== plan.head ||
     verdict.commit !== plan.commit ||
     typeof verdict.reason !== 'string' ||
-    !verdict.reason
+    !verdict.reason.trim() ||
+    (verdict.known !== undefined &&
+      (!Array.isArray(verdict.known) || verdict.known.some((item) => typeof item !== 'string')))
   )
     throw new Error('review verdict missing or bound to another subject');
   execution = { sha256: hash(bytes), bytes: bytes.length };
