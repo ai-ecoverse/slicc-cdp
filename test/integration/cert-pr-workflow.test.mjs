@@ -134,6 +134,15 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   assert.ok(!JSON.stringify(bios).includes('slicc-bios/'));
 });
 
+test('Non-required PR certification jobs cannot alias required CI check names', () => {
+  const required = ['integration', 'ci / test', 'shellcheck'];
+  for (const [id, job] of Object.entries(workflow.jobs)) {
+    assert.ok(!required.includes(job.name ?? id));
+    if (id !== 'report') assert.ok(job.name.startsWith('cert-review-pr / '));
+  }
+  assert.equal(workflow.jobs.report.name, 'cert-review');
+});
+
 test('PR certification signed bytes expire after one day while verification metadata remains', () => {
   for (const [name, job] of Object.entries(workflow.jobs)) {
     for (const step of job.steps.filter((item) =>
