@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
+import { cdpProxy } from './cdp-proxy.mjs';
 import { startServer } from './server.mjs';
 import { killTree } from './watchdog.mjs';
 
@@ -41,6 +42,47 @@ test('the cdp-client Fetch API against chromium', async () => {
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /2 passed/);
   } finally {
+    await browser?.close();
+    await site.close();
+  }
+});
+
+test('interception that turns active after Fetch.enable answers is waited for', async () => {
+  const site = await startServer();
+  let browser;
+  let proxy;
+  try {
+    browser = await launchBrowser([
+      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}, MAP vault.sliccy.ai 127.0.0.1:${site.port}`,
+      '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
+    ]);
+    proxy = await cdpProxy(browser.wsUrl, {
+      early: [{ method: 'Fetch.enable', match: '/api/headers', ms: 1500 }],
+    });
+    const result = await cargo(
+      [
+        'test',
+        '-p',
+        'slicc-cdp-client',
+        '--lib',
+        '--',
+        '--ignored',
+        '--exact',
+        'fetch::tests::live_chromium_interception',
+        '--test-threads=1',
+      ],
+      {
+        SLICC_FETCH_LIVE_WS: proxy.url,
+        SLICC_FETCH_LIVE_APP: site.origin,
+        SLICC_FETCH_LIVE_IDP: `http://localhost:${site.port}`,
+        SLICC_FETCH_LIVE_SEVEN: 'http://seven.sliccy.ai',
+        SLICC_FETCH_LIVE_VAULT: 'http://vault.sliccy.ai',
+      }
+    );
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /1 passed/);
+  } finally {
+    await proxy?.close();
     await browser?.close();
     await site.close();
   }
