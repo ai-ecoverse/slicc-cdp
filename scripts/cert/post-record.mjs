@@ -119,7 +119,7 @@ function verifyAssets() {
     const row = linux?.checksums?.files?.find((item) => item.file === file);
     check(
       row?.sha256 === row?.expected,
-      `checksum mismatch ${file}`,
+      row?.expected ? `checksum mismatch ${file}` : `${file} missing from SHA256SUMS`,
       !!(row?.sha256 && row?.expected)
     );
     const downloaded = linux?.files?.find((item) => item.file === file);

@@ -184,6 +184,30 @@ for (const scenario of [
     if (scenario.status === 'FAIL') assert.match(output.line, /supply-chain alert/);
   });
 
+test('post-publish absent installer checksum is INCOMPLETE, not a digest mismatch', (t) => {
+  const f = fixture(t);
+  const installer = f.linux.checksums.files.find((item) => item.file === 'install.sh');
+  delete installer.expected;
+  const output = record(f);
+  assert.equal(output.status, 'INCOMPLETE');
+  assert.equal(output.certified, false);
+  assert.deepEqual(output.failures, []);
+  assert.match(output.line, /install\.sh missing from SHA256SUMS/);
+  assert.doesNotMatch(output.line, /checksum mismatch install\.sh/);
+});
+
+test('post-publish actual installer digest mismatch is supply-chain FAIL', (t) => {
+  const f = fixture(t);
+  const installer = f.linux.checksums.files.find((item) => item.file === 'install.sh');
+  installer.expected = '0'.repeat(64);
+  const output = record(f);
+  assert.equal(output.status, 'FAIL');
+  assert.equal(output.certified, false);
+  assert.match(output.line, /supply-chain alert/);
+  assert.ok(output.failures.includes('checksum mismatch install.sh'));
+  assert.doesNotMatch(output.line, /install\.sh missing from SHA256SUMS/);
+});
+
 test('release publishes before code-only verification and cert jobs avoid developer browser ports', () => {
   const release = readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8');
   assert.doesNotMatch(release, /uses: \.\/\.github\/workflows\/cert-review.yml/);
