@@ -353,7 +353,7 @@ async function seven(dir) {
   };
 }
 
-test('list --json lists a real seven tab in sevenTabs and tabs, and an http stand-in in neither', {
+test('list --json lists a real seven tab in sevenTabs only, and an http stand-in in neither', {
   timeout: 120_000,
 }, async () => {
   const ports = await portRange(3);
@@ -383,7 +383,7 @@ test('list --json lists a real seven tab in sevenTabs and tabs, and an http stan
     assert.equal(entry.endpoint.sevenOpen, true);
     assert.deepEqual(ids(entry.endpoint.sevenTabs), [real]);
     assert.equal(entry.endpoint.sevenTabs[0].url, 'https://seven.sliccy.ai/');
-    assert.ok(ids(entry.endpoint.tabs).includes(real), listed.stdout);
+    assert.ok(!ids(entry.endpoint.tabs).includes(real), listed.stdout);
     assert.ok(!ids(entry.endpoint.tabs).includes(stand), listed.stdout);
     assert.ok(!listed.stdout.includes(`seven.sliccy.ai:${server.port}`), listed.stdout);
   } finally {
