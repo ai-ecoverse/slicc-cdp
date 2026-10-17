@@ -1,0 +1,72 @@
+{
+  "ucp": {
+    "version": "2026-08-25",
+    "services": {
+      "dev.ucp.shopping": [
+        {
+          "version": "2026-08-25",
+          "spec": "https://ucp.dev/2026-08-25/specification/overview/",
+          "transport": "rest",
+          "endpoint": "https://shop.example.test/ucp/v1",
+          "schema": "https://shop.example.test/schemas/rest.json"
+        },
+        {
+          "version": "2026-08-25",
+          "spec": "https://ucp.dev/2026-08-25/specification/overview/",
+          "transport": "mcp",
+          "endpoint": "https://shop.example.test/ucp/mcp"
+        },
+        {
+          "version": "2026-08-25",
+          "spec": "https://ucp.dev/2026-08-25/specification/overview/",
+          "transport": "a2a",
+          "endpoint": "https://shop.example.test/.well-known/agent-card.json"
+        },
+        {
+          "version": "2026-08-25",
+          "spec": "https://ucp.dev/2026-08-25/specification/overview/",
+          "transport": "embedded",
+          "schema": "https://shop.example.test/schemas/embedded.json"
+        }
+      ]
+    },
+    "capabilities": {
+      "dev.ucp.shopping.checkout": [
+        {
+          "version": "2026-08-25",
+          "spec": "https://shop.example.test/spec/checkout",
+          "schema": "https://shop.example.test/schemas/checkout.json"
+        }
+      ],
+      "dev.ucp.shopping.fulfillment": [
+        {
+          "version": "2026-08-25",
+          "spec": "https://shop.example.test/spec/fulfillment",
+          "schema": "https://shop.example.test/schemas/fulfillment.json",
+          "extends": "dev.ucp.shopping.checkout"
+        }
+      ]
+    },
+    "payment_handlers": {
+      "test.example.tokenizer": [
+        {
+          "id": "tokenizer",
+          "version": "2026-08-25",
+          "spec": "https://pay.example.test/spec",
+          "schema": "https://pay.example.test/schema.json"
+        }
+      ]
+    }
+  },
+  "keys": [
+    {
+      "kid": "test-key-1",
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "TEST-KEY-X-0001",
+      "y": "TEST-KEY-Y-0001",
+      "use": "sig",
+      "alg": "ES256"
+    }
+  ]
+}

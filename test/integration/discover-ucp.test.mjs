@@ -13,8 +13,8 @@ const root = path.resolve(here, '../..');
 const nativeDir = path.join(root, 'target/debug');
 const fixture = (name) => readFileSync(path.join(here, 'fixtures', name), 'utf8');
 
-const SPEC_BUSINESS = fixture('ucp-spec-business.json');
-const SPEC_AP2 = fixture('ucp-spec-ap2.json');
+const BUSINESS = fixture('ucp-business.json');
+const AP2 = fixture('ucp-ap2.json');
 const STOREFRONT = fixture('ucp-storefront.json');
 
 function parseEvents(stdout) {
@@ -78,41 +78,36 @@ test('discover UCP (/.well-known/ucp) with the AP2 extension', { timeout: 120_00
     };
 
     await t.test(
-      'the ucp.dev business-profile example (https://ucp.dev/specification/overview/, Apache-2.0) validates',
+      'a business profile with every transport, a capability extension and a signing key validates',
       async () => {
-        const { ucp, result } = await ucpOf(SPEC_BUSINESS);
+        const { ucp, result } = await ucpOf(BUSINESS);
         assert.equal(ucp.length, 1, result.stdout);
         const [e] = ucp;
         assert.equal(e.status, 'valid', JSON.stringify(e));
         assert.equal(e.via, 'well-known');
         assert.equal(e.summary.version, '2026-08-25');
-        assert.deepEqual(e.summary.mcp, ['https://business.example.com/ucp/mcp']);
-        assert.deepEqual(e.summary.a2a, [
-          'https://business.example.com/.well-known/agent-card.json',
-        ]);
+        assert.deepEqual(e.summary.mcp, ['https://shop.example.test/ucp/mcp']);
+        assert.deepEqual(e.summary.a2a, ['https://shop.example.test/.well-known/agent-card.json']);
         assert.deepEqual(
           e.summary.services['dev.ucp.shopping'].map((s) => s.transport),
           ['rest', 'mcp', 'a2a', 'embedded']
         );
         assert.ok(e.summary.capabilities.includes('dev.ucp.shopping.checkout@2026-08-25'));
-        assert.deepEqual(e.summary.paymentHandlers, ['com.example.processor_tokenizer']);
+        assert.deepEqual(e.summary.paymentHandlers, ['test.example.tokenizer']);
         assert.equal(e.summary.hasKeys, true);
         assert.equal(e.summary.ap2, false);
         assert.equal(e.summary.note, undefined);
-        assert.ok(!JSON.stringify(e).includes('JrQLj5P_89iXES9'), 'no key material');
+        assert.ok(!JSON.stringify(e).includes('TEST-KEY-X-0001'), 'no key material');
       }
     );
 
-    await t.test(
-      'the ucp.dev AP2 mandates profile example (https://ucp.dev/specification/payment/extensions/ap2-mandates/, Apache-2.0) sets ap2',
-      async () => {
-        const { ucp, result } = await ucpOf(SPEC_AP2);
-        assert.equal(ucp[0]?.status, 'valid', result.stdout);
-        assert.equal(ucp[0].summary.ap2, true);
-        assert.deepEqual(ucp[0].summary.services, {});
-        assert.equal(ucp[0].summary.hasKeys, false);
-      }
-    );
+    await t.test('a profile advertising the AP2 mandate capability sets ap2', async () => {
+      const { ucp, result } = await ucpOf(AP2);
+      assert.equal(ucp[0]?.status, 'valid', result.stdout);
+      assert.equal(ucp[0].summary.ap2, true);
+      assert.deepEqual(ucp[0].summary.services, {});
+      assert.equal(ucp[0].summary.hasKeys, false);
+    });
 
     await t.test(
       'a profile modelled on a public Shopify storefront profile (2026-10) validates with its MCP endpoint',
