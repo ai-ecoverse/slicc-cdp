@@ -169,6 +169,126 @@ Everything else goes over a flat session, with a top-level `sessionId`.
 
 `slicc-cdp-client` also lets a caller `IO.read` a stream that a session reply handed out (`crates/cdp-client/src/cdp.rs` `admit`).
 
+## Crates
+
+Each crate's crates.io README is its section below. `scripts/crate-readmes.mjs` writes it to `crates/<dir>/README.md` before `cargo publish`; the generated files are not in git.
+
+### slicc-cdp-client
+
+Shared Chrome DevTools Protocol connection for the `playwright-cli` and `curlwright` binaries.
+
+The crates.io name is `slicc-cdp-client`. The Rust library name stays `cdp_client`:
+
+```
+cdp-client = { package = "slicc-cdp-client", version = "1" }
+```
+
+One browser WebSocket. `Target.attachToTarget` uses `{targetId, flatten: true}`. Later page commands send that `sessionId` at the top level. There is no `/devtools/page/<id>` socket.
+
+#### Fetch interception
+
+`cdp_client::fetch` pauses requests on one target session. `Interception::attach(&mut cdp, target_id, &patterns)` checks the target, attaches, and sends `Fetch.enable`; dropping it, or `finish()`, sends `Fetch.disable` and detaches. `Interception::on_session` does the same on a session you already hold and leaves it attached. `cdp::detach` also forgets that session's paused requests.
+
+- `Pattern::request(glob)` and `Pattern::response(glob)` are CDP `urlPattern`s (`*`, `?`, `\` to escape) at the Request or Response stage, with an optional `resource_type`.
+- `next(timeout)` returns a `Paused`: `method`, `url`, `url_fragment`, `full_url()`, `headers`, `post_data`, and at the response stage `status`, `response_headers` and `location()`, which resolves `Location` against the request URL and keeps its fragment.
+- `decide(&paused, &Decision)` sends `Continue(Overrides)` (`continueRequest` with URL, method, body or headers), `ContinueResponse(ResponseOverrides)`, `Fulfill(Fulfill)` (`fulfillRequest`: status, headers, body; `Fulfill::signed_in()` is a short "Signed in, you can close this tab" page) or `Fail(ErrorReason)` (`failRequest`). `response_body(&paused)` is `Fetch.getResponseBody`, decoded.
+- `navigation(guard, event)` reads a `Page.frameNavigated` event as `url` plus `urlFragment`, for a redirect made by script.
+- `Cdp::set_decider(session, Some(Box<dyn FnMut(&Paused) -> Decision>))` answers pauses inline, even while another call waits for its reply, so a synchronous `Page.navigate` doesn't deadlock. A decision CDP rejects is retried as a plain continue and kept in `take_fetch_errors()`.
+
+#### Seven's origin is off limits
+
+`Cdp` filters every command and event the way slicc-cli's `cdp` relay does (slicc-cli README, "Seven's origin is off limits"). What is protected is `protectedOrigins` from the `slicc-browsers` crate: every `sliccy.ai` host, `vault.sliccy.ai` by name, `blob:`, `filesystem:` and `view-source:` URLs by their inner URL, `devtools:`, and the extra origins from `Cdp::protect_origins(&[...])`. `protected::Protected` parses URLs with a WHATWG parser and passes every vector in `protected.json`. Refusals are `slicc: refused: target is on seven's origin`, or a reason of their own after `slicc: refused: `. When the connection itself closes, the close frame (`websocket closed <code> <reason>`) is reported, never a refusal.
+
+- **Targets.** A target is protected when its URL is, or when it is on `about:blank` (or another inheriting URL) and was protected before or has a protected or unknown opener. A page session also becomes protected when its main frame commits a protected URL or `securityOrigin` (`Page.frameNavigated`), when its default context's origin is protected (`Runtime.executionContextCreated`), or when the target moves there (`Target.targetInfoChanged`). Such a session is detached, its events and results are dropped, and every later command on it is refused.
+- **Refused:** `Target.createTarget`, `Page.navigate` and anything else whose `url` is protected; `Page.navigateToHistoryEntry` to a protected entry; `attachToTarget`, `activateTarget`, `closeTarget`, `Browser.getWindowForTarget` and any command whose `targetId` or `frameId` is a protected target; every command on a protected session. `Target.getTargetInfo` and `Target.detachFromTarget` stay allowed.
+- **Origins, storage and cookies.** A command whose `origin`, `securityOrigin`, `topLevelSite`, `scopeURL` (and the rest of slicc-cli's list), `storageKey` or `cacheId` names a protected origin is refused. Free-form values (`expression`, `arguments`, `value`, `headers`, `postData`) aren't searched. Cookie readers answer without protected cookies, and cookie writers for a protected domain, URL or partition site are refused with `slicc: refused: cookies on seven's origin`. So are `Network.clearBrowserCookies` and `Storage.clearCookies`, except in a browser context this `Cdp` created.
+- **Browser-wide:** `Target.exposeDevToolsProtocol`, `Target.sendMessageToTarget`, `Target.attachToBrowserTarget`, `Tracing.start`, `Extensions.loadUnpacked`, `Fetch.*` without a session, permissions without an origin, and `Browser.resetPermissions` outside an own context. `Target.setAutoAttach` with `autoAttach: true` is refused: slicc-cdp does not support auto-attach.
+- **Requests a protected document makes.** When a touched target commits a protected origin all the same (back/forward cache, a protected `blob:`), seen by its guard session's `Page.frameNavigated` or `Runtime.executionContextCreated`, every page session on it gets `Fetch.disable` and is detached at once, and its pending pauses are continued unchanged. A paused request whose frame is a protected document, whose target is protected, or whose `Referer` or `Origin` is protected is continued unchanged and never reaches `next` or a decider, even when its URL isn't protected. Its `Network` events (by `documentURL`, `initiator` or `frameId`) are dropped.
+- **Requests.** A protected request's `Network.*` and `Fetch.*` events are dropped, `ExtraInfo` events are held until their request is known, and seven's cookies leave `associatedCookies`. Its body getters (`Network.getResponseBody`, `getRequestPostData`, `Fetch.getResponseBody`, `replayXHR` and the rest) are refused, and so is one for a request this `Cdp` never saw (`slicc: refused: slicc hasn't seen this request, so it could be seven's`). `IO.read` works only on a stream this `Cdp` handed out.
+- **Navigation by other means.** A target this `Cdp` attaches to or creates is touched. On it, `Cdp` attaches a session of its own, enables `Fetch` for document requests at the request stage plus `Network.setBypassServiceWorker`, and fails each document request into a protected origin with `BlockedByClient`. A script's `location`, a link, a meta refresh or a server redirect into the vault then shows Chrome's error page, and the target is protected from then on. `Target.createTarget` opens `about:blank`, touches it, and then navigates. The guard setup (`Target.setDiscoverTargets` the first time, the attach, `Fetch.enable`, `Network.enable` and `Network.setBypassServiceWorker`) shares one 30 s budget and fails closed when it runs out, refused as `…out of this target: <step> timed out`. `Page.enable` and `Runtime.enable` on that session are optional. When one of them times out, the setup goes on, `Cdp::unguarded_optional(target)` lists it, and `Cdp::take_notices()` returns `slicc: guard: <step> timed out; continuing`, which `playwright-cli` and `curlwright` print on stderr. A paused document request to a protected origin on your own `Fetch` is failed the same way, and other protected requests are continued unchanged; neither reaches `next` or a decider.
+- **Listing.** `Target.getTargets`, `getTargetInfo`, `targetCreated` and `targetInfoChanged` still show protected targets, but their `url` and `title` are only the origin. `Cdp::is_protected_target(id)` answers from what this `Cdp` has seen (listings, commits, refused sessions). `Cdp::target_protected(id, false)` asks the browser now, a tab that landed on the vault included, and records the answer, so both agree afterwards. `playwright-cli` and `curlwright` leave them out entirely.
+- **Limits.** As in slicc-cli: a document that arrives without a request (back/forward cache, a protected `blob:`) is caught only after it commits.
+
+`fetch::enable` refuses a pattern whose host part names a protected host (parsed, so `notsliccy.ai` and `?next=https://seven.sliccy.ai/` pass). A decision can't redirect to a protected URL by `url`, `Location` or `Refresh`.
+
+```rust
+use cdp_client::fetch::{Decision, Fulfill, Interception, Pattern};
+let mut seen = Interception::attach(&mut cdp, &target_id, &[Pattern::response("https://idp.example/authorize*")])?;
+let session = seen.session_id().to_string();
+seen.notify("Page.navigate", serde_json::json!({ "url": authorize_url }), Some(&session));
+if let Some(paused) = seen.next(std::time::Duration::from_secs(120))? {
+    let redirect = paused.location();
+    seen.decide(&paused, &Decision::Fulfill(Fulfill::signed_in()))?;
+}
+```
+
+Host builds use `native-tls` for `wss://` and for `https://` discovery, on macOS, Linux, and Windows. Rust 1.83 or newer. The `wasm32-wasip1` build has no TLS. This crate does not launch Chrome. Callers pass a DevTools WebSocket URL or an `http://` discovery URL.
+
+`cargo install slicc-cdp` installs the `playwright-cli` command. `cargo install curlwright` installs `curlwright`. `@ai-ecoverse/slicc-cdp` on npm ships their WASI builds for SLICC.
+
+### slicc-cdp
+
+`playwright-cli` is a playwright-cli-compatible command for SLICC and not affiliated with Microsoft Playwright.
+
+```
+cargo install slicc-cdp
+```
+
+That installs the `playwright-cli` command. Host `open` launches a browser into `<config>/slicc/seven-profiles/<id>` when no debugger is already connected, and inside slicc it only opens a tab.
+
+Host builds run on macOS, Linux, and Windows. Rust 1.88 or newer. Start Chrome with `--remote-debugging-port` and a non-default `--user-data-dir`, then pass that endpoint. Chrome 136 and later ignore the debugging port on the default profile. `--headless` is optional: leave it off to open a window.
+
+```
+google-chrome --headless --remote-debugging-port=9333 --user-data-dir=/tmp/chrome-cdp
+playwright-cli --cdp http://127.0.0.1:9333 open https://example.com
+playwright-cli --cdp http://127.0.0.1:9333 snapshot
+playwright-cli --cdp http://127.0.0.1:9333 tab-list
+playwright-cli list
+```
+
+`list` prints `connected`, `debug ports`, and `launchable`. An empty section is the line `none`. It does not launch a browser and does not open a websocket. On the host it probes `127.0.0.1:9222-9229`. `list --json` prints one JSON document and no text sections.
+
+On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
+
+`--cdp` wins, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort, else a loopback endpoint this tool saved under the user config dir. A `.playwright-cli/session.json` in the working directory is ignored. In the kernel, the wasm builds keep it at `<state>/slicc/playwright-cli/sessions/<hash>.json`, where `<state>` is `$XDG_STATE_HOME`, else `$XDG_CONFIG_HOME`, else `$HOME/.config`, and the hash is of `$PWD`. When that is not writable, `playwright-cli` prints `playwright-cli: running without saved state (<reason>)` on stderr and the command still succeeds, except `route` and `unroute`, which fail because they only save state. Host `list` GETs `/json/version` and `/json/list` on `127.0.0.1:9222-9229`, and host `open` GETs `/json/version` there when that port is absent or unreachable. `open` attaches to the first of those ports that answers, with or without a seven tab, and an unreachable seven-profiles port falls through to it. A successful command records a loopback endpoint and its provenance. A probe-derived session is reused while that browser answers, and every command shows all of its tabs except those on protected origins. Saved state never dials a non-loopback host. Host `open` and `tab-new` treat an unreachable saved endpoint as absent. Other commands report that connection error. When nothing answers, launch binds the first free port from 9222 to 9229, or lets Chrome pick one. `SLICC_CDP_PORTS=<from>-<to>`, for tests, replaces that range and stops every dial to loopback 9222-9229. The wasm build still uses port 9222. A host build dials `wss://`. The `wasm32-wasip1` binaries in the npm package `@ai-ecoverse/slicc-cdp` have no TLS.
+
+Implemented commands: `open`, `close`, `goto`, `snapshot`, `click`, `fill`, `type`, `press`, `screenshot`, `eval`, `tab-list`, `tab-new`, `tab-select`, `tab-close`, `console`, `requests`, `request`, `request-headers`, `request-body`, `response-headers`, `response-body`, `route`, `route-list`, `unroute`, `list`.
+
+```
+playwright-cli route "**/api/users" --body='[{"id":1}]' --content-type=application/json
+playwright-cli route "**/*.png" --fulfill-file ./pixel.png
+playwright-cli route-list
+playwright-cli unroute "**/api/users"
+```
+
+Routes are saved with the session and apply while a later command is attached to a tab. Requests to seven's origins and the vault are never routed.
+
+`playwright-cli --version` prints the crates.io version. A build from this repository prints the `package.json` version instead.
+
+### curlwright
+
+curl-style requests inside an already-open browser tab. The request is a page-context `fetch()`, so that tab's cookies, origin, and service worker apply.
+
+```
+cargo install curlwright
+```
+
+Host builds run on macOS, Linux, and Windows. Rust 1.83 or newer. Start Chrome with `--remote-debugging-port` and a non-default `--user-data-dir`. Chrome 136 and later ignore the debugging port on the default profile. `--headless` is optional: leave it off to open a window.
+
+```
+google-chrome --headless --remote-debugging-port=9333 --user-data-dir=/tmp/chrome-cdp
+curlwright --cdp http://127.0.0.1:9333 https://example.com/
+curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
+```
+
+On macOS the binary is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
+
+Connect order: `--cdp`, else `SLICC_CDP_URL`, else a live `seven-profiles` DevToolsActivePort whose directory name is a browser id. Dotfiles, including `.migrated-from-profiles`, are not profiles. On the host, if none of those exist, curlwright uses the first of `127.0.0.1:9222-9229` whose `/json/version` answers, as `playwright-cli` does, and exits when none does. Ports 9222-9229 inside those files are dialed like any other. The wasm build still uses port 9222. Without `--tab`, curlwright uses the `current` tab this tool saved for the working directory under the user config dir when that tab is still open, otherwise the single open tab on the URL's origin. It ignores a `.playwright-cli/session.json` in the working directory and does not read the saved endpoint. Any other case exits 2 and lists `--tab` choices.
+
+The npm package `@ai-ecoverse/slicc-cdp` ships the `wasm32-wasip1` build for SLICC. That build has no TLS.
+
+`curlwright --version` prints the crates.io version. A build from this repository prints the `package.json` version instead.
+
 ## Package
 
 Node ≥ 24. `npm run lint` runs `slicc-lint`. Releases use semantic-release on `main`. Git `package.json` stays `0.0.0`. The published version is the release tag.
