@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { CRATES, crateReadme } from '../../scripts/crate-readmes.mjs';
+import { CRATES, crateReadme, writeCrateReadmes } from '../../scripts/crate-readmes.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
@@ -33,4 +33,16 @@ test('the crate READMEs are generated, not tracked', () => {
     readFileSync(path.join(root, 'scripts/publish-crates.sh'), 'utf8'),
     /node scripts\/crate-readmes\.mjs/
   );
+});
+
+test('cargo packages the gitignored generated README into every crate', () => {
+  writeCrateReadmes();
+  for (const [name] of CRATES) {
+    const listed = spawnSync('cargo', ['package', '-p', name, '--list', '--allow-dirty'], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.ok(listed.stdout.split(/\r?\n/).includes('README.md'), `${name}: ${listed.stdout}`);
+  }
 });
