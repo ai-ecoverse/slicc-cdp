@@ -61,7 +61,13 @@ function json(frame) {
 
 export async function cdpProxy(
   wsUrl,
-  { delayGuardAttachMs = 0, failCloseTarget = false, browserEvents = true, delays = {} } = {}
+  {
+    delayGuardAttachMs = 0,
+    failCloseTarget = false,
+    browserEvents = true,
+    delays = {},
+    early = [],
+  } = {}
 ) {
   const pending = Object.fromEntries(
     Object.entries(delays).map(([method, { ms, times = 1 }]) => [method, { ms, times }])
@@ -75,6 +81,7 @@ export async function cdpProxy(
     sockets.add(browser);
     const held = new Set();
     const slowed = new Map();
+    const acked = new Set();
     let heldTarget = null;
     const upgraded = { up: false, down: false };
     let fromClient = Buffer.alloc(0);
@@ -108,6 +115,27 @@ export async function cdpProxy(
           slow.times -= 1;
           slowed.set(message.id, slow.ms);
         }
+        const ack = early.find(
+          (rule) =>
+            message?.method === rule.method &&
+            JSON.stringify(message.params ?? {}).includes(rule.match ?? '')
+        );
+        if (ack) {
+          acked.add(message.id);
+          toClient(
+            textFrame(
+              JSON.stringify({
+                id: message.id,
+                result: {},
+                ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+              })
+            )
+          );
+          setTimeout(() => {
+            if (!browser.destroyed) browser.write(frame.raw);
+          }, ack.ms);
+          continue;
+        }
         if (failCloseTarget && message?.method === 'Target.closeTarget') {
           toClient(
             textFrame(
@@ -134,6 +162,7 @@ export async function cdpProxy(
       for (const frame of out) {
         const message = json(frame);
         if (!browserEvents && message?.method && !message.sessionId) continue;
+        if (message?.id !== undefined && acked.delete(message.id)) continue;
         if (message?.id !== undefined && slowed.has(message.id)) {
           const ms = slowed.get(message.id);
           slowed.delete(message.id);

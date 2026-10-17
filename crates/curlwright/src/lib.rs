@@ -150,7 +150,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Err(stop) => {
             let output = Output::from_stop(stop);
             report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
-            return output;
+            return noted(&mut cdp, output);
         }
     };
     let effective_base = tab::effective_url(&request.url, tab_page_url.as_deref())
@@ -162,7 +162,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Err(message) => {
             let output = Output::plain(message, 1);
             report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
-            return output;
+            return noted(&mut cdp, output);
         }
     };
     let context = if let Some(frame) = opts.frame.as_deref().filter(|frame| !frame.is_empty()) {
@@ -172,7 +172,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
                 page::detach(&mut cdp, &session);
                 let output = Output::from_stop(stop);
                 report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
-                return output;
+                return noted(&mut cdp, output);
             }
         }
     } else {
@@ -188,6 +188,13 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Err(err) => render_failure(&opts, &request, &err, elapsed, &trace, &effective_base),
     };
     report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
+    noted(&mut cdp, output)
+}
+
+fn noted(cdp: &mut cdp_client::cdp::Cdp, mut output: Output) -> Output {
+    for notice in cdp.take_notices() {
+        output.stderr.push_str(&notice);
+    }
     output
 }
 

@@ -1545,6 +1545,45 @@ mod tests {
         )
     }
 
+    fn intercepting(seen: &mut Interception<'_>, session: &str, api: &str, app: &str) {
+        let mut active = false;
+        for probe in 1..=10 {
+            let url = format!("{api}?probe={probe}");
+            start_script(seen, session, &format!("fetch({}).catch(() => null)", json!(url)));
+            let until = Instant::now() + Duration::from_secs(2);
+            while let Some(paused) = seen
+                .next(until.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                assert!(paused.url.contains("?probe="), "{} paused before the real request", paused.url);
+                if paused.is_response() {
+                    seen.decide(&paused, &Decision::ContinueResponse(ResponseOverrides::default()))
+                        .unwrap();
+                    if active {
+                        break;
+                    }
+                } else {
+                    active = true;
+                    seen.decide(&paused, &Decision::Continue(Overrides::default()))
+                        .unwrap();
+                }
+            }
+            if active {
+                while let Some(paused) = seen.next(Duration::from_millis(300)).unwrap() {
+                    assert!(paused.url.contains("?probe="), "{} paused before the real request", paused.url);
+                    let decision = if paused.is_response() {
+                        Decision::ContinueResponse(ResponseOverrides::default())
+                    } else {
+                        Decision::Continue(Overrides::default())
+                    };
+                    seen.decide(&paused, &decision).unwrap();
+                }
+                return;
+            }
+        }
+        panic!("interception never became active: {}", unpaused(seen, session, app, api));
+    }
+
     fn start_script(cdp: &mut Cdp, session: &str, expression: &str) {
         let _ = cdp.notify(
             "Runtime.evaluate",
@@ -1648,6 +1687,7 @@ mod tests {
             )
             .unwrap();
             let session = seen.session_id().to_string();
+            intercepting(&mut seen, &session, &api, &app);
             start_script(
                 &mut seen,
                 &session,

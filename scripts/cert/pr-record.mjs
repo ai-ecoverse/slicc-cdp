@@ -126,7 +126,7 @@ for (const [source, positive, negative] of [
   }
 }
 const biosPin = json(new URL('./pr-bios.json', import.meta.url));
-validateBios(documents.bios, biosPin, emit);
+flags.push(...validateBios(documents.bios, biosPin, emit, plan, { base: baseline, candidate }));
 try {
   const checked = path.join(options.out, 'checksums.json');
   try {

@@ -1,7 +1,7 @@
 {
   "repository": "ai-ecoverse/slicc-bios",
   "workflow": ".github/workflows/canary.yml",
-  "commit": null,
+  "commit": "4025d6aabc2c06add216183064d81914a171cd64",
   "shards": ["packages-update-cdp", "guard"],
-  "state": "awaiting-merge-sha"
+  "state": "pinned"
 }
