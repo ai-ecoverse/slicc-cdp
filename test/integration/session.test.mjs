@@ -262,3 +262,132 @@ test('the saved session keeps no cookie, auth header, token query or request bod
     }
   }
 });
+
+async function withFixture(handler, body) {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-session-plant-'));
+  const cleanups = [cwd];
+  const server = createServer(handler);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const file = await sessionFile(cwd);
+    cleanups.push(file);
+    await body({ cwd, origin, file, wsUrl: browser.wsUrl });
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    await new Promise((resolve) => server.close(resolve));
+    for (const p of cleanups) {
+      await rm(p, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+test('the saved session drops console entries that hold a bare token', {
+  timeout: 60_000,
+}, async () => {
+  const tokens = {
+    openai: ['sk-test', 'PLNT0123456789abcdefXYZ'],
+    github: ['ghp_', 'PLNT0123456789abcdefghijklmnopqrstuv'],
+    githubPat: ['github_pat_', '11PLNT0123456789_abcdefghijklmnopqrstuvwxyz'],
+    aws: ['AKIA', 'PLNT0123456789AB'],
+    slack: ['xoxb-', '1234567890-PLNTabcdef'],
+    gitlab: ['glpat-', 'PLNT0123456789abcdefgh'],
+    entropy: ['Zk9xL3Rq2mWv8sPb7NcYd4hGe1', 'RaKu6TfQi0Xo5Jz9PLNT'],
+  };
+  const logs = Object.values(tokens)
+    .map(
+      ([head, tail]) => `console.log("value " + ${JSON.stringify(head)} + ${JSON.stringify(tail)});`
+    )
+    .join('');
+  const handler = (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(
+      `<!doctype html><title>plant</title><script>${logs}console.log("a plain sentence stays")</script>`
+    );
+  };
+  await withFixture(handler, async ({ cwd, origin, file, wsUrl }) => {
+    const open = await run(['--cdp', wsUrl, 'open', `${origin}/`], cwd);
+    assert.equal(open.code, 0, `open failed: ${open.stderr}`);
+    const text = await readFile(file, 'utf8');
+    const notes = Object.values(JSON.parse(text).console ?? {}).flat();
+    assert.ok(
+      notes.some((entry) => entry.text === 'a plain sentence stays'),
+      `the plain console entry was not saved: ${text}`
+    );
+    for (const [head, tail] of Object.values(tokens)) {
+      assert.ok(!text.includes(tail), `${head}${tail} is in the saved session: ${text}`);
+    }
+  });
+});
+
+test('the saved session redacts the query of a relative Location header', {
+  timeout: 60_000,
+}, async () => {
+  const handler = (req, res) => {
+    if (req.url.startsWith('/go')) {
+      res.writeHead(302, { location: '/next?token=PLNTLOC330&code=PLNTCODE330&page=2' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<!doctype html><title>next</title><p>next</p>');
+  };
+  await withFixture(handler, async ({ cwd, origin, file, wsUrl }) => {
+    const open = await run(['--cdp', wsUrl, 'open', `${origin}/go`], cwd);
+    assert.equal(open.code, 0, `open failed: ${open.stderr}`);
+    const text = await readFile(file, 'utf8');
+    const logged = Object.values(JSON.parse(text).requests ?? {}).flat();
+    const location = logged
+      .flatMap((entry) => entry.responseHeaders ?? [])
+      .find(([name]) => name.toLowerCase() === 'location');
+    assert.ok(location, `the redirect has no Location header: ${text}`);
+    for (const secret of ['PLNTLOC330', 'PLNTCODE330']) {
+      assert.ok(!text.includes(secret), `${secret} is in the saved session: ${text}`);
+    }
+    assert.equal(location[1], '/next?token=[redacted]&code=[redacted]&page=2');
+  });
+});
+
+test('the saved session keeps no response body and response-body says it was not saved', {
+  timeout: 60_000,
+}, async () => {
+  const handler = (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(
+      '<!doctype html><title>body</title><script>window.apiKey = "PLNT-PAGE-TOKEN-331"</script><p>body</p>'
+    );
+  };
+  await withFixture(handler, async ({ cwd, origin, file, wsUrl }) => {
+    const open = await run(['--cdp', wsUrl, 'open', `${origin}/page`], cwd);
+    assert.equal(open.code, 0, `open failed: ${open.stderr}`);
+    const text = await readFile(file, 'utf8');
+    assert.ok(
+      !text.includes('PLNT-PAGE-TOKEN-331'),
+      `the page body is in the saved session: ${text}`
+    );
+    const logged = Object.values(JSON.parse(text).requests ?? {}).flat();
+    const index = logged.findIndex((entry) => entry.url === `${origin}/page`) + 1;
+    assert.ok(index > 0, `the session has no page request: ${text}`);
+    assert.ok(
+      logged.every((entry) => entry.responseBody == null),
+      `a body was saved: ${text}`
+    );
+    const details = await run(['--cdp', wsUrl, 'request', String(index)], cwd);
+    assert.equal(details.code, 0, `request failed: ${details.stderr}`);
+    assert.ok(
+      details.stdout.includes('The response body is not kept in the saved session.'),
+      details.stdout
+    );
+    const body = await run(['--cdp', wsUrl, 'response-body', String(index)], cwd);
+    assert.notEqual(body.code, 0, `response-body succeeded: ${body.stdout}`);
+    assert.equal(
+      body.stderr,
+      `playwright-cli response-body: request #${index}: The response body is not kept in the saved session.\n`
+    );
+    assert.ok(!body.stdout.includes('PLNT-PAGE-TOKEN-331'), body.stdout);
+  });
+});

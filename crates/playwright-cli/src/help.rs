@@ -338,7 +338,7 @@ fn implemented_page(name: &str) -> Option<String> {
             "response-body <index>",
             &[
                 "Print the response body for one network request.",
-                "Text bodies are printed. Binary bodies are saved and the path is printed.",
+                "Response bodies are not kept in the saved session, so this reports that the body was not saved.",
             ],
             &[("<index>", "1-based request number from requests")],
             &[
@@ -639,5 +639,11 @@ mod tests {
         let text = super::implemented_page("discover").unwrap();
         assert!(text.contains("--probe robots"));
         assert!(text.contains("--probe nlweb"));
+    }
+
+    #[test]
+    fn response_body_help_says_bodies_are_not_saved() {
+        let text = super::implemented_page("response-body").unwrap();
+        assert!(text.contains("Response bodies are not kept in the saved session"));
     }
 }

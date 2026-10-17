@@ -14,10 +14,11 @@ Only the saved session file is redacted:
 
 - **Headers:** the values of `Cookie`, `Set-Cookie`, `Authorization`, `Proxy-Authorization`, and any request or response header whose name contains `token`, `secret`, `key`, `auth`, `session`, `csrf` or `cookie`, become `[redacted]`.
 - **URLs:** request URLs, URL-valued headers such as `Referer` and `Location`, and console source URLs lose their user info and fragment. Query values whose key contains `token`, `secret`, `key`, `auth`, `code`, `sig`, `session` or `password` become `[redacted]`.
-- **Request bodies:** dropped.
-- **Console entries:** dropped when the text holds a `Bearer` or `Basic` credential, a JWT, `cookie` with an `=`, or a pair such as `token=…` or `"password": "…"` whose value is at least 8 characters. Other entries are cut at 2048 bytes.
+- **URL-valued headers:** `Location`, `Content-Location`, `Referer`, `Refresh` and `Link` values that are relative, such as `Location: /next?token=abc`, are resolved against the request URL and get the same query redaction. A same-origin value is saved as its path and query.
+- **Request and response bodies:** dropped. The command that loaded the page keeps them in memory, but a later `response-body <index>` prints `The response body is not kept in the saved session.` and exits non-zero, and `request` says the same instead of pointing to `response-body`.
+- **Console entries:** dropped when the text holds a `Bearer` or `Basic` credential, a JWT, `cookie` with an `=`, or a pair such as `token=…` or `"password": "…"` whose value is at least 8 characters. They are also dropped when the text holds a bare token with a well-known prefix (`sk-`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `glpat-`, `xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, or a 20-character `AKIA…`/`ASIA…` key), or a run of at least 32 characters that looks random: hex with digits and letters, or base64 that mixes upper case, lower case and digits. Other entries are cut at 2048 bytes.
 
-The output of the command that captured an entry still shows it. Response bodies, route headers and the saved endpoint are kept as they are.
+The output of the command that captured an entry still shows it. Route headers and the saved endpoint are kept as they are.
 
 One browser WebSocket. `Target.attachToTarget` uses `{targetId, flatten: true}`. Later page commands send that `sessionId` at the top level. There is no `/devtools/page/<id>` socket.
 

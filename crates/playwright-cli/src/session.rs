@@ -266,13 +266,15 @@ fn names_secret(name: &str, words: &[&str]) -> bool {
     words.iter().any(|word| name.contains(word))
 }
 
-fn stored_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+fn stored_headers(headers: &[(String, String)], base: &str) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(name, value)| {
             let lowered = value.trim_start().to_ascii_lowercase();
             if names_secret(name, SECRET_HEADERS) {
                 (name.clone(), REDACTED.to_string())
+            } else if url_header(name) {
+                (name.clone(), stored_header_url(name, value, base))
             } else if lowered.starts_with("http://") || lowered.starts_with("https://") {
                 (name.clone(), stored_url(value))
             } else {
@@ -280,6 +282,68 @@ fn stored_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+fn url_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "location" | "content-location" | "referer" | "refresh" | "link"
+    )
+}
+
+fn stored_header_url(name: &str, value: &str, base: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "link" => stored_link(value, base),
+        "refresh" => stored_refresh(value, base),
+        _ => stored_ref(value.trim(), base),
+    }
+}
+
+fn stored_link(value: &str, base: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..=open]);
+        rest = &rest[open + 1..];
+        let close = rest.find('>').unwrap_or(rest.len());
+        out.push_str(&stored_ref(&rest[..close], base));
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn stored_refresh(value: &str, base: &str) -> String {
+    let Some(at) = value.to_ascii_lowercase().find("url=") else {
+        return value.to_string();
+    };
+    let (head, target) = value.split_at(at + 4);
+    let quote = target.chars().next().filter(|c| matches!(c, '"' | '\''));
+    let Some(quote) = quote else {
+        return format!("{head}{}", stored_ref(target.trim(), base));
+    };
+    let inner = target[1..].trim_end_matches(quote);
+    format!("{head}{quote}{}{quote}", stored_ref(inner, base))
+}
+
+fn stored_ref(raw: &str, base: &str) -> String {
+    let lowered = raw.to_ascii_lowercase();
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        return stored_url(raw);
+    }
+    let resolved = url::Url::parse(base)
+        .and_then(|base| base.join(raw).map(|url| (base, url)))
+        .ok()
+        .filter(|(_, url)| matches!(url.scheme(), "http" | "https"));
+    let Some((base, resolved)) = resolved else {
+        return stored_url(raw);
+    };
+    let stored = stored_url(resolved.as_str());
+    let origin = resolved.origin().ascii_serialization();
+    if base.origin().ascii_serialization() != origin {
+        return stored;
+    }
+    stored.strip_prefix(&origin).unwrap_or(&stored).to_string()
 }
 
 fn query_key(pair: &str) -> String {
@@ -374,9 +438,99 @@ fn holds_credential(lowered: &str, scheme: &str) -> bool {
     })
 }
 
+const TOKEN_PREFIXES: &[(&str, usize)] = &[
+    ("sk-", 16),
+    ("ghp_", 20),
+    ("gho_", 20),
+    ("ghu_", 20),
+    ("ghs_", 20),
+    ("ghr_", 20),
+    ("github_pat_", 20),
+    ("glpat-", 20),
+    ("xoxa-", 10),
+    ("xoxb-", 10),
+    ("xoxp-", 10),
+    ("xoxr-", 10),
+];
+
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
+}
+
+fn words(text: &str, part: fn(char) -> bool) -> impl Iterator<Item = &str> {
+    text.split(move |c: char| !part(c)).filter(|word| !word.is_empty())
+}
+
+fn holds_prefixed_token(text: &str) -> bool {
+    words(text, token_char).any(|word| {
+        TOKEN_PREFIXES.iter().any(|(prefix, min)| {
+            word.strip_prefix(prefix)
+                .is_some_and(|rest| rest.len() >= *min && rest.bytes().any(|b| b.is_ascii_digit()))
+        }) || aws_key(word)
+    })
+}
+
+fn aws_key(word: &str) -> bool {
+    word.len() == 20
+        && (word.starts_with("AKIA") || word.starts_with("ASIA"))
+        && word[4..].bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+fn entropy(word: &str) -> f64 {
+    let mut counts = [0usize; 256];
+    for byte in word.bytes() {
+        counts[byte as usize] += 1;
+    }
+    let len = word.len() as f64;
+    counts
+        .iter()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let p = *count as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+fn high_entropy(word: &str) -> bool {
+    let word = word.trim_end_matches('=');
+    if word.len() < 32 {
+        return false;
+    }
+    let digits = word.bytes().any(|b| b.is_ascii_digit());
+    if word.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return digits && word.bytes().any(|b| b.is_ascii_alphabetic()) && entropy(word) >= 3.0;
+    }
+    digits
+        && word.bytes().any(|b| b.is_ascii_uppercase())
+        && word.bytes().any(|b| b.is_ascii_lowercase())
+        && entropy(word) >= 4.0
+        && mixes_classes(word)
+}
+
+fn mixes_classes(word: &str) -> bool {
+    let classes: Vec<u8> = word
+        .bytes()
+        .filter_map(|b| match b {
+            b'A'..=b'Z' => Some(0),
+            b'a'..=b'z' => Some(1),
+            b'0'..=b'9' => Some(2),
+            _ => None,
+        })
+        .collect();
+    let switches = classes.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    switches * 20 >= (classes.len() - 1) * 7
+}
+
+fn holds_high_entropy(text: &str) -> bool {
+    words(text, |c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_')).any(high_entropy)
+}
+
 fn secret_text(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
-    holds_credential(&lowered, "bearer ")
+    holds_prefixed_token(text)
+        || holds_high_entropy(text)
+        || holds_credential(&lowered, "bearer ")
         || holds_credential(&lowered, "basic ")
         || (lowered.contains("cookie") && lowered.contains('='))
         || holds_jwt(text)
@@ -406,9 +560,11 @@ fn stored_console(entry: &ConsoleEntry) -> Option<Value> {
 fn stored_request(request: &NetRequest) -> Value {
     trace::request_json(&NetRequest {
         url: stored_url(&request.url),
-        request_headers: stored_headers(&request.request_headers),
-        response_headers: stored_headers(&request.response_headers),
+        request_headers: stored_headers(&request.request_headers, &request.url),
+        response_headers: stored_headers(&request.response_headers, &request.url),
         request_body: None,
+        response_body: None,
+        response_base64: false,
         ..request.clone()
     })
 }
@@ -850,12 +1006,12 @@ mod tests {
                     ("location".to_string(), "https://example.test/cb?state=1&code=l6".to_string()),
                 ],
                 request_body: Some("body".to_string()),
-                response_body: Some("ok".to_string()),
-                response_base64: false,
+                response_body: Some("BODY7SECRET".to_string()),
+                response_base64: true,
             }],
         );
         let written = encode(&session).to_string();
-        for secret in ["session=secret", "Bearer abc", "Basic def", "csrf1", "key1", "a=b", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\""] {
+        for secret in ["session=secret", "Bearer abc", "Basic def", "csrf1", "key1", "a=b", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
             assert!(!written.contains(secret), "{secret} was written: {written}");
         }
         assert_eq!(session.requests["T"][0].request_headers[0].1, "session=secret");
@@ -925,11 +1081,110 @@ mod tests {
             ]
         );
         assert_eq!(again.requests["T"][0].request_body, None);
-        assert_eq!(again.requests["T"][0].response_body.as_deref(), Some("ok"));
+        assert_eq!(again.requests["T"][0].response_body, None);
+        assert!(!again.requests["T"][0].response_base64);
+        assert_eq!(session.requests["T"][0].response_body.as_deref(), Some("BODY7SECRET"));
         clear_console(&mut again, "T");
         clear_requests(&mut again, "T");
         assert!(again.console.is_empty());
         assert!(again.requests.is_empty());
+    }
+
+    #[test]
+    fn bare_tokens_and_high_entropy_strings_drop_the_console_entry() {
+        let dropped = [
+            "key sk-testPLNT0123456789abcdefXYZ",
+            "sk-proj-PLNT_0123456789abcdefghij",
+            "ghp_PLNT0123456789abcdefghijklmnopqrstuv",
+            "gho_PLNT0123456789abcdefghij",
+            "ghu_PLNT0123456789abcdefghij",
+            "ghs_PLNT0123456789abcdefghij",
+            "ghr_PLNT0123456789abcdefghij",
+            "(github_pat_11PLNT0123456789_abcdefghijklmnopqrstuvwxyz)",
+            "aws AKIAPLNT0123456789AB.",
+            "ASIAPLNT0123456789AB",
+            "glpat-PLNT0123456789abcdefgh",
+            "xoxa-PLNT-0123456789",
+            "xoxb-1234567890-PLNTabcdef",
+            "xoxp-1234567890-PLNTabcdef",
+            "xoxr-1234567890-PLNTabcdef",
+            "hex 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "b64 Zk9xL3Rq2mWv8sPb7NcYd4hGe1RaKu6TfQi0Xo5Jz9==",
+            "b64 Zk9xL3Rq+mWv8sPb/NcYd4hGe1RaKu6TfQi0Xo5Jz9",
+        ];
+        for text in dropped {
+            assert!(secret_text(text), "{text}");
+        }
+        let kept = [
+            "a plain sentence about the checkout page",
+            "task-0123456789abcdefghijklmnop finished",
+            "sk-the-very-long-css-class-name-here",
+            "AKIA0123456789ABCDEFG",
+            "AKIAplnt0123456789ab",
+            "ghp_short1",
+            "xoxz-1234567890-PLNTabcdef",
+            "id 123e4567-e89b-12d3-a456-426614174000",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "0123456789012345678901234567890123456789",
+            "src/components/HeaderNavigationMenu2023/index",
+            "ReactDOMServerRenderingStream2Production",
+            "webpackChunk_N_E_app_layout_tsx_0123456",
+            "data-testid-ProductCard-Item-12345-Variant-B",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAAAAAAAAAA1",
+            "averyveryverylonglowercasewordwithdigits1234567890",
+            "Zk9xL3Rq2mWv8sPb7NcYd4hGe1Ra==",
+        ];
+        for text in kept {
+            assert!(!secret_text(text), "{text}");
+        }
+        assert_eq!(entropy("aaaa"), 0.0);
+        assert_eq!(entropy("abcd"), 2.0);
+    }
+
+    #[test]
+    fn relative_and_url_valued_headers_lose_their_secret_queries() {
+        let base = "https://example.test/start?q=1";
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        let headers = vec![
+            pair("Location", "/next?token=abc&page=2#frag"),
+            pair("location", "next?code=X&access_token=Y"),
+            pair("Content-Location", "?state=1&sig=Z"),
+            pair("Location", "//other.test/cb?code=C2"),
+            pair("Location", "//user:pw@example.test/cb?code=C3"),
+            pair("Location", "/\\evil.test/cb?code=C4"),
+            pair("Location", "HTTPS://example.test/cb?code=C5"),
+            pair("Location", "javascript:alert(1)?token=C6"),
+            pair("Link", "</a.css?token=L1>; rel=preload, <https://cdn.test/b?sig=L2>; rel=next, <broken?key=L3"),
+            pair("Refresh", "5; url=/r?token=R1"),
+            pair("Refresh", "0;URL='/r?code=R2'"),
+            pair("Refresh", "5"),
+            pair("Referer", "https://example.test/?code=R3"),
+            pair("x-forwarded", "https://example.test/?code=R4"),
+            pair("x-plain", "/keep?token=as-is"),
+        ];
+        let stored = stored_headers(&headers, base);
+        let values: Vec<&str> = stored.iter().map(|(_, value)| value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec![
+                "/next?token=[redacted]&page=2",
+                "/next?code=[redacted]&access_token=[redacted]",
+                "/start?state=1&sig=[redacted]",
+                "https://other.test/cb?code=[redacted]",
+                "/cb?code=[redacted]",
+                "https://evil.test/cb?code=[redacted]",
+                "HTTPS://example.test/cb?code=[redacted]",
+                "javascript:alert(1)?token=[redacted]",
+                "</a.css?token=[redacted]>; rel=preload, <https://cdn.test/b?sig=[redacted]>; rel=next, </broken?key=[redacted]",
+                "5; url=/r?token=[redacted]",
+                "0;URL='/r?code=[redacted]'",
+                "5",
+                "https://example.test/?code=[redacted]",
+                "https://example.test/?code=[redacted]",
+                "/keep?token=as-is",
+            ]
+        );
+        assert_eq!(stored_ref("/x?token=T", "not a url"), "/x?token=[redacted]");
     }
 
     #[test]
