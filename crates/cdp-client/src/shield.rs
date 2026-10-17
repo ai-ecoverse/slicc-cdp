@@ -1238,6 +1238,35 @@ mod tests {
         }
     }
 
+    fn until_history(
+        raw: &mut Raw,
+        session: &str,
+        what: &str,
+        done: impl Fn(Option<&str>) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let current = match raw.call("Page.getNavigationHistory", json!({}), Some(session)) {
+                Ok(history) => {
+                    let index = history["currentIndex"].as_u64().unwrap_or(0) as usize;
+                    Ok(history["entries"][index]["url"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string())
+                }
+                Err(error) if error.contains("Not attached to an active page") => Err(error),
+                Err(error) => panic!("Page.getNavigationHistory failed: {error}"),
+            };
+            if done(current.as_deref().ok()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} never happened: {current:?}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "needs SLICC_FETCH_LIVE_WS from test/integration/fetch.test.mjs"]
     fn live_guard_armed_while_a_navigation_commits() {
@@ -1252,7 +1281,7 @@ mod tests {
         raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
         raw.call(
             "Emulation.setCPUThrottlingRate",
-            json!({ "rate": 50 }),
+            json!({ "rate": 200 }),
             Some(&slow),
         )
         .unwrap();
@@ -1264,13 +1293,12 @@ mod tests {
             Some(&slow),
         )
         .unwrap();
-        raw.wait_event(Duration::from_secs(30), |event| {
-            event["method"] == "Page.frameNavigated"
-                && event["params"]["frame"]["url"]
-                    .as_str()
-                    .is_some_and(|url| url.contains("/landing"))
-        })
-        .expect("the renderer reported the landing");
+        until_history(&mut raw, &slow, "the js-redirect committed", |current| {
+            current.is_some_and(|url| url.contains("/js-redirect"))
+        });
+        until_history(&mut raw, &slow, "the landing went pending", |current| {
+            current.is_none()
+        });
         let session = client::attach(&mut cdp, &tab).unwrap();
         raw.call(
             "Emulation.setCPUThrottlingRate",
@@ -1278,7 +1306,24 @@ mod tests {
             Some(&slow),
         )
         .unwrap();
-        raw.wait_href(&slow, &landing);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let href = cdp
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": "document.readyState === 'complete' ? location.href : ''", "returnByValue": true }),
+                    Some(&session),
+                )
+                .map(|result| result["result"]["value"].clone());
+            if href.as_ref().is_ok_and(|href| href == &json!(landing)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the landing never loaded: {href:?}"
+            );
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+        }
 
         let frame = format!("{seven}/code?n=frame");
         cdp.call(

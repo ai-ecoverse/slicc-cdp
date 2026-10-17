@@ -99,23 +99,6 @@ impl Raw {
         }
     }
 
-    pub fn wait_event(
-        &mut self,
-        timeout: Duration,
-        matches: impl Fn(&Value) -> bool,
-    ) -> Option<Value> {
-        let deadline = Instant::now() + timeout;
-        while let Ok(Some(text)) = self.ws.recv_text(deadline) {
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if value.get("method").is_some() && matches(&value) {
-                return Some(value);
-            }
-        }
-        None
-    }
-
     pub fn close(&mut self, target: &str) {
         let _ = self.call("Target.closeTarget", json!({ "targetId": target }), None);
     }
