@@ -2,17 +2,36 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
-import { required, residual } from './pr-common.mjs';
+import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
+import { client, required, residual } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 import { validateBios, validateGuard, validateMac, validateSuite } from './pr-validate.mjs';
 
 const printVerdict = cliVerdict('pr-record: ');
-const options = args({ evidence: { type: 'string' } });
+const options = args({ evidence: { type: 'string' }, bindings: { type: 'string' } });
 const plan = json(path.join(options.evidence, 'plan.json'));
 const failures = [];
 const incomplete = [...(plan.issues ?? [])];
 const flags = [];
 const emit = (status, reason) => (status === 'FAIL' ? failures : incomplete).push(reason);
+let artifactBinding;
+if (options.bindings) {
+  try {
+    const { api } = client(plan.repository);
+    const inventory = await artifactInventory(api, plan.run);
+    let bindings;
+    try {
+      bindings = json(options.bindings);
+    } catch (error) {
+      emit('INCOMPLETE', `artifacts: ${error.message}`);
+    }
+    artifactBinding = artifactFindings(plan, bindings, inventory, { phase: 'record' });
+    for (const reason of artifactBinding.failures) emit('FAIL', `artifacts: ${reason}`);
+    for (const reason of artifactBinding.incomplete) emit('INCOMPLETE', `artifacts: ${reason}`);
+  } catch (error) {
+    emit('INCOMPLETE', `artifacts: ${error.message}`);
+  }
+}
 if (
   plan.mode !== 'pr' ||
   !plan.go ||
@@ -242,6 +261,7 @@ const record = {
   required,
   self: plan.self,
   upstream,
+  ...(options.bindings ? { artifactBinding } : {}),
   residual,
 };
 save(path.join(options.out, 'record.json'), record);

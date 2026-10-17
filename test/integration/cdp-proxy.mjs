@@ -50,6 +50,14 @@ function textFrame(text) {
   return Buffer.concat([head, payload]);
 }
 
+function maskedFrame(text) {
+  const plain = textFrame(text);
+  const head = plain.length - Buffer.byteLength(text);
+  const out = Buffer.concat([plain.subarray(0, head), Buffer.alloc(4), plain.subarray(head)]);
+  out[1] |= 0x80;
+  return out;
+}
+
 function json(frame) {
   if (frame.opcode !== 1) return null;
   try {
@@ -68,12 +76,14 @@ export async function cdpProxy(
     delays = {},
     early = [],
     transform = (message) => message,
+    before = [],
   } = {}
 ) {
   const pending = Object.fromEntries(
     Object.entries(delays).map(([method, { ms, times = 1 }]) => [method, { ms, times }])
   );
   const upstream = new URL(wsUrl);
+  const replies = [];
   const sockets = new Set();
   let delayed = false;
   const server = net.createServer((client) => {
@@ -83,6 +93,8 @@ export async function cdpProxy(
     const held = new Set();
     const slowed = new Map();
     const acked = new Set();
+    const injected = new Set();
+    let nextInjected = 2000000000;
     let heldTarget = null;
     const upgraded = { up: false, down: false };
     let fromClient = Buffer.alloc(0);
@@ -115,6 +127,25 @@ export async function cdpProxy(
         if (slow && slow.times > 0) {
           slow.times -= 1;
           slowed.set(message.id, slow.ms);
+        }
+        const lead = before.find(
+          (rule) =>
+            message?.method === rule.method &&
+            JSON.stringify(message.params ?? {}).includes(rule.match ?? '')
+        );
+        if (lead) {
+          nextInjected += 1;
+          injected.add(nextInjected);
+          browser.write(
+            maskedFrame(
+              JSON.stringify({
+                id: nextInjected,
+                method: lead.send.method,
+                params: lead.send.params ?? {},
+                ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+              })
+            )
+          );
         }
         const ack = early.find(
           (rule) =>
@@ -164,6 +195,10 @@ export async function cdpProxy(
         const message = json(frame);
         if (!browserEvents && message?.method && !message.sessionId) continue;
         if (message?.id !== undefined && acked.delete(message.id)) continue;
+        if (message?.id !== undefined && injected.delete(message.id)) {
+          replies.push(message);
+          continue;
+        }
         if (message?.id !== undefined && slowed.has(message.id)) {
           const ms = slowed.get(message.id);
           slowed.delete(message.id);
@@ -196,6 +231,7 @@ export async function cdpProxy(
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     url: `ws://127.0.0.1:${server.address().port}${upstream.pathname}`,
+    replies,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));

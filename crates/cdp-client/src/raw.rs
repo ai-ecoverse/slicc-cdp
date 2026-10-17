@@ -73,7 +73,7 @@ impl Raw {
             json!({ "expression": expression, "returnByValue": true, "awaitPromise": true, "userGesture": true }),
             Some(session),
         )
-        .unwrap()
+        .unwrap_or_else(|error| panic!("Runtime.evaluate {expression} failed: {error}"))
         .pointer("/result/value")
         .cloned()
         .unwrap_or(Value::Null)

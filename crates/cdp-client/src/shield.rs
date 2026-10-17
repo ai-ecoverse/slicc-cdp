@@ -1106,26 +1106,19 @@ mod tests {
             raw.close(&target);
         }
 
-        let hits = |raw: &mut Raw, scratch: &str| -> u64 {
-            let probe = raw.session(scratch);
-            raw.eval(
-                &probe,
-                &format!(
-                    "fetch({}).then((r) => r.text())",
-                    json!(format!("{app}/hits?path=/api/leak"))
-                ),
-            )
-            .as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0)
+        let hits = || -> u64 {
+            let url = format!("{app}/hits?path=/api/leak");
+            let response = crate::net::http_probe(&url, "text/plain")
+                .unwrap_or_else(|error| panic!("{url} failed: {}", error.trim()));
+            let text = String::from_utf8_lossy(&response.body).into_owned();
+            text.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{url} answered {text:?}"))
         };
-        let scratch = raw.create(&format!("{app}/one"));
-        std::thread::sleep(Duration::from_millis(500));
 
         {
             let leak = format!("{app}/api/leak");
-            let before = hits(&mut raw, &scratch);
+            let before = hits();
             let (target, session) = page_on(&mut cdp, "about:blank");
             let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
             let record = seen.clone();
@@ -1160,11 +1153,7 @@ mod tests {
                 "{:?}",
                 seen.borrow()
             );
-            assert_eq!(
-                hits(&mut raw, &scratch),
-                before,
-                "the vault page ran and sent its request"
-            );
+            assert_eq!(hits(), before, "the vault page ran and sent its request");
             nothing_mentions(&cdp, "LEAKKEY");
             raw.close(&target);
         }
@@ -1172,7 +1161,7 @@ mod tests {
         {
             let idp = live("SLICC_FETCH_LIVE_IDP");
             let leak = format!("{app}/api/leak");
-            let before = hits(&mut raw, &scratch);
+            let before = hits();
             let mut slipped = Cdp::connect(&ws).unwrap();
             let (target, session) = page_on(&mut slipped, &format!("{idp}/landing"));
             let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -1199,7 +1188,7 @@ mod tests {
                 seen.borrow()
             );
             assert_eq!(
-                hits(&mut raw, &scratch),
+                hits(),
                 before + 1,
                 "the request was not continued unchanged"
             );
@@ -1207,11 +1196,159 @@ mod tests {
             nothing_mentions(&slipped, "api/leak");
             raw.close(&target);
         }
-        raw.close(&scratch);
 
         nothing_mentions(&cdp, "SECRETKEY");
         nothing_mentions(&cdp, "COOKIESECRET");
         raw.close(&seven_tab);
         raw.close(&vault_tab);
+    }
+
+    fn fixture_hits(app: &str, path: &str) -> String {
+        crate::net::http_probe(&format!("{app}/hits?path={path}"), "text/plain")
+            .map(|response| String::from_utf8_lossy(&response.body).into_owned())
+            .unwrap_or_else(|error| format!("unknown ({})", error.trim()))
+    }
+
+    fn guard_failed(cdp: &mut Cdp, url: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if cdp
+                .paused_trail
+                .iter()
+                .any(|(_, seen, reason)| seen.starts_with(url) && *reason == "guard session")
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+        }
+    }
+
+    fn until_history(
+        raw: &mut Raw,
+        session: &str,
+        what: &str,
+        done: impl Fn(Option<&str>) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let current = match raw.call("Page.getNavigationHistory", json!({}), Some(session)) {
+                Ok(history) => {
+                    let index = history["currentIndex"].as_u64().unwrap_or(0) as usize;
+                    Ok(history["entries"][index]["url"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string())
+                }
+                Err(error) if error.contains("Not attached to an active page") => Err(error),
+                Err(error) => panic!("Page.getNavigationHistory failed: {error}"),
+            };
+            if done(current.as_deref().ok()) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} never happened: {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs SLICC_FETCH_LIVE_WS from test/integration/fetch.test.mjs"]
+    fn live_guard_armed_while_a_navigation_commits() {
+        let ws = live("SLICC_FETCH_LIVE_WS");
+        let app = live("SLICC_FETCH_LIVE_APP");
+        let idp = live("SLICC_FETCH_LIVE_IDP");
+        let seven = live("SLICC_FETCH_LIVE_SEVEN");
+        let mut raw = Raw::open(&ws);
+        let mut cdp = Cdp::connect(&ws).unwrap();
+        let tab = raw.create("about:blank");
+        let slow = raw.session(&tab);
+        raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
+        raw.call(
+            "Emulation.setCPUThrottlingRate",
+            json!({ "rate": 200 }),
+            Some(&slow),
+        )
+        .unwrap();
+        let landing = format!("{app}/landing?n=window");
+        let to: String = url::form_urlencoded::byte_serialize(landing.as_bytes()).collect();
+        raw.call(
+            "Page.navigate",
+            json!({ "url": format!("{idp}/js-redirect?to={to}") }),
+            Some(&slow),
+        )
+        .unwrap();
+        until_history(&mut raw, &slow, "the js-redirect committed", |current| {
+            current.is_some_and(|url| url.contains("/js-redirect"))
+        });
+        until_history(&mut raw, &slow, "the landing went pending", |current| {
+            current.is_none()
+        });
+        let session = client::attach(&mut cdp, &tab).unwrap();
+        raw.call(
+            "Emulation.setCPUThrottlingRate",
+            json!({ "rate": 1 }),
+            Some(&slow),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let href = cdp
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": "document.readyState === 'complete' ? location.href : ''", "returnByValue": true }),
+                    Some(&session),
+                )
+                .map(|result| result["result"]["value"].clone());
+            if href.as_ref().is_ok_and(|href| href == &json!(landing)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the landing never loaded: {href:?}"
+            );
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+        }
+
+        let frame = format!("{seven}/code?n=frame");
+        cdp.call(
+            "Runtime.evaluate",
+            json!({ "expression": format!("const f = document.createElement('iframe'); f.src = {}; document.body.appendChild(f); true", json!(frame)) }),
+            Some(&session),
+        )
+        .unwrap();
+        assert!(
+            guard_failed(&mut cdp, &frame),
+            "the guard never saw the seven iframe"
+        );
+        assert_eq!(
+            fixture_hits(&app, "/code"),
+            "0",
+            "the seven iframe reached the network"
+        );
+
+        let main = format!("{seven}/dump?n=main");
+        cdp.call(
+            "Runtime.evaluate",
+            json!({ "expression": format!("setTimeout(() => {{ location.href = {}; }}, 50); true", json!(main)) }),
+            Some(&session),
+        )
+        .unwrap();
+        assert!(
+            guard_failed(&mut cdp, &main),
+            "the guard never saw the seven navigation"
+        );
+        until_blocked(&mut cdp, &session);
+        assert_eq!(
+            fixture_hits(&app, "/dump"),
+            "0",
+            "the seven navigation reached the network"
+        );
+        nothing_mentions(&cdp, "n=main");
+        nothing_mentions(&cdp, "n=frame");
+        raw.close(&tab);
     }
 }
