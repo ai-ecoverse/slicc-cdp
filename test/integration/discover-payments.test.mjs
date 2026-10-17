@@ -96,7 +96,7 @@ test('discover HTTP 402 payment challenges', { timeout: 120_000 }, async (t) => 
         res.end(body);
       };
       if (url.pathname === '/') {
-        const imgs = [
+        const fetches = [
           '/x402-v1',
           '/x402-v2',
           '/mpp',
@@ -104,10 +104,10 @@ test('discover HTTP 402 payment challenges', { timeout: 120_000 }, async (t) => 
           '/bad',
           `http://vault.sliccy.ai:${vaultPort}/pay`,
         ]
-          .map((src) => `<img src="${src}">`)
+          .map((src) => `fetch(${JSON.stringify(src)}).then((r) => r.text()).catch(() => {});`)
           .join('');
         res.writeHead(200, { 'content-type': 'text/html' });
-        res.end(`<!doctype html><title>Paid</title>${imgs}`);
+        res.end(`<!doctype html><title>Paid</title><script>${fetches}</script>`);
         return;
       }
       if (url.pathname === '/x402-v1')
