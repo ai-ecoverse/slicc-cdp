@@ -82,6 +82,7 @@ export async function cdpProxy(
     Object.entries(delays).map(([method, { ms, times = 1 }]) => [method, { ms, times }])
   );
   const upstream = new URL(wsUrl);
+  const replies = [];
   const sockets = new Set();
   let delayed = false;
   const server = net.createServer((client) => {
@@ -193,7 +194,10 @@ export async function cdpProxy(
         const message = json(frame);
         if (!browserEvents && message?.method && !message.sessionId) continue;
         if (message?.id !== undefined && acked.delete(message.id)) continue;
-        if (message?.id !== undefined && injected.delete(message.id)) continue;
+        if (message?.id !== undefined && injected.delete(message.id)) {
+          replies.push(message);
+          continue;
+        }
         if (message?.id !== undefined && slowed.has(message.id)) {
           const ms = slowed.get(message.id);
           slowed.delete(message.id);
@@ -226,6 +230,7 @@ export async function cdpProxy(
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     url: `ws://127.0.0.1:${server.address().port}${upstream.pathname}`,
+    replies,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
