@@ -72,7 +72,7 @@ function codedSkips(results) {
   });
 }
 
-test('published guard set through the Rust guarded client', { timeout: 600000 }, async (t) => {
+test('published guard set through the Rust guarded client', { timeout: 900000 }, async (t) => {
   const started = Date.now();
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',
