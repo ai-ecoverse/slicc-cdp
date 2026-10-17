@@ -1,8 +1,10 @@
 import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, cleanEnv, digest, json, root, run, save, tree } from './common.mjs';
 import { prIdentity } from './pr-common.mjs';
 
+const printVerdict = cliVerdict('pr-pack: ');
 const options = args({
   side: { type: 'string' },
   target: { type: 'string', default: 'wasm32-wasip1' },
@@ -111,3 +113,4 @@ save(path.join(options.out, 'build.json'), {
   lockSha256: digest(path.join(source, 'Cargo.lock')),
   files,
 });
+printVerdict('PASS', options.out);

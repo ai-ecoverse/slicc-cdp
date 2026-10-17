@@ -62,7 +62,7 @@ jobs:
 
   ci:
     needs: runner
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.23.1
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.23.2
     with:
       chromium: false
       runs-on: ${{ needs.runner.outputs.runner }}
@@ -87,7 +87,7 @@ jobs:
         run: |
           if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
           npm run -s browser -- $deps
-      - run: npm run test:integration
+      - run: node scripts/gate.mjs integration -- npm run test:integration
         env:
           SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
       - name: Guard regression report
@@ -123,7 +123,7 @@ jobs:
       - name: Run WebMCP integration tests
         run: |
           cargo build -p slicc-cdp -p curlwright
-          node --test --test-timeout=600000 test/integration/webmcp.test.mjs
+          node scripts/gate.mjs webmcp --tap -- node --test --test-reporter=tap --test-timeout=600000 test/integration/webmcp.test.mjs
 
   shellcheck:
     runs-on: ubuntu-latest

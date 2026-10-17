@@ -77,7 +77,16 @@ export async function main(
   return 2;
 }
 
-const invoked = process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+function isMain(argv1, moduleUrl) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+const invoked = isMain(process.argv[1], import.meta.url);
 if (invoked) {
   main(process.argv.slice(2)).then(
     (code) => {

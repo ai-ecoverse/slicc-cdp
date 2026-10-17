@@ -60,3 +60,4 @@ if (process.env.GITHUB_OUTPUT)
     `certified=${record.certified}\nsha256=${record.sha256 ?? ''}\nstate=${record.certified ? 'success' : record.status === 'INCOMPLETE' ? 'error' : 'failure'}\n`
   );
 console.log(record.line);
+console.log(`cert-record: ${record.status} ${record.version}`);

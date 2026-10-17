@@ -1,10 +1,12 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
 import { required, residual } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 import { validateBios, validateGuard, validateMac, validateSuite } from './pr-validate.mjs';
 
+const printVerdict = cliVerdict('pr-record: ');
 const options = args({ evidence: { type: 'string' } });
 const plan = json(path.join(options.evidence, 'plan.json'));
 const failures = [];
@@ -245,3 +247,4 @@ const record = {
 save(path.join(options.out, 'record.json'), record);
 writeFileSync(path.join(options.out, 'line.txt'), `${line}\n`);
 console.log(line);
+printVerdict(record.status, options.out);

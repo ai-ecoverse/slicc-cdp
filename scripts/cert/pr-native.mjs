@@ -1,9 +1,11 @@
 import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, json, root, run, save } from './common.mjs';
 import { prIdentity } from './pr-common.mjs';
 import { integrity, unpackLocal } from './pr-subject.mjs';
 
+const printVerdict = cliVerdict('pr-native: ');
 const options = args({
   directory: { type: 'string' },
   action: { type: 'string', default: 'collect' },
@@ -80,3 +82,4 @@ if (options.action === 'sign-input') {
     files,
   });
 }
+printVerdict('PASS', options.action);

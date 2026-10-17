@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -27,7 +27,10 @@ for (const target of [
     };
     const save = (file, value) => writeFileSync(path.join(directory, file), JSON.stringify(value));
     mkdirSync(path.join(directory, 'scripts/cert'), { recursive: true });
-    for (const file of ['common.mjs', 'pr-common.mjs', 'pr-pack.mjs'])
+    const files = ['common.mjs', 'pr-common.mjs', 'pr-pack.mjs'];
+    if (existsSync(path.join(control, 'scripts/cert/cli-verdict.mjs')))
+      files.push('cli-verdict.mjs');
+    for (const file of files)
       copyFileSync(
         path.join(control, 'scripts/cert', file),
         path.join(directory, 'scripts/cert', file)

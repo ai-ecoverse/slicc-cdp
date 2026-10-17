@@ -22,4 +22,4 @@ try {
 } finally {
   rmSync(temporary, { force: true });
 }
-console.log(`checksummed ${files.length} release assets`);
+console.log(`release-checksums: PASS ${files.length} assets`);

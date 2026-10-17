@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, identity, json, save } from './common.mjs';
 import { hash } from './pr-common.mjs';
 
@@ -7,6 +8,7 @@ function toolUse(value) {
   return value.type === 'tool_use' || Object.values(value).some(toolUse);
 }
 
+const printVerdict = cliVerdict('pr-review: ');
 const options = args({ verdict: { type: 'string' }, execution: { type: 'string' } });
 const plan = json(options.plan);
 let verdict;
@@ -74,3 +76,4 @@ save(options.out, {
   head: plan.head,
   commit: plan.commit,
 });
+printVerdict(reason ? 'INCOMPLETE' : verdict.status, options.out);

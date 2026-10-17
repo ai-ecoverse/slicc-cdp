@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, json, root, run, save } from './common.mjs';
 
+const printVerdict = cliVerdict('pr-proofs: ');
 const options = args();
 const plan = json(options.plan);
 if (plan.mode !== 'pr' || !plan.go) throw new Error('proof derivation needs an eligible PR plan');
@@ -57,3 +59,4 @@ const result = JSON.parse(
 plan.proofs = result;
 plan.fixes = result.fixes;
 save(options.out, plan);
+printVerdict(plan.status, options.out);

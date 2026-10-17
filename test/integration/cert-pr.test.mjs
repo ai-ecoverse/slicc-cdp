@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertVerdict, stdoutDocument } from './cert-cli-verdict.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const repository = 'fixture/lane';
@@ -135,6 +136,27 @@ async function cli(script, argv, f, api, extra = {}) {
     child.once('error', reject);
     child.once('close', resolve);
   });
+  if (['pr-plan.mjs', 'pr-report.mjs'].includes(script)) {
+    const document = stdoutDocument(stdout);
+    const status =
+      script === 'pr-plan.mjs'
+        ? document.go || document.status === 'PASS'
+          ? 'PASS'
+          : document.status
+        : document.status === 'NOOP'
+          ? 'PASS'
+          : document.status;
+    const line = assertVerdict(stdout, script.replace(/\.mjs$/, ''), status);
+    if (script === 'pr-plan.mjs')
+      assert.equal(line, `pr-plan: ${status} go=${document.go} document=${document.status}`);
+    else assert.equal(line, `pr-report: ${status} document=${document.status}`);
+  }
+  if (script === 'pr-record.mjs')
+    assertVerdict(
+      stdout,
+      'pr-record',
+      read(path.join(argv[argv.indexOf('--out') + 1], 'record.json')).status
+    );
   return { exit, stdout, stderr };
 }
 
@@ -339,7 +361,7 @@ for (const scenario of ['absent', 'malformed', 'wrong identity'])
       api
     );
     assert.equal(result.exit, 1);
-    const output = JSON.parse(result.stdout);
+    const output = stdoutDocument(result.stdout);
     assert.equal(output.status, 'INCOMPLETE');
     assert.equal(output.head, f.head);
     const statuses = api.calls.filter((call) => call.pathname === `statuses/${f.head}`);
@@ -360,7 +382,7 @@ test('PR cert reporter never posts on a stale head and invalidates removed merge
     f,
     api
   );
-  assert.equal(JSON.parse(stale.stdout).status, 'NOOP');
+  assert.equal(stdoutDocument(stale.stdout).status, 'NOOP');
   assert.equal(api.calls.filter((call) => call.method === 'POST').length, 0);
   f.pull.head.sha = f.head;
   f.pull.labels = [];
@@ -371,7 +393,7 @@ test('PR cert reporter never posts on a stale head and invalidates removed merge
     api
   );
   assert.equal(removed.exit, 1);
-  assert.equal(JSON.parse(removed.stdout).status, 'INCOMPLETE');
+  assert.equal(stdoutDocument(removed.stdout).status, 'INCOMPLETE');
   assert.equal(
     api.calls.find((call) => call.pathname === `statuses/${f.head}`).body.state,
     'error'
@@ -384,7 +406,7 @@ test('PR cert reporter explicitly succeeds not behaviour without a full review',
   const { file, out } = await planned(f, api);
   const result = await cli('pr-report.mjs', ['--event', file, '--plan', out], f, api);
   assert.equal(result.exit, 0, result.stderr);
-  const record = JSON.parse(result.stdout);
+  const record = stdoutDocument(result.stdout);
   assert.match(record.line, /not behaviour/);
   assert.equal(record.fullReviewTriggered, false);
   assert.equal(
@@ -490,7 +512,7 @@ test('PR cert reporter deduplicates test-only full-review count across reruns', 
       api
     );
     assert.equal(result.exit, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout).testOnlyPRCountContribution, 1);
+    assert.equal(stdoutDocument(result.stdout).testOnlyPRCountContribution, 1);
   }
   assert.equal(
     api.calls.filter((call) => call.method === 'POST' && call.pathname === 'issues/10/comments')
@@ -645,7 +667,7 @@ for (const scenario of [
     const result = await cli('pr-report.mjs', options, f, api);
     const refused = Object.keys(scenario).length > 1;
     assert.equal(result.exit, refused ? 1 : 0, result.stderr);
-    const group = JSON.parse(result.stdout);
+    const group = stdoutDocument(result.stdout);
     assert.equal(group.status, scenario.corrupt ? 'FAIL' : refused ? 'INCOMPLETE' : 'PASS');
     const status = api.calls.find((call) => call.pathname === `statuses/${head}`);
     assert.equal(status.body.state, scenario.corrupt ? 'failure' : refused ? 'error' : 'success');

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertVerdict } from './cert-cli-verdict.mjs';
 
 const plan = { head: 'a'.repeat(40), commit: 'b'.repeat(40) };
 const verdict = { status: 'PASS', ...plan, reason: 'complete evidence', known: [] };
@@ -148,6 +149,7 @@ for (const [name, receipt, expected] of cases) {
     assert.equal(invocation.status, 0, invocation.stderr);
     const document = JSON.parse(readFileSync(file('review.json')));
     assert.equal(document.status, expected);
+    assertVerdict(invocation.stdout, 'pr-review', document.status);
     assert.equal(document.head, plan.head);
     assert.equal(document.commit, plan.commit);
     if (name.includes('Read') || name === 'MCP server in init' || name.includes('tool_use despite'))

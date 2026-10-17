@@ -135,3 +135,4 @@ if (process.env.GITHUB_OUTPUT)
   appendFileSync(process.env.GITHUB_OUTPUT, `version=${plan.version}\nrust=${plan.rust ?? ''}\n`);
 console.log(JSON.stringify(identity(plan)));
 console.log(readFileSync(options.out, 'utf8'));
+console.log(`plan: PASS ${plan.version} ${options.out}`);

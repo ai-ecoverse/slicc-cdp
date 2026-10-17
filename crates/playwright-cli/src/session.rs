@@ -251,8 +251,8 @@ fn encode(session: &Session) -> Value {
         "sessionName": session.session_name,
         "owned": session.owned,
         "snapshots": snapshots,
-        "console": encode_lists(&session.console, trace::console_json),
-        "requests": encode_lists(&session.requests, stored_request),
+        "console": encode_lists(&session.console, stored_console),
+        "requests": encode_lists(&session.requests, |request| Some(stored_request(request))),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
     })
 }
@@ -290,8 +290,20 @@ fn query_key(pair: &str) -> String {
         .unwrap_or_default()
 }
 
+fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 fn stored_url(url: &str) -> String {
-    let url = url.split('#').next().unwrap_or("");
+    let url = without_userinfo(url.split('#').next().unwrap_or(""));
+    let url = url.as_str();
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
     };
@@ -308,6 +320,89 @@ fn stored_url(url: &str) -> String {
     format!("{base}?{}", pairs.join("&"))
 }
 
+const CONSOLE_LIMIT: usize = 2048;
+
+fn base64url(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
+}
+
+fn holds_jwt(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices("eyJ").any(|(at, _)| {
+        let mut i = at;
+        for part in 0..2 {
+            let start = i;
+            while i < bytes.len() && base64url(bytes[i]) {
+                i += 1;
+            }
+            if i - start < 8 || bytes.get(i) != Some(&b'.') {
+                return false;
+            }
+            i += 1;
+            if part == 1 {
+                return i < bytes.len() && base64url(bytes[i]);
+            }
+        }
+        false
+    })
+}
+
+fn holds_secret_pair(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.match_indices(['=', ':']).any(|(at, _)| {
+        let before = lowered[..at].trim_end_matches([' ', '"', '\'']);
+        let start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+            .map_or(0, |found| found + 1);
+        let key = &before[start..];
+        let value: String = lowered[at + 1..]
+            .trim_start_matches([' ', '"', '\''])
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | ',' | '&' | '"' | '\''))
+            .collect();
+        value.len() >= 8 && names_secret(key, SECRET_QUERY)
+    })
+}
+
+fn holds_credential(lowered: &str, scheme: &str) -> bool {
+    lowered.match_indices(scheme).any(|(at, _)| {
+        lowered[at + scheme.len()..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | ','))
+            .count()
+            >= 8
+    })
+}
+
+fn secret_text(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    holds_credential(&lowered, "bearer ")
+        || holds_credential(&lowered, "basic ")
+        || (lowered.contains("cookie") && lowered.contains('='))
+        || holds_jwt(text)
+        || holds_secret_pair(text)
+}
+
+fn stored_console(entry: &ConsoleEntry) -> Option<Value> {
+    if secret_text(&entry.text) {
+        return None;
+    }
+    let mut text = entry.text.clone();
+    if text.len() > CONSOLE_LIMIT {
+        let mut cut = CONSOLE_LIMIT;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("…[truncated]");
+    }
+    Some(trace::console_json(&ConsoleEntry {
+        text,
+        url: stored_url(&entry.url),
+        ..entry.clone()
+    }))
+}
+
 fn stored_request(request: &NetRequest) -> Value {
     trace::request_json(&NetRequest {
         url: stored_url(&request.url),
@@ -320,13 +415,13 @@ fn stored_request(request: &NetRequest) -> Value {
 
 fn encode_lists<T>(
     tabs: &BTreeMap<String, Vec<T>>,
-    encode_one: fn(&T) -> Value,
+    encode_one: fn(&T) -> Option<Value>,
 ) -> Value {
     let mut object = serde_json::Map::new();
     for (target, entries) in tabs {
         object.insert(
             target.clone(),
-            Value::Array(entries.iter().map(encode_one).collect()),
+            Value::Array(entries.iter().filter_map(encode_one).collect()),
         );
     }
     Value::Object(object)
@@ -343,11 +438,12 @@ pub fn push_trace(
         for entry in console {
             if !entry.stamp.is_empty()
                 && stored.iter().any(|have| {
-                    have.stamp == entry.stamp
+                    (have.stamp == entry.stamp
                         && have.kind == entry.kind
                         && have.text == entry.text
                         && have.url == entry.url
-                        && have.line == entry.line
+                        && have.line == entry.line)
+                        || stored_console(have).is_some_and(|saved| Some(saved) == stored_console(&entry))
                 })
             {
                 continue;
@@ -680,6 +776,44 @@ mod tests {
     }
 
     #[test]
+    fn console_entries_that_look_secret_are_not_saved() {
+        let entry = |text: &str| ConsoleEntry {
+            kind: "log".to_string(),
+            text: text.to_string(),
+            url: "https://example.test/app.js?sig=abc123#L4".to_string(),
+            line: 1,
+            stamp: String::new(),
+        };
+        let texts = [
+            "Authorization: Bearer abcdefgh12345678",
+            "creds Basic dXNlcjpwYXNzd29yZA==",
+            "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl",
+            "document.cookie = sid=abc; theme=dark",
+            "{\"access_token\":\"abcdefgh12345678\"}",
+            "password=hunter2hunter2",
+            "kept: cookie banner shown",
+            "kept: the session ended",
+            "kept: basic usage",
+        ];
+        let mut session = Session::default();
+        push_trace(
+            &mut session,
+            "T",
+            texts.iter().map(|text| entry(text)).collect(),
+            Vec::new(),
+        );
+        push_trace(&mut session, "T", vec![entry(&"x".repeat(5000))], Vec::new());
+        let written = encode(&session).to_string();
+        let again = decode(&written);
+        let kept: Vec<&str> = again.console["T"].iter().map(|entry| entry.text.as_str()).collect();
+        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert_eq!(&kept[..3], ["kept: cookie banner shown", "kept: the session ended", "kept: basic usage"]);
+        assert!(kept[3].ends_with("…[truncated]") && kept[3].len() < 2100);
+        assert!(again.console["T"].iter().all(|entry| entry.url == "https://example.test/app.js?sig=[redacted]"));
+        assert_eq!(session.console["T"].len(), 10);
+    }
+
+    #[test]
     fn console_and_requests_round_trip_with_secrets_redacted() {
         let mut session = Session::default();
         push_trace(
@@ -726,10 +860,7 @@ mod tests {
         }
         assert_eq!(session.requests["T"][0].request_headers[0].1, "session=secret");
         let mut again = decode(&written);
-        assert_eq!(
-            again.console["T"][0].url,
-            "https://user:secret@example.test/a?q=1#h"
-        );
+        assert_eq!(again.console["T"][0].url, "https://example.test/a?q=1");
         assert_eq!(again.console["T"][0].stamp, "9.5");
         push_trace(
             &mut again,
