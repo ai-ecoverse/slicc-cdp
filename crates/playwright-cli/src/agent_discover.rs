@@ -23,57 +23,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[allow(dead_code)]
 const IO_READ_CAP: usize = 1024 * 1024;
 
-fn is_reserved_cdp_origin(origin: &str) -> bool {
-    let Some(parsed) = Url::parse(origin).ok() else {
-        return false;
-    };
-    let port = parsed.port().unwrap_or(match parsed.scheme() {
-        "http" | "ws" => 80,
-        "https" | "wss" => 443,
-        _ => 0,
-    });
-    if !(9222..=9229).contains(&port) {
-        return false;
-    }
-    match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => {
-            is_loopback_or_unspec_v4(ip)
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            is_loopback_or_unspec_v6(ip)
-        }
-        Some(url::Host::Domain(domain)) => {
-            let d = domain.to_ascii_lowercase();
-            let d = d.strip_suffix('.').unwrap_or(&d);
-            d == "localhost" || d.ends_with(".localhost")
-        }
-        None => false,
-    }
-}
-
-fn is_loopback_or_unspec_v4(ip: std::net::Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_unspecified()
-}
-
-fn is_loopback_or_unspec_v6(ip: std::net::Ipv6Addr) -> bool {
-    ip.is_loopback() || ip.is_unspecified()
-        || match ip.to_ipv4_mapped() {
-            Some(v4) => is_loopback_or_unspec_v4(v4),
-            None => false,
-        }
-}
-
-#[allow(dead_code)]
-pub fn is_reserved_cdp_addr(addr: std::net::SocketAddr, port: u16) -> bool {
-    if !(9222..=9229).contains(&port) {
-        return false;
-    }
-    match addr {
-        std::net::SocketAddr::V4(v4) => is_loopback_or_unspec_v4(*v4.ip()),
-        std::net::SocketAddr::V6(v6) => is_loopback_or_unspec_v6(*v6.ip()),
-    }
-}
-
 #[derive(Clone)]
 enum Sink {
     Stdout,
@@ -295,7 +244,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 Ok(_) => {}
                 Err(_) => break,
             }
-            output.push_str(&process_events(&mut cdp, &mut state, &sess_state));
+            output.push_str(&process_events(&mut cdp, &mut state));
             if !loaded {
                 for event in cdp.events()[load_from..].iter() {
                     if event.get("method").and_then(|v| v.as_str()) == Some("Page.loadEventFired")
@@ -380,14 +329,6 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         if cdp.is_protected_target(&page.target_id) {
             continue;
         }
-        if !session::page_visible(
-            sess_state.provenance.as_deref(),
-            &page.url,
-            &page.target_id,
-            &sess_state.owned,
-        ) {
-            continue;
-        }
         if let Ok(session) = cdp::attach(&mut cdp, &page.target_id) {
             if setup_session(&mut cdp, &session).is_ok() {
                 let frame_tree = cdp
@@ -443,7 +384,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                     continue;
                 }
             }
-            let events_out = process_events(&mut cdp, &mut state, &sess_state);
+            let events_out = process_events(&mut cdp, &mut state);
             if !events_out.is_empty() {
                 eprint_flush(&events_out);
             }
@@ -501,7 +442,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                     }
                 }
             }
-            attach_new_targets(&mut cdp, &mut state, &sess_state);
+            attach_new_targets(&mut cdp, &mut state);
         }
     }
 
@@ -521,7 +462,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 continue;
             }
         }
-        let events_out = process_events(&mut cdp, &mut state, &sess_state);
+        let events_out = process_events(&mut cdp, &mut state);
         if !events_out.is_empty() {
             eprint_flush(&events_out);
         }
@@ -579,7 +520,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                     }
                 }
             }
-        attach_new_targets(&mut cdp, &mut state, &sess_state);
+        attach_new_targets(&mut cdp, &mut state);
     }
 }
 
@@ -620,17 +561,7 @@ fn resolve_once_tab(
         return Ok(tab_id.to_string());
     }
     let pages = browser::list_pages(cdp)?;
-    let visible: Vec<&PageInfo> = pages
-        .iter()
-        .filter(|page| {
-            session::page_visible(
-                state.provenance.as_deref(),
-                &page.url,
-                &page.target_id,
-                &state.owned,
-            )
-        })
-        .collect();
+    let visible: Vec<&PageInfo> = pages.iter().collect();
     match state.current.as_deref() {
         Some(current) if visible.iter().any(|p| p.target_id == current) => Ok(current.to_string()),
         _ => visible
@@ -647,7 +578,7 @@ fn setup_session(cdp: &mut Cdp, session: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn process_events(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &session::Session) -> String {
+fn process_events(cdp: &mut Cdp, state: &mut WatcherState) -> String {
     let mut output = String::new();
     let events: Vec<Value> = cdp.events()[state.event_cursor..].to_vec();
     state.event_cursor = cdp.events().len();
@@ -667,7 +598,7 @@ fn process_events(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &session:
                 handle_frame_navigated(state, session_id, &params);
             }
             "Target.targetCreated" => {
-                handle_target_created(cdp, state, &params, sess_state);
+                handle_target_created(cdp, state, &params);
             }
             "Target.targetInfoChanged" => {
                 handle_target_info_changed(cdp, state, &params);
@@ -710,22 +641,13 @@ fn handle_frame_navigated(state: &mut WatcherState, session_id: &str, params: &V
     }
 }
 
-fn handle_target_created(cdp: &mut Cdp, state: &mut WatcherState, params: &Value, sess_state: &session::Session) {
+fn handle_target_created(cdp: &mut Cdp, state: &mut WatcherState, params: &Value) {
     let Some(info) = params.get("targetInfo") else { return };
     let Some(target_id) = info.get("targetId").and_then(|v| v.as_str()) else { return };
     if info.get("type").and_then(|v| v.as_str()) != Some("page") {
         return;
     }
     if cdp.is_protected_target(target_id) {
-        return;
-    }
-    let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    if !session::page_visible(
-        sess_state.provenance.as_deref(),
-        url,
-        target_id,
-        &sess_state.owned,
-    ) {
         return;
     }
     if let Ok(session) = cdp::attach(cdp, target_id) {
@@ -804,7 +726,7 @@ fn filter_protected_auth_urls(cdp: &Cdp, summary: &Value) -> Value {
                     for key in &["resource_metadata", "as_uri"] {
                         let drop = m.get(*key)
                             .and_then(|v| v.as_str())
-                            .map_or(false, |u| cdp.guard().url(u) || is_reserved_cdp_origin(u));
+                            .map_or(false, |u| cdp.guard().url(u));
                         if drop {
                             m.remove(*key);
                         }
@@ -816,7 +738,7 @@ fn filter_protected_auth_urls(cdp: &Cdp, summary: &Value) -> Value {
             links.retain(|link| {
                 link.get("href")
                     .and_then(|v| v.as_str())
-                    .map_or(true, |u| !cdp.guard().url(u) && !is_reserved_cdp_origin(u))
+                    .map_or(true, |u| !cdp.guard().url(u))
             });
         }
     }
@@ -862,7 +784,7 @@ fn handle_response(
         return output;
     }
 
-    if cdp.guard().url(&url) || is_reserved_cdp_origin(&url) {
+    if cdp.guard().url(&url) {
         return output;
     }
 
@@ -1218,10 +1140,6 @@ fn run_probes(
         return output;
     }
 
-    if is_reserved_cdp_origin(origin) {
-        return output;
-    }
-
     let sess = match state.sessions.get(session_id) {
         Some(s) => s,
         None => return output,
@@ -1355,7 +1273,7 @@ fn run_probes(
 
     if state.robots_probe {
         let robots_url = format!("{origin}/robots.txt");
-        if !cdp.guard().url(&robots_url) && !is_reserved_cdp_origin(&robots_url) {
+        if !cdp.guard().url(&robots_url) {
             let robots_result = isolated_world_probe(cdp, session_id, &frame_id, &robots_url);
             let (r_status, r_ct, r_body) = match robots_result {
                 IsolatedProbeResult::Ok(s, ct, b) => (s, ct, b),
@@ -1374,7 +1292,7 @@ fn run_probes(
                         Ok(u) => u.to_string(),
                         Err(_) => continue,
                     };
-                    if cdp.guard().url(&resolved) || is_reserved_cdp_origin(&resolved) {
+                    if cdp.guard().url(&resolved) {
                         continue;
                     }
                     if !state.dedup.is_new(origin, "ard", &resolved) {
@@ -1462,14 +1380,7 @@ fn poppy_redirect_probe(
     if !same_site {
         return None;
     }
-    if is_reserved_cdp_origin(&resolved_str) {
-        return None;
-    }
     if cdp.guard().url(&resolved_str) {
-        return None;
-    }
-    let origin_of_resolved = extract_origin(&resolved_str)?;
-    if is_reserved_cdp_origin(&origin_of_resolved) {
         return None;
     }
     let resp2 = cdp_client::net::http_probe(&resolved_str, accept).ok()?;
@@ -1650,7 +1561,7 @@ fn native_probe(_url: &str, _accept: &str) -> Option<(u16, String, String)> {
     None
 }
 
-fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &session::Session) {
+fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState) {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(_) => return,
@@ -1662,14 +1573,6 @@ fn attach_new_targets(cdp: &mut Cdp, state: &mut WatcherState, sess_state: &sess
             continue;
         }
         if cdp.is_protected_target(&page.target_id) {
-            continue;
-        }
-        if !session::page_visible(
-            sess_state.provenance.as_deref(),
-            &page.url,
-            &page.target_id,
-            &sess_state.owned,
-        ) {
             continue;
         }
         if let Ok(session) = cdp::attach(cdp, &page.target_id) {
@@ -2012,9 +1915,6 @@ fn follow_links(
         if cdp.guard().url(&link.href) {
             continue;
         }
-        if is_reserved_cdp_origin(&link.href) {
-            continue;
-        }
 
         let probe_result = isolated_world_probe(cdp, session_id, &frame_id, &link.href);
         let (status, content_type, body) = match probe_result {
@@ -2158,7 +2058,7 @@ fn run_nlweb_probes(
     if !state.dedup.is_new(origin, "nlweb-probe", &dedup_key) {
         return output;
     }
-    if cdp.guard().url(origin) || is_reserved_cdp_origin(origin) {
+    if cdp.guard().url(origin) {
         return output;
     }
     let sess = match state.sessions.get(session_id) {
@@ -2326,7 +2226,7 @@ fn follow_ard_catalogs(
             Some(u) => u.to_string(),
             None => continue,
         };
-        if cdp.guard().url(&cat_url) || is_reserved_cdp_origin(&cat_url) {
+        if cdp.guard().url(&cat_url) {
             continue;
         }
         let dedup_key = format!("follow-catalog:{cat_url}");
@@ -2775,44 +2675,40 @@ mod tests {
     }
 
     #[test]
-    fn reserved_cdp_ports_are_never_probed() {
-        for origin in [
-            "http://127.0.0.1:9222",
-            "http://127.0.0.1:9229",
-            "http://localhost:9222",
-            "http://[::1]:9225",
-            "http://127.1:9222",
-            "http://2130706433:9222",
-            "http://0x7f000001:9222",
-            "http://017700000001:9222",
-            "http://0.0.0.0:9222",
-            "http://localhost.:9223",
-            "http://127.0.0.2:9224",
-            "http://[::ffff:7f00:1]:9226",
-            "http://foo.localhost:9222",
-            "http://[::]:9223",
-            "http://[::ffff:0:0]:9224",
-            "http://LOCALHOST:9222",
-            "http://[0:0:0:0:0:0:0:1]:9222",
-            "http://[::ffff:127.0.0.1]:9225",
-            "http://0x7f.1:9222",
-            "http://0177.0.0.1:9222",
-        ] {
-            assert!(is_reserved_cdp_origin(origin), "{origin} should be reserved");
-        }
-    }
-
-    #[test]
-    fn non_reserved_ports_are_not_blocked() {
-        for origin in [
-            "http://127.0.0.1:8080",
-            "http://127.0.0.1:9221",
-            "http://127.0.0.1:9230",
-            "http://example.com:9222",
-            "http://10.0.0.1:9222",
-            "https://localhost:443",
-        ] {
-            assert!(!is_reserved_cdp_origin(origin), "{origin} should not be reserved");
+    fn a_page_on_a_catalog_debug_port_is_discovered_like_any_other() {
+        for origin in ["http://127.0.0.1:9222", "http://localhost:9229", "http://[::1]:9225"] {
+            let mut state = WatcherState {
+                dedup: DedupSet::new(),
+                probed_origins: BTreeSet::new(),
+                probes: default_probes(),
+                classifiers: default_classifiers(),
+                sessions: BTreeMap::new(),
+                json_mode: true,
+                follow_mode: false,
+                robots_probe: false, nlweb_probe: false,
+                no_probe: false,
+                events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            };
+            state.sessions.insert(
+                "S1".to_string(),
+                SessionState {
+                    target_id: "T1".to_string(),
+                    top_frame_id: Some("F1".to_string()),
+                    page_url: format!("{origin}/"),
+                },
+            );
+            let params = json!({
+                "type": "Document",
+                "frameId": "F1",
+                "response": {
+                    "url": format!("{origin}/pay"),
+                    "status": 402,
+                    "headers": { "x-payment": "lightning", "link": format!("<{origin}/api>; rel=\"api-catalog\"") }
+                }
+            });
+            let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+            let output = handle_response(&mut cdp, &mut state, "S1", &params);
+            assert!(output.contains("x402"), "{origin}: {output}");
         }
     }
 
@@ -3309,60 +3205,6 @@ mod tests {
     }
 
     #[test]
-    fn reserved_cdp_addr_ipv4_loopback() {
-        let addr = "127.0.0.1:9222".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9222));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_ipv4_unspec() {
-        let addr = "0.0.0.0:9222".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9222));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_ipv6_loopback() {
-        let addr = "[::1]:9222".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9222));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_ipv6_unspec() {
-        let addr = "[::]:9223".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9223));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_mapped_loopback() {
-        let addr = "[::ffff:127.0.0.1]:9224".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9224));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_mapped_unspec() {
-        let addr = "[::ffff:0.0.0.0]:9225".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9225));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_non_reserved_port() {
-        let addr = "127.0.0.1:9230".parse().unwrap();
-        assert!(!is_reserved_cdp_addr(addr, 9230));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_remote_host() {
-        let addr = "93.184.216.34:9222".parse().unwrap();
-        assert!(!is_reserved_cdp_addr(addr, 9222));
-    }
-
-    #[test]
-    fn reserved_cdp_addr_127_0_0_2() {
-        let addr = "127.0.0.2:9222".parse().unwrap();
-        assert!(is_reserved_cdp_addr(addr, 9222));
-    }
-
-    #[test]
     fn strip_userinfo_removes_credentials() {
         assert_eq!(
             strip_userinfo("https://u:PW@host.com/path"),
@@ -3725,12 +3567,6 @@ mod tests {
         let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
         let output = handle_response(&mut cdp, &mut state, "S1", &params);
         assert!(output.is_empty(), "protected origin link should be silently dropped: {output}");
-    }
-
-    #[test]
-    fn follow_skips_reserved_cdp_port_links() {
-        assert!(is_reserved_cdp_origin("http://127.0.0.1:9222"));
-        assert!(is_reserved_cdp_origin("http://localhost:9225"));
     }
 
     #[test]
@@ -4215,7 +4051,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_response_401_from_reserved_cdp_port_produces_nothing() {
+    fn handle_response_401_from_a_catalog_debug_port_is_reported() {
         let mut state = WatcherState {
             dedup: DedupSet::new(),
             probed_origins: BTreeSet::new(),
@@ -4225,7 +4061,7 @@ mod tests {
             json_mode: true,
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
-            no_probe: false,
+            no_probe: true,
             events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
         };
         state.sessions.insert(
@@ -4247,8 +4083,7 @@ mod tests {
         });
         let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
         let output = handle_response(&mut cdp, &mut state, "S1", &params);
-        assert!(output.is_empty(), "401 from reserved CDP port must produce no event: {output}");
-        assert!(!state.probed_origins.contains("http://127.0.0.1:9222"), "must not probe reserved CDP port");
+        assert!(output.contains(r#""standard":"auth-md","origin":"http://127.0.0.1:9222""#), "{output}");
     }
 
     #[test]
@@ -4558,7 +4393,6 @@ mod tests {
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1").is_empty());
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:1").is_empty());
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "https://vault.sliccy.ai").is_empty());
-        assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:9222").is_empty());
         assert!(run_nlweb_probes(&mut cdp, &mut state, "NONE", "http://127.0.0.1:2").is_empty());
         state.sessions.get_mut("S1").unwrap().top_frame_id = None;
         assert!(run_nlweb_probes(&mut cdp, &mut state, "S1", "http://127.0.0.1:3").is_empty());

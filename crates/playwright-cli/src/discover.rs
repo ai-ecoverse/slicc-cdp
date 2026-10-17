@@ -653,6 +653,7 @@ struct VersionDoc {
 }
 
 struct TabDraft {
+    seven: bool,
     id: String,
     url: String,
     title: String,
@@ -853,10 +854,6 @@ fn listed_start(invocation: &Invocation, cdp_env: Option<&str>) -> Option<Start>
     connect::choose_start(invocation.cdp.as_deref(), cdp_env).ok()
 }
 
-fn reserved_debug_port(port: u32) -> bool {
-    (9222..=9229).contains(&port)
-}
-
 fn runtime_name(invocation: &Invocation) -> Option<String> {
     invocation.runtime.clone().or_else(|| {
         invocation
@@ -891,7 +888,7 @@ fn resolve_process(
         }
         let text = read(&active_port_path(dir))?;
         let (port, ws_path) = parse_active_port(&text)?;
-        if reserved_debug_port(port) {
+        if probed_debug_port(port) {
             return Some((port, draft_bare(port, "process")));
         }
         let draft = draft_from_port(
@@ -906,7 +903,7 @@ fn resolve_process(
         )?;
         return Some((port, draft));
     }
-    if reserved_debug_port(hit.port) {
+    if probed_debug_port(hit.port) {
         return Some((hit.port, draft_bare(hit.port, "process")));
     }
     let draft = draft_from_port(
@@ -920,6 +917,10 @@ fn resolve_process(
         origins,
     )?;
     Some((hit.port, draft))
+}
+
+fn probed_debug_port(port: u32) -> bool {
+    (9222..=9229).contains(&port)
 }
 
 fn six_profiles_root(io: &ListIo<'_>) -> String {
@@ -1058,9 +1059,6 @@ fn draft_from_active_file(
 ) -> Option<EndpointDraft> {
     let text = (io.read)(&active_port_path(dir))?;
     let (port, ws_path) = parse_active_port(&text)?;
-    if reserved_debug_port(port) {
-        return None;
-    }
     draft_from_port(
         port,
         "devtools-active-port",
@@ -1456,23 +1454,22 @@ fn split_product(product: &str) -> (String, Option<String>) {
     }
 }
 
-pub(crate) fn list_has_seven_tab(body: &str) -> bool {
-    parse_tabs(body, &[]).is_some_and(|tabs| !tabs.is_empty())
-}
-
 fn parse_tabs(body: &str, origins: &[&str]) -> Option<Vec<TabDraft>> {
     let value: Value = serde_json::from_str(body).ok()?;
     let items = value.as_array()?;
+    let guard = cdp_client::protected::Protected::new(origins);
     let mut tabs = Vec::new();
     for item in items {
         if item.get("type").and_then(|value| value.as_str()) != Some("page") {
             continue;
         }
         let url = item.get("url").and_then(|value| value.as_str()).unwrap_or("");
-        if !seven_origin(url) && !extra_origin(url, origins) {
+        let seven = seven_origin(url) || extra_origin(url, origins);
+        if !seven && guard.url(url) {
             continue;
         }
         tabs.push(TabDraft {
+            seven,
             id: item
                 .get("id")
                 .and_then(|value| value.as_str())
@@ -1757,7 +1754,7 @@ fn draft_from_doc(
         profile: None,
         ws_only: false,
         six: false,
-        seven_open: !tabs.is_empty(),
+        seven_open: tabs.iter().any(|tab| tab.seven),
         tabs,
     })
 }
@@ -1915,6 +1912,7 @@ fn adopt_richer(winner: &mut EndpointDraft, donor: &EndpointDraft) {
         .tabs
         .iter()
         .map(|tab| TabDraft {
+            seven: tab.seven,
             id: tab.id.clone(),
             url: tab.url.clone(),
             title: tab.title.clone(),
@@ -1999,6 +1997,7 @@ fn report_entries(
                     .tabs
                     .iter()
                     .map(|tab| TabDraft {
+                        seven: tab.seven,
                         id: tab.id.clone(),
                         url: tab.url.clone(),
                         title: tab.title.clone(),
@@ -2294,7 +2293,10 @@ fn endpoint_json(endpoint: &EndpointDraft) -> String {
         "sevenOpen",
         if endpoint.seven_open { "true" } else { "false" },
     );
-    field(&mut out, &mut first, "sevenTabs", &tabs_json(&endpoint.tabs));
+    let seven: Vec<&TabDraft> = endpoint.tabs.iter().filter(|tab| tab.seven).collect();
+    field(&mut out, &mut first, "sevenTabs", &tabs_json(&seven));
+    let all: Vec<&TabDraft> = endpoint.tabs.iter().collect();
+    field(&mut out, &mut first, "tabs", &tabs_json(&all));
     out.push('}');
     out
 }
@@ -2325,7 +2327,7 @@ fn installed_json(installed: &InstalledDraft) -> String {
     out
 }
 
-fn tabs_json(tabs: &[TabDraft]) -> String {
+fn tabs_json(tabs: &[&TabDraft]) -> String {
     let mut out = String::from("[");
     for (index, tab) in tabs.iter().enumerate() {
         if index > 0 {
@@ -2372,7 +2374,7 @@ fn run_host(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let slicc_user_data_dir = std::env::var("SLICC_USER_DATA_DIR").ok();
     let process_text = read_process_text();
     let os = host_os().unwrap_or(HostOs::Linux);
-    let probe_ports = slicc_browsers::catalog().discovery.probe_ports;
+    let probe_ports = cdp_client::ports::catalog();
     let launch = LaunchQuery {
         os,
         bundles: &mdfind_bundle,
@@ -2881,9 +2883,11 @@ mod tests {
             "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.\n"
         ));
         assert!(global.stdout.contains(
-            "Host list, and open when that port is absent or unreachable, GET /json/version and /json/list on 127.0.0.1:9222-9229."
+            "Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229."
         ));
-        assert!(global.stdout.contains("Launch never binds those ports."));
+        assert!(global.stdout.contains(
+            "Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy."
+        ));
         let pending = global.stdout.split("Not implemented yet:").nth(1).unwrap();
         let pending_names: Vec<&str> = pending
             .split(|ch: char| ch == ',' || ch.is_whitespace())
@@ -3002,11 +3006,12 @@ mod tests {
         assert_eq!(reserved.stderr, "");
         assert!(reserved.stdout.contains("pid 7 port 9222 /usr/bin/chrome\n"));
         assert!(reserved.stdout.contains("pid 8 port 9228 /usr/bin/chromium\n"));
+        assert!(urls
+            .borrow()
+            .iter()
+            .any(|url| url == "http://127.0.0.1:9223/json/version"));
         assert!(urls.borrow().iter().all(|url| {
-            !url.contains(":9222")
-                && !url.contains(":9223")
-                && !url.contains(":9228")
-                && !url.contains(":9229")
+            !url.contains(":9222") && !url.contains(":9228") && !url.contains(":9229")
         }));
 
         urls.borrow_mut().clear();
@@ -3705,7 +3710,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_drops_personal_tabs_and_does_not_open_a_socket() {
+    fn probe_lists_personal_tabs_hides_protected_ones_and_does_not_open_a_socket() {
         let urls = RefCell::new(Vec::new());
         let secret = "PERSONAL-SECRET-TITLE";
         let http = |url: &str| -> HttpResult {
@@ -3724,7 +3729,7 @@ mod tests {
                 return HttpResult::Response {
                     status: 200,
                     body: format!(
-                        r#"[{{"id":"T1","type":"page","url":"https://lars.sliccy.ai/home","title":"seven"}},{{"id":"P1","type":"page","url":"https://example.com/secret","title":"{secret}"}}]"#
+                        r#"[{{"id":"T1","type":"page","url":"https://lars.sliccy.ai/home","title":"seven"}},{{"id":"P1","type":"page","url":"https://example.com/secret","title":"{secret}"}},{{"id":"V1","type":"page","url":"https://vault.sliccy.ai/k","title":"VAULT-TITLE"}},{{"id":"W1","type":"service_worker","url":"https://example.com/sw.js","title":"sw"}}]"#
                     ),
                 };
             }
@@ -3760,14 +3765,22 @@ mod tests {
             &[],
         );
         assert_eq!(output.code, 0, "{}", output.stderr);
-        assert!(!output.stdout.contains(secret));
-        assert!(!output.stdout.contains("example.com"));
+        assert!(!output.stdout.contains("VAULT-TITLE"));
+        assert!(!output.stdout.contains("vault.sliccy.ai"));
+        assert!(!output.stdout.contains("sw.js"));
         let actual: Value = serde_json::from_str(output.stdout.trim()).unwrap();
         let entries = actual["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["endpoint"]["source"], "process");
         assert_eq!(entries[0]["endpoint"]["cdp"], "http://127.0.0.1:9222");
         assert_eq!(entries[0]["endpoint"]["sevenTabs"][0]["id"], "T1");
+        assert_eq!(entries[0]["endpoint"]["sevenTabs"].as_array().unwrap().len(), 1);
+        let tabs = entries[0]["endpoint"]["tabs"].as_array().unwrap();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0]["id"], "T1");
+        assert_eq!(tabs[1]["id"], "P1");
+        assert_eq!(tabs[1]["title"], secret);
+        assert_eq!(tabs[1]["url"], "https://example.com/secret");
         assert_eq!(entries[0]["tier"], 1);
         assert_eq!(entries[1]["endpoint"]["source"], "probe");
         assert_eq!(entries[1]["endpoint"]["cdp"], "http://127.0.0.1:9401");
@@ -3879,9 +3892,18 @@ mod tests {
             };
             let output = assemble(&list_invocation(None, true), None, &io);
             assert_eq!(output.code, 0, "{}: {}", case.name, output.stderr);
-            let actual: Value = serde_json::from_str(output.stdout.trim()).unwrap_or_else(|err| {
+            let mut actual: Value = serde_json::from_str(output.stdout.trim()).unwrap_or_else(|err| {
                 panic!("{}: {err}\n{}", case.name, output.stdout);
             });
+            for entry in actual["entries"].as_array_mut().unwrap() {
+                let Some(endpoint) = entry.get_mut("endpoint").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                let tabs = endpoint.remove("tabs").unwrap();
+                for seven in endpoint["sevenTabs"].as_array().unwrap() {
+                    assert!(tabs.as_array().unwrap().contains(seven), "{}", case.name);
+                }
+            }
             assert_eq!(actual, case.expected(&layout), "{}", case.name);
         }
         assert_eq!(ran, applicable);

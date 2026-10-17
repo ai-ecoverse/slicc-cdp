@@ -6,7 +6,7 @@ use crate::session::Session;
 use serde_json::{json, Value};
 
 pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -99,7 +99,7 @@ pub fn call(
             code: 2,
         };
     }
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -176,21 +176,6 @@ pub fn read_stdin() -> Result<String, String> {
         return Err("webmcp-call: stdin is empty (expected JSON)\n".to_string());
     }
     Ok(buf)
-}
-
-fn visible_pages(cdp: &mut Cdp, state: &Session) -> Result<Vec<PageInfo>, String> {
-    let pages = browser::list_pages(cdp)?;
-    Ok(pages
-        .into_iter()
-        .filter(|page| {
-            crate::session::page_visible(
-                state.provenance.as_deref(),
-                &page.url,
-                &page.target_id,
-                &state.owned,
-            )
-        })
-        .collect())
 }
 
 fn resolve(

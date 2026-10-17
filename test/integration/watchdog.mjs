@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { after, afterEach, beforeEach } from 'node:test';
+import './ports.mjs';
 
 const rowMs = Number(process.env.SLICC_ROW_TIMEOUT_MS || 605000);
 const exitMs = Number(process.env.SLICC_EXIT_TIMEOUT_MS || 30000);

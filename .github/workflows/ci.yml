@@ -8,13 +8,16 @@ on:
 permissions:
   contents: read
 
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   runner:
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CERT_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -26,7 +29,7 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         env:
           FORCED: ${{ vars.CI_RUNNER }}
-          POOL: ${{ vars.CERT_RUNNER || 'cloud-run-bench' }}
+          POOL: ${{ vars.CERT_RUNNER }}
         with:
           script: |
             const hosted = 'ubuntu-latest';
@@ -59,7 +62,7 @@ jobs:
 
   ci:
     needs: runner
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.21.1
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.23.0
     with:
       chromium: false
       runs-on: ${{ needs.runner.outputs.runner }}
@@ -123,8 +126,7 @@ jobs:
           node --test --test-timeout=600000 test/integration/webmcp.test.mjs
 
   shellcheck:
-    needs: runner
-    runs-on: ${{ needs.runner.outputs.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

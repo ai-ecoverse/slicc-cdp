@@ -211,21 +211,6 @@ fn saved_provenance(
     Some("seven-profile".to_string())
 }
 
-fn visible_pages(cdp: &mut Cdp, state: &Session) -> Result<Vec<PageInfo>, String> {
-    let pages = browser::list_pages(cdp)?;
-    Ok(pages
-        .into_iter()
-        .filter(|page| {
-            session::page_visible(
-                state.provenance.as_deref(),
-                &page.url,
-                &page.target_id,
-                &state.owned,
-            )
-        })
-        .collect())
-}
-
 fn deferred_flag(invocation: &Invocation) -> Option<String> {
     for name in [
         "discover",
@@ -279,7 +264,7 @@ fn cmd_close(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -338,7 +323,7 @@ fn cmd_goto(
         return Output::err(format!("{command} requires a URL\n"));
     };
     report.url(url.as_str());
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -365,7 +350,7 @@ fn cmd_goto(
 }
 
 fn cmd_tab_list(cdp: &mut Cdp, state: &Session) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -410,7 +395,7 @@ fn cmd_tab_select(
     if index == 0 {
         return Output::err("tab-select index must be a positive integer\n");
     }
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -441,7 +426,7 @@ fn cmd_snapshot(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -596,7 +581,7 @@ fn cmd_type(
     let text = invocation.positionals.join(" ");
     report.length(text.chars().count());
     let submit = flag_true(&invocation.flags, "submit");
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -640,7 +625,7 @@ fn cmd_press(
         return Output::err("press requires a key name\n");
     };
     report.key(key.as_str());
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -673,7 +658,7 @@ fn cmd_screenshot(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -769,7 +754,7 @@ fn cmd_eval(
         return Output::err("eval requires an expression\n");
     }
     let expression = invocation.positionals.join(" ");
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -853,7 +838,7 @@ fn with_ref(
     id: &str,
     body: impl FnOnce(&mut Cdp, &str, &RefRec) -> Result<String, String>,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -1024,7 +1009,7 @@ fn current_target(
     invocation: &Invocation,
     state: &mut Session,
 ) -> Result<String, String> {
-    let pages = visible_pages(cdp, state)?;
+    let pages = browser::list_pages(cdp)?;
     resolve_target(cdp, invocation, state, &pages, false)
 }
 
@@ -1195,7 +1180,7 @@ fn cmd_go_back(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -1232,7 +1217,7 @@ fn cmd_go_forward(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -1269,7 +1254,7 @@ fn cmd_reload(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -1438,7 +1423,7 @@ fn cmd_drag(
     }
     let start_id = &invocation.positionals[0];
     let end_id = &invocation.positionals[1];
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -1484,7 +1469,7 @@ fn cmd_frames(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };
@@ -1536,7 +1521,7 @@ fn cmd_pdf(
     invocation: &Invocation,
     report: &mut Report,
 ) -> Output {
-    let pages = match visible_pages(cdp, state) {
+    let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
     };

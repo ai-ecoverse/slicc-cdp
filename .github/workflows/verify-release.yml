@@ -1,0 +1,148 @@
+name: Verify published release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published npm and GitHub release version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
+concurrency:
+  group: verify-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'ai-ecoverse/slicc-cdp' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: node scripts/cert/post-plan.mjs --version "$VERSION" --out evidence/plan.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verify-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence/plan.json
+          if-no-files-found: error
+
+  assets:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verify-plan-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ runner.os == 'macOS' && 'macos' || 'linux' }}
+        run: node scripts/cert/assets.mjs --plan evidence/plan.json --out "evidence/assets-$PLATFORM.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: verify-assets-${{ runner.os }}-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence/assets-*.json
+          if-no-files-found: error
+
+  record:
+    needs: [plan, assets]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      certified: ${{ steps.record.outputs.certified }}
+      status: ${{ steps.record.outputs.status }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: verify-*-${{ inputs.version }}-${{ github.run_attempt }}
+          path: evidence
+          merge-multiple: true
+      - name: Independent npm bytes and signed SLSA verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/cert/post-npm.mjs --plan evidence/plan.json --out evidence/registry.json
+      - id: record
+        env:
+          CERT_UPSTREAM: ${{ format('{{"plan":"{0}","assets":"{1}"}}', needs.plan.result, needs.assets.result) }}
+        run: node scripts/cert/post-record.mjs --evidence evidence --out record
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verify-record-${{ inputs.version }}-${{ github.run_attempt }}
+          path: |
+            record/
+            evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  notes:
+    needs: record
+    if: ${{ !cancelled() && needs.record.result == 'success' && needs.record.outputs.certified == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verify-record-${{ inputs.version }}-${{ github.run_attempt }}
+          path: downloaded
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/cert/post-notes.mjs --record downloaded/record/record.json
+
+  result:
+    name: ${{ needs.record.outputs.status == 'FAIL' && 'SUPPLY-CHAIN FAIL' || 'Supply-chain verdict' }}
+    needs: [plan, assets, record, notes]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          CERTIFIED: ${{ needs.record.outputs.certified }}
+          NOTES: ${{ needs.notes.result }}
+        run: test "$CERTIFIED" = true && test "$NOTES" = success

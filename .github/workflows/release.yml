@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
 concurrency:
   group: release
   cancel-in-progress: false
@@ -91,19 +94,6 @@ jobs:
             exit 1
           fi
           sh scripts/publish-crates.sh "${{ steps.version.outputs.version }}"
-
-  cert:
-    needs: [release, upload-assets, verify-signatures]
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.release.outputs.released == 'true' }}
-    permissions:
-      contents: write
-      statuses: write
-      actions: read
-      pull-requests: read
-    uses: ./.github/workflows/cert-review.yml
-    with:
-      version: ${{ needs.release.outputs.version }}
-      caller_results: ${{ toJSON(needs) }}
 
   build-binaries:
     needs: release
@@ -201,7 +191,7 @@ jobs:
           exit "$failed"
 
   publish-release:
-    needs: [release, upload-assets, verify-signatures, cert]
+    needs: [release, upload-assets, verify-signatures]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -223,6 +213,15 @@ jobs:
             fi
           done
           gh release edit "$tag" --draft=false --latest
+
+  verify:
+    needs: [release, publish-release]
+    if: ${{ !cancelled() && needs.release.outputs.released == 'true' && needs.publish-release.result == 'success' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/verify-release.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
 
   smoke:
     needs: publish-release

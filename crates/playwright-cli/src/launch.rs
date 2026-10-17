@@ -239,8 +239,7 @@ pub fn remembered_endpoint_named(
         let endpoint = session.endpoint.as_deref()?;
         let provenance = session.provenance.as_deref()?;
         let body = if provenance == "probe" {
-            let list = crate::session::list_url(endpoint)?;
-            Some(http_body(&list).ok()?)
+            Some(http_body(endpoint).ok()?)
         } else {
             None
         };
@@ -307,6 +306,23 @@ pub fn choose_port(mut bind: impl FnMut(u16) -> bool) -> Result<u16, String> {
         port += 1;
     }
     Err("playwright-cli: no free localhost port\n".to_string())
+}
+
+pub fn catalog_port(ports: &[u16], mut bind: impl FnMut(u16) -> bool) -> u16 {
+    ports.iter().copied().find(|port| bind(*port)).unwrap_or(0)
+}
+
+pub fn with_debug_port(mut plan: SpawnPlan, port: u16) -> SpawnPlan {
+    if port == 0 {
+        return plan;
+    }
+    for arg in plan.args.iter_mut() {
+        if arg == "--remote-debugging-port=0" {
+            *arg = format!("--remote-debugging-port={port}");
+            plan.port = port;
+        }
+    }
+    plan
 }
 
 pub fn version_url(port: u16) -> String {
@@ -1098,9 +1114,6 @@ fn live_text(
     let Some((port, path)) = parse_active_port(text) else {
         return Ok(None);
     };
-    if (9222..=9229).contains(&port) {
-        return Ok(None);
-    }
     let url = version_url(port);
     match probe(&url) {
         Ok(body) if version_accepts(&body, &path) => Ok(Some(url)),
@@ -1391,27 +1404,7 @@ enum Route {
 fn reuse_probed_browser(
     probe: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
-    let ports = slicc_browsers::catalog().discovery.probe_ports;
-    for port in ports {
-        let version = version_url(port);
-        let body = match probe(&version) {
-            Ok(body) => body,
-            Err(message) if message.starts_with("HTTP ") => continue,
-            Err(_) => continue,
-        };
-        if crate::connect::websocket_url_from_version(&body).is_err() {
-            continue;
-        }
-        let list = match probe(&format!("http://127.0.0.1:{port}/json/list")) {
-            Ok(body) => body,
-            Err(message) if message.starts_with("HTTP ") => continue,
-            Err(_) => continue,
-        };
-        if crate::discover::list_has_seven_tab(&list) {
-            return Ok(Some(version));
-        }
-    }
-    Ok(None)
+    Ok(cdp_client::ports::first_live(&cdp_client::ports::catalog(), probe))
 }
 
 fn attach_without_launch<F: ProfileFs>(
@@ -1553,7 +1546,10 @@ fn host_open(request: &LaunchRequest) -> Result<Resolved, String> {
             started: None,
             from_probe,
         }),
-        Route::Launch(plan) => launch_plan(request, &plan),
+        Route::Launch(plan) => {
+            let port = catalog_port(&cdp_client::ports::catalog(), bind_localhost);
+            launch_plan(request, &with_debug_port(plan, port))
+        }
     }
 }
 
@@ -1574,7 +1570,7 @@ fn launch_plan(request: &LaunchRequest, plan: &SpawnPlan) -> Result<Resolved, St
             return Err(message);
         }
     };
-    let version_url = match wait_for_debugger(request.command, plan, &mut child) {
+    let version_url = match wait_for_debugger(plan, &mut child) {
         Ok(url) => url,
         Err(message) => {
             stop_started(plan, &mut child);
@@ -1618,12 +1614,11 @@ fn launch_plan(request: &LaunchRequest, plan: &SpawnPlan) -> Result<Resolved, St
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 fn wait_for_debugger(
-    command: &str,
     plan: &SpawnPlan,
     child: &mut std::process::Child,
 ) -> Result<String, String> {
     if plan.port != 0 {
-        wait_ready(plan.port, child)?;
+        wait_ready(plan, child)?;
         return Ok(version_url(plan.port));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1640,11 +1635,6 @@ fn wait_for_debugger(
             .as_deref()
             .and_then(parse_active_port)
         {
-            if (9222..=9229).contains(&port) {
-                return Err(format!(
-                    "playwright-cli {command}: refusing debugger port {port}\n"
-                ));
-            }
             let url = version_url(port);
             match http_body(&url) {
                 Ok(body) if version_accepts(&body, &path) => return Ok(url),
@@ -1877,11 +1867,11 @@ fn spotlight(_bundle_id: &str) -> Vec<String> {
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
-fn wait_ready(port: u16, child: &mut std::process::Child) -> Result<(), String> {
-    let url = version_url(port);
+fn wait_ready(plan: &SpawnPlan, child: &mut std::process::Child) -> Result<(), String> {
+    let url = version_url(plan.port);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let running = matches!(child.try_wait(), Ok(None));
+        let running = !child_failed(plan, child);
         let body = if running {
             http_body(&url)
         } else {
@@ -2786,6 +2776,9 @@ mod tests {
             &mut fs,
             &mut |url| {
                 seen.push(url.to_string());
+                if catalog_probe_url(url) {
+                    return Err("connection refused\n".to_string());
+                }
                 Ok(
                     r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9333/devtools/browser/other"}"#
                         .to_string(),
@@ -2808,7 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forbidden_port_file_is_not_probed() {
+    fn a_catalog_port_file_is_probed_like_any_other() {
         let host = env("linux");
         let dir = chrome_dir(&host);
         let mut fs = MemFs::new();
@@ -2824,16 +2817,14 @@ mod tests {
             &mut fs,
             &mut |url| {
                 seen.push(url.to_string());
-                assert!(catalog_probe_url(url), "{url}");
-                Err("connection refused\n".to_string())
+                Ok(version_body(9224, "/devtools/browser/abc"))
             },
-            &mut |_| Ok(()),
+            &mut |_| panic!("spawned"),
         )
         .unwrap();
-        assert!(!seen.is_empty());
-        assert!(seen.iter().all(|url| catalog_probe_url(url)));
-        assert_eq!(resolved.discover, dir);
-        assert!(!resolved.discover.contains("9222"));
+        assert_eq!(seen, vec!["http://127.0.0.1:9224/json/version".to_string()]);
+        assert_eq!(resolved.discover, "http://127.0.0.1:9224/json/version");
+        assert!(!resolved.from_probe);
     }
 
     #[test]
@@ -2854,7 +2845,7 @@ mod tests {
             &mut |_| Ok(()),
         )
         .unwrap();
-        assert_eq!(seen.len(), slicc_browsers::catalog().discovery.probe_ports.len());
+        assert_eq!(seen.len(), cdp_client::ports::catalog().len());
         assert!(seen.iter().all(|url| url.ends_with("/json/version")));
         assert_eq!(resolved.discover, chrome_dir(&host));
         assert!(!resolved.from_probe);
@@ -2862,8 +2853,10 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_port_with_a_seven_tab_is_reused() {
+    fn a_probe_port_without_a_seven_tab_is_reused() {
         let host = env("linux");
+        let p = cdp_client::ports::catalog();
+        let at = |index: usize| format!("http://127.0.0.1:{}/json/version", p[index]);
         let mut fs = MemFs::new();
         let mut seen = Vec::new();
         let resolved = run(
@@ -2874,13 +2867,12 @@ mod tests {
             &mut |url| {
                 seen.push(url.to_string());
                 assert!(catalog_probe_url(url), "{url}");
-                if url == "http://127.0.0.1:9222/json/version" {
-                    Ok(version_body(9222, "/devtools/browser/personal"))
-                } else if url == "http://127.0.0.1:9222/json/list" {
-                    Ok(
-                        r#"[{"id":"T1","type":"page","url":"https://lars.sliccy.ai/","title":"seven"},{"id":"P1","type":"page","url":"https://example.com/","title":"PERSONAL-SECRET-TITLE"}]"#
-                            .to_string(),
-                    )
+                if url == at(0) {
+                    Err("connection refused\n".to_string())
+                } else if url == at(1) {
+                    Ok("{}".to_string())
+                } else if url == at(2) {
+                    Ok(version_body(p[2], "/devtools/browser/personal"))
                 } else {
                     Err("connection refused\n".to_string())
                 }
@@ -2890,20 +2882,23 @@ mod tests {
         .unwrap();
         assert!(resolved.started.is_none());
         assert!(resolved.from_probe);
-        assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
+        assert_eq!(resolved.discover, at(2));
         assert_eq!(
             seen,
             vec![
-                "http://127.0.0.1:9222/json/version".to_string(),
-                "http://127.0.0.1:9222/json/list".to_string(),
+                at(0),
+                at(1),
+                at(2),
             ]
         );
         assert!(fs.0.borrow().writes.is_empty());
     }
 
     #[test]
-    fn a_missing_launch_target_reuses_a_probed_seven_tab() {
+    fn a_missing_launch_target_reuses_a_probed_browser() {
         let host = env("linux");
+        let p = cdp_client::ports::catalog();
+        let at = |index: usize| format!("http://127.0.0.1:{}/json/version", p[index]);
         let mut fs = MemFs::new();
         let mut seen = Vec::new();
         let resolved = drive(
@@ -2917,13 +2912,8 @@ mod tests {
             &mut |url| {
                 seen.push(url.to_string());
                 assert!(catalog_probe_url(url), "{url}");
-                if url == "http://127.0.0.1:9222/json/version" {
-                    Ok(version_body(9222, "/devtools/browser/personal"))
-                } else if url == "http://127.0.0.1:9222/json/list" {
-                    Ok(
-                        r#"[{"id":"T1","type":"page","url":"https://lars.sliccy.ai/","title":"seven"}]"#
-                            .to_string(),
-                    )
+                if url == at(0) {
+                    Ok(version_body(p[0], "/devtools/browser/personal"))
                 } else {
                     Err("connection refused\n".to_string())
                 }
@@ -2934,19 +2924,13 @@ mod tests {
         .unwrap();
         assert!(resolved.started.is_none());
         assert!(resolved.from_probe);
-        assert_eq!(resolved.discover, "http://127.0.0.1:9222/json/version");
-        assert_eq!(
-            seen,
-            vec![
-                "http://127.0.0.1:9222/json/version".to_string(),
-                "http://127.0.0.1:9222/json/list".to_string(),
-            ]
-        );
+        assert_eq!(resolved.discover, at(0));
+        assert_eq!(seen, vec![at(0)]);
         assert!(fs.0.borrow().writes.is_empty());
     }
 
     #[test]
-    fn a_missing_launch_target_without_a_seven_tab_is_not_found() {
+    fn a_missing_launch_target_without_a_probed_browser_is_not_found() {
         let host = env("linux");
         let mut fs = MemFs::new();
         let mut seen = Vec::new();
@@ -2970,7 +2954,7 @@ mod tests {
         assert_eq!(err, "playwright-cli open: chrome was not found\n");
         assert_eq!(
             seen.len(),
-            slicc_browsers::catalog().discovery.probe_ports.len()
+            cdp_client::ports::catalog().len()
         );
         assert!(seen.iter().all(|url| url.ends_with("/json/version")));
         assert!(fs.0.borrow().writes.is_empty());
@@ -3271,11 +3255,40 @@ mod tests {
         let Ok(port) = port.parse::<u16>() else {
             return false;
         };
-        slicc_browsers::catalog()
-            .discovery
-            .probe_ports
-            .contains(&port)
+        cdp_client::ports::catalog().contains(&port)
             && (path == "json/version" || path == "json/list")
+    }
+
+    #[test]
+    fn launch_takes_the_first_free_catalog_port_or_falls_back_to_zero() {
+        let mut tried = Vec::new();
+        let port = catalog_port(&[9222, 9223, 9224], |port| {
+            tried.push(port);
+            port == 9223
+        });
+        assert_eq!(port, 9223);
+        assert_eq!(tried, vec![9222, 9223]);
+        assert_eq!(catalog_port(&[9222, 9223], |_| false), 0);
+        assert_eq!(catalog_port(&[], |_| true), 0);
+    }
+
+    #[test]
+    fn the_debug_port_replaces_port_zero_and_leaves_electron_alone() {
+        let host = env("linux");
+        let request = open_request(None, false, None);
+        let plan = plan_launch(&request, &host, 0, &installed, &no_mdfind, &no_plist).unwrap();
+        let fixed = with_debug_port(plan.clone(), 9223);
+        assert!(fixed.args.contains(&"--remote-debugging-port=9223".to_string()));
+        assert!(!fixed.args.contains(&"--remote-debugging-port=0".to_string()));
+        assert_eq!(fixed.port, 9223);
+        assert_eq!(fixed.args.len(), plan.args.len());
+        assert_eq!(with_debug_port(plan.clone(), 0), plan);
+        let electron = SpawnPlan {
+            args: vec!["--remote-debugging-port=9333".to_string()],
+            port: 9333,
+            ..plan
+        };
+        assert_eq!(with_debug_port(electron.clone(), 9224), electron);
     }
 
     fn version_body(port: u16, path: &str) -> String {
@@ -3434,7 +3447,7 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_forbidden_port_is_not_probed() {
+    fn a_newer_catalog_port_file_is_probed_like_any_other() {
         let host = env("macos");
         let root = config_seven_root(&host);
         let mut fs = ClockFs::new();
@@ -3462,15 +3475,23 @@ mod tests {
         let mut seen = Vec::new();
         let found = select_port(&host, &fs, &mut |url| {
             seen.push(url.to_string());
-            assert_high_port(url);
-            Ok(version_body(9333, "/devtools/browser/old"))
+            match url {
+                "http://127.0.0.1:9222/json/version" => Err("connection refused\n".to_string()),
+                "http://127.0.0.1:9223/json/version" => Ok(version_body(9223, "/devtools/browser/other")),
+                "http://127.0.0.1:9228/json/version" => Ok(version_body(9228, "/devtools/browser/nope")),
+                _ => panic!("{url}"),
+            }
         })
         .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9333/json/version"));
-        assert_eq!(seen, vec!["http://127.0.0.1:9333/json/version".to_string()]);
-        assert!(seen.iter().all(|url| !url.contains("9222")));
-        assert!(seen.iter().all(|url| !url.contains("9223")));
-        assert!(seen.iter().all(|url| !url.contains("9228")));
+        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9228/json/version"));
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9222/json/version".to_string(),
+                "http://127.0.0.1:9223/json/version".to_string(),
+                "http://127.0.0.1:9228/json/version".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -94,4 +94,5 @@ export declare function launchBrowser(options?: {
   args?: string[];
   env?: Record<string, string | undefined>;
   timeout?: number;
+  platform?: string;
 }): Promise<LaunchedBrowser>;

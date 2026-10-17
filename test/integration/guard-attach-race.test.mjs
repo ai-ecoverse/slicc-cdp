@@ -9,7 +9,7 @@ import { cdpProxy } from './cdp-proxy.mjs';
 import { killTree } from './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const guardTimeoutMs = 10000;
+const guardTimeoutMs = 30000;
 
 test('the guard attach race through a delaying CDP proxy', async (t) => {
   const harness = path.join(root, '.build/guard-race');

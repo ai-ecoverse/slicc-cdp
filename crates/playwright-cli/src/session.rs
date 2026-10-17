@@ -481,40 +481,20 @@ pub fn usable_endpoint(endpoint: Option<&str>, provenance: Option<&str>) -> Opti
 pub fn reuse_saved(
     endpoint: Option<&str>,
     provenance: Option<&str>,
-    list_body: Option<&str>,
+    version_body: Option<&str>,
 ) -> Option<String> {
     let url = usable_endpoint(endpoint, provenance)?;
     if provenance == Some("probe") {
-        list_url(&url)?;
-        if !crate::discover::list_has_seven_tab(list_body?) {
-            return None;
-        }
+        discovery_url(&url)?;
+        crate::connect::websocket_url_from_version(version_body?).ok()?;
     }
     Some(url)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn list_url(endpoint: &str) -> Option<String> {
+fn discovery_url(endpoint: &str) -> Option<&str> {
     let lower = endpoint.to_ascii_lowercase();
-    if lower.starts_with("ws://") || lower.starts_with("wss://") {
-        return None;
-    }
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
-        return None;
-    }
-    if let Some(index) = endpoint.find("/json/version") {
-        let mut list = endpoint.to_string();
-        list.replace_range(index..index + "/json/version".len(), "/json/list");
-        return Some(list);
-    }
-    Some(format!("{}/json/list", endpoint.trim_end_matches('/')))
-}
-
-pub fn page_visible(provenance: Option<&str>, url: &str, id: &str, owned: &[String]) -> bool {
-    if provenance != Some("probe") {
-        return true;
-    }
-    crate::discover::seven_origin(url) || owned.iter().any(|item| item == id)
+    (lower.starts_with("http://") || lower.starts_with("https://")).then_some(endpoint)
 }
 
 #[cfg(test)]
@@ -798,20 +778,14 @@ mod tests {
         assert!(usable_endpoint(Some(remote), Some("explicit")).is_none());
         assert!(loopback_url("http://user@[::1]:9333/json/version"));
         assert!(loopback_url("http://127.0.0.1:9333?x=1"));
+        let alive = r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/personal"}"#;
         assert_eq!(
-            list_url("http://127.0.0.1:9333/json/version").as_deref(),
-            Some("http://127.0.0.1:9333/json/list")
-        );
-        assert!(list_url("ws://127.0.0.1:9333/devtools/browser/abc").is_none());
-        let seven = r#"[{"id":"T1","type":"page","url":"https://lars.sliccy.ai/","title":"seven"},{"id":"P1","type":"page","url":"https://example.com/inbox","title":"PERSONAL"}]"#;
-        let personal = r#"[{"id":"P1","type":"page","url":"https://example.com/inbox","title":"PERSONAL"}]"#;
-        assert_eq!(
-            reuse_saved(Some("http://127.0.0.1:9222/json/version"), Some("probe"), Some(seven)).as_deref(),
+            reuse_saved(Some("http://127.0.0.1:9222/json/version"), Some("probe"), Some(alive)).as_deref(),
             Some("http://127.0.0.1:9222/json/version")
         );
-        assert!(reuse_saved(Some("http://127.0.0.1:9222/json/version"), Some("probe"), Some(personal)).is_none());
+        assert!(reuse_saved(Some("http://127.0.0.1:9222/json/version"), Some("probe"), Some("{}")).is_none());
         assert!(reuse_saved(Some("http://127.0.0.1:9222/json/version"), Some("probe"), None).is_none());
-        assert!(reuse_saved(Some("ws://127.0.0.1:9222/devtools/browser/x"), Some("probe"), Some(seven)).is_none());
+        assert!(reuse_saved(Some("ws://127.0.0.1:9222/devtools/browser/x"), Some("probe"), Some(alive)).is_none());
         assert!(reuse_saved(Some("https://evil.example/json/version"), Some("explicit"), None).is_none());
         assert_eq!(
             reuse_saved(Some("http://127.0.0.1:9333/json/version"), Some("explicit"), None).as_deref(),
@@ -821,17 +795,6 @@ mod tests {
             reuse_saved(Some("http://127.0.0.1:9333/json/version"), Some("seven-profile"), None).as_deref(),
             Some("http://127.0.0.1:9333/json/version")
         );
-    }
-
-    #[test]
-    fn a_probe_session_hides_personal_tabs_and_keeps_owned_ones() {
-        let owned = vec!["OWN".to_string()];
-        assert!(page_visible(Some("probe"), "https://abc.sliccy.ai/", "S", &owned));
-        assert!(!page_visible(Some("probe"), "https://example.com/inbox", "P", &owned));
-        assert!(page_visible(Some("probe"), "https://example.com/inbox", "OWN", &owned));
-        assert!(page_visible(Some("explicit"), "https://example.com/inbox", "P", &[]));
-        assert!(page_visible(Some("seven-profile"), "https://mail.example/", "P", &[]));
-        assert!(page_visible(None, "https://example.com/", "P", &[]));
     }
 
     #[cfg(unix)]
