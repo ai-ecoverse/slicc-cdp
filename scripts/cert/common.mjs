@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { cliVerdict } from './cli-verdict.mjs';
 
 export const name = '@ai-ecoverse/slicc-cdp';
 export const repo = 'ai-ecoverse/slicc-cdp';
@@ -127,6 +128,7 @@ export function capture(command, argv, options = {}) {
   };
 }
 export async function evidence(which, execute) {
+  const printVerdict = cliVerdict(`${which}: `);
   const options = args();
   const plan = json(options.plan);
   let result;
@@ -139,5 +141,5 @@ export async function evidence(which, execute) {
     };
   }
   save(options.out, { ...identity(plan), which, ...result });
-  console.log(`${which}: ${result.status} ${options.out}`);
+  printVerdict(result.status, options.out);
 }

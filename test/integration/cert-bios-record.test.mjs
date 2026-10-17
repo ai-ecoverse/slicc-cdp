@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertVerdict } from './cert-cli-verdict.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const save = (file, value) => writeFileSync(file, JSON.stringify(value));
@@ -154,6 +155,7 @@ for (const mode of [
     );
     assert.equal(run.status, 0, run.stderr);
     const record = read(path.join(out, 'record.json'));
+    assertVerdict(run.stdout, 'pr-record', record.status);
     if (mode === 'complete')
       assert.ok(!record.incomplete.some((reason) => reason.startsWith('bios:')));
     if (mode === 'forged PASS with regression')

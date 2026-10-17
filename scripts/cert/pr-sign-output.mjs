@@ -1,8 +1,10 @@
 import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, json, save } from './common.mjs';
 import { prIdentity } from './pr-common.mjs';
 
+const printVerdict = cliVerdict('pr-sign-output: ');
 const options = args({ directory: { type: 'string' } });
 const plan = json(options.plan);
 const input = json(path.join(options.directory, 'sign-input.json'));
@@ -20,3 +22,4 @@ const files = input.sources
 if (files.length !== 4 || new Set(files.map((row) => row.file)).size !== 4)
   throw new Error('all four signature outputs required');
 save(path.join(options.out, 'signed.json'), { ...prIdentity(plan), files });
+printVerdict('PASS', options.out);
