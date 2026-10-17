@@ -36,10 +36,14 @@ test('PR certification workflow reports despite skipped evidence ancestors', () 
     'guard',
     'integration',
     'bios',
+    'bios_inputs',
+    'bios_base',
+    'bios_candidate',
     'assets',
     'review',
     'record',
   ]) {
+    assert.ok(workflow.jobs[name], `required certification job ${name} exists`);
     assert.match(workflow.jobs[name].if, /github\.event_name == 'pull_request'/);
   }
   const group = steps('report').find((step) => step.run?.includes('--action group'));
@@ -52,6 +56,14 @@ test('PR certification controls come from main and candidate jobs stay hosted re
   assert.equal(workflow.env.SLICC_CDP_PORTS, '9300-9309');
   assert.deepEqual(workflow.permissions, { contents: 'read' });
   for (const job of Object.values(workflow.jobs)) {
+    if (!job.steps) {
+      assert.equal(
+        job.uses,
+        'ai-ecoverse/slicc-bios/.github/workflows/canary.yml@4025d6aabc2c06add216183064d81914a171cd64'
+      );
+      assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' });
+      continue;
+    }
     const checkouts = job.steps.filter((step) => step.uses?.startsWith('actions/checkout@'));
     assert.equal(checkouts.length, 1);
     assert.equal(checkouts[0].with['persist-credentials'], false);
@@ -90,13 +102,16 @@ test('PR certification credentials are step-only and model has no execution or f
   for (const job of Object.values(workflow.jobs))
     assert.ok(!JSON.stringify(job.env ?? {}).includes('secrets.'));
   const secretSteps = Object.entries(workflow.jobs).flatMap(([name, job]) =>
-    job.steps.filter((step) => JSON.stringify(step.env ?? {}).includes('secrets.')).map(() => name)
+    (job.steps ?? [])
+      .filter((step) => JSON.stringify(step.env ?? {}).includes('secrets.'))
+      .map(() => name)
   );
   assert.deepEqual(secretSteps, ['signing', 'review']);
   const model = steps('review').find((step) => step.id === 'model');
   assert.equal(model.env.NODE_VERSION, '24');
   assert.match(model.with.claude_args, /--tools ""/);
-  assert.match(model.with.claude_args, /--json-schema/);
+  assert.ok(!model.with.claude_args.includes('--json-schema'));
+  assert.ok(!JSON.stringify(workflow.jobs.review).includes('structured_output'));
   assert.equal(model.with.allowed_bots, undefined);
   assert.equal(model.with.prompt_file, 'review/prompt.txt');
   assert.ok(
@@ -108,6 +123,8 @@ test('PR certification credentials are step-only and model has no execution or f
     "${{ vars.CERT_BEDROCK_MODEL || 'global.anthropic.claude-opus-5-5' }}"
   );
   assert.ok(receipt.run.includes('value.model=process.env.CERT_REVIEW_MODEL'));
+  assert.ok(receipt.run.includes('--execution "${EXECUTION:-/dev/null}"'));
+  assert.ok(!receipt.run.includes('--verdict'));
   const prepare = steps('review').find((step) => step.run?.includes('EXACT SOURCE DIFF DATA'));
   assert.match(prepare.run, /--no-ext-diff.*--no-textconv/);
   assert.ok(!prepare.run.includes('npm ci'));
@@ -138,6 +155,22 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   const bios = workflow.jobs.bios;
   assert.ok(bios.steps.some((step) => step.run?.includes('scripts/cert/pr-bios.mjs')));
   assert.ok(!JSON.stringify(bios).includes('slicc-bios/'));
+  assert.ok(bios.needs.includes('bios_base') && bios.needs.includes('bios_candidate'));
+  assert.ok(!bios.if.includes('needs.bios_base.result'));
+  for (const side of ['base', 'candidate']) {
+    const call = workflow.jobs[`bios_${side}`];
+    assert.equal(
+      call.uses,
+      'ai-ecoverse/slicc-bios/.github/workflows/canary.yml@4025d6aabc2c06add216183064d81914a171cd64'
+    );
+    assert.equal(call.with.label, side);
+    assert.equal(call.with.repeat, 3);
+    assert.equal(call.with['bios-ref'], '4025d6aabc2c06add216183064d81914a171cd64');
+    assert.deepEqual(JSON.parse(call.with.shards), ['packages-update-cdp', 'guard']);
+  }
+  const consume = bios.steps.find((step) => step.env?.BIOS_BASE);
+  assert.ok(consume.env.BIOS_BASE.includes('fromJSON(needs.bios_base.outputs.result'));
+  assert.ok(consume.env.BIOS_CANDIDATE.includes('fromJSON(needs.bios_candidate.outputs.result'));
   for (const name of ['guard', 'integration']) {
     const raw = steps(name).find((step) => step.uses?.startsWith('actions/upload-artifact@'));
     assert.ok(
@@ -150,6 +183,7 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   for (const name of ['self', 'report']) {
     const guard = steps(name).find((step) => step.id === 'guard');
     for (const file of [
+      '.gitattributes',
       'scripts/test-integration.mjs',
       'test/integration/test-arguments.mjs',
       'test/integration/ports.mjs',
@@ -171,7 +205,7 @@ test('Non-required PR certification jobs cannot alias required CI check names', 
 test('PR certification signed bytes expire after one day while verification metadata remains', () => {
   const workflow = loadWorkflow();
   for (const [name, job] of Object.entries(workflow.jobs)) {
-    for (const step of job.steps.filter((item) =>
+    for (const step of (job.steps ?? []).filter((item) =>
       item.uses?.startsWith('actions/upload-artifact@')
     )) {
       const signedBytes = name === 'signing' || name === 'collect';
