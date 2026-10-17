@@ -313,11 +313,25 @@ fn stored_link(value: &str, base: &str) -> String {
     out
 }
 
+fn refresh_target(value: &str) -> Option<usize> {
+    let lowered = value.to_ascii_lowercase();
+    let assigned = lowered.match_indices("url").find_map(|(at, _)| {
+        let after = lowered[at + 3..].trim_start();
+        let rest = after.strip_prefix('=')?;
+        Some(value.len() - rest.trim_start().len())
+    });
+    assigned.or_else(|| {
+        let after = value.find(';')? + 1;
+        let start = value.len() - value[after..].trim_start().len();
+        (start < value.len()).then_some(start)
+    })
+}
+
 fn stored_refresh(value: &str, base: &str) -> String {
-    let Some(at) = value.to_ascii_lowercase().find("url=") else {
+    let Some(at) = refresh_target(value) else {
         return value.to_string();
     };
-    let (head, target) = value.split_at(at + 4);
+    let (head, target) = value.split_at(at);
     let quote = target.chars().next().filter(|c| matches!(c, '"' | '\''));
     let Some(quote) = quote else {
         return format!("{head}{}", stored_ref(target.trim(), base));
@@ -440,6 +454,17 @@ fn holds_credential(lowered: &str, scheme: &str) -> bool {
 
 const TOKEN_PREFIXES: &[(&str, usize)] = &[
     ("sk-", 16),
+    ("sk_live_", 16),
+    ("sk_test_", 16),
+    ("rk_live_", 16),
+    ("rk_test_", 16),
+    ("pk_live_", 16),
+    ("pk_test_", 16),
+    ("whsec_", 16),
+    ("AIza", 35),
+    ("npm_", 30),
+    ("hf_", 30),
+    ("pypi-", 32),
     ("ghp_", 20),
     ("gho_", 20),
     ("ghu_", 20),
@@ -465,9 +490,14 @@ fn holds_prefixed_token(text: &str) -> bool {
     words(text, token_char).any(|word| {
         TOKEN_PREFIXES.iter().any(|(prefix, min)| {
             word.strip_prefix(prefix)
-                .is_some_and(|rest| rest.len() >= *min && rest.bytes().any(|b| b.is_ascii_digit()))
+                .is_some_and(|rest| rest.len() >= *min && random_mix(rest))
         }) || aws_key(word)
     })
+}
+
+fn random_mix(rest: &str) -> bool {
+    rest.bytes().any(|b| b.is_ascii_digit())
+        || (rest.bytes().any(|b| b.is_ascii_uppercase()) && rest.bytes().any(|b| b.is_ascii_lowercase()))
 }
 
 fn aws_key(word: &str) -> bool {
@@ -509,7 +539,15 @@ fn high_entropy(word: &str) -> bool {
 }
 
 fn mixes_classes(word: &str) -> bool {
-    let classes: Vec<u8> = word
+    switches(word) * 20 >= (classes(word).len() - 1) * 7
+}
+
+fn switches(word: &str) -> usize {
+    classes(word).windows(2).filter(|pair| pair[0] != pair[1]).count()
+}
+
+fn classes(word: &str) -> Vec<u8> {
+    word
         .bytes()
         .filter_map(|b| match b {
             b'A'..=b'Z' => Some(0),
@@ -517,13 +555,28 @@ fn mixes_classes(word: &str) -> bool {
             b'0'..=b'9' => Some(2),
             _ => None,
         })
-        .collect();
-    let switches = classes.windows(2).filter(|pair| pair[0] != pair[1]).count();
-    switches * 20 >= (classes.len() - 1) * 7
+        .collect()
+}
+
+fn lowercase_secret(word: &str) -> bool {
+    word.len() >= 32
+        && !word.bytes().any(|b| b.is_ascii_uppercase())
+        && word.bytes().any(|b| b.is_ascii_digit())
+        && word.bytes().any(|b| b.is_ascii_lowercase())
+        && entropy(word) >= 3.7
+        && switches(word) * 20 >= (word.len() - 1) * 3
+        && short_letter_runs(word)
+}
+
+fn short_letter_runs(word: &str) -> bool {
+    let runs = words(word, |c| c.is_ascii_lowercase());
+    let (count, letters) = runs.fold((0, 0), |(count, letters), run| (count + 1, letters + run.len()));
+    letters <= count * 6
 }
 
 fn holds_high_entropy(text: &str) -> bool {
     words(text, |c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_')).any(high_entropy)
+        || words(text, |c| c.is_ascii_alphanumeric()).any(lowercase_secret)
 }
 
 fn secret_text(text: &str) -> bool {
@@ -1103,6 +1156,19 @@ mod tests {
             "(github_pat_11PLNT0123456789_abcdefghijklmnopqrstuvwxyz)",
             "aws AKIAPLNT0123456789AB.",
             "ASIAPLNT0123456789AB",
+            "stripe sk_live_PLNT0123456789abcdefgh",
+            "sk_test_PLNT0123456789abcdefgh",
+            "rk_live_PLNT0123456789abcdefgh",
+            "rk_test_PLNT0123456789abcdefgh",
+            "pk_live_PLNT0123456789abcdefgh",
+            "pk_test_PLNT0123456789abcdefgh",
+            "whsec_PLNT0123456789abcdefgh",
+            "google AIzaSyPLNT0123456789abcdefghijklmnopqrs",
+            "npm_PLNT0123456789abcdefghijklmnopqrstu",
+            "hf_PLNTabcdefghijklmnopqrstuvwxyzABCDEFGH",
+            "pypi-AgEIcHlwaS5vcmcPLNT0123456789abcdefghij",
+            "key 7f3k9q2m8x1v4b6n0c5z7l2j9h4g1d8s6a3p",
+            "lower+digit k7f3k9q2m8x1v4b6n0c5z7l2j9h4g1d8s6a3p0w2.",
             "glpat-PLNT0123456789abcdefgh",
             "xoxa-PLNT-0123456789",
             "xoxb-1234567890-PLNTabcdef",
@@ -1120,6 +1186,19 @@ mod tests {
             "task-0123456789abcdefghijklmnop finished",
             "sk-the-very-long-css-class-name-here",
             "AKIA0123456789ABCDEFG",
+            "sk_live_short123",
+            "sk_live_the_very_long_setting_name_here",
+            "AIzaShortKey123",
+            "npm_install_the_dependencies_for_this_package_now",
+            "hf_the_lowercase_hub_setting_without_digits_here",
+            "pypi-the-package-index-mirror-configuration-name",
+            "my-blog-post-2023-about-things-and-stuff-today",
+            "assets/js/chunk-vendors/v2/index/main/app",
+            "release-2024-10-17-build-1234-candidate-3-final",
+            "user_profile_settings_page_v2_loaded_ok_today",
+            "abc123abc123abc123abc123abc123abc123",
+            "chapter1section2paragraph3sentence4wordsfive",
+            "release1candidate2build3final4version5",
             "AKIAplnt0123456789ab",
             "ghp_short1",
             "xoxz-1234567890-PLNTabcdef",
@@ -1158,6 +1237,10 @@ mod tests {
             pair("Refresh", "5; url=/r?token=R1"),
             pair("Refresh", "0;URL='/r?code=R2'"),
             pair("Refresh", "5"),
+            pair("Refresh", "0; url = /r?token=R5"),
+            pair("Refresh", "0; /r?code=R6"),
+            pair("Refresh", "0;"),
+            pair("Refresh", "0; urlx /r?code=R7"),
             pair("Referer", "https://example.test/?code=R3"),
             pair("x-forwarded", "https://example.test/?code=R4"),
             pair("x-plain", "/keep?token=as-is"),
@@ -1179,6 +1262,10 @@ mod tests {
                 "5; url=/r?token=[redacted]",
                 "0;URL='/r?code=[redacted]'",
                 "5",
+                "0; url = /r?token=[redacted]",
+                "0; /r?code=[redacted]",
+                "0;",
+                "0; /urlx%20/r?code=[redacted]",
                 "https://example.test/?code=[redacted]",
                 "https://example.test/?code=[redacted]",
                 "/keep?token=as-is",

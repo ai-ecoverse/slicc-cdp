@@ -297,6 +297,12 @@ test('the saved session drops console entries that hold a bare token', {
     slack: ['xoxb-', '1234567890-PLNTabcdef'],
     gitlab: ['glpat-', 'PLNT0123456789abcdefgh'],
     entropy: ['Zk9xL3Rq2mWv8sPb7NcYd4hGe1', 'RaKu6TfQi0Xo5Jz9PLNT'],
+    stripe: ['sk_live_', 'PLNT0123456789abcdefgh'],
+    google: ['AIza', 'SyPLNT0123456789abcdefghijklmnopqrs'],
+    npm: ['npm_', 'PLNT0123456789abcdefghijklmnopqrstu'],
+    huggingface: ['hf_', 'PLNTabcdefghijklmnopqrstuvwxyzABCDEFGH'],
+    pypi: ['pypi-', 'AgEIcHlwaS5vcmcPLNT0123456789abcdefghij'],
+    lowercase: ['7f3k9q2m8x1v4b6n0c5z', '7l2j9h4g1d8s6a3pplnt'],
   };
   const logs = Object.values(tokens)
     .map(
