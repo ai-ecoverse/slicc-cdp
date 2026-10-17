@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { createServer as createTls } from 'node:https';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -66,9 +67,10 @@ function page(title) {
   return `<!doctype html><title>${title}</title><p>${title}</p>`;
 }
 
-function site() {
+function site(hits = []) {
   return listen((req, res) => {
     const url = new URL(req.url || '/', 'http://fixture');
+    hits.push(`${req.headers.host}${url.pathname}`);
     if (url.pathname === '/api') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"from":"api"}');
@@ -154,12 +156,16 @@ test('a browser on a catalog debug port is attached and driven without a seven t
   timeout: 240_000,
 }, async (t) => {
   const ports = await portRange(3);
-  const fixture = await site();
+  const hits = [];
+  const fixture = await site(hits);
   const other = await site();
   const dir = await home();
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-ports-cwd-'));
   const browser = await launchBrowser(
-    ['--host-resolver-rules=MAP vault.sliccy.ai 127.0.0.1', '--no-proxy-server'],
+    [
+      '--host-resolver-rules=MAP vault.sliccy.ai 127.0.0.1, MAP seven.sliccy.ai 127.0.0.1',
+      '--no-proxy-server',
+    ],
     { port: ports[1] }
   );
   const raw = await rawSocket(browser.wsUrl);
@@ -235,6 +241,53 @@ test('a browser on a catalog debug port is attached and driven without a seven t
       assert.ok(!listed.stdout.includes('vault.sliccy.ai'), listed.stdout);
     });
 
+    await t.test(
+      'webmcp, snapshot, goto, curlwright and discover refuse protected tabs and URLs',
+      async () => {
+        const stand = (host) => `http://${host}:${fixture.port}`;
+        const before = hits.length;
+        const refused = [
+          await pw(['webmcp-list', '--tab', vault]),
+          await pw(['webmcp-call', 'greet', '{}', '--tab', vault]),
+          await pw(['snapshot', '--tab', vault]),
+        ];
+        for (const host of ['vault.sliccy.ai', 'seven.sliccy.ai']) {
+          refused.push(await pw(['goto', `${stand(host)}/goto`]));
+          refused.push(await pw(['discover', '--json', '--once', `${stand(host)}/`]));
+          const curled = await run(curlwright, ['-s', `${stand(host)}/api`], cwd, env);
+          assert.equal(curled.code, 1, curled.stdout);
+          assert.equal(curled.stderr, `curlwright: ${refusal}`);
+          assert.equal(curled.stdout, '');
+        }
+        for (const result of refused) {
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stderr, refusal);
+          assert.equal(result.stdout, '');
+        }
+        const reached = hits.slice(before).filter((hit) => hit.includes('sliccy.ai'));
+        assert.deepEqual(reached, []);
+      }
+    );
+
+    await t.test('the same commands work on an unprotected tab and URL', async () => {
+      const before = hits.length;
+      const listed = await pw(['webmcp-list', '--tab', personal]);
+      assert.equal(listed.code, 0, listed.stderr);
+      const snapped = await pw(['snapshot', '--tab', personal]);
+      assert.equal(snapped.code, 0, snapped.stderr);
+      assert.match(snapped.stdout, /personal/);
+      const went = await pw(['goto', `${fixture.origin}/goto`]);
+      assert.equal(went.code, 0, went.stderr);
+      const found = await pw(['discover', '--json', '--once', `${fixture.origin}/`]);
+      assert.ok(!found.stderr.includes('refused'), found.stderr);
+      const curled = await run(curlwright, ['-s', `${fixture.origin}/api`], cwd, env);
+      assert.equal(curled.code, 0, curled.stderr);
+      assert.equal(curled.stdout, '{"from":"api"}');
+      const reached = hits.slice(before);
+      for (const want of ['/goto', '/', '/api'])
+        assert.ok(reached.includes(`127.0.0.1:${fixture.port}${want}`), reached.join('\n'));
+    });
+
     await t.test('curlwright finds the probed browser without --cdp', async () => {
       const fresh = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-ports-curl-'));
       try {
@@ -250,6 +303,93 @@ test('a browser on a catalog debug port is attached and driven without a seven t
     await browser.close();
     await fixture.close();
     await other.close();
+    await rm(dir, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+async function seven(dir) {
+  const key = path.join(dir, 'seven.key');
+  const cert = path.join(dir, 'seven.crt');
+  execFileSync(
+    'openssl',
+    [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-nodes',
+      '-keyout',
+      key,
+      '-out',
+      cert,
+      '-days',
+      '1',
+      '-subj',
+      '/CN=seven.sliccy.ai',
+      '-addext',
+      'subjectAltName=DNS:seven.sliccy.ai',
+    ],
+    { stdio: 'ignore' }
+  );
+  const handler = (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(page(req.socket.encrypted ? 'seven' : 'stand-in'));
+  };
+  const tls = createTls({ key: await readFile(key), cert: await readFile(cert) }, handler);
+  const plain = createServer(handler);
+  const server = net.createServer((socket) => {
+    socket.once('data', (first) => {
+      socket.pause();
+      socket.unshift(first);
+      (first[0] === 0x16 ? tls : plain).emit('connection', socket);
+      socket.resume();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    close: () => new Promise((done) => server.close(() => done())),
+  };
+}
+
+test('list --json lists a real seven tab in sevenTabs and tabs, and an http stand-in in neither', {
+  timeout: 120_000,
+}, async () => {
+  const ports = await portRange(3);
+  const dir = await home();
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-ports-seven-'));
+  const server = await seven(dir);
+  const browser = await launchBrowser(
+    [
+      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${server.port}`,
+      '--ignore-certificate-errors',
+      '--no-proxy-server',
+    ],
+    { port: ports[1] }
+  );
+  const raw = await rawSocket(browser.wsUrl);
+  try {
+    const real = await raw.open('https://seven.sliccy.ai/');
+    const stand = await raw.open(`http://seven.sliccy.ai:${server.port}/`);
+    raw.close();
+    const listed = await run(playwright, ['list', '--json'], cwd, hostEnv(dir, ports));
+    assert.equal(listed.code, 0, listed.stderr);
+    const entry = JSON.parse(listed.stdout).entries.find(
+      (item) => item.endpoint?.cdp === `http://127.0.0.1:${ports[1]}`
+    );
+    assert.ok(entry, listed.stdout);
+    const ids = (tabs) => tabs.map((tab) => tab.id);
+    assert.equal(entry.endpoint.sevenOpen, true);
+    assert.deepEqual(ids(entry.endpoint.sevenTabs), [real]);
+    assert.equal(entry.endpoint.sevenTabs[0].url, 'https://seven.sliccy.ai/');
+    assert.ok(ids(entry.endpoint.tabs).includes(real), listed.stdout);
+    assert.ok(!ids(entry.endpoint.tabs).includes(stand), listed.stdout);
+    assert.ok(!listed.stdout.includes(`seven.sliccy.ai:${server.port}`), listed.stdout);
+  } finally {
+    raw.close();
+    await browser.close();
+    await server.close();
     await rm(dir, { recursive: true, force: true });
     await rm(cwd, { recursive: true, force: true });
   }
