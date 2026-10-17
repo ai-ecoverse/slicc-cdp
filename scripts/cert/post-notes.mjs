@@ -13,7 +13,7 @@ if (release.draft || release.tag_name !== `v${record.version}`)
   throw new Error('published release required');
 const body = release.body ?? '';
 const pattern = new RegExp(
-  `certified(?:-candidate)? ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@${record.version.replaceAll('.', '\\.')} sha256=([a-f0-9]{64})`,
+  `(?:certified(?:-candidate)?|verified) ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@${record.version.replaceAll('.', '\\.')} sha256=([a-f0-9]{64})`,
   'g'
 );
 const hashes = [...body.matchAll(pattern)].map((match) => match[1]);
@@ -28,9 +28,16 @@ if (begins !== ends || begins > 1 || (begins && body.indexOf(start) > body.index
 if (body.includes(record.line)) console.log('verification notes unchanged');
 else {
   const section = `${start}\n## Supply-chain verification\n\n${record.line}\n${end}`;
-  const notes = begins
-    ? body.replace(/<!-- cert-verify -->[\s\S]*?<!-- \/cert-verify -->/, section)
-    : `${body.trimEnd()}\n\n${section}\n`;
+  let notes;
+  if (begins) {
+    const first = body.indexOf(start) + start.length;
+    const last = body.indexOf(end);
+    const marked = body.slice(first, last);
+    const linePattern = new RegExp(`^${pattern.source}[^\\r\\n]*$`, 'gm');
+    if ([...marked.matchAll(linePattern)].length !== 1)
+      throw new Error('verification notes require one marked verification line');
+    notes = `${body.slice(0, first)}${marked.replace(linePattern, () => record.line)}${body.slice(last)}`;
+  } else notes = `${body.trimEnd()}\n\n${section}\n`;
   if (!options.dry) {
     const file = path.join(path.dirname(options.record), 'notes-payload.json');
     save(file, { body: notes });
