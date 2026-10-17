@@ -48,6 +48,22 @@ test('the cdp-client Fetch API against chromium', async () => {
 });
 
 test('interception that turns active after Fetch.enable answers is waited for', async () => {
+  await throughProxy({ early: [{ method: 'Fetch.enable', match: '/api/headers', ms: 1500 }] });
+});
+
+test('interception waits until the browser has committed a navigation the renderer already reported', async () => {
+  await throughProxy({
+    before: [
+      {
+        method: 'Page.navigate',
+        match: '/js-redirect',
+        send: { method: 'Emulation.setCPUThrottlingRate', params: { rate: 50 } },
+      },
+    ],
+  });
+});
+
+async function throughProxy(options) {
   const site = await startServer();
   let browser;
   let proxy;
@@ -56,9 +72,7 @@ test('interception that turns active after Fetch.enable answers is waited for', 
       `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}, MAP vault.sliccy.ai 127.0.0.1:${site.port}`,
       '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
     ]);
-    proxy = await cdpProxy(browser.wsUrl, {
-      early: [{ method: 'Fetch.enable', match: '/api/headers', ms: 1500 }],
-    });
+    proxy = await cdpProxy(browser.wsUrl, options);
     const result = await cargo(
       [
         'test',
@@ -86,7 +100,7 @@ test('interception that turns active after Fetch.enable answers is waited for', 
     await browser?.close();
     await site.close();
   }
-});
+}
 
 function cargo(args, extra) {
   return new Promise((resolve, reject) => {
