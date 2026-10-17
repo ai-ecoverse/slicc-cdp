@@ -56,6 +56,9 @@ jobs:
             .github/workflows/cert*.yml
             .github/workflows/cert*.yaml
             scripts/cert/**
+            scripts/test-integration.mjs
+            test/integration/test-arguments.mjs
+            test/integration/ports.mjs
             .cert/proofs.json
             scripts/sign-macos.sh
             scripts/generate-notices.sh
@@ -991,6 +994,9 @@ jobs:
             .github/workflows/cert*.yml
             .github/workflows/cert*.yaml
             scripts/cert/**
+            scripts/test-integration.mjs
+            test/integration/test-arguments.mjs
+            test/integration/ports.mjs
             .cert/proofs.json
             scripts/sign-macos.sh
             scripts/generate-notices.sh
