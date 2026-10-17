@@ -78,7 +78,7 @@ test('discover UCP (/.well-known/ucp) with the AP2 extension', { timeout: 120_00
     };
 
     await t.test(
-      'a business profile with every transport, a capability extension and a signing key validates',
+      'ucp.dev business profile shape, 2026-08-25: every transport, a capability extension and a signing key validate',
       async () => {
         const { ucp, result } = await ucpOf(BUSINESS);
         assert.equal(ucp.length, 1, result.stdout);
@@ -101,13 +101,16 @@ test('discover UCP (/.well-known/ucp) with the AP2 extension', { timeout: 120_00
       }
     );
 
-    await t.test('a profile advertising the AP2 mandate capability sets ap2', async () => {
-      const { ucp, result } = await ucpOf(AP2);
-      assert.equal(ucp[0]?.status, 'valid', result.stdout);
-      assert.equal(ucp[0].summary.ap2, true);
-      assert.deepEqual(ucp[0].summary.services, {});
-      assert.equal(ucp[0].summary.hasKeys, false);
-    });
+    await t.test(
+      'ucp.dev AP2 mandates profile shape, 2026-08-25: the ap2_mandate capability sets ap2',
+      async () => {
+        const { ucp, result } = await ucpOf(AP2);
+        assert.equal(ucp[0]?.status, 'valid', result.stdout);
+        assert.equal(ucp[0].summary.ap2, true);
+        assert.deepEqual(ucp[0].summary.services, {});
+        assert.equal(ucp[0].summary.hasKeys, false);
+      }
+    );
 
     await t.test(
       'a profile modelled on a public Shopify storefront profile (2026-10) validates with its MCP endpoint',
