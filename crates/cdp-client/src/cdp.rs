@@ -47,6 +47,7 @@ pub struct Cdp {
     guarding: BTreeSet<String>,
     abandoned: BTreeSet<String>,
     unguarded_optional: BTreeMap<String, BTreeSet<String>>,
+    notices: Vec<String>,
     discovering: bool,
     requests: BTreeMap<String, bool>,
     handed: BTreeSet<(String, String)>,
@@ -83,6 +84,7 @@ impl Cdp {
             guarding: BTreeSet::new(),
             abandoned: BTreeSet::new(),
             unguarded_optional: BTreeMap::new(),
+            notices: Vec::new(),
             discovering: false,
             requests: BTreeMap::new(),
             handed: BTreeSet::new(),
@@ -107,6 +109,10 @@ impl Cdp {
 
     pub fn protect_origins(&mut self, extra_origins: &[&str]) {
         self.guard = Protected::new(extra_origins);
+    }
+
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
 
     pub fn unguarded_optional(&self, target_id: &str) -> Vec<String> {
@@ -649,10 +655,15 @@ impl Cdp {
             let failed = match answer {
                 Ok(_) => None,
                 Err(message) if optional && message == format!("{method} timed out\n") => {
-                    self.unguarded_optional
+                    if self
+                        .unguarded_optional
                         .entry(target_id.to_string())
                         .or_default()
-                        .insert(method.to_string());
+                        .insert(method.to_string())
+                    {
+                        self.notices
+                            .push(format!("slicc: guard: {method} timed out; continuing\n"));
+                    }
                     None
                 }
                 Err(message) if optional && message.starts_with(&format!("{method}:")) => None,

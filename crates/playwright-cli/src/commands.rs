@@ -165,6 +165,10 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         Err(message) if result.code == 0 => Output::err(message),
         _ => result,
     };
+    let mut result = result;
+    for notice in cdp.take_notices() {
+        result.stderr.push_str(&notice);
+    }
     report.finish(&mut cdp, &result);
     result
 }
