@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import yaml from 'js-yaml';
 
-const workflow = yaml.load(
-  readFileSync(new URL('../../.github/workflows/cert-review-pr.yml', import.meta.url), 'utf8')
-);
-const steps = (job) => workflow.jobs[job].steps;
+function loadWorkflow() {
+  const file = new URL('../../.github/workflows/cert-review-pr.yml', import.meta.url);
+  assert.ok(existsSync(file), 'PR certification workflow must exist');
+  return yaml.load(readFileSync(file, 'utf8'));
+}
+const steps = (job) => loadWorkflow().jobs[job].steps;
 
 test('PR certification workflow reports despite skipped evidence ancestors', () => {
+  const workflow = loadWorkflow();
   assert.deepEqual(workflow.on.pull_request.types, [
     'opened',
     'synchronize',
@@ -45,6 +48,7 @@ test('PR certification workflow reports despite skipped evidence ancestors', () 
 });
 
 test('PR certification controls come from main and candidate jobs stay hosted read-only', () => {
+  const workflow = loadWorkflow();
   assert.equal(workflow.env.SLICC_CDP_PORTS, '9300-9309');
   assert.deepEqual(workflow.permissions, { contents: 'read' });
   for (const job of Object.values(workflow.jobs)) {
@@ -81,6 +85,7 @@ test('PR certification controls come from main and candidate jobs stay hosted re
 });
 
 test('PR certification credentials are step-only and model has no execution or filesystem tools', () => {
+  const workflow = loadWorkflow();
   assert.ok(!JSON.stringify(workflow.env).includes('secrets.'));
   for (const job of Object.values(workflow.jobs))
     assert.ok(!JSON.stringify(job.env ?? {}).includes('secrets.'));
@@ -109,6 +114,7 @@ test('PR certification credentials are step-only and model has no execution or f
 });
 
 test('PR certification preserves canonical plan and missing producer refusal', () => {
+  const workflow = loadWorkflow();
   const gather = steps('record').find((step) => step.name?.startsWith('Gather only canonical'));
   assert.match(
     gather.run,
@@ -135,6 +141,7 @@ test('PR certification preserves canonical plan and missing producer refusal', (
 });
 
 test('Non-required PR certification jobs cannot alias required CI check names', () => {
+  const workflow = loadWorkflow();
   const required = ['integration', 'ci / test', 'shellcheck'];
   for (const [id, job] of Object.entries(workflow.jobs)) {
     assert.ok(!required.includes(job.name ?? id));
@@ -144,6 +151,7 @@ test('Non-required PR certification jobs cannot alias required CI check names', 
 });
 
 test('PR certification signed bytes expire after one day while verification metadata remains', () => {
+  const workflow = loadWorkflow();
   for (const [name, job] of Object.entries(workflow.jobs)) {
     for (const step of job.steps.filter((item) =>
       item.uses?.startsWith('actions/upload-artifact@')

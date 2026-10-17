@@ -556,7 +556,10 @@ jobs:
           name: "cert-pr-evidence-${{ github.run_id }}-${{ github.run_attempt }}-guard"
           path: |
             evidence/guard.json
-            .cert/guard-*/
+            .cert/guard-*/*.json
+            .cert/guard-*/*.jsonl
+            .cert/guard-*/*.log
+            .cert/guard-*/rows.md
           include-hidden-files: true
           if-no-files-found: "error"
           retention-days: 90
@@ -624,7 +627,9 @@ jobs:
           name: "cert-pr-evidence-${{ github.run_id }}-${{ github.run_attempt }}-integration"
           path: |
             evidence/integration.json
-            .cert/integration-*/
+            .cert/integration-*/*.json
+            .cert/integration-*/*.jsonl
+            .cert/integration-*/*.log
           include-hidden-files: true
           if-no-files-found: "error"
           retention-days: 90
