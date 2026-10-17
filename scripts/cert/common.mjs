@@ -92,7 +92,7 @@ export function tree(commit, dir) {
   mkdirSync(dir, { recursive: true });
   const archive = path.join(dir, 'source.tar');
   run('git', ['archive', '--format=tar', '-o', archive, commit], { cwd: root });
-  run('tar', ['-xf', archive, '-C', dir]);
+  run('tar', ['-xf', 'source.tar'], { cwd: dir });
   return dir;
 }
 export async function fetchJSON(url) {

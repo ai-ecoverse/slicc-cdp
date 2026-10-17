@@ -15,7 +15,7 @@ const subject =
   options.side === 'candidate' ? { version: plan.version, commit: plan.commit } : plan.baseline;
 if (
   !/^[a-f0-9]{40}$/.test(subject.commit) ||
-  !/^[a-zA-Z0-9-]+$/.test(options.target) ||
+  !/^[a-zA-Z0-9_-]+$/.test(options.target) ||
   !/^[a-zA-Z0-9-]+$/.test(options.label)
 )
   throw new Error('invalid build identity');

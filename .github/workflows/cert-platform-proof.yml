@@ -1,0 +1,58 @@
+name: Certification platform CLI regressions
+
+on:
+  pull_request:
+    paths:
+      - scripts/cert/common.mjs
+      - scripts/cert/pr-pack.mjs
+      - test/integration/cert-pack-platforms.test.mjs
+      - .github/workflows/cert-platform-proof.yml
+
+permissions:
+  contents: read
+
+env:
+  SLICC_CDP_PORTS: 9300-9309
+  LEFTHOOK: '0'
+
+jobs:
+  arguments:
+    name: cert-platform-proof / CLI arguments and archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Candidate public CLI acceptance without compiling project code
+        run: |
+          tar --version | grep 'GNU tar'
+          node --test --test-reporter=tap test/integration/cert-pack-platforms.test.mjs > positive.log
+      - name: Every new command-line case must fail on pre-fix main helpers
+        env:
+          BASE: 484df4ae4a968c3ec46e6e1dfb8acace09b25cf5
+        run: |
+          mkdir -p .cert/main-platform-tools/scripts/cert
+          for file in common.mjs pr-common.mjs pr-pack.mjs; do
+            git show "$BASE:scripts/cert/$file" > ".cert/main-platform-tools/scripts/cert/$file"
+          done
+          set +e
+          SLICC_CERT_TOOL_SOURCE="$PWD/.cert/main-platform-tools" node --test --test-reporter=tap test/integration/cert-pack-platforms.test.mjs > negative.log 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          grep -x '# tests 3' negative.log
+          grep -x '# fail 3' negative.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: cert-platform-cli-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            positive.log
+            negative.log
+          if-no-files-found: error
+          retention-days: 90
