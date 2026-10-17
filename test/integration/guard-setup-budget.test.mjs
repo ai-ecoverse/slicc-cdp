@@ -16,7 +16,13 @@ const playwright = path.join(
   'target/debug',
   process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
 );
+const curlwright = path.join(
+  root,
+  'target/debug',
+  process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
+);
 const unguarded = "slicc: refused: slicc can't keep seven's origin out of this target";
+const notice = (method) => `slicc: guard: ${method} timed out; continuing\n`;
 
 async function pages(wsUrl) {
   const listed = await fetch(`http://${new URL(wsUrl).host}/json/list`);
@@ -43,6 +49,7 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
     const flows = {
       'a 12 s Page.enable is optional and the tab still works': {
         delays: { 'Page.enable': { ms: 12000 } },
+        stderr: notice('Page.enable'),
       },
       'a 12 s Network.enable fits in the shared budget': {
         delays: { 'Network.enable': { ms: 12000 } },
@@ -54,10 +61,13 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
     };
     for (const [name, options] of Object.entries(flows)) {
       await t.test(name, async () => {
-        const proxy = await cdpProxy(browser.wsUrl, options);
+        const { stderr = '', ...proxied } = options;
+        const proxy = await cdpProxy(browser.wsUrl, proxied);
         try {
           const { opened, snapshot } = await drive(proxy, site);
           assert.equal(opened.code, 0, `${opened.stdout}\n${opened.stderr}`);
+          assert.equal(opened.stderr, stderr);
+          assert.ok(!snapshot.stderr.includes('slicc: guard:'), snapshot.stderr);
           assert.equal(snapshot.code, 0, `${snapshot.stdout}\n${snapshot.stderr}`);
           assert.match(snapshot.stdout, new RegExp(`Page URL: ${site.origin}/one`));
         } finally {
@@ -65,6 +75,27 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
         }
       });
     }
+    await t.test('curlwright says when it skipped a slow optional guard step', async () => {
+      const proxy = await cdpProxy(browser.wsUrl, {
+        delays: { 'Runtime.enable': { ms: 12000 } },
+      });
+      const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-budget-curl-'));
+      try {
+        const listed = await fetch(`http://${new URL(browser.wsUrl).host}/json/list`);
+        const tab = (await listed.json()).find((info) => info.url === `${site.origin}/one`).id;
+        const fetched = await runProcess(
+          curlwright,
+          ['--cdp', proxy.url, '--tab', tab, '-s', `${site.origin}/one`],
+          cwd,
+          120000
+        );
+        assert.equal(fetched.code, 0, fetched.stderr);
+        assert.equal(fetched.stderr, notice('Runtime.enable'));
+      } finally {
+        await proxy.close();
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
     await t.test(
       'a required step past the shared budget is refused, named, and closed',
       async () => {
