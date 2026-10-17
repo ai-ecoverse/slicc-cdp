@@ -13,7 +13,7 @@ export function origins(fixture) {
   };
 }
 
-export function browserArgs() {
+export function browserArgs({ privileged = false } = {}) {
   const hosts = [
     'seven.sliccy.ai',
     'vault.sliccy.ai',
@@ -27,12 +27,13 @@ export function browserArgs() {
   return [
     `--host-resolver-rules=${hosts.map((host) => `MAP ${host} 127.0.0.1`).join(', ')}`,
     '--no-proxy-server',
-    '--disable-extensions',
-    '--disable-component-extensions-with-background-pages',
+    ...(privileged
+      ? []
+      : ['--disable-extensions', '--disable-component-extensions-with-background-pages']),
     '--disable-background-networking',
     '--disable-sync',
     '--password-store=basic',
     '--use-mock-keychain',
-    '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,WebUIOmniboxPopup,WebUIOmniboxFullPopup,WebUIOmniboxAimPopup',
+    `--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable${privileged ? '' : ',WebUIOmniboxPopup,WebUIOmniboxFullPopup,WebUIOmniboxAimPopup'}`,
   ];
 }

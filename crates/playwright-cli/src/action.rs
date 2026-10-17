@@ -898,7 +898,7 @@ mod tests {
                 ),
                 (
                     "goto",
-                    "about:srcdoc,ABOUTSECRET",
+                    "about:newtab?ABOUTSECRET",
                     Some("about:"),
                     "ABOUTSECRET",
                 ),

@@ -94,6 +94,7 @@ export async function observer(wsUrl) {
     send: client.send,
     waitEvent: client.waitEvent,
     close: async () => {
+      if (ws.readyState === WebSocket.CLOSED) return;
       const closed = new Promise((resolve) =>
         ws.addEventListener('close', resolve, { once: true })
       );
