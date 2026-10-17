@@ -40,7 +40,7 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
   let proxy;
   let runner;
   try {
-    browser = await launchBrowser(browserArgs());
+    browser = await launchBrowser(browserArgs({ privileged: true }));
     raw = await rawSocket(browser.wsUrl);
     const ordinary = await raw.open(`${site.origin}/page`);
     const ui = await raw.open(`${site.origin}/page?ui`);
@@ -65,6 +65,7 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
           targetId: ntp,
           flatten: true,
         });
+        await raw.send('Page.enable', {}, sessionId);
         let ntpFrame = false;
         for (let attempt = 0; attempt < 50 && !ntpFrame; attempt += 1) {
           const tree = await raw.send('Page.getFrameTree', {}, sessionId);
