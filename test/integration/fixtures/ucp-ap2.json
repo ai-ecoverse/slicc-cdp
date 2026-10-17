@@ -1,0 +1,22 @@
+{
+  "ucp": {
+    "version": "2026-08-25",
+    "services": {},
+    "capabilities": {
+      "dev.ucp.shopping.checkout": [
+        {
+          "version": "2026-08-25",
+          "spec": "https://shop.example.test/spec/checkout"
+        }
+      ],
+      "dev.ucp.common.payment.ap2_mandate": [
+        {
+          "version": "2026-08-25",
+          "spec": "https://shop.example.test/spec/ap2",
+          "extends": "dev.ucp.shopping.checkout"
+        }
+      ]
+    },
+    "payment_handlers": {}
+  }
+}

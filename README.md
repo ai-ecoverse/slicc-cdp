@@ -52,6 +52,14 @@ Sinks:
 
 Opt-out: `--off` exits immediately. A file at `<config>/slicc/discover.disabled` (the same user config dir as the saved session) disables the watcher; checked at start and on SIGHUP.
 
+UCP ([Universal Commerce Protocol](https://ucp.dev/specification/overview/)) is probed by default: one same-origin `GET /.well-known/ucp` per origin, through the guard and capped like the other well-known probes. The listed endpoints are never called.
+- **Validation:** the profile must have `ucp.version` (`YYYY-MM-DD`), `ucp.services` and `ucp.payment_handlers` (both required, empty allowed). Each service entry needs `version`, `spec`, a `transport` of `rest`, `mcp`, `a2a` or `embedded`, and an `endpoint` (`embedded` may give only a `schema`).
+- **Summary:** `{version, services: {name: [{transport, endpoint}]}, capabilities: ["name@version"], paymentHandlers, hasKeys, ap2, mcp, a2a}`.
+  - `mcp` lists the MCP server candidates and `a2a` the agent-card URLs. Protected endpoints are left out.
+  - `hasKeys` only says whether `keys[]` is non-empty; no key material is reported.
+  - `ap2` is true when a capability or payment handler names the AP2 extension (a name segment starting with `ap2`, such as `dev.ucp.common.payment.ap2_mandate`). AP2 has no discovery of its own.
+- **Versions:** a version other than 2026-01-23, 2026-04-08 or 2026-08-25 is still `valid`, with `summary.note: "unknown version"`.
+
 Example `--exec` hook for Claude Code:
 
 ```sh
