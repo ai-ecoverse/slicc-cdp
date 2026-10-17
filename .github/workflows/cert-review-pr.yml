@@ -936,7 +936,7 @@ jobs:
           use_bedrock: "true"
           claude_args: |
             --model ${{ vars.CERT_BEDROCK_MODEL || 'global.anthropic.claude-opus-5-5' }}
-            --tools ""
+            --tools=
             --max-turns 3
           prompt_file: "review/prompt.txt"
       -

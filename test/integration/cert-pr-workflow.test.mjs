@@ -109,7 +109,17 @@ test('PR certification credentials are step-only and model has no execution or f
   assert.deepEqual(secretSteps, ['signing', 'review']);
   const model = steps('review').find((step) => step.id === 'model');
   assert.equal(model.env.NODE_VERSION, '24');
-  assert.match(model.with.claude_args, /--tools ""/);
+  assert.equal(
+    model.uses,
+    'anthropics/claude-code-action/base-action@a26b07d8c778b0c43f64618e5fd29fd0f8af72e8'
+  );
+  assert.deepEqual(
+    model.with.claude_args
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => /^--(?:tools|allowed-?tools|disallowed-?tools|mcp)/i.test(line)),
+    ['--tools=']
+  );
   assert.ok(!model.with.claude_args.includes('--json-schema'));
   assert.ok(!JSON.stringify(workflow.jobs.review).includes('structured_output'));
   assert.equal(model.with.allowed_bots, undefined);
