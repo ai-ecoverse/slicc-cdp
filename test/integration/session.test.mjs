@@ -195,6 +195,7 @@ test('the saved session keeps no cookie, auth header, token query or request bod
     'QSECRET5',
     'BSECRET6',
     'FSECRET7',
+    'KSECRET88',
   ];
   const server = createServer((req, res) => {
     if (req.url.startsWith('/api')) {
@@ -204,7 +205,9 @@ test('the saved session keeps no cookie, auth header, token query or request bod
       return;
     }
     res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'sid=CKSECRET1; Path=/' });
-    res.end('<!doctype html><title>redact</title><p>redact</p>');
+    res.end(
+      '<!doctype html><title>redact</title><p>redact</p><script>console.log("auth Bearer " + "KSECRET" + "88"); console.log("visible note")</script>'
+    );
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -241,6 +244,11 @@ test('the saved session keeps no cookie, auth header, token query or request bod
     const header = (pairs, name) =>
       pairs.find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
     assert.equal(header(api.requestHeaders, 'authorization'), '[redacted]');
+    const notes = Object.values(saved.console ?? {}).flat();
+    assert.ok(
+      notes.some((entry) => entry.text === 'visible note'),
+      `the harmless console entry was not saved: ${text}`
+    );
     for (const secret of secrets) {
       assert.ok(!text.includes(secret), `${secret} is in the saved session: ${text}`);
     }
