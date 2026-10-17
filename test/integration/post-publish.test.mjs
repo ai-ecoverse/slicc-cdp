@@ -256,4 +256,13 @@ test('post-publish notes CLI is idempotent and refuses another hash without a PA
     assert.throws(command, /different bytes/);
     assert.throws(() => readFileSync(patches), { code: 'ENOENT' });
   }
+  const literalLine = `${output.line} (literal $& $1 $$)`;
+  save(path.join(f.directory, 'record/record.json'), { ...output, line: literalLine });
+  const body = `Before\n<!-- cert-verify -->\n${output.line}\n<!-- /cert-verify -->\nAfter\n`;
+  save(release, { id: 90, tag_name: 'v1.26.3', draft: false, body });
+  command();
+  assert.equal(
+    JSON.parse(readFileSync(release)).body,
+    body.replace(output.line, () => literalLine)
+  );
 });

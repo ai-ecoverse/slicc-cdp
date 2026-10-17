@@ -36,7 +36,7 @@ else {
     const linePattern = new RegExp(`^${pattern.source}[^\\r\\n]*$`, 'gm');
     if ([...marked.matchAll(linePattern)].length !== 1)
       throw new Error('verification notes require one marked verification line');
-    notes = `${body.slice(0, first)}${marked.replace(linePattern, record.line)}${body.slice(last)}`;
+    notes = `${body.slice(0, first)}${marked.replace(linePattern, () => record.line)}${body.slice(last)}`;
   } else notes = `${body.trimEnd()}\n\n${section}\n`;
   if (!options.dry) {
     const file = path.join(path.dirname(options.record), 'notes-payload.json');
