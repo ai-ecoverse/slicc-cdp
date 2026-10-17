@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -175,6 +176,79 @@ test('sessions follow the invoking cwd: two cwds in parallel each keep their own
     if (browser) {
       await browser.close().catch(() => {});
     }
+    for (const p of cleanups) {
+      await rm(p, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+});
+
+test('the saved session keeps no cookie, auth header, token query or request body', {
+  timeout: 60_000,
+}, async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-session-redact-'));
+  const cleanups = [cwd];
+  const secrets = [
+    'CKSECRET1',
+    'RSECRET2',
+    'HSECRET3',
+    'CSECRET4',
+    'QSECRET5',
+    'BSECRET6',
+    'FSECRET7',
+  ];
+  const server = createServer((req, res) => {
+    if (req.url.startsWith('/api')) {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/plain', 'set-cookie': 'other=RSECRET2; Path=/' });
+      res.end('done');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'sid=CKSECRET1; Path=/' });
+    res.end('<!doctype html><title>redact</title><p>redact</p>');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let browser;
+  try {
+    browser = await launchBrowser();
+    const wsUrl = browser.wsUrl;
+    const file = await sessionFile(cwd);
+    cleanups.push(file);
+
+    const open = await run(
+      ['--cdp', wsUrl, 'open', `${origin}/?access_token=QSECRET5#id_token=FSECRET7`],
+      cwd
+    );
+    assert.equal(open.code, 0, `open failed: ${open.stderr}`);
+    const fetched = await run(
+      [
+        '--cdp',
+        wsUrl,
+        'eval',
+        "fetch('/api?token=QSECRET5&page=2', { method: 'POST', headers: { Authorization: 'Bearer HSECRET3', 'X-CSRF-Token': 'CSECRET4' }, body: 'BSECRET6' }).then((r) => r.text())",
+      ],
+      cwd
+    );
+    assert.equal(fetched.code, 0, `eval failed: ${fetched.stderr}`);
+    assert.ok(fetched.stdout.includes('done'), `eval output: ${fetched.stdout}`);
+
+    const text = await readFile(file, 'utf8');
+    const saved = JSON.parse(text);
+    const logged = Object.values(saved.requests ?? {}).flat();
+    const api = logged.find((entry) => entry.url.includes('/api'));
+    assert.ok(api, `the session has no /api request: ${text}`);
+    assert.equal(api.url, `${origin}/api?token=[redacted]&page=2`);
+    const header = (pairs, name) =>
+      pairs.find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+    assert.equal(header(api.requestHeaders, 'authorization'), '[redacted]');
+    for (const secret of secrets) {
+      assert.ok(!text.includes(secret), `${secret} is in the saved session: ${text}`);
+    }
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    await new Promise((resolve) => server.close(resolve));
     for (const p of cleanups) {
       await rm(p, { recursive: true, force: true }).catch(() => {});
     }
