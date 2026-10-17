@@ -1106,26 +1106,19 @@ mod tests {
             raw.close(&target);
         }
 
-        let hits = |raw: &mut Raw, scratch: &str| -> u64 {
-            let probe = raw.session(scratch);
-            raw.eval(
-                &probe,
-                &format!(
-                    "fetch({}).then((r) => r.text())",
-                    json!(format!("{app}/hits?path=/api/leak"))
-                ),
-            )
-            .as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0)
+        let hits = || -> u64 {
+            let url = format!("{app}/hits?path=/api/leak");
+            let response = crate::net::http_probe(&url, "text/plain")
+                .unwrap_or_else(|error| panic!("{url} failed: {}", error.trim()));
+            let text = String::from_utf8_lossy(&response.body).into_owned();
+            text.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{url} answered {text:?}"))
         };
-        let scratch = raw.create(&format!("{app}/one"));
-        std::thread::sleep(Duration::from_millis(500));
 
         {
             let leak = format!("{app}/api/leak");
-            let before = hits(&mut raw, &scratch);
+            let before = hits();
             let (target, session) = page_on(&mut cdp, "about:blank");
             let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
             let record = seen.clone();
@@ -1160,11 +1153,7 @@ mod tests {
                 "{:?}",
                 seen.borrow()
             );
-            assert_eq!(
-                hits(&mut raw, &scratch),
-                before,
-                "the vault page ran and sent its request"
-            );
+            assert_eq!(hits(), before, "the vault page ran and sent its request");
             nothing_mentions(&cdp, "LEAKKEY");
             raw.close(&target);
         }
@@ -1172,7 +1161,7 @@ mod tests {
         {
             let idp = live("SLICC_FETCH_LIVE_IDP");
             let leak = format!("{app}/api/leak");
-            let before = hits(&mut raw, &scratch);
+            let before = hits();
             let mut slipped = Cdp::connect(&ws).unwrap();
             let (target, session) = page_on(&mut slipped, &format!("{idp}/landing"));
             let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -1199,7 +1188,7 @@ mod tests {
                 seen.borrow()
             );
             assert_eq!(
-                hits(&mut raw, &scratch),
+                hits(),
                 before + 1,
                 "the request was not continued unchanged"
             );
@@ -1207,7 +1196,6 @@ mod tests {
             nothing_mentions(&slipped, "api/leak");
             raw.close(&target);
         }
-        raw.close(&scratch);
 
         nothing_mentions(&cdp, "SECRETKEY");
         nothing_mentions(&cdp, "COOKIESECRET");
