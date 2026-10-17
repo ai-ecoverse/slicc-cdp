@@ -2,6 +2,7 @@
 set -eu
 version="$1"
 node scripts/set-crate-versions.mjs "$version"
+node scripts/crate-readmes.mjs
 cargo update --offline --workspace
 publish_one() {
   name="$1"

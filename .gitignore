@@ -9,3 +9,4 @@ bin/*.wasm
 .build/
 .cert/*
 !.cert/proofs.json
+crates/*/README.md
