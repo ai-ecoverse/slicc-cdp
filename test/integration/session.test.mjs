@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createServer } from 'node:http';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -187,7 +187,15 @@ test('the saved session keeps no cookie, auth header, token query or request bod
 }, async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-session-redact-'));
   const cleanups = [cwd];
-  const secrets = ['CKSECRET1', 'RSECRET2', 'HSECRET3', 'CSECRET4', 'QSECRET5', 'BSECRET6', 'FSECRET7'];
+  const secrets = [
+    'CKSECRET1',
+    'RSECRET2',
+    'HSECRET3',
+    'CSECRET4',
+    'QSECRET5',
+    'BSECRET6',
+    'FSECRET7',
+  ];
   const server = createServer((req, res) => {
     if (req.url.startsWith('/api')) {
       req.resume();
@@ -207,7 +215,10 @@ test('the saved session keeps no cookie, auth header, token query or request bod
     const file = await sessionFile(cwd);
     cleanups.push(file);
 
-    const open = await run(['--cdp', wsUrl, 'open', `${origin}/?access_token=QSECRET5#id_token=FSECRET7`], cwd);
+    const open = await run(
+      ['--cdp', wsUrl, 'open', `${origin}/?access_token=QSECRET5#id_token=FSECRET7`],
+      cwd
+    );
     assert.equal(open.code, 0, `open failed: ${open.stderr}`);
     const fetched = await run(
       [
