@@ -87,4 +87,4 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM: ${{ needs.upload-assets.result }}
-        run: node scripts/cert/verify-call.mjs --record evidence/record/record.json
+        run: node scripts/gate.mjs verify-call -- node scripts/cert/verify-call.mjs --record evidence/record/record.json

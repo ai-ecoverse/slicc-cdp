@@ -27,6 +27,6 @@ for (const name of required) {
   if (!job || ['skipped', 'cancelled'].includes(job.conclusion) || job.status !== 'completed')
     throw new Error(`workflow_call did not execute required job: ${name}`);
 }
-const line = `workflow_call proved for ${record.version}: skipped release ancestor, all seven evidence jobs executed, record=${record.status}`;
+const line = `verify-call: PASS workflow_call proved for ${record.version}: skipped release ancestor, all seven evidence jobs executed, record=${record.status}`;
 console.log(line);
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);

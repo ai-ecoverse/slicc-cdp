@@ -53,5 +53,6 @@ else {
   console.log(options.dry ? 'verification notes dry run' : 'verification notes updated');
 }
 console.log(record.line);
+console.log(`post-notes: PASS v${record.version}`);
 if (process.env.GITHUB_STEP_SUMMARY)
   appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${record.line}\n`);

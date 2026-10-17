@@ -55,4 +55,4 @@ deps="$(collect_deps)"
   "
 } > "$outfile"
 
-echo "wrote $outfile ($(wc -l < "$outfile") lines)"
+echo "notices: PASS $outfile ($(wc -l < "$outfile") lines)"

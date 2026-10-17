@@ -34,7 +34,7 @@ jobs:
       - name: Build native public CLIs without credentials
         run: cargo build --locked -p slicc-cdp -p curlwright
       - name: Candidate cert runner passes all three real harness-port tests
-        run: node --test --test-reporter=tap test/integration/cert-harness.test.mjs > positive.log
+        run: node scripts/gate.mjs cert-harness --tap -- node --test --test-reporter=tap test/integration/cert-harness.test.mjs > positive.log
       - name: Preserve exact base runner for the hosted NEGATIVE
         env:
           BASE: fd01175e64856d18d02a23f9f697f065cb284b5a

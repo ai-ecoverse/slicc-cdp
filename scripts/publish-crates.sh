@@ -28,3 +28,4 @@ publish_one slicc-cdp-client
 publish_one slicc-discovery
 publish_one slicc-cdp
 publish_one curlwright
+echo "publish-crates: PASS 4 crates $version"

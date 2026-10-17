@@ -74,6 +74,8 @@ npx slicc-cdp install-browser --channel stable --with-deps
 npx slicc-cdp find-browser
 ```
 
+The bin runs through an npm bin link, a symlinked package dir, and `--preserve-symlinks-main`, because it compares the real paths of `process.argv[1]` and its own module. Node resolves a module's relative imports from the path it was loaded by, so `node --preserve-symlinks-main` on a symlink to `cli.js` alone cannot load `./browser.js`; link the package dir instead.
+
 Trust: Chrome for Testing publishes no checksums or signatures for its zips. `installBrowser` downloads only over HTTPS, only from `googlechromelabs.github.io` (the version index) and `storage.googleapis.com` (the zips). Redirects are refused. The only checks are the byte count and the version, so you are trusting those Google hosts and TLS. Pin an exact version (`--version x.y.z.w`) in CI, so a run gets the build you tested.
 
 ## Kernel commands
@@ -216,6 +218,8 @@ curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ## Testing
 
 A developer's own Chrome listens on `127.0.0.1:9222-9229`, so no test touches those ports. `npm run test:integration` and `npm run test:unit` set `SLICC_CDP_PORTS=9300-9309` unless it is already set, and so do `.cargo/config.toml` for `cargo test` and the CI workflows. Node test runs preload `test/integration/ports.mjs`, which sets the same default and makes any connect to loopback 9222-9229 from the test process throw. It matches the host as written (`localhost`, `*.localhost`, `127.x`, `0.0.0.0`, `::1`, `::`), not the address a name resolves to, so a hosts-file name or a service such as `lvh.me` that resolves to loopback gets past it; the CLIs check the resolved address too. `SLICC_CDP_PORTS` is for tests. While it is set, `playwright-cli` and `curlwright` probe and launch on that range, and loopback 9222-9229 are unreachable: they panic and exit 101 before dialing, even for an explicit `--cdp` or `SLICC_CDP_URL`. A test that needs other ports sets its own range. Run local builds the same way, for example `SLICC_CDP_PORTS=9300-9309 target/debug/playwright-cli list`. `cargo run` in this repository already gets the range from `.cargo/config.toml`, so to reach a browser on 9222-9229 run the built binary with `SLICC_CDP_PORTS` unset.
+
+A workflow step that gates a merge, a release or a cert runs its script through `node scripts/gate.mjs <name> -- <command>`. The script prints a verdict line `<name>: PASS <detail>`, and the gate fails on a non-zero exit or when that line is missing, so an early `exit 0`, a skipped script or empty output fails the step. Evidence steps pass `--accept PASS,FAIL,INCOMPLETE`, because the record step judges their status. For `node --test` the gate takes `--tap`: it needs `# fail 0` and at least one test that ran, not counting a file with no tests or a skipped test. `scripts/test-integration.mjs` prints `integration: PASS <n> tests` the same way. `test/integration/gate.test.mjs` checks that every such workflow step is gated.
 
 ## Release supply-chain verification
 

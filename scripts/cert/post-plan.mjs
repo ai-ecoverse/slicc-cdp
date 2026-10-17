@@ -44,5 +44,6 @@ const plan = {
   attempt: process.env.GITHUB_RUN_ATTEMPT ?? '1',
 };
 save(options.out, plan);
+console.log(`post-plan: PASS ${plan.version} ${options.out}`);
 if (process.env.GITHUB_OUTPUT)
   appendFileSync(process.env.GITHUB_OUTPUT, `version=${plan.version}\n`);

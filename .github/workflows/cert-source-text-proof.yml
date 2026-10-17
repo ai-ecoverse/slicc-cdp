@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: 24
       - name: Candidate preserves checkout and archive blob bytes
-        run: node --test --test-reporter=tap test/integration/cert-source-text.test.mjs > positive.log
+        run: node scripts/gate.mjs cert-source-text --tap -- node --test --test-reporter=tap test/integration/cert-source-text.test.mjs > positive.log
       - name: Base attributes fail the actual digest assertion under autocrlf
         env:
           BASE: abd8578ab80cf69c8e36815f09e386d830f30d27

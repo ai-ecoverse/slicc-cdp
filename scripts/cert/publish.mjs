@@ -32,3 +32,4 @@ writeFileSync(
 );
 run('gh', ['release', 'edit', `v${record.version}`, '--repo', repo, '--notes-file', notes]);
 console.log(record.line);
+console.log(`cert-publish: PASS v${record.version} ${state}`);
