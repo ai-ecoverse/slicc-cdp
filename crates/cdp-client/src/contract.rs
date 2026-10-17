@@ -413,46 +413,92 @@ mod tests {
         );
     }
 
-    fn citation(token: &str) -> Option<(&str, usize)> {
-        let (path, number) = token.rsplit_once(':')?;
-        if !path.contains('/') {
-            return None;
+    fn source_path(token: &str) -> bool {
+        token.contains('/') && (token.ends_with(".rs") || token.ends_with(".js"))
+    }
+
+    fn item_body(text: &str, name: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let starts = |line: &str| {
+            let line = line.trim_start();
+            let line = line.strip_prefix("pub ").unwrap_or(line);
+            let line = line.strip_prefix("async ").unwrap_or(line);
+            ["fn ", "const ", "function "].iter().any(|kind| {
+                line.strip_prefix(kind).is_some_and(|rest| {
+                    rest.strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with(['(', ':', ' ', '<']))
+                })
+            }) || line
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('('))
+                && line.trim_end().ends_with('{')
+        };
+        let at = lines.iter().position(|line| starts(line))?;
+        let indent = lines[at].len() - lines[at].trim_start().len();
+        if lines[at].trim_end().ends_with(';') {
+            return Some(lines[at].to_string());
         }
-        Some((path, number.parse().ok()?))
+        let end = lines[at + 1..]
+            .iter()
+            .position(|line| {
+                line.len() - line.trim_start().len() == indent && line.trim_start().starts_with('}')
+            })
+            .map_or(lines.len(), |end| at + 1 + end);
+        Some(lines[at..=end.min(lines.len() - 1)].join("\n"))
     }
 
     #[test]
     fn readme_citations_point_at_their_code() {
         let contract = contract();
         let mut checked = 0;
+        let mut listed = false;
         for line in contract.lines() {
+            if let Some(heading) = line.strip_prefix("### ") {
+                listed = heading.starts_with("Browser-level");
+            }
             let mut names: Vec<String> = Vec::new();
             let head = line
                 .strip_prefix("- `")
                 .and_then(|rest| rest.split('`').next())
+                .filter(|_| listed)
                 .map(str::to_string);
-            for token in line.split('`').skip(1).step_by(2) {
-                let Some((path, number)) = citation(token) else {
+            let tokens: Vec<&str> = line.split('`').skip(1).step_by(2).collect();
+            let mut i = 0;
+            while i < tokens.len() {
+                let token = tokens[i];
+                let item = tokens.get(i + 1).copied().filter(|item| {
+                    !item.is_empty() && item.chars().all(|c| c.is_alphanumeric() || c == '_')
+                });
+                let (true, Some(item)) = (source_path(token), item) else {
                     names.extend(
                         token
                             .split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '_'))
                             .filter(|name| name.len() > 3)
                             .map(str::to_string),
                     );
+                    i += 1;
                     continue;
                 };
-                let text = fs::read_to_string(root().join(path))
+                let text = fs::read_to_string(root().join(token))
                     .unwrap_or_else(|_| panic!("README cites {token}, which does not exist"));
-                let cited = text.lines().nth(number - 1).unwrap_or("");
+                let body = item_body(&text, item).unwrap_or_else(|| {
+                    panic!("README cites {item} in {token}, which has no such item")
+                });
+                let found = match &head {
+                    Some(head) => body.contains(head.as_str()),
+                    None => {
+                        names.is_empty() || names.iter().any(|name| body.contains(name.as_str()))
+                    }
+                };
                 assert!(
-                    names
-                        .iter()
-                        .chain(head.iter())
-                        .any(|name| cited.contains(name.as_str())),
-                    "README cites {token} for {names:?}, but that line is: {cited}"
+                    found,
+                    "README cites {token} {item} for {:?}, but it holds none of them",
+                    head.as_ref()
+                        .map_or(names.clone(), |head| vec![head.clone()])
                 );
                 names.clear();
                 checked += 1;
+                i += 2;
             }
         }
         assert!(checked >= BROWSER_METHODS.len());

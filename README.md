@@ -86,63 +86,63 @@ Routes in the kernel use these CDP methods through the facade, always with a tab
 
 ## Backend contract
 
-This is what `playwright-cli`, `curlwright`, `slicc-cdp-client` and the JS `CDPClient` need from a CDP backend: Chrome, slicc-extension's `sliccExtension.cdp`, bios's link and guard, or slicc-node. `crates/cdp-client/src/contract.rs` holds the same lists. Its unit test scans the production code in `crates/*/src` and fails when a list misses a sessionless call, a handled browser-level event or a session domain, or names one the code no longer uses. It also fails when this section disagrees with the lists or with `shield.rs`, or when a cited line no longer holds what it cites.
+This is what `playwright-cli`, `curlwright`, `slicc-cdp-client` and the JS `CDPClient` need from a CDP backend: Chrome, slicc-extension's `sliccExtension.cdp`, bios's link and guard, or slicc-node. `crates/cdp-client/src/contract.rs` holds the same lists. Its unit test scans the production code in `crates/*/src` and fails when a list misses a sessionless call, a handled browser-level event or a session domain, or names one the code no longer uses. It also fails when this section disagrees with the lists or with `shield.rs`, or when a cited function or const no longer holds what it is cited for.
 
-One browser WebSocket carries everything. An `http` endpoint is read as `GET /json/version`, which must return `webSocketDebuggerUrl` (`crates/cdp-client/src/connect.rs:71`). When nothing names an endpoint, the host probes the `probe_ports` of the slicc-browsers catalog, `127.0.0.1:9222-9229` (`crates/cdp-client/src/ports.rs:21`). Requests are `{id, method, params}` with an optional top-level `sessionId`. Replies are `{id, result}` or `{id, error: {message}}`. The client reports an error as `<method>: <message>` (`crates/cdp-client/src/cdp.rs:1038`). Events are `{method, params}`, with `sessionId` when they come from a session.
+One browser WebSocket carries everything. An `http` endpoint is read as `GET /json/version`, which must return `webSocketDebuggerUrl` (`crates/cdp-client/src/connect.rs` `websocket_url_from_version`). When nothing names an endpoint, the host probes the `probe_ports` of the slicc-browsers catalog, `127.0.0.1:9222-9229` (`crates/cdp-client/src/ports.rs` `catalog_from`). Requests are `{id, method, params}` with an optional top-level `sessionId`. Replies are `{id, result}` or `{id, error: {message}}`. The client reports an error as `<method>: <message>` (`crates/cdp-client/src/cdp.rs` `raw_call`). Events are `{method, params}`, with `sessionId` when they come from a session.
 
 ### Browser-level methods
 
 These are sent with no `sessionId`.
 
-- `Target.getTargets` with `{}`. Reads `targetId`, `type`, `url` and `title` from each of `targetInfos`. Only `type: "page"` is a tab. The client never lists a protected tab, and a backend may leave them out (`crates/playwright-cli/src/browser.rs:20`).
-- `Target.getTargetInfo` with `{targetId}`. Reads `targetInfo.type`, `url`, `openerId`. An error for a `frameId` is fine (`crates/cdp-client/src/cdp.rs:493`).
-- `Target.setDiscoverTargets` with `{discover: true}`, once per connection before the first guard attach (`crates/cdp-client/src/cdp.rs:600`). `discover` sends it with the same params (`crates/playwright-cli/src/agent_discover.rs:191`).
-- `Target.createTarget` with `{url: "about:blank", background}`. Must return `targetId`. Any other `url` is sent as `Page.navigate` on the guard session once the guard is up (`crates/cdp-client/src/cdp.rs:548`).
-- `Target.attachToTarget` with `{targetId, flatten: true}`. Must return `sessionId` (`crates/cdp-client/src/cdp.rs:1388`).
-- `Target.detachFromTarget` with `{sessionId}` (`crates/cdp-client/src/cdp.rs:1404`).
-- `Target.closeTarget` with `{targetId}` (`crates/playwright-cli/src/browser.rs:199`).
-- `Target.activateTarget` with `{targetId}`. `open` ignores an error, `tab-select` reports it (`crates/playwright-cli/src/browser.rs:191`).
-- `Browser.getVersion` with `{}`. Optional, `webmcp-call` only. Reads `product` as `Chrome/NNN` or `HeadlessChrome/NNN` (`crates/playwright-cli/src/webmcp.rs:271`).
-- `Slicc.action` with `{phase, kind, ...}`. An optional notification for the slicc panel that is never awaited, so a backend may ignore it or answer with an error (`crates/playwright-cli/src/action.rs:82`).
+- `Target.getTargets` with `{}`. Reads `targetId`, `type`, `url` and `title` from each of `targetInfos`. Only `type: "page"` is a tab. The client never lists a protected tab, and a backend may leave them out (`crates/playwright-cli/src/browser.rs` `list_pages`).
+- `Target.getTargetInfo` with `{targetId}`. Reads `targetInfo.type`, `url`, `openerId`. An error for a `frameId` is fine (`crates/cdp-client/src/cdp.rs` `target_protected`).
+- `Target.setDiscoverTargets` with `{discover: true}`, once per connection before the first guard attach (`crates/cdp-client/src/cdp.rs` `touch`). `discover` sends it with the same params (`crates/playwright-cli/src/agent_discover.rs` `run`).
+- `Target.createTarget` with `{url: "about:blank", background}`. Must return `targetId`. Any other `url` is sent as `Page.navigate` on the guard session once the guard is up (`crates/cdp-client/src/cdp.rs` `create_target`).
+- `Target.attachToTarget` with `{targetId, flatten: true}`. Must return `sessionId` (`crates/cdp-client/src/cdp.rs` `attach`).
+- `Target.detachFromTarget` with `{sessionId}` (`crates/cdp-client/src/cdp.rs` `detach`).
+- `Target.closeTarget` with `{targetId}` (`crates/playwright-cli/src/browser.rs` `close_target`).
+- `Target.activateTarget` with `{targetId}`. `open` ignores an error, `tab-select` reports it (`crates/playwright-cli/src/browser.rs` `activate`).
+- `Browser.getVersion` with `{}`. Optional, `webmcp-call` only. Reads `product` as `Chrome/NNN` or `HeadlessChrome/NNN` (`crates/playwright-cli/src/webmcp.rs` `chrome_major_version`).
+- `Slicc.action` with `{phase, kind, ...}`. An optional notification for the slicc panel that is never awaited, so a backend may ignore it or answer with an error (`crates/playwright-cli/src/action.rs` `begin`).
 
-The JS `CDPClient` sends only `Target.getTargets` (`src/page.js:13`) and `Target.attachToTarget` with `flatten: true` (`src/cdp-client.js:121`) without a session.
+The JS `CDPClient` sends only `Target.getTargets` (`src/page.js` `listTargets`) and `Target.attachToTarget` with `flatten: true` (`src/cdp-client.js` `attach`) without a session.
 
 ### Browser-level events
 
 A backend may omit any of these.
 
-- `Target.attachedToTarget` with `sessionId` and `targetInfo.targetId`. Registers the guard session if it comes before the attach reply (`crates/cdp-client/src/cdp.rs:693`).
-- `Target.targetCreated` with `targetInfo` (`crates/cdp-client/src/cdp.rs:892`).
-- `Target.targetInfoChanged` with `targetInfo`. A protected `url` marks the tab protected (`crates/cdp-client/src/cdp.rs:892`).
-- `Target.targetDestroyed` with `targetId` (`crates/cdp-client/src/cdp.rs:912`).
-- `Target.detachedFromTarget` with `sessionId` (`crates/cdp-client/src/cdp.rs:918`).
+- `Target.attachedToTarget` with `sessionId` and `targetInfo.targetId`. Registers the guard session if it comes before the attach reply (`crates/cdp-client/src/cdp.rs` `adopt_guard_attach`).
+- `Target.targetCreated` with `targetInfo` (`crates/cdp-client/src/cdp.rs` `watch`).
+- `Target.targetInfoChanged` with `targetInfo`. A protected `url` marks the tab protected (`crates/cdp-client/src/cdp.rs` `watch`).
+- `Target.targetDestroyed` with `targetId` (`crates/cdp-client/src/cdp.rs` `watch`).
+- `Target.detachedFromTarget` with `sessionId` (`crates/cdp-client/src/cdp.rs` `watch`).
 
 ### Guard
 
-- Every attach uses `flatten: true`. A non-flat `Target.attachToTarget` or `Target.setAutoAttach` is refused before it is sent (`crates/cdp-client/src/cdp.rs:254`), and so is `autoAttach: true` (`crates/cdp-client/src/cdp.rs:247`).
-- Before a tab is used, the client attaches a guard session of its own. It is registered from the `Target.attachToTarget` reply (`crates/cdp-client/src/cdp.rs:614`) or from the `Target.attachedToTarget` event (`crates/cdp-client/src/cdp.rs:693`), whichever comes first.
-- `Target.setDiscoverTargets`, the attach and the setup steps share one `GUARD_SETUP` budget of 30 s (`crates/cdp-client/src/cdp.rs:597`).
-- The guard's `Fetch.enable` is `{patterns: [{urlPattern: "*", resourceType: "Document", requestStage: "Request"}]}` and decides per paused request (`crates/cdp-client/src/cdp.rs:639`). A backend must accept it. A backend's shield may refuse any interception pattern that names a protected origin, and clients never send one: `route` checks each `pattern` and refuses such a route before `Fetch.enable` is sent (`crates/cdp-client/src/fetch.rs:496`). Sending one broke bios and the extension on 2026-10-17.
-- Then `Network.enable` and `Network.setBypassServiceWorker` with `{bypass: true}`, which must succeed (`crates/cdp-client/src/cdp.rs:642`).
-- `Page.enable` and `Runtime.enable` are optional. Each gets at most `OPTIONAL_STEP`, 10 s of what is left (`crates/cdp-client/src/cdp.rs:649`). An error reply, `<method>: <message>`, is ignored (`crates/cdp-client/src/cdp.rs:669`). A timeout prints `slicc: guard: <method> timed out; continuing` (`crates/cdp-client/src/cdp.rs:665`).
-- Any other failure detaches the guard and marks the tab unguarded, so every later command on it is refused (`abandon`, `crates/cdp-client/src/cdp.rs:674`).
+- Every attach uses `flatten: true`. A non-flat `Target.attachToTarget` or `Target.setAutoAttach` is refused before it is sent (`crates/cdp-client/src/cdp.rs` `admit`), and so is `autoAttach: true` (`crates/cdp-client/src/cdp.rs` `admit`).
+- Before a tab is used, the client attaches a guard session of its own. It is registered from the `Target.attachToTarget` reply (`crates/cdp-client/src/cdp.rs` `touch`) or from the `Target.attachedToTarget` event (`crates/cdp-client/src/cdp.rs` `adopt_guard_attach`), whichever comes first.
+- `Target.setDiscoverTargets`, the attach and the setup steps share one `GUARD_SETUP` budget of 30 s (`crates/cdp-client/src/cdp.rs` `GUARD_SETUP`).
+- The guard's `Fetch.enable` is `{patterns: [{urlPattern: "*", resourceType: "Document", requestStage: "Request"}]}` and decides per paused request (`crates/cdp-client/src/cdp.rs` `touch`). A backend must accept it. A backend's shield may refuse any interception pattern that names a protected origin, and clients never send one: `route` checks each `pattern` and refuses such a route before `Fetch.enable` is sent (`crates/cdp-client/src/fetch.rs` `enable`). Sending one broke bios and the extension on 2026-10-17.
+- Then `Network.enable` and `Network.setBypassServiceWorker` with `{bypass: true}`, which must succeed (`crates/cdp-client/src/cdp.rs` `touch`).
+- `Page.enable` and `Runtime.enable` are optional. Each gets at most `OPTIONAL_STEP`, 10 s of what is left (`crates/cdp-client/src/cdp.rs` `OPTIONAL_STEP`). An error reply, `<method>: <message>`, is ignored (`crates/cdp-client/src/cdp.rs` `touch`). A timeout prints `slicc: guard: <method> timed out; continuing` (`crates/cdp-client/src/cdp.rs` `touch`).
+- Any other failure detaches the guard and marks the tab unguarded, so every later command on it is refused (`abandon`, `crates/cdp-client/src/cdp.rs` `touch`).
 
 ### Refused before sending
 
-The client's `browser_wide` check refuses these, so a backend needn't implement them (`crates/cdp-client/src/shield.rs:73`).
+The client refuses these before sending, so a backend needn't implement them (`crates/cdp-client/src/shield.rs` `browser_wide`).
 
-- `Target.exposeDevToolsProtocol` (`crates/cdp-client/src/shield.rs:84`).
-- `Target.sendMessageToTarget`. Attach with `flatten: true` instead (`crates/cdp-client/src/shield.rs:87`).
-- `Target.attachToBrowserTarget` (`crates/cdp-client/src/shield.rs:90`).
-- `Tracing.start` (`crates/cdp-client/src/shield.rs:93`).
-- `Extensions.loadUnpacked` (`crates/cdp-client/src/shield.rs:94`).
-- `Network.clearBrowserCookies` (`crates/cdp-client/src/shield.rs:95`).
-- `Storage.clearCookies` unless its `browserContextId` came from this client's `Target.createBrowserContext` (`crates/cdp-client/src/shield.rs:96`).
-- `Browser.resetPermissions` on the same terms (`crates/cdp-client/src/shield.rs:97`).
-- `Browser.setPermission` with no `origin`, on the same terms (`crates/cdp-client/src/shield.rs:100`).
-- `Browser.grantPermissions` with no `origin`, on the same terms (`crates/cdp-client/src/shield.rs:100`).
-- `Network.setRequestInterception` (`crates/cdp-client/src/shield.rs:105`).
-- `Fetch.*` with no `sessionId` (`crates/cdp-client/src/shield.rs:108`).
+- `Target.exposeDevToolsProtocol`.
+- `Target.sendMessageToTarget`. Attach with `flatten: true` instead.
+- `Target.attachToBrowserTarget`.
+- `Tracing.start`.
+- `Extensions.loadUnpacked`.
+- `Network.clearBrowserCookies`.
+- `Storage.clearCookies` unless its `browserContextId` came from this client's `Target.createBrowserContext`.
+- `Browser.resetPermissions` on the same terms.
+- `Browser.setPermission` with no `origin`, on the same terms.
+- `Browser.grantPermissions` with no `origin`, on the same terms.
+- `Network.setRequestInterception`.
+- `Fetch.*` with no `sessionId`.
 
 ### Session-level domains
 
@@ -156,7 +156,7 @@ Everything else goes over a flat session, with a top-level `sessionId`.
 - `Fetch`
 - `Accessibility`
 
-`slicc-cdp-client` also lets a caller `IO.read` a stream that a session reply handed out (`crates/cdp-client/src/cdp.rs:334`).
+`slicc-cdp-client` also lets a caller `IO.read` a stream that a session reply handed out (`crates/cdp-client/src/cdp.rs` `admit`).
 
 ## Package
 
