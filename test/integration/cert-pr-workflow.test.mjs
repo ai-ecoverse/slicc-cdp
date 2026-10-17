@@ -94,6 +94,15 @@ test('PR certification credentials are step-only and model has no execution or f
   assert.match(model.with.claude_args, /--json-schema/);
   assert.equal(model.with.allowed_bots, undefined);
   assert.equal(model.with.prompt_file, 'review/prompt.txt');
+  assert.ok(
+    model.with.claude_args.includes("vars.CERT_BEDROCK_MODEL || 'global.anthropic.claude-opus-5-5'")
+  );
+  const receipt = steps('review').find((step) => step.env?.CERT_REVIEW_MODEL);
+  assert.equal(
+    receipt.env.CERT_REVIEW_MODEL,
+    "${{ vars.CERT_BEDROCK_MODEL || 'global.anthropic.claude-opus-5-5' }}"
+  );
+  assert.ok(receipt.run.includes('value.model=process.env.CERT_REVIEW_MODEL'));
   const prepare = steps('review').find((step) => step.run?.includes('EXACT SOURCE DIFF DATA'));
   assert.match(prepare.run, /--no-ext-diff.*--no-textconv/);
   assert.ok(!prepare.run.includes('npm ci'));
@@ -123,4 +132,15 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   const bios = workflow.jobs.bios;
   assert.ok(bios.steps.some((step) => step.run?.includes('scripts/cert/pr-bios.mjs')));
   assert.ok(!JSON.stringify(bios).includes('slicc-bios/'));
+});
+
+test('PR certification signed bytes expire after one day while verification metadata remains', () => {
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    for (const step of job.steps.filter((item) =>
+      item.uses?.startsWith('actions/upload-artifact@')
+    )) {
+      const signedBytes = name === 'signing' || name === 'collect';
+      assert.equal(step.with['retention-days'], signedBytes ? 1 : 90);
+    }
+  }
 });

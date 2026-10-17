@@ -335,7 +335,7 @@ jobs:
           path: ".cert/signed/"
           include-hidden-files: true
           if-no-files-found: "error"
-          retention-days: 90
+          retention-days: 1
   collect:
     needs:
       - "plan"
@@ -421,7 +421,7 @@ jobs:
           path: ".cert/pr-assets/"
           include-hidden-files: true
           if-no-files-found: "error"
-          retention-days: 90
+          retention-days: 1
   rebuild:
     needs:
       - "plan"
@@ -818,10 +818,12 @@ jobs:
           CERT_REVIEW_RESULT: "${{ steps.model.outcome }}"
           EXECUTION: "${{ steps.model.outputs.execution_file }}"
           VERDICT: "${{ steps.model.outputs.structured_output }}"
+          CERT_REVIEW_MODEL: "${{ vars.CERT_BEDROCK_MODEL || 'global.anthropic.claude-opus-5-5' }}"
         run: |
           mkdir -p review
           printf '%s\n' "$VERDICT" > review/verdict.json
           node scripts/cert/pr-review.mjs --plan evidence/plan.json --verdict review/verdict.json --execution "${EXECUTION:-/dev/null}" --out evidence/review.json
+          node --input-type=module -e 'import{readFileSync,writeFileSync}from"node:fs";const file="evidence/review.json";const value=JSON.parse(readFileSync(file));value.model=process.env.CERT_REVIEW_MODEL;writeFileSync(file,JSON.stringify(value,null,2)+"\n")'
       -
         uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
         if: "${{ always() }}"
