@@ -57,6 +57,43 @@ const cases = [
   ['unsuccessful result', [result(text, { subtype: 'error_max_turns' })], 'INCOMPLETE'],
   ['multiple results', [result(text), result(text)], 'INCOMPLETE'],
   ['result not final', [result(text), { type: 'assistant' }], 'INCOMPLETE'],
+  [
+    'tool_use despite empty init',
+    [
+      init,
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Read', id: 'fixture', input: { file_path: 'never-read' } },
+          ],
+        },
+      },
+      result(text),
+    ],
+    'INCOMPLETE',
+  ],
+  [
+    'streamed tool_use despite empty init',
+    [
+      init,
+      {
+        type: 'stream_event',
+        event: { content_block: { type: 'tool_use', name: 'Bash', id: 'fixture' } },
+      },
+      result(text),
+    ],
+    'INCOMPLETE',
+  ],
+  [
+    'tool_use words in text are only data',
+    [
+      init,
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'tool_use Read' }] } },
+      result(text),
+    ],
+    'PASS',
+  ],
   ['missing init', [result(text)], 'INCOMPLETE'],
   ['Read tool in init', [{ ...init, tools: ['Read'] }, result(text)], 'INCOMPLETE'],
   [
@@ -113,7 +150,7 @@ for (const [name, receipt, expected] of cases) {
     assert.equal(document.status, expected);
     assert.equal(document.head, plan.head);
     assert.equal(document.commit, plan.commit);
-    if (name.includes('Read') || name === 'MCP server in init')
+    if (name.includes('Read') || name === 'MCP server in init' || name.includes('tool_use despite'))
       assert.equal(document.reason, 'review model had tools');
     if (name === 'missing init') assert.match(document.reason, /tool receipt missing/);
     if (expected !== 'INCOMPLETE') assert.match(document.execution.sha256, /^[a-f0-9]{64}$/);

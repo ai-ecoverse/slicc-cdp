@@ -2,6 +2,11 @@ import { readFileSync } from 'node:fs';
 import { args, identity, json, save } from './common.mjs';
 import { hash } from './pr-common.mjs';
 
+function toolUse(value) {
+  if (!value || typeof value !== 'object') return false;
+  return value.type === 'tool_use' || Object.values(value).some(toolUse);
+}
+
 const options = args({ verdict: { type: 'string' }, execution: { type: 'string' } });
 const plan = json(options.plan);
 let verdict;
@@ -11,6 +16,7 @@ try {
   const bytes = readFileSync(options.execution);
   const transcript = JSON.parse(bytes);
   const messages = Array.isArray(transcript) ? transcript : [transcript];
+  if (toolUse(transcript)) throw new Error('review model had tools');
   const inits = messages.filter(
     (message) => message?.type === 'system' && message.subtype === 'init'
   );
