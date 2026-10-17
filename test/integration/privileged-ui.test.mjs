@@ -60,7 +60,7 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
     await t.test(
       'new-tab pages remain listed, attachable and navigable with their NTP frame',
       async () => {
-        const ntp = await raw.open('chrome://newtab/');
+        const ntp = await raw.open('chrome://new-tab-page/');
         const { sessionId } = await raw.send('Target.attachToTarget', {
           targetId: ntp,
           flatten: true,
@@ -81,7 +81,7 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
         assert(list.stdout.includes(ntp), list.stdout);
         const attached = await runner.playwright(['eval', 'location.href', '--tab', ntp], cwd);
         assert.equal(attached.code, 0, attached.stderr);
-        assert.match(attached.stdout, /chrome:\/\/newtab/);
+        assert.match(attached.stdout, /chrome:\/\/new-tab-page/);
         const navigated = await runner.playwright(
           ['goto', `${site.origin}/page`, '--tab', ntp],
           cwd
