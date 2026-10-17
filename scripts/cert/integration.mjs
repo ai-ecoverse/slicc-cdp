@@ -6,12 +6,17 @@ import { suite } from './suite.mjs';
 
 await evidence('integration', async (plan, options) => {
   const positiveTree = await stage(plan, plan.version, plan.commit, 'integration-positive');
-  const files = readdirSync(path.join(positiveTree.source, 'test/integration'))
-    .filter(
-      (file) =>
-        file.endsWith('.test.mjs') && !file.startsWith('cert-') && file !== 'toolchain.test.mjs'
-    )
-    .map((file) => `test/integration/${file}`);
+  const files = [
+    ...new Set([
+      ...readdirSync(path.join(positiveTree.source, 'test/integration'))
+        .filter(
+          (file) =>
+            file.endsWith('.test.mjs') && !file.startsWith('cert-') && file !== 'toolchain.test.mjs'
+        )
+        .map((file) => `test/integration/${file}`),
+      ...(plan.mode === 'pr' ? plan.changedTests : []),
+    ]),
+  ];
   const positive = await suite({
     cwd: positiveTree.source,
     files,
@@ -20,6 +25,9 @@ await evidence('integration', async (plan, options) => {
   });
   const tests = plan.proofs.tests.filter((test) => test.source === 'integration' && !test.missing);
   const proofFiles = [...new Set(tests.map((test) => test.file))];
+  const negativeFiles = [
+    ...new Set([...proofFiles, ...(plan.mode === 'pr' ? plan.changedTests : [])]),
+  ];
   const testList = path.join(root, '.cert/proof-tests.json');
   save(testList, tests);
   const install = (directory) =>
@@ -47,14 +55,20 @@ await evidence('integration', async (plan, options) => {
     positiveTree.source
   );
   install(negativeTree.source);
-  const negative = proofFiles.length
+  const negative = negativeFiles.length
     ? await suite({
         cwd: negativeTree.source,
-        files: proofFiles,
+        files: negativeFiles,
         env: negativeTree.env,
         out: path.join(root, '.cert/integration-negative/proofs'),
       })
     : { status: 'PASS', files: [], rows: [], attempts: [] };
+  positive.subject = { version: plan.version, commit: plan.commit, sha256: positiveTree.sha256 };
+  negative.subject = {
+    version: plan.baseline.version,
+    commit: plan.baseline.commit,
+    sha256: negativeTree.sha256,
+  };
   const current = path.join(root, '.cert/proof-positive.json');
   const previous = path.join(root, '.cert/proof-negative.json');
   const checked = path.join(root, '.cert/proof-results.json');
@@ -74,7 +88,9 @@ await evidence('integration', async (plan, options) => {
   const proofs = json(checked);
   return {
     status:
-      positive.status === 'INCOMPLETE' || proofs.status === 'INCOMPLETE'
+      positive.status === 'INCOMPLETE' ||
+      proofs.status === 'INCOMPLETE' ||
+      negative.status === 'INCOMPLETE'
         ? 'INCOMPLETE'
         : positive.status !== 'PASS' || proofs.status === 'FAIL'
           ? 'FAIL'
@@ -82,8 +98,9 @@ await evidence('integration', async (plan, options) => {
     sha256: positiveTree.sha256,
     executions: { positive, proofs: proofPositive, negative },
     proofs,
-    native: 'published release assets',
-    wasm: 'published npm tarball',
+    changedTests: plan.mode === 'pr' ? plan.changedTests : [],
+    native: plan.mode === 'pr' ? 'exact same-run host native packs' : 'published release assets',
+    wasm: plan.mode === 'pr' ? 'exact same-run npm packs' : 'published npm tarball',
     rustHarness: 'committed external integration drivers against the subject public library',
   };
 });

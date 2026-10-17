@@ -18,7 +18,11 @@ export const digest = (file, algorithm = 'sha256', encoding = 'hex') =>
 export const cleanEnv = () => {
   const env = { ...process.env };
   for (const key of Object.keys(env))
-    if (/TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|SLICC_CDP_URL|NODE_TEST_CONTEXT/.test(key))
+    if (
+      /TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|SLICC_CDP_URL|NODE_TEST_CONTEXT|SSH_AUTH_SOCK|GITHUB_(ENV|OUTPUT|PATH|STATE|STEP_SUMMARY)$/.test(
+        key
+      )
+    )
       delete env[key];
   env.LEFTHOOK = '0';
   return env;
@@ -52,6 +56,15 @@ export function identity(plan) {
     vectors: plan.vectors,
     run: plan.run,
     attempt: plan.attempt,
+    ...(plan.mode === 'pr'
+      ? {
+          repository: plan.repository,
+          pr: plan.pr,
+          head: plan.head,
+          base: plan.base,
+          tools: plan.tools,
+        }
+      : {}),
   };
 }
 export function unpackPackage(version, dir) {
@@ -79,7 +92,7 @@ export function tree(commit, dir) {
   mkdirSync(dir, { recursive: true });
   const archive = path.join(dir, 'source.tar');
   run('git', ['archive', '--format=tar', '-o', archive, commit], { cwd: root });
-  run('tar', ['-xf', archive, '-C', dir]);
+  run('tar', ['-xf', 'source.tar'], { cwd: dir });
   return dir;
 }
 export async function fetchJSON(url) {
@@ -120,7 +133,10 @@ export async function evidence(which, execute) {
   try {
     result = await execute(plan, options);
   } catch (error) {
-    result = { status: 'INCOMPLETE', reason: error.stack ?? String(error) };
+    result = {
+      status: error.certStatus === 'FAIL' ? 'FAIL' : 'INCOMPLETE',
+      reason: error.stack ?? String(error),
+    };
   }
   save(options.out, { ...identity(plan), which, ...result });
 }

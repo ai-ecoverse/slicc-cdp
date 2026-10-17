@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { capture, digest, evidence, gh, repo, root, run } from './common.mjs';
+import { capture, digest, evidence, gh, json, repo, root, run } from './common.mjs';
+import { prIdentity } from './pr-common.mjs';
 
 function verifySignature(file, asset) {
   chmodSync(file, 0o755);
@@ -40,29 +41,42 @@ const checksumMode = (plan) => [
   ...(plan.legacyChecksum ? ['--legacy'] : []),
 ];
 
-await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', async (plan) => {
-  const dir = path.join(root, '.cert/assets');
+function assetSource(plan) {
+  const local = plan.mode === 'pr';
+  const dir = local ? process.env.CERT_PR_ASSETS : path.join(root, '.cert/assets');
+  if (!dir) throw new Error('exact local PR assets unavailable');
   mkdirSync(dir, { recursive: true });
-  const release = gh(`repos/${repo}/releases/tags/v${plan.version}`);
+  const release = local
+    ? json(path.join(dir, 'asset-manifest.json'))
+    : gh(`repos/${repo}/releases/tags/v${plan.version}`);
+  if (local && JSON.stringify(prIdentity(release)) !== JSON.stringify(prIdentity(plan)))
+    throw new Error('asset manifest source/run identity mismatch');
+  const available = local ? release.files : release.assets;
   const assets =
     process.platform === 'darwin'
-      ? release.assets.filter((asset) => asset.name.includes('-darwin-'))
-      : release.assets;
-  run(
-    'gh',
-    [
-      'release',
-      'download',
-      `v${plan.version}`,
-      '--repo',
-      repo,
-      '--dir',
-      dir,
-      '--clobber',
-      ...(process.platform === 'darwin' ? ['--pattern', '*-darwin-*'] : []),
-    ],
-    { timeout: 300000 }
-  );
+      ? available.filter((asset) => asset.name.includes('-darwin-'))
+      : available;
+  if (!local)
+    run(
+      'gh',
+      [
+        'release',
+        'download',
+        `v${plan.version}`,
+        '--repo',
+        repo,
+        '--dir',
+        dir,
+        '--clobber',
+        ...(process.platform === 'darwin' ? ['--pattern', '*-darwin-*'] : []),
+      ],
+      { timeout: 300000 }
+    );
+  return { local, dir, release, assets };
+}
+
+await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', async (plan) => {
+  const { local, dir, release, assets } = assetSource(plan);
   const files = [];
   for (const asset of assets) {
     if (!/^[a-zA-Z0-9.-]+$/.test(asset.name)) throw new Error('invalid asset name');
@@ -104,6 +118,7 @@ await evidence(process.platform === 'darwin' ? 'assets-macos' : 'assets-linux', 
           : 'PASS',
     files,
     checksums,
+    sourceManifest: local ? release : undefined,
     release: release.html_url,
   };
 });
