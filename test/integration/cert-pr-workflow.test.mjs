@@ -140,7 +140,12 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   assert.ok(!JSON.stringify(bios).includes('slicc-bios/'));
   for (const name of ['guard', 'integration']) {
     const raw = steps(name).find((step) => step.uses?.startsWith('actions/upload-artifact@'));
-    assert.ok(raw.with.path.split('\n').every((file) => /\.(jsonl?|log|md)$/.test(file)));
+    assert.ok(
+      raw.with.path
+        .split('\n')
+        .filter(Boolean)
+        .every((file) => /\.(jsonl?|log|md)$/.test(file))
+    );
   }
   for (const name of ['self', 'report']) {
     const guard = steps(name).find((step) => step.id === 'guard');
