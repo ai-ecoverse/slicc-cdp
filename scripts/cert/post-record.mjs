@@ -168,7 +168,7 @@ const status = failures.length ? 'FAIL' : incomplete.length ? 'INCOMPLETE' : 'PA
 const url = `https://github.com/${repo}/actions/runs/${plan.run}`;
 const line =
   status === 'PASS'
-    ? `certified ${name}@${plan.version} sha256=${registry.sha256} (supply-chain: registry=SLSA; release.yml@main; gitCommit=gitHead=tag=${plan.commit}; macOS=4 signed+notarised; checksums=complete; pr-certified: not asserted by this byte verification; ci: ${url})`
+    ? `verified ${name}@${plan.version} sha256=${registry.sha256} (supply-chain: registry=SLSA; release.yml@main; gitCommit=gitHead=tag=${plan.commit}; macOS=4 signed+notarised; checksums=complete; pr-certified: not asserted by this byte verification; ci: ${url})`
     : `cert-ci: ${status} ${name}@${plan.version}${status === 'FAIL' ? ' supply-chain alert' : ''} (${[...failures, ...incomplete].join('; ')})`;
 const record = {
   ...identity(plan),

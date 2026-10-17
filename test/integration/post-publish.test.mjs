@@ -118,7 +118,8 @@ function record(f) {
 test('post-publish public record CLI recomputes full supply-chain facts without behaviour claims', (t) => {
   const output = record(fixture(t));
   assert.equal(output.status, 'PASS');
-  assert.match(output.line, /^certified @ai-ecoverse\/slicc-cdp@1.26.3 sha256=[a-f0-9]{64}/);
+  assert.match(output.line, /^verified @ai-ecoverse\/slicc-cdp@1.26.3 sha256=[a-f0-9]{64}/);
+  assert.doesNotMatch(output.line, /^certified(?:-candidate)? /);
   assert.match(output.line, /macOS=4 signed\+notarised; checksums=complete/);
   assert.match(output.line, /pr-certified: not asserted/);
 });
@@ -235,11 +236,24 @@ test('post-publish notes CLI is idempotent and refuses another hash without a PA
   rmSync(patches);
   command();
   assert.equal(readFileSync(release, 'utf8'), first);
-  save(release, {
-    id: 90,
-    tag_name: 'v1.26.3',
-    draft: false,
-    body: output.line.replace(output.sha256, '0'.repeat(64)),
-  });
-  assert.throws(command, /different bytes/);
+  for (const prefix of ['certified', 'verified']) {
+    const previousLine = output.line.replace(/^verified /, `${prefix} `);
+    const body = `Leading notes\n\n<!-- cert-verify -->\n## Existing heading\n\n${previousLine}\n\nKeep marked context\n<!-- /cert-verify -->\nTrailing notes\n`;
+    save(release, { id: 90, tag_name: 'v1.26.3', draft: false, body });
+    command();
+    assert.equal(JSON.parse(readFileSync(release)).body, body.replace(previousLine, output.line));
+    const migrated = readFileSync(release, 'utf8');
+    rmSync(patches, { force: true });
+    command();
+    assert.equal(readFileSync(release, 'utf8'), migrated);
+    assert.throws(() => readFileSync(patches), { code: 'ENOENT' });
+    save(release, {
+      id: 90,
+      tag_name: 'v1.26.3',
+      draft: false,
+      body: body.replace(output.sha256, '0'.repeat(64)),
+    });
+    assert.throws(command, /different bytes/);
+    assert.throws(() => readFileSync(patches), { code: 'ENOENT' });
+  }
 });
