@@ -898,8 +898,8 @@ mod tests {
                 ),
                 (
                     "goto",
-                    "about:newtab?ABOUTSECRET",
-                    Some("about:"),
+                    "about:blank#ABOUTSECRET",
+                    Some("about:blank"),
                     "ABOUTSECRET",
                 ),
                 ("open", "example.com/PATHSECRET", None, "PATHSECRET"),

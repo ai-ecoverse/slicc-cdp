@@ -69,9 +69,17 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
         let ntpFrame = false;
         for (let attempt = 0; attempt < 50 && !ntpFrame; attempt += 1) {
           const tree = await raw.send('Page.getFrameTree', {}, sessionId);
-          ntpFrame = tree.frameTree.childFrames?.some(({ frame }) =>
-            frame.url.startsWith('chrome-untrusted://new-tab-page/')
-          );
+          const { targetInfos } = await raw.send('Target.getTargets');
+          ntpFrame =
+            tree.frameTree.childFrames?.some(({ frame }) =>
+              frame.url.startsWith('chrome-untrusted://new-tab-page/')
+            ) ||
+            targetInfos.some(
+              (info) =>
+                info.type === 'iframe' &&
+                info.parentId === ntp &&
+                info.url.startsWith('chrome-untrusted://new-tab-page/')
+            );
           if (!ntpFrame) await new Promise((resolve) => setTimeout(resolve, 100));
         }
         assert(ntpFrame, 'the real NTP embeds its chrome-untrusted frame');
