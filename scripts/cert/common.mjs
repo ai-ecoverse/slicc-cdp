@@ -139,4 +139,5 @@ export async function evidence(which, execute) {
     };
   }
   save(options.out, { ...identity(plan), which, ...result });
+  console.log(`${which}: ${result.status} ${options.out}`);
 }

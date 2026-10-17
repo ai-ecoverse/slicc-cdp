@@ -93,7 +93,7 @@ jobs:
             echo "crates.io lookup for slicc-cdp-client returned $code"
             exit 1
           fi
-          sh scripts/publish-crates.sh "${{ steps.version.outputs.version }}"
+          node scripts/gate.mjs publish-crates -- sh scripts/publish-crates.sh "${{ steps.version.outputs.version }}"
 
   build-binaries:
     needs: release
@@ -131,12 +131,12 @@ jobs:
 
       - name: Generate licence notices
         run: |
-          bash scripts/generate-notices.sh artifacts/THIRD-PARTY-NOTICES
+          node scripts/gate.mjs notices -- bash scripts/generate-notices.sh artifacts/THIRD-PARTY-NOTICES
           cp LICENSE artifacts/LICENSE
           cp install.sh artifacts/install.sh
 
       - name: Generate checksums for the complete asset set
-        run: node scripts/release-checksums.mjs artifacts
+        run: node scripts/gate.mjs release-checksums -- node scripts/release-checksums.mjs artifacts
 
       - name: Upload release assets
         env:

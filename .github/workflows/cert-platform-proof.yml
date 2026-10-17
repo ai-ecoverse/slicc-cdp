@@ -44,7 +44,7 @@ jobs:
       - name: Candidate public CLI acceptance without compiling project code
         run: |
           tar --version | grep 'GNU tar'
-          node --test --test-reporter=tap test/integration/cert-pack-platforms.test.mjs > positive.log
+          node scripts/gate.mjs cert-platform --tap -- node --test --test-reporter=tap test/integration/cert-pack-platforms.test.mjs > positive.log
       - name: New target cases discriminate the affected platform on pre-fix main
         env:
           BASE: 484df4ae4a968c3ec46e6e1dfb8acace09b25cf5

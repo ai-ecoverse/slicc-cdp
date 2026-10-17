@@ -67,7 +67,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           CERT_MODE: ${{ (github.event_name == 'workflow_dispatch' || inputs.replay) && 'replay' || 'release' }}
-        run: node scripts/cert/plan.mjs --version "$VERSION" --out evidence/plan.json
+        run: node scripts/gate.mjs plan -- node scripts/cert/plan.mjs --version "$VERSION" --out evidence/plan.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
@@ -100,7 +100,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST" --target wasm32-wasip1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: node scripts/cert/rebuild.mjs --plan evidence/plan.json --out evidence/rebuild.json
+      - run: node scripts/gate.mjs rebuild --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/rebuild.mjs --plan evidence/plan.json --out evidence/rebuild.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -129,7 +129,7 @@ jobs:
           name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
           path: evidence
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: bash scripts/cert/gh.sh
+      - run: node scripts/gate.mjs gh -- bash scripts/cert/gh.sh
       - name: Exact Rust toolchain
         env:
           RUST: ${{ needs.plan.outputs.rust }}
@@ -143,7 +143,7 @@ jobs:
       - name: Shared guard suite and previous certified cdp-client NEGATIVE
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/cert/guard.mjs --plan evidence/plan.json --out evidence/guard.json
+        run: node scripts/gate.mjs guard --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/guard.mjs --plan evidence/plan.json --out evidence/guard.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -178,7 +178,7 @@ jobs:
           name: cert-plan-${{ inputs.version }}-${{ github.run_attempt }}
           path: evidence
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: bash scripts/cert/gh.sh
+      - run: node scripts/gate.mjs gh -- bash scripts/cert/gh.sh
       - name: Exact Rust toolchain
         env:
           RUST: ${{ needs.plan.outputs.rust }}
@@ -192,7 +192,7 @@ jobs:
       - name: Public integration suites on published bytes and fix NEGATIVEs
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/cert/integration.mjs --plan evidence/plan.json --out evidence/integration.json
+        run: node scripts/gate.mjs integration --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/integration.mjs --plan evidence/plan.json --out evidence/integration.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -230,7 +230,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CERT_APPLE_TEAM: ${{ vars.CERT_APPLE_TEAM || 'S8LB56P782' }}
           PLATFORM: ${{ runner.os == 'macOS' && 'macos' || 'linux' }}
-        run: node scripts/cert/assets.mjs --plan evidence/plan.json --out "evidence/assets-$PLATFORM.json"
+        run: node scripts/gate.mjs "assets-$PLATFORM" --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/assets.mjs --plan evidence/plan.json --out "evidence/assets-$PLATFORM.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -275,7 +275,7 @@ jobs:
         run: |
           CERT_UPSTREAM=$(node -e 'const n=JSON.parse(process.env.CERT_UPSTREAM); console.log(JSON.stringify(Object.fromEntries(["rebuild","guard","integration","assets"].map(k=>[k,n[k].result]))))')
           export CERT_UPSTREAM
-          node scripts/cert/record.mjs --evidence evidence --out record
+          node scripts/gate.mjs cert-record --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/record.mjs --evidence evidence --out record
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cert-record-${{ inputs.version }}-${{ github.run_attempt }}
@@ -306,7 +306,7 @@ jobs:
           path: downloaded
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/cert/publish.mjs --record downloaded/record/record.json
+        run: node scripts/gate.mjs cert-publish -- node scripts/cert/publish.mjs --record downloaded/record/record.json
 
   result:
     needs: record
