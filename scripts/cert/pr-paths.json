@@ -1,6 +1,7 @@
 [
   ".github/workflows/cert*.yml",
   ".github/workflows/cert*.yaml",
+  ".gitattributes",
   "scripts/cert/**",
   "scripts/test-integration.mjs",
   "test/integration/test-arguments.mjs",
