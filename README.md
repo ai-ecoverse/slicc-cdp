@@ -8,7 +8,7 @@
 
 The binary is `crates/playwright-cli`. Host `open` launches a browser into `<config>/slicc/seven-profiles/<id>` when no debugger is already connected, and inside slicc it only opens a tab. It does not invent a debugger path.
 
-Connect, in order: `--cdp`, else `SLICC_CDP_URL`, else a live `DevToolsActivePort` under `<config>/slicc/seven-profiles`, else a loopback endpoint this tool saved at `<config>/slicc/playwright-cli/sessions/<hash>.json`. A `.playwright-cli/session.json` in the working directory is ignored. In the kernel, the wasm builds keep it at `<state>/slicc/playwright-cli/sessions/<hash>.json`, where `<state>` is `$XDG_STATE_HOME`, else `$XDG_CONFIG_HOME`, else `$HOME/.config`, and the hash is of `$PWD`. When that is not writable, `playwright-cli` prints `playwright-cli: running without saved state (<reason>)` on stderr and the command still succeeds, except `route` and `unroute`, which fail because they only save state. A child of that directory is a profile only when its name is a browser id: it starts with a letter or digit, then letters, digits, `.`, `_`, or `-`, at most 64 characters, and it does not contain `..`. Dotfiles, including `.migrated-from-profiles`, are not profiles. `playwright-cli` does not migrate `slicc/profiles`. Host `list` GETs `/json/version` and `/json/list` on `127.0.0.1:9222-9229`, and host `open` GETs `/json/version` there when that port is absent or unreachable. `open` attaches to the first of those ports whose `/json/version` answers, with or without a seven tab, and an unreachable seven-profiles port falls through to that probe. A successful command writes the loopback endpoint it used, its provenance, and the ids of tabs it created. A saved endpoint is reused only when it is loopback. A probe-derived session is reused while that browser still answers `/json/version`. Every command shows and drives all of a browser's tabs, not only the ones this tool created, except tabs on protected origins, which stay refused. An explicit `--cdp` or `SLICC_CDP_URL` may name any host, and that URL is not saved unless it is loopback. Host `open` and `tab-new` treat an unreachable saved endpoint as absent, then probe and may launch. Other commands report that connection error. When nothing answers, launch passes `--remote-debugging-port` with the first free port from 9222 to 9229, or 0 when all are busy. `SLICC_CDP_PORTS=<from>-<to>` replaces 9222-9229 for the probes and the launch, and while it is set no command dials loopback 9222-9229. It is for tests. The wasm build still uses port 9222. A `ws://` URL is dialed as given. An `http://` URL is discovery. On the native build a `wss://` URL is dialed as given. The WASI build has no TLS, so `wss://` and `https://` fail there. `--runtime <name>` is appended to the query of the URL that is opened and is not interpreted.
+Connect, in order: `--cdp`, else `SLICC_CDP_URL`, else a live `DevToolsActivePort` under `<config>/slicc/seven-profiles`, else a loopback endpoint this tool saved at `<config>/slicc/playwright-cli/sessions/<hash>.json`. A `.playwright-cli/session.json` in the working directory is ignored. In the kernel, the wasm builds keep it at `<state>/slicc/playwright-cli/sessions/<hash>.json`, where `<state>` is `$XDG_STATE_HOME`, else `$XDG_CONFIG_HOME`, else `$HOME/.config`, and the hash is of `$PWD`. When that is not writable, `playwright-cli` prints `playwright-cli: running without saved state (<reason>)` on stderr and the command still succeeds, except `route` and `unroute`, which fail because they only save state. A child of that directory is a profile only when its name is a browser id: it starts with a letter or digit, then letters, digits, `.`, `_`, or `-`, at most 64 characters, and it does not contain `..`. Dotfiles, including `.migrated-from-profiles`, are not profiles. `playwright-cli` does not migrate `slicc/profiles`. Host `list` GETs `/json/version` and `/json/list` on `127.0.0.1:9222-9229`, and host `open` GETs `/json/version` there when that port is absent or unreachable. `open` attaches to the first of those ports whose `/json/version` answers, with or without a seven tab, and an unreachable seven-profiles port falls through to that probe. A successful command writes the loopback endpoint it used, its provenance, and the ids of tabs it created. It also keeps each tab's console and request log until the tab closes. Before that file is written, the values of `Cookie`, `Set-Cookie`, `Authorization`, `Proxy-Authorization` and any header whose name contains `token`, `secret`, `key`, `auth`, `session` or `csrf` become `[redacted]`, request URLs and URL-valued headers such as `Referer` and `Location` lose their fragment, query values whose key contains `token`, `secret`, `key`, `auth`, `code`, `sig`, `session` or `password` become `[redacted]`, and request bodies are dropped. The output of the command that captured a request still shows them. A saved endpoint is reused only when it is loopback. A probe-derived session is reused while that browser still answers `/json/version`. Every command shows and drives all of a browser's tabs, not only the ones this tool created, except tabs on protected origins, which stay refused. An explicit `--cdp` or `SLICC_CDP_URL` may name any host, and that URL is not saved unless it is loopback. Host `open` and `tab-new` treat an unreachable saved endpoint as absent, then probe and may launch. Other commands report that connection error. When nothing answers, launch passes `--remote-debugging-port` with the first free port from 9222 to 9229, or 0 when all are busy. `SLICC_CDP_PORTS=<from>-<to>` replaces 9222-9229 for the probes and the launch, and while it is set no command dials loopback 9222-9229. It is for tests. The wasm build still uses port 9222. A `ws://` URL is dialed as given. An `http://` URL is discovery. On the native build a `wss://` URL is dialed as given. The WASI build has no TLS, so `wss://` and `https://` fail there. `--runtime <name>` is appended to the query of the URL that is opened and is not interpreted.
 
 One browser WebSocket. `Target.attachToTarget` uses `{targetId, flatten: true}`. Later page commands send that `sessionId` at the top level. There is no `/devtools/page/<id>` socket.
 
@@ -23,6 +23,17 @@ Event JSON (NDJSON, one object per line):
 ```json
 {"v":1,"standard":"ard","origin":"https://example.com","url":"https://example.com/.well-known/ard.json","via":"well-known","page":"https://example.com/","targetId":"...","status":"valid","summary":{...}}
 ```
+
+Payments over HTTP 402: every response in a watched tab, subresources included, with status 402 is decoded as a payment challenge. The watcher never pays, retries, or sends `PAYMENT-SIGNATURE` or `Authorization: Payment`; it only reads the response the page already got. A protected origin's response is never read.
+
+- **`x402`** ([x402](https://github.com/coinbase/x402/tree/main/specs)). V2 is read from the base64 JSON `PAYMENT-REQUIRED` header. V1 is read from the JSON body of a 402 with a JSON content type. The body is fetched once with `Network.getResponseBody` after it has loaded, up to 1 MiB. `summary` is `{status: 402, version, resource, offers: [{scheme, network, amount, asset, payTo, expires, maxTimeoutSeconds}]}`. `amount` is V2's `amount` or V1's `maxAmountRequired`, kept as the string the server sent.
+- **`mpp`** ([Machine Payments Protocol](https://datatracker.ietf.org/doc/draft-httpauth-payment/)). It is read from each `WWW-Authenticate: Payment` challenge, whose `request` parameter is decoded as base64url JSON. `summary` is `{status: 402, resource, offers: [{method, intent, realm, amount, asset, expires}]}`, with `amount` and `asset` (the request's `currency`) as sent. One response can carry both standards.
+- **Invalid challenges:** a challenge that doesn't decode is reported with `status: "invalid"` and a `reason`, and the watcher goes on. Its `summary` is only `{status: 402, challenge}`, the raw header capped at 1 KiB. Possible reasons:
+  - `PAYMENT-REQUIRED is not base64 JSON`;
+  - `request is not base64url JSON`;
+  - `no x402 payload`: a legacy `X-Payment` header, or a body without `x402Version`/`accepts`;
+  - `body unavailable`: the body was evicted or the load failed.
+- **Limits:** events are deduplicated per origin, standard and resource, since each paid resource has its own price. A tab reports at most 50 events per payment standard, so a page that loops 402s can't flood the output. `--once` waits up to 2 s after the load event for the tab's requests to finish (and 402 bodies to be read), so the 402s of subresources are reported. A `--once` run can therefore take up to 2 s longer than the load.
 
 Sinks:
 
@@ -91,6 +102,80 @@ Trust: Chrome for Testing publishes no checksums or signatures for its zips. `in
 Inside the kernel the browser socket is `SLICC_CDP_URL`: `ws://127.0.0.1:9222/devtools/browser/<id>` from slicc-kernel. Port 9222 accepts connections only from inside the kernel.
 
 Routes in the kernel use these CDP methods through the facade, always with a tab's `sessionId`: `Fetch.enable`, `Fetch.disable`, `Fetch.continueRequest`, `Fetch.fulfillRequest`, the `Fetch.requestPaused` event, and `Target.getTargetInfo`. The `slicc-cdp-client` API can also send `Fetch.failRequest`, `Fetch.getResponseBody` and `Fetch.continueResponse`; `playwright-cli` doesn't.
+
+## Backend contract
+
+This is what `playwright-cli`, `curlwright`, `slicc-cdp-client` and the JS `CDPClient` need from a CDP backend: Chrome, slicc-extension's `sliccExtension.cdp`, bios's link and guard, or slicc-node. `crates/cdp-client/src/contract.rs` holds the same lists. Its unit test scans the production code in `crates/*/src` and fails when a list misses a sessionless call, a handled browser-level event or a session domain, or names one the code no longer uses. It also fails when this section disagrees with the lists or with `shield.rs`, or when a cited function or const no longer holds what it is cited for.
+
+One browser WebSocket carries everything. An `http` endpoint is read as `GET /json/version`, which must return `webSocketDebuggerUrl` (`crates/cdp-client/src/connect.rs` `websocket_url_from_version`). When nothing names an endpoint, the host probes the `probe_ports` of the slicc-browsers catalog, `127.0.0.1:9222-9229` (`crates/cdp-client/src/ports.rs` `catalog_from`). Requests are `{id, method, params}` with an optional top-level `sessionId`. Replies are `{id, result}` or `{id, error: {message}}`. The client reports an error as `<method>: <message>` (`crates/cdp-client/src/cdp.rs` `raw_call`). Events are `{method, params}`, with `sessionId` when they come from a session.
+
+### Browser-level methods
+
+These are sent with no `sessionId`.
+
+- `Target.getTargets` with `{}`. Reads `targetId`, `type`, `url` and `title` from each of `targetInfos`. Only `type: "page"` is a tab. The client never lists a protected tab, and a backend may leave them out (`crates/playwright-cli/src/browser.rs` `list_pages`).
+- `Target.getTargetInfo` with `{targetId}`. Reads `targetInfo.type`, `url`, `openerId`. An error for a `frameId` is fine (`crates/cdp-client/src/cdp.rs` `target_protected`).
+- `Target.setDiscoverTargets` with `{discover: true}`, once per connection before the first guard attach (`crates/cdp-client/src/cdp.rs` `touch`). `discover` sends it with the same params (`crates/playwright-cli/src/agent_discover.rs` `run`).
+- `Target.createTarget` with `{url: "about:blank", background}`. Must return `targetId`. Any other `url` is sent as `Page.navigate` on the guard session once the guard is up (`crates/cdp-client/src/cdp.rs` `create_target`).
+- `Target.attachToTarget` with `{targetId, flatten: true}`. Must return `sessionId` (`crates/cdp-client/src/cdp.rs` `attach`).
+- `Target.detachFromTarget` with `{sessionId}` (`crates/cdp-client/src/cdp.rs` `detach`).
+- `Target.closeTarget` with `{targetId}` (`crates/playwright-cli/src/browser.rs` `close_target`).
+- `Target.activateTarget` with `{targetId}`. `open` ignores an error, `tab-select` reports it (`crates/playwright-cli/src/browser.rs` `activate`).
+- `Browser.getVersion` with `{}`. Optional, `webmcp-call` only. Reads `product` as `Chrome/NNN` or `HeadlessChrome/NNN` (`crates/playwright-cli/src/webmcp.rs` `chrome_major_version`).
+- `Slicc.action` with `{phase, kind, ...}`. An optional notification for the slicc panel that is never awaited, so a backend may ignore it or answer with an error (`crates/playwright-cli/src/action.rs` `begin`).
+
+The JS `CDPClient` sends only `Target.getTargets` (`src/page.js` `listTargets`) and `Target.attachToTarget` with `flatten: true` (`src/cdp-client.js` `attach`) without a session.
+
+### Browser-level events
+
+A backend may omit any of these.
+
+- `Target.attachedToTarget` with `sessionId` and `targetInfo.targetId`. Registers the guard session if it comes before the attach reply (`crates/cdp-client/src/cdp.rs` `adopt_guard_attach`).
+- `Target.targetCreated` with `targetInfo` (`crates/cdp-client/src/cdp.rs` `watch`).
+- `Target.targetInfoChanged` with `targetInfo`. A protected `url` marks the tab protected (`crates/cdp-client/src/cdp.rs` `watch`).
+- `Target.targetDestroyed` with `targetId` (`crates/cdp-client/src/cdp.rs` `watch`).
+- `Target.detachedFromTarget` with `sessionId` (`crates/cdp-client/src/cdp.rs` `watch`).
+
+### Guard
+
+- Every attach uses `flatten: true`. A non-flat `Target.attachToTarget` or `Target.setAutoAttach` is refused before it is sent (`crates/cdp-client/src/cdp.rs` `admit`), and so is `autoAttach: true` (`crates/cdp-client/src/cdp.rs` `admit`).
+- Before a tab is used, the client attaches a guard session of its own. It is registered from the `Target.attachToTarget` reply (`crates/cdp-client/src/cdp.rs` `touch`) or from the `Target.attachedToTarget` event (`crates/cdp-client/src/cdp.rs` `adopt_guard_attach`), whichever comes first.
+- `Target.setDiscoverTargets`, the attach and the setup steps share one `GUARD_SETUP` budget of 30 s (`crates/cdp-client/src/cdp.rs` `GUARD_SETUP`).
+- The guard's `Fetch.enable` is `{patterns: [{urlPattern: "*", resourceType: "Document", requestStage: "Request"}]}` and decides per paused request (`crates/cdp-client/src/cdp.rs` `touch`). A backend must accept it. A backend's shield may refuse any interception pattern that names a protected origin, and clients never send one: `route` checks each `pattern` and refuses such a route before `Fetch.enable` is sent (`crates/cdp-client/src/fetch.rs` `enable`). Sending one broke bios and the extension on 2026-10-17.
+- Then `Network.enable` and `Network.setBypassServiceWorker` with `{bypass: true}`, which must succeed (`crates/cdp-client/src/cdp.rs` `touch`).
+- `Page.enable` and `Runtime.enable` are optional. Each gets at most `OPTIONAL_STEP`, 10 s of what is left (`crates/cdp-client/src/cdp.rs` `OPTIONAL_STEP`). An error reply, `<method>: <message>`, is ignored (`crates/cdp-client/src/cdp.rs` `touch`). A timeout prints `slicc: guard: <method> timed out; continuing` (`crates/cdp-client/src/cdp.rs` `touch`).
+- Any other failure detaches the guard and marks the tab unguarded, so every later command on it is refused (`abandon`, `crates/cdp-client/src/cdp.rs` `touch`).
+
+### Refused before sending
+
+The client refuses these before sending, so a backend needn't implement them (`crates/cdp-client/src/shield.rs` `browser_wide`).
+
+- `Target.exposeDevToolsProtocol`.
+- `Target.sendMessageToTarget`. Attach with `flatten: true` instead.
+- `Target.attachToBrowserTarget`.
+- `Tracing.start`.
+- `Extensions.loadUnpacked`.
+- `Network.clearBrowserCookies`.
+- `Storage.clearCookies` unless its `browserContextId` came from this client's `Target.createBrowserContext`.
+- `Browser.resetPermissions` on the same terms.
+- `Browser.setPermission` with no `origin`, on the same terms.
+- `Browser.grantPermissions` with no `origin`, on the same terms.
+- `Network.setRequestInterception`.
+- `Fetch.*` with no `sessionId`.
+
+### Session-level domains
+
+Everything else goes over a flat session, with a top-level `sessionId`.
+
+- `Page`
+- `Runtime`
+- `DOM`
+- `Input`
+- `Network`
+- `Fetch`
+- `Accessibility`
+
+`slicc-cdp-client` also lets a caller `IO.read` a stream that a session reply handed out (`crates/cdp-client/src/cdp.rs` `admit`).
 
 ## Package
 

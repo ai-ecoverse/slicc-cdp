@@ -8,8 +8,8 @@ use discovery::{
     default_probes, fingerprint, is_slicc_handoff_rel, known_link_rels,
     parse_link_header, classify_ard_body, classify_ai_catalog_body,
     classify_poppy_body, registrable_domain, parse_robots_txt_agentmap,
-    classify_nlweb_ask, classify_nlweb_mcp_init,
-    ClassifierRegistry, DedupSet, DiscoveryEvent,
+    classify_nlweb_ask, classify_nlweb_mcp_init, classify_payment, classify_x402_body,
+    ClassifierRegistry, PaymentSignal, DedupSet, DiscoveryEvent,
     ProbeRegistry, Validity, Via, EVENT_VERSION, LLMS_TXT_REL,
 };
 use serde_json::{json, Value};
@@ -86,6 +86,23 @@ struct WatcherState {
     events_emitted: usize,
     event_cursor: usize,
     sink: Sink,
+    payments: Payments,
+}
+
+const PAYMENT_EVENTS_PER_TAB: usize = 50;
+
+struct PendingBody {
+    session_id: String,
+    url: String,
+    headers: Vec<(String, String)>,
+}
+
+#[derive(Default)]
+struct Payments {
+    pending: BTreeMap<(String, String), PendingBody>,
+    emitted: BTreeMap<(String, String), usize>,
+    inflight: BTreeMap<(String, String), String>,
+    answered: BTreeSet<(String, String)>,
 }
 
 struct SessionState {
@@ -185,6 +202,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         events_emitted: 0,
         event_cursor: 0,
         sink: sink.clone(),
+        payments: Payments::default(),
     };
 
     if let Err(message) = cdp.call(
@@ -258,6 +276,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 }
             }
             if loaded {
+                output.push_str(&drain_requests(&mut cdp, &mut state, deadline));
                 let frame_tree_result = cdp
                     .call("Page.getFrameTree", json!({}), Some(&session))
                     .ok();
@@ -620,8 +639,23 @@ fn process_events(cdp: &mut Cdp, state: &mut WatcherState) -> String {
             .unwrap_or("");
         let params = event.get("params").cloned().unwrap_or(Value::Null);
 
-        if method == "Network.responseReceived" {
-            output.push_str(&handle_response(cdp, state, session_id, &params));
+        let request = request_key(state, session_id, &params);
+        match method {
+            "Network.requestWillBeSent" => {
+                state.payments.inflight.entry(request).or_insert_with(|| session_id.to_string());
+            }
+            "Network.responseReceived" => {
+                output.push_str(&handle_response(cdp, state, session_id, &params));
+            }
+            "Network.loadingFinished" => {
+                let reader = state.payments.inflight.remove(&request);
+                output.push_str(&handle_payment_body(cdp, state, session_id, &params, reader, true));
+            }
+            "Network.loadingFailed" => {
+                let reader = state.payments.inflight.remove(&request);
+                output.push_str(&handle_payment_body(cdp, state, session_id, &params, reader, false));
+            }
+            _ => {}
         }
     }
     output
@@ -800,7 +834,7 @@ fn handle_response(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u16;
 
-    if !is_top_frame_document && status != 401 {
+    if !is_top_frame_document && status != 401 && status != 402 {
         return output;
     }
 
@@ -914,6 +948,11 @@ fn handle_response(
         }
     }
 
+    if status == 402 {
+        let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+        output.push_str(&handle_payment(state, session_id, request_id, &url, headers.clone()));
+    }
+
     let response_signals = classify_response(status, &headers, Some(&url));
     for signal in response_signals {
         if !state.dedup.is_new(&origin, &signal.standard, &url) {
@@ -940,6 +979,153 @@ fn handle_response(
     }
 
     output
+}
+
+fn target_of(state: &WatcherState, session_id: &str) -> String {
+    state
+        .sessions
+        .get(session_id)
+        .map_or_else(|| session_id.to_string(), |sess| sess.target_id.clone())
+}
+
+fn request_key(state: &WatcherState, session_id: &str, params: &Value) -> (String, String) {
+    let request_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+    (target_of(state, session_id), request_id.to_string())
+}
+
+const DRAIN_AFTER_LOAD: Duration = Duration::from_secs(2);
+
+fn drain_requests(cdp: &mut Cdp, state: &mut WatcherState, deadline: Instant) -> String {
+    let mut output = String::new();
+    let until = deadline.min(Instant::now() + DRAIN_AFTER_LOAD);
+    while !state.payments.inflight.is_empty() && Instant::now() < until {
+        if cdp.pump(Instant::now() + Duration::from_millis(50)).is_err() {
+            break;
+        }
+        output.push_str(&process_events(cdp, state));
+    }
+    output
+}
+
+fn handle_payment(
+    state: &mut WatcherState,
+    session_id: &str,
+    request_id: &str,
+    url: &str,
+    headers: Vec<(String, String)>,
+) -> String {
+    if !state.sessions.contains_key(session_id) {
+        return String::new();
+    }
+    let key = (target_of(state, session_id), request_id.to_string());
+    if !request_id.is_empty() && !state.payments.answered.insert(key.clone()) {
+        return String::new();
+    }
+    let classification = classify_payment(&headers, url);
+    let mut output = String::new();
+    for signal in classification.signals {
+        output.push_str(&emit_payment(state, session_id, url, signal));
+    }
+    if classification.read_body && !request_id.is_empty() {
+        state.payments.pending.insert(
+            key,
+            PendingBody {
+                session_id: session_id.to_string(),
+                url: url.to_string(),
+                headers,
+            },
+        );
+    }
+    output
+}
+
+fn handle_payment_body(
+    cdp: &mut Cdp,
+    state: &mut WatcherState,
+    session_id: &str,
+    params: &Value,
+    reader: Option<String>,
+    finished: bool,
+) -> String {
+    let key = request_key(state, session_id, params);
+    let request_id = key.1.clone();
+    let Some(pending) = state.payments.pending.remove(&key) else {
+        return String::new();
+    };
+    if cdp.guard().url(&pending.url) {
+        return String::new();
+    }
+    let body = if finished {
+        cdp.call(
+            "Network.getResponseBody",
+            json!({ "requestId": request_id }),
+            Some(
+                reader
+                    .as_deref()
+                    .filter(|id| state.sessions.contains_key(*id))
+                    .unwrap_or(&pending.session_id),
+            ),
+        )
+        .ok()
+        .and_then(|result| response_text(&result))
+    } else {
+        None
+    };
+    match classify_x402_body(body.as_deref(), &pending.headers, &pending.url) {
+        Some(signal) => emit_payment(state, &pending.session_id, &pending.url, signal),
+        None => String::new(),
+    }
+}
+
+fn response_text(result: &Value) -> Option<String> {
+    let body = result.get("body")?.as_str()?;
+    let bytes = if result.get("base64Encoded").and_then(Value::as_bool) == Some(true) {
+        discovery::decode_base64(body)?
+    } else {
+        body.as_bytes().to_vec()
+    };
+    if bytes.len() > IO_READ_CAP {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn emit_payment(state: &mut WatcherState, session_id: &str, url: &str, signal: PaymentSignal) -> String {
+    let Some(origin) = extract_origin(url) else {
+        return String::new();
+    };
+    let Some(sess) = state.sessions.get(session_id) else {
+        return String::new();
+    };
+    let target_id = sess.target_id.clone();
+    let page_url = sess.page_url.clone();
+    if !state.dedup.is_new(&origin, &signal.standard, &signal.resource) {
+        return String::new();
+    }
+    let count = state
+        .payments
+        .emitted
+        .entry((target_id.clone(), signal.standard.clone()))
+        .or_insert(0);
+    if *count >= PAYMENT_EVENTS_PER_TAB {
+        return String::new();
+    }
+    *count += 1;
+    let status = if signal.reason.is_some() { Validity::Invalid } else { Validity::Valid };
+    let event = DiscoveryEvent {
+        v: EVENT_VERSION,
+        standard: signal.standard,
+        aliases: None,
+        origin,
+        url: url.to_string(),
+        via: Via::Response,
+        page: page_url,
+        target_id,
+        status,
+        summary: signal.summary,
+        reason: signal.reason,
+    };
+    emit_event(state, &event)
 }
 
 fn collect_page_signals(cdp: &mut Cdp, session: &str, frame_id: Option<&str>) -> Vec<(String, Value)> {
@@ -2366,7 +2552,7 @@ mod tests {
             no_probe: false,
             
             
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -2402,7 +2588,7 @@ mod tests {
             no_probe: false,
             
             
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -2437,7 +2623,7 @@ mod tests {
             no_probe: false,
             
             
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.probed_origins.insert("https://example.com".to_string());
         assert!(state.probed_origins.contains("https://example.com"));
@@ -2465,7 +2651,7 @@ mod tests {
             no_probe: false,
             
             
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -2501,7 +2687,7 @@ mod tests {
             no_probe: false,
             
             
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -2587,7 +2773,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -2623,7 +2809,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -2659,7 +2845,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -2708,7 +2894,7 @@ mod tests {
                 follow_mode: false,
                 robots_probe: false, nlweb_probe: false,
                 no_probe: false,
-                events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+                events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
             };
             state.sessions.insert(
                 "S1".to_string(),
@@ -2771,7 +2957,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -2803,7 +2989,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -2973,7 +3159,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() },
+            events_emitted: 0, event_cursor: 0, sink: Sink::Lick { slicc_dir: slicc.to_string_lossy().to_string() }, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -3180,7 +3366,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -3253,7 +3439,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -3302,7 +3488,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let event = DiscoveryEvent {
             v: EVENT_VERSION,
@@ -3389,7 +3575,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3430,7 +3616,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3469,7 +3655,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3507,7 +3693,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3566,7 +3752,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3609,7 +3795,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3804,7 +3990,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3843,7 +4029,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3885,7 +4071,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3921,7 +4107,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -3964,7 +4150,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -4005,7 +4191,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -4046,7 +4232,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -4083,7 +4269,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: true,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         state.sessions.insert(
             "S1".to_string(),
@@ -4119,7 +4305,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let summary = json!({
             "name": "Test",
@@ -4156,7 +4342,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: false,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         };
         let summary = json!({
             "name": "Test",
@@ -4228,7 +4414,7 @@ mod tests {
             follow_mode: false,
             robots_probe: false, nlweb_probe: true,
             no_probe: false,
-            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout,
+            events_emitted: 0, event_cursor: 0, sink: Sink::Stdout, payments: Payments::default(),
         }
     }
 
@@ -4533,5 +4719,135 @@ mod tests {
         assert_eq!(filtered["a2a"], json!([]));
         assert_eq!(filtered["services"]["s"], json!([{ "transport": "embedded", "endpoint": null }, { "transport": "rest", "endpoint": "https://shop.test/ucp" }]));
         assert_eq!(filter_protected_ucp(&cdp, &json!(null)), json!(null));
+    }
+
+    fn b64(text: &str) -> String {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in text.as_bytes().chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..=chunk.len() {
+                out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    fn payment_response(url: &str, request_id: &str, headers: Value) -> Value {
+        json!({
+            "requestId": request_id,
+            "type": "Fetch",
+            "frameId": "F1",
+            "response": { "url": url, "status": 402, "headers": headers }
+        })
+    }
+
+    fn events_of(output: &str) -> Vec<Value> {
+        output.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+    }
+
+    #[test]
+    fn a_subresource_402_reports_x402_v2_and_mpp_once_per_resource() {
+        let mut state = nlweb_state();
+        let v2 = b64(r#"{"x402Version":2,"accepts":[{"scheme":"exact","amount":"7"}]}"#);
+        let mpp = format!(r#"Payment method="m", intent="charge", request="{}""#, b64(r#"{"amount":"9"}"#));
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let params = payment_response(
+            "https://example.com/api/paid",
+            "R1",
+            json!({ "payment-required": v2, "www-authenticate": mpp }),
+        );
+        let output = handle_response(&mut cdp, &mut state, "S1", &params);
+        let events = events_of(&output);
+        let standards: Vec<&str> = events.iter().filter_map(|e| e["standard"].as_str()).collect();
+        assert_eq!(standards, ["x402", "mpp"], "{output}");
+        assert_eq!(events[0]["via"], "response");
+        assert_eq!(events[0]["summary"]["offers"][0]["amount"], "7");
+        assert_eq!(events[1]["summary"]["offers"][0]["amount"], "9");
+        assert!(handle_response(&mut cdp, &mut state, "S1", &params).is_empty());
+    }
+
+    #[test]
+    fn a_json_402_reads_its_body_once_it_has_loaded_and_reports_a_lost_body_as_invalid() {
+        let mut state = nlweb_state();
+        let body = r#"{"x402Version":1,"accepts":[{"scheme":"exact","maxAmountRequired":"10","resource":"https://example.com/v1"}]}"#;
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = json!({
+            "method": "Network.responseReceived",
+            "sessionId": "S1",
+            "params": { "requestId": "R1", "response": { "url": "https://example.com/p1" } }
+        });
+        let reply = json!({ "id": 1, "result": { "body": b64(body), "base64Encoded": true } });
+        let incoming = [seen.to_string(), reply.to_string()].into_iter().collect();
+        let mut cdp = Cdp::from_transport(Box::new(ScriptedTransport { incoming, sent: sent.clone() }));
+        let headers = json!({ "content-type": "application/json" });
+        assert!(handle_response(&mut cdp, &mut state, "S1", &payment_response("https://example.com/p1", "R1", headers.clone())).is_empty());
+        state.sessions.insert(
+            "S1b".to_string(),
+            SessionState { target_id: "T1".into(), top_frame_id: Some("F1".into()), page_url: "https://example.com/".into() },
+        );
+        assert!(handle_response(&mut cdp, &mut state, "S1b", &payment_response("https://example.com/p1", "R1", headers.clone())).is_empty());
+        assert_eq!(state.payments.pending.len(), 1);
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "other" }), None, true).is_empty());
+        let output = handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R1" }), Some("S1b".into()), true);
+        let events = events_of(&output);
+        assert_eq!(events[0]["summary"]["version"], 1, "{output}");
+        assert_eq!(events[0]["summary"]["offers"][0]["amount"], "10");
+        assert_eq!(sent.borrow()[0]["method"], "Network.getResponseBody");
+        assert_eq!(sent.borrow()[0]["sessionId"], "S1b");
+        handle_response(&mut cdp, &mut state, "S1", &payment_response("https://example.com/p2", "R2", headers));
+        let failed = handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R2" }), None, false);
+        assert_eq!(events_of(&failed)[0]["reason"], "body unavailable", "{failed}");
+        assert_eq!(sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_body_too_large_or_not_text_is_unavailable() {
+        assert_eq!(response_text(&json!({ "body": "x".repeat(IO_READ_CAP + 1) })), None);
+        assert_eq!(response_text(&json!({ "body": "@@", "base64Encoded": true })), None);
+        assert_eq!(response_text(&json!({ "body": "/w==", "base64Encoded": true })), None);
+        assert_eq!(response_text(&json!({})), None);
+        assert_eq!(response_text(&json!({ "body": "ok" })).as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn a_protected_subresource_402_is_never_read() {
+        let mut state = nlweb_state();
+        let (mut cdp, sent) = scripted_cdp(vec![]);
+        let params = payment_response(
+            "https://vault.sliccy.ai/pay",
+            "R9",
+            json!({ "content-type": "application/json", "payment-required": "x" }),
+        );
+        assert!(handle_response(&mut cdp, &mut state, "S1", &params).is_empty());
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R9" }), None, true).is_empty());
+        assert!(sent.borrow().is_empty());
+        state.payments.pending.insert(
+            ("T1".into(), "R8".into()),
+            PendingBody { session_id: "S1".into(), url: "https://vault.sliccy.ai/late".into(), headers: vec![] },
+        );
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R8" }), None, true).is_empty());
+        state.payments.pending.insert(
+            ("T2".into(), "R7".into()),
+            PendingBody { session_id: "S2".into(), url: "https://example.com/other-tab".into(), headers: vec![] },
+        );
+        assert!(handle_payment_body(&mut cdp, &mut state, "S1", &json!({ "requestId": "R7" }), None, true).is_empty());
+        assert!(state.payments.pending.contains_key(&("T2".to_string(), "R7".to_string())));
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_tab_reports_at_most_fifty_payment_events_per_standard() {
+        let mut state = nlweb_state();
+        let mut cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let mut total = 0;
+        for i in 0..60 {
+            let params = payment_response(&format!("https://example.com/r{i}"), "", json!({ "x-payment": "l" }));
+            total += events_of(&handle_response(&mut cdp, &mut state, "S1", &params)).len();
+        }
+        assert_eq!(total, PAYMENT_EVENTS_PER_TAB);
+        assert!(handle_payment(&mut state, "S9", "R", "https://example.com/x", vec![("x-payment".into(), "l".into())]).is_empty());
+        assert!(emit_payment(&mut state, "S9", "https://example.com/z", discovery::classify_payment(&[("x-payment".into(), "l".into())], "https://example.com/z").signals.remove(0)).is_empty());
+        assert!(emit_payment(&mut state, "S1", "not a url", discovery::classify_payment(&[("x-payment".into(), "l".into())], "u").signals.remove(0)).is_empty());
     }
 }
