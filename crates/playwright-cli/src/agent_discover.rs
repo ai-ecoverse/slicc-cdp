@@ -745,6 +745,26 @@ fn filter_protected_auth_urls(cdp: &Cdp, summary: &Value) -> Value {
     s
 }
 
+fn filter_protected_ucp(cdp: &Cdp, summary: &Value) -> Value {
+    let mut s = summary.clone();
+    let protected = |v: &Value| v.as_str().is_some_and(|u| cdp.guard().url(u));
+    if let Some(obj) = s.as_object_mut() {
+        for key in ["mcp", "a2a"] {
+            if let Some(list) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+                list.retain(|u| !protected(u));
+            }
+        }
+        if let Some(services) = obj.get_mut("services").and_then(|v| v.as_object_mut()) {
+            for entries in services.values_mut() {
+                if let Some(list) = entries.as_array_mut() {
+                    list.retain(|entry| !entry.get("endpoint").is_some_and(|u| protected(u)));
+                }
+            }
+        }
+    }
+    s
+}
+
 fn handle_response(
     cdp: &mut Cdp,
     state: &mut WatcherState,
@@ -1239,6 +1259,7 @@ fn run_probes(
                 None,
             ),
         };
+        let summary = if p.standard == "ucp" { filter_protected_ucp(cdp, &summary) } else { summary };
         if !state.dedup.is_new(origin, &p.standard, &p.url) {
             continue;
         }
@@ -4492,5 +4513,25 @@ mod tests {
         assert_eq!(invocation.repeated("probe"), ["robots", "nlweb"]);
         let output = run(&invocation, None);
         assert_ne!(output.code, 0);
+    }
+
+    #[test]
+    fn a_ucp_summary_drops_protected_endpoints() {
+        let cdp = Cdp::from_transport(Box::new(FakeTransport));
+        let summary = json!({
+            "mcp": ["https://vault.sliccy.ai/mcp", "https://shop.test/mcp"],
+            "a2a": ["https://seven.sliccy.ai/card.json"],
+            "services": { "s": [
+                { "transport": "mcp", "endpoint": "https://vault.sliccy.ai/mcp" },
+                { "transport": "embedded", "endpoint": null },
+                { "transport": "rest", "endpoint": "https://shop.test/ucp" }
+            ], "n": {} },
+            "version": "2026-08-25"
+        });
+        let filtered = filter_protected_ucp(&cdp, &summary);
+        assert_eq!(filtered["mcp"], json!(["https://shop.test/mcp"]));
+        assert_eq!(filtered["a2a"], json!([]));
+        assert_eq!(filtered["services"]["s"], json!([{ "transport": "embedded", "endpoint": null }, { "transport": "rest", "endpoint": "https://shop.test/ucp" }]));
+        assert_eq!(filter_protected_ucp(&cdp, &json!(null)), json!(null));
     }
 }

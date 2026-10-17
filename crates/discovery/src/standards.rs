@@ -79,6 +79,12 @@ pub fn default_probes() -> ProbeRegistry {
         content_type_prefix: "application/json".into(),
     });
     registry.register(Probe {
+        standard: "ucp".into(),
+        path: "/.well-known/ucp".into(),
+        accept: "application/json".into(),
+        content_type_prefix: "application/json".into(),
+    });
+    registry.register(Probe {
         standard: "auth-md".into(),
         path: "/auth.md".into(),
         accept: "text/markdown, text/plain".into(),
@@ -95,6 +101,7 @@ pub fn default_classifiers() -> ClassifierRegistry {
     registry.register("llms-txt", classify_llms_txt);
     registry.register("poppy", classify_poppy);
     registry.register("auth-md", classify_auth_md);
+    registry.register("ucp", crate::ucp::classify_ucp);
     registry
 }
 
