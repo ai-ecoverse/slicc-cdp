@@ -11,6 +11,19 @@ try {
   const bytes = readFileSync(options.execution);
   const transcript = JSON.parse(bytes);
   const messages = Array.isArray(transcript) ? transcript : [transcript];
+  const inits = messages.filter(
+    (message) => message?.type === 'system' && message.subtype === 'init'
+  );
+  if (
+    inits.some(
+      (init) =>
+        (Array.isArray(init.tools) && init.tools.length) ||
+        (Array.isArray(init.mcp_servers) && init.mcp_servers.length)
+    )
+  )
+    throw new Error('review model had tools');
+  if (inits.length !== 1 || !Array.isArray(inits[0].tools) || !Array.isArray(inits[0].mcp_servers))
+    throw new Error('review model tool receipt missing or malformed');
   const results = messages.filter((message) => message?.type === 'result');
   const result = results[0];
   if (
