@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertVerdict } from './cert-cli-verdict.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const pin = '4025d6aabc2c06add216183064d81914a171cd64';
@@ -115,7 +116,9 @@ function invoke(f, script = 'pr-bios.mjs', args = []) {
     ],
     { encoding: 'utf8', env: { ...process.env, CERT_PR_PACKS: f.packs } }
   );
-  return { ...invocation, document: read(out) };
+  const document = read(out);
+  assertVerdict(invocation.stdout, script.replace(/\.mjs$/, ''), document.status);
+  return { ...invocation, document };
 }
 
 const failure = {

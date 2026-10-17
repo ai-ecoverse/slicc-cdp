@@ -1,9 +1,11 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, identity, json, root, save } from './common.mjs';
 import { biosCalls, biosFindings } from './pr-bios-result.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
+const printVerdict = cliVerdict('pr-bios: ');
 const options = args({ base: { type: 'string' }, candidate: { type: 'string' } });
 const plan = json(options.plan);
 const pin = json(new URL('./pr-bios.json', import.meta.url));
@@ -48,3 +50,4 @@ try {
 }
 save(options.out, result);
 if (result.status === 'FAIL') process.exitCode = 1;
+printVerdict(result.status, options.out);

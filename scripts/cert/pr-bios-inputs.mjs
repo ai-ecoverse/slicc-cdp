@@ -1,8 +1,10 @@
 import path from 'node:path';
+import { cliVerdict } from './cli-verdict.mjs';
 import { args, identity, json, root, save } from './common.mjs';
 import { biosCalls } from './pr-bios-result.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
+const printVerdict = cliVerdict('pr-bios-inputs: ');
 const options = args();
 const plan = json(options.plan);
 const pin = json(new URL('./pr-bios.json', import.meta.url));
@@ -32,3 +34,4 @@ try {
 save(options.out, result);
 console.log(JSON.stringify(result));
 if (result.status === 'FAIL') process.exitCode = 1;
+printVerdict(result.status, options.out);
