@@ -2295,8 +2295,8 @@ fn endpoint_json(endpoint: &EndpointDraft) -> String {
     );
     let seven: Vec<&TabDraft> = endpoint.tabs.iter().filter(|tab| tab.seven).collect();
     field(&mut out, &mut first, "sevenTabs", &tabs_json(&seven));
-    let all: Vec<&TabDraft> = endpoint.tabs.iter().collect();
-    field(&mut out, &mut first, "tabs", &tabs_json(&all));
+    let open: Vec<&TabDraft> = endpoint.tabs.iter().filter(|tab| !tab.seven).collect();
+    field(&mut out, &mut first, "tabs", &tabs_json(&open));
     out.push('}');
     out
 }
@@ -3776,11 +3776,10 @@ mod tests {
         assert_eq!(entries[0]["endpoint"]["sevenTabs"][0]["id"], "T1");
         assert_eq!(entries[0]["endpoint"]["sevenTabs"].as_array().unwrap().len(), 1);
         let tabs = entries[0]["endpoint"]["tabs"].as_array().unwrap();
-        assert_eq!(tabs.len(), 2);
-        assert_eq!(tabs[0]["id"], "T1");
-        assert_eq!(tabs[1]["id"], "P1");
-        assert_eq!(tabs[1]["title"], secret);
-        assert_eq!(tabs[1]["url"], "https://example.com/secret");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0]["id"], "P1");
+        assert_eq!(tabs[0]["title"], secret);
+        assert_eq!(tabs[0]["url"], "https://example.com/secret");
         assert_eq!(entries[0]["tier"], 1);
         assert_eq!(entries[1]["endpoint"]["source"], "probe");
         assert_eq!(entries[1]["endpoint"]["cdp"], "http://127.0.0.1:9401");
@@ -3901,7 +3900,7 @@ mod tests {
                 };
                 let tabs = endpoint.remove("tabs").unwrap();
                 for seven in endpoint["sevenTabs"].as_array().unwrap() {
-                    assert!(tabs.as_array().unwrap().contains(seven), "{}", case.name);
+                    assert!(!tabs.as_array().unwrap().contains(seven), "{}", case.name);
                 }
             }
             assert_eq!(actual, case.expected(&layout), "{}", case.name);
