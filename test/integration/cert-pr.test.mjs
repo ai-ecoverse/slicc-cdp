@@ -532,13 +532,15 @@ test('PR bios public input planner binds both local packs and labels without pin
   const { out, plan } = await planned(f, api);
   const packs = path.join(f.directory, 'packs');
   for (const side of ['base', 'candidate']) pack(f, plan, side, packs);
-  t.after(() => {
-    for (const side of ['base', 'candidate'])
-      rmSync(path.join(root, `.cert/bios-input-${side}`), { recursive: true, force: true });
-  });
+  const directory = path.join(f.directory, 'unpacked-inputs');
+  const directoryArgs = /\bdirectory:\s*\{/.test(
+    readFileSync(path.join(root, 'scripts/cert/pr-bios-inputs.mjs'), 'utf8')
+  )
+    ? ['--directory', directory]
+    : [];
   const output = path.join(f.directory, 'inputs.json');
   const call = () =>
-    cli('pr-bios-inputs.mjs', ['--plan', out, '--out', output], f, api, {
+    cli('pr-bios-inputs.mjs', ['--plan', out, '--out', output, ...directoryArgs], f, api, {
       CERT_PR_PACKS: packs,
     });
   const result = await call();
