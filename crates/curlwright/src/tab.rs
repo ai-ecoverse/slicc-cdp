@@ -33,10 +33,8 @@ fn is_internal(url: &str, title: &str) -> bool {
     let url = url.trim();
     let title = title.trim();
     title == "Omnibox Popup"
-        || url.starts_with("chrome://")
+        || cdp_client::protected::Protected::default().url(url)
         || url.starts_with("chrome-search://")
-        || url.starts_with("chrome-untrusted://")
-        || url.starts_with("devtools://")
         || (url.is_empty() && title.to_ascii_lowercase().ends_with("popup"))
 }
 

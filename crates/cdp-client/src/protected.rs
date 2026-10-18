@@ -60,10 +60,19 @@ impl Protected {
     }
 
     pub fn url(&self, text: &str) -> bool {
-        let Some(url) = self.unwrap(parse(text)) else {
+        let Some(url) = self.unwrap(parse(text)).map(|url| self.rewrite_about(url)) else {
             return false;
         };
         let scheme = url.scheme();
+        if self
+            .rules
+            .protected_schemes
+            .iter()
+            .any(|item| item == scheme)
+        {
+            let pair = format!("{scheme}://{}", host_of(&url));
+            return !self.rules.scheme_exceptions.contains(&pair);
+        }
         if self.rules.any_schemes.iter().any(|item| item == scheme) {
             return true;
         }
@@ -77,6 +86,10 @@ impl Protected {
             }
         }
         origin_of(&url).is_some_and(|origin| self.extra.contains(&origin))
+    }
+
+    pub fn target_type(&self, kind: &str) -> bool {
+        self.rules.target_types.iter().any(|item| item == kind)
     }
 
     pub fn target(&self, text: &str, previous: bool, opener: Opener) -> bool {
@@ -162,6 +175,17 @@ impl Protected {
                 .inheriting
                 .iter()
                 .any(|item| *item == format!("about:{}", url.path().to_ascii_lowercase()))
+    }
+
+    fn rewrite_about(&self, url: Url) -> Url {
+        if url.scheme() != "about"
+            || self.rules.about_scheme.is_empty()
+            || self.inheriting(url.as_str())
+        {
+            return url;
+        }
+        let rest = &url.as_str()[url.scheme().len() + 1..];
+        parse(&format!("{}://{rest}", self.rules.about_scheme)).unwrap_or(url)
     }
 
     fn unwrap(&self, mut url: Option<Url>) -> Option<Url> {
@@ -313,6 +337,26 @@ mod tests {
     }
 
     #[test]
+    fn privileged_rules_are_catalog_driven() {
+        let mut rules = slicc_browsers::catalog().protected_origins;
+        rules.protected_schemes = vec!["privileged".into()];
+        rules.scheme_exceptions = vec!["privileged://newtab".into()];
+        rules.about_scheme = "privileged".into();
+        rules.target_types = vec!["custom_ui".into()];
+        let guard = Protected::with_rules(rules.clone(), &[]);
+        for url in ["privileged://settings", "about:settings", "view-source:about:settings", "blob:privileged://settings/id", "filesystem:privileged://settings/temporary/x"] {
+            assert!(guard.url(url), "{url}");
+        }
+        for url in ["privileged://newtab/path", "about:newtab/path", "about:blank", "about:srcdoc", "chrome://settings"] {
+            assert!(!guard.url(url), "{url}");
+        }
+        assert!(guard.target_type("custom_ui"));
+        assert!(!guard.target_type("browser_ui"));
+        rules.about_scheme.clear();
+        assert!(!Protected::with_rules(rules, &[]).url("about:settings"));
+    }
+
+    #[test]
     fn every_url_vector_matches_slicc_browsers() {
         let guard = guard();
         for vector in vectors().urls {
@@ -332,7 +376,8 @@ mod tests {
                 Some(other) => panic!("unknown opener {other}"),
             };
             assert_eq!(
-                guard.target(&vector.url, vector.previous, opener),
+                guard.target_type(vector.kind.as_deref().unwrap_or(""))
+                    || guard.target(&vector.url, vector.previous, opener),
                 vector.protected,
                 "{vector:?}"
             );

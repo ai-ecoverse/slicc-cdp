@@ -3,6 +3,13 @@
   "extends": ["github>ai-ecoverse/slicc-shared-web"],
   "packageRules": [
     {
+      "matchManagers": ["npm", "cargo"],
+      "matchPackageNames": ["@ai-ecoverse/slicc-browsers", "slicc-browsers"],
+      "groupName": "slicc-browsers catalog and vectors",
+      "groupSlug": "slicc-browsers-catalog-vectors",
+      "rangeStrategy": "pin"
+    },
+    {
       "matchFileNames": ["packages/sliccy-browser/package.json"],
       "matchPackageNames": ["@ai-ecoverse/slicc-cdp"],
       "semanticCommitType": "chore",

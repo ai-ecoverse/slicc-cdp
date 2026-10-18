@@ -97,6 +97,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
           scope: 'slicc-cdp',
           autoAttach: true,
           browserSession: true,
+          chromeUrlsAttach: true,
           browserContexts: true,
         },
         variant: Object.keys(set.variants),
@@ -109,7 +110,11 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
             vector.skip?.target === target
           )
             return {};
-          if (!browsers.has(slot)) browsers.set(slot, launchBrowser(browserArgs()));
+          if (!browsers.has(slot))
+            browsers.set(
+              slot,
+              launchBrowser(browserArgs({ privileged: vector.id.startsWith('C8.') }))
+            );
           const browser = await browsers.get(slot);
           const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
           let unguarded;
@@ -117,6 +122,8 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
             unguarded = await observer(browser.wsUrl);
           } catch (error) {
             await client.close();
+            await browser.close();
+            browsers.delete(slot);
             throw error;
           }
           let diagnostic;
@@ -177,6 +184,8 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
           diagnostic.references.push(details);
         },
         log: (row) => {
+          if (process.env.SLICC_GUARD_PROGRESS)
+            process.stdout.write(`row ${row.id} ${row.target} ${row.variant}\n`);
           if ([row.control, row.guarded, row.live].includes('fail'))
             process.stdout.write(`${JSON.stringify(row)}\n`);
         },
@@ -187,9 +196,16 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
       await fixture.close();
     }
   };
-  const settled = await Promise.allSettled(
-    ['seven', 'vault', 'vault-x', 'apex', 'own'].map(executeTarget)
-  );
+  const targetNames = [...new Set(set.vectors.flatMap((vector) => vector.targets))];
+  const targetParallel = Number(process.env.SLICC_GUARD_TARGET_PARALLEL ?? targetNames.length);
+  const settled = [];
+  for (let index = 0; index < targetNames.length; index += targetParallel) {
+    settled.push(
+      ...(await Promise.allSettled(
+        targetNames.slice(index, index + targetParallel).map(executeTarget)
+      ))
+    );
+  }
   const rejected = settled.filter((value) => value.status === 'rejected');
   if (rejected.length)
     throw new AggregateError(
@@ -217,7 +233,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
   ).length;
   const skipped = parity.filter((row) => row.control === 'skip').length;
   const ms = Date.now() - started;
-  const output = `${report.line}\nRuntime: ${(ms / 1000).toFixed(1)}s\nParity: ${passing}/${parity.length}; ${skipped} coded skips (before: 104/108)\nParallel: five target invocations, ${parallel} slots each\n\n${table(report.results)}\n`;
+  const output = `${report.line}\nRuntime: ${(ms / 1000).toFixed(1)}s\nParity: ${passing}/${parity.length}; ${skipped} coded skips (before: 104/108)\nParallel: ${targetParallel} of ${settled.length} target invocations, ${parallel} slots each\n\n${table(report.results)}\n`;
   const file =
     process.env.SLICC_GUARD_REPORT ?? path.join(tmpdir(), 'slicc-cdp-guard-runner-report.md');
   await writeFile(file, output);
@@ -242,5 +258,10 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
   assert.equal(parity.length, 108, 'recorded parity subset');
   assert.equal(skipped, 0);
   assert.equal(passing, 108);
+  const c8 = report.results.filter((row) => row.id.startsWith('C8.'));
+  assert(c8.length > 0, 'published privileged UI rows ran');
+  assert(
+    c8.every((row) => [row.control, row.guarded, row.live].every((status) => status === 'pass'))
+  );
   assert.equal(report.pass, true, report.line);
 });

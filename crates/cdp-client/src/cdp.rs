@@ -419,7 +419,10 @@ impl Cdp {
                 }
                 let mut out = Vec::new();
                 for info in &infos {
-                    out.push(self.redact(info, &infos));
+                    let redacted = self.redact(info, &infos);
+                    if !self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or("")) {
+                        out.push(redacted);
+                    }
                 }
                 result["targetInfos"] = Value::Array(out);
             }
@@ -453,6 +456,9 @@ impl Cdp {
     }
 
     fn info_protected(&self, info: &Value, all: &[Value]) -> bool {
+        if self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or("")) {
+            return true;
+        }
         let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let id = info.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
         let previous = self.protected_targets.contains(id);
@@ -518,11 +524,11 @@ impl Cdp {
                 Duration::from_secs(30),
             ) {
                 Ok(found) => {
-                    let opener_url = found
-                        .pointer("/targetInfo/url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if self.guard.target(opener_url, false, Opener::Unknown) {
+                    let opener_info = found.get("targetInfo").unwrap_or(&Value::Null);
+                    let opener_url = opener_info.get("url").and_then(Value::as_str).unwrap_or("");
+                    if self.guard.target_type(opener_info.get("type").and_then(Value::as_str).unwrap_or(""))
+                        || self.guard.target(opener_url, false, Opener::Unknown)
+                    {
                         Opener::Protected
                     } else {
                         Opener::Unprotected
@@ -531,7 +537,8 @@ impl Cdp {
                 Err(_) => Opener::Unknown,
             },
         };
-        let protected = self.guard.target(&url, false, opener);
+        let protected = self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))
+            || self.guard.target(&url, false, opener);
         if protected {
             self.protected_targets.insert(target_id.to_string());
         }
@@ -1645,6 +1652,42 @@ mod tests {
             inbox: VecDeque::new(),
             answer,
         }))
+    }
+
+    #[test]
+    fn privileged_target_types_and_extension_workers_are_guarded() {
+        let mut cdp = pending(|message| {
+            let info = match message["params"]["targetId"].as_str() {
+                Some("UI") => json!({"targetId": "UI", "type": "browser_ui", "url": "https://example.test/"}),
+                Some("W") => json!({"targetId": "W", "type": "service_worker", "url": "chrome-extension://abc/worker.js"}),
+                Some("B") => json!({"targetId": "B", "type": "page", "url": "about:blank", "openerId": "UI"}),
+                _ => json!({"targetId": "P", "type": "page", "url": "https://example.test/"}),
+            };
+            let result = match message["method"].as_str() {
+                Some("Target.getTargetInfo") => json!({"targetInfo": info}),
+                Some("Target.getTargets") => json!({"targetInfos": [
+                    {"targetId": "UI", "type": "browser_ui", "url": "https://example.test/"},
+                    {"targetId": "P", "type": "page", "url": "https://example.test/"}
+                ]}),
+                _ => json!({}),
+            };
+            vec![json!({"id": message["id"], "result": result})]
+        });
+        assert!(cdp.target_protected("B", false).unwrap());
+        assert!(cdp.target_protected("UI", false).unwrap());
+        assert!(cdp.target_protected("W", false).unwrap());
+        assert!(!cdp.target_protected("P", false).unwrap());
+        let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+        assert_eq!(listed["targetInfos"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["targetInfos"][0]["targetId"], "P");
+        for kind in ["page", "service_worker", "background_page", "other", "iframe"] {
+            assert!(cdp.info_protected(&json!({
+                "targetId": "E", "type": kind, "url": "chrome-extension://abc/options.html"
+            }), &[]));
+        }
+        assert!(cdp.info_protected(&json!({
+            "targetId": "UI", "type": "browser_ui", "url": "about:blank"
+        }), &[]));
     }
 
     fn evaluate(cdp: &mut Cdp) -> (Result<Value, String>, Duration) {

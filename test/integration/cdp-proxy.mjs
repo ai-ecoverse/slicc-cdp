@@ -75,6 +75,7 @@ export async function cdpProxy(
     browserEvents = true,
     delays = {},
     early = [],
+    transform = (message) => message,
     before = [],
   } = {}
 ) {
@@ -215,7 +216,7 @@ export async function cdpProxy(
           setTimeout(() => toClient(frame.raw), delayGuardAttachMs);
           continue;
         }
-        toClient(frame.raw);
+        toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
       }
     });
     const end = () => {
