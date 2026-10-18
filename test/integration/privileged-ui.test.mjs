@@ -122,6 +122,24 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
         assert.equal(navigated.code, 0, navigated.stderr);
       }
     );
+    await t.test('ordinary DNS errors leave the tab snapshotable and navigable', async () => {
+      const failed = await runner.playwright(
+        ['goto', 'http://slicc-cdp-non-resolving.invalid/', '--tab', ordinary],
+        cwd
+      );
+      assert.notEqual(failed.code, 0, failed.stdout);
+      assert.match(failed.stderr, /ERR_NAME_NOT_RESOLVED/);
+      assert.doesNotMatch(failed.stderr, /slicc: refused:/);
+      const snapshot = await runner.playwright(['snapshot', '--tab', ordinary], cwd);
+      assert.equal(snapshot.code, 0, `${snapshot.stdout}\n${snapshot.stderr}`);
+      assert.match(snapshot.stdout, /slicc-cdp-non-resolving\.invalid/);
+      const recovered = await runner.playwright(
+        ['goto', `${site.origin}/page`, '--tab', ordinary],
+        cwd
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+      assert.equal(await raw.targetUrl(ordinary), `${site.origin}/page`);
+    });
     await t.test(
       'browser_ui is hidden and refused by target id even with an HTTP URL',
       async () => {
