@@ -147,13 +147,14 @@ test('PR certification preserves canonical plan and missing producer refusal', (
       (step.run ?? '').split('\n').filter((line) => /node scripts\/cert\/[\w-]+\.mjs/.test(line))
     )
   );
-  assert.equal(calls.length, 18);
+  assert.equal(calls.length, 19);
   for (const call of calls) {
     const gated = call.match(
-      /node scripts\/gate\.mjs "?([\w$-]+)"? --accept PASS,FAIL,INCOMPLETE -- node scripts\/cert\/([\w-]+)\.mjs/
+      /node scripts\/gate\.mjs "?([\w$-]+)"? --accept (PASS(?:,FAIL,INCOMPLETE)?) -- node scripts\/cert\/([\w-]+)\.mjs/
     );
     assert.ok(gated, call);
-    assert.equal(gated[1], gated[2] === 'assets' ? 'assets-$PLATFORM' : gated[2]);
+    assert.equal(gated[1], gated[3] === 'assets' ? 'assets-$PLATFORM' : gated[3]);
+    assert.equal(gated[2], gated[3] === 'pr-bios-files' ? 'PASS' : 'PASS,FAIL,INCOMPLETE');
   }
   const gather = steps('record').find((step) => step.name?.startsWith('Gather only canonical'));
   assert.match(
@@ -191,9 +192,19 @@ test('PR certification preserves canonical plan and missing producer refusal', (
     assert.equal(call.with['bios-ref'], '4025d6aabc2c06add216183064d81914a171cd64');
     assert.deepEqual(JSON.parse(call.with.shards), ['packages-update-cdp', 'guard']);
   }
-  const consume = bios.steps.find((step) => step.env?.BIOS_BASE);
-  assert.ok(consume.env.BIOS_BASE.includes('fromJSON(needs.bios_base.outputs.result'));
-  assert.ok(consume.env.BIOS_CANDIDATE.includes('fromJSON(needs.bios_candidate.outputs.result'));
+  const consume = bios.steps.find((step) => step.run?.includes('scripts/cert/pr-bios-files.mjs'));
+  assert.ok(consume, 'main-owned file writer must replace whole-result environment transport');
+  assert.equal(consume.env, undefined);
+  assert.ok(consume.run.includes("<<'EOF'"));
+  for (const side of ['base', 'candidate']) {
+    assert.ok(consume.run.includes(`toJSON(needs.bios_${side}.outputs.result || 'null')`));
+    assert.ok(consume.run.includes(`--${side} evidence/bios-${side}.json`));
+  }
+  assert.ok(!JSON.stringify(bios).includes('BIOS_BASE'));
+  assert.ok(!JSON.stringify(bios).includes('BIOS_CANDIDATE'));
+  assert.ok(!consume.run.includes('fromJSON'));
+  assert.ok(consume.run.includes('pr-bios-files --accept PASS --'));
+  assert.ok(consume.run.indexOf('pr-bios-files --') < consume.run.indexOf('pr-bios --'));
   for (const name of ['guard', 'integration']) {
     const raw = steps(name).find((step) => step.uses?.startsWith('actions/upload-artifact@'));
     assert.ok(
