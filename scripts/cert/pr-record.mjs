@@ -3,6 +3,7 @@ import path from 'node:path';
 import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
+import { selectBiosPin } from './pr-bios-result.mjs';
 import { client, required, residual } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 import { validateBios, validateGuard, validateMac, validateSuite } from './pr-validate.mjs';
@@ -15,7 +16,9 @@ const incomplete = [...(plan.issues ?? [])];
 const flags = [];
 const emit = (status, reason) => (status === 'FAIL' ? failures : incomplete).push(reason);
 let artifactBinding;
-if (options.bindings) {
+const bindingContext = {};
+const bound = options.bindings !== undefined;
+if (bound) {
   try {
     const { api } = client(plan.repository);
     const inventory = await artifactInventory(api, plan.run);
@@ -25,6 +28,8 @@ if (options.bindings) {
     } catch (error) {
       emit('INCOMPLETE', `artifacts: ${error.message}`);
     }
+    bindingContext.bindings = bindings;
+    bindingContext.inventory = inventory;
     artifactBinding = artifactFindings(plan, bindings, inventory, { phase: 'record' });
     for (const reason of artifactBinding.failures) emit('FAIL', `artifacts: ${reason}`);
     for (const reason of artifactBinding.incomplete) emit('INCOMPLETE', `artifacts: ${reason}`);
@@ -146,8 +151,17 @@ for (const [source, positive, negative] of [
     emit('INCOMPLETE', `named ${source}: ${error.message}`);
   }
 }
-const biosPin = json(new URL('./pr-bios.json', import.meta.url));
-flags.push(...validateBios(documents.bios, biosPin, emit, plan, { base: baseline, candidate }));
+const biosPin = selectBiosPin(json(new URL('./pr-bios.json', import.meta.url)), bound);
+flags.push(
+  ...validateBios(
+    documents.bios,
+    biosPin,
+    emit,
+    plan,
+    { base: baseline, candidate },
+    bindingContext
+  )
+);
 try {
   const checked = path.join(options.out, 'checksums.json');
   try {
@@ -261,7 +275,7 @@ const record = {
   required,
   self: plan.self,
   upstream,
-  ...(options.bindings ? { artifactBinding } : {}),
+  ...(bound ? { artifactBinding } : {}),
   residual,
 };
 save(path.join(options.out, 'record.json'), record);

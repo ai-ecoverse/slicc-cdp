@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { artifactNames } from '../../scripts/cert/pr-artifact-binding.mjs';
+import * as biosLibrary from '../../scripts/cert/pr-bios-result.mjs';
+import { prIdentity } from '../../scripts/cert/pr-common.mjs';
 import { assertVerdict } from './cert-cli-verdict.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -357,4 +361,370 @@ test('bios consumer refuses corrupted package bytes before accepting canary outp
   const result = invoke(f);
   assert.equal(result.document.status, 'FAIL');
   assert.match(result.document.reason, /pack digest mismatch/);
+});
+
+function boundFixture(t) {
+  const f = fixture(t);
+  const sha = 'e'.repeat(64);
+  f.bindings = {
+    schema: 1,
+    ...prIdentity(f.plan),
+    artifacts: Object.entries(artifactNames(f.plan)).map(([role, name], index) => ({
+      role,
+      name,
+      id: String(index + 1),
+      digest: sha,
+    })),
+  };
+  f.actual = f.bindings.artifacts.map((row) => ({
+    id: Number(row.id),
+    name: row.name,
+    digest: `sha256:${sha}`,
+    expired: false,
+    workflow_run: { id: 42, head_sha: f.plan.head },
+  }));
+  f.outputs = {};
+  for (const side of ['base', 'candidate']) {
+    const rows = f.bindings.artifacts.filter((row) => row.role.startsWith(`bios-${side}-`));
+    const report = rows.find((row) => row.role.endsWith('-report'));
+    f.results[side].biosRef = '17ef7c40eb12d93d9a781626196d6052292aa94a';
+    f.results[side].artifact.url =
+      `https://github.com/fixture/lane/actions/runs/42/artifacts/${report.id}`;
+    f.outputs[side] = {
+      result: f.results[side],
+      'artifact-id': report.id,
+      'artifact-digest': report.digest,
+      artifacts: rows.map((row) => ({
+        ...row,
+        role: row.role.slice(`bios-${side}-`.length).split('-')[0],
+        attempt: '1',
+      })),
+    };
+  }
+  return f;
+}
+
+async function boundInvoke(t, f, script = 'pr-bios.mjs') {
+  const server = createServer((request, response) => {
+    assert.match(request.url, /^\/repos\/fixture\/lane\/actions\/runs\/42\/artifacts\?/);
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ total_count: f.actual.length, artifacts: f.actual }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const supportsBindings = typeof biosLibrary.selectBiosPin === 'function';
+  for (const side of ['base', 'candidate']) {
+    const output = supportsBindings ? f.outputs[side] : f.outputs[side]?.result;
+    save(path.join(f.directory, `${side}.json`), output);
+  }
+  save(path.join(f.directory, 'bindings.json'), f.bindings);
+  const out = path.join(f.directory, 'bound.json');
+  const processResult = await new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [
+        path.join(root, 'scripts/cert', script),
+        '--plan',
+        path.join(f.directory, 'plan.json'),
+        '--out',
+        out,
+        ...(supportsBindings ? ['--bindings', path.join(f.directory, 'bindings.json')] : []),
+      ],
+      {
+        env: {
+          ...process.env,
+          GH_TOKEN: '',
+          GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`,
+          CERT_PR_PACKS: f.packs,
+        },
+      }
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (data) => {
+      stdout += data;
+    });
+    child.stderr.on('data', (data) => {
+      stderr += data;
+    });
+    child.on('error', reject);
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+  const document = read(out);
+  assertVerdict(processResult.stdout, script.replace(/\.mjs$/, ''), document.status);
+  return { ...processResult, document };
+}
+
+const bindingCases = [
+  [
+    'missing callee upload digest',
+    (f) => {
+      delete f.outputs.candidate.artifacts[0].digest;
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'missing callee upload ID',
+    (f) => {
+      delete f.outputs.candidate.artifacts[0].id;
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'malformed callee upload ID',
+    (f) => {
+      f.outputs.candidate.artifacts[0].id = 'zero';
+    },
+    'FAIL',
+  ],
+  [
+    'zero callee attempt is present and wrong',
+    (f) => {
+      f.outputs.candidate.artifacts[0].attempt = 0;
+    },
+    'FAIL',
+  ],
+  [
+    'raw string result transport',
+    (f) => {
+      f.outputs.candidate.result = JSON.stringify(f.outputs.candidate.result);
+    },
+    'PASS',
+  ],
+  [
+    'malformed result JSON',
+    (f) => {
+      f.outputs.candidate.result = '{';
+    },
+    'FAIL',
+  ],
+  ['all five outputs per label match API', () => {}, 'PASS'],
+  [
+    'API forged bios suffix',
+    (f) => f.actual.push({ ...f.actual[0], id: 90, name: 'candidate-canary-shard-canary-forged' }),
+    'FAIL',
+  ],
+  [
+    'API forged evidence suffix',
+    (f) => f.actual.push({ ...f.actual[0], id: 90, name: 'cert-pr-evidence-42-1-forged' }),
+    'FAIL',
+  ],
+  [
+    'API digest differs from callee upload',
+    (f) => {
+      f.actual.find((row) => row.name === 'candidate-canary').digest = 'f'.repeat(64);
+    },
+    'FAIL',
+  ],
+  [
+    'callee manifest digest substitution',
+    (f) => {
+      f.outputs.candidate.artifacts[0].digest = 'f'.repeat(64);
+    },
+    'FAIL',
+  ],
+  [
+    'callee manifest ID substitution',
+    (f) => {
+      f.outputs.candidate.artifacts[0].id = '90';
+    },
+    'FAIL',
+  ],
+  [
+    'duplicate callee ID',
+    (f) => {
+      f.outputs.candidate.artifacts[0].id = f.outputs.base.artifacts[0].id;
+    },
+    'FAIL',
+  ],
+  [
+    'missing callee shard',
+    (f) => {
+      f.outputs.candidate.artifacts.pop();
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'unexpected plan upload',
+    (f) => {
+      f.outputs.candidate.artifacts.push({
+        role: 'plan',
+        name: 'candidate-plan',
+        id: '90',
+        digest: 'e'.repeat(64),
+        attempt: '1',
+      });
+    },
+    'FAIL',
+  ],
+  [
+    'renamed shard',
+    (f) => {
+      f.outputs.candidate.artifacts[0].name += '-forged';
+    },
+    'FAIL',
+  ],
+  [
+    'wrong callee attempt',
+    (f) => {
+      f.outputs.candidate.artifacts[0].attempt = '2';
+    },
+    'FAIL',
+  ],
+  [
+    'absent callee attempt',
+    (f) => {
+      delete f.outputs.candidate.artifacts[0].attempt;
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'missing direct report ID',
+    (f) => {
+      delete f.outputs.candidate['artifact-id'];
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'direct report ID substitution',
+    (f) => {
+      f.outputs.candidate['artifact-id'] = '90';
+    },
+    'FAIL',
+  ],
+  [
+    'direct report digest substitution',
+    (f) => {
+      f.outputs.candidate['artifact-digest'] = 'f'.repeat(64);
+    },
+    'FAIL',
+  ],
+  [
+    'result URL substitution',
+    (f) => {
+      f.outputs.candidate.result.artifact.url =
+        'https://github.com/fixture/lane/actions/runs/42/artifacts/90';
+    },
+    'FAIL',
+  ],
+  [
+    'malformed manifest JSON',
+    (f) => {
+      f.outputs.candidate.artifacts = '{';
+    },
+    'FAIL',
+  ],
+  [
+    'string manifest transport',
+    (f) => {
+      f.outputs.candidate.artifacts = JSON.stringify(f.outputs.candidate.artifacts);
+    },
+    'PASS',
+  ],
+  [
+    'wrong API head',
+    (f) => {
+      f.actual.find((row) => row.name === 'candidate-canary').workflow_run.head_sha = 'f'.repeat(
+        40
+      );
+    },
+    'FAIL',
+  ],
+  [
+    'malformed pack uploader digest',
+    (f) => {
+      f.bindings.artifacts.find((row) => row.role === 'pack-candidate').digest = 'SHA256:bad';
+    },
+    'FAIL',
+  ],
+  [
+    'missing pack uploader digest',
+    (f) => {
+      delete f.bindings.artifacts.find((row) => row.role === 'pack-candidate').digest;
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'missing manifest and forged API suffix keeps FAIL precedence',
+    (f) => {
+      delete f.outputs.base.artifacts;
+      f.actual.push({ ...f.actual[0], id: 90, name: 'base-canary-files-canary-forged' });
+    },
+    'FAIL',
+  ],
+  [
+    'wrong pin and forged manifest keeps FAIL precedence',
+    (f) => {
+      f.outputs.candidate.result.biosRef = pin;
+      f.outputs.candidate.artifacts[0].digest = 'f'.repeat(64);
+    },
+    'FAIL',
+  ],
+];
+
+for (const [name, mutate, expected] of bindingCases)
+  test(`bound bios public CLI: ${name}`, async (t) => {
+    const f = boundFixture(t);
+    mutate(f);
+    const run = await boundInvoke(t, f);
+    assert.equal(run.document.status, expected, run.stderr);
+    assert.equal(run.status, expected === 'FAIL' ? 1 : 0, run.stderr);
+    assert.equal(run.document.pin.commit, '17ef7c40eb12d93d9a781626196d6052292aa94a');
+  });
+
+for (const invalid of [false, true])
+  test(`bound bios inputs carry both distinct actual pack uploads: substitution=${invalid}`, async (t) => {
+    const f = boundFixture(t);
+    if (invalid)
+      f.actual.find(
+        (row) => row.name === f.bindings.artifacts.find((row) => row.role === 'pack-base').name
+      ).digest = 'f'.repeat(64);
+    const run = await boundInvoke(t, f, 'pr-bios-inputs.mjs');
+    assert.equal(run.document.status, invalid ? 'FAIL' : 'PASS', run.stderr);
+    if (invalid) assert.equal(run.document.ready, false);
+    else
+      for (const side of ['base', 'candidate']) {
+        const row = f.bindings.artifacts.find((row) => row.role === `pack-${side}`);
+        const call = run.document.calls[side];
+        assert.equal(call['candidate-artifact-id'], row.id);
+        assert.equal(call['candidate-artifact-digest'], row.digest);
+        assert.equal(call['candidate-binding'], 'strict');
+        assert.equal(call['bios-ref'], '17ef7c40eb12d93d9a781626196d6052292aa94a');
+        assert.equal(call['candidate-sha256'], f.results[side].overrides[0].sha256);
+        assert.notEqual(call['candidate-artifact-digest'], call['candidate-sha256']);
+      }
+  });
+
+test('strict schema cannot silently downgrade to legacy without binding data', (t) => {
+  const f = boundFixture(t);
+  assert.equal(
+    typeof biosLibrary.selectBiosPin,
+    'function',
+    'main-owned binding pin selector required'
+  );
+  const selected = biosLibrary.selectBiosPin(
+    read(path.join(root, 'scripts/cert/pr-bios.json')),
+    true
+  );
+  const subjects = Object.fromEntries(
+    ['base', 'candidate'].map((side) => [
+      side,
+      {
+        sha256: f.results[side].overrides[0].sha256,
+        manifest: { version: f.results[side].overrides[0].version },
+      },
+    ])
+  );
+  const findings = biosLibrary.biosFindings(
+    { pin: selected, results: f.results, calls: {} },
+    selected,
+    f.plan,
+    subjects
+  );
+  assert.ok(findings.incomplete.length);
+  assert.ok(
+    findings.incomplete.some((reason) =>
+      /producer binding|required|manifest unavailable/.test(reason)
+    )
+  );
 });

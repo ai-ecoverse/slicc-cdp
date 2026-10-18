@@ -2,19 +2,27 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { cliVerdict } from './cli-verdict.mjs';
 import { args, identity, json, root, save } from './common.mjs';
-import { biosCalls, biosFindings } from './pr-bios-result.mjs';
+import { artifactFindings, artifactInventory, artifactNames } from './pr-artifact-binding.mjs';
+import { biosCalls, biosFindings, selectBiosPin } from './pr-bios-result.mjs';
+import { client } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
 const printVerdict = cliVerdict('pr-bios: ');
-const options = args({ base: { type: 'string' }, candidate: { type: 'string' } });
+const options = args({
+  base: { type: 'string' },
+  candidate: { type: 'string' },
+  bindings: { type: 'string' },
+});
 const plan = json(options.plan);
-const pin = json(new URL('./pr-bios.json', import.meta.url));
+const bound = options.bindings !== undefined;
+const pin = selectBiosPin(json(new URL('./pr-bios.json', import.meta.url)), bound);
 const result = {
   ...identity(plan),
   which: 'bios',
   pin,
   status: 'INCOMPLETE',
   results: {},
+  ...(bound ? { outputs: {} } : {}),
   subjects: [
     { side: 'base', ...plan.baseline },
     { side: 'candidate', version: plan.version, commit: plan.commit },
@@ -32,12 +40,32 @@ try {
       ),
     ])
   );
-  result.calls = biosCalls(plan, pin, subjects);
+  const context = {};
+  if (bound) {
+    context.bindings = json(options.bindings);
+    const { api } = client(plan.repository);
+    context.inventory = await artifactInventory(api, plan.run);
+    result.artifactBinding = artifactFindings(plan, context.bindings, context.inventory, {
+      roles: [
+        'pack-base',
+        'pack-candidate',
+        ...Object.keys(artifactNames(plan)).filter((role) => role.startsWith('bios-')),
+      ],
+    });
+  }
+  result.calls = biosCalls(plan, pin, subjects, context.bindings);
   for (const side of ['base', 'candidate']) {
     const file = options[side] ?? path.join(path.dirname(options.plan), `${side}.json`);
-    if (existsSync(file)) result.results[side] = json(file);
+    if (existsSync(file)) {
+      const output = json(file);
+      if (bound) {
+        result.outputs[side] = output;
+        result.results[side] =
+          typeof output.result === 'string' ? JSON.parse(output.result) : output.result;
+      } else result.results[side] = output;
+    }
   }
-  Object.assign(result, biosFindings(result, pin, plan, subjects));
+  Object.assign(result, biosFindings(result, pin, plan, subjects, context));
   result.status = result.failures.length
     ? 'FAIL'
     : result.incomplete.length
@@ -45,7 +73,9 @@ try {
       : 'PASS';
   result.reason = [...result.failures, ...result.incomplete].join('; ') || undefined;
 } catch (error) {
-  result.status = error.certStatus ?? 'INCOMPLETE';
+  result.status = result.artifactBinding?.failures.length
+    ? 'FAIL'
+    : (error.certStatus ?? (bound && error instanceof SyntaxError ? 'FAIL' : 'INCOMPLETE'));
   result.reason = error.message;
 }
 save(options.out, result);
