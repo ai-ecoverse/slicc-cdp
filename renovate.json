@@ -1,88 +1,54 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "github>ai-ecoverse/slicc-shared-web"
-  ],
+  "extends": ["github>ai-ecoverse/slicc-shared-web"],
   "packageRules": [
     {
-      "matchManagers": [
-        "npm",
-        "cargo"
-      ],
-      "matchPackageNames": [
-        "@ai-ecoverse/slicc-browsers",
-        "slicc-browsers"
-      ],
+      "matchManagers": ["npm", "cargo"],
+      "matchPackageNames": ["@ai-ecoverse/slicc-browsers", "slicc-browsers"],
       "groupName": "slicc-browsers catalog and vectors",
       "groupSlug": "slicc-browsers-catalog-vectors",
       "rangeStrategy": "pin"
     },
     {
-      "matchFileNames": [
-        "packages/sliccy-browser/package.json"
-      ],
-      "matchPackageNames": [
-        "@ai-ecoverse/slicc-cdp"
-      ],
+      "matchFileNames": ["packages/sliccy-browser/package.json"],
+      "matchPackageNames": ["@ai-ecoverse/slicc-cdp"],
       "semanticCommitType": "chore",
       "semanticCommitScope": "sliccy-browser",
       "bumpVersion": "patch"
     },
     {
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchPackageNames": [
-        "ai-ecoverse/slicc-shared-web"
-      ],
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["ai-ecoverse/slicc-shared-web"],
       "additionalBranchPrefix": "workflow-",
       "commitMessageTopic": "slicc-shared-web reusable workflows",
       "semanticCommitType": "ci"
     },
     {
       "description": "Changes that reach the shipped wasm or binaries wait for the PR certification: Renovate labels them merge-ok so cert-review-pr runs, and merges only when every check, cert-review included, is green.",
-      "matchManagers": [
-        "cargo"
-      ],
-      "labels": [
-        "merge-ok"
-      ],
+      "matchManagers": ["cargo"],
+      "labels": ["merge-ok"],
       "platformAutomerge": false
     },
     {
       "description": "Runtime npm dependencies of the published package wait for the PR certification the same way.",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchFileNames": [
-        "package.json"
-      ],
-      "matchDepTypes": [
-        "dependencies"
-      ],
-      "labels": [
-        "merge-ok"
-      ],
+      "matchManagers": ["npm"],
+      "matchFileNames": ["package.json"],
+      "matchDepTypes": ["dependencies"],
+      "labels": ["merge-ok"],
       "platformAutomerge": false
     }
   ],
   "customDatasources": {
     "chrome-for-testing-beta": {
       "defaultRegistryUrlTemplate": "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json",
-      "transformTemplates": [
-        "{\"releases\": [{\"version\": channels.Beta.version}]}"
-      ]
+      "transformTemplates": ["{\"releases\": [{\"version\": channels.Beta.version}]}"]
     }
   },
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": [
-        "/^package\\.json$/"
-      ],
-      "matchStrings": [
-        "\"chrome\":\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+\\.\\d+)\""
-      ],
+      "managerFilePatterns": ["/^package\\.json$/"],
+      "matchStrings": ["\"chrome\":\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+\\.\\d+)\""],
       "depNameTemplate": "chrome-for-testing",
       "datasourceTemplate": "custom.chrome-for-testing-beta",
       "versioningTemplate": "loose"
