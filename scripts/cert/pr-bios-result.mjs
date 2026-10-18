@@ -5,6 +5,7 @@ import {
   artifactId,
   artifactNames,
 } from './pr-artifact-binding.mjs';
+import { pairedBiosFindings } from './pr-bios-pair.mjs';
 
 const packageName = '@ai-ecoverse/slicc-cdp';
 const kinds = ['pass', 'skip', 'fail', 'regression', 'both', 'flaky'];
@@ -128,11 +129,10 @@ function completion(side, result, pin, emit, flags) {
     return;
   }
   rowLists(side, result, pin, emit);
-  if (!counts.pass || counts.skip) emit('INCOMPLETE', `${side}: unexecuted or skipped smoke`);
+  if (!kinds.some((kind) => counts[kind]) || counts.skip)
+    emit('INCOMPLETE', `${side}: unexecuted or skipped smoke`);
   if (counts.flaky) emit('INCOMPLETE', `${side}: flaky smoke`);
-  if (side === 'candidate' && (counts.regression || counts.fail))
-    emit('FAIL', 'candidate: regressions or failing smoke');
-  if (!result.ok) emit('INCOMPLETE', `${side}: producer did not accept the smoke`);
+
   if (counts.both) flags.push(`bios ${side}: ${counts.both} failures also present on bios pins`);
   if (side === 'base' && counts.regression)
     flags.push(`bios base: ${counts.regression} regressions against bios pins`);
@@ -286,5 +286,9 @@ export function biosFindings(bios, pin, plan, subjects, context = {}) {
   }
   if (artifacts.length === 2 && artifacts[0] === artifacts[1])
     emit('INCOMPLETE', 'base and candidate result artifacts are not distinct');
+  const paired = pairedBiosFindings(bios?.results, pin, bios?.reports);
+  failures.push(...paired.failures);
+  incomplete.push(...paired.incomplete);
+  flags.push(...paired.flags);
   return { failures, incomplete, flags };
 }

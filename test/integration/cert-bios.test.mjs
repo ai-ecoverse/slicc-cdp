@@ -94,6 +94,15 @@ function fixture(t) {
       failures: [],
       missingShards: [],
       unexplainedExits: [],
+      refused: [],
+      ambiguous: [],
+      tests: Array.from({ length: 20 }, (_, index) => ({
+        key: `guard/test-${index}`,
+        shard: index === 19 ? 'packages-update-cdp' : 'guard',
+        test: index === 0 ? 'guarded CDP smoke' : `passing smoke ${index}`,
+        verdict: 'pass',
+        failed: { candidate: '0/3', baseline: '0/0' },
+      })),
       artifact: {
         name: `${side}-canary`,
         url: `https://github.com/fixture/lane/actions/runs/42/artifacts/${side === 'base' ? 1 : 2}`,
@@ -131,8 +140,50 @@ const failure = {
   log: 'failure',
   failed: { candidate: '3/3', baseline: '0/3' },
 };
+function failRow(f, side, kind) {
+  const result = f.results[side];
+  result.counts.pass = 19;
+  result.counts[kind] = 1;
+  result[{ regression: 'regressions', fail: 'failures', both: 'both', flaky: 'flaky' }[kind]] = [
+    failure,
+  ];
+  result.tests[0] = { ...result.tests[0], verdict: kind, failed: failure.failed };
+}
+
 const cases = [
   ['two complete bound calls', () => {}, 'PASS'],
+  [
+    'shared regressions and both producer rejections are flags',
+    (f) => {
+      for (const side of ['base', 'candidate']) {
+        failRow(f, side, 'regression');
+        f.results[side].ok = false;
+      }
+    },
+    'PASS',
+  ],
+  [
+    'failure on bios pins still FAILs if the PR base passes that test',
+    (f) => {
+      failRow(f, 'candidate', 'both');
+    },
+    'FAIL',
+  ],
+  [
+    'missing complete tests field is not a compact-count PASS',
+    (f) => {
+      delete f.results.base.tests;
+    },
+    'INCOMPLETE',
+  ],
+  [
+    'integrity failure retains precedence with missing base',
+    (f) => {
+      f.results.base = null;
+      f.results.candidate.overrides[0].sha256 = 'f'.repeat(64);
+    },
+    'FAIL',
+  ],
   [
     'missing candidate call',
     (f) => {
@@ -150,27 +201,24 @@ const cases = [
   [
     'candidate regression despite ok true',
     (f) => {
-      f.results.candidate.counts.regression = 1;
-      f.results.candidate.regressions = [failure];
+      failRow(f, 'candidate', 'regression');
     },
     'FAIL',
   ],
   [
     'candidate failing smoke',
     (f) => {
-      f.results.candidate.counts.fail = 1;
-      f.results.candidate.failures = [failure];
+      failRow(f, 'candidate', 'fail');
     },
     'FAIL',
   ],
   [
-    'failure precedence over missing base',
+    'missing base prevents a candidate-introduced failure proof',
     (f) => {
       f.results.base = null;
-      f.results.candidate.counts.regression = 1;
-      f.results.candidate.regressions = [failure];
+      failRow(f, 'candidate', 'regression');
     },
-    'FAIL',
+    'INCOMPLETE',
   ],
   [
     'wrong candidate digest',
@@ -275,8 +323,8 @@ const cases = [
   [
     'both failures retained as flags',
     (f) => {
-      f.results.candidate.counts.both = 1;
-      f.results.candidate.both = [failure];
+      failRow(f, 'candidate', 'both');
+      failRow(f, 'base', 'both');
     },
     'PASS',
   ],
@@ -339,6 +387,8 @@ for (const [name, mutate, expected] of cases)
     const result = invoke(f);
     assert.equal(result.document.status, expected, result.stderr);
     assert.equal(result.status, expected === 'FAIL' ? 1 : 0, result.stderr);
+    if (name.startsWith('shared regressions'))
+      assert.match(result.document.flags.join(';'), /producer ok=false explained/);
     if (name.startsWith('both failures'))
       assert.match(result.document.flags.join(';'), /failures also present on bios pins/);
   });
@@ -387,7 +437,7 @@ function boundFixture(t) {
   for (const side of ['base', 'candidate']) {
     const rows = f.bindings.artifacts.filter((row) => row.role.startsWith(`bios-${side}-`));
     const report = rows.find((row) => row.role.endsWith('-report'));
-    f.results[side].biosRef = '17ef7c40eb12d93d9a781626196d6052292aa94a';
+    f.results[side].biosRef = 'c2cec127b935419049568f584093d7ef03ac0721';
     f.results[side].artifact.url =
       `https://github.com/fixture/lane/actions/runs/42/artifacts/${report.id}`;
     f.outputs[side] = {
@@ -669,7 +719,7 @@ for (const [name, mutate, expected] of bindingCases)
     const run = await boundInvoke(t, f);
     assert.equal(run.document.status, expected, run.stderr);
     assert.equal(run.status, expected === 'FAIL' ? 1 : 0, run.stderr);
-    assert.equal(run.document.pin.commit, '17ef7c40eb12d93d9a781626196d6052292aa94a');
+    assert.equal(run.document.pin.commit, 'c2cec127b935419049568f584093d7ef03ac0721');
   });
 
 for (const invalid of [false, true])
@@ -689,7 +739,7 @@ for (const invalid of [false, true])
         assert.equal(call['candidate-artifact-id'], row.id);
         assert.equal(call['candidate-artifact-digest'], row.digest);
         assert.equal(call['candidate-binding'], 'strict');
-        assert.equal(call['bios-ref'], '17ef7c40eb12d93d9a781626196d6052292aa94a');
+        assert.equal(call['bios-ref'], 'c2cec127b935419049568f584093d7ef03ac0721');
         assert.equal(call['candidate-sha256'], f.results[side].overrides[0].sha256);
         assert.notEqual(call['candidate-artifact-digest'], call['candidate-sha256']);
       }

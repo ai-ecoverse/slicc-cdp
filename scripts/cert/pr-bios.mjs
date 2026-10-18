@@ -12,6 +12,8 @@ const options = args({
   base: { type: 'string' },
   candidate: { type: 'string' },
   bindings: { type: 'string' },
+  'base-report': { type: 'string' },
+  'candidate-report': { type: 'string' },
 });
 const plan = json(options.plan);
 const bound = options.bindings !== undefined;
@@ -63,6 +65,10 @@ try {
         result.results[side] =
           typeof output.result === 'string' ? JSON.parse(output.result) : output.result;
       } else result.results[side] = output;
+    }
+    if (options[`${side}-report`] !== undefined) {
+      result.reports ??= {};
+      result.reports[side] = json(options[`${side}-report`]);
     }
   }
   Object.assign(result, biosFindings(result, pin, plan, subjects, context));

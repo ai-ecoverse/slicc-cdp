@@ -782,11 +782,10 @@ jobs:
           path: ".cert/pr-packs/candidate"
       -
         name: "Main-owned validation of both pinned canary result documents"
-        env:
-          BIOS_BASE: "${{ toJSON(fromJSON(needs.bios_base.outputs.result || 'null')) }}"
-          BIOS_CANDIDATE: "${{ toJSON(fromJSON(needs.bios_candidate.outputs.result || 'null')) }}"
         run: |
-          node --input-type=module -e 'import{writeFileSync}from"node:fs";writeFileSync("evidence/bios-base.json",process.env.BIOS_BASE);writeFileSync("evidence/bios-candidate.json",process.env.BIOS_CANDIDATE)'
+          node scripts/gate.mjs pr-bios-files --accept PASS -- node scripts/cert/pr-bios-files.mjs --directory evidence --out evidence/bios-transport.json <<'EOF'
+          {"base":${{ toJSON(needs.bios_base.outputs.result || 'null') }},"candidate":${{ toJSON(needs.bios_candidate.outputs.result || 'null') }}}
+          EOF
           node scripts/gate.mjs pr-bios --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/pr-bios.mjs --plan evidence/plan.json --base evidence/bios-base.json --candidate evidence/bios-candidate.json --out evidence/bios.json
       -
         uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"

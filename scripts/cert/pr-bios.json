@@ -2,7 +2,7 @@
   "repository": "ai-ecoverse/slicc-bios",
   "workflow": ".github/workflows/canary.yml",
   "commit": "4025d6aabc2c06add216183064d81914a171cd64",
-  "bindingCommit": "17ef7c40eb12d93d9a781626196d6052292aa94a",
+  "bindingCommit": "c2cec127b935419049568f584093d7ef03ac0721",
   "shards": ["packages-update-cdp", "guard"],
   "state": "pinned"
 }
