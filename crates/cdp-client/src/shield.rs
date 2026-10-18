@@ -1226,6 +1226,37 @@ mod tests {
         }
     }
 
+    fn guard_evidence(
+        cdp: &Cdp,
+        raw: &mut Raw,
+        app: &str,
+        session: &str,
+        path: &str,
+        trigger: &Result<Value, String>,
+    ) -> String {
+        let hits = fixture_hits(app, path);
+        let window = raw.call(
+            "Runtime.evaluate",
+            json!({ "expression": "({ href: location.href, readyState: document.readyState, trigger: globalThis.guardWindowTrigger })", "returnByValue": true }),
+            Some(session),
+        );
+        let history = raw.call("Page.getNavigationHistory", json!({}), Some(session));
+        let timer = window
+            .as_ref()
+            .ok()
+            .and_then(|result| result.pointer("/result/value/trigger/fired"))
+            .and_then(Value::as_bool);
+        let classification = match hits.parse::<u64>() {
+            Ok(count) if count > 0 => "(a) protected fixture hit: guard bypass",
+            Ok(0) if timer == Some(false) => "(b) navigation timer never fired",
+            _ => "unclassified: inspect browser events, window and guard trail",
+        };
+        format!(
+            "{classification}; pending_before_attach=true; fixture_path={path}; seven_hits={hits}; trigger={trigger:?}; window={window:?}; history={history:?}; client_events={:?}; guard_trail={:?}",
+            cdp.events(), cdp.paused_trail
+        )
+    }
+
     fn until_history(
         raw: &mut Raw,
         session: &str,
@@ -1284,9 +1315,12 @@ mod tests {
         until_history(&mut raw, &slow, "the js-redirect committed", |current| {
             current.is_some_and(|url| url.contains("/js-redirect"))
         });
-        until_history(&mut raw, &slow, "the landing went pending", |current| {
-            current.is_none()
-        });
+        until_history(
+            &mut raw,
+            &slow,
+            "pending-commit window not produced: the landing went pending",
+            |current| current.is_none(),
+        );
         let session = client::attach(&mut cdp, &tab).unwrap();
         raw.call(
             "Emulation.setCPUThrottlingRate",
@@ -1314,38 +1348,44 @@ mod tests {
         }
 
         let frame = format!("{seven}/code?n=frame");
-        cdp.call(
+        let frame_trigger = cdp.call(
             "Runtime.evaluate",
             json!({ "expression": format!("const f = document.createElement('iframe'); f.src = {}; document.body.appendChild(f); true", json!(frame)) }),
             Some(&session),
-        )
-        .unwrap();
-        assert!(
-            guard_failed(&mut cdp, &frame),
-            "the guard never saw the seven iframe"
         );
+        let frame_seen = guard_failed(&mut cdp, &frame);
+        assert!(
+            frame_seen,
+            "seven iframe not intercepted: {}",
+            guard_evidence(&cdp, &mut raw, &app, &slow, "/code", &frame_trigger)
+        );
+        frame_trigger.as_ref().unwrap();
         assert_eq!(
             fixture_hits(&app, "/code"),
             "0",
-            "the seven iframe reached the network"
+            "seven iframe reached the network: {}",
+            guard_evidence(&cdp, &mut raw, &app, &slow, "/code", &frame_trigger)
         );
 
         let main = format!("{seven}/dump?n=main");
-        cdp.call(
+        let main_trigger = cdp.call(
             "Runtime.evaluate",
-            json!({ "expression": format!("setTimeout(() => {{ location.href = {}; }}, 50); true", json!(main)) }),
+            json!({ "expression": format!("globalThis.guardWindowTrigger = {{ scheduled: true, fired: false }}; setTimeout(() => {{ globalThis.guardWindowTrigger.fired = true; location.href = {}; }}, 50); true", json!(main)) }),
             Some(&session),
-        )
-        .unwrap();
-        assert!(
-            guard_failed(&mut cdp, &main),
-            "the guard never saw the seven navigation"
         );
+        let main_seen = guard_failed(&mut cdp, &main);
+        assert!(
+            main_seen,
+            "seven navigation not intercepted: {}",
+            guard_evidence(&cdp, &mut raw, &app, &slow, "/dump", &main_trigger)
+        );
+        main_trigger.as_ref().unwrap();
         until_blocked(&mut cdp, &session);
         assert_eq!(
             fixture_hits(&app, "/dump"),
             "0",
-            "the seven navigation reached the network"
+            "seven navigation reached the network: {}",
+            guard_evidence(&cdp, &mut raw, &app, &slow, "/dump", &main_trigger)
         );
         nothing_mentions(&cdp, "n=main");
         nothing_mentions(&cdp, "n=frame");

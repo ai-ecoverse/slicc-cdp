@@ -76,12 +76,27 @@ test('a guard armed while the browser has not committed a navigation still fails
     },
     'shield::tests::live_guard_armed_while_a_navigation_commits'
   );
-  assert.equal(proxy.replies.length, 1);
-  assert.match(JSON.stringify(proxy.replies[0]), /Not attached to an active page/);
+  const window = JSON.stringify(proxy.replies);
+  const evidence = `pending-commit window not produced; ${proxy.evidence}`;
+  assert.equal(proxy.replies.length, 1, evidence);
+  assert.match(window, /Not attached to an active page/, evidence);
 });
+
+async function fixtureHits(site) {
+  return Object.fromEntries(
+    await Promise.all(
+      ['/code', '/dump'].map(async (path) => {
+        const response = await fetch(`${site.origin}/hits?path=${path}`);
+        assert(response.ok, `fixture hits unavailable: ${response.status}`);
+        return [path, Number(await response.text())];
+      })
+    )
+  );
+}
 
 async function throughProxy(options, name = 'fetch::tests::live_chromium_interception') {
   const site = await startServer();
+  const initialHits = await fixtureHits(site);
   let browser;
   let proxy;
   try {
@@ -89,7 +104,15 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
       `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${site.port}, MAP vault.sliccy.ai 127.0.0.1:${site.port}`,
       '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
     ]);
-    proxy = await cdpProxy(browser.wsUrl, options);
+    const events = [];
+    const transform = options.transform ?? ((message) => message);
+    proxy = await cdpProxy(browser.wsUrl, {
+      ...options,
+      transform: (message) => {
+        if (message.method) events.push(message);
+        return transform(message);
+      },
+    });
     const result = await cargo(
       [
         'test',
@@ -110,7 +133,38 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
         SLICC_FETCH_LIVE_VAULT: 'http://vault.sliccy.ai',
       }
     );
-    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const hits = await fixtureHits(site);
+    const delta = Object.fromEntries(
+      Object.entries(hits).map(([path, count]) => [path, count - initialHits[path]])
+    );
+    const commits = events.filter(
+      ({ method, params }) =>
+        (method === 'Page.frameNavigated' &&
+          params.frame?.url?.startsWith('http://seven.sliccy.ai/')) ||
+        (method === 'Network.responseReceived' &&
+          params.response?.url?.startsWith('http://seven.sliccy.ai/'))
+    );
+    const guardRace = name === 'shield::tests::live_guard_armed_while_a_navigation_commits';
+    const classification = !guardRace
+      ? 'interception diagnostics'
+      : Object.values(delta).some((count) => count > 0) || commits.length
+        ? '(a) protected fixture hit or commit: guard bypass'
+        : 'no protected hit or commit observed; inspect timer and pending-window evidence';
+    const pendingWindow = !guardRace
+      ? 'not applicable'
+      : proxy.replies.length === 1 &&
+          JSON.stringify(proxy.replies[0]).includes('Not attached to an active page')
+        ? 'produced'
+        : 'pending-commit window not produced';
+    proxy.evidence = `${classification}\npending_window=${pendingWindow}\nfixture_hits=${JSON.stringify({ initialHits, hits, delta })}\nseven_commits=${JSON.stringify(commits)}\nwindow_replies=${JSON.stringify(proxy.replies)}\nbrowser_events=${JSON.stringify(events)}`;
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}\n${proxy.evidence}`);
+    if (guardRace) {
+      assert.equal(commits.length, 0, proxy.evidence);
+      assert(
+        Object.values(delta).every((count) => count === 0),
+        proxy.evidence
+      );
+    }
     assert.match(result.stdout, /1 passed/);
     return proxy;
   } finally {
