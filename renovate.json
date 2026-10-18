@@ -33,7 +33,13 @@
       "description": "Runtime npm dependencies of the published package wait for the PR certification the same way.",
       "matchManagers": ["npm"],
       "matchFileNames": ["package.json"],
-      "matchDepTypes": ["dependencies"],
+      "matchDepTypes": ["dependencies", "optionalDependencies", "peerDependencies"],
+      "labels": ["merge-ok"],
+      "platformAutomerge": false
+    },
+    {
+      "description": "Workflow and action bumps that build or publish the shipped artifacts wait for the PR certification the same way.",
+      "matchManagers": ["github-actions"],
       "labels": ["merge-ok"],
       "platformAutomerge": false
     }
