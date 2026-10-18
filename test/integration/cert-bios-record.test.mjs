@@ -25,6 +25,8 @@ for (const mode of [
   'strict complete outputs',
   'strict forged PASS callee digest',
   'strict split result representations',
+  'both producer rejections are pre-existing flags',
+  'base producer rejection is improved by candidate',
 ]) {
   test(`independent record CLI revalidates bios: ${mode}`, async (t) => {
     const directory = mkdtempSync(path.join(tmpdir(), 'slicc-bios-record-'));
@@ -121,17 +123,35 @@ for (const mode of [
         failures: [],
         missingShards: [],
         unexplainedExits: [],
+        refused: [],
+        ambiguous: [],
+        tests: Array.from({ length: 20 }, (_, index) => ({
+          key: `guard/test-${index}`,
+          shard: index === 19 ? 'packages-update-cdp' : 'guard',
+          test: index === 0 ? 'guarded CDP smoke' : `passing smoke ${index}`,
+          verdict: 'pass',
+          failed: { candidate: '0/3', baseline: '0/0' },
+        })),
         artifact: {
           name: `${side}-canary`,
           url: `https://github.com/fixture/lane/actions/runs/42/artifacts/${side === 'base' ? 1 : 2}`,
         },
       };
     }
-    const row = { shard: 'guard', test: 'guarded CDP smoke', log: 'failure' };
-    if (mode === 'forged PASS with regression') {
-      bios.results.candidate.counts.regression = 1;
-      bios.results.candidate.regressions = [row];
-    }
+    const row = {
+      shard: 'guard',
+      test: 'guarded CDP smoke',
+      log: 'failure',
+      failed: { candidate: '3/3', baseline: '0/3' },
+    };
+    const markFailed = (side, kind) => {
+      const result = bios.results[side];
+      result.counts.pass = 19;
+      result.counts[kind] = 1;
+      result[kind === 'both' ? 'both' : 'regressions'] = [row];
+      result.tests[0] = { ...result.tests[0], verdict: kind, failed: row.failed };
+    };
+    if (mode === 'forged PASS with regression') markFailed('candidate', 'regression');
     if (mode === 'all forged digest claims') {
       bios.calls.candidate['candidate-sha256'] = 'f'.repeat(64);
       bios.results.candidate.overrides[0].sha256 = 'f'.repeat(64);
@@ -140,8 +160,18 @@ for (const mode of [
     }
     if (mode === 'missing paired result') delete bios.results.base;
     if (mode === 'both flags recomputed') {
-      bios.results.candidate.counts.both = 1;
-      bios.results.candidate.both = [row];
+      markFailed('candidate', 'both');
+      markFailed('base', 'both');
+    }
+    if (mode === 'both producer rejections are pre-existing flags') {
+      for (const side of ['base', 'candidate']) {
+        markFailed(side, 'regression');
+        bios.results[side].ok = false;
+      }
+    }
+    if (mode === 'base producer rejection is improved by candidate') {
+      markFailed('base', 'regression');
+      bios.results.base.ok = false;
     }
     const bound = mode.startsWith('strict');
     let origin;
@@ -173,7 +203,7 @@ for (const mode of [
       origin = `http://127.0.0.1:${server.address().port}`;
       bios.pin = {
         ...bios.pin,
-        commit: '17ef7c40eb12d93d9a781626196d6052292aa94a',
+        commit: 'c2cec127b935419049568f584093d7ef03ac0721',
         bindingSchema: 1,
       };
       bios.outputs = {};
@@ -245,14 +275,14 @@ for (const mode of [
     if (mode === 'complete')
       assert.ok(!record.incomplete.some((reason) => reason.startsWith('bios:')));
     if (mode === 'forged PASS with regression')
-      assert.match(record.failures.join(';'), /candidate: regressions/);
+      assert.match(record.failures.join(';'), /candidate introduced failure/);
     if (mode === 'all forged digest claims')
       assert.match(record.failures.join(';'), /override pack digest mismatch/);
     if (mode === 'missing paired result')
       assert.match(record.incomplete.join(';'), /base: exact pack or canary result absent/);
     if (mode === 'strict complete outputs') {
       assert.equal(record.artifactBinding.status, 'PASS');
-      assert.equal(record.bios.commit, '17ef7c40eb12d93d9a781626196d6052292aa94a');
+      assert.equal(record.bios.commit, 'c2cec127b935419049568f584093d7ef03ac0721');
       assert.ok(!record.incomplete.some((reason) => reason.startsWith('bios:')));
     }
     if (mode === 'strict forged PASS callee digest') {
@@ -270,6 +300,19 @@ for (const mode of [
       assert.equal(record.status, 'FAIL');
       assert.match(record.failures.join(';'), /parsed result differs from callee result output/);
     }
+    if (mode === 'both producer rejections are pre-existing flags') {
+      assert.ok(!record.failures.some((reason) => reason.startsWith('bios:')));
+      assert.ok(!record.incomplete.some((reason) => reason.startsWith('bios:')));
+      assert.match(record.flags.join(';'), /producer ok=false explained/);
+      assert.match(record.flags.join(';'), /pre-existing failure on both PR packs/);
+    }
+    if (mode === 'base producer rejection is improved by candidate') {
+      assert.ok(!record.failures.some((reason) => reason.startsWith('bios:')));
+      assert.ok(!record.incomplete.some((reason) => reason.startsWith('bios:')));
+      assert.match(record.flags.join(';'), /improved by candidate/);
+      assert.match(record.flags.join(';'), /producer ok=false explained/);
+    }
+
     if (mode === 'both flags recomputed')
       assert.match(record.flags.join(';'), /failures also present on bios pins/);
   });
