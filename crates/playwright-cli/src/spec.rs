@@ -39,7 +39,7 @@ static SPECS: &[Spec] = &[
     spec("eval", &["func"], true, &[("tab", S), ("frame", S), ("output", S), ("filename", S)], true, RefMode::None),
     spec("screenshot", &["target"], false, &[("tab", S), ("filename", S), ("fullPage", B), ("full-page", B), ("max-width", S)], true, RefMode::Main),
     spec("tab-list", &[], false, &[], true, RefMode::None),
-    spec("tab-select", &["index"], false, &[], true, RefMode::None),
+    spec("tab-select", &["index"], false, &[("foreground", B), ("fg", B)], true, RefMode::None),
     spec("tab-close", &["index"], false, &[("tab", S)], true, RefMode::None),
     spec("list", &[], false, &[("json", B)], true, RefMode::None),
     spec("discover", &[], false, &[("tab", S), ("json", B), ("once", S), ("only", S), ("skip", S), ("no-probe", B), ("probe", S), ("follow", B), ("exec", S), ("exec-timeout", S), ("lick", B), ("off", B)], true, RefMode::None),
