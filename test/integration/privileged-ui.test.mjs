@@ -45,12 +45,37 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
     const ordinary = await raw.open(`${site.origin}/page`);
     const ui = await raw.open(`${site.origin}/page?ui`);
     const worker = await raw.open(`${site.origin}/page?worker`);
+    const extensionDocuments = [];
+    const extensionOrigins = new Map();
+    for (const origin of [
+      'chrome-extension://akjjllgokmbgpbdbmafpiefnhidlmbgf',
+      'chrome-extension://abcdefghijklmnopabcdefghijklmnop',
+    ]) {
+      const targetId = await raw.open('about:blank');
+      const { sessionId } = await raw.send('Target.attachToTarget', {
+        targetId,
+        flatten: true,
+      });
+      const tree = await raw.send('Page.getFrameTree', {}, sessionId);
+      assert.equal(tree.frameTree.frame.url, 'about:blank');
+      extensionOrigins.set(tree.frameTree.frame.id, origin);
+      extensionDocuments.push({ targetId, origin });
+      await raw.send('Target.detachFromTarget', { sessionId });
+    }
     const replacements = new Map([
       [ui, { type: 'browser_ui', url: `${site.origin}/page?ui`, title: 'Privileged UI' }],
       [worker, { type: 'service_worker', url: refusedUrls[4], title: 'Extension worker' }],
     ]);
     proxy = await cdpProxy(browser.wsUrl, {
-      transform: (message) => targetInfo(message, replacements),
+      transform: (message) => {
+        targetInfo(message, replacements);
+        if (message.method === 'Runtime.executionContextCreated') {
+          const context = message.params.context;
+          const origin = extensionOrigins.get(context.auxData?.frameId);
+          if (origin && context.auxData?.isDefault === true) context.origin = origin;
+        }
+        return message;
+      },
     });
     runner = nativeRunner(
       path.resolve('target/debug/playwright-cli'),
@@ -109,6 +134,22 @@ test('privileged UI protection through the public native CLIs', { timeout: 24000
     await t.test('extension service_worker is refused by target id', async () => {
       refused(await runner.playwright(['snapshot', '--tab', worker], cwd));
     });
+    for (const { targetId, origin } of extensionDocuments) {
+      await t.test(`an about:blank document with default origin ${origin} is refused`, async () => {
+        const info = await raw.send('Target.getTargetInfo', { targetId });
+        assert.equal(info.targetInfo.type, 'page');
+        assert.equal(info.targetInfo.url, 'about:blank');
+        assert.equal(info.targetInfo.openerId, undefined);
+        for (const args of [
+          ['snapshot', '--tab', targetId],
+          ['eval', '"EXTENSION-DOCUMENT-MARK"', '--tab', targetId],
+        ]) {
+          const result = await runner.playwright(args, cwd);
+          refused(result);
+          assert.doesNotMatch(result.stdout, /EXTENSION-DOCUMENT-MARK/);
+        }
+      });
+    }
     for (const url of refusedUrls) {
       await t.test(`goto refuses ${url}`, async () => {
         refused(await runner.playwright(['goto', url, '--tab', ordinary], cwd));
