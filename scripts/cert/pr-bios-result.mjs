@@ -1,8 +1,25 @@
+import { isDeepStrictEqual } from 'node:util';
+import {
+  artifactDigest,
+  artifactFindings,
+  artifactId,
+  artifactNames,
+} from './pr-artifact-binding.mjs';
+
 const packageName = '@ai-ecoverse/slicc-cdp';
 const kinds = ['pass', 'skip', 'fail', 'regression', 'both', 'flaky'];
 const lists = { fail: 'failures', regression: 'regressions', both: 'both', flaky: 'flaky' };
+const producerArtifact = (bindings, role) =>
+  (Array.isArray(bindings?.artifacts) ? bindings.artifacts : []).find((row) => row?.role === role);
 
-export function biosCalls(plan, pin, subjects) {
+export function selectBiosPin(pin, bound = false) {
+  if (!bound) return pin;
+  if (!/^[a-f0-9]{40}$/.test(pin.bindingCommit ?? ''))
+    throw new Error('reviewed binding producer pin required');
+  return { ...pin, commit: pin.bindingCommit, bindingSchema: 1 };
+}
+
+export function biosCalls(plan, pin, subjects, producerBindings) {
   return Object.fromEntries(
     ['base', 'candidate'].map((side) => [
       side,
@@ -17,6 +34,15 @@ export function biosCalls(plan, pin, subjects) {
         'candidate-run': plan.run,
         'candidate-sha256': subjects[side]?.sha256,
         'candidate-repo': plan.repository,
+        ...(pin.bindingSchema === 1
+          ? {
+              'candidate-binding': 'strict',
+              'candidate-artifact-id':
+                artifactId(producerArtifact(producerBindings, `pack-${side}`)?.id) ?? '',
+              'candidate-artifact-digest':
+                artifactDigest(producerArtifact(producerBindings, `pack-${side}`)?.digest) ?? '',
+            }
+          : {}),
         repeat: 3,
       },
     ])
@@ -112,17 +138,135 @@ function completion(side, result, pin, emit, flags) {
     flags.push(`bios base: ${counts.regression} regressions against bios pins`);
 }
 
-export function biosFindings(bios, pin, plan, subjects) {
+const supplied = (value) => value !== undefined && value !== null && value !== '';
+
+function manifestRows(output, side, emit) {
+  let rows = output?.artifacts;
+  if (typeof rows === 'string' && rows) {
+    try {
+      rows = JSON.parse(rows);
+    } catch {
+      emit('FAIL', `${side}: malformed producer manifest JSON`);
+    }
+  }
+  if (Array.isArray(rows)) return rows;
+  emit(supplied(rows) ? 'FAIL' : 'INCOMPLETE', `${side}: producer manifest unavailable`);
+  return [];
+}
+
+function uploadBinding(row, role, plan, producerBindings, ids, emit) {
+  const id = artifactId(row.id);
+  const digest = artifactDigest(row.digest);
+  for (const [field, normalize] of [
+    ['id', artifactId],
+    ['digest', artifactDigest],
+  ])
+    if (!normalize(row[field]))
+      emit(supplied(row[field]) ? 'FAIL' : 'INCOMPLETE', `${role}: upload ${field} unavailable`);
+  if (id && ids.has(id)) emit('FAIL', `${role}: duplicate upload id`);
+  if (id) ids.add(id);
+  if (String(row.attempt ?? '') !== String(plan.attempt))
+    emit(supplied(row.attempt) ? 'FAIL' : 'INCOMPLETE', `${role}: wrong or absent upload attempt`);
+  const bound = producerArtifact(producerBindings, role);
+  if (
+    bound &&
+    ((id && id !== artifactId(bound.id)) || (digest && digest !== artifactDigest(bound.digest)))
+  )
+    emit('FAIL', `${role}: callee output differs from trusted producer binding`);
+}
+
+function reportBinding(output, side, producerBindings, emit) {
+  const report = producerArtifact(producerBindings, `bios-${side}-report`);
+  for (const [field, normalize, expected] of [
+    ['artifact-id', artifactId, artifactId(report?.id)],
+    ['artifact-digest', artifactDigest, artifactDigest(report?.digest)],
+  ]) {
+    const value = output?.[field];
+    if (!supplied(value)) emit('INCOMPLETE', `${side}: direct report ${field} missing`);
+    else if (!normalize(value) || (expected && normalize(value) !== expected))
+      emit('FAIL', `${side}: direct report ${field} mismatch`);
+  }
+}
+
+function labelledUploads(plan, side, output, producerBindings, ids, emit) {
+  const wanted = Object.entries(artifactNames(plan)).filter(([role]) =>
+    role.startsWith(`bios-${side}-`)
+  );
+  const byName = new Map(wanted.map(([role, name]) => [name, role]));
+  const seen = new Set();
+  for (const row of manifestRows(output, side, emit)) {
+    const role = byName.get(row?.name);
+    const kind = role?.slice(`bios-${side}-`.length).split('-')[0];
+    if (!role || row.role !== kind || seen.has(role)) {
+      emit('FAIL', `${side}: unexpected, duplicate or renamed upload`);
+      continue;
+    }
+    seen.add(role);
+    uploadBinding(row, role, plan, producerBindings, ids, emit);
+  }
+  for (const [role] of wanted)
+    if (!seen.has(role)) emit('INCOMPLETE', `${role}: producer upload missing`);
+  reportBinding(output, side, producerBindings, emit);
+}
+
+export function biosBindingFindings(plan, outputs, producerBindings, inventory) {
+  const roles = Object.keys(artifactNames(plan)).filter((role) => role.startsWith('bios-'));
+  const checked = artifactFindings(plan, producerBindings, inventory, {
+    roles: ['pack-base', 'pack-candidate', ...roles],
+  });
+  const emit = (status, reason) =>
+    (status === 'FAIL' ? checked.failures : checked.incomplete).push(`bios uploads: ${reason}`);
+  const ids = new Set();
+  for (const side of ['base', 'candidate'])
+    labelledUploads(plan, side, outputs?.[side], producerBindings, ids, emit);
+  checked.failures = [...new Set(checked.failures)];
+  checked.incomplete = [...new Set(checked.incomplete)];
+  checked.status = checked.failures.length
+    ? 'FAIL'
+    : checked.incomplete.length
+      ? 'INCOMPLETE'
+      : 'PASS';
+  return checked;
+}
+
+function resultBinding(bios, side, emit) {
+  const value = bios?.outputs?.[side]?.result;
+  if (value === undefined || value === null || value === '') {
+    emit('INCOMPLETE', `${side}: callee result output absent`);
+    return;
+  }
+  try {
+    const result = typeof value === 'string' ? JSON.parse(value) : value;
+    if (!isDeepStrictEqual(result, bios?.results?.[side]))
+      emit('FAIL', `${side}: parsed result differs from callee result output`);
+  } catch {
+    emit('FAIL', `${side}: malformed callee result output`);
+  }
+}
+
+export function biosFindings(bios, pin, plan, subjects, context = {}) {
   const failures = [];
   const incomplete = [];
   const flags = [];
   const emit = (status, message) =>
     (status === 'FAIL' ? failures : incomplete).push(`bios: ${message}`);
+  const calls = biosCalls(plan, pin, subjects, context.bindings);
+  if (pin.bindingSchema === 1) {
+    const checked = biosBindingFindings(plan, bios?.outputs, context.bindings, context.inventory);
+    for (const reason of checked.failures) emit('FAIL', reason);
+    for (const reason of checked.incomplete) emit('INCOMPLETE', reason);
+    for (const side of ['base', 'candidate']) {
+      resultBinding(bios, side, emit);
+      const reportId = artifactId(bios?.outputs?.[side]?.['artifact-id']);
+      const url = bios?.results?.[side]?.artifact?.url;
+      if (reportId && typeof url === 'string' && url.slice(url.lastIndexOf('/') + 1) !== reportId)
+        emit('FAIL', `${side}: result URL differs from report upload output`);
+    }
+  }
   if (!/^[a-f0-9]{40}$/.test(pin.commit ?? '') || bios?.pin?.commit !== pin.commit) {
     emit('INCOMPLETE', 'pinned canary workflow_call evidence pending or another producer');
     return { failures, incomplete, flags };
   }
-  const calls = biosCalls(plan, pin, subjects);
   const artifacts = [];
   for (const side of ['base', 'candidate']) {
     const subject = subjects[side];

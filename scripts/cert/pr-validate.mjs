@@ -99,8 +99,8 @@ export function validateGuard(guard, plan, vectors, emit) {
   }
 }
 
-export function validateBios(bios, pin, emit, plan, subjects) {
-  const findings = biosFindings(bios, pin, plan, subjects);
+export function validateBios(bios, pin, emit, plan, subjects, context) {
+  const findings = biosFindings(bios, pin, plan, subjects, context);
   for (const reason of findings.failures) emit('FAIL', reason);
   for (const reason of findings.incomplete) emit('INCOMPLETE', reason);
   if (bios?.status === 'FAIL') emit('FAIL', 'bios: producer reported failure');
