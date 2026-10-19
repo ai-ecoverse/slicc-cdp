@@ -1257,15 +1257,109 @@ mod tests {
         )
     }
 
+    enum GuardWindow<T> {
+        Produced(T),
+        Miss,
+        Bypass,
+    }
+
+    fn produce_guard_window<T>(
+        mut attempt: impl FnMut(usize) -> (GuardWindow<T>, String),
+    ) -> Result<T, String> {
+        let mut evidence = Vec::new();
+        for number in 1..=3 {
+            let (window, detail) = attempt(number);
+            let detail = format!("attempt {number}: {detail}");
+            eprintln!("{detail}");
+            evidence.push(detail);
+            match window {
+                GuardWindow::Produced(value) => return Ok(value),
+                GuardWindow::Miss => {}
+                GuardWindow::Bypass => {
+                    return Err(format!(
+                        "(a) protected fixture hit or commit: guard bypass\n{}",
+                        evidence.join("\n")
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "pending-commit window not produced after 3 attempts\n{}",
+            evidence.join("\n")
+        ))
+    }
+
+    #[test]
+    fn guard_window_retries_only_precondition_misses() {
+        let mut attempts = Vec::new();
+        let result = produce_guard_window(|number| {
+            attempts.push(number);
+            (
+                if number == 3 {
+                    GuardWindow::Produced("ready")
+                } else {
+                    GuardWindow::Miss
+                },
+                format!("stub {number}"),
+            )
+        });
+        assert_eq!(result.unwrap(), "ready");
+        assert_eq!(attempts, [1, 2, 3]);
+    }
+
+    #[test]
+    fn guard_window_exhaustion_keeps_every_attempt() {
+        let mut attempts = Vec::new();
+        let result = produce_guard_window::<()>(|number| {
+            attempts.push(number);
+            (GuardWindow::Miss, format!("stub {number}"))
+        });
+        assert_eq!(attempts, [1, 2, 3]);
+        assert_eq!(
+            result.unwrap_err(),
+            "pending-commit window not produced after 3 attempts\nattempt 1: stub 1\nattempt 2: stub 2\nattempt 3: stub 3"
+        );
+    }
+
+    #[test]
+    fn guard_window_bypass_is_never_retried() {
+        let mut attempts = Vec::new();
+        let result = produce_guard_window::<()>(|number| {
+            attempts.push(number);
+            (GuardWindow::Bypass, "seven hit".to_string())
+        });
+        assert_eq!(attempts, [1]);
+        assert_eq!(
+            result.unwrap_err(),
+            "(a) protected fixture hit or commit: guard bypass\nattempt 1: seven hit"
+        );
+    }
+
     fn until_history(
         raw: &mut Raw,
         session: &str,
-        what: &str,
+        history_replies: &mut Vec<Result<Value, String>>,
+        seven: &str,
         done: impl Fn(Option<&str>) -> bool,
-    ) {
+    ) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let current = match raw.call("Page.getNavigationHistory", json!({}), Some(session)) {
+            let reply = raw.call("Page.getNavigationHistory", json!({}), Some(session));
+            if history_replies.last() != Some(&reply) {
+                history_replies.push(reply.clone());
+            }
+            if reply.as_ref().is_ok_and(|history| {
+                history["entries"].as_array().is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry["url"]
+                            .as_str()
+                            .is_some_and(|url| url.starts_with(seven))
+                    })
+                })
+            }) {
+                return false;
+            }
+            let current = match reply {
                 Ok(history) => {
                     let index = history["currentIndex"].as_u64().unwrap_or(0) as usize;
                     Ok(history["entries"][index]["url"]
@@ -1277,12 +1371,11 @@ mod tests {
                 Err(error) => panic!("Page.getNavigationHistory failed: {error}"),
             };
             if done(current.as_deref().ok()) {
-                return;
+                return true;
             }
-            assert!(
-                Instant::now() < deadline,
-                "{what} never happened: {current:?}"
-            );
+            if Instant::now() >= deadline {
+                return false;
+            }
         }
     }
 
@@ -1293,35 +1386,105 @@ mod tests {
         let app = live("SLICC_FETCH_LIVE_APP");
         let idp = live("SLICC_FETCH_LIVE_IDP");
         let seven = live("SLICC_FETCH_LIVE_SEVEN");
-        let mut raw = Raw::open(&ws);
-        let mut cdp = Cdp::connect(&ws).unwrap();
-        let tab = raw.create("about:blank");
-        let slow = raw.session(&tab);
-        raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
-        raw.call(
-            "Emulation.setCPUThrottlingRate",
-            json!({ "rate": 200 }),
-            Some(&slow),
-        )
-        .unwrap();
-        let landing = format!("{app}/landing?n=window");
-        let to: String = url::form_urlencoded::byte_serialize(landing.as_bytes()).collect();
-        raw.call(
-            "Page.navigate",
-            json!({ "url": format!("{idp}/js-redirect?to={to}") }),
-            Some(&slow),
-        )
-        .unwrap();
-        until_history(&mut raw, &slow, "the js-redirect committed", |current| {
-            current.is_some_and(|url| url.contains("/js-redirect"))
-        });
-        until_history(
-            &mut raw,
-            &slow,
-            "pending-commit window not produced: the landing went pending",
-            |current| current.is_none(),
-        );
-        let session = client::attach(&mut cdp, &tab).unwrap();
+        let evidence_url = live("SLICC_FETCH_LIVE_GUARD_EVIDENCE");
+        let mut window_reply_count = 0;
+        let (mut raw, mut cdp, tab, slow, landing, session) = produce_guard_window(|_| {
+            let mut raw = Raw::open(&ws);
+            let mut cdp = Cdp::connect(&ws).unwrap();
+            let tab = raw.create("about:blank");
+            let slow = raw.session(&tab);
+            raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
+            raw.call(
+                "Emulation.setCPUThrottlingRate",
+                json!({ "rate": 200 }),
+                Some(&slow),
+            )
+            .unwrap();
+            let landing = format!("{app}/landing?n=window");
+            let to: String = url::form_urlencoded::byte_serialize(landing.as_bytes()).collect();
+            let trigger = raw.call(
+                "Page.navigate",
+                json!({ "url": format!("{idp}/js-redirect?to={to}") }),
+                Some(&slow),
+            );
+            trigger.as_ref().unwrap();
+            let mut history_replies = Vec::new();
+            let committed = until_history(
+                &mut raw,
+                &slow,
+                &mut history_replies,
+                &seven,
+                |current| current.is_some_and(|url| url.contains("/js-redirect")),
+            );
+            let pending = committed
+                && until_history(
+                    &mut raw,
+                    &slow,
+                    &mut history_replies,
+                    &seven,
+                    |current| current.is_none(),
+                );
+            let session = pending.then(|| client::attach(&mut cdp, &tab).unwrap());
+            let proxy_evidence: Value = serde_json::from_slice(
+                &crate::net::http_probe(&evidence_url, "application/json")
+                    .unwrap_or_else(|error| panic!("guard evidence unavailable: {error}"))
+                    .body,
+            )
+            .unwrap();
+            let replies = proxy_evidence["window_replies"].as_array().unwrap();
+            let produced = pending
+                && replies.len() == window_reply_count + 1
+                && replies.last().is_some_and(|reply| {
+                    reply["error"]["message"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("Not attached to an active page"))
+                });
+            window_reply_count = replies.len();
+            let hits = [fixture_hits(&app, "/code"), fixture_hits(&app, "/dump")];
+            let seven_commits: Vec<_> = history_replies
+                .iter()
+                .filter_map(|reply| reply.as_ref().ok()?.get("entries")?.as_array())
+                .flatten()
+                .filter(|entry| {
+                    entry["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with(&seven))
+                })
+                .collect();
+            let bypass = hits
+                .iter()
+                .any(|hits| hits.parse::<u64>().is_ok_and(|count| count > 0))
+                || !seven_commits.is_empty()
+                || !proxy_evidence["seven_commits"].as_array().unwrap().is_empty();
+            let evidence = format!(
+                "pending_window_produced={produced}; pending_before_attach={pending}; js_redirect_committed={committed}; tab={tab}; trigger={trigger:?}; fixture_hits(/code,/dump)={hits:?}; seven_commits={seven_commits:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+                cdp.events(), cdp.paused_trail
+            );
+            if bypass || !produced {
+                raw.close(&tab);
+                assert!(
+                    hits.iter().all(|hits| hits.parse::<u64>().is_ok()),
+                    "fixture hits unavailable: {evidence}"
+                );
+                return (
+                    if bypass {
+                        GuardWindow::Bypass
+                    } else {
+                        GuardWindow::Miss
+                    },
+                    evidence,
+                );
+            }
+            assert!(
+                hits.iter().all(|hits| hits.parse::<u64>().is_ok()),
+                "fixture hits unavailable: {evidence}"
+            );
+            (
+                GuardWindow::Produced((raw, cdp, tab, slow, landing, session.unwrap())),
+                evidence,
+            )
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
         raw.call(
             "Emulation.setCPUThrottlingRate",
             json!({ "rate": 1 }),
