@@ -16,10 +16,23 @@ test('PR certification workflow reports despite skipped evidence ancestors', () 
     'opened',
     'synchronize',
     'reopened',
+    'ready_for_review',
+    'converted_to_draft',
     'labeled',
     'unlabeled',
-    'ready_for_review',
   ]);
+  assert.equal(
+    workflow.concurrency.group,
+    "${{ ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'cert-review-approved') && format('cert-pr-noop-{0}', github.run_id) || format('cert-pr-{0}', github.event.pull_request.number || github.event.merge_group.head_sha) }}"
+  );
+  assert.equal(
+    workflow.concurrency['cancel-in-progress'],
+    "${{ github.event_name == 'pull_request' }}"
+  );
+  assert.doesNotMatch(
+    readFileSync(new URL('../../.github/workflows/cert-review-pr.yml', import.meta.url), 'utf8'),
+    /merge-ok/
+  );
   assert.equal(workflow.on.pull_request_target, undefined);
   assert.deepEqual(workflow.on.merge_group.types, ['checks_requested']);
   assert.match(workflow.jobs.report.if, /always\(\)/);
