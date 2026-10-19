@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -18,6 +26,11 @@ const packageName = '@ai-ecoverse/slicc-cdp';
 const read = (file) => JSON.parse(readFileSync(file));
 const save = (file, value) => writeFileSync(file, JSON.stringify(value));
 const digest = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
+const inputDirectoryArgs = (f, script) =>
+  script === 'pr-bios-inputs.mjs' &&
+  /\bdirectory:\s*\{/.test(readFileSync(path.join(root, 'scripts/cert', script), 'utf8'))
+    ? ['--directory', path.join(f.directory, 'unpacked-inputs')]
+    : [];
 
 function fixture(t) {
   const directory = mkdtempSync(path.join(tmpdir(), 'slicc-bios-result-'));
@@ -125,6 +138,7 @@ function invoke(f, script = 'pr-bios.mjs', args = []) {
       path.join(f.directory, 'plan.json'),
       '--out',
       out,
+      ...inputDirectoryArgs(f, script),
       ...args,
     ],
     { encoding: 'utf8', env: { ...process.env, CERT_PR_PACKS: f.packs } }
@@ -478,6 +492,7 @@ async function boundInvoke(t, f, script = 'pr-bios.mjs') {
         path.join(f.directory, 'plan.json'),
         '--out',
         out,
+        ...inputDirectoryArgs(f, script),
         ...(supportsBindings ? ['--bindings', path.join(f.directory, 'bindings.json')] : []),
       ],
       {
@@ -504,6 +519,68 @@ async function boundInvoke(t, f, script = 'pr-bios.mjs') {
   assertVerdict(processResult.stdout, script.replace(/\.mjs$/, ''), document.status);
   return { ...processResult, document };
 }
+
+test('parallel bios input planners own their extraction directories and cleanup', async (t) => {
+  const fixtures = Array.from({ length: 4 }, () => boundFixture(t));
+  const results = await Promise.all(fixtures.map((f) => boundInvoke(t, f, 'pr-bios-inputs.mjs')));
+  for (const [index, result] of results.entries()) {
+    assert.equal(result.document.status, 'PASS', result.stderr);
+    for (const side of ['base', 'candidate']) {
+      const file = path.join(
+        fixtures[index].directory,
+        'unpacked-inputs',
+        side,
+        'package/package.json'
+      );
+      assert.ok(existsSync(file), 'input planner must use its case-owned extraction directory');
+      const manifest = read(file);
+      assert.equal(manifest.version, fixtures[index].results[side].overrides[0].version);
+      assert.equal(
+        result.document.calls[side]['candidate-sha256'],
+        fixtures[index].results[side].overrides[0].sha256
+      );
+    }
+  }
+  rmSync(path.join(fixtures[0].directory, 'unpacked-inputs'), { recursive: true });
+  for (const f of fixtures.slice(1))
+    assert.equal(
+      existsSync(path.join(f.directory, 'unpacked-inputs', 'candidate/package/package.json')),
+      true
+    );
+});
+
+for (const corrupt of [false, true])
+  test(`default bios input workspace is unique and cleaned on completion: corrupt=${corrupt}`, (t) => {
+    const f = fixture(t);
+    if (corrupt) writeFileSync(path.join(f.packs, 'candidate/package.tgz'), 'corrupt bytes');
+    const out = path.join(f.directory, 'default-inputs.json');
+    const run = spawnSync(
+      process.execPath,
+      [
+        path.join(root, 'scripts/cert/pr-bios-inputs.mjs'),
+        '--plan',
+        path.join(f.directory, 'plan.json'),
+        '--out',
+        out,
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          CERT_PR_PACKS: f.packs,
+          TMPDIR: f.directory,
+          TMP: f.directory,
+          TEMP: f.directory,
+        },
+      }
+    );
+    assert.equal(read(out).status, corrupt ? 'FAIL' : 'PASS', run.stderr);
+    assert.equal(run.status, corrupt ? 1 : 0, run.stderr);
+    assert.deepEqual(
+      readdirSync(f.directory).filter((entry) => entry.startsWith('slicc-bios-inputs-')),
+      []
+    );
+  });
 
 const bindingCases = [
   [
