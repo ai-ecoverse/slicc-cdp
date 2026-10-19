@@ -233,21 +233,21 @@ fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
     }
 }
 
-pub fn command_url_refusal<'a>(guard: &'a Protected, params: &Value) -> Option<&'a str> {
+pub fn command_url_refusal<'a>(guard: &'a Protected, params: &Value, filtered: bool) -> Option<&'a str> {
     let urls = params.get("url").and_then(Value::as_str).into_iter().chain(
         params.get("urls").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
     );
     for url in urls {
-        if guard.url(url) {
+        if guard.url(url) && (!filtered || guard.unparseable(url)) {
             return Some(guard.refusal_for_url(url));
         }
         let mapped = web_socket_as_http(url);
-        if guard.url(&mapped) {
+        if guard.url(&mapped) && (!filtered || guard.unparseable(&mapped)) {
             return Some(guard.refusal_for_url(&mapped));
         }
     }
     params.get("cookies").and_then(Value::as_array).into_iter().flatten()
-        .find_map(|cookie| command_url_refusal(guard, cookie))
+        .find_map(|cookie| command_url_refusal(guard, cookie, false))
 }
 
 pub fn loaded_urls_protected(guard: &Protected, value: &Value) -> bool {

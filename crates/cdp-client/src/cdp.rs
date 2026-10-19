@@ -266,7 +266,7 @@ impl Cdp {
         {
             return Err("slicc: refused: attach with flatten: true\n".into());
         }
-        if let Some(reason) = shield::command_url_refusal(&self.guard, params) {
+        if let Some(reason) = shield::command_url_refusal(&self.guard, params, shield::cookie_reader(method)) {
             if reason == self.guard.refusal() && shield::cookie_method(method) {
                 return Err(COOKIES.into());
             }
@@ -1879,7 +1879,6 @@ mod tests {
             for (method, params) in [
                 ("Target.createTarget", json!({"url":url})),
                 ("Page.navigate", json!({"url":url})),
-                ("Network.getCookies", json!({"urls":[url]})),
                 ("Network.setCookie", json!({"url":url,"name":"x","value":"y"})),
                 ("Network.deleteCookies", json!({"url":url,"name":"x"})),
                 ("Network.setCookies", json!({"cookies":[{"url":url,"name":"x","value":"y"}]})),
@@ -1914,6 +1913,12 @@ mod tests {
             assert!(url_backend(&url).call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_err(), "{url}");
             assert!(url_backend(&url).call("Page.navigateToHistoryEntry", json!({"entryId":1}), Some("S")).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn cookie_readers_keep_filtering_parseable_mixed_url_lists() {
+        assert!(url_backend("about:blank").call("Network.getCookies", json!({"urls":["https://seven.sliccy.ai/", "https://example.test/"]}), Some("S")).is_ok());
+        assert_eq!(url_backend("about:blank").call("Network.getCookies", json!({"urls":["http://exa%20mple.sliccy.ai/", "https://example.test/"]}), Some("S")).unwrap_err(), UNPARSEABLE);
     }
 
     #[test]
