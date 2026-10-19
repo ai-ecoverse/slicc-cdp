@@ -5,7 +5,9 @@ import {
   artifactId,
   artifactNames,
 } from './pr-artifact-binding.mjs';
+import { biosAdvisoryLedger } from './pr-bios-ledger.mjs';
 import { pairedBiosFindings } from './pr-bios-pair.mjs';
+import { biosExecutionRowFindings } from './pr-bios-rows.mjs';
 
 const packageName = '@ai-ecoverse/slicc-cdp';
 const kinds = ['pass', 'skip', 'fail', 'regression', 'both', 'flaky'];
@@ -114,7 +116,7 @@ function rowLists(side, result, pin, emit) {
   }
 }
 
-function completion(side, result, pin, emit, flags) {
+function completion(side, result, pin, emit, flags, paired) {
   if (
     typeof result.ok !== 'boolean' ||
     !Array.isArray(result.missingShards) ||
@@ -131,7 +133,16 @@ function completion(side, result, pin, emit, flags) {
   rowLists(side, result, pin, emit);
   if (!kinds.some((kind) => counts[kind]) || counts.skip)
     emit('INCOMPLETE', `${side}: unexecuted or skipped smoke`);
-  if (counts.flaky) emit('INCOMPLETE', `${side}: flaky smoke`);
+  if (
+    counts.flaky &&
+    !(
+      side === 'base' &&
+      paired.advisories.length === counts.flaky &&
+      !paired.failures.length &&
+      !paired.incomplete.length
+    )
+  )
+    emit('INCOMPLETE', `${side}: flaky smoke`);
 
   if (counts.both) flags.push(`bios ${side}: ${counts.both} failures also present on bios pins`);
   if (side === 'base' && counts.regression)
@@ -268,6 +279,17 @@ export function biosFindings(bios, pin, plan, subjects, context = {}) {
     return { failures, incomplete, flags };
   }
   const artifacts = [];
+  const paired = pairedBiosFindings(bios?.results, pin, bios?.reports, bios?.rows);
+  const actual = biosExecutionRowFindings(
+    plan,
+    pin,
+    bios?.rows,
+    subjects,
+    context.inventory,
+    context.rows
+  );
+  failures.push(...actual.failures);
+  incomplete.push(...actual.incomplete);
   for (const side of ['base', 'candidate']) {
     const subject = subjects[side];
     const result = bios?.results?.[side];
@@ -282,13 +304,19 @@ export function biosFindings(bios, pin, plan, subjects, context = {}) {
       continue;
     }
     bindings(side, bios, pin, plan, subject, calls[side], emit, artifacts);
-    completion(side, result, pin, emit, flags);
+    completion(side, result, pin, emit, flags, paired);
   }
   if (artifacts.length === 2 && artifacts[0] === artifacts[1])
     emit('INCOMPLETE', 'base and candidate result artifacts are not distinct');
-  const paired = pairedBiosFindings(bios?.results, pin, bios?.reports);
   failures.push(...paired.failures);
   incomplete.push(...paired.incomplete);
   flags.push(...paired.flags);
-  return { failures, incomplete, flags };
+  let biosLedger = [];
+  const advisories = failures.length || incomplete.length ? [] : paired.advisories;
+  try {
+    biosLedger = biosAdvisoryLedger(plan, pin, advisories, bios?.rows);
+  } catch (error) {
+    emit('INCOMPLETE', error.message);
+  }
+  return { failures, incomplete, flags, advisories, biosLedger };
 }

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "repository": "ai-ecoverse/slicc-cdp",
+  "run": "39212646049",
+  "attempt": "1",
+  "pr": 373,
+  "head": "473779287fdf337bdd98fd2bb974452a83ed15ce",
+  "audit": "4f3654a939efb90d87df2b09d7ae9e8052a3a4f5",
+  "biosPin": "4025d6aabc2c06add216183064d81914a171cd64",
+  "shard": "guard",
+  "key": "test/integration/guard-vectors.test.mjs › E2–E5, prompt detach › E2.vault control",
+  "base": { "outcomes": ["pass", "fail", "pass"], "rate": "1/3" },
+  "candidate": { "outcomes": ["pass", "pass", "pass"], "rate": "0/3" },
+  "originalStatus": "INCOMPLETE",
+  "originalCertified": false,
+  "producerRecordArtifact": "12178017658",
+  "independentRecordArtifact": "12177307060",
+  "artifacts": {
+    "base": {
+      "id": "12177831767",
+      "name": "base-canary-shard-canary-guard",
+      "digest": "eb9254f506f481f7128585827cc6a3180d177ed76588764f301df9160e6a42a1",
+      "documentSha256": "fe4668394297bd2e8b185b2774c0047a9cef30e78fa8f61c96dd150d963c2c0b"
+    },
+    "candidate": {
+      "id": "12173000343",
+      "name": "candidate-canary-shard-canary-guard",
+      "digest": "f86d3c99dff5821c9fbff5198d63ecf7139e1fcd518053c8b709e8346baa7aac",
+      "documentSha256": "fc9e6dd2c15a0bec690a27676c2dd05d8a8380f50d34fb14f4df4c0945afec87"
+    }
+  },
+  "receipt": "https://github.com/ai-ecoverse/slicc-cdp/pull/373#issuecomment-6264926895",
+  "use": "Historical reporting case only; never a certificate input or retroactive approval."
+}

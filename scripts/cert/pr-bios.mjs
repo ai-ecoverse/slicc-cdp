@@ -4,6 +4,7 @@ import { cliVerdict } from './cli-verdict.mjs';
 import { args, identity, json, root, save } from './common.mjs';
 import { artifactFindings, artifactInventory, artifactNames } from './pr-artifact-binding.mjs';
 import { biosCalls, biosFindings, selectBiosPin } from './pr-bios-result.mjs';
+import { biosExecutionRows } from './pr-bios-rows.mjs';
 import { client } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
@@ -12,6 +13,7 @@ const options = args({
   base: { type: 'string' },
   candidate: { type: 'string' },
   bindings: { type: 'string' },
+  rows: { type: 'boolean', default: false },
   'base-report': { type: 'string' },
   'candidate-report': { type: 'string' },
 });
@@ -70,6 +72,12 @@ try {
       result.reports ??= {};
       result.reports[side] = json(options[`${side}-report`]);
     }
+  }
+  if (options.rows) {
+    const { api } = client(plan.repository);
+    result.rows = await biosExecutionRows(plan, pin, api);
+    context.rows = result.rows;
+    context.inventory ??= await artifactInventory(api, plan.run);
   }
   Object.assign(result, biosFindings(result, pin, plan, subjects, context));
   result.status = result.failures.length
