@@ -252,7 +252,7 @@ function baseAdvisories(base, candidate, actual, emit, flags, advisories, adviso
     const after = candidate.get(key);
     const runs = actual.candidate.get(key);
     if (
-      after.verdict !== 'pass' ||
+      after?.verdict !== 'pass' ||
       !Array.isArray(runs) ||
       runs.length !== 3 ||
       runs.some((value) => value !== 'pass')

@@ -166,6 +166,20 @@ for (const mode of [
     assert.deepEqual(value.advisories, []);
   });
 
+test('missing candidate E2 key emits INCOMPLETE rather than throwing or recording an advisory', () => {
+  const f = actualFixture();
+  f.candidate.tests.shift();
+  f.candidate.counts.pass--;
+  f.executions.candidate.guard.document.results.shift();
+  let value;
+  assert.doesNotThrow(() => {
+    value = library.pairedBiosFindings(f, pin, {}, f.executions);
+  });
+  assert.equal(status(value), 'INCOMPLETE');
+  assert.match(value.incomplete.join(';'), /base\/candidate test row sets differ/);
+  assert.deepEqual(value.advisories, []);
+});
+
 test('integrity FAIL retains precedence over a potential baseline advisory', () => {
   const f = actualFixture();
   const reports = { base: report(f.base), candidate: report(f.candidate) };
