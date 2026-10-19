@@ -532,6 +532,10 @@ impl Cdp {
             Duration::from_secs(30),
         ) {
             Ok(info) => info.get("targetInfo").cloned().unwrap_or(Value::Null),
+            Err(message) if message.starts_with("Target.getTargetInfo: slicc: refused:") => {
+                self.protected_targets.insert(target_id.to_string());
+                return Ok(true);
+            }
             Err(_) if frame => return Ok(false),
             Err(message) => return Err(message),
         };
