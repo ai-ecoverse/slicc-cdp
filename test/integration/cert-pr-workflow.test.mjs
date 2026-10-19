@@ -64,6 +64,21 @@ test('PR certification workflow reports despite skipped evidence ancestors', () 
   assert.match(group.run, /scripts\/cert\/pr-report\.mjs/);
 });
 
+test('independent BIOS re-download receives only a step-scoped Actions read token', () => {
+  const record = loadWorkflow().jobs.record;
+  assert.deepEqual(record.permissions, { contents: 'read', actions: 'read' });
+  assert.equal(record.env?.GH_TOKEN, undefined);
+  const authenticated = record.steps.filter((step) => step.env?.GH_TOKEN !== undefined);
+  assert.equal(authenticated.length, 1);
+  assert.equal(
+    authenticated[0].name,
+    'Code-only decision with explicit failed/skipped upstream statuses'
+  );
+  assert.equal(authenticated[0].env.GH_TOKEN, '${{ github.token }}');
+  assert.ok(authenticated[0].run.includes('scripts/cert/pr-record.mjs'));
+  assert.ok(record.steps.some((step) => step.with?.['persist-credentials'] === false));
+});
+
 test('PR certification controls come from main and candidate jobs stay hosted read-only', () => {
   const workflow = loadWorkflow();
   assert.equal(workflow.env.SLICC_CDP_PORTS, '9300-9309');

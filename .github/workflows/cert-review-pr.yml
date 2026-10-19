@@ -992,6 +992,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: "read"
+      actions: "read"
     steps:
       -
         name: "Main-owned control checkout"
@@ -1045,6 +1046,7 @@ jobs:
       -
         name: "Code-only decision with explicit failed/skipped upstream statuses"
         env:
+          GH_TOKEN: "${{ github.token }}"
           CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
           CERT_PR_ASSETS: "${{ github.workspace }}/.cert/pr-assets"
           CERT_NEEDS: "${{ toJSON(needs) }}"
