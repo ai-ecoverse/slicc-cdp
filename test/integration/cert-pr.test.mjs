@@ -421,6 +421,32 @@ for (const scenario of ['absent', 'malformed', 'wrong identity'])
     assert.ok(!api.calls.some((call) => call.body?.state === 'success'));
   });
 
+test('PR cert reporter: an unrelated label run posts nothing and its job is green only when the head is certified', async (t) => {
+  const f = fixture(t);
+  let state;
+  const api = await server(t, f, {
+    route(req, pathname, res) {
+      if (pathname !== `commits/${f.head}/statuses`) return false;
+      res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+      res.end(JSON.stringify(state ? [{ context: 'cert-review-pr', state }] : []));
+      return true;
+    },
+  });
+  const { file, out } = await planned(f, api, { action: 'labeled', label: { name: 'bug' } });
+  for (const [current, exit] of [
+    ['success', 0],
+    ['pending', 1],
+    ['failure', 1],
+    [undefined, 1],
+  ]) {
+    state = current;
+    const r = await cli('pr-report.mjs', ['--event', file, '--plan', out], f, api);
+    assert.equal(r.exit, exit, `${current}: ${r.stderr}`);
+    assert.equal(stdoutDocument(r.stdout).status, exit ? 'INCOMPLETE' : 'NOOP');
+  }
+  assert.equal(api.calls.filter((call) => call.method === 'POST').length, 0);
+});
+
 test('PR cert reporter never posts on a stale head and a PR converted to draft mid-run is not proof', async (t) => {
   const f = fixture(t);
   const api = await server(t, f);
@@ -436,6 +462,15 @@ test('PR cert reporter never posts on a stale head and a PR converted to draft m
   assert.equal(stdoutDocument(stale.stdout).status, 'NOOP');
   assert.equal(api.calls.filter((call) => call.method === 'POST').length, 0);
   f.pull.head.sha = f.head;
+  const ready = await cli(
+    'pr-report.mjs',
+    ['--event', file, '--plan', out, '--record', record],
+    f,
+    api
+  );
+  assert.equal(ready.exit, 0, ready.stderr);
+  assert.equal(stdoutDocument(ready.stdout).status, 'PASS');
+  api.calls.length = 0;
   f.pull.draft = true;
   const removed = await cli(
     'pr-report.mjs',
@@ -445,6 +480,7 @@ test('PR cert reporter never posts on a stale head and a PR converted to draft m
   );
   assert.equal(removed.exit, 1);
   assert.equal(stdoutDocument(removed.stdout).status, 'INCOMPLETE');
+  assert.deepEqual(stdoutDocument(removed.stdout).incomplete, ['converted to draft: not proof']);
   assert.ok(!api.calls.some((call) => call.body?.state === 'success'));
   assert.equal(
     api.calls.find((call) => call.pathname === `statuses/${f.head}`).body.state,
