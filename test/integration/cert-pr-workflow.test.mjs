@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import yaml from 'js-yaml';
+import { subjectIdentity } from '../../scripts/cert/execution-identity.mjs';
 
 function loadWorkflow() {
   const file = new URL('../../.github/workflows/cert-review-pr.yml', import.meta.url);
@@ -77,6 +81,76 @@ test('independent BIOS re-download receives only a step-scoped Actions read toke
   assert.equal(authenticated[0].env.GH_TOKEN, '${{ github.token }}');
   assert.ok(authenticated[0].run.includes('scripts/cert/pr-record.mjs'));
   assert.ok(record.steps.some((step) => step.with?.['persist-credentials'] === false));
+});
+
+test('record fetches exact source objects without credentials or candidate checkout before reconstruction', (t) => {
+  const workflow = loadWorkflow();
+  const record = workflow.jobs.record;
+  const fetch = record.steps.find((step) => step.name === 'Fetch planned source objects');
+  assert.ok(fetch);
+  assert.equal(fetch.run, workflow.jobs.guard.steps.find((step) => step.name === fetch.name).run);
+  assert.equal(fetch.env, undefined);
+  assert.equal(record.env, undefined);
+  assert.deepEqual(record.permissions, { contents: 'read', actions: 'read' });
+  const checkout = record.steps.find((step) => step.uses?.startsWith('actions/checkout@'));
+  assert.equal(checkout.with['persist-credentials'], false);
+  assert.equal(checkout.with['fetch-depth'], 0);
+  const plan = record.steps.findIndex((step) => step.with?.name?.startsWith('cert-pr-plan-'));
+  const decision = record.steps.findIndex((step) =>
+    step.run?.includes('scripts/cert/pr-record.mjs')
+  );
+  assert.ok(plan < record.steps.indexOf(fetch) && record.steps.indexOf(fetch) < decision);
+  const directory = mkdtempSync(path.join(tmpdir(), 'slicc-record-fetch-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const root = path.resolve(import.meta.dirname, '../..');
+  const remote = path.join(directory, 'remote.git');
+  const local = path.join(directory, 'record');
+  const env = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => !/TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|SSH_AUTH_SOCK|^GIT_/.test(key)
+      )
+    ),
+    GIT_AUTHOR_NAME: 'Fixture',
+    GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'Fixture',
+    GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+  };
+  const git = (cwd, args, input) =>
+    execFileSync('git', args, {
+      cwd,
+      env,
+      input,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  const base = git(root, ['rev-parse', 'HEAD']);
+  const previous = git(root, ['rev-parse', 'HEAD~1']);
+  git(root, ['clone', '--bare', '--no-local', root, remote]);
+  git(remote, ['update-ref', 'refs/heads/source', base]);
+  git(remote, ['symbolic-ref', 'HEAD', 'refs/heads/source']);
+  git(remote, ['config', 'uploadpack.allowAnySHA1InWant', 'true']);
+  const merge = git(
+    remote,
+    ['commit-tree', `${base}^{tree}`, '-p', base, '-p', previous],
+    'isolated unadvertised merge fixture\n'
+  );
+  git(directory, ['clone', '--no-local', '--single-branch', '--branch', 'source', remote, local]);
+  assert.notEqual(
+    spawnSync('git', ['cat-file', '-e', `${merge}^{commit}`], { cwd: local, env }).status,
+    0
+  );
+  const evidence = path.join(local, 'evidence');
+  execFileSync('mkdir', ['-p', evidence]);
+  writeFileSync(
+    path.join(evidence, 'plan.json'),
+    JSON.stringify({ commit: merge, baseline: { commit: base } })
+  );
+  const result = spawnSync('bash', ['-c', fetch.run], { cwd: local, env, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(subjectIdentity(merge, local).commit, merge);
+  assert.equal(git(local, ['rev-parse', 'HEAD']), base);
+  assert.equal(record.steps.filter((step) => step.env?.GH_TOKEN !== undefined).length, 1);
 });
 
 test('PR certification controls come from main and candidate jobs stay hosted read-only', () => {

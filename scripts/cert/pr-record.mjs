@@ -5,6 +5,7 @@ import { args, digest, identity, json, root, run, save } from './common.mjs';
 import {
   expectedExecutionIdentity,
   sourceIdentity,
+  subjectIdentity,
   validateExecutionIdentity,
 } from './execution-identity.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
@@ -100,7 +101,8 @@ const executionIdentities = {};
 try {
   const toolsSource = sourceIdentity(plan.tools);
   const candidateSource = sourceIdentity(plan.commit);
-  const baseSource = sourceIdentity(plan.baseline.commit);
+  const candidateSubject = subjectIdentity(plan.commit);
+  const baseSource = subjectIdentity(plan.baseline.commit);
   const proofFiles = [
     ...new Set(
       plan.proofs.tests
@@ -112,7 +114,7 @@ try {
     [
       'guard positive',
       documents.guard?.executions?.positive,
-      candidateSource,
+      candidateSubject,
       toolsSource,
       'guard',
       candidate,
@@ -130,7 +132,7 @@ try {
     [
       'integration positive',
       documents.integration?.executions?.positive,
-      candidateSource,
+      candidateSubject,
       candidateSource,
       'integration',
       candidate,
@@ -141,7 +143,7 @@ try {
           [
             'integration proofs',
             documents.integration?.executions?.proofs,
-            candidateSource,
+            candidateSubject,
             candidateSource,
             'proof-integration',
             candidate,

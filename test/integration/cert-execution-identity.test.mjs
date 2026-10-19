@@ -11,6 +11,7 @@ import {
   observeIdentity,
   sourceIdentity,
   stagedIdentity,
+  subjectIdentity,
   validateExecutionIdentity,
 } from '../../scripts/cert/execution-identity.mjs';
 
@@ -19,12 +20,17 @@ const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding:
 const source = sourceIdentity(commit);
 const corpus = { ...installedCorpus(root), integrity: source.corpus.integrity };
 
-function fixture(t) {
+function fixture(t, subjectCommit = commit) {
   const directory = mkdtempSync(path.join(tmpdir(), 'slicc-execution-identity-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const archive = path.join(directory, 'source.tar');
-  execFileSync('git', ['archive', '-o', archive, commit], { cwd: root });
+  execFileSync('git', ['archive', '-o', archive, subjectCommit], { cwd: root });
   execFileSync('tar', ['-xf', archive, '-C', directory]);
+  if (subjectCommit !== commit) {
+    const harnessArchive = path.join(directory, 'harness.tar');
+    execFileSync('git', ['archive', '-o', harnessArchive, commit, 'test'], { cwd: root });
+    execFileSync('tar', ['-xf', harnessArchive, '-C', directory]);
+  }
   const installed = path.join(directory, 'node_modules/@ai-ecoverse/slicc-browsers');
   mkdirSync(installed, { recursive: true });
   for (const file of ['package.json', 'guard-vectors.json', 'guard-driver.mjs', 'guard-runner.mjs'])
@@ -32,7 +38,7 @@ function fixture(t) {
       path.join(root, 'node_modules/@ai-ecoverse/slicc-browsers', file),
       path.join(installed, file)
     );
-  const seed = stagedIdentity(directory, source, source, 'a'.repeat(64));
+  const seed = stagedIdentity(directory, subjectIdentity(subjectCommit), source, 'a'.repeat(64));
   return { directory, installed, seed };
 }
 
@@ -43,6 +49,44 @@ function findings(execution, expected) {
   );
   return result;
 }
+
+test('historical subject needs Cargo only while the selected current harness still requires its corpus lock', (t) => {
+  const configured = JSON.parse(readFileSync(path.join(root, 'scripts/cert/base.json'), 'utf8'));
+  const historical = execFileSync('git', ['rev-parse', `${configured.commit}^{commit}`], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim();
+  const manifest = JSON.parse(
+    execFileSync('git', ['show', `${historical}:package.json`], { cwd: root })
+  );
+  assert.equal(manifest.devDependencies?.['@ai-ecoverse/slicc-browsers'], undefined);
+  const subject = subjectIdentity(historical);
+  assert.deepEqual(Object.keys(subject), ['commit', 'cargo']);
+  assert.equal(subject.cargo.length, 4);
+  assert.throws(
+    () => sourceIdentity(historical),
+    /execution corpus exact locked package unavailable/
+  );
+  const f = fixture(t, historical);
+  const bridge = 'crates/cdp-client/examples/guard_bridge.rs';
+  mkdirSync(path.dirname(path.join(f.directory, bridge)), { recursive: true });
+  cpSync(path.join(root, bridge), path.join(f.directory, bridge));
+  const observed = observeIdentity(f.directory, f.seed, 'guard', commit);
+  const expected = expectedExecutionIdentity(
+    subject,
+    source,
+    source,
+    'guard',
+    'a'.repeat(64),
+    [],
+    corpus
+  );
+  assert.deepEqual(observed, expected);
+  assert.equal(observed.subject.commit, historical);
+  assert.equal(observed.harness.commit, commit);
+  assert.equal(observed.corpus.version, source.corpus.version);
+  assert.notEqual(observed.subject.commit, observed.harness.commit);
+});
 
 test('validated staging identifies actual Cargo versions separately from synthetic npm pack versions', (t) => {
   const f = fixture(t);

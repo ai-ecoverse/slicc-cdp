@@ -20,6 +20,7 @@ const version = /^\d+\.\d+\.\d+$/;
 const crates = ['cdp-client', 'discovery', 'playwright-cli', 'curlwright'];
 const cache = new Map();
 const sources = new Map();
+const subjects = new Map();
 
 export function corpusIdentity(directory) {
   const bytes = readFileSync(path.join(directory, 'guard-vectors.json'));
@@ -68,6 +69,26 @@ function cargo(bytes, file) {
   return { file, version: values[0][1], sha256: hash(bytes) };
 }
 
+export function subjectIdentity(commit, directory = root) {
+  if (!sha.test(commit ?? '')) throw new Error('execution subject commit unavailable');
+  const key = `${directory}/${commit}`;
+  if (subjects.has(key)) return subjects.get(key);
+  const subject = {
+    commit,
+    cargo: crates.map((crate) => {
+      const file = `crates/${crate}/Cargo.toml`;
+      const bytes = execFileSync('git', ['show', `${commit}:${file}`], {
+        cwd: directory,
+        timeout: 120000,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      return cargo(bytes, file);
+    }),
+  };
+  subjects.set(key, subject);
+  return subject;
+}
+
 export function sourceIdentity(commit, directory = root) {
   if (!sha.test(commit ?? '')) throw new Error('execution source commit unavailable');
   const key = `${directory}/${commit}`;
@@ -98,11 +119,7 @@ export function sourceIdentity(commit, directory = root) {
   )
     throw new Error('execution corpus exact locked package unavailable');
   const source = {
-    commit,
-    cargo: crates.map((crate) => {
-      const file = `crates/${crate}/Cargo.toml`;
-      return cargo(read(file), file);
-    }),
+    ...subjectIdentity(commit, directory),
     harness: files.map((file) => ({ file, sha256: hash(read(file)) })),
     corpus: { version: pin, integrity: entry.integrity },
   };
