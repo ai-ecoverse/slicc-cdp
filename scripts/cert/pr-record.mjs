@@ -2,6 +2,11 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
+import {
+  expectedExecutionIdentity,
+  sourceIdentity,
+  validateExecutionIdentity,
+} from './execution-identity.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { selectBiosPin } from './pr-bios-result.mjs';
 import { biosExecutionRows } from './pr-bios-rows.mjs';
@@ -90,6 +95,91 @@ for (const [leg, subject, checked] of [
     integrationSubject.sha256 !== checked?.sha256
   )
     emit('INCOMPLETE', `integration ${leg}: pack/source identity missing`);
+}
+const executionIdentities = {};
+try {
+  const toolsSource = sourceIdentity(plan.tools);
+  const candidateSource = sourceIdentity(plan.commit);
+  const baseSource = sourceIdentity(plan.baseline.commit);
+  const proofFiles = [
+    ...new Set(
+      plan.proofs.tests
+        .filter((test) => test.source === 'integration' && !test.missing)
+        .map((test) => test.file)
+    ),
+  ];
+  for (const [label, execution, subject, harness, scope, checked, files] of [
+    [
+      'guard positive',
+      documents.guard?.executions?.positive,
+      candidateSource,
+      toolsSource,
+      'guard',
+      candidate,
+      [],
+    ],
+    [
+      'guard negative',
+      documents.guard?.executions?.negative,
+      baseSource,
+      toolsSource,
+      'guard',
+      baseline,
+      [],
+    ],
+    [
+      'integration positive',
+      documents.integration?.executions?.positive,
+      candidateSource,
+      candidateSource,
+      'integration',
+      candidate,
+      [],
+    ],
+    ...(proofFiles.length
+      ? [
+          [
+            'integration proofs',
+            documents.integration?.executions?.proofs,
+            candidateSource,
+            candidateSource,
+            'proof-integration',
+            candidate,
+            proofFiles,
+          ],
+        ]
+      : []),
+    ...(proofFiles.length || plan.changedTests?.length
+      ? [
+          [
+            'integration negative',
+            documents.integration?.executions?.negative,
+            baseSource,
+            candidateSource,
+            'proof-integration',
+            baseline,
+            proofFiles,
+          ],
+        ]
+      : []),
+  ]) {
+    if (!checked?.sha256) {
+      emit('INCOMPLETE', `${label}: independently checked pack unavailable`);
+      continue;
+    }
+    const expected = expectedExecutionIdentity(
+      subject,
+      harness,
+      toolsSource,
+      scope,
+      checked.sha256,
+      files
+    );
+    validateExecutionIdentity(execution, expected, label, emit);
+    executionIdentities[label] = { expected, observed: execution?.identity ?? null };
+  }
+} catch (error) {
+  emit(error.certStatus ?? 'INCOMPLETE', `execution identities: ${error.message}`);
 }
 const rebuild = documents.rebuild;
 if (
@@ -285,6 +375,7 @@ const record = {
   fullReviewTriggered: true,
   bios: biosPin,
   biosLedger,
+  executionIdentities,
   required,
   self: plan.self,
   upstream,

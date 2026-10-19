@@ -2,9 +2,17 @@ import { chmodSync, copyFileSync, cpSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { cleanEnv, json, repo, root, run, save, tree, unpackPackage } from './common.mjs';
+import { sourceIdentity, stagedIdentity } from './execution-identity.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
-export async function stage(plan, version, commit, label, testsFrom) {
+export async function stage(
+  plan,
+  version,
+  commit,
+  label,
+  testsFrom,
+  harnessCommit = testsFrom ? plan.harness : commit
+) {
   const dir = path.join(root, '.cert', label);
   const source = tree(commit, path.join(dir, 'tree'));
   if (testsFrom)
@@ -44,6 +52,16 @@ export async function stage(plan, version, commit, label, testsFrom) {
     env,
     timeout: 300000,
   });
+  const executionIdentity = stagedIdentity(
+    source,
+    sourceIdentity(commit),
+    sourceIdentity(harnessCommit),
+    packed.sha256
+  );
+  env.CERT_EXECUTION_IDENTITY = JSON.stringify(executionIdentity);
+  env.CERT_EXECUTION_TOOLS = plan.tools ?? plan.harness;
+  env.CERT_EXECUTION_SCOPE = 'integration';
+  env.SLICC_GUARD_SHA = commit;
   const chrome = run(
     process.execPath,
     [path.join(root, 'src/cli.js'), 'install-browser', '--version', plan.chrome],

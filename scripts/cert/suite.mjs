@@ -2,6 +2,7 @@ import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { save } from './common.mjs';
+import { observeIdentity } from './execution-identity.mjs';
 import { boundedBudget, suitePolicy } from './suite-policy.mjs';
 import { executeWorker, guardFile } from './suite-worker.mjs';
 
@@ -19,6 +20,30 @@ export async function suite({
   workerTimeoutMs = boundedBudget(workerTimeoutMs, suitePolicy.workerTimeoutMs, 'worker timeout');
   budgetMs = boundedBudget(budgetMs, suitePolicy.suiteBudgetMs, 'suite budget');
   const started = performance.now();
+  let executionIdentity;
+  if (env.CERT_EXECUTION_IDENTITY) {
+    try {
+      executionIdentity = observeIdentity(
+        cwd,
+        JSON.parse(env.CERT_EXECUTION_IDENTITY),
+        env.CERT_EXECUTION_SCOPE,
+        env.CERT_EXECUTION_TOOLS,
+        JSON.parse(env.CERT_EXECUTION_PROOFS ?? '[]')
+      );
+      env = { ...env, SLICC_GUARD_SHA: executionIdentity.subject.commit };
+    } catch (error) {
+      const result = {
+        status: error.certStatus ?? 'INCOMPLETE',
+        reason: error.message,
+        files,
+        rows: [],
+        attempts: [],
+        missing: files,
+      };
+      save(`${out}.json`, result);
+      return result;
+    }
+  }
   deadline = Math.min(deadline ?? Infinity, started + budgetMs);
   if (!Number.isFinite(deadline)) throw new Error('suite deadline must be finite');
   const policy = { ...suitePolicy, workerTimeoutMs, budgetMs, isolatedGuardWorker: true };
@@ -120,6 +145,7 @@ export async function suite({
     retryNotRunReason:
       retry && repeated.length && !retryBudgetAvailable ? 'suite budget exhausted' : null,
     guardReport: workers.find((worker) => worker.file === guardFile)?.guardReport ?? null,
+    ...(executionIdentity ? { identity: executionIdentity } : {}),
   };
   save(`${out}.json`, result);
   return result;

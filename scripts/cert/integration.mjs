@@ -44,30 +44,39 @@ await evidence('integration', async (plan, options) => {
       '--tests',
       testList,
     ]);
+  const negativeTree = await stage(
+    plan,
+    plan.baseline.version,
+    plan.baseline.commit,
+    'integration-negative',
+    positiveTree.source,
+    plan.commit
+  );
   install(positiveTree.source);
   const proofPositive = proofFiles.length
     ? await suite({
         deadline,
         cwd: positiveTree.source,
         files: proofFiles,
-        env: positiveTree.env,
+        env: {
+          ...positiveTree.env,
+          CERT_EXECUTION_SCOPE: 'proof-integration',
+          CERT_EXECUTION_PROOFS: JSON.stringify(proofFiles),
+        },
         out: path.join(root, '.cert/integration-positive/proofs'),
       })
     : { status: 'PASS', files: [], rows: [], attempts: [] };
-  const negativeTree = await stage(
-    plan,
-    plan.baseline.version,
-    plan.baseline.commit,
-    'integration-negative',
-    positiveTree.source
-  );
   install(negativeTree.source);
   const negative = negativeFiles.length
     ? await suite({
         deadline,
         cwd: negativeTree.source,
         files: negativeFiles,
-        env: negativeTree.env,
+        env: {
+          ...negativeTree.env,
+          CERT_EXECUTION_SCOPE: 'proof-integration',
+          CERT_EXECUTION_PROOFS: JSON.stringify(proofFiles),
+        },
         out: path.join(root, '.cert/integration-negative/proofs'),
       })
     : { status: 'PASS', files: [], rows: [], attempts: [] };
@@ -95,10 +104,13 @@ await evidence('integration', async (plan, options) => {
   ]);
   const proofs = json(checked);
   return {
-    status:
-      positive.status === 'INCOMPLETE' ||
-      proofs.status === 'INCOMPLETE' ||
-      negative.status === 'INCOMPLETE'
+    status: [positive, proofPositive, negative].some(
+      (execution) => execution.status === 'FAIL' && !execution.rows?.length
+    )
+      ? 'FAIL'
+      : positive.status === 'INCOMPLETE' ||
+          proofs.status === 'INCOMPLETE' ||
+          negative.status === 'INCOMPLETE'
         ? 'INCOMPLETE'
         : positive.status !== 'PASS' || proofs.status === 'FAIL'
           ? 'FAIL'

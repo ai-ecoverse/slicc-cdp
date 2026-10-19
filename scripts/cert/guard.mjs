@@ -48,6 +48,7 @@ await evidence('guard', async (plan, options) => {
         out: path.join(root, '.cert', `guard-${leg}/suite`),
         env: {
           ...staged.env,
+          CERT_EXECUTION_SCOPE: 'guard',
           SLICC_GUARD_SHA: commit,
           SLICC_FIXTURE_BROWSER_API: pathToFileURL(path.join(root, 'src/browser.js')).href,
         },
@@ -55,7 +56,12 @@ await evidence('guard', async (plan, options) => {
       const rows = result.guardReport?.report ?? null;
       executions[leg] = { ...result, report: rows, version, commit, sha256: staged.sha256 };
     } catch (error) {
-      executions[leg] = { status: 'INCOMPLETE', reason: error.stack, version, commit };
+      executions[leg] = {
+        status: error.certStatus ?? 'INCOMPLETE',
+        reason: error.stack,
+        version,
+        commit,
+      };
     }
   }
   const positive = executions.positive;
@@ -95,8 +101,11 @@ await evidence('guard', async (plan, options) => {
     positive.status === 'INCOMPLETE' ||
     negative.status === 'INCOMPLETE';
   return {
-    status:
-      incomplete || proofs.status === 'INCOMPLETE'
+    status: [positive, negative].some(
+      (execution) => execution.status === 'FAIL' && !execution.report
+    )
+      ? 'FAIL'
+      : incomplete || proofs.status === 'INCOMPLETE'
         ? 'INCOMPLETE'
         : positive.status !== 'PASS' || !positive.report.pass || proofs.status === 'FAIL'
           ? 'FAIL'
