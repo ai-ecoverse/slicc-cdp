@@ -17,9 +17,9 @@ name = "cdp_client"
 
 [dependencies]
 serde_json = "1"
-slicc-browsers = { version = "=1.8.5", features = ["serde"] }
+slicc-browsers = { version = "=1.9.0", features = ["serde"] }
 url = "2.5"
-wasix-net = "0.1"
+wasix-net = "0.1.2"
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 native-tls = "0.2"
@@ -28,4 +28,4 @@ native-tls = "0.2"
 openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
-slicc-browsers = { version = "=1.8.5", features = ["corpus"] }
+slicc-browsers = { version = "=1.9.0", features = ["corpus"] }

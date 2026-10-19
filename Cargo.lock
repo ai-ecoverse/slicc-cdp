@@ -618,9 +618,9 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "slicc-browsers"
-version = "1.8.5"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b17f986ef7ce1754e55a3c7f3c671c579c980753688d94dee7d046c6255f4d2"
+checksum = "1620b9df11d43f719bddba16ea45bd002af9bae192454473107caffa6763a873"
 dependencies = [
  "serde",
  "serde_json",
@@ -761,9 +761,9 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "wasix-net"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "966dbac17aacf0e6e9743a1b497aa384b89f3270343a3e5e7adc2fc05d975f93"
+checksum = "2c10d8f3fa98b897763ee69db843c3dd8db96e953c99c29c569b23cfe45296f4"
 
 [[package]]
 name = "windows-link"

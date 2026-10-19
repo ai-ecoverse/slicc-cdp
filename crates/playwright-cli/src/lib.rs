@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(tab_select.code, 0);
         assert_eq!(
             tab_select.stdout,
-            "playwright-cli tab-select <index>\n\nSelect a browser tab\n\nArguments:\n  <index>                     tab index\n"
+            "playwright-cli tab-select <index>\n\nSelect a browser tab\nOnly the saved current tab changes. The browser keeps its foreground tab.\n\nArguments:\n  <index>                     tab index\nOptions:\n  --foreground                also bring the tab to the front\n  --fg                        same as --foreground\n"
         );
         assert_page(
             "tab-close",

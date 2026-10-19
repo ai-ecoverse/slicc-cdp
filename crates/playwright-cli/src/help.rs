@@ -264,10 +264,15 @@ fn implemented_page(name: &str) -> Option<String> {
             )],
             &[],
         ),
-        "tab-select" => {
-            "playwright-cli tab-select <index>\n\nSelect a browser tab\n\nArguments:\n  <index>                     tab index\n"
-                .to_string()
-        }
+        "tab-select" => page(
+            "tab-select <index>",
+            &["Select a browser tab", "Only the saved current tab changes. The browser keeps its foreground tab."],
+            &[("<index>", "tab index")],
+            &[
+                ("--foreground", "also bring the tab to the front"),
+                ("--fg", "same as --foreground"),
+            ],
+        ),
         "tab-close" => page(
             "tab-close [index]",
             &["Close a browser tab"],

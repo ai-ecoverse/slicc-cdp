@@ -7,16 +7,36 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
-import { launchBrowser } from './browser.mjs';
+import { launchBrowser, rawSocket } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, origins } from './guard-fixture.mjs';
 
-const set = JSON.parse(
+const published = JSON.parse(
   await readFile(
     fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-vectors.json')),
     'utf8'
   )
 );
+const allTargets = [...new Set(published.vectors.flatMap((vector) => vector.targets))];
+const selectedTargets = process.env.SLICC_GUARD_TARGETS
+  ? JSON.parse(process.env.SLICC_GUARD_TARGETS)
+  : allTargets;
+if (
+  !Array.isArray(selectedTargets) ||
+  !selectedTargets.length ||
+  new Set(selectedTargets).size !== selectedTargets.length ||
+  selectedTargets.some((target) => !allTargets.includes(target))
+)
+  throw new Error('guard shard must select unique published targets');
+const set = {
+  ...published,
+  vectors: published.vectors
+    .map((vector) => ({
+      ...vector,
+      targets: vector.targets.filter((target) => selectedTargets.includes(target)),
+    }))
+    .filter((vector) => vector.targets.length),
+};
 const parityIds = new Set([
   'C5.fetch',
   'C5.xhr',
@@ -46,6 +66,33 @@ const parityIds = new Set([
   'C6.storage-getCookies',
   'C6.clearDataForOrigin',
 ]);
+
+const extensionPath = fileURLToPath(
+  new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
+);
+
+async function guardBrowser({ privileged, extension }) {
+  const browser = await launchBrowser([
+    ...browserArgs({ privileged: privileged || extension }),
+    ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
+  ]);
+  if (!extension) return browser;
+  let raw;
+  try {
+    raw = await rawSocket(browser.wsUrl);
+    const { id } = await raw.send('Extensions.loadUnpacked', {
+      path: extensionPath,
+      enableInIncognito: true,
+    });
+    assert.equal(id, 'ankmbodmgimjemnojmeddfcdlbocolob');
+    return browser;
+  } catch (error) {
+    await browser.close();
+    throw error;
+  } finally {
+    raw?.close();
+  }
+}
 
 function table(results) {
   return [
@@ -98,6 +145,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
           autoAttach: true,
           browserSession: true,
           chromeUrlsAttach: true,
+          extensionWorld: true,
           browserContexts: true,
         },
         variant: Object.keys(set.variants),
@@ -113,7 +161,10 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
           if (!browsers.has(slot))
             browsers.set(
               slot,
-              launchBrowser(browserArgs({ privileged: vector.id.startsWith('C8.') }))
+              guardBrowser({
+                privileged: vector.id.startsWith('C8.'),
+                extension: selected.vectors.some((row) => row.id.startsWith('C9.')),
+              })
             );
           const browser = await browsers.get(slot);
           const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
@@ -221,6 +272,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
+  report.selection = { targets: selectedTargets, allTargets };
   report.results = codedSkips(report.results);
   report.skipped = report.results
     .filter((row) => row.control === 'skip')
@@ -255,19 +307,42 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
   t.diagnostic(`report: ${file}`);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  assert.equal(parity.length, 108, 'recorded parity subset');
-  assert.equal(skipped, 0);
-  assert.equal(passing, 108);
-  const c8 = report.results.filter((row) => row.id.startsWith('C8.'));
-  assert(c8.length > 0, 'published privileged UI rows ran');
-  for (const id of ['C8.chrome-search', 'C8.network-error', 'C8.iframe-error']) {
-    assert(
-      c8.some((row) => row.id === id),
-      `${id} must run from the published guard set`
+  const expectedParity = set.vectors
+    .filter((vector) => parityIds.has(vector.id))
+    .reduce(
+      (total, vector) =>
+        total +
+        vector.targets.filter((target) => ['seven', 'vault'].includes(target)).length *
+          Object.keys(set.variants).length,
+      0
     );
+  assert.equal(parity.length, expectedParity, 'recorded parity subset');
+  if (!process.env.SLICC_GUARD_TARGETS) assert.equal(expectedParity, 108);
+  assert.equal(skipped, 0);
+  assert.equal(passing, expectedParity);
+  const c8 = report.results.filter((row) => row.id.startsWith('C8.'));
+  if (set.vectors.some((vector) => vector.id.startsWith('C8.')))
+    assert(c8.length > 0, 'published privileged UI rows ran');
+  for (const id of ['C8.chrome-search', 'C8.network-error', 'C8.iframe-error']) {
+    if (set.vectors.some((vector) => vector.id === id))
+      assert(
+        c8.some((row) => row.id === id),
+        `${id} must run from the published guard set`
+      );
   }
   assert(
     c8.every((row) => [row.control, row.guarded, row.live].every((status) => status === 'pass'))
   );
+  const c9 = report.results.filter((row) => row.id.startsWith('C9.'));
+  for (const vector of set.vectors.filter((row) => row.id.startsWith('C9.'))) {
+    const rows = c9.filter((row) => row.id === vector.id);
+    assert.equal(rows.length, vector.targets.length * Object.keys(set.variants).length);
+    assert(
+      rows.every((row) =>
+        [row.control, row.guarded, row.live].every((status) => status === 'pass')
+      ),
+      `${vector.id} must pass without skips: ${JSON.stringify(rows)}`
+    );
+  }
   assert.equal(report.pass, true, report.line);
 });

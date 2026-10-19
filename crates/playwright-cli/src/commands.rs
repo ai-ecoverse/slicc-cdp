@@ -412,16 +412,18 @@ fn cmd_tab_select(
     };
     report.tab(&page.target_id);
     report.begin(cdp);
-    match browser::activate(cdp, &page.target_id) {
-        Ok(()) => {
-            state.current = Some(page.target_id.clone());
-            Output::ok(format!(
-                "Selected tab {index} [targetId: {}]\n",
-                page.target_id
-            ))
+    let foreground =
+        flag_true(&invocation.flags, "foreground") || flag_true(&invocation.flags, "fg");
+    if foreground {
+        if let Err(message) = browser::activate(cdp, &page.target_id) {
+            return Output::err(message);
         }
-        Err(message) => Output::err(message),
     }
+    state.current = Some(page.target_id.clone());
+    Output::ok(format!(
+        "Selected tab {index} [targetId: {}]\n",
+        page.target_id
+    ))
 }
 
 fn cmd_snapshot(

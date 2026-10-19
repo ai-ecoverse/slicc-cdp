@@ -76,6 +76,7 @@ export async function cdpProxy(
     delays = {},
     early = [],
     transform = (message) => message,
+    observe = () => {},
     before = [],
   } = {}
 ) {
@@ -113,6 +114,7 @@ export async function cdpProxy(
       fromClient = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
+        if (message) observe('client', message);
         if (
           delayGuardAttachMs &&
           !delayed &&
@@ -193,6 +195,7 @@ export async function cdpProxy(
       fromBrowser = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
+        if (message) observe('browser', message);
         if (!browserEvents && message?.method && !message.sessionId) continue;
         if (message?.id !== undefined && acked.delete(message.id)) continue;
         if (message?.id !== undefined && injected.delete(message.id)) {

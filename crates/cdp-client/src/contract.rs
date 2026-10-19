@@ -22,6 +22,7 @@ pub const BROWSER_EVENTS: &[&str] = &[
 pub const SESSION_DOMAINS: &[&str] = &[
     "Page",
     "Runtime",
+    "Debugger",
     "DOM",
     "Input",
     "Network",

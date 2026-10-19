@@ -2,6 +2,7 @@ use crate::fetch::{self, Decision, Paused};
 use crate::net::Ws;
 use crate::protected::{Opener, Protected};
 use crate::shield;
+use crate::worlds::Worlds;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -56,6 +57,7 @@ pub struct Cdp {
     streams: BTreeSet<String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
+    worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
@@ -93,6 +95,7 @@ impl Cdp {
             streams: BTreeSet::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
+            worlds: Worlds::default(),
             frames: BTreeMap::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
@@ -233,6 +236,16 @@ impl Cdp {
                 return Err(self.refusal());
             }
         }
+        if Worlds::selectors(params) || Worlds::sensitive(method) {
+            let session = session_id.unwrap_or("");
+            if !self.worlds.enabled(session) && (Worlds::sensitive(method) || self.worlds.reason(session, method, params).is_some()) {
+                self.raw_call("Runtime.enable", json!({}), session_id, Duration::from_secs(10))?;
+                self.worlds.enable(session);
+            }
+            if let Some(reason) = self.worlds.reason(session, method, params) {
+                return Err(reason.into());
+            }
+        }
         if params
             .get("targetId")
             .and_then(|v| v.as_str())
@@ -295,7 +308,7 @@ impl Cdp {
             for key in ["targetId", "frameId"] {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
-                    if self.target_protected(&target, key == "frameId")? {
+                    if (key == "frameId" && self.frame_protected(&target)) || self.target_protected(&target, key == "frameId")? {
                         return Err(self.refusal());
                     }
                 }
@@ -351,6 +364,23 @@ impl Cdp {
         session_id: Option<&str>,
         mut result: Value,
     ) -> Result<Value, String> {
+        if Worlds::sensitive(method) {
+            if let Some(reason) = self.worlds.reason(session_id.unwrap_or(""), method, params) {
+                return Err(reason.into());
+            }
+        }
+        if method == "Runtime.enable" {
+            self.worlds.enable(session_id.unwrap_or(""));
+        } else if method == "Runtime.disable" {
+            self.worlds.disable(session_id.unwrap_or(""));
+        }
+        self.worlds.reply(session_id.unwrap_or(""), method, &result);
+        if method == "Page.createIsolatedWorld" {
+            self.worlds.created(session_id.unwrap_or(""), &result);
+        }
+        if method == "Runtime.compileScript" {
+            self.worlds.script(session_id.unwrap_or(""), &result);
+        }
         if let Some(stream) = result.get("stream").and_then(|v| v.as_str()) {
             self.streams.insert(stream.to_string());
         }
@@ -502,6 +532,10 @@ impl Cdp {
             Duration::from_secs(30),
         ) {
             Ok(info) => info.get("targetInfo").cloned().unwrap_or(Value::Null),
+            Err(message) if message.starts_with("Target.getTargetInfo: slicc: refused:") => {
+                self.protected_targets.insert(target_id.to_string());
+                return Ok(true);
+            }
             Err(_) if frame => return Ok(false),
             Err(message) => return Err(message),
         };
@@ -553,6 +587,7 @@ impl Cdp {
             .to_string();
         let mut blank = params.clone();
         blank["url"] = json!("about:blank");
+        let mark = self.events.len();
         let result = self.raw_call("Target.createTarget", blank, None, timeout)?;
         let target = result
             .get("targetId")
@@ -560,19 +595,65 @@ impl Cdp {
             .unwrap_or("")
             .to_string();
         if let Err(message) = self.touch(&target) {
-            let _ = self.raw_call(
-                "Target.closeTarget",
-                json!({ "targetId": target }),
-                None,
-                Duration::from_secs(5),
-            );
-            return Err(message);
+            let closed = self
+                .raw_call(
+                    "Target.closeTarget",
+                    json!({ "targetId": target }),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .and_then(|result| {
+                    if result.get("success").and_then(Value::as_bool) != Some(true) {
+                        return Err("Target.closeTarget did not confirm success\n".into());
+                    }
+                    self.wait_destroyed(&target, mark, Duration::from_secs(2))
+                });
+            return Err(match closed {
+                Ok(()) => message,
+                Err(error) => format!("{message}slicc: refused: cleanup: {}\n", error.trim()),
+            });
         }
         if !url.eq_ignore_ascii_case("about:blank") {
             let guard = self.guards.get(&target).cloned();
             self.send("Page.navigate", json!({ "url": url }), guard.as_deref())?;
         }
         Ok(result)
+    }
+
+    fn wait_destroyed(&mut self, target: &str, mark: usize, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let destroyed = |events: &[Value]| {
+            events[mark..].iter().any(|event| {
+                event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
+                    && event.pointer("/params/targetId").and_then(Value::as_str) == Some(target)
+            })
+        };
+        loop {
+            if destroyed(&self.events) {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(
+                    "Target.targetDestroyed timed out and Target.getTargets did not confirm closure\n".into()
+                );
+            }
+            let listed = self.raw_call("Target.getTargets", json!({}), None, left);
+            let absent = listed
+                .as_ref()
+                .ok()
+                .and_then(|result| result.get("targetInfos"))
+                .and_then(Value::as_array)
+                .is_some_and(|infos| {
+                    infos.iter().all(|info| info.get("targetId").and_then(Value::as_str).is_some())
+                        && !infos.iter().any(|info| info.get("targetId").and_then(Value::as_str) == Some(target))
+                });
+            if destroyed(&self.events) || absent {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.pump(Instant::now() + left.min(Duration::from_millis(100)))?;
+        }
     }
 
     fn touch(&mut self, target_id: &str) -> Result<(), String> {
@@ -985,12 +1066,19 @@ impl Cdp {
     }
 
     fn deliver(&mut self, mut value: Value) {
+        if self.worlds.event(&value, &self.guard) {
+            if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
+                let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
+            }
+            return;
+        }
         self.adopt_guard_attach(&value);
         self.watch(&mut value);
         if self.hidden(&value) {
             return;
         }
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        self.worlds.visible_event(value.get("sessionId").and_then(Value::as_str).unwrap_or(""), method, &value["params"]);
         let id = value
             .pointer("/params/requestId")
             .and_then(|v| v.as_str())
@@ -1652,6 +1740,146 @@ mod tests {
             inbox: VecDeque::new(),
             answer,
         }))
+    }
+
+    struct Cleanup {
+        inner: Pending,
+        destroy_after: Option<Duration>,
+        destroyed_at: Option<Instant>,
+        closed: bool,
+    }
+
+    impl Transport for Cleanup {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            self.inner.send_text(text)?;
+            let message: Value = serde_json::from_str(text).unwrap();
+            if message["method"] == "Target.closeTarget" {
+                self.closed = true;
+                self.destroyed_at = self.destroy_after.map(|delay| Instant::now() + delay);
+            }
+            Ok(())
+        }
+
+        fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+            if let Some(message) = self.inner.inbox.pop_front() {
+                return Ok(Some(message));
+            }
+            if let Some(at) = self.destroyed_at.take() {
+                if at <= deadline {
+                    std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                    return Ok(Some(json!({
+                        "method": "Target.targetDestroyed", "params": { "targetId": "T" }
+                    }).to_string()));
+                }
+                self.destroyed_at = Some(at);
+            }
+            if self.closed {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }
+            Ok(None)
+        }
+    }
+
+    fn cleanup_answer(message: &Value) -> Vec<Value> {
+        let result = match message["method"].as_str() {
+            Some("Target.createTarget") => json!({ "targetId": "T" }),
+            Some("Target.getTargetInfo") => json!({ "targetInfo": {
+                "targetId": "T", "type": "page", "url": "about:blank"
+            } }),
+            Some("Target.getTargets") => json!({ "targetInfos": [
+                { "targetId": "T", "type": "page", "url": "about:blank" }
+            ] }),
+            Some("Target.attachToTarget") => json!({ "sessionId": "S" }),
+            Some("Network.setBypassServiceWorker") => return Vec::new(),
+            Some("Target.closeTarget") => return vec![
+                json!({ "method": "Target.targetDestroyed", "params": { "targetId": "OTHER" } }),
+                json!({ "id": message["id"], "result": { "success": true } }),
+            ],
+            _ => json!({}),
+        };
+        vec![json!({ "id": message["id"], "result": result })]
+    }
+
+    fn cleanup(delay: Option<Duration>, answer: fn(&Value) -> Vec<Value>) -> Cdp {
+        Cdp::from_transport(Box::new(Cleanup {
+            inner: Pending { inbox: VecDeque::new(), answer },
+            destroy_after: delay,
+            destroyed_at: None,
+            closed: false,
+        }))
+    }
+
+    #[test]
+    fn cleanup_waits_for_the_refused_targets_late_destruction() {
+        let mut cdp = cleanup(Some(Duration::from_millis(40)), cleanup_answer);
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target: Network.setBypassServiceWorker timed out\n");
+        assert!(cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == "T"));
+        assert!(cdp.is_protected_target("T"));
+    }
+
+    #[test]
+    fn cleanup_confirms_closure_without_browser_events() {
+        let mut cdp = cleanup(None, |message| {
+            if message["method"] == "Target.getTargets" {
+                return vec![json!({ "id": message["id"], "result": { "targetInfos": [
+                    { "targetId": "OTHER", "type": "page", "url": "about:blank" }
+                ] } })];
+            }
+            cleanup_answer(message).into_iter().filter(|reply| reply.get("method").is_none()).collect()
+        });
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target: Network.setBypassServiceWorker timed out\n");
+        assert!(!cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed"));
+        assert!(cdp.is_protected_target("T"));
+    }
+
+    #[test]
+    fn cleanup_reports_a_missing_destruction_event_without_allowing_the_target() {
+        let mut cdp = cleanup(None, cleanup_answer);
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert!(error.starts_with("slicc: refused:"), "{error}");
+        assert!(error.contains("Network.setBypassServiceWorker timed out"), "{error}");
+        assert!(error.contains("Target.targetDestroyed timed out"), "{error}");
+        assert!(cdp.is_protected_target("T"));
+    }
+
+    #[test]
+    fn cleanup_reports_a_close_that_did_not_succeed() {
+        let mut cdp = cleanup(None, |message| {
+            let mut replies = cleanup_answer(message);
+            if message["method"] == "Target.closeTarget" {
+                replies.last_mut().unwrap()["result"] = json!({ "success": false });
+            }
+            replies
+        });
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert!(error.contains("Network.setBypassServiceWorker timed out"), "{error}");
+        assert!(error.contains("cleanup: Target.closeTarget did not confirm success"), "{error}");
+        assert!(cdp.is_protected_target("T"));
+    }
+
+    #[test]
+    fn cleanup_does_not_accept_a_stale_destruction_event() {
+        let mut cdp = cleanup(None, cleanup_answer);
+        cdp.absorb(json!({ "method": "Target.targetDestroyed", "params": { "targetId": "T" } }));
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert!(error.contains("Target.targetDestroyed timed out"), "{error}");
+        assert!(cdp.is_protected_target("T"));
+    }
+
+    #[test]
+    fn cleanup_accepts_destruction_before_the_close_reply() {
+        let mut cdp = cleanup(None, |message| {
+            let mut replies = cleanup_answer(message);
+            if message["method"] == "Target.closeTarget" {
+                replies.insert(0, json!({ "method": "Target.targetDestroyed", "params": { "targetId": "T" } }));
+            }
+            replies
+        });
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert!(error.contains("Network.setBypassServiceWorker timed out"), "{error}");
+        assert!(!error.contains("cleanup:"), "{error}");
     }
 
     #[test]

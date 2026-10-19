@@ -31,11 +31,21 @@ pub struct Ws {
 
 trait ReadWrite: Read + Write {
     fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()>;
+    fn read_timeout(&self) -> std::io::Result<Option<Duration>>;
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
 }
 
 impl ReadWrite for TcpStream {
     fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()> {
         TcpStream::set_nonblocking(self, on)
+    }
+
+    fn read_timeout(&self) -> std::io::Result<Option<Duration>> {
+        TcpStream::read_timeout(self)
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
     }
 }
 
@@ -43,6 +53,14 @@ impl ReadWrite for TcpStream {
 impl ReadWrite for native_tls::TlsStream<TcpStream> {
     fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()> {
         self.get_mut().set_nonblocking(on)
+    }
+
+    fn read_timeout(&self) -> std::io::Result<Option<Duration>> {
+        self.get_ref().read_timeout()
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.get_ref().set_read_timeout(timeout)
     }
 }
 
@@ -210,10 +228,19 @@ impl Ws {
         if let Some(message) = buffered_close(&self.buf) {
             return Err(message);
         }
-        let _ = self.stream.set_nonblocking(true);
+        let timeout = self.stream.read_timeout()
+            .map_err(|err| format!("websocket timeout setup failed: {err}\n"))?;
+        self.stream.set_nonblocking(true)
+            .map_err(|err| format!("websocket nonblocking setup failed: {err}\n"))?;
+        if let Err(err) = self.stream.set_read_timeout(None) {
+            let _ = self.stream.set_nonblocking(false);
+            return Err(format!("websocket timeout setup failed: {err}\n"));
+        }
+        let deadline = Instant::now() + Duration::from_millis(2);
+        let mut drained = 0;
         let mut tmp = [0u8; 8192];
         let mut failed = None;
-        loop {
+        while drained < 65536 && Instant::now() < deadline {
             match self.stream.read(&mut tmp) {
                 Ok(0) => {
                     failed = Some(
@@ -222,7 +249,14 @@ impl Ws {
                     );
                     break;
                 }
-                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                    drained += n;
+                    if let Some(message) = buffered_close(&self.buf) {
+                        failed = Some(message);
+                        break;
+                    }
+                }
                 Err(err)
                     if err.kind() == std::io::ErrorKind::WouldBlock
                         || err.kind() == std::io::ErrorKind::TimedOut
@@ -239,7 +273,10 @@ impl Ws {
                 }
             }
         }
-        let _ = self.stream.set_nonblocking(false);
+        let restored_timeout = self.stream.set_read_timeout(timeout);
+        let restored_blocking = self.stream.set_nonblocking(false);
+        restored_timeout.map_err(|err| format!("websocket timeout restore failed: {err}\n"))?;
+        restored_blocking.map_err(|err| format!("websocket nonblocking restore failed: {err}\n"))?;
         if let Some(message) = failed {
             return Err(message);
         }
@@ -881,6 +918,60 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReadyStream {
+        state: std::rc::Rc<std::cell::RefCell<(usize, bool, Option<Duration>)>>,
+        slow: bool,
+        broken: bool,
+    }
+
+    impl Read for ReadyStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut state = self.state.borrow_mut();
+            assert!(state.1);
+            assert_eq!(state.2, None);
+            state.0 += 1;
+            if self.broken { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+            let n = if self.slow {
+                std::thread::sleep(Duration::from_millis(1));
+                4
+            } else { buf.len() };
+            for chunk in buf[..n].chunks_exact_mut(4) { chunk.copy_from_slice(b"\x81\x02{}"); }
+            Ok(n)
+        }
+    }
+
+    impl Write for ReadyStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let state = self.state.borrow();
+            assert!(!state.1);
+            assert_eq!(state.2, Some(Duration::from_millis(200)));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl ReadWrite for ReadyStream {
+        fn set_nonblocking(&mut self, on: bool) -> std::io::Result<()> { self.state.borrow_mut().1 = on; Ok(()) }
+        fn read_timeout(&self) -> std::io::Result<Option<Duration>> { Ok(self.state.borrow().2) }
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> { self.state.borrow_mut().2 = timeout; Ok(()) }
+    }
+
+    #[test]
+    fn pre_send_draining_is_bounded_and_restores_socket_options() {
+        for (slow, broken) in [(false, false), (true, false), (false, true)] {
+            let state = std::rc::Rc::new(std::cell::RefCell::new((0, false, Some(Duration::from_millis(200)))));
+            let mut ws = Ws { stream: Box::new(ReadyStream { state: state.clone(), slow, broken }), buf: Vec::new() };
+            let result = ws.send_text("{}");
+            assert_eq!(result.is_err(), broken);
+            let state = state.borrow();
+            assert!(state.0 > 0);
+            assert!(state.0 <= if slow { 2 } else { 8 });
+            assert!(!state.1);
+            assert_eq!(state.2, Some(Duration::from_millis(200)));
+            assert!(ws.buf.len() <= 65536);
+        }
+    }
 
     #[test]
     fn decodes_unmasked_text_frame() {

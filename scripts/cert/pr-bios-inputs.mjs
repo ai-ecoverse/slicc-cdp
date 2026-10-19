@@ -1,17 +1,20 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { cliVerdict } from './cli-verdict.mjs';
-import { args, identity, json, root, save } from './common.mjs';
+import { args, identity, json, save } from './common.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { biosCalls, selectBiosPin } from './pr-bios-result.mjs';
 import { client } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
 const printVerdict = cliVerdict('pr-bios-inputs: ');
-const options = args({ bindings: { type: 'string' } });
+const options = args({ bindings: { type: 'string' }, directory: { type: 'string' } });
 const plan = json(options.plan);
 const bound = options.bindings !== undefined;
 const pin = selectBiosPin(json(new URL('./pr-bios.json', import.meta.url)), bound);
 const result = { ...identity(plan), which: 'bios-inputs', status: 'INCOMPLETE', ready: false, pin };
+let temporary;
 try {
   if (plan.mode !== 'pr' || !plan.go || !/^\d+$/.test(plan.run))
     throw new Error('eligible hosted PR plan required');
@@ -31,14 +34,13 @@ try {
         { certStatus: result.artifactBinding.status }
       );
   }
+  const directory =
+    options.directory ?? (temporary = mkdtempSync(path.join(tmpdir(), 'slicc-bios-inputs-')));
   const subjects = Object.fromEntries(
     ['base', 'candidate'].map((side) => {
       const subject =
         side === 'base' ? plan.baseline : { version: plan.version, commit: plan.commit };
-      return [
-        side,
-        unpackLocal(plan, subject.version, path.join(root, `.cert/bios-input-${side}`)),
-      ];
+      return [side, unpackLocal(plan, subject.version, path.join(directory, side))];
     })
   );
   result.calls = biosCalls(plan, pin, subjects, bindings);
@@ -50,6 +52,8 @@ try {
   result.status =
     error.certStatus ?? (bound && error instanceof SyntaxError ? 'FAIL' : 'INCOMPLETE');
   result.reason = error.message;
+} finally {
+  if (temporary) rmSync(temporary, { recursive: true, force: true });
 }
 save(options.out, result);
 console.log(JSON.stringify(result));
