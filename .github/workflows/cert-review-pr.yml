@@ -510,6 +510,9 @@ jobs:
       CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
     steps:
       -
+        name: "Record cert job start"
+        run: 'printf "CERT_SUITE_JOB_STARTED_MS=%s\n" "$(date +%s%3N)" >> "$GITHUB_ENV"'
+      -
         name: "Main-owned control checkout"
         uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
@@ -580,6 +583,9 @@ jobs:
     env:
       CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
     steps:
+      -
+        name: "Record cert job start"
+        run: 'printf "CERT_SUITE_JOB_STARTED_MS=%s\n" "$(date +%s%3N)" >> "$GITHUB_ENV"'
       -
         name: "Main-owned control checkout"
         uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"

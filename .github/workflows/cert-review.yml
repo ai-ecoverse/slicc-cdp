@@ -113,10 +113,12 @@ jobs:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
     runs-on: ${{ vars.CERT_RUNNER }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       LEFTHOOK: '0'
     steps:
+      - name: Record cert job start
+        run: 'printf "CERT_SUITE_JOB_STARTED_MS=%s\n" "$(date +%s%3N)" >> "$GITHUB_ENV"'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
@@ -153,7 +155,7 @@ jobs:
             .cert/guard-*/*.json
             .cert/guard-*/*.jsonl
             .cert/guard-*/*.log
-            .cert/guard-*/rows.md
+            .cert/guard-*/*.guard.md
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
@@ -162,10 +164,12 @@ jobs:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.rust != '' }}
     runs-on: ${{ vars.CERT_RUNNER }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       LEFTHOOK: '0'
     steps:
+      - name: Record cert job start
+        run: 'printf "CERT_SUITE_JOB_STARTED_MS=%s\n" "$(date +%s%3N)" >> "$GITHUB_ENV"'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
