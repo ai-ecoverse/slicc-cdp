@@ -92,7 +92,7 @@ function fixture(t, file = 'src/client.js', contents = 'changed\n') {
     draft: false,
     head: { sha: head, repo: { full_name: repository } },
     base: { sha: base, ref: 'main', repo: { full_name: repository } },
-    labels: [{ name: 'merge-ok' }],
+    labels: [],
   };
   const self = { status: 'PASS', repository, members: [{ pr: 10, head, status: 'PASS' }] };
   return {
@@ -260,16 +260,19 @@ test('PR cert planner runs full review for a scripts-only package postinstall ch
   assert.equal(plan.commit, f.merge);
 });
 
-test('PR cert planner merge-ok starts review and later pushes bind a new real head', async (t) => {
+test('PR cert planner: a draft waits, ready_for_review starts review, later pushes bind a new real head', async (t) => {
   const f = fixture(t);
   const api = await server(t, f);
-  f.pull.labels = [];
-  assert.equal((await planned(f, api)).plan.go, false);
-  f.pull.labels = [{ name: 'merge-ok' }];
-  assert.equal(
-    (await planned(f, api, { action: 'labeled', label: { name: 'merge-ok' } })).plan.go,
-    true
-  );
+  f.pull.draft = true;
+  const draft = (await planned(f, api, { action: 'opened' })).plan;
+  assert.equal(draft.go, false);
+  assert.equal(draft.report, true);
+  assert.equal(draft.status, 'INCOMPLETE');
+  assert.equal(draft.reason, 'not reviewed: draft, mark it ready for review');
+  delete f.pull.draft;
+  assert.equal((await planned(f, api)).plan.go, false, 'a missing draft flag counts as a draft');
+  f.pull.draft = false;
+  assert.equal((await planned(f, api, { action: 'ready_for_review' })).plan.go, true);
   f.git('checkout', '--quiet', 'proposal');
   writeFileSync(path.join(f.directory, 'src/client.js'), 'later\n');
   f.git('add', 'src/client.js');
@@ -284,6 +287,11 @@ test('PR cert planner merge-ok starts review and later pushes bind a new real he
   assert.equal(latest.go, true);
   assert.equal(latest.head, f.head);
   assert.equal(latest.commit, f.merge);
+  f.pull.draft = true;
+  const converted = (await planned(f, api, { action: 'converted_to_draft' })).plan;
+  assert.equal(converted.go, false);
+  assert.equal(converted.report, true);
+  assert.match(converted.reason, /draft/);
 });
 
 test('PR cert planner ignores unrelated labels, rejects stale heads, incomplete files and removed readiness', async (t) => {
@@ -300,11 +308,16 @@ test('PR cert planner ignores unrelated labels, rejects stale heads, incomplete 
   f.pull.changed_files = 2;
   assert.match((await planned(f, api)).plan.issues.join(';'), /listing incomplete/);
   f.pull.changed_files = 1;
-  f.pull.labels = [];
-  assert.match(
-    (await planned(f, api, { action: 'unlabeled', label: { name: 'merge-ok' } })).plan.reason,
-    /waits/
-  );
+  for (const event of [
+    { action: 'labeled', label: { name: 'merge-ok' } },
+    { action: 'unlabeled', label: { name: 'merge-ok' } },
+    { action: 'unlabeled', label: { name: 'other' } },
+  ]) {
+    const quiet = (await planned(f, api, event)).plan;
+    assert.equal(quiet.report, false, JSON.stringify(event));
+    assert.equal(quiet.go, false);
+    assert.equal(quiet.reason, 'unrelated label');
+  }
 });
 
 test('PR cert planner honours shared reviewer refusal and binds the receipt to the exact head', async (t) => {
@@ -408,7 +421,7 @@ for (const scenario of ['absent', 'malformed', 'wrong identity'])
     assert.ok(!api.calls.some((call) => call.body?.state === 'success'));
   });
 
-test('PR cert reporter never posts on a stale head and invalidates removed merge-ok', async (t) => {
+test('PR cert reporter never posts on a stale head and a PR converted to draft mid-run is not proof', async (t) => {
   const f = fixture(t);
   const api = await server(t, f);
   const { file, out, plan } = await planned(f, api);
@@ -423,7 +436,7 @@ test('PR cert reporter never posts on a stale head and invalidates removed merge
   assert.equal(stdoutDocument(stale.stdout).status, 'NOOP');
   assert.equal(api.calls.filter((call) => call.method === 'POST').length, 0);
   f.pull.head.sha = f.head;
-  f.pull.labels = [];
+  f.pull.draft = true;
   const removed = await cli(
     'pr-report.mjs',
     ['--event', file, '--plan', out, '--record', record],
@@ -432,6 +445,7 @@ test('PR cert reporter never posts on a stale head and invalidates removed merge
   );
   assert.equal(removed.exit, 1);
   assert.equal(stdoutDocument(removed.stdout).status, 'INCOMPLETE');
+  assert.ok(!api.calls.some((call) => call.body?.state === 'success'));
   assert.equal(
     api.calls.find((call) => call.pathname === `statuses/${f.head}`).body.state,
     'error'

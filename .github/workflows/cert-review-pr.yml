@@ -5,9 +5,10 @@ on:
       - "opened"
       - "synchronize"
       - "reopened"
+      - "ready_for_review"
+      - "converted_to_draft"
       - "labeled"
       - "unlabeled"
-      - "ready_for_review"
   merge_group:
     types:
       - "checks_requested"
@@ -20,8 +21,8 @@ defaults:
   run:
     shell: "bash"
 concurrency:
-  group: "cert-pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}"
-  cancel-in-progress: false
+  group: "${{ ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'cert-review-approved') && format('cert-pr-noop-{0}', github.run_id) || format('cert-pr-{0}', github.event.pull_request.number || github.event.merge_group.head_sha) }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 jobs:
   self:
     name: "cert-review-pr / self"

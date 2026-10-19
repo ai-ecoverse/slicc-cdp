@@ -42,7 +42,7 @@ try {
   if (!sha.test(plan.head) || !sha.test(plan.tools)) throw new Error('invalid PR identity');
   if (
     ['labeled', 'unlabeled'].includes(event.action) &&
-    !['merge-ok', 'cert-review-approved'].includes(event.label?.name)
+    event.label?.name !== 'cert-review-approved'
   ) {
     plan.report = false;
     plan.reason = 'unrelated label';
@@ -108,8 +108,8 @@ try {
         pull.head.repo?.full_name !== repository
       ) {
         plan.reason = 'refused: fork behaviour requires trusted same-repository route';
-      } else if (current.draft || !current.labels.some((label) => label.name === 'merge-ok')) {
-        plan.reason = 'not reviewed: waits for ready PR and merge-ok';
+      } else if (current.draft !== false) {
+        plan.reason = 'not reviewed: draft, mark it ready for review';
       } else {
         if (!sha.test(values.merge ?? '')) throw new Error('merge ref unavailable');
         const parents = run('git', ['show', '-s', '--format=%P', values.merge], {

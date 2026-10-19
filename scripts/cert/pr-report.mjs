@@ -62,11 +62,11 @@ async function reviewedRecord(plan, current) {
       status: 'INCOMPLETE',
       incomplete: ['complete code-generated certificate required'],
     };
-  if (!current.labels.some((label) => label.name === 'merge-ok') || current.draft)
+  if (current.draft !== false)
     record = {
       ...record,
       status: 'INCOMPLETE',
-      incomplete: ['ready/merge-ok eligibility removed'],
+      incomplete: ['converted to draft: not proof'],
     };
   if (plan.reviewer) {
     const latest = (await pages(`issues/${plan.pr}/timeline`))
