@@ -4,8 +4,13 @@ import { pathToFileURL } from 'node:url';
 import { evidence, json, root, run, save } from './common.mjs';
 import { stage } from './stage.mjs';
 import { suite } from './suite.mjs';
+import { executionBudget } from './suite-policy.mjs';
 
 await evidence('guard', async (plan, options) => {
+  const budget = executionBudget();
+  if (budget.status !== 'AVAILABLE')
+    return { status: 'INCOMPLETE', reason: budget.reason, budget, executions: {} };
+  const { deadline } = budget;
   const executions = {};
   for (const [leg, version, commit] of [
     ['positive', plan.version, plan.commit],
@@ -28,8 +33,8 @@ await evidence('guard', async (plan, options) => {
         '--tests',
         testList,
       ]);
-      const report = path.join(root, '.cert', `guard-${leg}/rows.md`);
       const result = await suite({
+        deadline,
         cwd: staged.source,
         files: [
           ...new Set([
@@ -43,17 +48,11 @@ await evidence('guard', async (plan, options) => {
         out: path.join(root, '.cert', `guard-${leg}/suite`),
         env: {
           ...staged.env,
-          SLICC_GUARD_REPORT: report,
           SLICC_GUARD_SHA: commit,
           SLICC_FIXTURE_BROWSER_API: pathToFileURL(path.join(root, 'src/browser.js')).href,
         },
       });
-      let rows;
-      try {
-        rows = json(`${report}.json`);
-      } catch {
-        rows = null;
-      }
+      const rows = result.guardReport?.report ?? null;
       executions[leg] = { ...result, report: rows, version, commit, sha256: staged.sha256 };
     } catch (error) {
       executions[leg] = { status: 'INCOMPLETE', reason: error.stack, version, commit };
@@ -109,6 +108,7 @@ await evidence('guard', async (plan, options) => {
         : undefined,
     sha256: positive.sha256,
     executions,
+    budget,
     expected,
     failures,
     proofs,

@@ -3,8 +3,13 @@ import path from 'node:path';
 import { evidence, json, root, run, save } from './common.mjs';
 import { stage } from './stage.mjs';
 import { suite } from './suite.mjs';
+import { executionBudget } from './suite-policy.mjs';
 
 await evidence('integration', async (plan, options) => {
+  const budget = executionBudget();
+  if (budget.status !== 'AVAILABLE')
+    return { status: 'INCOMPLETE', reason: budget.reason, budget, executions: {} };
+  const { deadline } = budget;
   const positiveTree = await stage(plan, plan.version, plan.commit, 'integration-positive');
   const files = [
     ...new Set([
@@ -18,6 +23,7 @@ await evidence('integration', async (plan, options) => {
     ]),
   ];
   const positive = await suite({
+    deadline,
     cwd: positiveTree.source,
     files,
     env: positiveTree.env,
@@ -41,6 +47,7 @@ await evidence('integration', async (plan, options) => {
   install(positiveTree.source);
   const proofPositive = proofFiles.length
     ? await suite({
+        deadline,
         cwd: positiveTree.source,
         files: proofFiles,
         env: positiveTree.env,
@@ -57,6 +64,7 @@ await evidence('integration', async (plan, options) => {
   install(negativeTree.source);
   const negative = negativeFiles.length
     ? await suite({
+        deadline,
         cwd: negativeTree.source,
         files: negativeFiles,
         env: negativeTree.env,
@@ -97,6 +105,7 @@ await evidence('integration', async (plan, options) => {
           : 'PASS',
     sha256: positiveTree.sha256,
     executions: { positive, proofs: proofPositive, negative },
+    budget,
     proofs,
     changedTests: plan.mode === 'pr' ? plan.changedTests : [],
     native: plan.mode === 'pr' ? 'exact same-run host native packs' : 'published release assets',
