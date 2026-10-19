@@ -85,6 +85,82 @@ fn client() -> (Cdp, Rc<RefCell<Vec<Value>>>) {
 }
 
 #[test]
+fn object_aliases_refuse_hidden_worlds_before_call_or_notify() {
+    for (method, key) in [
+        ("Runtime.awaitPromise", "promiseObjectId"),
+        ("Runtime.getExceptionDetails", "errorObjectId"),
+    ] {
+        let (mut cdp, sent) = client();
+        cdp.call("Runtime.enable", json!({}), Some("S")).unwrap();
+        let params = json!({key: "extension-object"});
+        let count = sent.borrow().len();
+        assert_eq!(
+            cdp.call(method, params.clone(), Some("S")).unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(cdp.notify(method, params, Some("S")).unwrap_err(), REFUSAL);
+        assert_eq!(sent.borrow().len(), count);
+        assert!(!cdp.session_blocked("S"));
+    }
+}
+
+#[test]
+fn guessed_object_aliases_cannot_skip_context_discovery() {
+    for (method, key) in [
+        ("Runtime.awaitPromise", "promiseObjectId"),
+        ("Runtime.getExceptionDetails", "errorObjectId"),
+    ] {
+        for (id, reason) in [("extension-object", REFUSAL), ("unknown-object", UNSEEN)] {
+            let (mut cdp, sent) = client();
+            assert_eq!(
+                cdp.call(method, json!({key: id}), Some("S")).unwrap_err(),
+                reason
+            );
+            assert!(sent
+                .borrow()
+                .iter()
+                .all(|message| message["method"] != method));
+        }
+    }
+}
+
+#[test]
+fn visible_object_aliases_are_session_scoped_and_need_no_new_preflight() {
+    let (mut cdp, sent) = client();
+    cdp.call("Runtime.enable", json!({}), Some("S")).unwrap();
+    cdp.call(
+        "Runtime.evaluate",
+        json!({"expression":"document"}),
+        Some("S"),
+    )
+    .unwrap();
+    for (method, key) in [
+        ("Runtime.awaitPromise", "promiseObjectId"),
+        ("Runtime.getExceptionDetails", "errorObjectId"),
+    ] {
+        cdp.call(method, json!({key: "page-object"}), Some("S"))
+            .unwrap();
+    }
+    assert_eq!(
+        sent.borrow()
+            .iter()
+            .filter(|message| message["method"] == "Runtime.enable")
+            .count(),
+        1
+    );
+    for (method, key) in [
+        ("Runtime.awaitPromise", "promiseObjectId"),
+        ("Runtime.getExceptionDetails", "errorObjectId"),
+    ] {
+        assert_eq!(
+            cdp.call(method, json!({key: "page-object"}), Some("OTHER"))
+                .unwrap_err(),
+            UNSEEN
+        );
+    }
+}
+
+#[test]
 fn extension_worlds_are_hidden_without_blocking_the_page() {
     let (mut cdp, _) = client();
     cdp.call("Runtime.enable", json!({}), Some("S")).unwrap();

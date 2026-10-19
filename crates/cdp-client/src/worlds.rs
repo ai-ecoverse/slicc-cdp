@@ -47,11 +47,10 @@ impl Worlds {
                     "uniqueContextId"
                         | "executionContextUniqueId"
                         | "executionContextName"
-                        | "objectId"
-                        | "prototypeObjectId"
                         | "scriptId"
                         | "callFrameId"
                 )
+                || object_key(key)
         })
     }
 
@@ -65,7 +64,7 @@ impl Worlds {
                 value.as_str().map(|id| self.unique.get(&pair(id)).copied())
             }
             "executionContextName" => value.as_str().map(|id| self.names.get(&pair(id)).copied()),
-            "objectId" | "prototypeObjectId" => value
+            key if object_key(key) => value
                 .as_str()
                 .map(|id| self.objects.get(&pair(id)).copied()),
             "scriptId" => value
@@ -228,7 +227,7 @@ impl Worlds {
 
     fn remember_hidden(&mut self, session: &str, value: &Value) {
         walk(value, &mut |key, value| {
-            if matches!(key, "objectId" | "prototypeObjectId") {
+            if object_key(key) {
                 if let Some(id) = value.as_str() {
                     self.objects
                         .insert((session.to_string(), id.to_string()), true);
@@ -324,6 +323,13 @@ impl Worlds {
                 .or_insert(false);
         }
     }
+}
+
+fn object_key(key: &str) -> bool {
+    matches!(
+        key,
+        "objectId" | "prototypeObjectId" | "promiseObjectId" | "errorObjectId"
+    )
 }
 
 fn walk(value: &Value, visit: &mut impl FnMut(&str, &Value) -> bool) -> bool {
