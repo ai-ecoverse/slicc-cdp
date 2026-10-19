@@ -1,9 +1,11 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { cliVerdict } from './cli-verdict.mjs';
 import { json, save } from './common.mjs';
 import { recordGuardShards } from './guard-shards.mjs';
 
+const verdict = cliVerdict('guard-shard-record: ');
 const { values } = parseArgs({
   options: { plan: { type: 'string' }, directory: { type: 'string' }, out: { type: 'string' } },
 });
@@ -16,3 +18,4 @@ const record = recordGuardShards(plan, documents);
 save(values.out, record);
 console.log(JSON.stringify(record));
 process.exitCode = record.status === 'PASS' ? 0 : 1;
+verdict(record.status, record.rows + ' planned rows');

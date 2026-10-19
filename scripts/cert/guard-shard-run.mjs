@@ -1,10 +1,12 @@
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { cliVerdict } from './cli-verdict.mjs';
 import { json, root, save } from './common.mjs';
 import { guardSetupTimeoutCount } from './guard-shards.mjs';
 import { suite } from './suite.mjs';
 import { executionBudget } from './suite-policy.mjs';
 
+const verdict = cliVerdict('guard-shard-run: ');
 const { values } = parseArgs({
   options: { plan: { type: 'string' }, shard: { type: 'string' }, out: { type: 'string' } },
 });
@@ -49,3 +51,4 @@ console.log(
   })
 );
 process.exitCode = result.status === 'PASS' ? 0 : 1;
+verdict(result.status, shard.id);

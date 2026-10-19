@@ -37,7 +37,7 @@ jobs:
           node-version: 24
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - id: plan
-        run: node scripts/cert/guard-shard-plan.mjs --out .cert/guard-shard-plan.json
+        run: node scripts/gate.mjs guard-shard-plan -- node scripts/cert/guard-shard-plan.mjs --out .cert/guard-shard-plan.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: guard-shard-plan-${{ github.run_id }}-${{ github.run_attempt }}
@@ -84,7 +84,7 @@ jobs:
       - name: Execute every row assigned to this fixed shard
         env:
           SHARD: ${{ matrix.id }}
-        run: node scripts/cert/guard-shard-run.mjs --plan .cert/guard-shard-plan.json --shard "$SHARD" --out .cert/guard-shard/shard.json
+        run: node scripts/gate.mjs guard-shard-run -- node scripts/cert/guard-shard-run.mjs --plan .cert/guard-shard-plan.json --shard "$SHARD" --out .cert/guard-shard/shard.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -134,7 +134,7 @@ jobs:
           path: .cert/guard-shards/d
       - name: Require every shard and every exact planned row
         if: always()
-        run: node scripts/cert/guard-shard-record.mjs --plan .cert/guard-shard-plan.json --directory .cert/guard-shards --out .cert/guard-shard-record.json
+        run: node scripts/gate.mjs guard-shard-record -- node scripts/cert/guard-shard-record.mjs --plan .cert/guard-shard-plan.json --directory .cert/guard-shards --out .cert/guard-shard-record.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

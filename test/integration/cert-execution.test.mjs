@@ -428,6 +428,10 @@ test('guard shard planner partitions all published targets and row keys without 
   const keys = plan.shards.flatMap((shard) => shard.keys).sort();
   assert.deepEqual(keys, plan.keys);
   assert.equal(new Set(keys).size, keys.length);
+  assert.deepEqual(
+    plan.shards.map((shard) => shard.expectedRows),
+    [6, 6, 6, 8]
+  );
   assert.throws(
     () =>
       guardShardPlan({

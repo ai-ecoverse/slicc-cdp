@@ -1,8 +1,8 @@
 const partitions = [
-  { id: 'a', targets: ['seven', 'chrome-passwords', 'vault-x'] },
-  { id: 'b', targets: ['vault', 'chrome-extension-page', 'apex'] },
-  { id: 'c', targets: ['own', 'chrome-newtab', 'chrome-search'] },
-  { id: 'd', targets: ['chrome-new-tab-page', 'chrome-settings', 'file-root', 'network-error'] },
+  { id: 'a', targets: ['seven', 'chrome-newtab', 'chrome-passwords'] },
+  { id: 'b', targets: ['vault', 'chrome-new-tab-page', 'chrome-settings'] },
+  { id: 'c', targets: ['vault-x', 'own', 'chrome-search'] },
+  { id: 'd', targets: ['apex', 'chrome-extension-page', 'file-root', 'network-error'] },
 ];
 
 export const guardRowKey = (row) => JSON.stringify([row.id, row.target, row.variant]);
@@ -30,6 +30,7 @@ export function guardShardPlan(set) {
       .map(guardRowKey)
       .sort(),
   }));
+  for (const shard of shards) shard.expectedRows = shard.keys.length;
   if (shards.some((shard) => !shard.targets.length || !shard.keys.length))
     throw new Error('each fixed guard shard must contain published targets and rows');
   return { schema: 1, targets, keys, shards };
@@ -103,6 +104,8 @@ export function recordGuardShards(plan, documents) {
     JSON.stringify(partitions.map((shard) => shard.id))
   )
     issues.failures.push('fixed guard shard plan is incomplete or ambiguous');
+  if (plan.shards.some((shard) => shard.expectedRows !== shard.keys.length))
+    issues.failures.push('guard shard expected row count differs from declared keys');
   const planned = plan.shards.flatMap((shard) => shard.keys).sort();
   if (
     new Set(planned).size !== planned.length ||
@@ -128,6 +131,7 @@ export function recordGuardShards(plan, documents) {
       setupTimeoutCount: document.setupTimeoutCount,
       status: document.suite?.status ?? 'INCOMPLETE',
       rows,
+      expectedRows: shard.expectedRows,
     });
   }
   for (const shard of plan.shards)
