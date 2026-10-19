@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
@@ -57,9 +58,108 @@ function channel(write) {
   };
 }
 
+async function wasiGuarded(ws, origin, { variant, detachDelay }) {
+  const { createNodeKernel } = await import('@ai-ecoverse/slicc-kernel/node');
+  const { bridge: browserBridge } = await import('./browser.mjs');
+  const kernel = await createNodeKernel({ cdp: browserBridge(ws) });
+  let terminal;
+  let client;
+  let closing = false;
+  try {
+    await kernel.writeFile(
+      '/node_modules/guard/package.json',
+      JSON.stringify({
+        name: 'guard',
+        slicc: {
+          commands: {
+            'guard-bridge': { abi: 'wasi', wasm: 'bridge.wasm' },
+            'guard-terminal': { abi: 'js', module: 'terminal.mjs' },
+          },
+        },
+      })
+    );
+    await kernel.writeFile(
+      '/node_modules/guard/bridge.wasm',
+      await readFile(
+        new URL('../../target/wasm32-wasip1/debug/examples/guard_bridge.wasm', import.meta.url)
+      )
+    );
+    await kernel.writeFile(
+      '/node_modules/guard/terminal.mjs',
+      `export default async function(ctx) {
+      await ctx.tty.setRaw(0, true);
+      const child = await ctx.spawn({ argv: ['guard-bridge', ...ctx.argv.slice(1)] });
+      await ctx.write(1, '{"ready":true}\\n');
+      return (await child.wait()).status;
+    }`
+    );
+    client = channel((message) => terminal.write(`${message}\n`));
+    let buffered = '';
+    let ready;
+    const started = new Promise((resolve) => {
+      ready = resolve;
+    });
+    terminal = await kernel.openTerminal(['guard-terminal', ws, origin], {
+      onData: (bytes) => {
+        if (closing) return;
+        buffered += new TextDecoder().decode(bytes);
+        for (;;) {
+          const end = buffered.indexOf('\n');
+          if (end < 0) break;
+          const line = buffered.slice(0, end).replaceAll('\r', '');
+          buffered = buffered.slice(end + 1);
+          let message;
+          try {
+            message = JSON.parse(line);
+          } catch {
+            throw new Error(`invalid WASI guard bridge output: ${line}`);
+          }
+          if (message.ready) ready();
+          else client.receive(message);
+        }
+      },
+    });
+    terminal.ended.catch(client.stop);
+    terminal.exited.then(client.stop, client.stop);
+    let timer;
+    try {
+      await Promise.race([
+        started,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('WASI guard bridge startup timed out')), 10000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    return {
+      events: client.events,
+      send: client.send,
+      waitEvent: client.waitEvent,
+      variant,
+      detachDelay,
+      close: async () => {
+        closing = true;
+        terminal.signal('SIGKILL');
+        await terminal.exited.catch(() => {});
+        client.stop();
+        kernel.terminate();
+      },
+    };
+  } catch (error) {
+    closing = true;
+    terminal?.signal('SIGKILL');
+    client?.stop();
+    kernel.terminate();
+    throw error;
+  }
+}
+
 export async function guarded(ws, origin, { variant, detachDelay }) {
   if (!['prompt', 'lagging'].includes(variant) || !Number.isInteger(detachDelay))
     throw new Error('invalid guard variant');
+  if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
+    return wasiGuarded(ws, origin, { variant, detachDelay });
   const child = spawn(bridge, [ws, origin], { stdio: ['pipe', 'pipe', 'inherit'] });
   const client = channel((message) => child.stdin.write(`${message}\n`));
   createInterface({ input: child.stdout }).on('line', (line) => client.receive(JSON.parse(line)));

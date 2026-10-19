@@ -162,7 +162,7 @@ pub fn web_socket_as_http(url: &str) -> String {
 }
 
 fn url_protected(guard: &Protected, text: &str) -> bool {
-    guard.url(text) || guard.url(&web_socket_as_http(text))
+    guard.url_read_only(text) || guard.url_read_only(&web_socket_as_http(text))
 }
 
 pub fn mentions(guard: &Protected, value: &Value) -> bool {
@@ -230,6 +230,41 @@ fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
             .and_then(|v| v.as_str())
             .is_some_and(|site| site_protected(guard, site)),
         None => false,
+    }
+}
+
+pub fn command_url_refusal<'a>(guard: &'a Protected, params: &Value) -> Option<&'a str> {
+    let urls = params.get("url").and_then(Value::as_str).into_iter().chain(
+        params.get("urls").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
+    );
+    for url in urls {
+        if guard.url(url) {
+            return Some(guard.refusal_for_url(url));
+        }
+        let mapped = web_socket_as_http(url);
+        if guard.url(&mapped) {
+            return Some(guard.refusal_for_url(&mapped));
+        }
+    }
+    params.get("cookies").and_then(Value::as_array).into_iter().flatten()
+        .find_map(|cookie| command_url_refusal(guard, cookie))
+}
+
+pub fn loaded_urls_protected(guard: &Protected, value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(|item| loaded_urls_protected(guard, item)),
+        Value::Object(items) => items.iter().any(|(key, item)| {
+            if FREE_FORM.contains(&key.as_str()) {
+                return false;
+            }
+            if matches!(key.as_str(), "url" | "scriptURL" | "scopeURL" | "origin" | "securityOrigin") {
+                if let Some(url) = item.as_str() {
+                    return guard.url(url) || guard.url(&web_socket_as_http(url));
+                }
+            }
+            loaded_urls_protected(guard, item)
+        }),
+        _ => false,
     }
 }
 

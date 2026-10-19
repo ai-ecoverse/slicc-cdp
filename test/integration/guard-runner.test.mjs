@@ -7,7 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
-import { launchBrowser } from './browser.mjs';
+import { launchBrowser, rawSocket } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, origins } from './guard-fixture.mjs';
 
@@ -67,6 +67,33 @@ const parityIds = new Set([
   'C6.clearDataForOrigin',
 ]);
 
+const extensionPath = fileURLToPath(
+  new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
+);
+
+async function guardBrowser({ privileged, extension }) {
+  const browser = await launchBrowser([
+    ...browserArgs({ privileged: privileged || extension }),
+    ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
+  ]);
+  if (!extension) return browser;
+  let raw;
+  try {
+    raw = await rawSocket(browser.wsUrl);
+    const { id } = await raw.send('Extensions.loadUnpacked', {
+      path: extensionPath,
+      enableInIncognito: true,
+    });
+    assert.equal(id, 'ankmbodmgimjemnojmeddfcdlbocolob');
+    return browser;
+  } catch (error) {
+    await browser.close();
+    throw error;
+  } finally {
+    raw?.close();
+  }
+}
+
 function table(results) {
   return [
     '| Row | Target | Variant | Control | Guarded | Live | Reason |',
@@ -97,6 +124,12 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',
   });
+  if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
+    execFileSync(
+      'cargo',
+      ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge', '--target', 'wasm32-wasip1'],
+      { stdio: 'inherit' }
+    );
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
   const diagnostics = [];
   const executeTarget = async (target) => {
@@ -118,6 +151,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
           autoAttach: true,
           browserSession: true,
           chromeUrlsAttach: true,
+          extensionWorld: true,
           browserContexts: true,
         },
         variant: Object.keys(set.variants),
@@ -133,7 +167,10 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
           if (!browsers.has(slot))
             browsers.set(
               slot,
-              launchBrowser(browserArgs({ privileged: vector.id.startsWith('C8.') }))
+              guardBrowser({
+                privileged: vector.id.startsWith('C8.'),
+                extension: selected.vectors.some((row) => row.id.startsWith('C9.')),
+              })
             );
           const browser = await browsers.get(slot);
           const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
@@ -242,6 +279,8 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
   report.selection = { targets: selectedTargets, allTargets };
+  report.transport =
+    process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
   report.results = codedSkips(report.results);
   report.skipped = report.results
     .filter((row) => row.control === 'skip')
@@ -295,5 +334,16 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
   assert(
     c8.every((row) => [row.control, row.guarded, row.live].every((status) => status === 'pass'))
   );
+  const c9 = report.results.filter((row) => row.id.startsWith('C9.'));
+  for (const vector of set.vectors.filter((row) => row.id.startsWith('C9.'))) {
+    const rows = c9.filter((row) => row.id === vector.id);
+    assert.equal(rows.length, vector.targets.length * Object.keys(set.variants).length);
+    assert(
+      rows.every((row) =>
+        [row.control, row.guarded, row.live].every((status) => status === 'pass')
+      ),
+      `${vector.id} must pass without skips: ${JSON.stringify(rows)}`
+    );
+  }
   assert.equal(report.pass, true, report.line);
 });

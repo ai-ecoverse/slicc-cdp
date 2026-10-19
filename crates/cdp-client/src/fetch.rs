@@ -389,7 +389,7 @@ fn refresh_target(value: &str) -> &str {
     }
 }
 
-fn redirects_to_protected(guard: &Protected, base: &str, headers: &[(String, String)]) -> bool {
+fn redirect_refusal<'a>(guard: &'a Protected, base: &str, headers: &[(String, String)]) -> Option<&'a str> {
     let base = url::Url::parse(base).ok();
     let reaches = |target: &str| {
         let resolved = base
@@ -397,15 +397,21 @@ fn redirects_to_protected(guard: &Protected, base: &str, headers: &[(String, Str
             .and_then(|base| base.join(target).ok())
             .map(|url| url.to_string())
             .unwrap_or_else(|| target.to_string());
-        guard.url(&resolved) || guard.url(target)
-    };
-    headers.iter().any(|(name, value)| {
-        if name.eq_ignore_ascii_case("location") {
-            reaches(value) || guard.pattern(value)
-        } else if name.eq_ignore_ascii_case("refresh") {
-            reaches(refresh_target(value)) || guard.pattern(value)
+        if guard.url(&resolved) {
+            Some(guard.refusal_for_url(&resolved))
+        } else if guard.url_read_only(target) || guard.pattern(target) {
+            Some(guard.refusal())
         } else {
-            false
+            None
+        }
+    };
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("location") {
+            reaches(value)
+        } else if name.eq_ignore_ascii_case("refresh") {
+            reaches(refresh_target(value))
+        } else {
+            None
         }
     })
 }
@@ -421,7 +427,7 @@ pub fn command(
             let mut params = json!({ "requestId": id });
             if let Some(url) = &overrides.url {
                 if guard.url(url) {
-                    return Err(format!("{}\n", guard.refusal()));
+                    return Err(format!("{}\n", guard.refusal_for_url(url)));
                 }
                 params["url"] = json!(url);
             }
@@ -450,16 +456,16 @@ pub fn command(
                 params["responsePhrase"] = json!(text);
             }
             if let Some(headers) = &overrides.headers {
-                if redirects_to_protected(guard, &paused.url, headers) {
-                    return Err(format!("{}\n", guard.refusal()));
+                if let Some(reason) = redirect_refusal(guard, &paused.url, headers) {
+                    return Err(format!("{reason}\n"));
                 }
                 params["responseHeaders"] = header_list(headers);
             }
             Ok(("Fetch.continueResponse", params))
         }
         Decision::Fulfill(fulfill) => {
-            if redirects_to_protected(guard, &paused.url, &fulfill.headers) {
-                return Err(format!("{}\n", guard.refusal()));
+            if let Some(reason) = redirect_refusal(guard, &paused.url, &fulfill.headers) {
+                return Err(format!("{reason}\n"));
             }
             let mut params = json!({
                 "requestId": id,
@@ -756,6 +762,28 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn unparseable_overrides_and_redirects_use_the_catalog_refusal() {
+        let guard = Protected::default();
+        let url = "http://exa%20mple.sliccy.ai/";
+        let error = format!("{}\n", slicc_browsers::catalog().protected_origins.unparseable_refusal);
+        let mut paused = Paused::from_event(&paused_event("S", "R", "https://example.test/base")).unwrap();
+        let decision = Decision::Continue(Overrides { url: Some(url.into()), ..Overrides::default() });
+        assert_eq!(command(&guard, &paused, &decision).unwrap_err(), error);
+        paused.status = Some(200);
+        for (name, value) in [("Location", url.to_string()), ("Refresh", format!("0; url={url}"))] {
+            let headers = vec![(name.into(), value)];
+            let decision = Decision::ContinueResponse(ResponseOverrides { headers: Some(headers.clone()), ..ResponseOverrides::default() });
+            assert_eq!(command(&guard, &paused, &decision).unwrap_err(), error);
+            let decision = Decision::Fulfill(Fulfill { status: 302, status_text: None, headers, body: Vec::new() });
+            assert_eq!(command(&guard, &paused, &decision).unwrap_err(), error);
+        }
+        for location in ["../ordinary", "/ordinary", "https://example.test/ordinary"] {
+            let decision = Decision::Fulfill(Fulfill::new(302).header("Location", location));
+            assert!(command(&guard, &paused, &decision).is_ok(), "{location}");
+        }
     }
 
     #[test]
