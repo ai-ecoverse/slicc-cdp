@@ -64,6 +64,21 @@ test('PR certification workflow reports despite skipped evidence ancestors', () 
   assert.match(group.run, /scripts\/cert\/pr-report\.mjs/);
 });
 
+test('independent BIOS re-download receives only a step-scoped Actions read token', () => {
+  const record = loadWorkflow().jobs.record;
+  assert.deepEqual(record.permissions, { contents: 'read', actions: 'read' });
+  assert.equal(record.env?.GH_TOKEN, undefined);
+  const authenticated = record.steps.filter((step) => step.env?.GH_TOKEN !== undefined);
+  assert.equal(authenticated.length, 1);
+  assert.equal(
+    authenticated[0].name,
+    'Code-only decision with explicit failed/skipped upstream statuses'
+  );
+  assert.equal(authenticated[0].env.GH_TOKEN, '${{ github.token }}');
+  assert.ok(authenticated[0].run.includes('scripts/cert/pr-record.mjs'));
+  assert.ok(record.steps.some((step) => step.with?.['persist-credentials'] === false));
+});
+
 test('PR certification controls come from main and candidate jobs stay hosted read-only', () => {
   const workflow = loadWorkflow();
   assert.equal(workflow.env.SLICC_CDP_PORTS, '9300-9309');
@@ -97,7 +112,10 @@ test('PR certification controls come from main and candidate jobs stay hosted re
     'assets',
   ]) {
     const job = workflow.jobs[name];
-    assert.deepEqual(job.permissions, { contents: 'read' });
+    assert.deepEqual(
+      job.permissions,
+      name === 'bios' ? { contents: 'read', actions: 'read' } : { contents: 'read' }
+    );
     const runners = job.strategy?.matrix?.include?.map((row) => row.os) ??
       job.strategy?.matrix?.os ?? [job['runs-on']];
     assert.ok(
@@ -208,16 +226,31 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   const consume = bios.steps.find((step) => step.run?.includes('scripts/cert/pr-bios-files.mjs'));
   assert.ok(consume, 'main-owned file writer must replace whole-result environment transport');
   assert.equal(consume.env, undefined);
+  const compare = bios.steps.find((step) => step.run?.includes('scripts/cert/pr-bios.mjs'));
+  assert.deepEqual(compare.env, { GH_TOKEN: '${{ github.token }}', CERT_BIOS_ACTUAL_ROWS: '1' });
+  assert.deepEqual(
+    Object.values(workflow.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .filter((step) => step.env?.CERT_BIOS_ACTUAL_ROWS !== undefined),
+    [compare]
+  );
+  assert.equal(workflow.env.CERT_BIOS_ACTUAL_ROWS, undefined);
+  assert.equal(bios.env.CERT_BIOS_ACTUAL_ROWS, undefined);
+  assert.equal(bios.permissions.actions, 'read');
+  assert.equal(bios.permissions.contents, 'read');
+  assert.equal(bios.env.GH_TOKEN, undefined);
+  assert.ok(!compare.run.includes('--rows'));
+  assert.ok(compare.run.includes('pr-bios --accept PASS,FAIL,INCOMPLETE --'));
   assert.ok(consume.run.includes("<<'EOF'"));
   for (const side of ['base', 'candidate']) {
     assert.ok(consume.run.includes(`toJSON(needs.bios_${side}.outputs.result || 'null')`));
-    assert.ok(consume.run.includes(`--${side} evidence/bios-${side}.json`));
+    assert.ok(compare.run.includes(`--${side} evidence/bios-${side}.json`));
   }
   assert.ok(!JSON.stringify(bios).includes('BIOS_BASE'));
   assert.ok(!JSON.stringify(bios).includes('BIOS_CANDIDATE'));
   assert.ok(!consume.run.includes('fromJSON'));
   assert.ok(consume.run.includes('pr-bios-files --accept PASS --'));
-  assert.ok(consume.run.indexOf('pr-bios-files --') < consume.run.indexOf('pr-bios --'));
+  assert.ok(bios.steps.indexOf(consume) < bios.steps.indexOf(compare));
   for (const name of ['guard', 'integration']) {
     const raw = steps(name).find((step) => step.uses?.startsWith('actions/upload-artifact@'));
     assert.ok(

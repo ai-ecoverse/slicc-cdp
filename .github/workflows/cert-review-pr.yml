@@ -758,6 +758,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: "read"
+      actions: "read"
     env:
       CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
     steps:
@@ -793,6 +794,12 @@ jobs:
           node scripts/gate.mjs pr-bios-files --accept PASS -- node scripts/cert/pr-bios-files.mjs --directory evidence --out evidence/bios-transport.json <<'EOF'
           {"base":${{ toJSON(needs.bios_base.outputs.result || 'null') }},"candidate":${{ toJSON(needs.bios_candidate.outputs.result || 'null') }}}
           EOF
+      -
+        name: "Main-owned actual-row and advisory validation"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          CERT_BIOS_ACTUAL_ROWS: "1"
+        run: |
           node scripts/gate.mjs pr-bios --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/pr-bios.mjs --plan evidence/plan.json --base evidence/bios-base.json --candidate evidence/bios-candidate.json --out evidence/bios.json
       -
         uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
@@ -986,6 +993,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: "read"
+      actions: "read"
     steps:
       -
         name: "Main-owned control checkout"
@@ -1039,6 +1047,7 @@ jobs:
       -
         name: "Code-only decision with explicit failed/skipped upstream statuses"
         env:
+          GH_TOKEN: "${{ github.token }}"
           CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
           CERT_PR_ASSETS: "${{ github.workspace }}/.cert/pr-assets"
           CERT_NEEDS: "${{ toJSON(needs) }}"

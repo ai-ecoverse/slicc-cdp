@@ -4,6 +4,7 @@ import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { selectBiosPin } from './pr-bios-result.mjs';
+import { biosExecutionRows } from './pr-bios-rows.mjs';
 import { client, required, residual } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 import { validateBios, validateGuard, validateMac, validateSuite } from './pr-validate.mjs';
@@ -14,6 +15,7 @@ const plan = json(path.join(options.evidence, 'plan.json'));
 const failures = [];
 const incomplete = [...(plan.issues ?? [])];
 const flags = [];
+const biosLedger = [];
 const emit = (status, reason) => (status === 'FAIL' ? failures : incomplete).push(reason);
 let artifactBinding;
 const bindingContext = {};
@@ -152,6 +154,15 @@ for (const [source, positive, negative] of [
   }
 }
 const biosPin = selectBiosPin(json(new URL('./pr-bios.json', import.meta.url)), bound);
+if (documents.bios?.rows !== undefined) {
+  try {
+    const { api } = client(plan.repository);
+    bindingContext.inventory ??= await artifactInventory(api, plan.run);
+    bindingContext.rows = await biosExecutionRows(plan, biosPin, api);
+  } catch (error) {
+    emit(error.certStatus ?? 'INCOMPLETE', `bios row uploads: ${error.message}`);
+  }
+}
 flags.push(
   ...validateBios(
     documents.bios,
@@ -159,7 +170,8 @@ flags.push(
     emit,
     plan,
     { base: baseline, candidate },
-    bindingContext
+    bindingContext,
+    biosLedger
   )
 );
 try {
@@ -272,6 +284,7 @@ const record = {
   testOnly: plan.testOnly,
   fullReviewTriggered: true,
   bios: biosPin,
+  biosLedger,
   required,
   self: plan.self,
   upstream,

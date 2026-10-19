@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { biosFindings } from './pr-bios-result.mjs';
 
@@ -99,11 +100,18 @@ export function validateGuard(guard, plan, vectors, emit) {
   }
 }
 
-export function validateBios(bios, pin, emit, plan, subjects, context) {
+export function validateBios(bios, pin, emit, plan, subjects, context, ledger) {
   const findings = biosFindings(bios, pin, plan, subjects, context);
   for (const reason of findings.failures) emit('FAIL', reason);
   for (const reason of findings.incomplete) emit('INCOMPLETE', reason);
   if (bios?.status === 'FAIL') emit('FAIL', 'bios: producer reported failure');
+  if (
+    bios?.rows !== undefined &&
+    (!isDeepStrictEqual(bios.advisories, findings.advisories) ||
+      !isDeepStrictEqual(bios.biosLedger, findings.biosLedger))
+  )
+    emit('FAIL', 'bios: producer advisory or ledger differs from independent classification');
+  if (Array.isArray(ledger)) ledger.push(...(findings.biosLedger ?? []));
   return findings.flags;
 }
 
