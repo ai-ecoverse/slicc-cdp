@@ -126,7 +126,7 @@ function fixture(t) {
   return { directory, packs, plan, results };
 }
 
-function invoke(f, script = 'pr-bios.mjs', args = []) {
+function invoke(f, script = 'pr-bios.mjs', args = [], overrides = {}) {
   for (const side of ['base', 'candidate'])
     save(path.join(f.directory, `${side}.json`), f.results[side]);
   const out = path.join(f.directory, 'bios.json');
@@ -141,7 +141,10 @@ function invoke(f, script = 'pr-bios.mjs', args = []) {
       ...inputDirectoryArgs(f, script),
       ...args,
     ],
-    { encoding: 'utf8', env: { ...process.env, CERT_PR_PACKS: f.packs } }
+    {
+      encoding: 'utf8',
+      env: { ...process.env, CERT_BIOS_ACTUAL_ROWS: '', CERT_PR_PACKS: f.packs, ...overrides },
+    }
   );
   const document = read(out);
   assertVerdict(invocation.stdout, script.replace(/\.mjs$/, ''), document.status);
@@ -163,6 +166,105 @@ function failRow(f, side, kind) {
   ];
   result.tests[0] = { ...result.tests[0], verdict: kind, failed: failure.failed };
 }
+
+test('without actual-row opt-in the strict baseline-flake classification is byte-for-byte unchanged', (t) => {
+  const f = fixture(t);
+  failRow(f, 'base', 'flaky');
+  const failed = { candidate: '1/3', baseline: '0/3' };
+  f.results.base.tests[0].failed = failed;
+  f.results.base.flaky = [{ ...failure, failed }];
+  f.results.base.tests[0].runs = ['pass', 'fail', 'pass'];
+  f.results.candidate.tests[0].runs = ['pass', 'pass', 'pass'];
+  const result = invoke(f).document;
+  const incomplete = [
+    'bios: base: flaky smoke',
+    'bios: paired base: unexecuted, partial or flaky test guard/test-0',
+  ];
+  assert.equal(
+    JSON.stringify({
+      status: result.status,
+      failures: result.failures,
+      incomplete: result.incomplete,
+      flags: result.flags,
+      reason: result.reason,
+    }),
+    JSON.stringify({
+      status: 'INCOMPLETE',
+      failures: [],
+      incomplete,
+      flags: [],
+      reason: incomplete.join('; '),
+    })
+  );
+  assert.equal(result.rows, undefined);
+  assert.deepEqual(result.advisories, []);
+  assert.deepEqual(result.biosLedger, []);
+});
+
+for (const mode of ['env missing documents', 'env mismatched documents', 'direct flag accepted'])
+  test(`actual-row opt-in never relaxes ${mode}`, async (t) => {
+    const f = fixture(t);
+    for (const side of ['base', 'candidate'])
+      save(path.join(f.directory, `${side}.json`), f.results[side]);
+    const server = createServer((request, response) => {
+      assert.match(request.url, /^\/repos\/fixture\/lane\/actions\/runs\/42\/artifacts\?/);
+      const artifacts =
+        mode === 'env mismatched documents'
+          ? [
+              {
+                id: 20,
+                name: 'base-canary-shard-canary-packages-update-cdp',
+                digest: `sha256:${'d'.repeat(64)}`,
+                expired: false,
+                workflow_run: { id: 99, head_sha: 'f'.repeat(40) },
+              },
+            ]
+          : [];
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ total_count: artifacts.length, artifacts }));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const out = path.join(f.directory, 'actual-rows-result.json');
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [
+          path.join(root, 'scripts/cert/pr-bios.mjs'),
+          '--plan',
+          path.join(f.directory, 'plan.json'),
+          '--out',
+          out,
+          ...(mode === 'direct flag accepted' ? ['--rows'] : []),
+        ],
+        {
+          env: {
+            ...process.env,
+            CERT_PR_PACKS: f.packs,
+            CERT_BIOS_ACTUAL_ROWS: mode === 'direct flag accepted' ? '' : '1',
+            GH_TOKEN: '',
+            GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`,
+          },
+        }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const value = read(out);
+    assert.equal(value.status, 'INCOMPLETE');
+    assertVerdict(result.stdout, 'pr-bios', 'INCOMPLETE');
+    assert.match(value.reason, /row artifact/);
+    assert.notEqual(value.status, 'PASS');
+  });
 
 const cases = [
   ['two complete bound calls', () => {}, 'PASS'],

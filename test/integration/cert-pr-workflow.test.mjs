@@ -227,11 +227,19 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   assert.ok(consume, 'main-owned file writer must replace whole-result environment transport');
   assert.equal(consume.env, undefined);
   const compare = bios.steps.find((step) => step.run?.includes('scripts/cert/pr-bios.mjs'));
-  assert.deepEqual(compare.env, { GH_TOKEN: '${{ github.token }}' });
+  assert.deepEqual(compare.env, { GH_TOKEN: '${{ github.token }}', CERT_BIOS_ACTUAL_ROWS: '1' });
+  assert.deepEqual(
+    Object.values(workflow.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .filter((step) => step.env?.CERT_BIOS_ACTUAL_ROWS !== undefined),
+    [compare]
+  );
+  assert.equal(workflow.env.CERT_BIOS_ACTUAL_ROWS, undefined);
+  assert.equal(bios.env.CERT_BIOS_ACTUAL_ROWS, undefined);
   assert.equal(bios.permissions.actions, 'read');
   assert.equal(bios.permissions.contents, 'read');
   assert.equal(bios.env.GH_TOKEN, undefined);
-  assert.ok(compare.run.includes('--rows'));
+  assert.ok(!compare.run.includes('--rows'));
   assert.ok(compare.run.includes('pr-bios --accept PASS,FAIL,INCOMPLETE --'));
   assert.ok(consume.run.includes("<<'EOF'"));
   for (const side of ['base', 'candidate']) {

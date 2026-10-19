@@ -13,7 +13,7 @@ const options = args({
   base: { type: 'string' },
   candidate: { type: 'string' },
   bindings: { type: 'string' },
-  rows: { type: 'boolean', default: false },
+  rows: { type: 'boolean', default: process.env.CERT_BIOS_ACTUAL_ROWS === '1' },
   'base-report': { type: 'string' },
   'candidate-report': { type: 'string' },
 });

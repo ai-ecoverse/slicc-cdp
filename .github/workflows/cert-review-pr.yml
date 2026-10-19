@@ -798,8 +798,9 @@ jobs:
         name: "Main-owned actual-row and advisory validation"
         env:
           GH_TOKEN: "${{ github.token }}"
+          CERT_BIOS_ACTUAL_ROWS: "1"
         run: |
-          node scripts/gate.mjs pr-bios --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/pr-bios.mjs --plan evidence/plan.json --base evidence/bios-base.json --candidate evidence/bios-candidate.json --rows --out evidence/bios.json
+          node scripts/gate.mjs pr-bios --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/pr-bios.mjs --plan evidence/plan.json --base evidence/bios-base.json --candidate evidence/bios-candidate.json --out evidence/bios.json
       -
         uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
         if: "${{ always() }}"
