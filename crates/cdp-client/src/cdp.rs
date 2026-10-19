@@ -2,6 +2,7 @@ use crate::fetch::{self, Decision, Paused};
 use crate::net::Ws;
 use crate::protected::{Opener, Protected};
 use crate::shield;
+use crate::worlds::Worlds;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -56,6 +57,7 @@ pub struct Cdp {
     streams: BTreeSet<String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
+    worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
@@ -93,6 +95,7 @@ impl Cdp {
             streams: BTreeSet::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
+            worlds: Worlds::default(),
             frames: BTreeMap::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
@@ -233,6 +236,16 @@ impl Cdp {
                 return Err(self.refusal());
             }
         }
+        if Worlds::selectors(params) || Worlds::sensitive(method) {
+            let session = session_id.unwrap_or("");
+            if !self.worlds.enabled(session) && (Worlds::sensitive(method) || self.worlds.reason(session, method, params).is_some()) {
+                self.raw_call("Runtime.enable", json!({}), session_id, Duration::from_secs(10))?;
+                self.worlds.enable(session);
+            }
+            if let Some(reason) = self.worlds.reason(session, method, params) {
+                return Err(reason.into());
+            }
+        }
         if params
             .get("targetId")
             .and_then(|v| v.as_str())
@@ -295,7 +308,7 @@ impl Cdp {
             for key in ["targetId", "frameId"] {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
-                    if self.target_protected(&target, key == "frameId")? {
+                    if (key == "frameId" && self.frame_protected(&target)) || self.target_protected(&target, key == "frameId")? {
                         return Err(self.refusal());
                     }
                 }
@@ -351,6 +364,23 @@ impl Cdp {
         session_id: Option<&str>,
         mut result: Value,
     ) -> Result<Value, String> {
+        if Worlds::sensitive(method) {
+            if let Some(reason) = self.worlds.reason(session_id.unwrap_or(""), method, params) {
+                return Err(reason.into());
+            }
+        }
+        if method == "Runtime.enable" {
+            self.worlds.enable(session_id.unwrap_or(""));
+        } else if method == "Runtime.disable" {
+            self.worlds.disable(session_id.unwrap_or(""));
+        }
+        self.worlds.reply(session_id.unwrap_or(""), method, &result);
+        if method == "Page.createIsolatedWorld" {
+            self.worlds.created(session_id.unwrap_or(""), &result);
+        }
+        if method == "Runtime.compileScript" {
+            self.worlds.script(session_id.unwrap_or(""), &result);
+        }
         if let Some(stream) = result.get("stream").and_then(|v| v.as_str()) {
             self.streams.insert(stream.to_string());
         }
@@ -1032,12 +1062,19 @@ impl Cdp {
     }
 
     fn deliver(&mut self, mut value: Value) {
+        if self.worlds.event(&value, &self.guard) {
+            if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
+                let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
+            }
+            return;
+        }
         self.adopt_guard_attach(&value);
         self.watch(&mut value);
         if self.hidden(&value) {
             return;
         }
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        self.worlds.visible_event(value.get("sessionId").and_then(Value::as_str).unwrap_or(""), method, &value["params"]);
         let id = value
             .pointer("/params/requestId")
             .and_then(|v| v.as_str())
