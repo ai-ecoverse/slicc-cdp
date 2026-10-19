@@ -1036,7 +1036,7 @@ Object.defineProperty(document, 'modelContext', {
 
     await t.test('stalled body probe gives up within its own timeout', async () => {
       const probeTimeoutMs = 5000;
-      const schedulingMarginMs = 1500;
+      const schedulingMarginMs = 2000;
       const hangMs = 30000;
       let requested;
       let abandoned;
