@@ -588,18 +588,37 @@ impl Cdp {
 
     fn wait_destroyed(&mut self, target: &str, mark: usize, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
-        loop {
-            if self.events[mark..].iter().any(|event| {
+        let destroyed = |events: &[Value]| {
+            events[mark..].iter().any(|event| {
                 event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
                     && event.pointer("/params/targetId").and_then(Value::as_str) == Some(target)
-            }) {
+            })
+        };
+        loop {
+            if destroyed(&self.events) {
                 return Ok(());
             }
-            if Instant::now() >= deadline || !self.pump(deadline)? {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(
-                    "Target.targetDestroyed timed out while closing the refused target\n".into()
+                    "Target.targetDestroyed timed out and Target.getTargets did not confirm closure\n".into()
                 );
             }
+            let listed = self.raw_call("Target.getTargets", json!({}), None, left);
+            let absent = listed
+                .as_ref()
+                .ok()
+                .and_then(|result| result.get("targetInfos"))
+                .and_then(Value::as_array)
+                .is_some_and(|infos| {
+                    infos.iter().all(|info| info.get("targetId").and_then(Value::as_str).is_some())
+                        && !infos.iter().any(|info| info.get("targetId").and_then(Value::as_str) == Some(target))
+                });
+            if destroyed(&self.events) || absent {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            self.pump(Instant::now() + left.min(Duration::from_millis(100)))?;
         }
     }
 
@@ -1686,6 +1705,7 @@ mod tests {
         inner: Pending,
         destroy_after: Option<Duration>,
         destroyed_at: Option<Instant>,
+        closed: bool,
     }
 
     impl Transport for Cleanup {
@@ -1693,6 +1713,7 @@ mod tests {
             self.inner.send_text(text)?;
             let message: Value = serde_json::from_str(text).unwrap();
             if message["method"] == "Target.closeTarget" {
+                self.closed = true;
                 self.destroyed_at = self.destroy_after.map(|delay| Instant::now() + delay);
             }
             Ok(())
@@ -1709,6 +1730,10 @@ mod tests {
                         "method": "Target.targetDestroyed", "params": { "targetId": "T" }
                     }).to_string()));
                 }
+                self.destroyed_at = Some(at);
+            }
+            if self.closed {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             }
             Ok(None)
         }
@@ -1720,6 +1745,9 @@ mod tests {
             Some("Target.getTargetInfo") => json!({ "targetInfo": {
                 "targetId": "T", "type": "page", "url": "about:blank"
             } }),
+            Some("Target.getTargets") => json!({ "targetInfos": [
+                { "targetId": "T", "type": "page", "url": "about:blank" }
+            ] }),
             Some("Target.attachToTarget") => json!({ "sessionId": "S" }),
             Some("Network.setBypassServiceWorker") => return Vec::new(),
             Some("Target.closeTarget") => return vec![
@@ -1736,6 +1764,7 @@ mod tests {
             inner: Pending { inbox: VecDeque::new(), answer },
             destroy_after: delay,
             destroyed_at: None,
+            closed: false,
         }))
     }
 
@@ -1745,6 +1774,22 @@ mod tests {
         let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
         assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target: Network.setBypassServiceWorker timed out\n");
         assert!(cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == "T"));
+        assert!(cdp.is_protected_target("T"));
+    }
+
+    #[test]
+    fn cleanup_confirms_closure_without_browser_events() {
+        let mut cdp = cleanup(None, |message| {
+            if message["method"] == "Target.getTargets" {
+                return vec![json!({ "id": message["id"], "result": { "targetInfos": [
+                    { "targetId": "OTHER", "type": "page", "url": "about:blank" }
+                ] } })];
+            }
+            cleanup_answer(message).into_iter().filter(|reply| reply.get("method").is_none()).collect()
+        });
+        let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target: Network.setBypassServiceWorker timed out\n");
+        assert!(!cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed"));
         assert!(cdp.is_protected_target("T"));
     }
 

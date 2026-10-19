@@ -96,75 +96,83 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
         await rm(cwd, { recursive: true, force: true });
       }
     });
-    await t.test(
-      'a required step past the shared budget is refused, named, and closed',
-      async () => {
-        const before = await pages(browser.wsUrl);
-        const traffic = [];
-        const proxy = await cdpProxy(browser.wsUrl, {
-          observe: (direction, message) =>
-            traffic.push({ at: performance.now(), direction, message }),
-          delays: {
-            'Fetch.enable': { ms: 12000 },
-            'Network.enable': { ms: 12000 },
-            'Network.setBypassServiceWorker': { ms: 12000 },
-          },
-        });
-        try {
-          const { opened, snapshot } = await drive(proxy, site);
-          assert.equal(snapshot, undefined);
-          assert.notEqual(opened.code, 0);
-          assert.equal(opened.stdout, '');
-          assert.equal(
-            opened.stderr,
-            `${unguarded}: Network.setBypassServiceWorker timed out\n`,
-            opened.stderr
-          );
-          const after = await pages(browser.wsUrl);
-          const inspector = await rawSocket(browser.wsUrl);
-          let targets;
-          try {
-            targets = await inspector.send('Target.getTargets');
-          } finally {
-            inspector.close();
-          }
-          const create = traffic.find(
-            ({ direction, message }) =>
-              direction === 'client' && message.method === 'Target.createTarget'
-          );
-          const created = traffic.find(
-            ({ direction, message }) => direction === 'browser' && message.id === create?.message.id
-          );
-          const targetId = created?.message.result?.targetId;
-          const close = traffic.find(
-            ({ direction, message }) =>
-              direction === 'client' &&
-              message.method === 'Target.closeTarget' &&
-              message.params.targetId === targetId
-          );
-          const closeReply = traffic.find(
-            ({ direction, message }) => direction === 'browser' && message.id === close?.message.id
-          );
-          const evidence = JSON.stringify({
-            opened,
-            before,
-            after,
-            targets,
-            targetId,
-            close,
-            closeReply,
-            traffic,
+    for (const browserEvents of [true, false]) {
+      await t.test(
+        browserEvents
+          ? 'a required step past the shared budget is refused, named, and closed'
+          : 'a required step past the shared budget is closed without browser-level events',
+        async () => {
+          const before = await pages(browser.wsUrl);
+          const traffic = [];
+          const proxy = await cdpProxy(browser.wsUrl, {
+            browserEvents,
+            observe: (direction, message) =>
+              traffic.push({ at: performance.now(), direction, message }),
+            delays: {
+              'Fetch.enable': { ms: 12000 },
+              'Network.enable': { ms: 12000 },
+              'Network.setBypassServiceWorker': { ms: 12000 },
+            },
           });
-          assert.deepEqual(
-            after.filter((id) => !before.includes(id)),
-            [],
-            `the refused tab was left open: ${evidence}`
-          );
-        } finally {
-          await proxy.close();
+          try {
+            const { opened, snapshot } = await drive(proxy, site);
+            assert.equal(snapshot, undefined);
+            assert.notEqual(opened.code, 0);
+            assert.equal(opened.stdout, '');
+            assert.equal(
+              opened.stderr,
+              `${unguarded}: Network.setBypassServiceWorker timed out\n`,
+              opened.stderr
+            );
+            const after = await pages(browser.wsUrl);
+            const inspector = await rawSocket(browser.wsUrl);
+            let targets;
+            try {
+              targets = await inspector.send('Target.getTargets');
+            } finally {
+              inspector.close();
+            }
+            const create = traffic.find(
+              ({ direction, message }) =>
+                direction === 'client' && message.method === 'Target.createTarget'
+            );
+            const created = traffic.find(
+              ({ direction, message }) =>
+                direction === 'browser' && message.id === create?.message.id
+            );
+            const targetId = created?.message.result?.targetId;
+            const close = traffic.find(
+              ({ direction, message }) =>
+                direction === 'client' &&
+                message.method === 'Target.closeTarget' &&
+                message.params.targetId === targetId
+            );
+            const closeReply = traffic.find(
+              ({ direction, message }) =>
+                direction === 'browser' && message.id === close?.message.id
+            );
+            const evidence = JSON.stringify({
+              browserEvents,
+              opened,
+              before,
+              after,
+              targets,
+              targetId,
+              close,
+              closeReply,
+              traffic,
+            });
+            assert.deepEqual(
+              after.filter((id) => !before.includes(id)),
+              [],
+              `the refused tab was left open: ${evidence}`
+            );
+          } finally {
+            await proxy.close();
+          }
         }
-      }
-    );
+      );
+    }
   } finally {
     await browser.close();
     await site.close();
