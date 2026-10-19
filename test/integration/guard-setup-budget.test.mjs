@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { launchBrowser } from './browser.mjs';
+import { launchBrowser, rawSocket } from './browser.mjs';
 import { cdpProxy } from './cdp-proxy.mjs';
 import { runProcess } from './runners.mjs';
 import { startServer } from './server.mjs';
@@ -100,7 +100,10 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
       'a required step past the shared budget is refused, named, and closed',
       async () => {
         const before = await pages(browser.wsUrl);
+        const traffic = [];
         const proxy = await cdpProxy(browser.wsUrl, {
+          observe: (direction, message) =>
+            traffic.push({ at: performance.now(), direction, message }),
           delays: {
             'Fetch.enable': { ms: 12000 },
             'Network.enable': { ms: 12000 },
@@ -118,10 +121,44 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
             opened.stderr
           );
           const after = await pages(browser.wsUrl);
+          const inspector = await rawSocket(browser.wsUrl);
+          let targets;
+          try {
+            targets = await inspector.send('Target.getTargets');
+          } finally {
+            inspector.close();
+          }
+          const create = traffic.find(
+            ({ direction, message }) =>
+              direction === 'client' && message.method === 'Target.createTarget'
+          );
+          const created = traffic.find(
+            ({ direction, message }) => direction === 'browser' && message.id === create?.message.id
+          );
+          const targetId = created?.message.result?.targetId;
+          const close = traffic.find(
+            ({ direction, message }) =>
+              direction === 'client' &&
+              message.method === 'Target.closeTarget' &&
+              message.params.targetId === targetId
+          );
+          const closeReply = traffic.find(
+            ({ direction, message }) => direction === 'browser' && message.id === close?.message.id
+          );
+          const evidence = JSON.stringify({
+            opened,
+            before,
+            after,
+            targets,
+            targetId,
+            close,
+            closeReply,
+            traffic,
+          });
           assert.deepEqual(
             after.filter((id) => !before.includes(id)),
             [],
-            'the refused tab was left open'
+            `the refused tab was left open: ${evidence}`
           );
         } finally {
           await proxy.close();
