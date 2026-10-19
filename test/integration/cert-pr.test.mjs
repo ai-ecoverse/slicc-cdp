@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -18,6 +18,38 @@ const save = (file, value) => {
   writeFileSync(file, JSON.stringify(value));
   return file;
 };
+
+test('test CLI children strip ambient CERT and GITHUB values unless explicitly overridden', () => {
+  const ambient = {
+    CERT_PR_PACKS: '/ambient/packs',
+    CERT_RUNNER: 'ambient',
+    CERT_REVIEW_MODEL: 'ambient',
+    GITHUB_API_URL: 'https://ambient.invalid',
+    GITHUB_OUTPUT: '/ambient/output',
+    GITHUB_RUN_ID: 'ambient',
+    KEEP_FIXTURE: 'kept',
+  };
+  const env = cliEnvironment({}, ambient);
+  assert.deepEqual(env, { KEEP_FIXTURE: 'kept' });
+  const child = spawnSync(
+    process.execPath,
+    [
+      '-e',
+      'process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => /^(CERT_|GITHUB_|KEEP_FIXTURE)/.test(key)))))',
+    ],
+    {
+      env,
+      encoding: 'utf8',
+    }
+  );
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), { KEEP_FIXTURE: 'kept' });
+  assert.deepEqual(cliEnvironment({ CERT_PR_PACKS: '/case/packs', GITHUB_RUN_ID: '42' }, ambient), {
+    KEEP_FIXTURE: 'kept',
+    CERT_PR_PACKS: '/case/packs',
+    GITHUB_RUN_ID: '42',
+  });
+});
 
 function fixture(t, file = 'src/client.js', contents = 'changed\n') {
   const directory = mkdtempSync(path.join(tmpdir(), 'slicc-pr-'));
@@ -112,17 +144,23 @@ async function server(t, f, extras = {}) {
   return { origin: `http://127.0.0.1:${api.address().port}`, calls };
 }
 
+function cliEnvironment(overrides = {}, ambient = process.env) {
+  return {
+    ...Object.fromEntries(Object.entries(ambient).filter(([key]) => !/^(CERT_|GITHUB_)/.test(key))),
+    ...overrides,
+  };
+}
+
 async function cli(script, argv, f, api, extra = {}) {
   const child = spawn(process.execPath, [path.join(root, 'scripts/cert', script), ...argv], {
     cwd: f.directory,
-    env: {
-      ...process.env,
+    env: cliEnvironment({
       GH_TOKEN: '',
       GITHUB_API_URL: api.origin,
       GITHUB_RUN_ID: '42',
       GITHUB_RUN_ATTEMPT: '1',
       ...extra,
-    },
+    }),
   });
   let stdout = '';
   let stderr = '';
@@ -532,13 +570,15 @@ test('PR bios public input planner binds both local packs and labels without pin
   const { out, plan } = await planned(f, api);
   const packs = path.join(f.directory, 'packs');
   for (const side of ['base', 'candidate']) pack(f, plan, side, packs);
-  t.after(() => {
-    for (const side of ['base', 'candidate'])
-      rmSync(path.join(root, `.cert/bios-input-${side}`), { recursive: true, force: true });
-  });
+  const directory = path.join(f.directory, 'unpacked-inputs');
+  const directoryArgs = /\bdirectory:\s*\{/.test(
+    readFileSync(path.join(root, 'scripts/cert/pr-bios-inputs.mjs'), 'utf8')
+  )
+    ? ['--directory', directory]
+    : [];
   const output = path.join(f.directory, 'inputs.json');
   const call = () =>
-    cli('pr-bios-inputs.mjs', ['--plan', out, '--out', output], f, api, {
+    cli('pr-bios-inputs.mjs', ['--plan', out, '--out', output, ...directoryArgs], f, api, {
       CERT_PR_PACKS: packs,
     });
   const result = await call();

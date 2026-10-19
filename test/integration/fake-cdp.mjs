@@ -67,7 +67,7 @@ const tree = {
   ],
 };
 
-export async function fakeCdp({ refuse = [] } = {}) {
+export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = false } = {}) {
   const calls = [];
   const targets = [];
   const sessions = new Map();
@@ -97,6 +97,8 @@ export async function fakeCdp({ refuse = [] } = {}) {
     socket.write(
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
+    let noise;
+    socket.on('close', () => clearInterval(noise));
     const send = (message) => {
       if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
     };
@@ -106,8 +108,28 @@ export async function fakeCdp({ refuse = [] } = {}) {
       const event = (name, eventParams) =>
         send({ method: name, params: eventParams, ...(sessionId ? { sessionId } : {}) });
       const target = sessionId ? sessions.get(sessionId) : undefined;
-      if (refuse.includes(method))
-        return send({ id, error: { code: -32000, message: `${method} refused` } });
+      if (method === 'Slicc.action') clearInterval(noise);
+      if (refuse.includes(method)) {
+        send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
+        if (noisyRefusal) {
+          noise = setInterval(
+            () =>
+              send({
+                method: 'Target.targetInfoChanged',
+                params: {
+                  targetInfo: {
+                    targetId: 'NOISY',
+                    type: 'page',
+                    url: 'https://example.test/',
+                    title: 'Activity',
+                  },
+                },
+              }),
+            20
+          );
+        }
+        return;
+      }
       switch (method) {
         case 'Target.getTargets':
           return answer({ targetInfos: targets.map(info) });

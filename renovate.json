@@ -22,6 +22,26 @@
       "additionalBranchPrefix": "workflow-",
       "commitMessageTopic": "slicc-shared-web reusable workflows",
       "semanticCommitType": "ci"
+    },
+    {
+      "description": "Changes that reach the shipped wasm or binaries wait for the PR certification: Renovate labels them merge-ok so cert-review-pr runs, and merges only when every check, cert-review included, is green.",
+      "matchManagers": ["cargo"],
+      "labels": ["merge-ok"],
+      "platformAutomerge": false
+    },
+    {
+      "description": "Runtime npm dependencies of the published package wait for the PR certification the same way.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["package.json"],
+      "matchDepTypes": ["dependencies", "optionalDependencies", "peerDependencies"],
+      "labels": ["merge-ok"],
+      "platformAutomerge": false
+    },
+    {
+      "description": "Workflow and action bumps that build or publish the shipped artifacts wait for the PR certification the same way.",
+      "matchManagers": ["github-actions"],
+      "labels": ["merge-ok"],
+      "platformAutomerge": false
     }
   ],
   "customDatasources": {

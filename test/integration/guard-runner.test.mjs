@@ -11,12 +11,32 @@ import { launchBrowser } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, origins } from './guard-fixture.mjs';
 
-const set = JSON.parse(
+const published = JSON.parse(
   await readFile(
     fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-vectors.json')),
     'utf8'
   )
 );
+const allTargets = [...new Set(published.vectors.flatMap((vector) => vector.targets))];
+const selectedTargets = process.env.SLICC_GUARD_TARGETS
+  ? JSON.parse(process.env.SLICC_GUARD_TARGETS)
+  : allTargets;
+if (
+  !Array.isArray(selectedTargets) ||
+  !selectedTargets.length ||
+  new Set(selectedTargets).size !== selectedTargets.length ||
+  selectedTargets.some((target) => !allTargets.includes(target))
+)
+  throw new Error('guard shard must select unique published targets');
+const set = {
+  ...published,
+  vectors: published.vectors
+    .map((vector) => ({
+      ...vector,
+      targets: vector.targets.filter((target) => selectedTargets.includes(target)),
+    }))
+    .filter((vector) => vector.targets.length),
+};
 const parityIds = new Set([
   'C5.fetch',
   'C5.xhr',
@@ -221,6 +241,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
+  report.selection = { targets: selectedTargets, allTargets };
   report.results = codedSkips(report.results);
   report.skipped = report.results
     .filter((row) => row.control === 'skip')
@@ -255,11 +276,22 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
   t.diagnostic(`report: ${file}`);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  assert.equal(parity.length, 108, 'recorded parity subset');
+  const expectedParity = set.vectors
+    .filter((vector) => parityIds.has(vector.id))
+    .reduce(
+      (total, vector) =>
+        total +
+        vector.targets.filter((target) => ['seven', 'vault'].includes(target)).length *
+          Object.keys(set.variants).length,
+      0
+    );
+  assert.equal(parity.length, expectedParity, 'recorded parity subset');
+  if (!process.env.SLICC_GUARD_TARGETS) assert.equal(expectedParity, 108);
   assert.equal(skipped, 0);
-  assert.equal(passing, 108);
+  assert.equal(passing, expectedParity);
   const c8 = report.results.filter((row) => row.id.startsWith('C8.'));
-  assert(c8.length > 0, 'published privileged UI rows ran');
+  if (set.vectors.some((vector) => vector.id.startsWith('C8.')))
+    assert(c8.length > 0, 'published privileged UI rows ran');
   assert(
     c8.every((row) => [row.control, row.guarded, row.live].every((status) => status === 'pass'))
   );

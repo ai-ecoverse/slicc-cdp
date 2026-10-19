@@ -1,0 +1,145 @@
+name: Guard shard measurement
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/cert-guard-shards.yml'
+      - 'scripts/cert/**'
+      - 'test/integration/guard-*.mjs'
+      - 'test/integration/cert-execution.test.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'Cargo.lock'
+      - 'crates/cdp-client/**'
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SLICC_CDP_PORTS: 9300-9309
+
+jobs:
+  plan:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - id: plan
+        run: node scripts/gate.mjs guard-shard-plan -- node scripts/cert/guard-shard-plan.mjs --out .cert/guard-shard-plan.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guard-shard-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cert/guard-shard-plan.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  shard:
+    needs: plan
+    runs-on: ${{ vars.CERT_RUNNER }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Record job start
+        run: printf 'CERT_SUITE_JOB_STARTED_MS=%s\n' "$(date +%s%3N)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: guard-shard-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cert
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Exact Rust using the runner's installed rustup
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rust=$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)
+          rustup toolchain install "$rust" --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Pinned Chromium and required system libraries
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          npm run -s browser -- $deps
+      - name: Build the subject's public Rust guard driver
+        run: cargo build --locked -p slicc-cdp-client --example guard_bridge
+      - name: Execute every row assigned to this fixed shard
+        env:
+          SHARD: ${{ matrix.id }}
+        run: node scripts/gate.mjs guard-shard-run -- node scripts/cert/guard-shard-run.mjs --plan .cert/guard-shard-plan.json --shard "$SHARD" --out .cert/guard-shard/shard.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: guard-shard-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+          path: .cert/guard-shard/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  aggregate:
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: guard-shard-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cert
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        continue-on-error: true
+        with:
+          name: guard-shard-${{ github.run_id }}-${{ github.run_attempt }}-a
+          path: .cert/guard-shards/a
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        continue-on-error: true
+        with:
+          name: guard-shard-${{ github.run_id }}-${{ github.run_attempt }}-b
+          path: .cert/guard-shards/b
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        continue-on-error: true
+        with:
+          name: guard-shard-${{ github.run_id }}-${{ github.run_attempt }}-c
+          path: .cert/guard-shards/c
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        continue-on-error: true
+        with:
+          name: guard-shard-${{ github.run_id }}-${{ github.run_attempt }}-d
+          path: .cert/guard-shards/d
+      - name: Require every shard and every exact planned row
+        if: always()
+        run: node scripts/gate.mjs guard-shard-record -- node scripts/cert/guard-shard-record.mjs --plan .cert/guard-shard-plan.json --directory .cert/guard-shards --out .cert/guard-shard-record.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: guard-shard-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cert/guard-shard-record.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90

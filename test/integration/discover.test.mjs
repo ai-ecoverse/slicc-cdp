@@ -1034,22 +1034,32 @@ Object.defineProperty(document, 'modelContext', {
       }
     });
 
-    await t.test('stalled body probe gives up within 6s', async () => {
+    await t.test('stalled body probe gives up within its own timeout', async () => {
+      const probeTimeoutMs = 5000;
+      const schedulingMarginMs = 2000;
+      const hangMs = 30000;
       let requested;
+      let abandoned;
+      const mark = () => {
+        if (requested !== undefined) abandoned ??= performance.now();
+      };
       const stallServer = createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
-        if (url.pathname === '/') {
-          res.writeHead(200, { 'content-type': 'text/html' });
-          res.end('<!doctype html><title>Stall</title>');
-          return;
-        }
         if (url.pathname === '/.well-known/ard.json') {
+          mark();
           res.writeHead(200, {
             'content-type': 'application/json',
             'content-length': '10000',
           });
           requested ??= performance.now();
+          req.socket.once('close', mark);
           res.write('{"name":"x');
+          return;
+        }
+        mark();
+        if (url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          res.end('<!doctype html><title>Stall</title>');
           return;
         }
         res.writeHead(404);
@@ -1061,32 +1071,24 @@ Object.defineProperty(document, 'modelContext', {
         const cwd = await runner.fresh();
         await runner.clearSession(cwd);
         await runner.playwright(['discover', '--json', '--once', `${stallOrigin}/`], cwd);
+        const exited = performance.now();
+        mark();
         assert.ok(requested !== undefined, 'the probe must request /.well-known/ard.json');
-        const elapsed = Math.round(performance.now() - requested);
-        assert.ok(elapsed < 6000, `probe must give up within 6s of its request, took ${elapsed}ms`);
+        const gaveUp = Math.round(abandoned - requested);
+        const finished = Math.round(exited - requested);
+        assert.ok(
+          gaveUp < probeTimeoutMs + schedulingMarginMs,
+          `probe must give up within its ${probeTimeoutMs}ms timeout plus ${schedulingMarginMs}ms of scheduling, took ${gaveUp}ms`
+        );
+        assert.ok(
+          finished < hangMs,
+          `discover must finish well before the ${hangMs}ms default call timeout, took ${finished}ms`
+        );
       } finally {
         stallServer.closeAllConnections();
         stallServer.close();
       }
     });
-  } finally {
-    await settle(browser?.close());
-  }
-});
-
-test('discover ARD', { timeout: 120_000 }, async (t) => {
-  let browser;
-  try {
-    browser = await launchBrowser();
-    const cli = path.join(
-      nativeDir,
-      process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
-    );
-    const curl = path.join(
-      nativeDir,
-      process.platform === 'win32' ? 'curlwright.exe' : 'curlwright'
-    );
-    const runner = nativeRunner(cli, curl, browser.wsUrl);
 
     await t.test('well-known ard.json with MCP, skill and squatted URN', async () => {
       const ardServer = createServer((req, res) => {

@@ -13,3 +13,6 @@ mod raw;
 pub mod sanitize;
 pub mod shield;
 pub mod state;
+mod worlds;
+#[cfg(test)]
+mod worlds_test;

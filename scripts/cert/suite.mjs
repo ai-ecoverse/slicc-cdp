@@ -1,11 +1,27 @@
-import { spawn } from 'node:child_process';
-import { appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { testArguments } from '../../test/integration/test-arguments.mjs';
-import { cleanEnv, save } from './common.mjs';
+import { performance } from 'node:perf_hooks';
+import { save } from './common.mjs';
+import { boundedBudget, suitePolicy } from './suite-policy.mjs';
+import { executeWorker, guardFile } from './suite-worker.mjs';
 
-export async function suite({ cwd, files, out, env = {}, retry = true }) {
+export async function suite({
+  cwd,
+  files,
+  out,
+  env = {},
+  retry = true,
+  workerTimeoutMs = suitePolicy.workerTimeoutMs,
+  budgetMs = suitePolicy.suiteBudgetMs,
+  deadline,
+}) {
   cwd = realpathSync(cwd);
+  workerTimeoutMs = boundedBudget(workerTimeoutMs, suitePolicy.workerTimeoutMs, 'worker timeout');
+  budgetMs = boundedBudget(budgetMs, suitePolicy.suiteBudgetMs, 'suite budget');
+  const started = performance.now();
+  deadline = Math.min(deadline ?? Infinity, started + budgetMs);
+  if (!Number.isFinite(deadline)) throw new Error('suite deadline must be finite');
+  const policy = { ...suitePolicy, workerTimeoutMs, budgetMs, isolatedGuardWorker: true };
   const behaviour = (row) =>
     ['test:pass', 'test:fail'].includes(row.type) &&
     !(row.file && row.name && path.resolve(cwd, row.name) === path.resolve(row.file));
@@ -30,62 +46,24 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
     writeFileSync(log, '');
     writeFileSync(stderr, '');
     const workers = [];
-    const pending = [...selected];
+    const pending = selected.filter((file) => file !== guardFile);
+    const executeFile = async (file) =>
+      workers.push(
+        await executeWorker({ cwd, file, env, deadline, index, out, log, stderr, workerTimeoutMs })
+      );
     const consume = async () => {
-      while (pending.length) {
-        const file = pending.shift();
-        const child = spawn(
-          process.execPath,
-          [
-            ...testArguments,
-            '--test-concurrency=1',
-            `--test-reporter=${path.join(import.meta.dirname, 'reporter.mjs')}`,
-            file,
-          ],
-          { cwd, env: { ...cleanEnv(), ...env }, detached: process.platform !== 'win32' }
-        );
-        let buffered = '';
-        const rows = [];
-        child.stdout.on('data', (chunk) => {
-          buffered += chunk;
-          const lines = buffered.split('\n');
-          buffered = lines.pop();
-          for (const line of lines) {
-            try {
-              const row = { ...JSON.parse(line), worker: file };
-              rows.push(row);
-              appendFileSync(log, `${JSON.stringify(row)}\n`);
-            } catch {
-              appendFileSync(stderr, `${file}: invalid reporter line\n`);
-            }
-          }
-        });
-        child.stderr.on('data', (chunk) => appendFileSync(stderr, `${file}: ${chunk}`));
-        const timer = setTimeout(() => {
-          if (process.platform === 'win32') child.kill('SIGKILL');
-          else {
-            try {
-              process.kill(-child.pid, 'SIGKILL');
-            } catch {
-              child.kill('SIGKILL');
-            }
-          }
-        }, 650000);
-        const outcome = await new Promise((resolve) => {
-          child.once('error', (error) => resolve({ exit: null, error: error.message }));
-          child.once('close', (exit, signal) => resolve({ exit, signal }));
-        });
-        clearTimeout(timer);
-        workers.push({ file, ...outcome, rows });
-      }
+      while (pending.length) await executeFile(pending.shift());
     };
-    await Promise.all([consume(), consume()]);
-    const lost = workers.some((worker) => worker.exit === null || worker.signal);
+    await Promise.all(Array.from({ length: suitePolicy.fileWorkers }, consume));
+    for (const file of selected.filter((file) => file === guardFile)) await executeFile(file);
+    const lost = workers.some((worker) => worker.exit === null || worker.signal || worker.timedOut);
     const result = {
       files: selected,
       exit: lost ? null : workers.some((worker) => worker.exit !== 0) ? 1 : 0,
       rows: workers.flatMap((worker) => worker.rows),
       workers,
+      policy,
+      elapsedMs: Math.round(performance.now() - started),
     };
     attempts.push(result);
     save(`${out}.${index}.json`, result);
@@ -97,10 +75,13 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
       (worker) =>
         !completed(worker) ||
         worker.exit !== 0 ||
-        worker.rows.some((row) => row.skip || row.todo || row.type === 'test:fail')
+        worker.reporterComplete === false ||
+        worker.rows.some((row) => row.skip || row.todo || row.type === 'test:fail') ||
+        worker.guardReport?.status === 'INCOMPLETE'
     )
     .map((worker) => worker.file);
-  if (retry && repeated.length) await execute(repeated);
+  const retryBudgetAvailable = performance.now() < deadline;
+  if (retry && repeated.length && retryBudgetAvailable) await execute(repeated);
   const latest = attempts.at(-1);
   const workers =
     attempts.length === 1
@@ -110,7 +91,14 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
   const missing = workers.filter((worker) => !completed(worker)).map((worker) => worker.file);
   const incomplete =
     missing.length ||
-    workers.some((worker) => worker.exit === null || worker.signal) ||
+    workers.some(
+      (worker) =>
+        worker.exit === null ||
+        worker.signal ||
+        worker.timedOut ||
+        worker.reporterComplete === false ||
+        worker.guardReport?.status === 'INCOMPLETE'
+    ) ||
     rows.some(
       (row) =>
         row.skip ||
@@ -127,6 +115,11 @@ export async function suite({ cwd, files, out, env = {}, retry = true }) {
     missing,
     rows,
     attempts,
+    policy,
+    elapsedMs: Math.round(performance.now() - started),
+    retryNotRunReason:
+      retry && repeated.length && !retryBudgetAvailable ? 'suite budget exhausted' : null,
+    guardReport: workers.find((worker) => worker.file === guardFile)?.guardReport ?? null,
   };
   save(`${out}.json`, result);
   return result;
