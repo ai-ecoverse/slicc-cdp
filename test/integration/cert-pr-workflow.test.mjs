@@ -125,8 +125,8 @@ test('record fetches exact source objects without credentials or candidate check
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
   const base = git(root, ['rev-parse', 'HEAD']);
-  const previous = git(root, ['rev-parse', 'HEAD~1']);
   git(root, ['clone', '--bare', '--no-local', root, remote]);
+  const previous = git(remote, ['commit-tree', `${base}^{tree}`], 'isolated fixture parent\n');
   git(remote, ['update-ref', 'refs/heads/source', base]);
   git(remote, ['symbolic-ref', 'HEAD', 'refs/heads/source']);
   git(remote, ['config', 'uploadpack.allowAnySHA1InWant', 'true']);

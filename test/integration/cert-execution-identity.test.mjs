@@ -20,17 +20,12 @@ const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding:
 const source = sourceIdentity(commit);
 const corpus = { ...installedCorpus(root), integrity: source.corpus.integrity };
 
-function fixture(t, subjectCommit = commit) {
+function fixture(t) {
   const directory = mkdtempSync(path.join(tmpdir(), 'slicc-execution-identity-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const archive = path.join(directory, 'source.tar');
-  execFileSync('git', ['archive', '-o', archive, subjectCommit], { cwd: root });
+  execFileSync('git', ['archive', '-o', archive, commit], { cwd: root });
   execFileSync('tar', ['-xf', archive, '-C', directory]);
-  if (subjectCommit !== commit) {
-    const harnessArchive = path.join(directory, 'harness.tar');
-    execFileSync('git', ['archive', '-o', harnessArchive, commit, 'test'], { cwd: root });
-    execFileSync('tar', ['-xf', harnessArchive, '-C', directory]);
-  }
   const installed = path.join(directory, 'node_modules/@ai-ecoverse/slicc-browsers');
   mkdirSync(installed, { recursive: true });
   for (const file of ['package.json', 'guard-vectors.json', 'guard-driver.mjs', 'guard-runner.mjs'])
@@ -38,7 +33,7 @@ function fixture(t, subjectCommit = commit) {
       path.join(root, 'node_modules/@ai-ecoverse/slicc-browsers', file),
       path.join(installed, file)
     );
-  const seed = stagedIdentity(directory, subjectIdentity(subjectCommit), source, 'a'.repeat(64));
+  const seed = stagedIdentity(directory, subjectIdentity(commit), source, 'a'.repeat(64));
   return { directory, installed, seed };
 }
 
@@ -52,26 +47,53 @@ function findings(execution, expected) {
 
 test('historical subject needs Cargo only while the selected current harness still requires its corpus lock', (t) => {
   const configured = JSON.parse(readFileSync(path.join(root, 'scripts/cert/base.json'), 'utf8'));
-  const historical = execFileSync('git', ['rev-parse', `${configured.commit}^{commit}`], {
-    cwd: root,
+  const golden = JSON.parse(
+    readFileSync(new URL('./cert-historical-cargo.json', import.meta.url), 'utf8')
+  );
+  assert.equal(golden.version, configured.version);
+  assert.ok(golden.sourceCommit.startsWith(configured.commit));
+  assert.equal(golden.package.devDependencies?.['@ai-ecoverse/slicc-browsers'], undefined);
+  assert.equal(golden.lockProjection.corpusEntryAbsent, true);
+  const f = fixture(t);
+  for (const item of golden.cargo) writeFileSync(path.join(f.directory, item.file), item.manifest);
+  writeFileSync(path.join(f.directory, 'package.json'), JSON.stringify(golden.package));
+  writeFileSync(
+    path.join(f.directory, 'package-lock.json'),
+    JSON.stringify({ lockfileVersion: 3, packages: {} })
+  );
+  execFileSync('git', ['init', '-q'], { cwd: f.directory });
+  execFileSync('git', ['add', 'crates', 'test', 'package.json', 'package-lock.json'], {
+    cwd: f.directory,
+  });
+  execFileSync(
+    'git',
+    [
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.invalid',
+      'commit',
+      '-qm',
+      'Historical Cargo-only subject fixture',
+    ],
+    { cwd: f.directory }
+  );
+  const historical = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: f.directory,
     encoding: 'utf8',
   }).trim();
-  const manifest = JSON.parse(
-    execFileSync('git', ['show', `${historical}:package.json`], { cwd: root })
-  );
-  assert.equal(manifest.devDependencies?.['@ai-ecoverse/slicc-browsers'], undefined);
-  const subject = subjectIdentity(historical);
+  const subject = subjectIdentity(historical, f.directory);
   assert.deepEqual(Object.keys(subject), ['commit', 'cargo']);
-  assert.equal(subject.cargo.length, 4);
+  assert.deepEqual(
+    subject.cargo.map(({ file, sha256 }) => ({ file, sha256 })),
+    golden.cargo.map(({ file, sha256 }) => ({ file, sha256 }))
+  );
   assert.throws(
-    () => sourceIdentity(historical),
+    () => sourceIdentity(historical, f.directory),
     /execution corpus exact locked package unavailable/
   );
-  const f = fixture(t, historical);
-  const bridge = 'crates/cdp-client/examples/guard_bridge.rs';
-  mkdirSync(path.dirname(path.join(f.directory, bridge)), { recursive: true });
-  cpSync(path.join(root, bridge), path.join(f.directory, bridge));
-  const observed = observeIdentity(f.directory, f.seed, 'guard', commit);
+  const seed = stagedIdentity(f.directory, subject, source, 'a'.repeat(64));
+  const observed = observeIdentity(f.directory, seed, 'guard', commit);
   const expected = expectedExecutionIdentity(
     subject,
     source,
