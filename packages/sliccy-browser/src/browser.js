@@ -334,7 +334,10 @@ async function ensureTabNow(url, options = {}) {
     }
   }
   const client = await openClient();
-  const created = await client.send('Target.createTarget', { url: 'about:blank' });
+  const created = await client.send('Target.createTarget', {
+    url: 'about:blank',
+    background: true,
+  });
   const targetId = created?.targetId;
   if (typeof targetId !== 'string' || targetId.length === 0) {
     throw new Error('Target.createTarget returned no targetId');
