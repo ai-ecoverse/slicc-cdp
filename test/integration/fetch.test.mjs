@@ -79,11 +79,7 @@ test('a guard armed while the browser has not committed a navigation still fails
   );
   const evidence = `pending-commit window not produced; ${proxy.evidence}`;
   assert(proxy.replies.length >= 1 && proxy.replies.length <= 3, evidence);
-  assert.match(
-    JSON.stringify(proxy.replies.at(-1)),
-    /Not attached to an active page/,
-    evidence
-  );
+  assert.match(JSON.stringify(proxy.replies.at(-1)), /Not attached to an active page/, evidence);
 });
 
 async function fixtureHits(site) {
