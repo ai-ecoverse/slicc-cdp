@@ -233,7 +233,7 @@ fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool)
     let text = normalized.as_str();
     let lower = text.to_ascii_lowercase();
     let mut prefixes = Vec::new();
-    for scheme in guard.redaction_schemes().chain(["ws", "wss"]) {
+    for scheme in guard.redaction_schemes().chain(["ws", "wss", "about"]) {
         prefixes.push(format!("{scheme}:"));
         prefixes.push(format!("{scheme}%"));
     }

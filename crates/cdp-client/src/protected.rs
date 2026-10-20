@@ -81,6 +81,7 @@ impl Protected {
             .chain(&self.rules.any_schemes)
             .chain(&self.rules.inner_schemes)
             .map(String::as_str)
+            .chain(self.extra.iter().filter_map(|origin| origin.split_once(':').map(|(scheme, _)| scheme)))
     }
 
     pub fn url_read_only(&self, text: &str) -> bool {

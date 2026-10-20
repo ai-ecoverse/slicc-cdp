@@ -29,6 +29,7 @@ fn review_non_http_protected_schemes_cannot_leak() {
         format!("chrome://settings/passwords?secret={REDIRECT_MARKER}"),
         format!("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/x?secret={REDIRECT_MARKER}"),
         format!("devtools://devtools/bundled/inspector.html?secret={REDIRECT_MARKER}"),
+        format!("about:settings/passwords?secret={REDIRECT_MARKER}"),
         format!("view-source:https://seven.sliccy.ai/{REDIRECT_MARKER}"),
         format!("blob:https://seven.sliccy.ai/{REDIRECT_MARKER}"),
     ] {
@@ -41,6 +42,10 @@ fn review_non_http_protected_schemes_cannot_leak() {
             assert!(!format!("{:?}", cdp.events()).contains(REDIRECT_MARKER), "{method} {url}: {:?}", cdp.events());
         }
     }
+    let mut cdp = url_backend("about:blank");
+    cdp.protect_origins(&["ftp://client.example.test"]);
+    cdp.absorb(json!({"method":"Runtime.consoleAPICalled","sessionId":"S","params":{"type":"log","executionContextId":1,"args":[{"type":"string","value":format!("message names ftp://client.example.test/{REDIRECT_MARKER}")}]}}));
+    assert!(!format!("{:?}", cdp.events()).contains(REDIRECT_MARKER));
 }
 
 #[test]
