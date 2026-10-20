@@ -78,18 +78,13 @@ impl Output {
     }
 }
 
+fn destination(url: &str) -> String {
+    url::Url::parse("https://relative.invalid/").unwrap().join(url)
+        .map(|url| url.to_string()).unwrap_or_else(|_| url.to_string())
+}
+
 fn reaches_protected(url: &str) -> bool {
-    let guard = cdp_client::protected::Protected::default();
-    let trimmed = url.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch.is_ascii_control());
-    if guard.url(trimmed) {
-        return true;
-    }
-    let mut chars = trimmed.chars();
-    let authority = matches!(
-        (chars.next(), chars.next()),
-        (Some('/' | '\\'), Some('/' | '\\'))
-    );
-    authority && (guard.url(&format!("https:{trimmed}")) || guard.url(&format!("http:{trimmed}")))
+    cdp_client::protected::Protected::default().url(&destination(url))
 }
 
 fn redact_url(url: &str, full: bool) -> String {
@@ -132,7 +127,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     };
     if reaches_protected(&request.url) {
         return Output::plain(
-            format!("curlwright: {}\n", cdp_client::protected::refusal()),
+            format!("curlwright: {}\n", cdp_client::protected::Protected::default().refusal_for_url(&destination(&request.url))),
             1,
         );
     }
@@ -430,6 +425,27 @@ mod tests {
         assert!(!super::reaches_protected("https://notsliccy.ai/"));
         assert!(!super::reaches_protected("/api/me"));
         assert!(!super::reaches_protected("https://app.example/?next=https://vault.sliccy.ai/"));
+    }
+
+    #[test]
+    fn malformed_absolute_and_authority_urls_fail_closed() {
+        for url in [
+            "http://exa%20mple.sliccy.ai/",
+            "http://exa mple.sliccy.ai/",
+            "//exa%20mple.sliccy.ai/",
+            "http://xn--1ug.sliccy.ai/",
+            "http://xn--a.sliccy.ai/",
+        ] {
+            let output = run(&["--cdp", "ws://127.0.0.1:1/devtools/browser/x", url]);
+            assert_eq!(output.code, 1, "{url}");
+            assert_eq!(output.stderr, "curlwright: slicc: refused: slicc can't parse this URL, so it could be a protected page\n", "{url}");
+        }
+        for url in ["/api/me", "../api/me", "//app.example/api/me"] {
+            assert!(!super::reaches_protected(url), "{url}");
+        }
+        for url in ["http://vault%2Esliccy.ai/", "http://vau%6Ct.sliccy.ai/", "http://VAULT.sliccy.ai/", "http://vault.sliccy.ai./", "http://seven.sliccy.ai./"] {
+            assert!(super::reaches_protected(url), "{url}");
+        }
     }
 
     #[test]

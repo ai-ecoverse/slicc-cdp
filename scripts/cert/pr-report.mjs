@@ -62,11 +62,11 @@ async function reviewedRecord(plan, current) {
       status: 'INCOMPLETE',
       incomplete: ['complete code-generated certificate required'],
     };
-  if (!current.labels.some((label) => label.name === 'merge-ok') || current.draft)
+  if (current.draft !== false)
     record = {
       ...record,
       status: 'INCOMPLETE',
-      incomplete: ['ready/merge-ok eligibility removed'],
+      incomplete: ['converted to draft: not proof'],
     };
   if (plan.reviewer) {
     const latest = (await pages(`issues/${plan.pr}/timeline`))
@@ -93,8 +93,20 @@ async function reviewedRecord(plan, current) {
   return record;
 }
 
+async function mirror(plan) {
+  const statuses = await pages(`commits/${plan.head}/statuses`);
+  const state = statuses.find((item) => item.context === context)?.state ?? 'missing';
+  if (state === 'success') return { status: 'NOOP', reason: plan.reason, head: plan.head };
+  return {
+    status: 'INCOMPLETE',
+    reason: `unrelated label: this job mirrors ${context} on the head, which is ${state}`,
+    head: plan.head,
+  };
+}
+
 async function pr() {
   const plan = json(values.plan);
+  if (!plan.report && plan.reason === 'unrelated label') return mirror(plan);
   if (!plan.report) return { status: 'NOOP', reason: plan.reason, head: plan.head };
   const current = await api(`pulls/${plan.pr}`);
   if (current.head.sha !== plan.head || current.state !== 'open')

@@ -84,7 +84,61 @@ function executed(row, repeat) {
   return failedKinds.has(row.verdict) && Number(match[1]) === repeat;
 }
 
-function rowIdentity(side, row, pin, repeat, seen, emit) {
+function actualRows(side, executions, result, pin, emit) {
+  const actual = new Map();
+  if (executions === undefined) return actual;
+  for (const shard of pin.shards) {
+    const document = executions?.[shard]?.document;
+    if (
+      document?.shard !== shard ||
+      document.repeat !== 3 ||
+      ![0, 1].includes(document.exit) ||
+      document.signal ||
+      document.timedOut ||
+      !Array.isArray(document.results)
+    ) {
+      emit('INCOMPLETE', `${side}: actual shard repeats absent: ${shard}`);
+      continue;
+    }
+    for (const row of document.results) {
+      const key = keyFor({ shard, key: row?.key });
+      const summary = result?.tests?.find((item) => keyFor(item) === key);
+      if (actual.has(key)) emit('INCOMPLETE', `${side}: duplicate actual row ${key}`);
+      if (
+        !summary ||
+        !['pass', 'fail'].includes(row?.status) ||
+        !Array.isArray(row?.runs) ||
+        row.runs.length !== 3 ||
+        row.runs.some((value) => !['pass', 'fail'].includes(value)) ||
+        summary.failed?.candidate !== `${row.runs.filter((value) => value === 'fail').length}/3`
+      )
+        emit('INCOMPLETE', `${side}: actual repeat coverage differs: ${key}`);
+      actual.set(key, row?.runs);
+    }
+  }
+  const expected = result?.tests;
+  if (
+    !Array.isArray(expected) ||
+    expected.length !== actual.size ||
+    expected.some((row) => !actual.has(keyFor(row)))
+  )
+    emit('INCOMPLETE', `${side}: actual scoped row set differs`);
+  return actual;
+}
+
+function actualFlaky(row, outcomes) {
+  return (
+    row.verdict === 'flaky' &&
+    Array.isArray(outcomes) &&
+    outcomes.length === 3 &&
+    outcomes.every((value) => ['pass', 'fail'].includes(value)) &&
+    outcomes.includes('pass') &&
+    outcomes.includes('fail') &&
+    row.failed?.candidate === `${outcomes.filter((value) => value === 'fail').length}/3`
+  );
+}
+
+function rowIdentity(side, row, pin, repeat, seen, emit, actual) {
   if (
     !row ||
     typeof row.key !== 'string' ||
@@ -100,7 +154,10 @@ function rowIdentity(side, row, pin, repeat, seen, emit) {
   const key = keyFor(row);
   if (seen.has(key)) emit('INCOMPLETE', `${side}: duplicate test key ${key}`);
   seen.add(key);
-  if (!executed(row, repeat))
+  if (
+    !executed(row, repeat) &&
+    !(side === 'base' && repeat === 3 && actualFlaky(row, actual.get(key)))
+  )
     emit('INCOMPLETE', `${side}: unexecuted, partial or flaky test ${row.key}`);
   return true;
 }
@@ -141,7 +198,7 @@ function producerCompletion(side, result, emit) {
   if (typeof result?.ok !== 'boolean') emit('INCOMPLETE', `${side}: producer verdict absent`);
 }
 
-function readRows(side, result, report, pin, emit) {
+function readRows(side, result, report, pin, emit, actual) {
   producerCompletion(side, result, emit);
   const rows = reportSource(side, result, report, emit);
   if (!Array.isArray(rows) || !rows.length) {
@@ -149,7 +206,9 @@ function readRows(side, result, report, pin, emit) {
     return new Map();
   }
   const seen = new Set();
-  const valid = rows.filter((row) => rowIdentity(side, row, pin, result?.repeat, seen, emit));
+  const valid = rows.filter((row) =>
+    rowIdentity(side, row, pin, result?.repeat, seen, emit, actual)
+  );
   rowCounts(side, valid, result, emit);
   for (const shard of pin.shards)
     if (!valid.some((row) => row.shard === shard))
@@ -166,11 +225,16 @@ function sameRowSet(base, candidate, emit) {
   }
 }
 
-function producerAcceptance(side, result, rows, shared, candidate, emit, flags) {
+function producerAcceptance(side, result, rows, shared, candidate, emit, flags, advisoryKeys) {
   if (result.ok !== false) return;
-  const failed = [...rows.values()].filter((row) => failedKinds.has(row.verdict));
+  const failed = [...rows.values()].filter(
+    (row) => failedKinds.has(row.verdict) || row.verdict === 'flaky'
+  );
   const explained = (row) =>
-    shared.has(keyFor(row)) || (side === 'base' && candidate.get(keyFor(row))?.verdict === 'pass');
+    shared.has(keyFor(row)) ||
+    (side === 'base' &&
+      (advisoryKeys.has(keyFor(row)) ||
+        (failedKinds.has(row.verdict) && candidate.get(keyFor(row))?.verdict === 'pass')));
   if (!failed.length || failed.some((row) => !explained(row)))
     emit(
       'INCOMPLETE',
@@ -182,15 +246,61 @@ function producerAcceptance(side, result, rows, shared, candidate, emit, flags) 
     );
 }
 
-export function pairedBiosFindings(results, pin, reports = {}) {
+function baseAdvisories(base, candidate, actual, emit, flags, advisories, advisoryKeys) {
+  for (const [key, row] of base) {
+    if (row.verdict !== 'flaky') continue;
+    const after = candidate.get(key);
+    const runs = actual.candidate.get(key);
+    if (
+      after?.verdict !== 'pass' ||
+      !Array.isArray(runs) ||
+      runs.length !== 3 ||
+      runs.some((value) => value !== 'pass')
+    ) {
+      emit('INCOMPLETE', `base-only flaky row requires three actual candidate passes: ${key}`);
+      continue;
+    }
+    advisoryKeys.add(key);
+    advisories.push({
+      classification: 'base-only-flaky',
+      shard: row.shard,
+      key: row.key,
+      test: row.test,
+      base: { outcomes: actual.base.get(key), rate: row.failed.candidate },
+      candidate: { outcomes: runs, rate: after.failed.candidate },
+    });
+    flags.push(
+      `bios base-only flaky advisory: ${key} base=${row.failed.candidate} candidate=${after.failed.candidate}`
+    );
+  }
+}
+
+export function pairedBiosFindings(results, pin, reports = {}, executions = {}) {
   const failures = [];
   const incomplete = [];
   const flags = [];
+  const advisories = [];
   const emit = (status, reason) =>
     (status === 'FAIL' ? failures : incomplete).push(`bios: paired ${reason}`);
-  const base = readRows('base', results?.base, reports?.base, pin, emit);
-  const candidate = readRows('candidate', results?.candidate, reports?.candidate, pin, emit);
+  const actual = Object.fromEntries(
+    ['base', 'candidate'].map((side) => [
+      side,
+      actualRows(side, executions[side], results?.[side], pin, emit),
+    ])
+  );
+  const base = readRows('base', results?.base, reports?.base, pin, emit, actual.base);
+  const candidate = readRows(
+    'candidate',
+    results?.candidate,
+    reports?.candidate,
+    pin,
+    emit,
+    actual.candidate
+  );
   sameRowSet(base, candidate, emit);
+  const advisoryKeys = new Set();
+  if (!failures.length && !incomplete.length)
+    baseAdvisories(base, candidate, actual, emit, flags, advisories, advisoryKeys);
   if (!failures.length && !incomplete.length) {
     const shared = new Set();
     for (const [key, row] of candidate) {
@@ -213,8 +323,14 @@ export function pairedBiosFindings(results, pin, reports = {}) {
         shared,
         candidate,
         emit,
-        flags
+        flags,
+        advisoryKeys
       );
   }
-  return { failures: [...new Set(failures)], incomplete: [...new Set(incomplete)], flags };
+  return {
+    failures: [...new Set(failures)],
+    incomplete: [...new Set(incomplete)],
+    flags,
+    advisories,
+  };
 }

@@ -9,7 +9,7 @@ import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
-import { browserArgs, origins } from './guard-fixture.mjs';
+import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 
 const published = JSON.parse(
   await readFile(
@@ -71,11 +71,14 @@ const extensionPath = fileURLToPath(
   new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
 );
 
-async function guardBrowser({ privileged, extension }) {
-  const browser = await launchBrowser([
-    ...browserArgs({ privileged: privileged || extension }),
-    ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
-  ]);
+async function guardBrowser(startup, { privileged, extension, target, slot }) {
+  const browser = await startup.start(
+    [
+      ...browserArgs({ privileged: privileged || extension }),
+      ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
+    ],
+    { target, slot }
+  );
   if (!extension) return browser;
   let raw;
   try {
@@ -119,13 +122,24 @@ function codedSkips(results) {
   });
 }
 
-test('published guard set through the Rust guarded client', { timeout: 900000 }, async (t) => {
+test('published guard set through the Rust guarded client', {
+  timeout: Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000),
+}, async (t) => {
   const started = Date.now();
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',
   });
+  if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
+    execFileSync(
+      'cargo',
+      ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge', '--target', 'wasm32-wasip1'],
+      { stdio: 'inherit' }
+    );
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
   const diagnostics = [];
+  const startup = browserStartup(launchBrowser, (retry) => {
+    process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
+  });
   const executeTarget = async (target) => {
     const fixture = await fixtureServer();
     const targets = origins(fixture);
@@ -156,14 +170,18 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
             vector.kind === 'text' ||
             vector.observable?.[target] === false ||
             vector.skip?.target === target
-          )
+          ) {
+            startup.markRowStarted();
             return {};
+          }
           if (!browsers.has(slot))
             browsers.set(
               slot,
-              guardBrowser({
+              guardBrowser(startup, {
                 privileged: vector.id.startsWith('C8.'),
                 extension: selected.vectors.some((row) => row.id.startsWith('C9.')),
+                target,
+                slot,
               })
             );
           const browser = await browsers.get(slot);
@@ -212,6 +230,7 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
               }
             };
           }
+          startup.markRowStarted();
           return {
             client,
             unguarded,
@@ -272,7 +291,10 @@ test('published guard set through the Rust guarded client', { timeout: 900000 },
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
+  report.startupRetries = startup.retries;
   report.selection = { targets: selectedTargets, allTargets };
+  report.transport =
+    process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
   report.results = codedSkips(report.results);
   report.skipped = report.results
     .filter((row) => row.control === 'skip')

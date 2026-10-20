@@ -59,9 +59,29 @@ impl Protected {
         &self.rules.refusal
     }
 
+    pub fn refusal_for_url(&self, text: &str) -> &str {
+        if self.rules.unparseable == "protected" && self.unparseable(text) {
+            &self.rules.unparseable_refusal
+        } else {
+            self.refusal()
+        }
+    }
+
+    pub fn unparseable(&self, text: &str) -> bool {
+        !matches!(text, "" | "null" | "://") && self.unwrap(parse(text)).is_none()
+    }
+
     pub fn url(&self, text: &str) -> bool {
+        self.judge_url(text, false)
+    }
+
+    pub fn url_read_only(&self, text: &str) -> bool {
+        self.judge_url(text, true)
+    }
+
+    fn judge_url(&self, text: &str, read_only: bool) -> bool {
         let Some(url) = self.unwrap(parse(text)).map(|url| self.rewrite_about(url)) else {
-            return false;
+            return !read_only && self.rules.unparseable == "protected" && !matches!(text, "" | "null" | "://");
         };
         let scheme = url.scheme();
         if self
@@ -124,12 +144,12 @@ impl Protected {
     pub fn storage_key(&self, key: &str) -> bool {
         let mut parts = key.split('^');
         let first = parts.next().unwrap_or("");
-        if self.url(first) {
+        if self.url_read_only(first) {
             return true;
         }
         parts
             .filter_map(|part| part.strip_prefix('0'))
-            .any(|site| self.url(site))
+            .any(|site| self.url_read_only(site))
     }
 
     pub fn pattern(&self, pattern: &str) -> bool {
@@ -159,7 +179,7 @@ impl Protected {
             .chars()
             .take_while(|ch| !matches!(ch, '*' | '?' | '{' | '}' | '[' | ']' | '\\'))
             .collect();
-        literal.contains("://") && self.url(&literal)
+        literal.contains("://") && self.url_read_only(&literal)
     }
 
     fn inheriting(&self, text: &str) -> bool {
@@ -191,14 +211,16 @@ impl Protected {
     fn unwrap(&self, mut url: Option<Url>) -> Option<Url> {
         let mut depth = 0;
         while let Some(current) = url.as_ref() {
-            if depth >= 8
-                || !self
-                    .rules
-                    .inner_schemes
-                    .iter()
-                    .any(|item| item == current.scheme())
+            if !self
+                .rules
+                .inner_schemes
+                .iter()
+                .any(|item| item == current.scheme())
             {
                 break;
+            }
+            if depth >= 8 {
+                return None;
             }
             let rest = current.as_str()[current.scheme().len() + 1..].to_string();
             url = parse(&rest);
@@ -334,6 +356,39 @@ mod tests {
         let vectors = vectors();
         let origins: Vec<&str> = vectors.origins.iter().map(String::as_str).collect();
         Protected::new(&origins)
+    }
+
+    #[test]
+    fn unparseable_policy_and_refusal_are_catalog_driven() {
+        let mut rules = slicc_browsers::catalog().protected_origins;
+        rules.unparseable_refusal = "custom unparseable refusal".into();
+        let guard = Protected::with_rules(rules.clone(), &[]);
+        for text in ["https://exa%20mple.example/", "blob:invalid", "view-source:invalid"] {
+            assert!(guard.unparseable(text));
+            assert!(guard.url(text));
+            assert!(!guard.url_read_only(text));
+            assert!(!guard.storage_key(text));
+            assert_eq!(guard.refusal_for_url(text), "custom unparseable refusal");
+        }
+        for text in ["", "null", "://"] {
+            assert!(!guard.unparseable(text));
+            assert!(!guard.url(text));
+        }
+        let at_limit = format!("{}https://example.test/", "view-source:".repeat(8));
+        assert!(!guard.unparseable(&at_limit));
+        assert!(!guard.url(&at_limit));
+        let over_limit = format!("view-source:{at_limit}");
+        assert!(guard.unparseable(&over_limit));
+        assert!(guard.url(&over_limit));
+        rules.unparseable = "not protected".into();
+        let guard = Protected::with_rules(rules, &[]);
+        assert!(!guard.url("https://exa%20mple.example/"));
+        assert_eq!(guard.refusal_for_url("https://exa%20mple.example/"), guard.refusal());
+        for url in ["http://xn--1ug.sliccy.ai/", "http://xn--a.sliccy.ai/"] {
+            let guard = Protected::default();
+            assert!(guard.url(url));
+            assert!(guard.unparseable(url));
+        }
     }
 
     #[test]

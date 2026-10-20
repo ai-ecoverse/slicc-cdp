@@ -24,9 +24,8 @@
       "semanticCommitType": "ci"
     },
     {
-      "description": "Changes that reach the shipped wasm or binaries wait for the PR certification: Renovate labels them merge-ok so cert-review-pr runs, and merges only when every check, cert-review included, is green.",
+      "description": "Changes that reach the shipped wasm or binaries wait for the PR certification: Renovate's pull requests aren't drafts, so cert-review-pr reviews them, and Renovate merges only when every check, cert-review included, is green.",
       "matchManagers": ["cargo"],
-      "labels": ["merge-ok"],
       "platformAutomerge": false
     },
     {
@@ -34,13 +33,11 @@
       "matchManagers": ["npm"],
       "matchFileNames": ["package.json"],
       "matchDepTypes": ["dependencies", "optionalDependencies", "peerDependencies"],
-      "labels": ["merge-ok"],
       "platformAutomerge": false
     },
     {
       "description": "Workflow and action bumps that build or publish the shipped artifacts wait for the PR certification the same way.",
       "matchManagers": ["github-actions"],
-      "labels": ["merge-ok"],
       "platformAutomerge": false
     }
   ],

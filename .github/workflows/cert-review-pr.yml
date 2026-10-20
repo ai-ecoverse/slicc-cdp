@@ -5,9 +5,10 @@ on:
       - "opened"
       - "synchronize"
       - "reopened"
+      - "ready_for_review"
+      - "converted_to_draft"
       - "labeled"
       - "unlabeled"
-      - "ready_for_review"
   merge_group:
     types:
       - "checks_requested"
@@ -20,8 +21,8 @@ defaults:
   run:
     shell: "bash"
 concurrency:
-  group: "cert-pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}"
-  cancel-in-progress: false
+  group: "${{ ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'cert-review-approved') && format('cert-pr-noop-{0}', github.run_id) || format('cert-pr-{0}', github.event.pull_request.number || github.event.merge_group.head_sha) }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' }}"
 jobs:
   self:
     name: "cert-review-pr / self"
@@ -757,6 +758,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: "read"
+      actions: "read"
     env:
       CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
     steps:
@@ -792,6 +794,12 @@ jobs:
           node scripts/gate.mjs pr-bios-files --accept PASS -- node scripts/cert/pr-bios-files.mjs --directory evidence --out evidence/bios-transport.json <<'EOF'
           {"base":${{ toJSON(needs.bios_base.outputs.result || 'null') }},"candidate":${{ toJSON(needs.bios_candidate.outputs.result || 'null') }}}
           EOF
+      -
+        name: "Main-owned actual-row and advisory validation"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          CERT_BIOS_ACTUAL_ROWS: "1"
+        run: |
           node scripts/gate.mjs pr-bios --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/pr-bios.mjs --plan evidence/plan.json --base evidence/bios-base.json --candidate evidence/bios-candidate.json --out evidence/bios.json
       -
         uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
@@ -985,6 +993,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: "read"
+      actions: "read"
     steps:
       -
         name: "Main-owned control checkout"
@@ -1028,6 +1037,9 @@ jobs:
           name: "cert-pr-assets-${{ github.run_id }}-${{ github.run_attempt }}"
           path: ".cert/pr-assets"
       -
+        name: "Fetch planned source objects"
+        run: "node --input-type=module -e 'import{readFileSync}from\"node:fs\";import{execFileSync}from\"node:child_process\";const p=JSON.parse(readFileSync(\"evidence/plan.json\"));for(const s of[p.commit,p.baseline.commit]){if(!/^[a-f0-9]{40}$/.test(s))throw Error(\"invalid planned source\");execFileSync(\"git\",[\"fetch\",\"--no-tags\",\"origin\",s],{stdio:\"inherit\"})}'"
+      -
         name: "Gather only canonical required documents; never replace trusted plan"
         run: |
           for name in rebuild guard integration bios assets-linux assets-macos review; do
@@ -1038,6 +1050,7 @@ jobs:
       -
         name: "Code-only decision with explicit failed/skipped upstream statuses"
         env:
+          GH_TOKEN: "${{ github.token }}"
           CERT_PR_PACKS: "${{ github.workspace }}/.cert/pr-packs"
           CERT_PR_ASSETS: "${{ github.workspace }}/.cert/pr-assets"
           CERT_NEEDS: "${{ toJSON(needs) }}"

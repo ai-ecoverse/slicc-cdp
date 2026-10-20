@@ -266,13 +266,19 @@ impl Cdp {
         {
             return Err("slicc: refused: attach with flatten: true\n".into());
         }
-        if let Some(url) = params.get("url").and_then(|v| v.as_str()) {
-            if shield::cookie_method(method) {
-                if shield::cookie_refused(&self.guard, params) {
-                    return Err(COOKIES.into());
+        if let Some(reason) = shield::command_url_refusal(&self.guard, params, method) {
+            if reason == self.guard.refusal() && shield::cookie_method(method) {
+                return Err(COOKIES.into());
+            }
+            return Err(format!("{reason}\n"));
+        }
+        if method.starts_with("PWA.") {
+            for key in ["manifestId", "installUrlOrBundleUrl"] {
+                if let Some(url) = params.get(key).and_then(Value::as_str) {
+                    if self.guard.url(url) {
+                        return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                    }
                 }
-            } else if self.guard.url(url) || self.guard.url(&shield::web_socket_as_http(url)) {
-                return Err(self.refusal());
             }
         }
         if shield::cookie_method(method) && shield::cookie_refused(&self.guard, params) {
@@ -301,7 +307,7 @@ impl Cdp {
                 .unwrap_or("")
                 .to_string();
             if self.guard.url(&url) {
-                return Err(self.refusal());
+                return Err(format!("{}\n", self.guard.refusal_for_url(&url)));
             }
         }
         if !matches!(method, "Target.getTargetInfo" | "Target.detachFromTarget") {
@@ -309,7 +315,8 @@ impl Cdp {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
                     if (key == "frameId" && self.frame_protected(&target)) || self.target_protected(&target, key == "frameId")? {
-                        return Err(self.refusal());
+                        let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+                        return Err(format!("{}\n", self.guard.refusal_for_url(url)));
                     }
                 }
             }
@@ -450,7 +457,9 @@ impl Cdp {
                 let mut out = Vec::new();
                 for info in &infos {
                     let redacted = self.redact(info, &infos);
-                    if !self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or("")) {
+                    let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+                    if !(self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))
+                        || self.guard.unparseable(url) && self.guard.url(url)) {
                         out.push(redacted);
                     }
                 }
@@ -1049,6 +1058,14 @@ impl Cdp {
             }
         }
         if method.starts_with("Target.") {
+            let info = value.pointer("/params/targetInfo");
+            let reported = info.and_then(|info| info.get("targetId")).and_then(Value::as_str)
+                .and_then(|target| self.targets.get(target)).or(info);
+            if let Some(url) = reported.and_then(|info| info.get("url")).and_then(Value::as_str) {
+                if self.guard.unparseable(url) && self.guard.url(url) {
+                    return true;
+                }
+            }
             if let Some(child) = value.pointer("/params/sessionId").and_then(|v| v.as_str()) {
                 if self.guard_sessions.contains(child) || self.blocked.contains(child) {
                     return true;
@@ -1062,7 +1079,7 @@ impl Cdp {
                 return true;
             }
         }
-        shield::mentions(&self.guard, &params)
+        shield::loaded_urls_protected(&self.guard, &params) || shield::mentions(&self.guard, &params)
     }
 
     fn deliver(&mut self, mut value: Value) {
@@ -1777,6 +1794,197 @@ mod tests {
                 std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             }
             Ok(None)
+        }
+    }
+
+    const UNPARSEABLE: &str = "slicc: refused: slicc can't parse this URL, so it could be a protected page\n";
+
+    fn malformed_urls() -> Vec<String> {
+        let mut urls = [
+            "http://exa%20mple.sliccy.ai/",
+            "http://exa mple.sliccy.ai/",
+            "http://\u{200d}.sliccy.ai/",
+            "https://exa%20mple.example/",
+            "http://xn--1ug.sliccy.ai/",
+            "http://xn--a.sliccy.ai/",
+            "view-source:http://exa%20mple.sliccy.ai/",
+            "blob:http://exa%20mple.sliccy.ai/id",
+            "filesystem:http://exa%20mple.sliccy.ai/temporary/x",
+        ].map(str::to_string).to_vec();
+        urls.push(format!("{}https://example.test/", "view-source:".repeat(9)));
+        urls
+    }
+
+    struct UrlBackend {
+        url: String,
+        inbox: VecDeque<String>,
+    }
+
+    impl Transport for UrlBackend {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            let message: Value = serde_json::from_str(text).unwrap();
+            let info = json!({"targetId":"T","type":"page","url":self.url,"title":"SECRET"});
+            let result = match message["method"].as_str().unwrap() {
+                "Target.getTargetInfo" => json!({"targetInfo":info}),
+                "Target.getTargets" => json!({"targetInfos":[info]}),
+                "Target.attachToTarget" => json!({"sessionId":"S"}),
+                "Target.createTarget" => json!({"targetId":"T"}),
+                "Page.getNavigationHistory" => json!({"entries":[{"id":1,"url":self.url}]}),
+                _ => json!({}),
+            };
+            self.inbox.push_back(json!({"id":message["id"],"result":result}).to_string());
+            Ok(())
+        }
+
+        fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+            Ok(self.inbox.pop_front())
+        }
+    }
+
+    fn url_backend(url: &str) -> Cdp {
+        Cdp::from_transport(Box::new(UrlBackend { url: url.into(), inbox: VecDeque::new() }))
+    }
+
+    #[test]
+    fn issue_401_command_destinations_fail_closed() {
+        let mut failures = Vec::new();
+        for url in malformed_urls() {
+            for method in ["Target.createTarget", "Page.navigate", "Network.loadNetworkResource", "Fetch.continueRequest", "Network.continueInterceptedRequest", "PWA.install", "PWA.launch"] {
+                let mut cdp = url_backend("about:blank");
+                cdp.hand("S", "R");
+                cdp.requests.insert("R".into(), false);
+                let params = if method.starts_with("PWA.") {
+                    json!({"manifestId":url,"installUrlOrBundleUrl":url})
+                } else {
+                    json!({"url":url,"requestId":"R","interceptionId":"R"})
+                };
+                let result = cdp.call(method, params, Some("S"));
+                if !result.as_ref().err().is_some_and(|error| error.starts_with("slicc: refused:")) {
+                    failures.push(format!("{method} {url}: {result:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn issue_401_normalized_protected_hosts_are_guarded() {
+        for url in [
+            "http://vault%2Esliccy.ai/",
+            "http://vau%6Ct.sliccy.ai/",
+            "http://VAULT.sliccy.ai/",
+            "http://vault.sliccy.ai./",
+            "http://seven.sliccy.ai./",
+        ] {
+            for (method, params) in [
+                ("Target.createTarget", json!({"url":url})),
+                ("Page.navigate", json!({"url":url})),
+                ("Network.setCookie", json!({"url":url,"name":"x","value":"y"})),
+                ("Network.deleteCookies", json!({"url":url,"name":"x"})),
+                ("Network.setCookies", json!({"cookies":[{"url":url,"name":"x","value":"y"}]})),
+                ("Storage.setCookies", json!({"cookies":[{"url":url,"name":"x","value":"y"}]})),
+            ] {
+                assert!(url_backend("about:blank").call(method, params, Some("S")).unwrap_err().starts_with("slicc: refused:"), "{method} {url}");
+            }
+            let mut cdp = url_backend(url);
+            let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+            assert_ne!(listed["targetInfos"][0]["url"], url);
+            assert!(cdp.is_protected_target("T"));
+            assert!(url_backend(url).call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_err());
+        }
+    }
+
+    #[test]
+    fn issue_401_refusal_text_is_exact() {
+        for method in ["Page.navigate", "Target.createTarget", "Network.setCookie", "Network.getCookies"] {
+            let url = "http://exa%20mple.sliccy.ai/";
+            let params = if method == "Network.getCookies" { json!({"urls":[url]}) } else { json!({"url":url,"name":"x","value":"y"}) };
+            assert_eq!(url_backend("about:blank").call(method, params, Some("S")).unwrap_err(), UNPARSEABLE, "{method}");
+        }
+    }
+
+    #[test]
+    fn issue_401_reported_targets_and_history_fail_closed() {
+        for url in malformed_urls() {
+            let mut cdp = url_backend(&url);
+            let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+            assert!(listed["targetInfos"].as_array().unwrap().is_empty(), "{url}");
+            assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err().starts_with("slicc: refused:"), "{url}");
+            assert!(url_backend(&url).call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_err(), "{url}");
+            assert!(url_backend(&url).call("Page.navigateToHistoryEntry", json!({"entryId":1}), Some("S")).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn cookie_readers_keep_filtering_parseable_mixed_url_lists() {
+        assert!(url_backend("about:blank").call("Network.getCookies", json!({"urls":["https://seven.sliccy.ai/", "https://example.test/"]}), Some("S")).is_ok());
+        assert_eq!(url_backend("about:blank").call("Network.getCookies", json!({"urls":["http://exa%20mple.sliccy.ai/", "https://example.test/"]}), Some("S")).unwrap_err(), UNPARSEABLE);
+    }
+
+    #[test]
+    fn issue_401_cookie_command_urls_fail_closed() {
+        let mut failures = Vec::new();
+        for url in malformed_urls() {
+            for (method, params) in [
+                ("Network.setCookie", json!({"url":url,"name":"x","value":"y"})),
+                ("Network.deleteCookies", json!({"url":url,"name":"x"})),
+                ("Network.getCookies", json!({"urls":["https://example.test/",url]})),
+                ("Network.setCookies", json!({"cookies":[{"url":url,"name":"x","value":"y"}]})),
+                ("Storage.setCookies", json!({"cookies":[{"url":url,"name":"x","value":"y"}]})),
+            ] {
+                if url_backend("about:blank").call(method, params, Some("S")).is_ok() {
+                    failures.push(format!("{method} {url}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn issue_401_loaded_urls_are_never_exposed() {
+        for url in malformed_urls() {
+            for event in [
+                json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":url}}}),
+                json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":url,"securityOrigin":"null"}}}),
+                json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":url,"auxData":{"isDefault":true}}}}),
+                json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":url,"auxData":{"isDefault":false}}}}),
+                json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"R","request":{"url":url}}}),
+                json!({"method":"Network.webSocketCreated","sessionId":"S","params":{"requestId":"R","url":url.replacen("http:","ws:",1)}}),
+                json!({"method":"ServiceWorker.workerVersionUpdated","params":{"versions":[{"scriptURL":url,"status":"activated"}]}}),
+            ] {
+                let mut cdp = url_backend("about:blank");
+                cdp.absorb(event.clone());
+                assert!(cdp.events().is_empty(), "{event}: {:?}", cdp.events());
+                if event["method"] == "Page.frameNavigated" || event.pointer("/params/context/auxData/isDefault") == Some(&json!(true)) {
+                    assert!(cdp.blocked.contains("S"), "{event}");
+                }
+            }
+            for kind in ["page", "service_worker", "shared_worker", "iframe"] {
+                let mut cdp = url_backend("about:blank");
+                cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"T","type":kind,"url":url,"title":"SECRET"}}}));
+                assert!(cdp.is_protected_target("T"), "{kind} {url}");
+                assert!(cdp.events().is_empty(), "{kind} {url}");
+            }
+        }
+        for origin in ["", "null", "://"] {
+            let mut cdp = url_backend("about:blank");
+            cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"about:blank","securityOrigin":origin}}}));
+            assert!(!cdp.blocked.contains("S"));
+            assert_eq!(cdp.events().len(), 1);
+        }
+    }
+
+    #[test]
+    fn issue_401_exemptions_and_read_only_keys_remain_open() {
+        for url in ["", "null", "://"] {
+            assert!(url_backend("about:blank").call("Target.createTarget", json!({"url":url}), None).is_ok(), "{url}");
+            assert!(url_backend("about:blank").call("Page.navigate", json!({"url":url}), Some("S")).is_ok(), "{url}");
+        }
+        for url in malformed_urls() {
+            let mut cdp = url_backend("about:blank");
+            assert!(cdp.notify("Slicc.action", json!({"url":url,"phase":"start"}), None).is_ok(), "{url}");
+            assert!(cdp.call("Storage.getUsageAndQuota", json!({"origin":url}), None).is_ok(), "{url}");
+            assert!(cdp.call("Storage.clearDataForStorageKey", json!({"storageKey":format!("{url}^0{url}")}), None).is_ok(), "{url}");
         }
     }
 

@@ -890,6 +890,9 @@ mod tests {
                     "BLOBSECRET",
                 ),
                 ("open", "about:blank", Some("about:blank"), ""),
+                ("open", "", None, ""),
+                ("open", "null", None, ""),
+                ("goto", "://", None, ""),
                 (
                     "goto",
                     "ABOUT:blank?q=BLANKSECRET",
@@ -902,7 +905,6 @@ mod tests {
                     Some("about:blank"),
                     "ABOUTSECRET",
                 ),
-                ("open", "example.com/PATHSECRET", None, "PATHSECRET"),
                 ("goto", "HOSTSECRET3:8080/path", None, "HOSTSECRET3"),
                 (
                     "open",
@@ -940,6 +942,22 @@ mod tests {
                     assert!(!start.to_string().contains(secret), "{url} {start}");
                 }
                 assert!(!start.to_string().contains("PASSSECRET5"), "{url} {start}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn malformed_absolute_destinations_still_use_the_catalog_refusal() {
+            let root = std::env::temp_dir().join(format!("slicc-action-malformed-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let peer = Peer::start(SliccReply::Silent, true);
+            for command in ["open", "tab-new", "goto", "navigate"] {
+                for url in ["http://exa%20mple.sliccy.ai/", "http://xn--1ug.sliccy.ai/", "http://xn--a.sliccy.ai/", "view-source:http://exa%20mple.sliccy.ai/"] {
+                    let output = run(&root, peer.port, &[command, url]);
+                    assert_eq!(output.code, 1, "{command} {url}");
+                    assert_eq!(output.stderr, format!("{}\n", slicc_browsers::catalog().protected_origins.unparseable_refusal), "{command} {url}");
+                    assert!(!output.stderr.contains("add https://"));
+                }
             }
             let _ = std::fs::remove_dir_all(&root);
         }

@@ -2,8 +2,15 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
+import {
+  expectedExecutionIdentity,
+  sourceIdentity,
+  subjectIdentity,
+  validateExecutionIdentity,
+} from './execution-identity.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { selectBiosPin } from './pr-bios-result.mjs';
+import { biosExecutionRows } from './pr-bios-rows.mjs';
 import { client, required, residual } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 import { validateBios, validateGuard, validateMac, validateSuite } from './pr-validate.mjs';
@@ -14,6 +21,7 @@ const plan = json(path.join(options.evidence, 'plan.json'));
 const failures = [];
 const incomplete = [...(plan.issues ?? [])];
 const flags = [];
+const biosLedger = [];
 const emit = (status, reason) => (status === 'FAIL' ? failures : incomplete).push(reason);
 let artifactBinding;
 const bindingContext = {};
@@ -89,6 +97,92 @@ for (const [leg, subject, checked] of [
   )
     emit('INCOMPLETE', `integration ${leg}: pack/source identity missing`);
 }
+const executionIdentities = {};
+try {
+  const toolsSource = sourceIdentity(plan.tools);
+  const candidateSource = sourceIdentity(plan.commit);
+  const candidateSubject = subjectIdentity(plan.commit);
+  const baseSource = subjectIdentity(plan.baseline.commit);
+  const proofFiles = [
+    ...new Set(
+      plan.proofs.tests
+        .filter((test) => test.source === 'integration' && !test.missing)
+        .map((test) => test.file)
+    ),
+  ];
+  for (const [label, execution, subject, harness, scope, checked, files] of [
+    [
+      'guard positive',
+      documents.guard?.executions?.positive,
+      candidateSubject,
+      toolsSource,
+      'guard',
+      candidate,
+      [],
+    ],
+    [
+      'guard negative',
+      documents.guard?.executions?.negative,
+      baseSource,
+      toolsSource,
+      'guard',
+      baseline,
+      [],
+    ],
+    [
+      'integration positive',
+      documents.integration?.executions?.positive,
+      candidateSubject,
+      candidateSource,
+      'integration',
+      candidate,
+      [],
+    ],
+    ...(proofFiles.length
+      ? [
+          [
+            'integration proofs',
+            documents.integration?.executions?.proofs,
+            candidateSubject,
+            candidateSource,
+            'proof-integration',
+            candidate,
+            proofFiles,
+          ],
+        ]
+      : []),
+    ...(proofFiles.length || plan.changedTests?.length
+      ? [
+          [
+            'integration negative',
+            documents.integration?.executions?.negative,
+            baseSource,
+            candidateSource,
+            'proof-integration',
+            baseline,
+            proofFiles,
+          ],
+        ]
+      : []),
+  ]) {
+    if (!checked?.sha256) {
+      emit('INCOMPLETE', `${label}: independently checked pack unavailable`);
+      continue;
+    }
+    const expected = expectedExecutionIdentity(
+      subject,
+      harness,
+      toolsSource,
+      scope,
+      checked.sha256,
+      files
+    );
+    validateExecutionIdentity(execution, expected, label, emit);
+    executionIdentities[label] = { expected, observed: execution?.identity ?? null };
+  }
+} catch (error) {
+  emit(error.certStatus ?? 'INCOMPLETE', `execution identities: ${error.message}`);
+}
 const rebuild = documents.rebuild;
 if (
   !Array.isArray(rebuild?.files) ||
@@ -152,6 +246,15 @@ for (const [source, positive, negative] of [
   }
 }
 const biosPin = selectBiosPin(json(new URL('./pr-bios.json', import.meta.url)), bound);
+if (documents.bios?.rows !== undefined) {
+  try {
+    const { api } = client(plan.repository);
+    bindingContext.inventory ??= await artifactInventory(api, plan.run);
+    bindingContext.rows = await biosExecutionRows(plan, biosPin, api);
+  } catch (error) {
+    emit(error.certStatus ?? 'INCOMPLETE', `bios row uploads: ${error.message}`);
+  }
+}
 flags.push(
   ...validateBios(
     documents.bios,
@@ -159,7 +262,8 @@ flags.push(
     emit,
     plan,
     { base: baseline, candidate },
-    bindingContext
+    bindingContext,
+    biosLedger
   )
 );
 try {
@@ -272,6 +376,8 @@ const record = {
   testOnly: plan.testOnly,
   fullReviewTriggered: true,
   bios: biosPin,
+  biosLedger,
+  executionIdentities,
   required,
   self: plan.self,
   upstream,
