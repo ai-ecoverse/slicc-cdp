@@ -1436,6 +1436,7 @@ mod tests {
                 "Network.setBypassServiceWorker",
                 "Page.enable",
                 "Runtime.enable",
+                "Page.getFrameTree",
                 "Fetch.enable",
                 "Fetch.getResponseBody",
                 "Fetch.fulfillRequest",
