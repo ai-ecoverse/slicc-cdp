@@ -51,6 +51,11 @@ pub struct Cdp {
     notices: Vec<String>,
     discovering: bool,
     requests: BTreeMap<String, bool>,
+    redirects: BTreeSet<String>,
+    request_aliases: BTreeMap<String, BTreeSet<String>>,
+    request_resources: BTreeMap<String, BTreeSet<(String, String)>>,
+    protected_resources: BTreeSet<(String, String)>,
+    source_resources: BTreeMap<(String, String), String>,
     handed: BTreeSet<(String, String)>,
     answering: BTreeMap<i64, (String, String)>,
     held: BTreeMap<String, Vec<Value>>,
@@ -89,6 +94,11 @@ impl Cdp {
             notices: Vec::new(),
             discovering: false,
             requests: BTreeMap::new(),
+            redirects: BTreeSet::new(),
+            request_aliases: BTreeMap::new(),
+            request_resources: BTreeMap::new(),
+            protected_resources: BTreeSet::new(),
+            source_resources: BTreeMap::new(),
             handed: BTreeSet::new(),
             answering: BTreeMap::new(),
             held: BTreeMap::new(),
@@ -236,6 +246,22 @@ impl Cdp {
                 return Err(self.refusal());
             }
         }
+        if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
+            return Err(self.refusal());
+        }
+        if matches!(method, "Page.getResourceContent" | "Page.searchInResource") {
+            let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+            if self.resource_protected(session_id.unwrap_or(""), url) {
+                return Err(self.refusal());
+            }
+        }
+        if matches!(method, "CSS.getStyleSheetText" | "Debugger.getScriptSource" | "Debugger.getWasmBytecode" | "Debugger.searchInContent" | "Debugger.disassembleWasmModule") {
+            let id = params.get("styleSheetId").or_else(|| params.get("scriptId")).and_then(Value::as_str).unwrap_or("");
+            let session = session_id.unwrap_or("");
+            if self.source_resources.get(&(session.to_string(), id.to_string())).is_none_or(|url| self.resource_protected(session, url)) {
+                return Err(self.refusal());
+            }
+        }
         if Worlds::selectors(params) || Worlds::sensitive(method) {
             let session = session_id.unwrap_or("");
             if !self.worlds.enabled(session) && (Worlds::sensitive(method) || self.worlds.reason(session, method, params).is_some()) {
@@ -325,7 +351,7 @@ impl Cdp {
             let id = shield::request_key(params).unwrap_or_default();
             let handed = session_id
                 .is_some_and(|session| self.handed.contains(&(session.to_string(), id.clone())));
-            if !handed || self.request_state(&id) == Some(true) {
+            if !handed || self.requests.get(&id) == Some(&true) {
                 return Err(UNSEEN.into());
             }
         }
@@ -361,7 +387,7 @@ impl Cdp {
     }
 
     fn request_state(&self, id: &str) -> Option<bool> {
-        self.requests.get(id).copied()
+        if self.redirects.contains(id) { Some(true) } else { self.requests.get(id).copied() }
     }
 
     fn after(
@@ -479,7 +505,7 @@ impl Cdp {
             }
             _ => {}
         }
-        let _ = session_id;
+        shield::redact_strings(&self.guard, &mut result);
         Ok(result)
     }
 
@@ -914,6 +940,21 @@ impl Cdp {
         );
     }
 
+    fn resource_protected(&self, session: &str, url: &str) -> bool {
+        self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), url.to_string()))
+    }
+
+    fn mark_redirect(&mut self, id: &str) {
+        let mut ids = self.request_aliases.get(id).cloned().unwrap_or_default();
+        ids.insert(id.to_string());
+        for id in ids {
+            self.redirects.insert(id.clone());
+            if let Some(resources) = self.request_resources.get(&id) {
+                self.protected_resources.extend(resources.iter().cloned());
+            }
+        }
+    }
+
     fn watch(&mut self, value: &mut Value) {
         let method = value
             .get("method")
@@ -927,6 +968,11 @@ impl Cdp {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         if let Some(id) = params.get("requestId").and_then(|v| v.as_str()) {
             if let Some(url) = shield::request_url(&params) {
+                let resource = (session.clone().unwrap_or_default(), url.clone());
+                self.request_resources.entry(id.to_string()).or_default().insert(resource.clone());
+                if self.redirects.contains(id) || self.guard.url(&url) {
+                    self.protected_resources.insert(resource);
+                }
                 let initiator = ["documentURL"]
                     .iter()
                     .filter_map(|key| params.get(*key).and_then(|v| v.as_str()))
@@ -942,6 +988,20 @@ impl Cdp {
                 let entry = self.requests.entry(id.to_string()).or_insert(false);
                 *entry = *entry || protected;
             }
+        }
+        if let Some(id) = params.get("requestId").and_then(Value::as_str) {
+            for key in ["response", "redirectResponse", "headers", "headersText", "requestHeadersText", "responseHeaders"] {
+                if params.get(key).is_some_and(|item| shield::redact_strings(&self.guard, &mut item.clone())) {
+                    self.mark_redirect(id);
+                }
+            }
+        }
+        if let Some((id, url)) = match method.as_str() {
+            "Debugger.scriptParsed" | "Debugger.scriptFailedToParse" => params.get("scriptId").and_then(Value::as_str).zip(params.get("url").and_then(Value::as_str)),
+            "CSS.styleSheetAdded" => params.pointer("/header/styleSheetId").and_then(Value::as_str).zip(params.pointer("/header/sourceURL").and_then(Value::as_str)),
+            _ => None,
+        } {
+            self.source_resources.insert((session.clone().unwrap_or_default(), id.to_string()), url.to_string());
         }
         match method.as_str() {
             "Page.frameNavigated" => {
@@ -1079,10 +1139,11 @@ impl Cdp {
                 return true;
             }
         }
-        shield::loaded_urls_protected(&self.guard, &params) || shield::mentions(&self.guard, &params)
+        shield::loaded_urls_protected(&self.guard, &params)
     }
 
     fn deliver(&mut self, mut value: Value) {
+        self.watch(&mut value);
         if self.worlds.event(&value, &self.guard) {
             if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
                 let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
@@ -1090,7 +1151,10 @@ impl Cdp {
             return;
         }
         self.adopt_guard_attach(&value);
-        self.watch(&mut value);
+        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || shield::loaded_urls_protected(&self.guard, &value["params"]) {
+            return;
+        }
+        shield::redact_strings(&self.guard, &mut value);
         if self.hidden(&value) {
             return;
         }
@@ -1147,6 +1211,7 @@ impl Cdp {
                         .get("message")
                         .and_then(|item| item.as_str())
                         .unwrap_or("CDP error");
+                    let (text, _) = shield::redact_text(&self.guard, text);
                     return Err(format!("{method}: {text}\n"));
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
@@ -1241,7 +1306,7 @@ impl Cdp {
         self.deciders.remove(session_id);
     }
 
-    fn absorb(&mut self, value: Value) {
+    fn absorb(&mut self, mut value: Value) {
         if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
             if let Some((session, request)) = self.answering.remove(&id) {
                 if value.get("error").is_none() {
@@ -1276,10 +1341,31 @@ impl Cdp {
             return;
         }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
-            let Some(paused) = Paused::from_event(&value) else {
+            let Some(mut paused) = Paused::from_event(&value) else {
                 return;
             };
-            let protected = fetch::reaches_protected(&self.guard, &paused);
+            if let Some(network) = &paused.network_id {
+                self.request_aliases.entry(network.clone()).or_default().insert(paused.request_id.clone());
+                self.request_aliases.entry(paused.request_id.clone()).or_default().insert(network.clone());
+                if self.redirects.contains(network) {
+                    self.mark_redirect(network);
+                }
+            }
+            let reaches = fetch::reaches_protected(&self.guard, &paused);
+            let protected = reaches;
+            let mut headers = json!({"headers":paused.headers,"responseHeaders":paused.response_headers});
+            let redirect = shield::redact_strings(&self.guard, &mut headers);
+            if redirect || reaches {
+                self.mark_redirect(&paused.request_id);
+                if let Some(network) = &paused.network_id {
+                    self.mark_redirect(network);
+                    self.protected_resources.insert((paused.session_id.clone(), paused.url.clone()));
+                }
+            }
+            if redirect {
+                shield::redact_strings(&self.guard, &mut value);
+                paused = Paused::from_event(&value).unwrap();
+            }
             let initiated = self.initiated_by_protected(&paused);
             self.requests.insert(paused.request_id.clone(), protected || initiated);
             if let Some(network) = &paused.network_id {
@@ -1305,7 +1391,7 @@ impl Cdp {
                     .push((paused.session_id.clone(), paused.url.clone(), reason));
             }
             if self.guard_sessions.contains(&paused.session_id) {
-                if protected && paused.resource_type == "Document" {
+                if reaches && paused.resource_type == "Document" {
                     self.answer_protected(&paused);
                 } else {
                     self.continue_plain(&paused.session_id, &paused.request_id);
@@ -1313,6 +1399,9 @@ impl Cdp {
                 return;
             }
             if protected {
+                if !self.guard.url(&paused.full_url()) && !self.blocked.contains(&paused.session_id) {
+                    self.events.push(value);
+                }
                 self.answer_protected(&paused);
                 return;
             }
@@ -1732,6 +1821,9 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
+
+    include!("redirect_test.rs");
+    include!("redirect_matrix_test.rs");
 
     struct Pending {
         inbox: VecDeque<String>,

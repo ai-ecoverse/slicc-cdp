@@ -174,6 +174,113 @@ pub fn mentions(guard: &Protected, value: &Value) -> bool {
     }
 }
 
+fn decode_percent(text: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+fn encode_origin(text: &str) -> String {
+    text.bytes().map(|byte| match byte {
+        b':' | b'/' => format!("%{byte:02X}"),
+        _ => char::from(byte).to_string(),
+    }).collect()
+}
+
+pub fn redact_text(guard: &Protected, text: &str) -> (String, bool) {
+    redact_text_at(guard, text, 0)
+}
+
+fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool) {
+    let bytes = text.as_bytes();
+    let mut normalized = String::new();
+    let mut from = 0;
+    let mut index = 0;
+    let mut encoded_protected = false;
+    while index + 2 < bytes.len() {
+        if bytes[index] != b'%' || !bytes[index + 1].is_ascii_hexdigit() || !bytes[index + 2].is_ascii_hexdigit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 2 < bytes.len() && bytes[index] == b'%' && bytes[index + 1].is_ascii_hexdigit() && bytes[index + 2].is_ascii_hexdigit() {
+            index += 3;
+        }
+        let decoded = decode_percent(&text[start..index]);
+        let (redacted, protected) = if depth < 8 { redact_text_at(guard, &decoded, depth + 1) } else { ("about:blank".to_string(), true) };
+        if protected {
+            normalized.push_str(&text[from..start]);
+            normalized.extend(redacted.bytes().map(|byte| format!("%{byte:02X}")));
+            from = index;
+            encoded_protected = true;
+        }
+    }
+    normalized.push_str(&text[from..]);
+    let text = normalized.as_str();
+    let lower = text.to_ascii_lowercase();
+    let prefixes = ["https://", "http://", "wss://", "ws://", "https%3a%2f%2f", "http%3a%2f%2f", "https:\\/\\/", "http:\\/\\/"];
+    let mut out = String::new();
+    let mut from = 0;
+    let mut protected = encoded_protected;
+    while from < text.len() {
+        let next = prefixes.iter().filter_map(|prefix| lower[from..].find(prefix).map(|at| (from + at, *prefix))).min_by_key(|(at, _)| *at);
+        let Some((start, prefix)) = next else { break };
+        out.push_str(&text[from..start]);
+        let encoded = prefix.contains('%');
+        let end = text[start..].char_indices().find_map(|(at, ch)| {
+            (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | ')' | ']' | '}') || encoded && ch == '&').then_some(start + at)
+        }).unwrap_or(text.len());
+        let raw = &text[start..end];
+        let decoded = decode_percent(&raw.replace("\\/", "/"));
+        if url_protected(guard, &decoded) {
+            protected = true;
+            let origin = url::Url::parse(&web_socket_as_http(&decoded)).ok().map(|url| url.origin().ascii_serialization()).filter(|origin| origin != "null").unwrap_or_else(|| "about:blank".into());
+            out.push_str(&if encoded { encode_origin(&origin) } else { origin });
+            from = end;
+        } else {
+            out.push_str(&text[start..start + prefix.len()]);
+            from = start + prefix.len();
+        }
+    }
+    out.push_str(&text[from..]);
+    (out, protected)
+}
+
+pub fn redact_strings(guard: &Protected, value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let (redacted, protected) = redact_text(guard, text);
+            *text = redacted;
+            protected
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |found, item| redact_strings(guard, item) || found),
+        Value::Object(map) => {
+            let mut found = false;
+            for (key, mut item) in std::mem::take(map) {
+                let (key, protected) = redact_text(guard, &key);
+                found |= protected | redact_strings(guard, &mut item);
+                map.insert(key, item);
+            }
+            found
+        }
+        _ => false,
+    }
+}
+
 pub fn names_protected_storage(guard: &Protected, value: &Value) -> bool {
     match value {
         Value::Array(items) => items

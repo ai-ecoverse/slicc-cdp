@@ -5,11 +5,12 @@ import { fileURLToPath } from 'node:url';
 
 const bridge = fileURLToPath(new URL('../../target/debug/examples/guard_bridge', import.meta.url));
 
-function channel(write) {
+function channel(write, onMessage) {
   const events = [];
   const pending = new Map();
   let id = 0;
   const receive = (message) => {
+    onMessage?.(message);
     if (message.event) events.push(message.event);
     else if (message.method) events.push(message);
     const waiter = pending.get(message.id);
@@ -58,7 +59,7 @@ function channel(write) {
   };
 }
 
-async function wasiGuarded(ws, origin, { variant, detachDelay }) {
+async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
   const { createNodeKernel } = await import('@ai-ecoverse/slicc-kernel/node');
   const { bridge: browserBridge } = await import('./browser.mjs');
   const kernel = await createNodeKernel({ cdp: browserBridge(ws) });
@@ -93,7 +94,7 @@ async function wasiGuarded(ws, origin, { variant, detachDelay }) {
       return (await child.wait()).status;
     }`
     );
-    client = channel((message) => terminal.write(`${message}\n`));
+    client = channel((message) => terminal.write(`${message}\n`), onMessage);
     let buffered = '';
     let ready;
     const started = new Promise((resolve) => {
@@ -155,13 +156,13 @@ async function wasiGuarded(ws, origin, { variant, detachDelay }) {
   }
 }
 
-export async function guarded(ws, origin, { variant, detachDelay }) {
+export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
   if (!['prompt', 'lagging'].includes(variant) || !Number.isInteger(detachDelay))
     throw new Error('invalid guard variant');
   if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
-    return wasiGuarded(ws, origin, { variant, detachDelay });
+    return wasiGuarded(ws, origin, { variant, detachDelay, onMessage });
   const child = spawn(bridge, [ws, origin], { stdio: ['pipe', 'pipe', 'inherit'] });
-  const client = channel((message) => child.stdin.write(`${message}\n`));
+  const client = channel((message) => child.stdin.write(`${message}\n`), onMessage);
   createInterface({ input: child.stdout }).on('line', (line) => client.receive(JSON.parse(line)));
   child.on('error', client.stop);
   child.stdin.on('error', client.stop);

@@ -955,7 +955,8 @@ mod tests {
             .collect();
         assert_eq!(failed, [("R1", "BlockedByClient"), ("R3", "BlockedByClient")]);
         assert!(sent.iter().all(|item| item["params"].get("url").is_none()));
-        assert!(cdp.events().is_empty());
+        assert_eq!(cdp.events().len(), 1);
+        assert_eq!(cdp.events()[0]["params"]["responseHeaders"][0]["value"], "https://vault.sliccy.ai");
     }
 
     #[test]
