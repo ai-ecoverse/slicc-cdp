@@ -13,6 +13,37 @@ export function origins(fixture) {
   };
 }
 
+export function browserStartup(launch, report = () => {}) {
+  let rowStarted = false;
+  let retried = false;
+  const retries = [];
+  return {
+    markRowStarted() {
+      rowStarted = true;
+    },
+    get retries() {
+      return retries.map((retry) => ({ ...retry }));
+    },
+    async start(args, details = {}) {
+      try {
+        return await launch(args);
+      } catch (error) {
+        if (
+          rowStarted ||
+          retried ||
+          !/^debugging port \d+ did not answer \/json\/version\b/.test(error?.message ?? '')
+        )
+          throw error;
+        retried = true;
+        const retry = { ...details, attempt: 1, reason: error.message };
+        retries.push(retry);
+        report({ ...retry });
+        return launch(args);
+      }
+    },
+  };
+}
+
 export function browserArgs({ privileged = false } = {}) {
   const hosts = [
     'seven.sliccy.ai',
