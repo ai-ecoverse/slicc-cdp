@@ -75,9 +75,12 @@ fn main() {
             Ok(line) => {
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let method = message["method"].as_str().unwrap();
-                let params = message["params"].clone();
+                let mut params = message["params"].clone();
+                let notify = params.as_object_mut().and_then(|params| params.remove("__guardBridgeNotify")).and_then(|value| value.as_bool()).unwrap_or(false);
                 let session = message["sessionId"].as_str();
-                if method == "Runtime.evaluate" && params["awaitPromise"] == true {
+                if notify && method == "Page.navigate" {
+                    answer(message["id"].clone(), cdp.notify(method, params, session).map(|_| json!({})));
+                } else if method == "Runtime.evaluate" && params["awaitPromise"] == true {
                     let id = message["id"].as_u64().unwrap();
                     let key = format!("__guard_bridge_{id}");
                     let expression =

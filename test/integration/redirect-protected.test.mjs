@@ -46,7 +46,9 @@ before(() => {
 });
 
 for (const transport of ['native', 'wasi']) {
-  test(`protected redirects redact secrets through ${transport}`, { timeout: 300000 }, async () => {
+  test(`protected redirects redact secrets through ${transport}`, {
+    timeout: 300000,
+  }, async (t) => {
     const scratch = mkdtempSync(path.join(tmpdir(), 'slicc-redirect-427-'));
     const key = path.join(scratch, 'key.pem');
     const cert = path.join(scratch, 'cert.pem');
@@ -102,6 +104,22 @@ for (const transport of ['native', 'wasi']) {
     const tls = createTlsServer({ key: readFileSync(key), cert: readFileSync(cert) }, handler);
     let browser;
     let client;
+    const cleanup = () =>
+      (cleanupPromise ??= (async () => {
+        await browser?.close();
+        await client?.close();
+        server.closeAllConnections();
+        tls.closeAllConnections();
+        await new Promise((resolve) => server.close(resolve));
+        await new Promise((resolve) => tls.close(resolve));
+        rmSync(scratch, { recursive: true, force: true });
+      })());
+    let cleanupPromise;
+    const interrupt = () => {
+      void cleanup();
+    };
+    t.signal.addEventListener('abort', interrupt, { once: true });
+    process.once('SIGTERM', interrupt);
     const previousTransport = process.env.SLICC_GUARD_TRANSPORT;
     const record = (message) => {
       messages.push(message);
@@ -163,13 +181,14 @@ for (const transport of ['native', 'wasi']) {
             const navigating = call(
               navigate,
               navigate === 'Page.navigate'
-                ? { url }
+                ? { url, __guardBridgeNotify: true }
                 : { expression: `location.href=${JSON.stringify(url)}` },
               sessionId
             );
             const answered = new Set();
-            const deadline = Date.now() + 13000;
+            const deadline = Date.now() + 5000;
             while (Date.now() < deadline) {
+              t.signal.throwIfAborted();
               for (const event of client.events.filter(
                 (event) => event.sessionId === sessionId && event.method === 'Fetch.requestPaused'
               )) {
@@ -188,21 +207,18 @@ for (const transport of ['native', 'wasi']) {
                   sessionId
                 );
               }
-              if (
-                client.events.some(
-                  (event) =>
-                    event.sessionId === sessionId && event.method === 'Network.loadingFinished'
-                ) ||
-                (kind === 'location' && answered.size)
-              )
-                break;
+              if (answered.size) break;
               await delay(50);
             }
             await navigating;
+            await client.send('Fetch.disable', {}, sessionId);
+            await delay(300);
             check(answered.size > 0, 'Response-stage redirect event must be delivered');
             const requests = client.events.filter(
               (event) =>
-                event.sessionId === sessionId && event.method === 'Network.requestWillBeSent'
+                event.sessionId === sessionId &&
+                event.method === 'Network.requestWillBeSent' &&
+                event.params.request.url.startsWith(`http://127.0.0.1:${port}/`)
             );
             check(requests.length > 0, 'ordinary request metadata must be delivered');
             for (const event of requests) {
@@ -325,23 +341,16 @@ for (const transport of ['native', 'wasi']) {
         await client.send('Target.closeTarget', { targetId });
       }
     } finally {
-      try {
-        await client?.close();
-      } finally {
-        await browser?.close();
-        server.closeAllConnections();
-        tls.closeAllConnections();
-        await new Promise((resolve) => server.close(resolve));
-        await new Promise((resolve) => tls.close(resolve));
-        rmSync(scratch, { recursive: true, force: true });
-        if (previousTransport === undefined) delete process.env.SLICC_GUARD_TRANSPORT;
-        else process.env.SLICC_GUARD_TRANSPORT = previousTransport;
-        if (directory)
-          appendFileSync(
-            path.join(directory, `${transport}-results.jsonl`),
-            `${results.map((result) => JSON.stringify(result)).join('\n')}\n`
-          );
-      }
+      await cleanup();
+      process.removeListener('SIGTERM', interrupt);
+      t.signal.removeEventListener('abort', interrupt);
+      if (previousTransport === undefined) delete process.env.SLICC_GUARD_TRANSPORT;
+      else process.env.SLICC_GUARD_TRANSPORT = previousTransport;
+      if (directory)
+        appendFileSync(
+          path.join(directory, `${transport}-results.jsonl`),
+          `${results.map((result) => JSON.stringify(result)).join('\n')}\n`
+        );
     }
     assert.deepEqual(failures, [], 'redirect policy or ordinary control failed');
     assert.equal(

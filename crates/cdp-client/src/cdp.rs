@@ -1834,6 +1834,7 @@ mod tests {
     include!("redirect_test.rs");
     include!("redirect_matrix_test.rs");
     include!("redirect_race_test.rs");
+    include!("redirect_fragment_test.rs");
 
     struct Pending {
         inbox: VecDeque<String>,
