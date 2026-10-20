@@ -20,6 +20,7 @@ export async function executeWorker({
   log,
   stderr,
   workerTimeoutMs,
+  guardTargetParallel = suitePolicy.guardTargetParallel,
 }) {
   const remainingMs = Math.max(0, Math.floor(deadline - performance.now()));
   if (!remainingMs) {
@@ -50,7 +51,8 @@ export async function executeWorker({
       env: {
         ...cleanEnv(),
         ...env,
-        SLICC_GUARD_TARGET_PARALLEL: String(suitePolicy.guardTargetParallel),
+        SLICC_GUARD_TARGET_PARALLEL: String(guardTargetParallel),
+        SLICC_GUARD_TIMEOUT: String(suitePolicy.testTimeoutMs),
         SLICC_GUARD_PARALLEL: String(suitePolicy.guardSlotParallel),
         SLICC_GUARD_REPORT: report,
       },
