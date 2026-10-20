@@ -1186,7 +1186,7 @@ impl Cdp {
             return;
         }
         self.adopt_guard_attach(&value);
-        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || shield::loaded_urls_protected(&self.guard, &value["params"]) {
+        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") && shield::loaded_urls_protected(&self.guard, &value["params"]) {
             return;
         }
         let redacted = shield::redact_strings(&self.guard, &mut value);

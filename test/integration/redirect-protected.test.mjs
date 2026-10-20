@@ -10,6 +10,8 @@ import { launchBrowser } from './browser.mjs';
 import { guarded } from './guard-client.mjs';
 
 const marker = 'P0_REDIRECT_SECRET_7F9A';
+const ordinaryMarker = 'P0_ORDINARY_CONTROL_5D2B';
+const ordinaryPath = `/ordinary?control=${ordinaryMarker}`;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const forms = [
   marker,
@@ -19,6 +21,12 @@ const forms = [
   [...Buffer.from(marker)].map((byte) => `\\u${byte.toString(16).padStart(4, '0')}`).join(''),
   Buffer.from(marker).toString('base64'),
 ];
+
+function headerValue(headers, name) {
+  if (Array.isArray(headers))
+    return headers.find((header) => header.name.toLowerCase() === name)?.value;
+  return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name)?.[1];
+}
 
 function containsMarker(value) {
   const text = JSON.stringify(value);
@@ -86,17 +94,23 @@ for (const transport of ['native', 'wasi']) {
       if (parsed.pathname === '/redirect') {
         const kind = parsed.searchParams.get('kind');
         res.statusCode = 302;
-        res.setHeader('Location', kind === 'location' ? secret : '/ordinary');
-        if (kind === 'link') res.setHeader('Link', `<${secret}>; rel=preconnect`);
-        if (kind === 'refresh') res.setHeader('Refresh', `0;url=${secret}`);
+        const ordinary = `http://${req.headers.host}${ordinaryPath}`;
+        res.setHeader(
+          'Location',
+          kind === 'location' ? secret : kind === 'control' ? ordinaryPath : '/ordinary'
+        );
+        if (kind === 'link' || kind === 'control')
+          res.setHeader('Link', `<${kind === 'control' ? ordinary : secret}>; rel=preconnect`);
+        if (kind === 'refresh' || kind === 'control')
+          res.setHeader('Refresh', `0;url=${kind === 'control' ? ordinary : secret}`);
         res.setHeader('X-Control', 'ordinary-header');
-        res.end(kind === 'control' ? 'ordinary body' : `Redirect to ${secret}`);
+        res.end(kind === 'control' ? `ordinary body ${ordinaryMarker}` : `Redirect to ${secret}`);
       } else {
         res.setHeader('Content-Type', 'text/html');
         res.end(
           req.headers.host?.includes('sliccy.ai')
             ? `<html><body>${marker}</body></html>`
-            : '<html><body>ordinary body</body></html>'
+            : `<html><body>ordinary body${parsed.searchParams.get('control') === ordinaryMarker ? ` ${ordinaryMarker}` : ''}</body></html>`
         );
       }
     };
@@ -177,6 +191,7 @@ for (const transport of ['native', 'wasi']) {
               sessionId
             );
             const start = messages.length;
+            const ordinaryUrl = `http://127.0.0.1:${port}${kind === 'control' ? ordinaryPath : '/ordinary'}`;
             const url = `http://127.0.0.1:${port}/redirect?host=${host}&kind=${kind}`;
             const navigating = call(
               navigate,
@@ -214,12 +229,54 @@ for (const transport of ['native', 'wasi']) {
             await client.send('Fetch.disable', {}, sessionId);
             await delay(300);
             check(answered.size > 0, 'Response-stage redirect event must be delivered');
+            if (kind === 'control') {
+              const controlEvents = client.events.filter((event) => event.sessionId === sessionId);
+              const controls = [
+                [
+                  'Network.responseReceivedExtraInfo',
+                  controlEvents.find(
+                    (event) =>
+                      event.method === 'Network.responseReceivedExtraInfo' &&
+                      event.params.statusCode === 302
+                  )?.params.headers,
+                ],
+                [
+                  'Network.requestWillBeSent.redirectResponse',
+                  controlEvents.find(
+                    (event) =>
+                      event.method === 'Network.requestWillBeSent' &&
+                      event.params.redirectResponse?.status === 302
+                  )?.params.redirectResponse.headers,
+                ],
+                [
+                  'Fetch.requestPaused.Response',
+                  controlEvents.find(
+                    (event) =>
+                      event.method === 'Fetch.requestPaused' &&
+                      event.params.responseStatusCode === 302
+                  )?.params.responseHeaders,
+                ],
+              ];
+              for (const [source, headers] of controls) {
+                check(
+                  headerValue(headers, 'location') === ordinaryPath,
+                  `${source}: ordinary Location marker must be preserved`
+                );
+                check(
+                  headerValue(headers, 'link') === `<${ordinaryUrl}>; rel=preconnect`,
+                  `${source}: ordinary Link marker must be preserved`
+                );
+                check(
+                  headerValue(headers, 'refresh') === `0;url=${ordinaryUrl}`,
+                  `${source}: ordinary Refresh marker must be preserved`
+                );
+              }
+            }
             const requests = client.events.filter(
               (event) =>
                 event.sessionId === sessionId &&
                 event.method === 'Network.requestWillBeSent' &&
-                (event.params.request.url === url ||
-                  event.params.request.url === `http://127.0.0.1:${port}/ordinary`)
+                (event.params.request.url === url || event.params.request.url === ordinaryUrl)
             );
             check(requests.length > 0, 'ordinary request metadata must be delivered');
             for (const event of requests) {
@@ -234,7 +291,10 @@ for (const transport of ['native', 'wasi']) {
                 sessionId
               );
               if (kind === 'control')
-                check(body?.body?.includes('ordinary body'), 'ordinary body must remain readable');
+                check(
+                  body?.body?.includes(ordinaryMarker),
+                  'ordinary body marker must remain readable through Network.getResponseBody'
+                );
               else {
                 check(body === null, 'tainted Network body must be refused');
                 check(replay === null, 'tainted replayXHR must be refused');
@@ -246,11 +306,15 @@ for (const transport of ['native', 'wasi']) {
             if (tree?.frameTree?.frame?.id) {
               const content = await call(
                 'Page.getResourceContent',
-                { frameId: tree.frameTree.frame.id, url },
+                { frameId: tree.frameTree.frame.id, url: kind === 'control' ? ordinaryUrl : url },
                 sessionId
               );
-              if (kind !== 'control')
-                check(content === null, 'tainted resource content must be refused');
+              if (kind === 'control')
+                check(
+                  content?.content?.includes(ordinaryMarker),
+                  'ordinary body marker must remain readable through Page.getResourceContent'
+                );
+              else check(content === null, 'tainted resource content must be refused');
             }
             await call('DOMSnapshot.captureSnapshot', { computedStyles: [] }, sessionId);
             check(

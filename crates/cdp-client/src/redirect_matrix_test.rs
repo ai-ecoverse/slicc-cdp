@@ -1,7 +1,9 @@
 #[test]
 fn redirect_extra_info_pairing_and_ordinary_controls_remain_visible() {
     let url = redirect_url("seven");
-    let mut cdp = redirect_body_backend("ordinary body".into());
+    let ordinary_marker = "P0_ORDINARY_CONTROL_5D2B";
+    let ordinary_url = format!("https://example.test/ordinary?control={ordinary_marker}");
+    let mut cdp = redirect_body_backend(format!("ordinary body {ordinary_marker}"));
     cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"S","params":{"requestId":"R","statusCode":302,"headers":{"Location":url,"X-Control":"ordinary"},"headersText":format!("HTTP/1.1 302\r\nLocation: {url}\r\nX-Control: ordinary\r\n")}}));
     assert!(cdp.events().is_empty());
     cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"R","request":{"url":"https://example.test/start"}}}));
@@ -9,10 +11,13 @@ fn redirect_extra_info_pairing_and_ordinary_controls_remain_visible() {
     assert_eq!(cdp.events()[1]["params"]["headers"]["Location"], "https://seven.sliccy.ai");
     assert_eq!(cdp.events()[1]["params"]["headers"]["X-Control"], "ordinary");
     assert!(cdp.call("Network.getResponseBody", json!({"requestId":"R"}), Some("S")).is_err());
-    cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"ORDINARY","request":{"url":"https://example.test/ordinary"},"redirectResponse":{"url":"https://example.test/start","status":302,"headers":{"Location":"https://example.test/ordinary","Link":"<https://example.test/style.css>; rel=stylesheet"}}}}));
+    let headers = json!({"Location":ordinary_url,"Link":format!("<{ordinary_url}>; rel=preconnect"),"Refresh":format!("0;url={ordinary_url}")});
+    cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"ORDINARY","request":{"url":ordinary_url},"redirectResponse":{"url":"https://example.test/start","status":302,"headers":headers}}}));
     let body = cdp.call("Network.getResponseBody", json!({"requestId":"ORDINARY"}), Some("S")).unwrap();
-    assert_eq!(body["body"], "ordinary body");
-    assert_eq!(cdp.events().last().unwrap()["params"]["redirectResponse"]["headers"]["Location"], "https://example.test/ordinary");
+    assert!(body["body"].as_str().unwrap().contains(ordinary_marker));
+    assert_eq!(cdp.events().last().unwrap()["params"]["redirectResponse"]["headers"], headers);
+    let content = cdp.call("Page.getResourceContent", json!({"frameId":"FRAME","url":ordinary_url}), Some("S")).unwrap();
+    assert!(content["content"].as_str().unwrap().contains(ordinary_marker));
 }
 
 #[test]
