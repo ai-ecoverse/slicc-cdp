@@ -27,6 +27,28 @@ fn ordinary_source_reads_remain_readable() {
 }
 
 #[test]
+fn guard_session_redirect_taint_blocks_client_session_source_reads() {
+    let mut cdp = redirect_body_backend(REDIRECT_MARKER.into());
+    cdp.session_targets.insert("S".into(), "T".into());
+    cdp.guards.insert("T".into(), "G".into());
+    cdp.guard_sessions.insert("G".into());
+    cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"G","params":{"requestId":"R","request":{"url":"https://example.test/source"}}}));
+    cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"G","params":{"requestId":"R","headers":{"Location":redirect_url("seven")},"statusCode":302}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":"https://example.test","auxData":{"isDefault":true}}}}));
+    cdp.absorb(json!({"method":"Debugger.scriptParsed","sessionId":"S","params":{"scriptId":"JS","url":"https://example.test/source#client-fragment","executionContextId":1}}));
+    cdp.absorb(json!({"method":"CSS.styleSheetAdded","sessionId":"S","params":{"header":{"styleSheetId":"CSS","sourceURL":"https://example.test/source#client-fragment"}}}));
+    cdp.guards.remove("T");
+    for (method, params) in [
+        ("CSS.getStyleSheetText", json!({"styleSheetId":"CSS"})),
+        ("Debugger.getScriptSource", json!({"scriptId":"JS"})),
+        ("Page.getResourceContent", json!({"url":"https://example.test/source#client-fragment","frameId":"FRAME"})),
+    ] {
+        let result = cdp.call(method, params, Some("S"));
+        assert!(result.is_err(), "guard-only taint did not block {method}: {result:?}");
+    }
+}
+
+#[test]
 fn multiply_encoded_nested_urls_and_json_slashes_are_redacted() {
     for host in ["seven", "vault"] {
         let url = redirect_url(host);

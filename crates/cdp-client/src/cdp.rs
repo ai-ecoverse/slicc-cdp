@@ -55,6 +55,7 @@ pub struct Cdp {
     request_aliases: BTreeMap<String, BTreeSet<String>>,
     request_resources: BTreeMap<String, BTreeSet<(String, String)>>,
     protected_resources: BTreeSet<(String, String)>,
+    protected_target_resources: BTreeSet<(String, String)>,
     source_resources: BTreeMap<(String, String), String>,
     handed: BTreeSet<(String, String)>,
     answering: BTreeMap<i64, (String, String)>,
@@ -98,6 +99,7 @@ impl Cdp {
             request_aliases: BTreeMap::new(),
             request_resources: BTreeMap::new(),
             protected_resources: BTreeSet::new(),
+            protected_target_resources: BTreeSet::new(),
             source_resources: BTreeMap::new(),
             handed: BTreeSet::new(),
             answering: BTreeMap::new(),
@@ -947,8 +949,22 @@ impl Cdp {
         false
     }
 
+    fn resource_url(url: &str) -> String {
+        url::Url::parse(url).map(|mut url| { url.set_fragment(None); url.to_string() }).unwrap_or_else(|_| url.to_string())
+    }
+
+    fn protect_resource(&mut self, session: &str, url: &str) {
+        let url = Self::resource_url(url);
+        self.protected_resources.insert((session.to_string(), url.clone()));
+        if let Some(target) = self.session_target(session) {
+            self.protected_target_resources.insert((target, url));
+        }
+    }
+
     fn resource_protected(&self, session: &str, url: &str) -> bool {
-        self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), url.to_string()))
+        let key = Self::resource_url(url);
+        self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), key.clone()))
+            || self.session_target(session).is_some_and(|target| self.protected_target_resources.contains(&(target, key)))
     }
 
     fn mark_redirect(&mut self, id: &str) {
@@ -956,8 +972,8 @@ impl Cdp {
         ids.insert(id.to_string());
         for id in ids {
             self.redirects.insert(id.clone());
-            if let Some(resources) = self.request_resources.get(&id) {
-                self.protected_resources.extend(resources.iter().cloned());
+            for (session, url) in self.request_resources.get(&id).cloned().unwrap_or_default() {
+                self.protect_resource(&session, &url);
             }
         }
     }
@@ -978,7 +994,7 @@ impl Cdp {
                 let resource = (session.clone().unwrap_or_default(), url.clone());
                 self.request_resources.entry(id.to_string()).or_default().insert(resource.clone());
                 if self.redirects.contains(id) || self.guard.url(&url) {
-                    self.protected_resources.insert(resource);
+                    self.protect_resource(&resource.0, &resource.1);
                 }
                 let initiator = ["documentURL"]
                     .iter()
@@ -1385,7 +1401,7 @@ impl Cdp {
                 self.mark_redirect(&paused.request_id);
                 if let Some(network) = &paused.network_id {
                     self.mark_redirect(network);
-                    self.protected_resources.insert((paused.session_id.clone(), paused.url.clone()));
+                    self.protect_resource(&paused.session_id, &paused.url);
                 }
             }
             if redirect {
