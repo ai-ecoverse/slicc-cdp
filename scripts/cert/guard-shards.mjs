@@ -37,7 +37,10 @@ export function guardShardPlan(set) {
 }
 
 function checkRows(report, shard, issues) {
-  const actual = Array.isArray(report?.results) ? report.results.map(guardRowKey).sort() : null;
+  const actual =
+    Array.isArray(report?.results) && report.results.every((row) => row && typeof row === 'object')
+      ? report.results.map(guardRowKey).sort()
+      : null;
   if (
     !actual ||
     new Set(actual).size !== actual.length ||
@@ -68,7 +71,11 @@ function checkBinding(plan, shard, document, issues) {
 }
 
 export function guardSetupTimeoutCount(report) {
-  if (!Array.isArray(report?.results)) return null;
+  if (
+    !Array.isArray(report?.results) ||
+    report.results.some((row) => !row || typeof row !== 'object')
+  )
+    return null;
   const setupError =
     /CDP timeout Target\.(createTarget|attachToTarget)|debugging port.*did not answer|browser websocket failed/i;
   return report.results.filter((row) =>
@@ -113,6 +120,10 @@ export function recordGuardShards(plan, documents) {
   )
     issues.failures.push('guard shard plan does not partition the full row universe');
   for (const document of documents) {
+    if (!document || typeof document !== 'object') {
+      issues.incomplete.push('guard shard document unavailable');
+      continue;
+    }
     const shard = plan.shards.find((shard) => shard.id === document.id);
     if (!shard || seen.has(document.id)) {
       issues.failures.push('unknown or duplicate guard shard ' + document.id);

@@ -1,5 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
+import { aggregateGuardReports } from './guard-shard-report.mjs';
+import { guardShardPlan } from './guard-shards.mjs';
 import { biosFindings } from './pr-bios-result.mjs';
 
 export function validateSuite(execution, label, emit, candidate = true) {
@@ -69,12 +71,37 @@ function validateGuardRows(report, leg, vectors, emit) {
   }
 }
 
+function validateGuardShards(execution, subject, plan, vectors, leg, emit) {
+  if (!execution?.shardPlan) return;
+  const expectedPlan = { ...guardShardPlan(vectors), head: subject.commit, run: plan.run };
+  if (!isDeepStrictEqual(execution.shardPlan, expectedPlan))
+    emit('FAIL', `guard ${leg}: shard plan differs from independent corpus/source`);
+  if (!Array.isArray(execution.shards)) emit('INCOMPLETE', `guard ${leg}: shard executions absent`);
+  else {
+    const aggregate = aggregateGuardReports(vectors, expectedPlan, execution.shards);
+    for (const reason of aggregate.coverage.incomplete)
+      emit('INCOMPLETE', `guard ${leg}: ${reason}`);
+    for (const reason of aggregate.coverage.failures)
+      if (
+        leg === 'positive' ||
+        !/^guard shard [a-d] failed$|^guard shard rows failed$/.test(reason)
+      )
+        emit('FAIL', `guard ${leg}: ${reason}`);
+    if (
+      !isDeepStrictEqual(execution.report, aggregate.report) ||
+      !isDeepStrictEqual(execution.guardReport?.report, aggregate.report)
+    )
+      emit('FAIL', `guard ${leg}: aggregate differs from captured shard rows`);
+  }
+}
+
 export function validateGuard(guard, plan, vectors, emit) {
   for (const leg of ['positive', 'negative']) {
     const execution = guard?.executions?.[leg];
     const subject =
       leg === 'positive' ? { version: plan.version, commit: plan.commit } : plan.baseline;
     validateSuite(execution, `guard ${leg}`, emit, leg === 'positive');
+    validateGuardShards(execution, subject, plan, vectors, leg, emit);
     const report = execution?.report;
     if (
       !Array.isArray(report?.results) ||
