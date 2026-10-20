@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "repository": "ai-ecoverse/slicc-cdp",
+  "version": "1.25.1",
+  "sourceCommit": "baa5edda2411f771f123f6c78b871a14612d5634",
+  "package": {
+    "name": "@ai-ecoverse/slicc-cdp",
+    "version": "0.0.0",
+    "description": "SLICC's CDP layer: client, browser API, transports, HAR, and ARIA snapshot",
+    "type": "module",
+    "license": "Apache-2.0",
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/ai-ecoverse/slicc-cdp.git"
+    },
+    "engines": {
+      "node": ">=24"
+    },
+    "workspaces": ["packages/sliccy-browser"],
+    "fledgling": {
+      "provider": "github",
+      "workflow": "release.yml",
+      "repo": "ai-ecoverse/slicc-cdp",
+      "publish": true
+    },
+    "publishConfig": {
+      "access": "public",
+      "provenance": true
+    },
+    "exports": {
+      ".": {
+        "types": "./src/index.d.ts",
+        "default": "./src/index.js"
+      }
+    },
+    "files": ["src", "bin/playwright-cli.wasm", "bin/curlwright.wasm"],
+    "slicc": {
+      "abi": "wasi",
+      "commands": {
+        "playwright-cli": {
+          "wasm": "bin/playwright-cli.wasm"
+        },
+        "curlwright": {
+          "wasm": "bin/curlwright.wasm"
+        }
+      }
+    },
+    "scripts": {
+      "prepare": "lefthook install && node scripts/allow-crate-readmes.mjs",
+      "build:wasm": "cargo build --release --target wasm32-wasip1 -p slicc-cdp -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
+      "prepublishOnly": "npm run build:wasm",
+      "lint": "slicc-lint",
+      "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js && node --check src/page.js && node --check packages/sliccy-browser/src/browser.js && node --check packages/sliccy-browser/src/fetch-script.js && node --check packages/sliccy-browser/src/ws-router.js",
+      "format": "biome check --write .",
+      "test": "true",
+      "test:integration": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build -p slicc-cdp -p curlwright && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --target wasm32-wasip1 -p slicc-cdp -p curlwright && npx playwright-core install chromium && node --test --test-timeout=600000 test/integration/*.test.mjs",
+      "test:unit": "mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node --test 'test/unit/**/*.test.mjs'",
+      "trust": "npx fledgling sync -y --skip-publish",
+      "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",
+      "release": "semantic-release"
+    },
+    "devDependencies": {
+      "@ai-ecoverse/slicc-kernel": "1.85.1",
+      "@ai-ecoverse/slicc-shared-web": "1.13.2",
+      "@biomejs/biome": "2.5.15",
+      "lefthook": "2.1.17",
+      "playwright-core": "1.63.0",
+      "semantic-release": "25.0.9"
+    }
+  },
+  "lockProjection": {
+    "sha256": "7fc0feac8dc469b8aabeafea623518910e68707071ac96ff67247a362e11d749",
+    "corpusEntryAbsent": true
+  },
+  "cargo": [
+    {
+      "file": "crates/cdp-client/Cargo.toml",
+      "sha256": "b01e9efbbd3e34a4720ff9e0be759bc379cc5461ef263a55215aca8e7aa5f30d",
+      "manifest": "[package]\nname = \"slicc-cdp-client\"\nversion = \"0.0.0\"\nedition = \"2021\"\nrust-version = \"1.83\"\nlicense = \"Apache-2.0\"\ndescription = \"Shared CDP connection for slicc-cdp CLIs\"\nrepository = \"https://github.com/ai-ecoverse/slicc-cdp\"\nhomepage = \"https://github.com/ai-ecoverse/slicc-cdp\"\nreadme = \"README.md\"\nkeywords = [\"cdp\", \"chrome\", \"devtools\", \"websocket\"]\ncategories = [\"development-tools\", \"network-programming\"]\npublish = true\n\n[lib]\nname = \"cdp_client\"\n\n[dependencies]\nserde_json = \"1\"\nslicc-browsers = { version = \"1.5\", features = [\"serde\"] }\nurl = \"2.5\"\nwasix-net = \"0.1\"\n\n[target.'cfg(not(target_os = \"wasi\"))'.dependencies]\nnative-tls = \"0.2\"\n\n[target.'cfg(all(target_os = \"linux\", target_env = \"musl\"))'.dependencies]\nopenssl = { version = \"0.10\", features = [\"vendored\"] }\n\n[dev-dependencies]\nslicc-browsers = { version = \"1.5\", features = [\"corpus\"] }\n"
+    },
+    {
+      "file": "crates/discovery/Cargo.toml",
+      "sha256": "44e12a79ea7f1b545c71fa2bd3741ffef97838b56111fb3c2c4a3b2649bfdcb7",
+      "manifest": "[package]\nname = \"slicc-discovery\"\nversion = \"0.0.0\"\nedition = \"2021\"\nrust-version = \"1.83\"\nlicense = \"Apache-2.0\"\ndescription = \"Discovery engine for agent-facing web standards\"\nrepository = \"https://github.com/ai-ecoverse/slicc-cdp\"\nhomepage = \"https://github.com/ai-ecoverse/slicc-cdp\"\nkeywords = [\"discovery\", \"web-standards\", \"link-header\", \"well-known\"]\ncategories = [\"web-programming\", \"parser-implementations\"]\npublish = true\n\n[lib]\nname = \"discovery\"\n\n[dependencies]\npsl = \"2\"\nserde = { version = \"1\", features = [\"derive\"] }\nserde_json = \"1\"\nurl = \"2.5\"\n"
+    },
+    {
+      "file": "crates/playwright-cli/Cargo.toml",
+      "sha256": "321cae76dfc3c94a9eae2da46eefe92c47f9346b729e02bcbc79dd7003a767c5",
+      "manifest": "[package]\nname = \"slicc-cdp\"\nversion = \"0.0.0\"\nedition = \"2021\"\nrust-version = \"1.88\"\nlicense = \"Apache-2.0\"\ndescription = \"SLICC CDP client; installs the playwright-cli command\"\nrepository = \"https://github.com/ai-ecoverse/slicc-cdp\"\nhomepage = \"https://github.com/ai-ecoverse/slicc-cdp\"\nreadme = \"README.md\"\nkeywords = [\"cdp\", \"chrome\", \"devtools\", \"browser\"]\ncategories = [\"command-line-utilities\", \"development-tools\"]\npublish = true\n\n[lib]\nname = \"slicc_cdp\"\n\n[[bin]]\nname = \"playwright-cli\"\npath = \"src/main.rs\"\n\n[dependencies]\ncdp-client = { package = \"slicc-cdp-client\", path = \"../cdp-client\", version = \"0.0.0\" }\ndiscovery = { package = \"slicc-discovery\", path = \"../discovery\", version = \"0.0.0\" }\nimage = { version = \"0.25.8\", default-features = false, features = [\"png\"] }\nserde_json = \"1\"\nslicc-browsers = { version = \"1.5\", features = [\"serde\"] }\nurl = \"2.5\"\n\n[target.'cfg(not(target_os = \"wasi\"))'.dependencies]\nlibc = \"0.2\"\n\n[dev-dependencies]\nslicc-browsers = { version = \"1.5\", features = [\"corpus\"] }\n"
+    },
+    {
+      "file": "crates/curlwright/Cargo.toml",
+      "sha256": "245aeb291d541f3e4a00622df09f94343b39000531c3697bd6fe7cb21dfa9f1b",
+      "manifest": "[package]\nname = \"curlwright\"\nversion = \"0.0.0\"\nedition = \"2021\"\nrust-version = \"1.83\"\nlicense = \"Apache-2.0\"\ndescription = \"curl-style requests inside an already-open browser tab\"\nrepository = \"https://github.com/ai-ecoverse/slicc-cdp\"\nhomepage = \"https://github.com/ai-ecoverse/slicc-cdp\"\nreadme = \"README.md\"\nkeywords = [\"cdp\", \"chrome\", \"curl\", \"http\"]\ncategories = [\"command-line-utilities\", \"web-programming\"]\npublish = true\n\n[[bin]]\nname = \"curlwright\"\npath = \"src/main.rs\"\n\n[dependencies]\ncdp-client = { package = \"slicc-cdp-client\", path = \"../cdp-client\", version = \"0.0.0\" }\nserde_json = \"1\"\n"
+    }
+  ]
+}
