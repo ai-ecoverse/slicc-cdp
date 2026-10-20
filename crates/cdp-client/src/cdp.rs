@@ -1239,6 +1239,7 @@ impl Cdp {
                     let targets: Vec<String> = self.guards.iter().filter(|(_, session)| session.as_str() == child).map(|(target, _)| target.clone()).collect();
                     for target in targets {
                         self.documents.remove(&target);
+                        self.abandon(&target);
                     }
                     self.guards.retain(|_, session| session != child);
                 }
@@ -2431,6 +2432,45 @@ mod tests {
             assert_eq!(runtime["result"]["value"]["text"], origin);
             assert!(!runtime.to_string().contains("HISTORY_MARK"));
             assert!(!cdp.session_blocked("S"));
+        }
+    }
+
+    #[test]
+    fn internal_guard_loss_refuses_direct_commands_even_with_stale_ordinary_discovery() {
+        for error in [false, true] {
+            let mut cdp = error_page_client();
+            if error {
+                error_commit(&mut cdp, "https://seven.sliccy.ai/path?secret#fragment", "://");
+            }
+            assert_eq!(cdp.targets["T"]["url"], "https://example.test/");
+            assert!(!cdp.session_blocked("S"));
+            cdp.guards.insert("T".into(), "G".into());
+            cdp.guard_sessions.insert("G".into());
+            cdp.absorb(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"G","targetId":"T"}}));
+            let sent = cdp.next_id;
+            let result = cdp.call("Runtime.evaluate", json!({"expression":"location.href = 'https://seven.sliccy.ai/'"}), Some("S"));
+            assert!(result.is_err(), "guard loss must refuse before any discovery refresh");
+            assert_eq!(cdp.next_id, sent, "no Runtime or discovery command may reach the backend");
+            assert!(cdp.session_blocked("S"));
+            assert!(cdp.abandoned.contains("T"));
+            assert!(cdp.is_protected_target("T"));
+            assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_err());
+        }
+    }
+
+    #[test]
+    fn caller_and_unknown_detach_do_not_abandon_a_healthy_guard() {
+        let mut cdp = error_page_client_url("https://example.test/");
+        cdp.guards.insert("T".into(), "G".into());
+        cdp.guard_sessions.insert("G".into());
+        for detached in ["UNKNOWN", "OTHER"] {
+            cdp.session_targets.insert("OTHER".into(), "T".into());
+            cdp.absorb(json!({"method":"Target.detachedFromTarget","params":{"sessionId":detached,"targetId":"T"}}));
+            assert_eq!(cdp.guards["T"], "G");
+            assert!(cdp.documents.contains_key("T"));
+            assert!(!cdp.abandoned.contains("T"));
+            assert!(!cdp.session_blocked("S"));
+            assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.readyState"}), Some("S")).is_ok());
         }
     }
 
