@@ -249,18 +249,8 @@ impl Cdp {
         if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
             return Err(self.refusal());
         }
-        if matches!(method, "Page.getResourceContent" | "Page.searchInResource") {
-            let url = params.get("url").and_then(Value::as_str).unwrap_or("");
-            if self.resource_protected(session_id.unwrap_or(""), url) {
-                return Err(self.refusal());
-            }
-        }
-        if matches!(method, "CSS.getStyleSheetText" | "Debugger.getScriptSource" | "Debugger.getWasmBytecode" | "Debugger.searchInContent" | "Debugger.disassembleWasmModule") {
-            let id = params.get("styleSheetId").or_else(|| params.get("scriptId")).and_then(Value::as_str).unwrap_or("");
-            let session = session_id.unwrap_or("");
-            if self.source_resources.get(&(session.to_string(), id.to_string())).is_none_or(|url| self.resource_protected(session, url)) {
-                return Err(self.refusal());
-            }
+        if !shield::body_method(method) && self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Err(self.refusal());
         }
         if Worlds::selectors(params) || Worlds::sensitive(method) {
             let session = session_id.unwrap_or("");
@@ -397,6 +387,9 @@ impl Cdp {
         session_id: Option<&str>,
         mut result: Value,
     ) -> Result<Value, String> {
+        if self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Err(self.refusal());
+        }
         if Worlds::sensitive(method) {
             if let Some(reason) = self.worlds.reason(session_id.unwrap_or(""), method, params) {
                 return Err(reason.into());
@@ -940,6 +933,20 @@ impl Cdp {
         );
     }
 
+    fn content_refused(&self, method: &str, params: &Value, session: &str) -> bool {
+        if shield::body_method(method) && shield::request_key(params).is_some_and(|id| self.request_state(&id) == Some(true)) {
+            return true;
+        }
+        if matches!(method, "Page.getResourceContent" | "Page.searchInResource") {
+            return self.resource_protected(session, params.get("url").and_then(Value::as_str).unwrap_or(""));
+        }
+        if matches!(method, "CSS.getStyleSheetText" | "Debugger.getScriptSource" | "Debugger.getWasmBytecode" | "Debugger.searchInContent" | "Debugger.disassembleWasmModule") {
+            let id = params.get("styleSheetId").or_else(|| params.get("scriptId")).and_then(Value::as_str).unwrap_or("");
+            return self.source_resources.get(&(session.to_string(), id.to_string())).is_none_or(|url| self.resource_protected(session, url));
+        }
+        false
+    }
+
     fn resource_protected(&self, session: &str, url: &str) -> bool {
         self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), url.to_string()))
     }
@@ -1098,7 +1105,7 @@ impl Cdp {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         let id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         let text = |pointer: &str| params.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("");
-        self.requests.get(id) == Some(&true)
+        self.request_state(id) == Some(true)
             || self.blocked.contains(session)
             || self.guard_sessions.contains(session)
             || self.frame_protected(text("/frameId"))
@@ -1319,6 +1326,7 @@ impl Cdp {
                         .get("message")
                         .and_then(|item| item.as_str())
                         .unwrap_or("CDP error");
+                    let (text, _) = shield::redact_text(&self.guard, text);
                     self.fetch_errors.push(format!("Fetch: {text}\n"));
                     self.continue_plain(&session, &request);
                 }
@@ -1367,10 +1375,11 @@ impl Cdp {
                 paused = Paused::from_event(&value).unwrap();
             }
             let initiated = self.initiated_by_protected(&paused);
-            self.requests.insert(paused.request_id.clone(), protected || initiated);
+            let loaded_protected = self.guard.url(&paused.full_url());
+            self.requests.insert(paused.request_id.clone(), loaded_protected || initiated);
             if let Some(network) = &paused.network_id {
                 let entry = self.requests.entry(network.clone()).or_insert(false);
-                *entry = *entry || protected || initiated;
+                *entry = *entry || loaded_protected || initiated;
             }
             #[cfg(test)]
             {
@@ -1824,6 +1833,7 @@ mod tests {
 
     include!("redirect_test.rs");
     include!("redirect_matrix_test.rs");
+    include!("redirect_race_test.rs");
 
     struct Pending {
         inbox: VecDeque<String>,

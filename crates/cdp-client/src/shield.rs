@@ -232,20 +232,32 @@ fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool)
     normalized.push_str(&text[from..]);
     let text = normalized.as_str();
     let lower = text.to_ascii_lowercase();
-    let prefixes = ["https://", "http://", "wss://", "ws://", "https%3a%2f%2f", "http%3a%2f%2f", "https:\\/\\/", "http:\\/\\/"];
+    let mut prefixes = vec!["https://".to_string(), "http://".to_string(), "wss://".to_string(), "ws://".to_string(), "https:\\/\\/".to_string(), "http:\\/\\/".to_string()];
+    for scheme in ["https", "http", "wss", "ws"] {
+        let mut prefix = format!("{scheme}%3a%2f%2f");
+        for _ in 0..8 {
+            prefixes.push(prefix.clone());
+            prefix = prefix.replace('%', "%25");
+        }
+    }
     let mut out = String::new();
     let mut from = 0;
     let mut protected = encoded_protected;
     while from < text.len() {
-        let next = prefixes.iter().filter_map(|prefix| lower[from..].find(prefix).map(|at| (from + at, *prefix))).min_by_key(|(at, _)| *at);
+        let next = prefixes.iter().filter_map(|prefix| lower[from..].find(prefix).map(|at| (from + at, prefix.as_str()))).min_by_key(|(at, _)| *at);
         let Some((start, prefix)) = next else { break };
         out.push_str(&text[from..start]);
         let encoded = prefix.contains('%');
         let end = text[start..].char_indices().find_map(|(at, ch)| {
-            (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | ')' | ']' | '}') || encoded && ch == '&').then_some(start + at)
+            (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') || encoded && ch == '&').then_some(start + at)
         }).unwrap_or(text.len());
         let raw = &text[start..end];
-        let decoded = decode_percent(&raw.replace("\\/", "/"));
+        let mut decoded = raw.replace("\\/", "/");
+        for _ in 0..8 {
+            let next = decode_percent(&decoded);
+            if next == decoded { break; }
+            decoded = next;
+        }
         if url_protected(guard, &decoded) {
             protected = true;
             let origin = url::Url::parse(&web_socket_as_http(&decoded)).ok().map(|url| url.origin().ascii_serialization()).filter(|origin| origin != "null").unwrap_or_else(|| "about:blank".into());
