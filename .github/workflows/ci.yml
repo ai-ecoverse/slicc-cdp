@@ -90,12 +90,15 @@ jobs:
       - run: node scripts/gate.mjs integration -- npm run test:integration
         env:
           SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
+          SLICC_REDIRECT_EVIDENCE: ${{ runner.temp }}/slicc-cdp-redirect-report
       - name: Guard regression report
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: guard-regression-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md*
+          path: |
+            ${{ runner.temp }}/slicc-cdp-guard-runner-report.md*
+            ${{ runner.temp }}/slicc-cdp-redirect-report/
           if-no-files-found: ignore
           retention-days: 7
 

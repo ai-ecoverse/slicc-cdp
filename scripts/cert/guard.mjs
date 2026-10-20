@@ -2,8 +2,8 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { evidence, json, root, run, save } from './common.mjs';
+import { guardSuite } from './guard-suite.mjs';
 import { stage } from './stage.mjs';
-import { suite } from './suite.mjs';
 import { executionBudget } from './suite-policy.mjs';
 
 await evidence('guard', async (plan, options) => {
@@ -33,7 +33,7 @@ await evidence('guard', async (plan, options) => {
         '--tests',
         testList,
       ]);
-      const result = await suite({
+      const result = await guardSuite({
         deadline,
         cwd: staged.source,
         files: [
@@ -101,15 +101,15 @@ await evidence('guard', async (plan, options) => {
     positive.status === 'INCOMPLETE' ||
     negative.status === 'INCOMPLETE';
   return {
-    status: [positive, negative].some(
-      (execution) => execution.status === 'FAIL' && !execution.report
-    )
-      ? 'FAIL'
-      : incomplete || proofs.status === 'INCOMPLETE'
-        ? 'INCOMPLETE'
-        : positive.status !== 'PASS' || !positive.report.pass || proofs.status === 'FAIL'
-          ? 'FAIL'
-          : 'PASS',
+    status:
+      positive.status === 'FAIL' ||
+      [positive, negative].some((execution) => execution.status === 'FAIL' && !execution.report)
+        ? 'FAIL'
+        : incomplete || proofs.status === 'INCOMPLETE'
+          ? 'INCOMPLETE'
+          : positive.status !== 'PASS' || !positive.report.pass || proofs.status === 'FAIL'
+            ? 'FAIL'
+            : 'PASS',
     reason: incomplete
       ? 'both guard legs must emit complete row evidence'
       : JSON.stringify(failures) !== JSON.stringify(expected)

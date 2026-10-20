@@ -75,9 +75,12 @@ fn main() {
             Ok(line) => {
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let method = message["method"].as_str().unwrap();
-                let params = message["params"].clone();
+                let mut params = message["params"].clone();
+                let notify = params.as_object_mut().and_then(|params| params.remove("__guardBridgeNotify")).and_then(|value| value.as_bool()).unwrap_or(false);
                 let session = message["sessionId"].as_str();
-                if method == "Runtime.evaluate" && params["awaitPromise"] == true {
+                if notify && method == "Page.navigate" {
+                    answer(message["id"].clone(), cdp.notify(method, params, session).map(|_| json!({})));
+                } else if method == "Runtime.evaluate" && params["awaitPromise"] == true {
                     let id = message["id"].as_u64().unwrap();
                     let key = format!("__guard_bridge_{id}");
                     let expression =
@@ -112,7 +115,7 @@ fn main() {
         while let Ok(Some(paused)) = cdp.next_paused(None, Duration::ZERO) {
             let headers: BTreeMap<String, String> = paused.headers.into_iter().collect();
             emit(
-                json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"request":{"url":paused.url,"method":paused.method,"headers":headers}}}}),
+                json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"responseHeaders":paused.response_headers.as_ref().map(|headers| headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>()),"request":{"url":paused.url,"method":paused.method,"headers":headers}}}}),
             );
         }
         for event in &cdp.events()[seen..] {

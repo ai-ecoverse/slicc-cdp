@@ -174,6 +174,232 @@ pub fn mentions(guard: &Protected, value: &Value) -> bool {
     }
 }
 
+fn decode_percent(text: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+fn encode_origin(text: &str) -> String {
+    text.bytes().map(|byte| match byte {
+        b':' | b'/' => format!("%{byte:02X}"),
+        _ => char::from(byte).to_string(),
+    }).collect()
+}
+
+pub fn redact_text(guard: &Protected, text: &str) -> (String, bool) {
+    redact_text_at(guard, text, 0)
+}
+
+fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool) {
+    let bytes = text.as_bytes();
+    let mut normalized = String::new();
+    let mut from = 0;
+    let mut index = 0;
+    let mut encoded_protected = false;
+    while index + 2 < bytes.len() {
+        if bytes[index] != b'%' || !bytes[index + 1].is_ascii_hexdigit() || !bytes[index + 2].is_ascii_hexdigit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index + 2 < bytes.len() && bytes[index] == b'%' && bytes[index + 1].is_ascii_hexdigit() && bytes[index + 2].is_ascii_hexdigit() {
+            index += 3;
+        }
+        let decoded = decode_percent(&text[start..index]);
+        let (redacted, protected) = if depth < 8 { redact_text_at(guard, &decoded, depth + 1) } else { ("about:blank".to_string(), true) };
+        if protected {
+            normalized.push_str(&text[from..start]);
+            normalized.extend(redacted.bytes().map(|byte| format!("%{byte:02X}")));
+            from = index;
+            encoded_protected = true;
+        }
+    }
+    normalized.push_str(&text[from..]);
+    let text = normalized.as_str();
+    let lower = text.to_ascii_lowercase();
+    let mut prefixes = Vec::new();
+    for scheme in guard.redaction_schemes().chain(["ws", "wss", "about"]) {
+        prefixes.push(format!("{scheme}:"));
+        prefixes.push(format!("{scheme}%"));
+    }
+    let mut out = String::new();
+    let mut from = 0;
+    let mut protected = encoded_protected;
+    while from < text.len() {
+        let next = prefixes.iter().flat_map(|prefix| {
+            lower[from..].match_indices(prefix).filter_map(|(at, _)| {
+                let start = from + at;
+                let after = start + prefix.len();
+                if prefix.ends_with(':') && text[after..].chars().next().is_none_or(char::is_whitespace) {
+                    return None;
+                }
+                let web = ["http:", "https:", "ws:", "wss:", "http%", "https%", "ws%", "wss%"].contains(&prefix.as_str());
+                if !web && text[..start].chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '+' | '-' | '.')) {
+                    return None;
+                }
+                Some((start, prefix.as_str()))
+            })
+        }).min_by_key(|(at, _)| *at);
+        let Some((start, prefix)) = next else { break };
+        out.push_str(&text[from..start]);
+        let encoded = prefix.contains('%');
+        let end = text[start..].char_indices().find_map(|(at, ch)| {
+            (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') || encoded && ch == '&').then_some(start + at)
+        }).unwrap_or(text.len());
+        let raw = &text[start..end];
+        let mut decoded = raw.replace("\\/", "/");
+        for _ in 0..8 {
+            let next = decode_percent(&decoded);
+            if next == decoded { break; }
+            decoded = next;
+        }
+        let overflow = encoded && decode_percent(&decoded) != decoded;
+        if overflow || url_protected(guard, &decoded) || guard.unparseable(&decoded) && guard.url(&decoded) {
+            protected = true;
+            let origin = if overflow { "about:blank".to_string() } else {
+                url::Url::parse(&web_socket_as_http(&decoded)).ok().and_then(|url| {
+                    let origin = url.origin().ascii_serialization();
+                    if origin != "null" { Some(origin) } else { url.host_str().map(|host| format!("{}://{host}", url.scheme())) }
+                }).unwrap_or_else(|| "about:blank".into())
+            };
+            out.push_str(&if encoded { encode_origin(&origin) } else { origin });
+            from = end;
+        } else {
+            out.push_str(&text[start..start + prefix.len()]);
+            from = start + prefix.len();
+        }
+    }
+    out.push_str(&text[from..]);
+    (out, protected)
+}
+
+fn redact_link(guard: &Protected, text: &str) -> (String, bool) {
+    const RELATION: &str = "https://www.sliccy.ai/rel/upskill";
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    let mut target = false;
+    let mut quote = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' if !quote => target = true,
+            b'>' if !quote => target = false,
+            b'"' if !target => quote = !quote,
+            b';' if !target && !quote => {
+                let mut at = index + 1;
+                while at < bytes.len() && bytes[at].is_ascii_whitespace() { at += 1; }
+                let name = at;
+                while at < bytes.len() && bytes[at].is_ascii_alphabetic() { at += 1; }
+                let relation = text[name..at].eq_ignore_ascii_case("rel") || text[name..at].eq_ignore_ascii_case("rev");
+                while at < bytes.len() && bytes[at].is_ascii_whitespace() { at += 1; }
+                if relation && bytes.get(at) == Some(&b'=') {
+                    at += 1;
+                    while at < bytes.len() && bytes[at].is_ascii_whitespace() { at += 1; }
+                    let quoted = bytes.get(at) == Some(&b'"');
+                    if quoted { at += 1; }
+                    let start = at;
+                    while at < bytes.len() && if quoted { bytes[at] != b'"' } else { !bytes[at].is_ascii_whitespace() && !matches!(bytes[at], b';' | b',') } { at += 1; }
+                    if &text[start..at] == RELATION { spans.push((start, at)); }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let mut from = 0;
+    let mut out = String::new();
+    let mut protected = false;
+    for (start, end) in spans {
+        let (redacted, found) = redact_text(guard, &text[from..start]);
+        out.push_str(&redacted);
+        out.push_str(&text[start..end]);
+        protected |= found;
+        from = end;
+    }
+    let (redacted, found) = redact_text(guard, &text[from..]);
+    out.push_str(&redacted);
+    (out, protected || found)
+}
+
+fn redact_header_block(guard: &Protected, text: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut protected = false;
+    for line in text.split_inclusive('\n') {
+        let (redacted, found) = if let Some((name, value)) = line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("link")) {
+            let (value, found) = redact_link(guard, value);
+            (format!("{name}:{value}"), found)
+        } else { redact_text(guard, line) };
+        out.push_str(&redacted);
+        protected |= found;
+    }
+    (out, protected)
+}
+
+pub fn scheme_less_protected(guard: &Protected, value: &Value) -> bool {
+    let authority = |name: &str, value: &str| (name.eq_ignore_ascii_case("host") || name == ":authority") && ["http", "https"].iter().any(|scheme| guard.url_read_only(&format!("{scheme}://{}/", value.trim())));
+    match value {
+        Value::Array(items) => items.iter().any(|item| scheme_less_protected(guard, item)),
+        Value::Object(map) => {
+            map.get("name").and_then(Value::as_str).zip(map.get("value").and_then(Value::as_str)).is_some_and(|(name, value)| authority(name, value))
+                || map.iter().any(|(key, item)| {
+                    item.as_str().is_some_and(|text| authority(key, text) || matches!(key.as_str(), "headersText" | "requestHeadersText") && text.lines().any(|line| line.split_once(':').is_some_and(|(name, value)| authority(name.trim(), value))))
+                        || scheme_less_protected(guard, item)
+                })
+        }
+        _ => false,
+    }
+}
+
+pub fn redact_strings(guard: &Protected, value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let (redacted, protected) = redact_text(guard, text);
+            *text = redacted;
+            protected
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |found, item| redact_strings(guard, item) || found),
+        Value::Object(map) => {
+            let protected_url = |item: &Value| item.as_str().is_some_and(|text| redact_text(guard, text).1 || url_protected(guard, text));
+            let named_protected = map.iter().any(|(key, item)| {
+                key.to_ascii_lowercase().ends_with("url") && protected_url(item)
+                    || matches!(key.as_str(), "request" | "response" | "redirectResponse") && item.get("url").is_some_and(protected_url)
+            });
+            if named_protected {
+                map.retain(|key, _| !key.to_ascii_lowercase().ends_with("fragment") && key != "documentURL");
+            }
+            let link_value = map.get("name").and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("link"));
+            let mut found = named_protected;
+            for (key, mut item) in std::mem::take(map) {
+                let (key, protected) = redact_text(guard, &key);
+                found |= protected;
+                if let Some(text) = item.as_str().filter(|_| key.eq_ignore_ascii_case("link") || link_value && key == "value" || matches!(key.as_str(), "headersText" | "requestHeadersText")) {
+                    let (redacted, protected) = if matches!(key.as_str(), "headersText" | "requestHeadersText") { redact_header_block(guard, text) } else { redact_link(guard, text) };
+                    item = Value::String(redacted);
+                    found |= protected;
+                } else { found |= redact_strings(guard, &mut item); }
+                map.insert(key, item);
+            }
+            found
+        }
+        _ => false,
+    }
+}
+
 pub fn names_protected_storage(guard: &Protected, value: &Value) -> bool {
     match value {
         Value::Array(items) => items
