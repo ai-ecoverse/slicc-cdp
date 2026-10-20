@@ -100,6 +100,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scheme_less_navigation_gets_a_hint_before_endpoint_validation() {
+        for command in ["open", "tab-new", "goto", "navigate"] {
+            for url in ["example.com", "example.com/PATHSECRET?q=QUERYSECRET#FRAGSECRET", "//example.com/path", "/relative/path", "\texample.com"] {
+                let output = execute(&["--cdp".into(), "ftp://127.0.0.1:1/invalid".into(), command.into(), url.into()], None);
+                assert_eq!(output.code, 1, "{command} {url}");
+                assert_eq!(output.stdout, "");
+                assert_eq!(output.stderr, format!("playwright-cli {command}: URL needs a scheme; add https:// or http://\n"));
+                for secret in ["PATHSECRET", "QUERYSECRET", "FRAGSECRET"] {
+                    assert!(!output.stderr.contains(secret));
+                }
+                assert!(!output.stderr.contains("protected page"));
+            }
+        }
+    }
+
+    #[test]
     fn unknown_command_matches_upstream_usage_error() {
         let output = execute(&["nope".to_string()], None);
         assert_eq!(output.code, 1);
