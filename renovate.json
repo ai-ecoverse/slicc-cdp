@@ -7,7 +7,7 @@
       "matchPackageNames": ["@ai-ecoverse/slicc-browsers", "slicc-browsers"],
       "groupName": "slicc-browsers catalog and vectors",
       "groupSlug": "slicc-browsers-catalog-vectors",
-      "rangeStrategy": "pin"
+      "rangeStrategy": "bump"
     },
     {
       "matchFileNames": ["packages/sliccy-browser/package.json"],

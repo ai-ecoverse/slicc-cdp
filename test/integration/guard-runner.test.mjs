@@ -345,6 +345,13 @@ test('published guard set through the Rust guarded client', {
   const c8 = report.results.filter((row) => row.id.startsWith('C8.'));
   if (set.vectors.some((vector) => vector.id.startsWith('C8.')))
     assert(c8.length > 0, 'published privileged UI rows ran');
+  for (const id of ['C8.chrome-search', 'C8.network-error', 'C8.iframe-error']) {
+    if (set.vectors.some((vector) => vector.id === id))
+      assert(
+        c8.some((row) => row.id === id),
+        `${id} must run from the published guard set`
+      );
+  }
   assert(
     c8.every((row) => [row.control, row.guarded, row.live].every((status) => status === 'pass'))
   );
