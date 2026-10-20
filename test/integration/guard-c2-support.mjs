@@ -11,7 +11,7 @@ export function redirectSelection(published) {
 
 export async function recordedClient(open) {
   const messages = [];
-  const client = await open((message) => messages.push(message));
+  const client = await open((message) => messages.push(JSON.stringify(message.event ?? message)));
   client.messages = messages;
   return client;
 }

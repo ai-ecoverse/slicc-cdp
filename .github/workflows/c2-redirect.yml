@@ -63,7 +63,7 @@ jobs:
           version=$(node -p 'JSON.parse(require("fs").readFileSync(process.env.GITHUB_WORKSPACE + "/package.json")).devDependencies["@ai-ecoverse/slicc-browsers"]')
           npm pack "@ai-ecoverse/slicc-browsers@$version" --pack-destination "$RUNNER_TEMP"
           tarball="$RUNNER_TEMP/ai-ecoverse-slicc-browsers-$version.tgz"
-          echo "585e4320f04edf3b6025f02f9e29daf376657fd8015f93b5063832ed20b34aec  $tarball" | sha256sum -c -
+          echo "c45f5e29e888436fbd6a6bb3435b7a834e96711bb6aae267eba465a0a1da4b52  $tarball" | sha256sum -c -
           npm install --no-save --package-lock=false --ignore-scripts "$tarball"
       - name: Install pinned Chrome for Testing
         working-directory: ${{ env.SUBJECT_DIR }}
