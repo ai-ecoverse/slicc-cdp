@@ -218,7 +218,8 @@ for (const transport of ['native', 'wasi']) {
               (event) =>
                 event.sessionId === sessionId &&
                 event.method === 'Network.requestWillBeSent' &&
-                event.params.request.url.startsWith(`http://127.0.0.1:${port}/`)
+                (event.params.request.url === url ||
+                  event.params.request.url === `http://127.0.0.1:${port}/ordinary`)
             );
             check(requests.length > 0, 'ordinary request metadata must be delivered');
             for (const event of requests) {

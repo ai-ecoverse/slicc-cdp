@@ -281,7 +281,11 @@ pub fn redact_strings(guard: &Protected, value: &mut Value) -> bool {
         }
         Value::Array(items) => items.iter_mut().fold(false, |found, item| redact_strings(guard, item) || found),
         Value::Object(map) => {
-            let named_protected = map.iter().any(|(key, item)| key.to_ascii_lowercase().ends_with("url") && item.as_str().is_some_and(|text| redact_text(guard, text).1 || url_protected(guard, text)));
+            let protected_url = |item: &Value| item.as_str().is_some_and(|text| redact_text(guard, text).1 || url_protected(guard, text));
+            let named_protected = map.iter().any(|(key, item)| {
+                key.to_ascii_lowercase().ends_with("url") && protected_url(item)
+                    || matches!(key.as_str(), "request" | "response" | "redirectResponse") && item.get("url").is_some_and(protected_url)
+            });
             if named_protected {
                 map.retain(|key, _| !key.to_ascii_lowercase().ends_with("fragment") && key != "documentURL");
             }
