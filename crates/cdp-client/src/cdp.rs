@@ -2095,6 +2095,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn protected_seven_fragment_targets_and_url_changes_never_disclose_markers() {
+        for url in [
+            "https://seven.sliccy.ai/auth/callback#access_token=MARK",
+            "https://seven.sliccy.ai/#tailscale=MARK1",
+            "https://seven.sliccy.ai/#proxy=http%3A%2F%2F127.0.0.1%3A9%2F&key=MARK2",
+        ] {
+            for changed in [false, true] {
+                let mut cdp = url_backend(url);
+                if changed {
+                    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://seven.sliccy.ai/","title":"clean"}}}));
+                }
+                let info = json!({"targetId":"T","type":"page","url":url,"title":url});
+                for method in ["Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"] {
+                    let mark = cdp.events().len();
+                    cdp.absorb(json!({"method":method,"params":{"sessionId":"A","targetInfo":info}}));
+                    for event in &cdp.events()[mark..] {
+                        assert!(!event.to_string().contains("MARK"), "{method} {changed} {event}");
+                        for key in ["url", "title"] {
+                            assert_eq!(event["params"]["targetInfo"][key], "https://seven.sliccy.ai", "{method} {key} {url}");
+                        }
+                    }
+                }
+                for method in ["Target.getTargets", "Target.getTargetInfo"] {
+                    let params = if method == "Target.getTargets" { json!({}) } else { json!({"targetId":"T"}) };
+                    let out = cdp.call(method, params, None).unwrap();
+                    assert!(!out.to_string().contains("MARK"), "{method} {out}");
+                    let info = if method == "Target.getTargets" { &out["targetInfos"][0] } else { &out["targetInfo"] };
+                    for key in ["url", "title"] {
+                        assert_eq!(info[key], "https://seven.sliccy.ai", "{method} {key} {url}");
+                    }
+                }
+                cdp.absorb(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"A","targetId":"T"}}));
+                assert!(!cdp.events().last().unwrap().to_string().contains("MARK"));
+                assert!(cdp.target_protected("T", false).unwrap());
+            }
+        }
+    }
+
     const UNPARSEABLE: &str = "slicc: refused: slicc can't parse this URL, so it could be a protected page\n";
 
     fn malformed_urls() -> Vec<String> {
