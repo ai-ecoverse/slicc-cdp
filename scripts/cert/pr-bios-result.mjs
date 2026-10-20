@@ -46,6 +46,7 @@ export function biosCalls(plan, pin, subjects, producerBindings) {
                 artifactDigest(producerArtifact(producerBindings, `pack-${side}`)?.digest) ?? '',
             }
           : {}),
+        ...(pin.bindingSchema === 1 ? {} : { 'candidate-binding': 'legacy' }),
         repeat: 3,
       },
     ])

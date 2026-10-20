@@ -658,6 +658,8 @@ jobs:
       candidate_sha: "${{ steps.inputs.outputs.candidate_sha }}"
       base_artifact: "${{ steps.inputs.outputs.base_artifact }}"
       candidate_artifact: "${{ steps.inputs.outputs.candidate_artifact }}"
+      shards: "${{ steps.inputs.outputs.shards }}"
+      bios_ref: "${{ steps.inputs.outputs.bios_ref }}"
     permissions:
       contents: "read"
     env:
@@ -695,9 +697,16 @@ jobs:
         run: |
           node scripts/gate.mjs pr-bios-inputs --accept PASS,FAIL,INCOMPLETE -- node scripts/cert/pr-bios-inputs.mjs --plan evidence/plan.json --out evidence/bios-inputs.json
           node --input-type=module <<'NODE'
-          import { readFileSync, appendFileSync } from 'node:fs';
+          import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
           const value = JSON.parse(readFileSync('evidence/bios-inputs.json'));
-          const outputs = { ready: String(value.ready), base_sha: value.calls?.base?.['candidate-sha256'] ?? '', candidate_sha: value.calls?.candidate?.['candidate-sha256'] ?? '', base_artifact: value.calls?.base?.['candidate-artifact'] ?? '', candidate_artifact: value.calls?.candidate?.['candidate-artifact'] ?? '' };
+          if (value.shardContract?.status !== 'PASS') {
+            value.ready = false;
+            value.status = 'INCOMPLETE';
+            value.reason ??= 'MAIN control has no pinned BIOS shard contract; awaits tools landing';
+            writeFileSync('evidence/bios-inputs.json', JSON.stringify(value, null, 2) + '\n');
+            console.log('pr-bios-inputs: INCOMPLETE ' + value.reason);
+          }
+          const outputs = { ready: String(value.ready), shards: value.ready ? value.calls?.base?.shards ?? '' : '', bios_ref: value.ready ? value.pin?.commit ?? '' : '', base_sha: value.calls?.base?.['candidate-sha256'] ?? '', candidate_sha: value.calls?.candidate?.['candidate-sha256'] ?? '', base_artifact: value.calls?.base?.['candidate-artifact'] ?? '', candidate_artifact: value.calls?.candidate?.['candidate-artifact'] ?? '' };
           for (const [key, item] of Object.entries(outputs)) appendFileSync(process.env.GITHUB_OUTPUT, key + '=' + item + '\n');
           NODE
       -
@@ -716,16 +725,17 @@ jobs:
     permissions:
       contents: "read"
       actions: "read"
-    uses: "ai-ecoverse/slicc-bios/.github/workflows/canary.yml@4025d6aabc2c06add216183064d81914a171cd64"
+    uses: "ai-ecoverse/slicc-bios/.github/workflows/canary.yml@8d4e5d56bfdce208f853c8ea98628392787e31ea"
     with:
-      bios-ref: "4025d6aabc2c06add216183064d81914a171cd64"
+      bios-ref: "${{ needs.bios_inputs.outputs.bios_ref }}"
       candidate-package: "@ai-ecoverse/slicc-cdp"
       candidate-artifact: "${{ needs.bios_inputs.outputs.base_artifact }}"
       candidate-run: "${{ github.run_id }}"
       candidate-sha256: "${{ needs.bios_inputs.outputs.base_sha }}"
       candidate-repo: "${{ github.repository }}"
+      candidate-binding: "legacy"
       label: "base"
-      shards: '["packages-update-cdp","guard"]'
+      shards: "${{ needs.bios_inputs.outputs.shards }}"
       repeat: 3
   bios_candidate:
     name: "cert-review-pr / bios canary candidate"
@@ -734,16 +744,17 @@ jobs:
     permissions:
       contents: "read"
       actions: "read"
-    uses: "ai-ecoverse/slicc-bios/.github/workflows/canary.yml@4025d6aabc2c06add216183064d81914a171cd64"
+    uses: "ai-ecoverse/slicc-bios/.github/workflows/canary.yml@8d4e5d56bfdce208f853c8ea98628392787e31ea"
     with:
-      bios-ref: "4025d6aabc2c06add216183064d81914a171cd64"
+      bios-ref: "${{ needs.bios_inputs.outputs.bios_ref }}"
       candidate-package: "@ai-ecoverse/slicc-cdp"
       candidate-artifact: "${{ needs.bios_inputs.outputs.candidate_artifact }}"
       candidate-run: "${{ github.run_id }}"
       candidate-sha256: "${{ needs.bios_inputs.outputs.candidate_sha }}"
       candidate-repo: "${{ github.repository }}"
+      candidate-binding: "legacy"
       label: "candidate"
-      shards: '["packages-update-cdp","guard"]'
+      shards: "${{ needs.bios_inputs.outputs.shards }}"
       repeat: 3
   bios:
     name: "cert-review-pr / bios"

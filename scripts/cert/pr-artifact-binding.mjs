@@ -1,3 +1,4 @@
+import { biosShards } from './pr-bios-shards.mjs';
 import { prIdentity } from './pr-common.mjs';
 
 export function artifactNames(plan) {
@@ -31,7 +32,7 @@ export function artifactNames(plan) {
     names[role] = `cert-pr-evidence-${run}-assets-${platform}`;
   for (const side of ['base', 'candidate']) {
     names[`bios-${side}-report`] = `${side}-canary`;
-    for (const shard of ['packages-update-cdp', 'guard'])
+    for (const shard of biosShards)
       for (const kind of ['shard', 'files'])
         names[`bios-${side}-${kind}-${shard}`] = `${side}-canary-${kind}-canary-${shard}`;
   }
