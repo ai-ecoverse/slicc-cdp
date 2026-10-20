@@ -1037,6 +1037,9 @@ jobs:
           name: "cert-pr-assets-${{ github.run_id }}-${{ github.run_attempt }}"
           path: ".cert/pr-assets"
       -
+        name: "Fetch planned source objects"
+        run: "node --input-type=module -e 'import{readFileSync}from\"node:fs\";import{execFileSync}from\"node:child_process\";const p=JSON.parse(readFileSync(\"evidence/plan.json\"));for(const s of[p.commit,p.baseline.commit]){if(!/^[a-f0-9]{40}$/.test(s))throw Error(\"invalid planned source\");execFileSync(\"git\",[\"fetch\",\"--no-tags\",\"origin\",s],{stdio:\"inherit\"})}'"
+      -
         name: "Gather only canonical required documents; never replace trusted plan"
         run: |
           for name in rebuild guard integration bios assets-linux assets-macos review; do
