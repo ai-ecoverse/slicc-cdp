@@ -20,6 +20,20 @@ export function freePort() {
   });
 }
 
+export async function waitExit(exited, timeoutMs = 5000) {
+  let timer;
+  try {
+    await Promise.race([
+      exited,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('chromium cleanup timed out')), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function launchBrowser(extraArgs = [], options = {}) {
   let port = options.port ?? (await freePort());
   while (port >= 9222 && port <= 9229) port = await freePort();
@@ -56,12 +70,11 @@ export async function launchBrowser(extraArgs = [], options = {}) {
     } catch {
       if (running) child.kill('SIGKILL');
     }
-    if (running) {
-      let timer;
-      await Promise.race([exited, new Promise((resolve) => (timer = setTimeout(resolve, 5000)))]);
-      clearTimeout(timer);
+    try {
+      if (running) await waitExit(exited);
+    } finally {
+      child.stderr.destroy();
     }
-    child.stderr.destroy();
   };
   try {
     const version = await waitVersion(port, () => chromeStatus(child, chromeLog));

@@ -1,8 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { waitExit } from './browser.mjs';
 import { browserStartup } from './guard-fixture.mjs';
 
 const timeout = () => new Error('debugging port 9300 did not answer /json/version (fetch failed)');
+
+test('confirmed process exit cancels the cleanup timeout', async () => {
+  await waitExit(Promise.resolve(), 5000);
+});
+
+test('unconfirmed process exit rejects cleanup and prevents startup retry', async () => {
+  let calls = 0;
+  const startup = browserStartup(async () => {
+    calls += 1;
+    await waitExit(new Promise(() => {}), 1);
+  });
+  await assert.rejects(startup.start([]), /chromium cleanup timed out/);
+  assert.equal(calls, 1);
+  assert.deepEqual(startup.retries, []);
+});
 
 test('successful browser startup needs no retry', async () => {
   let calls = 0;
