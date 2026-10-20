@@ -276,7 +276,9 @@ mod tests {
         for (_, source) in sources() {
             for (literal, _) in literals(&source) {
                 let (domain, name) = literal.split_once('.').unwrap();
-                if BROWSER_DOMAINS.contains(&domain) && event_name(name) {
+                if BROWSER_DOMAINS.contains(&domain) && event_name(name)
+                    && !matches!(literal.as_str(), "Target.autoAttachRelated" | "Target.receivedMessageFromTarget")
+                {
                     found.insert(literal);
                 }
             }

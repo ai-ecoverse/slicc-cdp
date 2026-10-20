@@ -274,7 +274,7 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
-        if method == "Target.setAutoAttach"
+        if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
         {
             return Err("slicc: refused: auto-attach is not supported by slicc-cdp\n".into());
@@ -1093,6 +1093,11 @@ impl Cdp {
                     self.protected_targets.remove(&target);
                 }
             }
+            "Target.attachedToTarget" => {
+                if let Some(info) = params.get("targetInfo") {
+                    value["params"]["targetInfo"] = self.redact(info, &[]);
+                }
+            }
             "Target.targetDestroyed" => {
                 if let Some(target) = params.get("targetId").and_then(|v| v.as_str()) {
                     self.guards.remove(target);
@@ -1139,6 +1144,9 @@ impl Cdp {
 
     fn hidden(&self, value: &Value) -> bool {
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if method == "Target.receivedMessageFromTarget" {
+            return true;
+        }
         if let Some(session) = value.get("sessionId").and_then(|v| v.as_str()) {
             if self.blocked.contains(session) || self.guard_sessions.contains(session) {
                 return true;
@@ -1940,6 +1948,82 @@ mod tests {
                 std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             }
             Ok(None)
+        }
+    }
+
+    fn target_fragment_markers() -> [&'static str; 5] {
+        [
+            "https://seven.sliccy.ai/#tailscale=MARK1",
+            "https://seven.sliccy.ai/#proxy=http%3A%2F%2F127.0.0.1%3A9%2F&key=MARK2",
+            "https://seven.sliccy.ai/auth/callback#access_token=MARK",
+            "https://seven.sliccy.ai/path-secret?query-secret=MARK",
+            "https://seven.sliccy.ai/path-secret?query-secret=MARK#access_token=MARK",
+        ]
+    }
+
+    #[test]
+    fn target_info_fragment_markers_are_redacted_in_responses_and_events() {
+        for url in target_fragment_markers() {
+            for changed in [false, true] {
+                let mut cdp = url_backend(url);
+                if changed {
+                    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://seven.sliccy.ai/","title":"clean"}}}));
+                }
+                let info = json!({"targetId":"T","type":"page","url":url,"title":url,"openerId":"OPENER","openerFrameId":"FRAME"});
+                for method in ["Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"] {
+                    let mark = cdp.events().len();
+                    cdp.absorb(json!({"method":method,"params":{"sessionId":"A","targetInfo":info}}));
+                    let event = cdp.events()[mark..].iter().find(|event| event["method"] == method).unwrap();
+                    for key in ["url", "title"] {
+                        assert_eq!(event["params"]["targetInfo"][key], "https://seven.sliccy.ai", "{method} {key} {url} {changed}");
+                    }
+                    assert_eq!(event["params"]["targetInfo"]["openerId"], "OPENER");
+                    assert_eq!(event["params"]["targetInfo"]["openerFrameId"], "FRAME");
+                    assert!(!event.to_string().contains("MARK"));
+                }
+                for method in ["Target.getTargets", "Target.getTargetInfo"] {
+                    let params = if method == "Target.getTargets" { json!({}) } else { json!({"targetId":"T"}) };
+                    let out = cdp.call(method, params, None).unwrap();
+                    let info = if method == "Target.getTargets" { &out["targetInfos"][0] } else { &out["targetInfo"] };
+                    for key in ["url", "title"] {
+                        assert_eq!(info[key], "https://seven.sliccy.ai", "{method} {key} {url}");
+                    }
+                    assert!(!out.to_string().contains("MARK"));
+                }
+                for event in [
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"A","targetId":"T"}}),
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"B"}}),
+                    json!({"method":"Page.frameAttached","sessionId":"S","params":{"frameId":"CHILD","parentFrameId":"FRAME"}}),
+                ] {
+                    cdp.absorb(event);
+                    assert!(!cdp.events().last().unwrap().to_string().contains("MARK"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_info_nonflattened_and_browser_attach_paths_remain_refused() {
+        for (method, params) in [
+            ("Target.attachToTarget", json!({"targetId":"T","flatten":false})),
+            ("Target.attachToBrowserTarget", json!({})),
+            ("Target.setAutoAttach", json!({"autoAttach":true,"flatten":true})),
+            ("Target.autoAttachRelated", json!({"targetId":"T","waitForDebuggerOnStart":false})),
+            ("Target.sendMessageToTarget", json!({"targetId":"T","message":"MARK"})),
+        ] {
+            let mut cdp = url_backend("https://example.test/");
+            assert!(cdp.call(method, params, None).is_err(), "{method}");
+        }
+    }
+
+    #[test]
+    fn target_info_wrapped_nonflattened_events_never_disclose_markers() {
+        for url in target_fragment_markers() {
+            let mut cdp = url_backend("https://example.test/");
+            let mark = cdp.events().len();
+            let nested = json!({"method":"Target.attachedToTarget","params":{"sessionId":"CHILD","targetInfo":{"targetId":"T","type":"page","url":url,"title":url}}});
+            cdp.absorb(json!({"method":"Target.receivedMessageFromTarget","params":{"sessionId":"A","targetId":"T","message":nested.to_string()}}));
+            assert_eq!(cdp.events().len(), mark, "{url}");
         }
     }
 
