@@ -266,7 +266,7 @@ impl Cdp {
         {
             return Err("slicc: refused: attach with flatten: true\n".into());
         }
-        if let Some(reason) = shield::command_url_refusal(&self.guard, params, shield::cookie_reader(method)) {
+        if let Some(reason) = shield::command_url_refusal(&self.guard, params, method) {
             if reason == self.guard.refusal() && shield::cookie_method(method) {
                 return Err(COOKIES.into());
             }
@@ -1982,6 +1982,7 @@ mod tests {
         }
         for url in malformed_urls() {
             let mut cdp = url_backend("about:blank");
+            assert!(cdp.notify("Slicc.action", json!({"url":url,"phase":"start"}), None).is_ok(), "{url}");
             assert!(cdp.call("Storage.getUsageAndQuota", json!({"origin":url}), None).is_ok(), "{url}");
             assert!(cdp.call("Storage.clearDataForStorageKey", json!({"storageKey":format!("{url}^0{url}")}), None).is_ok(), "{url}");
         }

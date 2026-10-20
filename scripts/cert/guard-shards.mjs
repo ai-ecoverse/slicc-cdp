@@ -1,5 +1,5 @@
 const partitions = [
-  { id: 'a', targets: ['seven', 'chrome-newtab', 'chrome-passwords'] },
+  { id: 'a', targets: ['seven', 'ordinary', 'chrome-newtab', 'chrome-passwords'] },
   { id: 'b', targets: ['vault', 'chrome-new-tab-page', 'chrome-settings'] },
   { id: 'c', targets: ['vault-x', 'own', 'chrome-search'] },
   { id: 'd', targets: ['apex', 'chrome-extension-page', 'file-root', 'network-error'] },

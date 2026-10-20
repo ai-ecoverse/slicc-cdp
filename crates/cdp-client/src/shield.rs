@@ -233,21 +233,25 @@ fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
     }
 }
 
-pub fn command_url_refusal<'a>(guard: &'a Protected, params: &Value, filtered: bool) -> Option<&'a str> {
+pub fn command_url_refusal<'a>(guard: &'a Protected, params: &Value, method: &str) -> Option<&'a str> {
+    let filtered = cookie_reader(method);
+    let protected = |url: &str| {
+        if method == "Slicc.action" { guard.url_read_only(url) } else { guard.url(url) }
+    };
     let urls = params.get("url").and_then(Value::as_str).into_iter().chain(
         params.get("urls").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str)
     );
     for url in urls {
-        if guard.url(url) && (!filtered || guard.unparseable(url)) {
+        if protected(url) && (!filtered || guard.unparseable(url)) {
             return Some(guard.refusal_for_url(url));
         }
         let mapped = web_socket_as_http(url);
-        if guard.url(&mapped) && (!filtered || guard.unparseable(&mapped)) {
+        if protected(&mapped) && (!filtered || guard.unparseable(&mapped)) {
             return Some(guard.refusal_for_url(&mapped));
         }
     }
     params.get("cookies").and_then(Value::as_array).into_iter().flatten()
-        .find_map(|cookie| command_url_refusal(guard, cookie, false))
+        .find_map(|cookie| command_url_refusal(guard, cookie, method))
 }
 
 pub fn loaded_urls_protected(guard: &Protected, value: &Value) -> bool {
