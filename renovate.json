@@ -10,11 +10,10 @@
       "rangeStrategy": "bump"
     },
     {
+      "description": "sliccy-browser pins slicc-cdp to the certified version by hand.",
       "matchFileNames": ["packages/sliccy-browser/package.json"],
       "matchPackageNames": ["@ai-ecoverse/slicc-cdp"],
-      "semanticCommitType": "chore",
-      "semanticCommitScope": "sliccy-browser",
-      "bumpVersion": "patch"
+      "enabled": false
     },
     {
       "matchManagers": ["github-actions"],
