@@ -28,7 +28,8 @@ export async function suite({
         JSON.parse(env.CERT_EXECUTION_IDENTITY),
         env.CERT_EXECUTION_SCOPE,
         env.CERT_EXECUTION_TOOLS,
-        JSON.parse(env.CERT_EXECUTION_PROOFS ?? '[]')
+        JSON.parse(env.CERT_EXECUTION_PROOFS ?? '[]'),
+        files
       );
       env = { ...env, SLICC_GUARD_SHA: executionIdentity.subject.commit };
     } catch (error) {

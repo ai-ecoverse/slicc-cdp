@@ -2,7 +2,7 @@ import { chmodSync, copyFileSync, cpSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { cleanEnv, json, repo, root, run, save, tree, unpackPackage } from './common.mjs';
-import { sourceIdentity, stagedIdentity, subjectIdentity } from './execution-identity.mjs';
+import { selectedHarnessIdentity, stagedIdentity, subjectIdentity } from './execution-identity.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
 export async function stage(
@@ -55,7 +55,7 @@ export async function stage(
   const executionIdentity = stagedIdentity(
     source,
     subjectIdentity(commit),
-    sourceIdentity(harnessCommit),
+    selectedHarnessIdentity(harnessCommit, plan.mode, label),
     packed.sha256
   );
   env.CERT_EXECUTION_IDENTITY = JSON.stringify(executionIdentity);

@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync as readFile } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync as readFile } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -89,9 +89,30 @@ export function subjectIdentity(commit, directory = root) {
   return subject;
 }
 
-export function sourceIdentity(commit, directory = root) {
+const guardWorker = 'test/integration/guard-runner.test.mjs';
+const shared = '@ai-ecoverse/slicc-browsers';
+const hasDependency = (manifest) =>
+  ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'].some((key) =>
+    Object.hasOwn(manifest?.[key] ?? {}, shared)
+  );
+const corpusAbsent = (manifest, lock) =>
+  !hasDependency(manifest) &&
+  !hasDependency(lock.packages?.['']) &&
+  !Object.hasOwn(lock.packages ?? {}, `node_modules/${shared}`) &&
+  !Object.hasOwn(lock.dependencies ?? {}, shared);
+
+function stagedCorpusAbsent(directory) {
+  return (
+    corpusAbsent(
+      JSON.parse(readFileSync(path.join(directory, 'package.json'))),
+      JSON.parse(readFileSync(path.join(directory, 'package-lock.json')))
+    ) && !existsSync(path.join(directory, guardWorker))
+  );
+}
+
+export function sourceIdentity(commit, directory = root, allowAbsentCorpus = false) {
   if (!sha.test(commit ?? '')) throw new Error('execution source commit unavailable');
-  const key = `${directory}/${commit}`;
+  const key = `${directory}/${commit}/${allowAbsentCorpus}`;
   if (sources.has(key)) return sources.get(key);
   const read = (file) =>
     execFileSync('git', ['show', `${commit}:${file}`], {
@@ -110,21 +131,30 @@ export function sourceIdentity(commit, directory = root) {
   const lock = JSON.parse(read('package-lock.json'));
   const pin = manifest.devDependencies?.['@ai-ecoverse/slicc-browsers'];
   const entry = lock.packages?.['node_modules/@ai-ecoverse/slicc-browsers'];
+  const absent = allowAbsentCorpus && corpusAbsent(manifest, lock) && !files.includes(guardWorker);
   if (
-    !version.test(pin ?? '') ||
-    entry?.version !== pin ||
-    !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(entry.integrity ?? '') ||
-    entry.resolved !==
-      `https://registry.npmjs.org/@ai-ecoverse/slicc-browsers/-/slicc-browsers-${pin}.tgz`
+    !absent &&
+    (!version.test(pin ?? '') ||
+      entry?.version !== pin ||
+      !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(entry.integrity ?? '') ||
+      entry.resolved !==
+        `https://registry.npmjs.org/@ai-ecoverse/slicc-browsers/-/slicc-browsers-${pin}.tgz`)
   )
     throw new Error('execution corpus exact locked package unavailable');
   const source = {
     ...subjectIdentity(commit, directory),
     harness: files.map((file) => ({ file, sha256: hash(read(file)) })),
-    corpus: { version: pin, integrity: entry.integrity },
+    corpus: absent ? null : { version: pin, integrity: entry.integrity },
   };
   sources.set(key, source);
   return source;
+}
+
+export function selectedHarnessIdentity(commit, mode, label, directory = root) {
+  const allowed =
+    ['release', 'replay'].includes(mode) &&
+    ['integration-positive', 'integration-negative'].includes(label);
+  return sourceIdentity(commit, directory, allowed);
 }
 
 export function stagedIdentity(directory, subject, harness, sha256) {
@@ -138,14 +168,18 @@ export function stagedIdentity(directory, subject, harness, sha256) {
   }));
   if (!isDeepStrictEqual(files, harness.harness))
     throw integrity('staged harness differs from exact source');
-  const corpus = installedCorpus(directory);
-  if (corpus.version !== harness.corpus.version)
+  const corpus = harness.corpus === null ? null : installedCorpus(directory);
+  if (corpus === null) {
+    if (!stagedCorpusAbsent(directory))
+      throw new Error('historical harness corpus absence not positively identified');
+  } else if (corpus.version !== harness.corpus.version)
     throw integrity('staged corpus differs from locked harness');
   return {
     schema: 1,
     subject: { commit: subject.commit, sha256, cargo: subject.cargo },
     harness: { commit: harness.commit },
-    corpus: { ...corpus, integrity: harness.corpus.integrity },
+    corpus: corpus === null ? null : { ...corpus, integrity: harness.corpus.integrity },
+    ...(corpus === null ? { historicalIntegration: true } : {}),
   };
 }
 
@@ -167,26 +201,53 @@ export function effectiveHarness(harness, tools, scope) {
   return [...files].sort(([a], [b]) => compare(a, b)).map(([file, sha256]) => ({ file, sha256 }));
 }
 
-export function observeIdentity(directory, expected, scope, toolsCommit, proofFiles = []) {
+function observedCorpus(directory, expected, scope, workerFiles) {
+  const noCorpus = expected.corpus === null;
   if (
-    expected?.schema !== 1 ||
-    !sha.test(expected.subject?.commit ?? '') ||
-    !sha.test(expected.harness?.commit ?? '')
+    noCorpus &&
+    (expected.historicalIntegration !== true ||
+      scope === 'guard' ||
+      !Array.isArray(workerFiles) ||
+      !workerFiles.length ||
+      workerFiles.includes(guardWorker) ||
+      !stagedCorpusAbsent(directory))
   )
-    throw new Error('staged execution identity unavailable');
-  const corpus = installedCorpus(directory);
+    throw new Error('historical corpus absence requires assigned non-guard integration workers');
+  const corpus = noCorpus ? null : installedCorpus(directory);
   if (
+    !noCorpus &&
     !isDeepStrictEqual(
       corpus,
       Object.fromEntries(Object.entries(expected.corpus).filter(([key]) => key !== 'integrity'))
     )
   )
     throw integrity('executed corpus/driver/universe differs from staged identity');
+  return noCorpus;
+}
+
+export function observeIdentity(
+  directory,
+  expected,
+  scope,
+  toolsCommit,
+  proofFiles = [],
+  workerFiles = [],
+  harnessDirectory = root
+) {
+  if (
+    expected?.schema !== 1 ||
+    !sha.test(expected.subject?.commit ?? '') ||
+    !sha.test(expected.harness?.commit ?? '')
+  )
+    throw new Error('staged execution identity unavailable');
+  const noCorpus = observedCorpus(directory, expected, scope, workerFiles);
   for (const item of expected.subject.cargo) {
     if (!isDeepStrictEqual(cargo(readFileSync(path.join(directory, item.file)), item.file), item))
       throw integrity('executed product Cargo differs from staged identity');
   }
-  const harness = sourceIdentity(expected.harness.commit);
+  const harness = sourceIdentity(expected.harness.commit, harnessDirectory, noCorpus);
+  if (noCorpus && harness.corpus !== null)
+    throw integrity('historical harness has a declared corpus');
   const tools = sourceIdentity(toolsCommit);
   const files = effectiveHarness(harness, tools, scope);
   if (scope === 'proof-integration') {
@@ -283,8 +344,10 @@ export function expectedExecutionIdentity(
   scope,
   sha256,
   proofFiles = [],
-  corpus = referenceCorpus(harness.corpus)
+  corpus = harness.corpus === null ? null : referenceCorpus(harness.corpus)
 ) {
+  if (corpus === null && scope === 'guard')
+    throw new Error('guard execution requires exact corpus lock');
   const files = effectiveHarness(harness, tools, scope);
   if (scope === 'proof-integration') {
     for (const file of proofFiles) {
@@ -314,7 +377,22 @@ export function expectedExecutionIdentity(
       sha256: hash(JSON.stringify(files)),
     },
     corpus,
+    ...(corpus === null ? { historicalIntegration: true } : {}),
   };
+}
+
+function completeCorpus(corpus) {
+  const digest = /^[a-f0-9]{64}$/;
+  return (
+    !!corpus &&
+    version.test(corpus.version ?? '') &&
+    ['sha256', 'driverSha256', 'runnerSha256', 'universeSha256'].every((key) =>
+      digest.test(corpus[key] ?? '')
+    ) &&
+    Number.isInteger(corpus.rows) &&
+    corpus.rows > 0 &&
+    /^sha512-[A-Za-z0-9+/]+={0,2}$/.test(corpus.integrity ?? '')
+  );
 }
 
 function completeIdentity(actual) {
@@ -337,20 +415,22 @@ function completeIdentity(actual) {
     !sha.test(actual.harness?.tools ?? '') ||
     !digest.test(actual.harness?.sha256 ?? '') ||
     !Object.hasOwn(actual.harness, 'overlay') ||
-    !version.test(actual.corpus?.version ?? '') ||
-    ['sha256', 'driverSha256', 'runnerSha256', 'universeSha256'].some(
-      (key) => !digest.test(actual.corpus?.[key] ?? '')
-    ) ||
-    !Number.isInteger(actual.corpus?.rows) ||
-    actual.corpus.rows < 1 ||
-    !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(actual.corpus.integrity ?? '') ||
+    !(actual.corpus === null
+      ? actual.historicalIntegration === true && actual.scope !== 'guard'
+      : completeCorpus(actual.corpus)) ||
     !['guard', 'integration', 'proof-integration'].includes(actual.scope)
   );
 }
 
 export function validateExecutionIdentity(execution, expected, label, emit) {
   const actual = execution?.identity;
-  if (!completeIdentity(actual)) {
+  if (
+    !completeIdentity(actual) ||
+    (actual.corpus === null &&
+      (!Array.isArray(execution.files) ||
+        !execution.files.length ||
+        execution.files.includes(guardWorker)))
+  ) {
     emit('INCOMPLETE', `${label}: validated execution identity absent`);
     return;
   }
@@ -364,6 +444,11 @@ export function validateExecutionIdentity(execution, expected, label, emit) {
       )
     ),
   ].filter(Boolean);
+  if (expected.corpus === null) {
+    if (reports.length)
+      emit('INCOMPLETE', `${label}: historical corpus-null execution cannot carry guard reports`);
+    return;
+  }
   for (const report of reports) {
     if (!sha.test(report.sha ?? '') || typeof report.set !== 'string')
       emit('INCOMPLETE', `${label}: guard report source/corpus absent`);

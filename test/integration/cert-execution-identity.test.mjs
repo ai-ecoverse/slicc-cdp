@@ -9,6 +9,7 @@ import {
   expectedExecutionIdentity,
   installedCorpus,
   observeIdentity,
+  selectedHarnessIdentity,
   sourceIdentity,
   stagedIdentity,
   subjectIdentity,
@@ -45,7 +46,7 @@ function findings(execution, expected) {
   return result;
 }
 
-test('historical subject needs Cargo only while the selected current harness still requires its corpus lock', (t) => {
+function historicalFixture(t, kind = 'guard') {
   const configured = JSON.parse(readFileSync(path.join(root, 'scripts/cert/base.json'), 'utf8'));
   const golden = JSON.parse(
     readFileSync(new URL('./cert-historical-cargo.json', import.meta.url), 'utf8')
@@ -56,11 +57,28 @@ test('historical subject needs Cargo only while the selected current harness sti
   assert.equal(golden.lockProjection.corpusEntryAbsent, true);
   const f = fixture(t);
   for (const item of golden.cargo) writeFileSync(path.join(f.directory, item.file), item.manifest);
-  writeFileSync(path.join(f.directory, 'package.json'), JSON.stringify(golden.package));
-  writeFileSync(
-    path.join(f.directory, 'package-lock.json'),
-    JSON.stringify({ lockfileVersion: 3, packages: {} })
-  );
+  const manifest = structuredClone(golden.package);
+  const lock = { lockfileVersion: 3, packages: {} };
+  if (kind !== 'guard' && kind !== 'guard-worker') {
+    rmSync(path.join(f.directory, 'test/integration/guard-runner.test.mjs'));
+    writeFileSync(
+      path.join(f.directory, 'test/integration/legacy-probe.test.mjs'),
+      'import test from "node:test"; test("nonguard legacy identity fixture",()=>{});\n'
+    );
+  }
+  if (kind === 'dependency-only')
+    manifest.devDependencies['@ai-ecoverse/slicc-browsers'] = source.corpus.version;
+  if (kind === 'lock-only')
+    lock.packages['node_modules/@ai-ecoverse/slicc-browsers'] = {
+      version: source.corpus.version,
+      integrity: source.corpus.integrity,
+    };
+  if (kind === 'root-lock-only')
+    lock.packages[''] = {
+      devDependencies: { '@ai-ecoverse/slicc-browsers': source.corpus.version },
+    };
+  writeFileSync(path.join(f.directory, 'package.json'), JSON.stringify(manifest));
+  writeFileSync(path.join(f.directory, 'package-lock.json'), JSON.stringify(lock));
   execFileSync('git', ['init', '-q'], { cwd: f.directory });
   execFileSync('git', ['add', 'crates', 'test', 'package.json', 'package-lock.json'], {
     cwd: f.directory,
@@ -88,6 +106,12 @@ test('historical subject needs Cargo only while the selected current harness sti
     subject.cargo.map(({ file, sha256 }) => ({ file, sha256 })),
     golden.cargo.map(({ file, sha256 }) => ({ file, sha256 }))
   );
+  return { ...f, historical, subject };
+}
+
+test('historical subject needs Cargo only while the selected current harness still requires its corpus lock', (t) => {
+  const f = historicalFixture(t);
+  const { historical, subject } = f;
   assert.throws(
     () => sourceIdentity(historical, f.directory),
     /execution corpus exact locked package unavailable/
@@ -109,6 +133,116 @@ test('historical subject needs Cargo only while the selected current harness sti
   assert.equal(observed.corpus.version, source.corpus.version);
   assert.notEqual(observed.subject.commit, observed.harness.commit);
 });
+
+test('historical positive integration positively binds absent corpus and executes only an assigned nonguard worker', (t) => {
+  const f = historicalFixture(t, 'historical');
+  const harness = selectedHarnessIdentity(
+    f.historical,
+    'replay',
+    'integration-positive',
+    f.directory
+  );
+  assert.equal(
+    selectedHarnessIdentity(f.historical, 'release', 'integration-positive', f.directory).corpus,
+    null
+  );
+  for (const [mode, label] of [
+    ['pr', 'integration-positive'],
+    ['replay', 'guard-positive'],
+    ['release', 'guard-negative'],
+    ['replay', 'other'],
+  ])
+    assert.throws(
+      () => selectedHarnessIdentity(f.historical, mode, label, f.directory),
+      /exact locked package unavailable/
+    );
+  assert.equal(harness.corpus, null);
+  assert.throws(
+    () => sourceIdentity(f.historical, f.directory),
+    /exact locked package unavailable/
+  );
+  const seed = stagedIdentity(f.directory, f.subject, harness, 'a'.repeat(64));
+  const workers = ['test/integration/legacy-probe.test.mjs'];
+  const observed = observeIdentity(
+    f.directory,
+    seed,
+    'integration',
+    commit,
+    [],
+    workers,
+    f.directory
+  );
+  const expected = expectedExecutionIdentity(
+    f.subject,
+    harness,
+    source,
+    'integration',
+    'a'.repeat(64)
+  );
+  assert.deepEqual(observed, expected);
+  assert.equal(observed.corpus, null);
+  assert.deepEqual(findings({ identity: observed, files: workers, attempts: [] }, expected), {
+    failures: [],
+    incomplete: [],
+  });
+  const result = execFileSync(process.execPath, ['--test', workers[0]], {
+    cwd: f.directory,
+    encoding: 'utf8',
+    env: Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => !/^(CERT_|GITHUB_|NODE_TEST_CONTEXT$)/.test(key)
+      )
+    ),
+  });
+  assert.match(result, /nonguard legacy identity fixture/);
+  assert.throws(
+    () => observeIdentity(f.directory, seed, 'guard', commit, [], workers, f.directory),
+    /requires assigned non-guard integration workers/
+  );
+  assert.throws(
+    () =>
+      observeIdentity(
+        f.directory,
+        seed,
+        'integration',
+        commit,
+        [],
+        ['test/integration/guard-runner.test.mjs'],
+        f.directory
+      ),
+    /requires assigned non-guard integration workers/
+  );
+  assert.throws(
+    () => expectedExecutionIdentity(f.subject, harness, source, 'guard', 'a'.repeat(64)),
+    /guard execution requires exact corpus lock/
+  );
+  assert.equal(
+    findings({ identity: { ...observed, scope: 'guard' }, files: workers }, expected).incomplete
+      .length,
+    1
+  );
+  assert.equal(
+    findings({ identity: observed, files: ['test/integration/guard-runner.test.mjs'] }, expected)
+      .incomplete.length,
+    1
+  );
+  assert.equal(
+    findings(
+      { identity: observed, files: workers, guardReport: { report: { results: [] } } },
+      expected
+    ).incomplete.length,
+    1
+  );
+});
+
+for (const kind of ['dependency-only', 'lock-only', 'root-lock-only', 'guard-worker'])
+  test(`historical partial or guard-selected corpus ${kind} stays unavailable`, (t) => {
+    const f = historicalFixture(t, kind);
+    assert.throws(
+      () => sourceIdentity(f.historical, f.directory, true),
+      /execution corpus exact locked package unavailable/
+    );
+  });
 
 test('validated staging identifies actual Cargo versions separately from synthetic npm pack versions', (t) => {
   const f = fixture(t);
