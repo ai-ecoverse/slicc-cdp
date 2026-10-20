@@ -37,6 +37,7 @@ struct MainDocument {
     origin: String,
     unreachable_url: String,
     navigating: bool,
+    navigation_url: String,
     previous: bool,
 }
 
@@ -539,7 +540,7 @@ impl Cdp {
         let previous = self.protected_targets.contains(id);
         if let Some(doc) = self.documents.get(id) {
             if doc.navigating {
-                return true;
+                return doc.previous || self.guard.url(url) || doc.navigation_url.is_empty() || self.guard.url(&doc.navigation_url);
             }
             if self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() {
                 if !self.guard.error_document(&doc.url, &doc.origin) || doc.unreachable_url.is_empty() || doc.unreachable_url != url {
@@ -922,7 +923,9 @@ impl Cdp {
         let url = format!("{}{}", frame.get("url").and_then(Value::as_str).unwrap_or(""), frame.get("urlFragment").and_then(Value::as_str).unwrap_or(""));
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
         let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
-        let previous = self.documents.get(&target).map(|doc| doc.previous).unwrap_or(true);
+        let previous = self.documents.get(&target).map(|doc| doc.previous).unwrap_or_else(|| {
+            self.protected_targets.contains(&target) || unreachable_url.is_empty() || self.guard.url(&unreachable_url)
+        });
         let error = self.guard.error_page_url(&url) || !unreachable_url.is_empty();
         let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if error {
             previous || unreachable_url.is_empty() || !self.guard.error_document(&url, &origin)
@@ -930,7 +933,7 @@ impl Cdp {
             self.guard.target(&url, self.protected_targets.contains(&target), Opener::None) || self.guard.url(&origin)
         };
         self.documents.insert(target.clone(), MainDocument {
-            frame_id: frame_id.to_string(), url, origin, unreachable_url, navigating: false, previous: protected,
+            frame_id: frame_id.to_string(), url, origin, unreachable_url, navigating: false, navigation_url: String::new(), previous: protected,
         });
         if protected {
             self.protect_target(&target);
@@ -1069,7 +1072,7 @@ impl Cdp {
                 }
             }
             "Page.frameStartedNavigating" => {
-                if params.get("navigationType").and_then(Value::as_str) == Some("sameDocument") {
+                if matches!(params.get("navigationType").and_then(Value::as_str), Some("sameDocument" | "historySameDocument")) {
                     return;
                 }
                 if let Some(target) = session.as_deref().and_then(|session| self.session_target(session)) {
@@ -1079,6 +1082,7 @@ impl Cdp {
                     if let Some(doc) = self.documents.get_mut(&target) {
                         if params.get("frameId").and_then(Value::as_str) == Some(&doc.frame_id) {
                             doc.navigating = true;
+                            doc.navigation_url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                         }
                     }
                 }
@@ -2040,6 +2044,21 @@ mod tests {
         cdp.absorb(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"G"}}));
         assert!(cdp.target_protected("T", false).unwrap());
         assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some("S")).is_err());
+    }
+
+    #[test]
+    fn protected_error_page_ordinary_navigation_and_fresh_dns_error_remain_drivable() {
+        let mut cdp = url_backend("https://example.test/next");
+        cdp.session_targets.insert("S".into(), "T".into());
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test"}}}));
+        cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":"S","params":{"frameId":"F","url":"https://example.test/next"}}));
+        assert!(!cdp.target_protected("T", false).unwrap());
+        assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some("S")).is_ok());
+        let mut cdp = url_backend("http://ordinary.invalid/");
+        cdp.session_targets.insert("S".into(), "T".into());
+        error_commit(&mut cdp, "http://ordinary.invalid/", "://");
+        assert!(!cdp.target_protected("T", false).unwrap());
+        assert!(cdp.call("Page.navigate", json!({"url":"about:blank"}), Some("S")).is_ok());
     }
 
     const UNPARSEABLE: &str = "slicc: refused: slicc can't parse this URL, so it could be a protected page\n";
