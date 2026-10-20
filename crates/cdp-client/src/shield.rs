@@ -338,7 +338,7 @@ fn redact_header_block(guard: &Protected, text: &str) -> (String, bool) {
 }
 
 pub fn scheme_less_protected(guard: &Protected, value: &Value) -> bool {
-    let authority = |name: &str, value: &str| (name.eq_ignore_ascii_case("host") || name == ":authority") && guard.url_read_only(&format!("https://{}/", value.trim()));
+    let authority = |name: &str, value: &str| (name.eq_ignore_ascii_case("host") || name == ":authority") && ["http", "https"].iter().any(|scheme| guard.url_read_only(&format!("{scheme}://{}/", value.trim())));
     match value {
         Value::Array(items) => items.iter().any(|item| scheme_less_protected(guard, item)),
         Value::Object(map) => {

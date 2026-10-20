@@ -16,6 +16,11 @@ fn review_redirect_chain_hides_scheme_less_secret_carriers() {
         cdp.absorb(event.clone());
         assert!(!format!("{:?} {:?}", cdp.events(), cdp.paused).contains(REDIRECT_MARKER), "{event}: {:?} {:?}", cdp.events(), cdp.paused);
     }
+    let mut cdp = url_backend("about:blank");
+    cdp.protect_origins(&["http://client.example.test:8080"]);
+    cdp.requests.insert("R".into(), false);
+    cdp.absorb(json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":"S","params":{"requestId":"R","headers":{":authority":"client.example.test:8080",":path":format!("/auth/callback?code={REDIRECT_MARKER}")}}}));
+    assert!(cdp.events().is_empty());
 }
 
 #[test]
