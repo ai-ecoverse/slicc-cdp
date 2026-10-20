@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
+import { guardEvidenceProtocol, guardToolsProtocol } from './guard-protocol.mjs';
 import { aggregateGuardReports } from './guard-shard-report.mjs';
 import { guardShardPlan } from './guard-shards.mjs';
 import { biosFindings } from './pr-bios-result.mjs';
@@ -71,11 +72,16 @@ function validateGuardRows(report, leg, vectors, emit) {
   }
 }
 
-function validateGuardShards(execution, subject, plan, vectors, leg, emit) {
-  if (!execution?.shardPlan) return;
+function validateGuardShards(execution, subject, plan, vectors, leg, emit, producingTools) {
+  const protocol = guardEvidenceProtocol(execution, producingTools);
+  if (protocol === 'LEGACY') return;
+  if (protocol !== 'CURRENT') {
+    emit('INCOMPLETE', `guard ${leg}: current shard protocol or verified legacy evidence absent`);
+    return;
+  }
   const expectedPlan = { ...guardShardPlan(vectors), head: subject.commit, run: plan.run };
-  if (!isDeepStrictEqual(execution.shardPlan, expectedPlan))
-    emit('FAIL', `guard ${leg}: shard plan differs from independent corpus/source`);
+  if (!isDeepStrictEqual(execution.guardShards.plan, expectedPlan))
+    emit('INCOMPLETE', `guard ${leg}: shard plan contradicts independent corpus/source`);
   if (!Array.isArray(execution.shards)) emit('INCOMPLETE', `guard ${leg}: shard executions absent`);
   else {
     const aggregate = aggregateGuardReports(vectors, expectedPlan, execution.shards);
@@ -96,12 +102,13 @@ function validateGuardShards(execution, subject, plan, vectors, leg, emit) {
 }
 
 export function validateGuard(guard, plan, vectors, emit) {
+  const producingTools = guardToolsProtocol(plan.tools);
   for (const leg of ['positive', 'negative']) {
     const execution = guard?.executions?.[leg];
     const subject =
       leg === 'positive' ? { version: plan.version, commit: plan.commit } : plan.baseline;
     validateSuite(execution, `guard ${leg}`, emit, leg === 'positive');
-    validateGuardShards(execution, subject, plan, vectors, leg, emit);
+    validateGuardShards(execution, subject, plan, vectors, leg, emit, producingTools);
     const report = execution?.report;
     if (
       !Array.isArray(report?.results) ||

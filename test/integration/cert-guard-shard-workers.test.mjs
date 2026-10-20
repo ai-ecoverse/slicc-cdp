@@ -118,7 +118,7 @@ test('guard stage partitions every scoped row into four owned workers with uncha
   assert.equal(result.guardReport.report.results.length, 28);
   assert.equal(result.shardCoverage.status, 'PASS');
   assert.equal(result.attempts.length, 4);
-  assert.deepEqual(result.shardPlan.keys, guardShardPlan(vectors).keys);
+  assert.deepEqual(result.guardShards.plan.keys, guardShardPlan(vectors).keys);
   assert.ok(result.guardReport.sha256);
   assert.equal(JSON.parse(readFileSync(result.guardReport.file)).results.length, 28);
 });
@@ -224,7 +224,10 @@ test('the independent guard reader reconstructs the shard plan and aggregate rat
     version: '0.0.0',
     commit: sha,
     baseline: { version: '0.0.0', commit: sha },
-    run: execution.shardPlan.run,
+    run: execution.guardShards.plan.run,
+    tools: (await import('node:child_process'))
+      .execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' })
+      .trim(),
   };
   const findings = (positive) => {
     const messages = [];
@@ -245,13 +248,17 @@ test('the independent guard reader reconstructs the shard plan and aggregate rat
     )
   );
   const renamed = structuredClone(execution);
-  renamed.shardPlan.shards[0].targets = ['vault'];
+  renamed.guardShards.plan.shards[0].targets = ['vault'];
   assert.ok(
     findings(renamed).some(
-      (entry) => entry.status === 'FAIL' && /shard plan differs/.test(entry.reason)
+      (entry) => entry.status === 'INCOMPLETE' && /shard plan contradicts/.test(entry.reason)
     )
   );
-  const missing = aggregateGuardReports(vectors, execution.shardPlan, execution.shards.slice(1));
+  const missing = aggregateGuardReports(
+    vectors,
+    execution.guardShards.plan,
+    execution.shards.slice(1)
+  );
   assert.equal(missing.coverage.status, 'INCOMPLETE');
 });
 
