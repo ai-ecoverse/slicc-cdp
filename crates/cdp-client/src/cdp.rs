@@ -254,7 +254,9 @@ impl Cdp {
                             return Err(self.refusal());
                         }
                     } else if self.targets.get(&target).is_some_and(|info| self.info_protected(info, &[])) {
-                        return Err(self.refusal());
+                        if self.target_protected(&target, false)? {
+                            return Err(self.refusal());
+                        }
                     }
                 }
             }
@@ -2216,6 +2218,19 @@ mod tests {
             cdp.absorb(json!({"method":"Target.receivedMessageFromTarget","params":{"sessionId":"A","targetId":"T","message":nested.to_string()}}));
             assert_eq!(cdp.events().len(), mark, "{url}");
         }
+    }
+
+    #[test]
+    fn allowed_blank_commit_refreshes_stale_protected_discovery_before_driving() {
+        let mut cdp = url_backend("about:blank");
+        cdp.session_targets.insert("S".into(), "T".into());
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test"}}}));
+        error_commit(&mut cdp, "https://seven.sliccy.ai/doc#access_token=MARK", "://");
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://seven.sliccy.ai/doc#access_token=MARK","title":"MARK"}}}));
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"about:blank","securityOrigin":"://"}}}));
+        assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.readyState"}), Some("S")).is_ok());
+        assert!(!cdp.session_blocked("S"));
+        assert!(!cdp.is_protected_target("T"));
     }
 
     const UNPARSEABLE: &str = "slicc: refused: slicc can't parse this URL, so it could be a protected page\n";

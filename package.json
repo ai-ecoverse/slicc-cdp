@@ -68,7 +68,7 @@
     "chrome": "156.0.8078.4"
   },
   "devDependencies": {
-    "@ai-ecoverse/slicc-browsers": "1.11.0",
+    "@ai-ecoverse/slicc-browsers": "1.12.0",
     "@ai-ecoverse/slicc-kernel": "1.136.4",
     "@ai-ecoverse/slicc-shared-web": "1.29.0",
     "@biomejs/biome": "2.5.15",
