@@ -2379,6 +2379,61 @@ mod tests {
         assert!(!cdp.is_protected_target("T"));
     }
 
+    #[test]
+    fn permitted_error_document_responses_redact_history_and_runtime_without_losing_ids() {
+        struct HistoryResponses(UrlBackend);
+        impl Transport for HistoryResponses {
+            fn send_text(&mut self, text: &str) -> Result<(), String> {
+                let call: Value = serde_json::from_str(text).unwrap();
+                let protected = self.0.url.clone();
+                let output = match call["method"].as_str().unwrap() {
+                    "Page.getNavigationHistory" => Some(json!({"currentIndex":1,"entries":[
+                        {"id":701,"url":"https://ordinary.example/ready","title":"ordinary control","userTypedURL":"https://ordinary.example/ready"},
+                        {"id":702,"url":protected,"title":protected,"userTypedURL":protected}
+                    ]})),
+                    "Runtime.evaluate" => Some(json!({"result":{"type":"object","value":{"url":protected,"text":protected}}})),
+                    _ => None,
+                };
+                if let Some(output) = output {
+                    self.0.inbox.push_back(json!({"id":call["id"],"result":output}).to_string());
+                    Ok(())
+                } else {
+                    self.0.send_text(text)
+                }
+            }
+            fn recv_text(&mut self, until: Instant) -> Result<Option<String>, String> {
+                self.0.recv_text(until)
+            }
+        }
+        for attempted in [
+            "https://seven.sliccy.ai/private/HISTORY_MARK?key=HISTORY_MARK#access_token=HISTORY_MARK",
+            "https://vault.sliccy.ai/private/HISTORY_MARK?key=HISTORY_MARK#access_token=HISTORY_MARK",
+        ] {
+            let mut cdp = Cdp::from_transport(Box::new(HistoryResponses(UrlBackend { url:attempted.into(), inbox:VecDeque::new() })));
+            cdp.session_targets.insert("S".into(), "T".into());
+            cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://ordinary.example/ready","securityOrigin":"https://ordinary.example"}}}));
+            error_commit(&mut cdp, attempted, "://");
+            assert!(!cdp.target_protected("T", false).unwrap());
+            assert!(!cdp.session_blocked("S"));
+            let origin = url::Url::parse(attempted).unwrap().origin().ascii_serialization();
+            let history = cdp.call("Page.getNavigationHistory", json!({}), Some("S")).unwrap();
+            assert_eq!(history["currentIndex"], 1);
+            assert_eq!(history["entries"][0]["id"], 701);
+            assert_eq!(history["entries"][0]["url"], "https://ordinary.example/ready");
+            assert_eq!(history["entries"][0]["title"], "ordinary control");
+            assert_eq!(history["entries"][1]["id"], 702);
+            for key in ["url", "title", "userTypedURL"] {
+                assert_eq!(history["entries"][1][key], origin, "{key}");
+            }
+            assert!(!history.to_string().contains("HISTORY_MARK"));
+            let runtime = cdp.call("Runtime.evaluate", json!({"expression":"location.href","returnByValue":true}), Some("S")).unwrap();
+            assert_eq!(runtime["result"]["value"]["url"], origin);
+            assert_eq!(runtime["result"]["value"]["text"], origin);
+            assert!(!runtime.to_string().contains("HISTORY_MARK"));
+            assert!(!cdp.session_blocked("S"));
+        }
+    }
+
     const UNPARSEABLE: &str = "slicc: refused: slicc can't parse this URL, so it could be a protected page\n";
 
     fn malformed_urls() -> Vec<String> {
