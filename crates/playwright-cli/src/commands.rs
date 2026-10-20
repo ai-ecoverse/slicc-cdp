@@ -24,6 +24,15 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = deferred_flag(invocation) {
         return Output::err(message);
     }
+    if matches!(command, "open" | "tab-new" | "goto" | "navigate") {
+        if let Some(url) = invocation.positionals.first() {
+            if cdp_client::protected::Protected::default().unparseable(url)
+                && matches!(url::Url::parse(url), Err(url::ParseError::RelativeUrlWithoutBase))
+            {
+                return Output::err(format!("playwright-cli {command}: URL needs a scheme; add https:// or http://\n"));
+            }
+        }
+    }
     if command == "tab-close" {
         if let Some(index) = invocation.positionals.first() {
             if close_index(index).is_none() {
