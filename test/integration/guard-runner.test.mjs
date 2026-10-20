@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 
@@ -141,7 +142,7 @@ test('published guard set through the Rust guarded client', {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
   });
   const executeTarget = async (target) => {
-    const fixture = await fixtureServer();
+    const fixture = requireRedirectRegistration(await fixtureServer());
     const targets = origins(fixture);
     const browsers = new Map();
     const selected = {
@@ -185,10 +186,12 @@ test('published guard set through the Rust guarded client', {
               })
             );
           const browser = await browsers.get(slot);
-          const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
+          const client = await recordedClient((onMessage) =>
+            guarded(browser.wsUrl, targets.client, { variant, detachDelay, onMessage })
+          );
           let unguarded;
           try {
-            unguarded = await observer(browser.wsUrl);
+            unguarded = await recordedClient((onMessage) => observer(browser.wsUrl, onMessage));
           } catch (error) {
             await client.close();
             await browser.close();

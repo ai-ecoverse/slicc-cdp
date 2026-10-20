@@ -1,0 +1,83 @@
+name: Focused C2 redirects
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/c2-redirect.yml'
+      - 'test/integration/guard-c2-*.mjs'
+      - 'test/integration/guard-client.mjs'
+      - 'crates/cdp-client/**'
+      - 'Cargo.lock'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  c2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        subject: [main, adoption]
+    env:
+      LEFTHOOK: '0'
+      SLICC_CDP_PORTS: 9300-9309
+      BASELINE: a42bcad95baef84283f61c3597938feaa607d108
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '\"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Select subject
+        env:
+          SUBJECT: ${{ matrix.subject }}
+        run: |
+          if [ "$SUBJECT" = main ]; then
+            destination="$RUNNER_TEMP/c2-main"
+            git worktree add --detach "$destination" "$BASELINE"
+            cp test/integration/guard-c2-support.mjs "$destination/test/integration/"
+            cp test/integration/guard-c2-redirect.test.mjs "$destination/test/integration/"
+            cp test/integration/guard-client.mjs "$destination/test/integration/"
+          else
+            destination="$GITHUB_WORKSPACE"
+          fi
+          echo "SUBJECT_DIR=$destination" >> "$GITHUB_ENV"
+      - name: Install verified vector package
+        working-directory: ${{ env.SUBJECT_DIR }}
+        run: |
+          npm ci
+          version=$(node -p 'JSON.parse(require("fs").readFileSync(process.env.GITHUB_WORKSPACE + "/package.json")).devDependencies["@ai-ecoverse/slicc-browsers"]')
+          npm pack "@ai-ecoverse/slicc-browsers@$version" --pack-destination "$RUNNER_TEMP"
+          tarball="$RUNNER_TEMP/ai-ecoverse-slicc-browsers-$version.tgz"
+          echo "585e4320f04edf3b6025f02f9e29daf376657fd8015f93b5063832ed20b34aec  $tarball" | sha256sum -c -
+          npm install --no-save --package-lock=false --ignore-scripts "$tarball"
+      - name: Install pinned Chrome for Testing
+        working-directory: ${{ env.SUBJECT_DIR }}
+        run: npm run -s browser -- --with-deps
+      - name: Native and WASI focused controls and guarded rows
+        working-directory: ${{ env.SUBJECT_DIR }}
+        env:
+          SLICC_GUARD_REPORT: ${{ runner.temp }}/c2-${{ matrix.subject }}
+        run: node --test --test-concurrency=1 --test-reporter=spec test/integration/guard-c2-redirect.test.mjs
+      - name: Focused raw report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: c2-${{ matrix.subject }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/c2-${{ matrix.subject }}*
+          if-no-files-found: error
+          retention-days: 7

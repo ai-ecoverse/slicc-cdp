@@ -181,13 +181,13 @@ export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
   };
 }
 
-export async function observer(wsUrl) {
+export async function observer(wsUrl, onMessage) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve, { once: true });
     ws.addEventListener('error', reject, { once: true });
   });
-  const client = channel((message) => ws.send(message));
+  const client = channel((message) => ws.send(message), onMessage);
   ws.addEventListener('message', (event) => client.receive(JSON.parse(event.data)));
   ws.addEventListener('close', client.stop);
   return {
