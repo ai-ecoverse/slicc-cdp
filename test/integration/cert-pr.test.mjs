@@ -152,16 +152,24 @@ function cliEnvironment(overrides = {}, ambient = process.env) {
 }
 
 async function cli(script, argv, f, api, extra = {}) {
-  const child = spawn(process.execPath, [path.join(root, 'scripts/cert', script), ...argv], {
-    cwd: f.directory,
-    env: cliEnvironment({
-      GH_TOKEN: '',
-      GITHUB_API_URL: api.origin,
-      GITHUB_RUN_ID: '42',
-      GITHUB_RUN_ATTEMPT: '1',
-      ...extra,
-    }),
-  });
+  const preload =
+    script === 'pr-bios-inputs.mjs'
+      ? ['--import', new URL('./cert-bios-fetch.mjs', import.meta.url).href]
+      : [];
+  const child = spawn(
+    process.execPath,
+    [...preload, path.join(root, 'scripts/cert', script), ...argv],
+    {
+      cwd: f.directory,
+      env: cliEnvironment({
+        GH_TOKEN: '',
+        GITHUB_API_URL: api.origin,
+        GITHUB_RUN_ID: '42',
+        GITHUB_RUN_ATTEMPT: '1',
+        ...extra,
+      }),
+    }
+  );
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (chunk) => {
@@ -634,19 +642,20 @@ test('PR bios public input planner binds both local packs and labels without pin
   const result = await call();
   assert.equal(result.exit, 0, result.stderr);
   const inputs = read(output);
+  const expectedPin = read(path.join(root, 'scripts/cert/pr-bios.json'));
   assert.equal(inputs.status, 'PASS');
   assert.equal(inputs.ready, true);
   for (const side of ['base', 'candidate']) {
     const row = inputs.calls[side];
     assert.equal(row.label, side);
-    assert.equal(row['bios-ref'], '4025d6aabc2c06add216183064d81914a171cd64');
+    assert.equal(row['bios-ref'], expectedPin.commit);
     assert.equal(row.repeat, 3);
     assert.equal(row.runner, 'ubuntu-latest');
     assert.equal(row['candidate-package'], '@ai-ecoverse/slicc-cdp');
     assert.equal(row['candidate-repo'], repository);
     assert.equal(row['candidate-run'], plan.run);
     assert.equal(row['candidate-sha256'], sha256(path.join(packs, side, 'package.tgz')));
-    assert.deepEqual(JSON.parse(row.shards), ['packages-update-cdp', 'guard']);
+    assert.deepEqual(JSON.parse(row.shards), expectedPin.shards);
   }
   assert.notEqual(
     inputs.calls.base['candidate-artifact'],
@@ -668,8 +677,9 @@ test('PR bios slot stays INCOMPLETE without paired byte-bound packs and canary r
   const bios = read(evidence);
   assert.equal(bios.status, 'INCOMPLETE');
   assert.equal(bios.pin.workflow, '.github/workflows/canary.yml');
-  assert.equal(bios.pin.commit, '4025d6aabc2c06add216183064d81914a171cd64');
-  assert.deepEqual(bios.pin.shards, ['packages-update-cdp', 'guard']);
+  const expectedPin = read(path.join(root, 'scripts/cert/pr-bios.json'));
+  assert.equal(bios.pin.commit, expectedPin.commit);
+  assert.deepEqual(bios.pin.shards, expectedPin.shards);
   assert.deepEqual(
     bios.subjects.map((item) => item.side),
     ['base', 'candidate']

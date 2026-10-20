@@ -5,6 +5,7 @@ import { cliVerdict } from './cli-verdict.mjs';
 import { args, identity, json, save } from './common.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { biosCalls, selectBiosPin } from './pr-bios-result.mjs';
+import { fetchBiosShardContract } from './pr-bios-shards.mjs';
 import { client } from './pr-common.mjs';
 import { unpackLocal } from './pr-subject.mjs';
 
@@ -44,6 +45,9 @@ try {
     })
   );
   result.calls = biosCalls(plan, pin, subjects, bindings);
+  result.shardContract = await fetchBiosShardContract(pin);
+  if (result.shardContract.status !== 'PASS')
+    throw new Error(result.shardContract.incomplete.join('; '));
   if (!/^[a-f0-9]{40}$/.test(pin.commit ?? ''))
     throw new Error('bios canary merge SHA pending; inputs prepared but no guarded smoke executed');
   result.ready = true;

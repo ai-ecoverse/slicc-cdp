@@ -21,7 +21,11 @@ import { prIdentity } from '../../scripts/cert/pr-common.mjs';
 import { assertVerdict } from './cert-cli-verdict.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
-const pin = '4025d6aabc2c06add216183064d81914a171cd64';
+const pinConfig = JSON.parse(
+  readFileSync(new URL('../../scripts/cert/pr-bios.json', import.meta.url))
+);
+const pin = pinConfig.commit;
+const guardShard = pinConfig.shards.find((shard) => shard.startsWith('guard-'));
 const packageName = '@ai-ecoverse/slicc-cdp';
 const read = (file) => JSON.parse(readFileSync(file));
 const save = (file, value) => writeFileSync(file, JSON.stringify(value));
@@ -111,7 +115,10 @@ function fixture(t) {
       ambiguous: [],
       tests: Array.from({ length: 20 }, (_, index) => ({
         key: `guard/test-${index}`,
-        shard: index === 19 ? 'packages-update-cdp' : 'guard',
+        shard:
+          index === 19
+            ? 'packages-update-cdp'
+            : pinConfig.shards[1 + (index % (pinConfig.shards.length - 1))],
         test: index === 0 ? 'guarded CDP smoke' : `passing smoke ${index}`,
         verdict: 'pass',
         failed: { candidate: '0/3', baseline: '0/0' },
@@ -133,6 +140,8 @@ function invoke(f, script = 'pr-bios.mjs', args = [], overrides = {}) {
   const invocation = spawnSync(
     process.execPath,
     [
+      '--import',
+      new URL('./cert-bios-fetch.mjs', import.meta.url).href,
       path.join(root, 'scripts/cert', script),
       '--plan',
       path.join(f.directory, 'plan.json'),
@@ -152,7 +161,7 @@ function invoke(f, script = 'pr-bios.mjs', args = [], overrides = {}) {
 }
 
 const failure = {
-  shard: 'guard',
+  shard: guardShard,
   test: 'guarded CDP smoke',
   log: 'failure',
   failed: { candidate: '3/3', baseline: '0/3' },
@@ -589,6 +598,8 @@ async function boundInvoke(t, f, script = 'pr-bios.mjs') {
     const child = spawn(
       process.execPath,
       [
+        '--import',
+        new URL('./cert-bios-fetch.mjs', import.meta.url).href,
         path.join(root, 'scripts/cert', script),
         '--plan',
         path.join(f.directory, 'plan.json'),
@@ -626,7 +637,9 @@ test('parallel bios input planners own their extraction directories and cleanup'
   const fixtures = Array.from({ length: 4 }, () => boundFixture(t));
   const results = await Promise.all(fixtures.map((f) => boundInvoke(t, f, 'pr-bios-inputs.mjs')));
   for (const [index, result] of results.entries()) {
-    assert.equal(result.document.status, 'PASS', result.stderr);
+    assert.equal(result.document.status, 'INCOMPLETE', result.stderr);
+    assert.equal(result.document.ready, false);
+    assert.match(result.document.reason, /unknown BIOS shard/);
     for (const side of ['base', 'candidate']) {
       const file = path.join(
         fixtures[index].directory,
@@ -659,6 +672,8 @@ for (const corrupt of [false, true])
     const run = spawnSync(
       process.execPath,
       [
+        '--import',
+        new URL('./cert-bios-fetch.mjs', import.meta.url).href,
         path.join(root, 'scripts/cert/pr-bios-inputs.mjs'),
         '--plan',
         path.join(f.directory, 'plan.json'),
@@ -909,7 +924,9 @@ for (const invalid of [false, true])
         (row) => row.name === f.bindings.artifacts.find((row) => row.role === 'pack-base').name
       ).digest = 'f'.repeat(64);
     const run = await boundInvoke(t, f, 'pr-bios-inputs.mjs');
-    assert.equal(run.document.status, invalid ? 'FAIL' : 'PASS', run.stderr);
+    assert.equal(run.document.status, invalid ? 'FAIL' : 'INCOMPLETE', run.stderr);
+    assert.equal(run.document.ready, false);
+    if (!invalid) assert.match(run.document.reason, /unknown BIOS shard/);
     if (invalid) assert.equal(run.document.ready, false);
     else
       for (const side of ['base', 'candidate']) {

@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "scope": "test/integration/cert-*.mjs; direct requested patterns and expanded URL, fetch, registry and command references",
+  "patterns": [
+    "raw.githubusercontent",
+    "api.github.com",
+    "registry.npmjs.org",
+    "fetch()",
+    "https.get"
+  ],
+  "entries": [
+    {
+      "files": [
+        "cert-bios-fetch.mjs",
+        "cert-bios-fetch.test.mjs",
+        "cert-bios.test.mjs",
+        "cert-pr.test.mjs"
+      ],
+      "classification": "CLI child-process catalog fetches use explicit test-only preloads for exactly two immutable URLs; every other request passes through. Regression children block original outbound fetch and assert golden bytes and refusal. PR API fixtures use loopback HTTP.",
+      "stubbedUrls": [
+        "https://raw.githubusercontent.com/ai-ecoverse/slicc-bios/8d4e5d56bfdce208f853c8ea98628392787e31ea/scripts/canary/shards.json",
+        "https://raw.githubusercontent.com/ai-ecoverse/slicc-bios/c2cec127b935419049568f584093d7ef03ac0721/scripts/canary/shards.json"
+      ]
+    },
+    {
+      "files": ["cert-bios-shards.test.mjs"],
+      "classification": "The raw URL is asserted against an injected fetcher returning local Response bytes; unavailable, HTTP and oversized cases use injected responses, not remote requests. Artifact URLs are provenance data."
+    },
+    {
+      "files": ["cert-bios-pair.test.mjs"],
+      "classification": "Artifact download tests replace and restore globalThis.fetch with deterministic ZIP responses. GitHub run URLs are provenance data, not dialed hosts."
+    },
+    {
+      "files": ["cert-artifact-binding.test.mjs", "cert-bios-record.test.mjs"],
+      "classification": "CLI artifact readers use GITHUB_API_URL pointing to case-owned loopback servers and empty fixture credentials; GitHub URLs identify artifacts in JSON, not outbound requests."
+    },
+    {
+      "files": ["cert-pr-workflow.test.mjs"],
+      "classification": "Fetch references inspect workflow YAML and execute credential-free git fetch against a case-owned local repository; checkout and npm ci text is asserted, not executed remotely by these tests."
+    },
+    {
+      "files": ["cert-proofs.test.mjs", "cert-evidence.test.mjs", "cert-fixture.mjs"],
+      "classification": "Registry and GitHub provenance values are local JSON evidence fixtures. No registry.npmjs.org or api.github.com request is present."
+    },
+    {
+      "files": [
+        "cert-cli-verdict.test.mjs",
+        "cert-execution-identity.test.mjs",
+        "cert-harness.test.mjs"
+      ],
+      "classification": "Expanded grep hits identify local curlwright binaries, synthetic npm versions, installed corpus bytes and fake harness-port subprocesses; no external fetch or https.get call is present."
+    }
+  ],
+  "remaining": "No direct api.github.com, registry.npmjs.org or https.get calls found. Installation and Cargo dependency setup occur before this suite and are not claimed offline. Blocking Node fetch is an execution cross-check, not a native-process network attestation. Production readers are unchanged."
+}
