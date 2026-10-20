@@ -152,16 +152,24 @@ function cliEnvironment(overrides = {}, ambient = process.env) {
 }
 
 async function cli(script, argv, f, api, extra = {}) {
-  const child = spawn(process.execPath, [path.join(root, 'scripts/cert', script), ...argv], {
-    cwd: f.directory,
-    env: cliEnvironment({
-      GH_TOKEN: '',
-      GITHUB_API_URL: api.origin,
-      GITHUB_RUN_ID: '42',
-      GITHUB_RUN_ATTEMPT: '1',
-      ...extra,
-    }),
-  });
+  const preload =
+    script === 'pr-bios-inputs.mjs'
+      ? ['--import', new URL('./cert-bios-fetch.mjs', import.meta.url).href]
+      : [];
+  const child = spawn(
+    process.execPath,
+    [...preload, path.join(root, 'scripts/cert', script), ...argv],
+    {
+      cwd: f.directory,
+      env: cliEnvironment({
+        GH_TOKEN: '',
+        GITHUB_API_URL: api.origin,
+        GITHUB_RUN_ID: '42',
+        GITHUB_RUN_ATTEMPT: '1',
+        ...extra,
+      }),
+    }
+  );
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (chunk) => {

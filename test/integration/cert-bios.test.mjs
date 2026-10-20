@@ -140,6 +140,8 @@ function invoke(f, script = 'pr-bios.mjs', args = [], overrides = {}) {
   const invocation = spawnSync(
     process.execPath,
     [
+      '--import',
+      new URL('./cert-bios-fetch.mjs', import.meta.url).href,
       path.join(root, 'scripts/cert', script),
       '--plan',
       path.join(f.directory, 'plan.json'),
@@ -596,6 +598,8 @@ async function boundInvoke(t, f, script = 'pr-bios.mjs') {
     const child = spawn(
       process.execPath,
       [
+        '--import',
+        new URL('./cert-bios-fetch.mjs', import.meta.url).href,
         path.join(root, 'scripts/cert', script),
         '--plan',
         path.join(f.directory, 'plan.json'),
@@ -668,6 +672,8 @@ for (const corrupt of [false, true])
     const run = spawnSync(
       process.execPath,
       [
+        '--import',
+        new URL('./cert-bios-fetch.mjs', import.meta.url).href,
         path.join(root, 'scripts/cert/pr-bios-inputs.mjs'),
         '--plan',
         path.join(f.directory, 'plan.json'),
