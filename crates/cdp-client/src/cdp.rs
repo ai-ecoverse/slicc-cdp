@@ -1928,7 +1928,11 @@ mod tests {
     }
 
     fn error_page_client() -> Cdp {
-        let mut cdp = url_backend("https://seven.sliccy.ai/path?secret#fragment");
+        error_page_client_url("https://seven.sliccy.ai/path?secret#fragment")
+    }
+
+    fn error_page_client_url(url: &str) -> Cdp {
+        let mut cdp = url_backend(url);
         cdp.session_targets.insert("S".into(), "T".into());
         cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://example.test/"}}}));
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test"}}}));
@@ -2059,6 +2063,36 @@ mod tests {
         error_commit(&mut cdp, "http://ordinary.invalid/", "://");
         assert!(!cdp.target_protected("T", false).unwrap());
         assert!(cdp.call("Page.navigate", json!({"url":"about:blank"}), Some("S")).is_ok());
+    }
+
+    #[test]
+    fn protected_error_page_path_query_and_fragment_redact_url_and_title_everywhere() {
+        for url in [
+            "https://seven.sliccy.ai/path-secret",
+            "https://seven.sliccy.ai/?query-secret=hidden",
+            "https://seven.sliccy.ai/#fragment-secret-hidden",
+            "https://seven.sliccy.ai/path-secret?query-secret=hidden#fragment-secret-hidden",
+        ] {
+            let mut cdp = error_page_client_url(url);
+            error_commit(&mut cdp, url, "://");
+            let info = json!({"targetId":"T","type":"page","url":url,"title":url});
+            for method in ["Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"] {
+                cdp.absorb(json!({"method":method,"params":{"sessionId":"A","targetInfo":info}}));
+                let event = cdp.events().last().unwrap();
+                for key in ["url", "title"] {
+                    assert_eq!(event["params"]["targetInfo"][key], "https://seven.sliccy.ai", "{method} {key} {url}");
+                }
+            }
+            for method in ["Target.getTargets", "Target.getTargetInfo"] {
+                let out = cdp.call(method, json!({"targetId":"T"}), None).unwrap();
+                let info = if method == "Target.getTargets" { &out["targetInfos"][0] } else { &out["targetInfo"] };
+                for key in ["url", "title"] {
+                    assert_eq!(info[key], "https://seven.sliccy.ai", "{method} {key} {url}");
+                }
+            }
+            assert!(!cdp.target_protected("T", false).unwrap());
+            assert!(!cdp.session_blocked("S"));
+        }
     }
 
     const UNPARSEABLE: &str = "slicc: refused: slicc can't parse this URL, so it could be a protected page\n";
