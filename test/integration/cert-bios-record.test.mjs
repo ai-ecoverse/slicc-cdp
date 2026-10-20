@@ -100,6 +100,7 @@ for (const mode of [
         'candidate-run': '42',
         'candidate-sha256': sha256,
         'candidate-repo': 'fixture/lane',
+        'candidate-binding': 'legacy',
         repeat: 3,
       };
       bios.results[side] = {
@@ -127,7 +128,10 @@ for (const mode of [
         ambiguous: [],
         tests: Array.from({ length: 20 }, (_, index) => ({
           key: `guard/test-${index}`,
-          shard: index === 19 ? 'packages-update-cdp' : 'guard',
+          shard:
+            index === 19
+              ? 'packages-update-cdp'
+              : bios.pin.shards[1 + (index % (bios.pin.shards.length - 1))],
           test: index === 0 ? 'guarded CDP smoke' : `passing smoke ${index}`,
           verdict: 'pass',
           failed: { candidate: '0/3', baseline: '0/0' },
@@ -139,7 +143,7 @@ for (const mode of [
       };
     }
     const row = {
-      shard: 'guard',
+      shard: bios.pin.shards[1],
       test: 'guarded CDP smoke',
       log: 'failure',
       failed: { candidate: '3/3', baseline: '0/3' },

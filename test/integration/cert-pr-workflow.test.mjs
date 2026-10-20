@@ -159,10 +159,10 @@ test('PR certification controls come from main and candidate jobs stay hosted re
   assert.deepEqual(workflow.permissions, { contents: 'read' });
   for (const job of Object.values(workflow.jobs)) {
     if (!job.steps) {
-      assert.equal(
-        job.uses,
-        'ai-ecoverse/slicc-bios/.github/workflows/canary.yml@4025d6aabc2c06add216183064d81914a171cd64'
+      const pin = JSON.parse(
+        readFileSync(new URL('../../scripts/cert/pr-bios.json', import.meta.url))
       );
+      assert.equal(job.uses, `${pin.repository}/${pin.workflow}@${pin.commit}`);
       assert.deepEqual(job.permissions, { contents: 'read', actions: 'read' });
       continue;
     }
@@ -288,14 +288,14 @@ test('PR certification preserves canonical plan and missing producer refusal', (
   assert.ok(!bios.if.includes('needs.bios_base.result'));
   for (const side of ['base', 'candidate']) {
     const call = workflow.jobs[`bios_${side}`];
-    assert.equal(
-      call.uses,
-      'ai-ecoverse/slicc-bios/.github/workflows/canary.yml@4025d6aabc2c06add216183064d81914a171cd64'
+    const pin = JSON.parse(
+      readFileSync(new URL('../../scripts/cert/pr-bios.json', import.meta.url))
     );
+    assert.equal(call.uses, `${pin.repository}/${pin.workflow}@${pin.commit}`);
     assert.equal(call.with.label, side);
     assert.equal(call.with.repeat, 3);
-    assert.equal(call.with['bios-ref'], '4025d6aabc2c06add216183064d81914a171cd64');
-    assert.deepEqual(JSON.parse(call.with.shards), ['packages-update-cdp', 'guard']);
+    assert.equal(call.with['bios-ref'], '${{ needs.bios_inputs.outputs.bios_ref }}');
+    assert.equal(call.with.shards, '${{ needs.bios_inputs.outputs.shards }}');
   }
   const consume = bios.steps.find((step) => step.run?.includes('scripts/cert/pr-bios-files.mjs'));
   assert.ok(consume, 'main-owned file writer must replace whole-result environment transport');

@@ -211,7 +211,10 @@ for (const [name, change, status] of cases) {
 
 test('record and report require every produced binding, but not their own future upload', () => {
   const f = fixture();
-  assert.equal(Object.keys(f.names).length, 32);
+  const shardCount = JSON.parse(
+    readFileSync(new URL('../../scripts/cert/pr-bios.json', import.meta.url))
+  ).shards.length;
+  assert.equal(Object.keys(f.names).length, 24 + 4 * shardCount);
   f.actual = f.actual.filter((row) => ![f.names.record, f.names.report].includes(row.name));
   assert.equal(artifactFindings(plan, f.bindings, f.actual, { phase: 'record' }).status, 'PASS');
   assert.equal(
@@ -226,7 +229,10 @@ test('record and report require every produced binding, but not their own future
     workflow_run: { id: 42, head_sha: plan.head },
   });
   assert.equal(artifactFindings(plan, f.bindings, f.actual, { phase: 'report' }).status, 'PASS');
-  f.bindings.artifacts = f.bindings.artifacts.filter((row) => row.role !== 'bios-base-shard-guard');
+  const pin = JSON.parse(readFileSync(new URL('../../scripts/cert/pr-bios.json', import.meta.url)));
+  f.bindings.artifacts = f.bindings.artifacts.filter(
+    (row) => row.role !== `bios-base-shard-${pin.shards[1]}`
+  );
   assert.equal(
     artifactFindings(plan, f.bindings, f.actual, { phase: 'report' }).status,
     'INCOMPLETE'
@@ -452,7 +458,10 @@ test('valid record bindings never waive missing behavioural documents', async (t
   assert.equal(record.status, 'INCOMPLETE');
   assert.equal(record.certified, false);
   assert.equal(record.artifactBinding.status, 'PASS');
-  assert.equal(record.artifactBinding.matched.length, 30);
+  assert.deepEqual(
+    record.artifactBinding.matched.map((row) => row.role).sort(),
+    [...record.artifactBinding.roles].sort()
+  );
   assert.ok(record.incomplete.length > 0);
   assertVerdict(run.stdout, 'pr-record', 'INCOMPLETE');
 });
