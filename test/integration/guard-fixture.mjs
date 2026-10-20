@@ -23,6 +23,9 @@ export function browserArgs({ privileged = false } = {}) {
     'plain.guard.test',
     'same.guard.test',
     'cross.other.test',
+    'exa%20mple.sliccy.ai',
+    'xn--1ug.sliccy.ai',
+    'xn--a.sliccy.ai',
   ];
   return [
     `--host-resolver-rules=${hosts.map((host) => `MAP ${host} 127.0.0.1`).join(', ')}`,

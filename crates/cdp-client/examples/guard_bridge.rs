@@ -1,7 +1,9 @@
 use cdp_client::cdp::Cdp;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
+#[cfg(not(target_os = "wasi"))]
+use std::io::BufRead;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -17,23 +19,59 @@ fn answer(id: Value, result: Result<Value, String>) {
     }
 }
 
+fn input() -> Box<dyn FnMut() -> Result<String, mpsc::TryRecvError>> {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        Box::new(move || rx.try_recv())
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        use std::io::Read;
+        #[link(wasm_import_module = "wasi_snapshot_preview1")]
+        unsafe extern "C" {
+            fn fd_fdstat_set_flags(fd: u32, flags: u32) -> u32;
+        }
+        unsafe { assert_eq!(fd_fdstat_set_flags(0, 4), 0); }
+        let mut buffered = Vec::new();
+        Box::new(move || {
+            if !buffered.contains(&b'\n') {
+                let mut bytes = [0; 8192];
+                match io::stdin().read(&mut bytes) {
+                    Ok(0) => return Err(mpsc::TryRecvError::Disconnected),
+                    Ok(count) => buffered.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            match buffered.iter().position(|byte| *byte == b'\n') {
+                Some(end) => Ok(String::from_utf8(buffered.drain(..=end).collect()).unwrap()),
+                None => Err(mpsc::TryRecvError::Empty),
+            }
+        })
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "wasi")]
+    let url = std::env::var("SLICC_CDP_URL").unwrap();
+    #[cfg(not(target_os = "wasi"))]
     let url = std::env::args().nth(1).unwrap();
     let mut cdp = Cdp::connect(&url).unwrap();
     let origin = std::env::args().nth(2).unwrap();
     cdp.protect_origins(&[&origin]);
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if tx.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
+    let mut input = input();
     let mut seen = 0;
     let mut pending = BTreeMap::<u64, (String, String, Instant)>::new();
     loop {
-        match rx.try_recv() {
+        match input() {
             Ok(line) => {
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let method = message["method"].as_str().unwrap();
