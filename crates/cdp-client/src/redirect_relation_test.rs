@@ -24,6 +24,14 @@ fn canonical_handoff_relation_is_kept_only_as_an_exact_link_parameter() {
         assert!(!result.to_string().contains(relation));
         assert!(!result.to_string().contains(REDIRECT_MARKER));
     }
+    let mixed = "</api>; rel=\"api-catalog\", </llms.txt>; rel=\"https://llmstxt.org/rel/llms-txt\", <https://github.com/o/r>; rel=\"https://www.sliccy.ai/rel/upskill\"; branch=main; path=\"skills/foo\"";
+    let mut cdp = url_backend("about:blank");
+    cdp.requests.insert("R".into(), false);
+    cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"S","params":{"requestId":"R","headers":{"link":mixed},"headersText":format!("HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nlink: {mixed}\r\n\r\n")}}));
+    cdp.absorb(json!({"method":"Network.responseReceived","sessionId":"S","params":{"requestId":"R","response":{"url":"http://127.0.0.1:8080/","status":200,"headers":{"link":mixed}}}}));
+    assert_eq!(cdp.events().len(), 2, "{:?}", cdp.events());
+    assert_eq!(cdp.events()[1]["params"]["response"]["headers"]["link"], mixed);
+    assert_eq!(cdp.request_state("R"), Some(false));
     let mut cdp = url_backend("about:blank");
     let reply = json!({"headers":{"Location":relation,"Refresh":format!("0;url={relation}")},"text":relation});
     let result = cdp.after("Runtime.evaluate", &json!({}), Some("S"), reply).unwrap();

@@ -1002,7 +1002,7 @@ impl Cdp {
                 self.mark_redirect(id);
             }
             for key in ["response", "redirectResponse", "headers", "headersText", "requestHeadersText", "responseHeaders"] {
-                if params.get(key).is_some_and(|item| shield::redact_strings(&self.guard, &mut item.clone())) {
+                if params.get(key).is_some_and(|item| shield::redact_strings(&self.guard, &mut json!({key:item}))) {
                     self.mark_redirect(id);
                 }
             }

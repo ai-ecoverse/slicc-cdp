@@ -121,7 +121,19 @@ test('a pending call fails at once when the guard blocks its session or Chrome d
           flatten: true,
         });
         await client.send('Page.enable', {}, sessionId);
-        const pending = await pendingEvaluate(client, sessionId, 'new Promise(() => {})');
+        const pending = timed(
+          client.send(
+            'Runtime.evaluate',
+            {
+              expression: 'new Promise(() => {})',
+              awaitPromise: true,
+              returnByValue: true,
+            },
+            sessionId
+          )
+        );
+        await sleep(500);
+        assert.equal(pending.settled.done, false, 'the evaluation must still be pending');
         const history = await raw.send('Page.getNavigationHistory', {}, watched);
         const back = history.entries[history.currentIndex - 1];
         assert.equal(back.url, `${targets.client}/doc`);
