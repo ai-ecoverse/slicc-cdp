@@ -918,8 +918,16 @@ mod tests {
                 let output = {
                     run(&root, peer.port, &[command, url])
                 };
-                assert_eq!(output.code, 0, "{command} {url} {}", output.stderr);
-                if !secret.is_empty() {
+                let refused = url == "example.com/PATHSECRET";
+                assert_eq!(output.code, if refused { 1 } else { 0 }, "{command} {url} {}", output.stderr);
+                if refused {
+                    assert_eq!(output.stderr, format!("{}\n", slicc_browsers::catalog().protected_origins.unparseable_refusal));
+                    assert!(!peer.log.lock().unwrap().iter().any(|message| {
+                        matches!(message["method"].as_str(), Some("Target.createTarget" | "Page.navigate"))
+                            && message["params"]["url"] == url
+                    }));
+                }
+                if !refused && !secret.is_empty() {
                     let lower_stdout = output.stdout.to_ascii_lowercase();
                     let lower_secret = secret.to_ascii_lowercase();
                     if !url.contains('?') && !url.contains('#') {
