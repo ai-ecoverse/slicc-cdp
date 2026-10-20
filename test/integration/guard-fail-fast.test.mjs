@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import http from 'node:http';
 import test from 'node:test';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { launchBrowser } from './browser.mjs';
@@ -69,20 +68,6 @@ async function refusedFast({ call, settled }, fired) {
   assert(spent < prompt, `the call took ${spent} ms after the trigger: ${error.message}`);
 }
 
-async function hanging() {
-  const sockets = new Set();
-  const server = http.createServer(() => {});
-  server.on('connection', (socket) => sockets.add(socket));
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  return {
-    port: server.address().port,
-    close: async () => {
-      for (const socket of sockets) socket.destroy();
-      await new Promise((resolve) => server.close(resolve));
-    },
-  };
-}
-
 test('a pending call fails at once when the guard blocks its session or Chrome detaches it', {
   timeout: 300000,
 }, async (t) => {
@@ -91,7 +76,6 @@ test('a pending call fails at once when the guard blocks its session or Chrome d
   });
   const fixture = await fixtureServer();
   const targets = origins(fixture);
-  const stall = await hanging();
   const each = async (body) => {
     const browser = await launchBrowser(browserArgs());
     const raw = await observer(browser.wsUrl);
@@ -137,20 +121,7 @@ test('a pending call fails at once when the guard blocks its session or Chrome d
           flatten: true,
         });
         await client.send('Page.enable', {}, sessionId);
-        const { frameTree } = await client.send('Page.getFrameTree', {}, sessionId);
-        const pending = timed(
-          client.send(
-            'Network.loadNetworkResource',
-            {
-              frameId: frameTree.frame.id,
-              url: `${targets.ordinary.replace(/:\d+$/, '')}:${stall.port}/never`,
-              options: { disableCache: true, includeCredentials: false },
-            },
-            sessionId
-          )
-        );
-        await sleep(500);
-        assert.equal(pending.settled.done, false, 'the load must still be pending');
+        const pending = await pendingEvaluate(client, sessionId, 'new Promise(() => {})');
         const history = await raw.send('Page.getNavigationHistory', {}, watched);
         const back = history.entries[history.currentIndex - 1];
         assert.equal(back.url, `${targets.client}/doc`);
@@ -183,7 +154,6 @@ test('a pending call fails at once when the guard blocks its session or Chrome d
       })
     );
   } finally {
-    await stall.close();
     await fixture.close();
   }
 });

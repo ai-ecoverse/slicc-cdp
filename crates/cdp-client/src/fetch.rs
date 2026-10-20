@@ -754,7 +754,7 @@ mod tests {
                 "requestId": id,
                 "frameId": "F1",
                 "resourceType": "Document",
-                "networkId": "N1",
+                "networkId": format!("N{id}"),
                 "request": {
                     "url": url,
                     "method": "GET",
@@ -1155,7 +1155,7 @@ mod tests {
                 json!({
                     "method": "Network.requestWillBeSent",
                     "sessionId": "S",
-                    "params": { "requestId": "N1", "documentURL": "https://seven.sliccy.ai/os/", "request": { "url": "https://api.model.example/v1/chat", "headers": { "Authorization": "Bearer KEY" } } }
+                    "params": { "requestId": "NR1", "documentURL": "https://seven.sliccy.ai/os/", "request": { "url": "https://api.model.example/v1/chat", "headers": { "Authorization": "Bearer KEY" } } }
                 }),
             ],
             Box::new(|message| vec![ok(message)]),

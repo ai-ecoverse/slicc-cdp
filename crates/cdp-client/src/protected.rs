@@ -75,6 +75,14 @@ impl Protected {
         self.judge_url(text, false)
     }
 
+    pub fn redaction_schemes(&self) -> impl Iterator<Item = &str> {
+        self.rules.schemes.iter()
+            .chain(&self.rules.protected_schemes)
+            .chain(&self.rules.any_schemes)
+            .chain(&self.rules.inner_schemes)
+            .map(String::as_str)
+    }
+
     pub fn url_read_only(&self, text: &str) -> bool {
         self.judge_url(text, true)
     }

@@ -997,6 +997,10 @@ impl Cdp {
             }
         }
         if let Some(id) = params.get("requestId").and_then(Value::as_str) {
+            if shield::scheme_less_protected(&self.guard, &params) {
+                self.requests.insert(id.to_string(), true);
+                self.mark_redirect(id);
+            }
             for key in ["response", "redirectResponse", "headers", "headersText", "requestHeadersText", "responseHeaders"] {
                 if params.get(key).is_some_and(|item| shield::redact_strings(&self.guard, &mut item.clone())) {
                     self.mark_redirect(id);
@@ -1161,7 +1165,20 @@ impl Cdp {
         if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || shield::loaded_urls_protected(&self.guard, &value["params"]) {
             return;
         }
-        shield::redact_strings(&self.guard, &mut value);
+        let redacted = shield::redact_strings(&self.guard, &mut value);
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let tainted = value.pointer("/params/requestId").and_then(Value::as_str).is_some_and(|id| self.redirects.contains(id));
+        if tainted {
+            let request = value.pointer("/params/request");
+            let opaque_request = request.and_then(Value::as_object).is_some_and(|request| request.keys().any(|key| key.starts_with("postData") || key.to_ascii_lowercase().ends_with("fragment")));
+            let safe_request = method == "Network.requestWillBeSent" && request.and_then(|request| request.get("url")).and_then(Value::as_str).is_some_and(|url| !self.guard.url(url)) && !opaque_request;
+            if opaque_request || !redacted && !safe_request {
+                return;
+            }
+            if let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) {
+                params.retain(|key, _| key != "documentURL" && !key.to_ascii_lowercase().ends_with("fragment"));
+            }
+        }
         if self.hidden(&value) {
             return;
         }
@@ -1359,7 +1376,8 @@ impl Cdp {
                     self.mark_redirect(network);
                 }
             }
-            let reaches = fetch::reaches_protected(&self.guard, &paused);
+            let authority_protected = shield::scheme_less_protected(&self.guard, &value["params"]);
+            let reaches = fetch::reaches_protected(&self.guard, &paused) || authority_protected;
             let protected = reaches;
             let mut headers = json!({"headers":paused.headers,"responseHeaders":paused.response_headers});
             let redirect = shield::redact_strings(&self.guard, &mut headers);
@@ -1375,7 +1393,7 @@ impl Cdp {
                 paused = Paused::from_event(&value).unwrap();
             }
             let initiated = self.initiated_by_protected(&paused);
-            let loaded_protected = self.guard.url(&paused.full_url());
+            let loaded_protected = self.guard.url(&paused.full_url()) || authority_protected;
             self.requests.insert(paused.request_id.clone(), loaded_protected || initiated);
             if let Some(network) = &paused.network_id {
                 let entry = self.requests.entry(network.clone()).or_insert(false);
@@ -1408,13 +1426,20 @@ impl Cdp {
                 return;
             }
             if protected {
-                if !self.guard.url(&paused.full_url()) && !self.blocked.contains(&paused.session_id) {
+                if redirect && !authority_protected && !self.guard.url(&paused.full_url()) && !self.blocked.contains(&paused.session_id) {
+                    if let Some(request) = value.pointer_mut("/params/request").and_then(Value::as_object_mut) {
+                        request.retain(|key, _| !key.starts_with("postData") && !key.to_ascii_lowercase().ends_with("fragment"));
+                    }
                     self.events.push(value);
                 }
                 self.answer_protected(&paused);
                 return;
             }
             if self.blocked.contains(&paused.session_id) || initiated {
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
+            if self.redirects.contains(&paused.request_id) && !redirect && !protected {
                 self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
             }
@@ -1835,6 +1860,8 @@ mod tests {
     include!("redirect_matrix_test.rs");
     include!("redirect_race_test.rs");
     include!("redirect_fragment_test.rs");
+    include!("redirect_review_test.rs");
+    include!("redirect_relation_test.rs");
 
     struct Pending {
         inbox: VecDeque<String>,
