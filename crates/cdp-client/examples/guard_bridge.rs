@@ -98,6 +98,10 @@ fn main() {
                     }
                 } else {
                     let result = cdp.call(method, params, session);
+                    for event in &cdp.events()[seen..] {
+                        emit(json!({"event":event}));
+                    }
+                    seen = cdp.events().len();
                     answer(message["id"].clone(), result);
                 }
             }

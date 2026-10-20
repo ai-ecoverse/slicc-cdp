@@ -67,7 +67,12 @@ const tree = {
   ],
 };
 
-export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = false } = {}) {
+export async function fakeCdp({
+  refuse = [],
+  refusalMessage,
+  noisyRefusal = false,
+  attachEvents = false,
+} = {}) {
   const calls = [];
   const targets = [];
   const sessions = new Map();
@@ -150,6 +155,12 @@ export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = fals
           next += 1;
           const session = `S${next}`;
           sessions.set(session, found);
+          if (attachEvents)
+            event('Target.attachedToTarget', {
+              sessionId: session,
+              targetInfo: info(found),
+              waitingForDebugger: false,
+            });
           return answer({ sessionId: session });
         }
         case 'Target.detachFromTarget':
