@@ -49,6 +49,28 @@ fn review_non_http_protected_schemes_cannot_leak() {
 }
 
 #[test]
+fn ordinary_scheme_like_console_and_log_text_stays_unchanged() {
+    for phrase in ["Error reading file: foo.txt", "file: 3 of 5", "profile:x"] {
+        for event in [
+            json!({"method":"Runtime.consoleAPICalled","sessionId":"S","params":{"type":"log","executionContextId":1,"args":[{"type":"string","value":phrase}]}}),
+            json!({"method":"Log.entryAdded","sessionId":"S","params":{"entry":{"source":"javascript","level":"info","text":phrase}}}),
+        ] {
+            let mut cdp = url_backend("about:blank");
+            cdp.absorb(event.clone());
+            assert_eq!(cdp.events(), &[event]);
+        }
+    }
+    for uri in ["file:///etc/passwd", "file:foo"] {
+        let mut cdp = url_backend("about:blank");
+        cdp.absorb(json!({"method":"Runtime.consoleAPICalled","sessionId":"S","params":{"type":"log","executionContextId":1,"args":[{"type":"string","value":uri}]}}));
+        assert_eq!(cdp.events()[0]["params"]["args"][0]["value"], "about:blank");
+        let mut cdp = url_backend("about:blank");
+        cdp.absorb(json!({"method":"Log.entryAdded","sessionId":"S","params":{"entry":{"text":uri}}}));
+        assert_eq!(cdp.events()[0]["params"]["entry"]["text"], "about:blank");
+    }
+}
+
+#[test]
 fn review_nine_level_percent_nesting_fails_closed() {
     let mut encoded = redirect_url("seven").replace(':', "%3A").replace('/', "%2F").replace('?', "%3F").replace('=', "%3D").replace('&', "%26");
     for _ in 0..8 { encoded = encoded.replace('%', "%25"); }

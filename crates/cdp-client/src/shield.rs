@@ -241,7 +241,20 @@ fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool)
     let mut from = 0;
     let mut protected = encoded_protected;
     while from < text.len() {
-        let next = prefixes.iter().filter_map(|prefix| lower[from..].find(prefix).map(|at| (from + at, prefix.as_str()))).min_by_key(|(at, _)| *at);
+        let next = prefixes.iter().flat_map(|prefix| {
+            lower[from..].match_indices(prefix).filter_map(|(at, _)| {
+                let start = from + at;
+                let after = start + prefix.len();
+                if prefix.ends_with(':') && text[after..].chars().next().is_none_or(char::is_whitespace) {
+                    return None;
+                }
+                let web = ["http:", "https:", "ws:", "wss:", "http%", "https%", "ws%", "wss%"].contains(&prefix.as_str());
+                if !web && text[..start].chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '+' | '-' | '.')) {
+                    return None;
+                }
+                Some((start, prefix.as_str()))
+            })
+        }).min_by_key(|(at, _)| *at);
         let Some((start, prefix)) = next else { break };
         out.push_str(&text[from..start]);
         let encoded = prefix.contains('%');
