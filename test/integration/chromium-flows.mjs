@@ -641,7 +641,7 @@ function escapeReg(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function kernelUploadFlow(runner, site) {
+export async function kernelUploadFlow(runner, site) {
   const cwd = await runner.fresh();
   const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
   assert.equal(opened.code, 0, opened.stderr);
@@ -665,10 +665,10 @@ async function kernelUploadFlow(runner, site) {
         cwd
       );
       content = ev.stdout.trim();
-      if (content.startsWith('file:')) break;
+      if (content.startsWith('upload:')) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    assert.ok(content.startsWith('file:'), `page did not read the file: ${content}`);
+    assert.ok(content.startsWith('upload:'), `page did not read the file: ${content}`);
     assert.ok(content.includes('VFS_BYTES'), `expected VFS_BYTES in: ${content}`);
     assert.ok(!content.includes('HOST_SECRET'), `host content leaked: ${content}`);
   } finally {
@@ -678,7 +678,7 @@ async function kernelUploadFlow(runner, site) {
   }
 }
 
-async function nativeUploadValidationFlow(runner, site) {
+export async function nativeUploadValidationFlow(runner, site) {
   const cwd = await runner.fresh();
   const opened = await runner.playwright(['open', `${site.origin}/page`], cwd);
   assert.equal(opened.code, 0, opened.stderr);
@@ -715,7 +715,7 @@ async function nativeUploadValidationFlow(runner, site) {
     cwd
   );
   assert.ok(
-    !pageContent.stdout.includes('file:'),
+    !pageContent.stdout.includes('upload:'),
     `page input should be empty but got: ${pageContent.stdout}`
   );
 }

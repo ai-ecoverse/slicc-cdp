@@ -754,7 +754,7 @@ mod tests {
                 "requestId": id,
                 "frameId": "F1",
                 "resourceType": "Document",
-                "networkId": "N1",
+                "networkId": format!("N{id}"),
                 "request": {
                     "url": url,
                     "method": "GET",
@@ -955,7 +955,8 @@ mod tests {
             .collect();
         assert_eq!(failed, [("R1", "BlockedByClient"), ("R3", "BlockedByClient")]);
         assert!(sent.iter().all(|item| item["params"].get("url").is_none()));
-        assert!(cdp.events().is_empty());
+        assert_eq!(cdp.events().len(), 1);
+        assert_eq!(cdp.events()[0]["params"]["responseHeaders"][0]["value"], "https://vault.sliccy.ai");
     }
 
     #[test]
@@ -1154,7 +1155,7 @@ mod tests {
                 json!({
                     "method": "Network.requestWillBeSent",
                     "sessionId": "S",
-                    "params": { "requestId": "N1", "documentURL": "https://seven.sliccy.ai/os/", "request": { "url": "https://api.model.example/v1/chat", "headers": { "Authorization": "Bearer KEY" } } }
+                    "params": { "requestId": "NR1", "documentURL": "https://seven.sliccy.ai/os/", "request": { "url": "https://api.model.example/v1/chat", "headers": { "Authorization": "Bearer KEY" } } }
                 }),
             ],
             Box::new(|message| vec![ok(message)]),

@@ -51,6 +51,12 @@ pub struct Cdp {
     notices: Vec<String>,
     discovering: bool,
     requests: BTreeMap<String, bool>,
+    redirects: BTreeSet<String>,
+    request_aliases: BTreeMap<String, BTreeSet<String>>,
+    request_resources: BTreeMap<String, BTreeSet<(String, String)>>,
+    protected_resources: BTreeSet<(String, String)>,
+    protected_target_resources: BTreeSet<(String, String)>,
+    source_resources: BTreeMap<(String, String), String>,
     handed: BTreeSet<(String, String)>,
     answering: BTreeMap<i64, (String, String)>,
     held: BTreeMap<String, Vec<Value>>,
@@ -89,6 +95,12 @@ impl Cdp {
             notices: Vec::new(),
             discovering: false,
             requests: BTreeMap::new(),
+            redirects: BTreeSet::new(),
+            request_aliases: BTreeMap::new(),
+            request_resources: BTreeMap::new(),
+            protected_resources: BTreeSet::new(),
+            protected_target_resources: BTreeSet::new(),
+            source_resources: BTreeMap::new(),
             handed: BTreeSet::new(),
             answering: BTreeMap::new(),
             held: BTreeMap::new(),
@@ -236,6 +248,12 @@ impl Cdp {
                 return Err(self.refusal());
             }
         }
+        if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
+            return Err(self.refusal());
+        }
+        if !shield::body_method(method) && self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Err(self.refusal());
+        }
         if Worlds::selectors(params) || Worlds::sensitive(method) {
             let session = session_id.unwrap_or("");
             if !self.worlds.enabled(session) && (Worlds::sensitive(method) || self.worlds.reason(session, method, params).is_some()) {
@@ -256,7 +274,7 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
-        if method == "Target.setAutoAttach"
+        if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
         {
             return Err("slicc: refused: auto-attach is not supported by slicc-cdp\n".into());
@@ -325,7 +343,7 @@ impl Cdp {
             let id = shield::request_key(params).unwrap_or_default();
             let handed = session_id
                 .is_some_and(|session| self.handed.contains(&(session.to_string(), id.clone())));
-            if !handed || self.request_state(&id) == Some(true) {
+            if !handed || self.requests.get(&id) == Some(&true) {
                 return Err(UNSEEN.into());
             }
         }
@@ -361,7 +379,7 @@ impl Cdp {
     }
 
     fn request_state(&self, id: &str) -> Option<bool> {
-        self.requests.get(id).copied()
+        if self.redirects.contains(id) { Some(true) } else { self.requests.get(id).copied() }
     }
 
     fn after(
@@ -371,6 +389,9 @@ impl Cdp {
         session_id: Option<&str>,
         mut result: Value,
     ) -> Result<Value, String> {
+        if self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Err(self.refusal());
+        }
         if Worlds::sensitive(method) {
             if let Some(reason) = self.worlds.reason(session_id.unwrap_or(""), method, params) {
                 return Err(reason.into());
@@ -479,7 +500,7 @@ impl Cdp {
             }
             _ => {}
         }
-        let _ = session_id;
+        shield::redact_strings(&self.guard, &mut result);
         Ok(result)
     }
 
@@ -914,6 +935,49 @@ impl Cdp {
         );
     }
 
+    fn content_refused(&self, method: &str, params: &Value, session: &str) -> bool {
+        if shield::body_method(method) && shield::request_key(params).is_some_and(|id| self.request_state(&id) == Some(true)) {
+            return true;
+        }
+        if matches!(method, "Page.getResourceContent" | "Page.searchInResource") {
+            return self.resource_protected(session, params.get("url").and_then(Value::as_str).unwrap_or(""));
+        }
+        if matches!(method, "CSS.getStyleSheetText" | "Debugger.getScriptSource" | "Debugger.getWasmBytecode" | "Debugger.searchInContent" | "Debugger.disassembleWasmModule") {
+            let id = params.get("styleSheetId").or_else(|| params.get("scriptId")).and_then(Value::as_str).unwrap_or("");
+            return self.source_resources.get(&(session.to_string(), id.to_string())).is_none_or(|url| self.resource_protected(session, url));
+        }
+        false
+    }
+
+    fn resource_url(url: &str) -> String {
+        url::Url::parse(url).map(|mut url| { url.set_fragment(None); url.to_string() }).unwrap_or_else(|_| url.to_string())
+    }
+
+    fn protect_resource(&mut self, session: &str, url: &str) {
+        let url = Self::resource_url(url);
+        self.protected_resources.insert((session.to_string(), url.clone()));
+        if let Some(target) = self.session_target(session) {
+            self.protected_target_resources.insert((target, url));
+        }
+    }
+
+    fn resource_protected(&self, session: &str, url: &str) -> bool {
+        let key = Self::resource_url(url);
+        self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), key.clone()))
+            || self.session_target(session).is_some_and(|target| self.protected_target_resources.contains(&(target, key)))
+    }
+
+    fn mark_redirect(&mut self, id: &str) {
+        let mut ids = self.request_aliases.get(id).cloned().unwrap_or_default();
+        ids.insert(id.to_string());
+        for id in ids {
+            self.redirects.insert(id.clone());
+            for (session, url) in self.request_resources.get(&id).cloned().unwrap_or_default() {
+                self.protect_resource(&session, &url);
+            }
+        }
+    }
+
     fn watch(&mut self, value: &mut Value) {
         let method = value
             .get("method")
@@ -927,6 +991,11 @@ impl Cdp {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         if let Some(id) = params.get("requestId").and_then(|v| v.as_str()) {
             if let Some(url) = shield::request_url(&params) {
+                let resource = (session.clone().unwrap_or_default(), url.clone());
+                self.request_resources.entry(id.to_string()).or_default().insert(resource.clone());
+                if self.redirects.contains(id) || self.guard.url(&url) {
+                    self.protect_resource(&resource.0, &resource.1);
+                }
                 let initiator = ["documentURL"]
                     .iter()
                     .filter_map(|key| params.get(*key).and_then(|v| v.as_str()))
@@ -942,6 +1011,24 @@ impl Cdp {
                 let entry = self.requests.entry(id.to_string()).or_insert(false);
                 *entry = *entry || protected;
             }
+        }
+        if let Some(id) = params.get("requestId").and_then(Value::as_str) {
+            if shield::scheme_less_protected(&self.guard, &params) {
+                self.requests.insert(id.to_string(), true);
+                self.mark_redirect(id);
+            }
+            for key in ["response", "redirectResponse", "headers", "headersText", "requestHeadersText", "responseHeaders"] {
+                if params.get(key).is_some_and(|item| shield::redact_strings(&self.guard, &mut json!({key:item}))) {
+                    self.mark_redirect(id);
+                }
+            }
+        }
+        if let Some((id, url)) = match method.as_str() {
+            "Debugger.scriptParsed" | "Debugger.scriptFailedToParse" => params.get("scriptId").and_then(Value::as_str).zip(params.get("url").and_then(Value::as_str)),
+            "CSS.styleSheetAdded" => params.pointer("/header/styleSheetId").and_then(Value::as_str).zip(params.pointer("/header/sourceURL").and_then(Value::as_str)),
+            _ => None,
+        } {
+            self.source_resources.insert((session.clone().unwrap_or_default(), id.to_string()), url.to_string());
         }
         match method.as_str() {
             "Page.frameNavigated" => {
@@ -1006,6 +1093,11 @@ impl Cdp {
                     self.protected_targets.remove(&target);
                 }
             }
+            "Target.attachedToTarget" => {
+                if let Some(info) = params.get("targetInfo") {
+                    value["params"]["targetInfo"] = self.redact(info, &[]);
+                }
+            }
             "Target.targetDestroyed" => {
                 if let Some(target) = params.get("targetId").and_then(|v| v.as_str()) {
                     self.guards.remove(target);
@@ -1038,7 +1130,7 @@ impl Cdp {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         let id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         let text = |pointer: &str| params.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("");
-        self.requests.get(id) == Some(&true)
+        self.request_state(id) == Some(true)
             || self.blocked.contains(session)
             || self.guard_sessions.contains(session)
             || self.frame_protected(text("/frameId"))
@@ -1052,6 +1144,9 @@ impl Cdp {
 
     fn hidden(&self, value: &Value) -> bool {
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        if method == "Target.receivedMessageFromTarget" {
+            return true;
+        }
         if let Some(session) = value.get("sessionId").and_then(|v| v.as_str()) {
             if self.blocked.contains(session) || self.guard_sessions.contains(session) {
                 return true;
@@ -1079,10 +1174,11 @@ impl Cdp {
                 return true;
             }
         }
-        shield::loaded_urls_protected(&self.guard, &params) || shield::mentions(&self.guard, &params)
+        shield::loaded_urls_protected(&self.guard, &params)
     }
 
     fn deliver(&mut self, mut value: Value) {
+        self.watch(&mut value);
         if self.worlds.event(&value, &self.guard) {
             if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
                 let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
@@ -1090,7 +1186,23 @@ impl Cdp {
             return;
         }
         self.adopt_guard_attach(&value);
-        self.watch(&mut value);
+        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") && shield::loaded_urls_protected(&self.guard, &value["params"]) {
+            return;
+        }
+        let redacted = shield::redact_strings(&self.guard, &mut value);
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let tainted = value.pointer("/params/requestId").and_then(Value::as_str).is_some_and(|id| self.redirects.contains(id));
+        if tainted {
+            let request = value.pointer("/params/request");
+            let opaque_request = request.and_then(Value::as_object).is_some_and(|request| request.keys().any(|key| key.starts_with("postData") || key.to_ascii_lowercase().ends_with("fragment")));
+            let safe_request = method == "Network.requestWillBeSent" && request.and_then(|request| request.get("url")).and_then(Value::as_str).is_some_and(|url| !self.guard.url(url)) && !opaque_request;
+            if opaque_request || !redacted && !safe_request {
+                return;
+            }
+            if let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) {
+                params.retain(|key, _| key != "documentURL" && !key.to_ascii_lowercase().ends_with("fragment"));
+            }
+        }
         if self.hidden(&value) {
             return;
         }
@@ -1147,6 +1259,7 @@ impl Cdp {
                         .get("message")
                         .and_then(|item| item.as_str())
                         .unwrap_or("CDP error");
+                    let (text, _) = shield::redact_text(&self.guard, text);
                     return Err(format!("{method}: {text}\n"));
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
@@ -1241,7 +1354,7 @@ impl Cdp {
         self.deciders.remove(session_id);
     }
 
-    fn absorb(&mut self, value: Value) {
+    fn absorb(&mut self, mut value: Value) {
         if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
             if let Some((session, request)) = self.answering.remove(&id) {
                 if value.get("error").is_none() {
@@ -1254,6 +1367,7 @@ impl Cdp {
                         .get("message")
                         .and_then(|item| item.as_str())
                         .unwrap_or("CDP error");
+                    let (text, _) = shield::redact_text(&self.guard, text);
                     self.fetch_errors.push(format!("Fetch: {text}\n"));
                     self.continue_plain(&session, &request);
                 }
@@ -1276,15 +1390,38 @@ impl Cdp {
             return;
         }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
-            let Some(paused) = Paused::from_event(&value) else {
+            let Some(mut paused) = Paused::from_event(&value) else {
                 return;
             };
-            let protected = fetch::reaches_protected(&self.guard, &paused);
+            if let Some(network) = &paused.network_id {
+                self.request_aliases.entry(network.clone()).or_default().insert(paused.request_id.clone());
+                self.request_aliases.entry(paused.request_id.clone()).or_default().insert(network.clone());
+                if self.redirects.contains(network) {
+                    self.mark_redirect(network);
+                }
+            }
+            let authority_protected = shield::scheme_less_protected(&self.guard, &value["params"]);
+            let reaches = fetch::reaches_protected(&self.guard, &paused) || authority_protected;
+            let protected = reaches;
+            let mut headers = json!({"headers":paused.headers,"responseHeaders":paused.response_headers});
+            let redirect = shield::redact_strings(&self.guard, &mut headers);
+            if redirect || reaches {
+                self.mark_redirect(&paused.request_id);
+                if let Some(network) = &paused.network_id {
+                    self.mark_redirect(network);
+                    self.protect_resource(&paused.session_id, &paused.url);
+                }
+            }
+            if redirect {
+                shield::redact_strings(&self.guard, &mut value);
+                paused = Paused::from_event(&value).unwrap();
+            }
             let initiated = self.initiated_by_protected(&paused);
-            self.requests.insert(paused.request_id.clone(), protected || initiated);
+            let loaded_protected = self.guard.url(&paused.full_url()) || authority_protected;
+            self.requests.insert(paused.request_id.clone(), loaded_protected || initiated);
             if let Some(network) = &paused.network_id {
                 let entry = self.requests.entry(network.clone()).or_insert(false);
-                *entry = *entry || protected || initiated;
+                *entry = *entry || loaded_protected || initiated;
             }
             #[cfg(test)]
             {
@@ -1305,7 +1442,7 @@ impl Cdp {
                     .push((paused.session_id.clone(), paused.url.clone(), reason));
             }
             if self.guard_sessions.contains(&paused.session_id) {
-                if protected && paused.resource_type == "Document" {
+                if reaches && paused.resource_type == "Document" {
                     self.answer_protected(&paused);
                 } else {
                     self.continue_plain(&paused.session_id, &paused.request_id);
@@ -1313,10 +1450,20 @@ impl Cdp {
                 return;
             }
             if protected {
+                if redirect && !authority_protected && !self.guard.url(&paused.full_url()) && !self.blocked.contains(&paused.session_id) {
+                    if let Some(request) = value.pointer_mut("/params/request").and_then(Value::as_object_mut) {
+                        request.retain(|key, _| !key.starts_with("postData") && !key.to_ascii_lowercase().ends_with("fragment"));
+                    }
+                    self.events.push(value);
+                }
                 self.answer_protected(&paused);
                 return;
             }
             if self.blocked.contains(&paused.session_id) || initiated {
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
+            if self.redirects.contains(&paused.request_id) && !redirect && !protected {
                 self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
             }
@@ -1733,6 +1880,13 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
+    include!("redirect_test.rs");
+    include!("redirect_matrix_test.rs");
+    include!("redirect_race_test.rs");
+    include!("redirect_fragment_test.rs");
+    include!("redirect_review_test.rs");
+    include!("redirect_relation_test.rs");
+
     struct Pending {
         inbox: VecDeque<String>,
         answer: fn(&Value) -> Vec<Value>,
@@ -1794,6 +1948,82 @@ mod tests {
                 std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             }
             Ok(None)
+        }
+    }
+
+    fn target_fragment_markers() -> [&'static str; 5] {
+        [
+            "https://seven.sliccy.ai/#tailscale=MARK1",
+            "https://seven.sliccy.ai/#proxy=http%3A%2F%2F127.0.0.1%3A9%2F&key=MARK2",
+            "https://seven.sliccy.ai/auth/callback#access_token=MARK",
+            "https://seven.sliccy.ai/path-secret?query-secret=MARK",
+            "https://seven.sliccy.ai/path-secret?query-secret=MARK#access_token=MARK",
+        ]
+    }
+
+    #[test]
+    fn target_info_fragment_markers_are_redacted_in_responses_and_events() {
+        for url in target_fragment_markers() {
+            for changed in [false, true] {
+                let mut cdp = url_backend(url);
+                if changed {
+                    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://seven.sliccy.ai/","title":"clean"}}}));
+                }
+                let info = json!({"targetId":"T","type":"page","url":url,"title":url,"openerId":"OPENER","openerFrameId":"FRAME"});
+                for method in ["Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"] {
+                    let mark = cdp.events().len();
+                    cdp.absorb(json!({"method":method,"params":{"sessionId":"A","targetInfo":info}}));
+                    let event = cdp.events()[mark..].iter().find(|event| event["method"] == method).unwrap();
+                    for key in ["url", "title"] {
+                        assert_eq!(event["params"]["targetInfo"][key], "https://seven.sliccy.ai", "{method} {key} {url} {changed}");
+                    }
+                    assert_eq!(event["params"]["targetInfo"]["openerId"], "OPENER");
+                    assert_eq!(event["params"]["targetInfo"]["openerFrameId"], "FRAME");
+                    assert!(!event.to_string().contains("MARK"));
+                }
+                for method in ["Target.getTargets", "Target.getTargetInfo"] {
+                    let params = if method == "Target.getTargets" { json!({}) } else { json!({"targetId":"T"}) };
+                    let out = cdp.call(method, params, None).unwrap();
+                    let info = if method == "Target.getTargets" { &out["targetInfos"][0] } else { &out["targetInfo"] };
+                    for key in ["url", "title"] {
+                        assert_eq!(info[key], "https://seven.sliccy.ai", "{method} {key} {url}");
+                    }
+                    assert!(!out.to_string().contains("MARK"));
+                }
+                for event in [
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"A","targetId":"T"}}),
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"B"}}),
+                    json!({"method":"Page.frameAttached","sessionId":"S","params":{"frameId":"CHILD","parentFrameId":"FRAME"}}),
+                ] {
+                    cdp.absorb(event);
+                    assert!(!cdp.events().last().unwrap().to_string().contains("MARK"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_info_nonflattened_and_browser_attach_paths_remain_refused() {
+        for (method, params) in [
+            ("Target.attachToTarget", json!({"targetId":"T","flatten":false})),
+            ("Target.attachToBrowserTarget", json!({})),
+            ("Target.setAutoAttach", json!({"autoAttach":true,"flatten":true})),
+            ("Target.autoAttachRelated", json!({"targetId":"T","waitForDebuggerOnStart":false})),
+            ("Target.sendMessageToTarget", json!({"targetId":"T","message":"MARK"})),
+        ] {
+            let mut cdp = url_backend("https://example.test/");
+            assert!(cdp.call(method, params, None).is_err(), "{method}");
+        }
+    }
+
+    #[test]
+    fn target_info_wrapped_nonflattened_events_never_disclose_markers() {
+        for url in target_fragment_markers() {
+            let mut cdp = url_backend("https://example.test/");
+            let mark = cdp.events().len();
+            let nested = json!({"method":"Target.attachedToTarget","params":{"sessionId":"CHILD","targetInfo":{"targetId":"T","type":"page","url":url,"title":url}}});
+            cdp.absorb(json!({"method":"Target.receivedMessageFromTarget","params":{"sessionId":"A","targetId":"T","message":nested.to_string()}}));
+            assert_eq!(cdp.events().len(), mark, "{url}");
         }
     }
 

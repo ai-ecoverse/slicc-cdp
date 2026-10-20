@@ -15,7 +15,14 @@ export async function suite({
   workerTimeoutMs = suitePolicy.workerTimeoutMs,
   budgetMs = suitePolicy.suiteBudgetMs,
   deadline,
+  guardTargetParallel = suitePolicy.guardTargetParallel,
 }) {
+  if (
+    !Number.isSafeInteger(guardTargetParallel) ||
+    guardTargetParallel < 1 ||
+    guardTargetParallel > suitePolicy.guardTargetParallel
+  )
+    throw new Error('guard target parallelism must stay within the suite policy');
   cwd = realpathSync(cwd);
   workerTimeoutMs = boundedBudget(workerTimeoutMs, suitePolicy.workerTimeoutMs, 'worker timeout');
   budgetMs = boundedBudget(budgetMs, suitePolicy.suiteBudgetMs, 'suite budget');
@@ -47,7 +54,13 @@ export async function suite({
   }
   deadline = Math.min(deadline ?? Infinity, started + budgetMs);
   if (!Number.isFinite(deadline)) throw new Error('suite deadline must be finite');
-  const policy = { ...suitePolicy, workerTimeoutMs, budgetMs, isolatedGuardWorker: true };
+  const policy = {
+    ...suitePolicy,
+    guardTargetParallel,
+    workerTimeoutMs,
+    budgetMs,
+    isolatedGuardWorker: true,
+  };
   const behaviour = (row) =>
     ['test:pass', 'test:fail'].includes(row.type) &&
     !(row.file && row.name && path.resolve(cwd, row.name) === path.resolve(row.file));
@@ -75,7 +88,18 @@ export async function suite({
     const pending = selected.filter((file) => file !== guardFile);
     const executeFile = async (file) =>
       workers.push(
-        await executeWorker({ cwd, file, env, deadline, index, out, log, stderr, workerTimeoutMs })
+        await executeWorker({
+          cwd,
+          file,
+          env,
+          deadline,
+          index,
+          out,
+          log,
+          stderr,
+          workerTimeoutMs,
+          guardTargetParallel,
+        })
       );
     const consume = async () => {
       while (pending.length) await executeFile(pending.shift());

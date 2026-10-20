@@ -422,6 +422,19 @@ function completeIdentity(actual) {
   );
 }
 
+function validateShardIdentities(execution, expected, label, emit) {
+  if (Array.isArray(execution.shards)) {
+    for (const shard of execution.shards) {
+      if (!completeIdentity(shard.suite?.identity))
+        emit('INCOMPLETE', `${label}: shard ${shard.id} validated identity absent`);
+      else if (!isDeepStrictEqual(shard.suite.identity, expected))
+        emit('FAIL', `${label}: shard ${shard.id} execution identity differs`);
+    }
+    if (execution.native)
+      validateExecutionIdentity(execution.native, expected, `${label} native`, emit);
+  }
+}
+
 export function validateExecutionIdentity(execution, expected, label, emit) {
   const actual = execution?.identity;
   if (
@@ -436,6 +449,7 @@ export function validateExecutionIdentity(execution, expected, label, emit) {
   }
   if (!isDeepStrictEqual(actual, expected))
     emit('FAIL', `${label}: execution identity differs from independent source/corpus`);
+  validateShardIdentities(execution, expected, label, emit);
   const reports = [
     execution.guardReport?.report,
     ...(Array.isArray(execution.attempts) ? execution.attempts : []).flatMap((attempt) =>

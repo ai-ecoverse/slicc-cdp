@@ -374,6 +374,52 @@ test('exact full keys, not a matching count, bind the guard row universe', () =>
   assert.equal(findings(execution, expected).failures.length, 1);
 });
 
+test('every guard shard keeps its independently checked identity and earlier report source', () => {
+  const expected = expectedExecutionIdentity(
+    source,
+    source,
+    source,
+    'guard',
+    'a'.repeat(64),
+    [],
+    corpus
+  );
+  const vectors = JSON.parse(
+    readFileSync(path.join(root, 'node_modules/@ai-ecoverse/slicc-browsers/guard-vectors.json'))
+  );
+  const results = vectors.vectors.flatMap((vector) =>
+    vector.targets.flatMap((target) =>
+      Object.keys(vectors.variants).map((variant) => ({
+        id: vector.id,
+        target,
+        variant,
+        transport: 'cdp',
+      }))
+    )
+  );
+  const report = { sha: commit, set: `@ai-ecoverse/slicc-browsers@${corpus.version}`, results };
+  const execution = {
+    identity: expected,
+    files: ['test/integration/guard-runner.test.mjs'],
+    guardReport: { report },
+    attempts: [],
+    shards: [{ id: 'a', suite: { identity: structuredClone(expected) } }],
+  };
+  assert.deepEqual(findings(execution, expected), { failures: [], incomplete: [] });
+  delete execution.shards[0].suite.identity;
+  assert.equal(findings(execution, expected).incomplete.length, 1);
+  execution.shards[0].suite.identity = {
+    ...expected,
+    subject: { ...expected.subject, commit: 'f'.repeat(40) },
+  };
+  assert.equal(findings(execution, expected).failures.length, 1);
+  execution.shards[0].suite.identity = expected;
+  execution.attempts = [
+    { workers: [{ guardReport: { report: { ...report, sha: 'f'.repeat(40) } } }] },
+  ];
+  assert.equal(findings(execution, expected).failures.length, 1);
+});
+
 test('the archived subject has no git fallback and the MAIN Rust bridge remains a separate guard harness input', (t) => {
   const f = fixture(t);
   const observed = observeIdentity(f.directory, f.seed, 'guard', commit);

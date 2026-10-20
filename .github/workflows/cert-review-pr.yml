@@ -567,7 +567,7 @@ jobs:
             .cert/guard-*/*.json
             .cert/guard-*/*.jsonl
             .cert/guard-*/*.log
-            .cert/guard-*/rows.md
+            .cert/guard-*/*.md
           include-hidden-files: true
           if-no-files-found: "error"
           retention-days: 90
