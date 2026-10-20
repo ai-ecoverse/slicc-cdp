@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const fixture = new URL('./cert-bios-fetch.mjs', import.meta.url).href;
@@ -34,7 +34,7 @@ test('CLI catalog preload serves only the exact reviewed URL with independently 
 test('CLI catalog preload passes every other URL and its original options through unchanged', () => {
   const urls = [
     url.replace(snapshot.commit, 'main'),
-    url.replace(snapshot.commit, 'c2cec127b935419049568f584093d7ef03ac0721'),
+    url.replace(snapshot.commit, 'f'.repeat(40)),
     url.replace(snapshot.repository, 'fixture/other'),
     `${url}?different=1`,
     url.replace('shards.json', 'other.json'),
@@ -72,4 +72,61 @@ test('the real pinned catalog reader succeeds with external fetching blocked und
   assert.equal(contract.sha256, sha256);
   assert.deepEqual(contract.shards, pin.shards);
   assert.deepEqual(contract.incomplete, []);
+});
+
+test('the exact staged binding catalog stays unknown-shard INCOMPLETE with external fetching blocked', () => {
+  const bound = JSON.parse(
+    readFileSync(new URL('./cert-bios-bound-shard-catalog.json', import.meta.url))
+  );
+  const bytes = Buffer.from(bound.content);
+  const boundHash = '04ddd94597619bcd1a66fdb745fcf699dc090d174c0fe7ea902d2cd8d0a420b4';
+  assert.equal(bound.commit, 'c2cec127b935419049568f584093d7ef03ac0721');
+  assert.equal(bound.repository, snapshot.repository);
+  assert.equal(bound.sha256, boundHash);
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), boundHash);
+  assert.equal(bound.blob, '9f46b195017a200e7348bf65dfd6686823ba441f');
+  assert.equal(
+    createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex'),
+    bound.blob
+  );
+  const reader = new URL('../../scripts/cert/pr-bios-shards.mjs', import.meta.url).href;
+  const pin = JSON.parse(readFileSync(new URL('../../scripts/cert/pr-bios.json', import.meta.url)));
+  assert.equal(pin.bindingCommit, bound.commit);
+  const observed = child(`
+    globalThis.fetch = async () => { throw new Error('outbound network blocked'); };
+    await import(${JSON.stringify(fixture)});
+    const { fetchBiosShardContract } = await import(${JSON.stringify(reader)});
+    process.stdout.write(JSON.stringify(await fetchBiosShardContract(${JSON.stringify({ ...pin, commit: bound.commit })})));
+  `);
+  const contract = JSON.parse(observed);
+  assert.equal(contract.status, 'INCOMPLETE');
+  assert.equal(contract.commit, bound.commit);
+  assert.equal(contract.sha256, boundHash);
+  assert.deepEqual(contract.shards, pin.shards);
+  assert.deepEqual(
+    contract.incomplete,
+    ['guard-prompt', 'guard-lagging'].map((name) => `unknown BIOS shard ${name} at ${bound.commit}`)
+  );
+});
+
+test('the cert network sweep documents every matching source file', () => {
+  const directory = new URL('./', import.meta.url);
+  const audit = JSON.parse(readFileSync(new URL('./cert-network-audit.json', import.meta.url)));
+  const requested =
+    /raw\.githubusercontent|api\.github\.com|registry\.npmjs\.org|\bfetch\s*\(|https\.get/;
+  const expanded =
+    /https?:\/\/|\bfetch\b|\bhttps\b|npm|curl|wget|registry|GITHUB_API_URL|NPM_CONFIG/;
+  const matched = readdirSync(directory)
+    .filter((file) => /^cert-.*\.mjs$/.test(file))
+    .filter((file) => {
+      const source = readFileSync(new URL(file, directory), 'utf8');
+      return requested.test(source) || expanded.test(source);
+    })
+    .sort();
+  const documented = audit.entries.flatMap((entry) => {
+    assert.ok(entry.classification);
+    return entry.files;
+  });
+  assert.equal(new Set(documented).size, documented.length);
+  assert.deepEqual(documented.sort(), matched);
 });
