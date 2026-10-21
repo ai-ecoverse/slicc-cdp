@@ -337,6 +337,17 @@ export function referenceCorpus(pin) {
   return identity;
 }
 
+export function referenceVectors(corpus) {
+  const pin = { version: corpus.version, integrity: corpus.integrity };
+  const identity = referenceCorpus(pin);
+  const bytes = readFileSync(
+    path.join(root, '.cert/execution-corpus', pin.version, 'package/guard-vectors.json')
+  );
+  if (hash(bytes) !== identity.sha256 || identity.sha256 !== corpus.sha256)
+    throw integrity('reference vector bytes differ from independently checked corpus');
+  return JSON.parse(bytes);
+}
+
 export function expectedExecutionIdentity(
   subject,
   harness,
