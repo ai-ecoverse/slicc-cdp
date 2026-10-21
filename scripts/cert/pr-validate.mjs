@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
+import { actualFailure, incompleteExecution } from './execution-failure.mjs';
 import { guardEvidenceProtocol, guardToolsProtocol } from './guard-protocol.mjs';
 import { aggregateGuardReports } from './guard-shard-report.mjs';
 import { guardShardPlan } from './guard-shards.mjs';
@@ -19,17 +20,7 @@ export function validateSuite(execution, label, emit, candidate = true) {
     emit('INCOMPLETE', `${label}: execution absent`);
     return;
   }
-  if (
-    execution.status === 'INCOMPLETE' ||
-    execution.missing?.length ||
-    execution.rows.some(
-      (row) =>
-        row.skip ||
-        row.todo ||
-        ['cancelledByParent', 'testTimeoutFailure'].includes(row.failureType)
-    )
-  )
-    emit('INCOMPLETE', `${label}: unfinished/skipped worker`);
+  if (incompleteExecution(execution)) emit('INCOMPLETE', `${label}: unfinished/skipped worker`);
   for (const file of execution.files) {
     if (
       !execution.rows.some(
@@ -41,11 +32,7 @@ export function validateSuite(execution, label, emit, candidate = true) {
     )
       emit('INCOMPLETE', `${label}: missing worker ${file}`);
   }
-  if (
-    candidate &&
-    (execution.status === 'FAIL' || execution.rows.some((row) => row.type === 'test:fail'))
-  )
-    emit('FAIL', `${label}: candidate failed`);
+  if (candidate && actualFailure(execution)) emit('FAIL', `${label}: candidate failed`);
 }
 
 function validateGuardRows(report, leg, vectors, emit) {

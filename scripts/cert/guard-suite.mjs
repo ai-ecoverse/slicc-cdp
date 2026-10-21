@@ -33,6 +33,11 @@ function guardResult({ vectors, shardPlan, shards, native, files, out, started, 
     guardShards: { schema: 2, plan: shardPlan },
     shards,
     shardCoverage: coverage,
+    ...(coverage.failures.some(
+      (reason) => !/^guard shard [a-d] failed$|^guard shard rows failed$/.test(reason)
+    )
+      ? { failureKind: 'integrity' }
+      : {}),
     native,
     elapsedMs: Math.round(performance.now() - started),
     policy: {
@@ -77,6 +82,7 @@ export async function guardSuite({
         rows: [],
         attempts: [],
         elapsedMs: 0,
+        ...(error.certStatus === 'FAIL' ? { failureKind: 'integrity' } : {}),
       };
       save(`${options.out}.json`, result);
       return result;

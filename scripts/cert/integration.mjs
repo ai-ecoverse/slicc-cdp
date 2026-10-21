@@ -1,8 +1,9 @@
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import { evidence, json, root, run, save } from './common.mjs';
+import { integrationStatus } from './execution-failure.mjs';
+import { integrationSuite } from './integration-suite.mjs';
 import { stage } from './stage.mjs';
-import { suite } from './suite.mjs';
 import { executionBudget } from './suite-policy.mjs';
 
 await evidence('integration', async (plan, options) => {
@@ -22,7 +23,7 @@ await evidence('integration', async (plan, options) => {
       ...(plan.mode === 'pr' ? plan.changedTests : []),
     ]),
   ];
-  const positive = await suite({
+  const positive = await integrationSuite({
     deadline,
     cwd: positiveTree.source,
     files,
@@ -54,7 +55,7 @@ await evidence('integration', async (plan, options) => {
   );
   install(positiveTree.source);
   const proofPositive = proofFiles.length
-    ? await suite({
+    ? await integrationSuite({
         deadline,
         cwd: positiveTree.source,
         files: proofFiles,
@@ -68,7 +69,7 @@ await evidence('integration', async (plan, options) => {
     : { status: 'PASS', files: [], rows: [], attempts: [] };
   install(negativeTree.source);
   const negative = negativeFiles.length
-    ? await suite({
+    ? await integrationSuite({
         deadline,
         cwd: negativeTree.source,
         files: negativeFiles,
@@ -104,17 +105,7 @@ await evidence('integration', async (plan, options) => {
   ]);
   const proofs = json(checked);
   return {
-    status: [positive, proofPositive, negative].some(
-      (execution) => execution.status === 'FAIL' && !execution.rows?.length
-    )
-      ? 'FAIL'
-      : positive.status === 'INCOMPLETE' ||
-          proofs.status === 'INCOMPLETE' ||
-          negative.status === 'INCOMPLETE'
-        ? 'INCOMPLETE'
-        : positive.status !== 'PASS' || proofs.status === 'FAIL'
-          ? 'FAIL'
-          : 'PASS',
+    status: integrationStatus(positive, proofPositive, negative, proofs),
     sha256: positiveTree.sha256,
     executions: { positive, proofs: proofPositive, negative },
     budget,
