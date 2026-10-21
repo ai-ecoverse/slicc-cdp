@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use wasix_net::TcpStream;
 
+const READ_SLICE: Duration = Duration::from_millis(200);
+
 pub struct HttpResponse {
     pub body: Vec<u8>,
 }
@@ -290,9 +292,13 @@ impl Ws {
         let mut fragments: Vec<u8> = Vec::new();
         let mut kind = 0u8;
         loop {
-            if std::time::Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(None);
             }
+            self.stream
+                .set_read_timeout(Some(remaining.clamp(Duration::from_millis(1), READ_SLICE)))
+                .map_err(|err| format!("websocket timeout setup failed: {err}\n"))?;
             let frame = match next_frame(&mut self.buf, self.stream.as_mut())? {
                 Some(frame) => frame,
                 None => continue,
@@ -656,7 +662,7 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|err| {
         connect_error(parts, &err.to_string())
     })?;
-    tcp.set_read_timeout(Some(Duration::from_millis(200)))
+    tcp.set_read_timeout(Some(READ_SLICE))
         .map_err(|err| connect_error(parts, &err.to_string()))?;
     tcp.set_nodelay(true).ok();
     if parts.scheme == "https" || parts.scheme == "wss" {
@@ -973,6 +979,45 @@ mod tests {
         }
     }
 
+    struct SilentStream {
+        timeout: Option<Duration>,
+    }
+
+    impl Read for SilentStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.timeout.unwrap_or(Duration::from_secs(5)));
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    impl Write for SilentStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl ReadWrite for SilentStream {
+        fn set_nonblocking(&mut self, _on: bool) -> std::io::Result<()> { Ok(()) }
+        fn read_timeout(&self) -> std::io::Result<Option<Duration>> { Ok(self.timeout) }
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+            if timeout == Some(Duration::ZERO) { return Err(std::io::ErrorKind::InvalidInput.into()); }
+            self.timeout = timeout;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_receive_deadline_is_not_stretched_by_the_socket_timeout() {
+        let stream = SilentStream { timeout: Some(READ_SLICE) };
+        let mut ws = Ws { stream: Box::new(stream), buf: Vec::new() };
+        let started = Instant::now();
+        assert_eq!(ws.recv_text(started + Duration::from_millis(5)).unwrap(), None);
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        let started = Instant::now();
+        assert_eq!(ws.recv_text(started + Duration::from_millis(450)).unwrap(), None);
+        let spent = started.elapsed();
+        assert!(spent >= Duration::from_millis(450) && spent < Duration::from_millis(700), "{spent:?}");
+    }
+
     #[test]
     fn decodes_unmasked_text_frame() {
         let payload = b"hello";
@@ -1111,6 +1156,28 @@ mod tests {
             .recv_text(std::time::Instant::now() + Duration::from_secs(2))
             .unwrap();
         assert_eq!(text.as_deref(), Some("hello"));
+        server.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn silent_websocket_returns_at_a_short_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut sock = accept_headers(listener);
+            sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            let _ = wait.recv();
+        });
+        let mut ws = ws_connect(&format!("ws://{addr}/devtools/browser/abc")).unwrap();
+        for _ in 0..3 {
+            let started = Instant::now();
+            assert_eq!(ws.recv_text(started + Duration::from_millis(5)).unwrap(), None);
+            assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        }
+        done.send(()).unwrap();
         server.join().unwrap();
     }
 
