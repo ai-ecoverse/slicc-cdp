@@ -210,6 +210,9 @@ impl Cdp {
                 return Err(self.refusal());
             }
         }
+        if crosses_frames(method, &params) && self.frame_tree_refused(session_id)? {
+            return Err(self.refusal());
+        }
         self.after(method, &params, session_id, result)
     }
 
@@ -252,6 +255,9 @@ impl Cdp {
             return Err(self.refusal());
         }
         if !shield::body_method(method) && self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Err(self.refusal());
+        }
+        if crosses_frames(method, params) && self.frame_tree_refused(session_id)? {
             return Err(self.refusal());
         }
         if Worlds::selectors(params) || Worlds::sensitive(method) {
@@ -879,6 +885,26 @@ impl Cdp {
         if !self.guard_sessions.contains(session_id) {
             self.block(session_id);
         }
+    }
+
+    fn frame_tree_refused(&mut self, session_id: Option<&str>) -> Result<bool, String> {
+        let Some(session) = session_id else {
+            return Ok(true);
+        };
+        let tree = match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
+            Ok(tree) => tree,
+            Err(message) if transport_error(&message) => return Err(message),
+            Err(_) => return Ok(true),
+        };
+        self.record_frames(&tree);
+        Ok(tree.get("frameTree").is_none_or(|node| self.tree_node_refused(node)))
+    }
+
+    fn tree_node_refused(&self, node: &Value) -> bool {
+        let frame = node.get("frame").unwrap_or(&Value::Null);
+        let unknown = ["id", "url", "securityOrigin"].iter().any(|key| frame.get(key).and_then(Value::as_str).is_none_or(|text| matches!(text, "" | "null" | "://")));
+        unknown || self.frame_protected(frame.get("id").and_then(Value::as_str).unwrap_or(""))
+            || node.get("childFrames").is_some_and(|children| children.as_array().is_none_or(|children| children.iter().any(|child| self.tree_node_refused(child))))
     }
 
     fn frame_refused(&mut self, frame_id: &str, session_id: Option<&str>) -> Result<bool, String> {
@@ -1618,6 +1644,12 @@ fn unguarded(message: String) -> String {
     } else {
         UNGUARDED.to_string()
     }
+}
+
+fn crosses_frames(method: &str, params: &Value) -> bool {
+    matches!(method, "DOMSnapshot.captureSnapshot" | "DOMSnapshot.getSnapshot" | "DOM.getFlattenedDocument")
+        || method.starts_with("DOM.") && (params.get("pierce").and_then(Value::as_bool) == Some(true)
+            || params.get("depth").and_then(Value::as_i64).is_some_and(|depth| depth < 0 || depth > 1))
 }
 
 fn harmless(method: &str, params: &Value) -> bool {

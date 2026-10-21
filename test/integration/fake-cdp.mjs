@@ -172,7 +172,12 @@ export async function fakeCdp({
         case 'Page.getFrameTree':
           return answer({
             frameTree: {
-              frame: { id: target?.targetId ?? 'F', loaderId: 'L', url: target?.url ?? '' },
+              frame: {
+                id: target?.targetId ?? 'F',
+                loaderId: 'L',
+                url: target?.url ?? '',
+                securityOrigin: new URL(target?.url ?? 'about:blank').origin,
+              },
               childFrames,
             },
           });
