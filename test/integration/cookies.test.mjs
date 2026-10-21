@@ -256,6 +256,72 @@ for (const kind of ['native', 'wasi']) {
     );
   });
 
+  test(`${kind}: missing historical scopes use only current cookies applicable to an ordinary URL`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(
+      kind,
+      async ({ ok, saved }) => {
+        await ok(['open', 'http://127.0.0.1:9944/app']);
+        const output = await ok(['request-headers', '1']);
+        assert.equal(
+          output,
+          `cookie: session=fixture-current; flavor=fixture-domain\n${currentValues}`
+        );
+        const text = await saved();
+        for (const value of [
+          'fixture-current',
+          'fixture-domain',
+          'fixture-other',
+          'fixture-secure',
+        ]) {
+          assert.ok(!text.includes(value), text);
+        }
+      },
+      {
+        cookies: [
+          cookie('session', 'fixture-current', '127.0.0.1', { secure: false, path: '/api' }),
+          cookie('flavor', 'fixture-domain', '.127.0.0.1', { secure: false }),
+          cookie('other', 'fixture-other', 'other.example.test', { secure: false }),
+          cookie('path', 'fixture-other', '127.0.0.1', { secure: false, path: '/other' }),
+          cookie('secure', 'fixture-secure', '127.0.0.1'),
+          ...jar.filter((item) => /sliccy/.test(item.domain)),
+        ],
+        traffic: [
+          {
+            url: 'http://127.0.0.1:9944/api/me',
+            requestHeaders: { Cookie: '[redacted]' },
+            responseHeaders: {},
+          },
+        ],
+      }
+    );
+  });
+
+  test(`${kind}: missing scopes never fall back on a URL that can share protected parent cookies`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(
+      kind,
+      async ({ fake, ok }) => {
+        await ok(['open', 'https://shop.example.ai/app']);
+        const reads = count(fake, 'Network.getAllCookies');
+        assert.equal(await ok(['request-headers', '1']), 'cookie: [redacted]\n');
+        assert.equal(count(fake, 'Network.getAllCookies'), reads);
+      },
+      {
+        cookies: [cookie('ordinary', 'fixture-current', 'shop.example.ai')],
+        traffic: [
+          {
+            url: 'https://shop.example.ai/api',
+            requestHeaders: { Cookie: '[redacted]' },
+            responseHeaders: {},
+          },
+        ],
+      }
+    );
+  });
+
   test(`${kind}: removed ordinary cookies retain only their scopes from CDP metadata`, {
     timeout: 120_000,
   }, async () => {

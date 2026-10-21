@@ -1,6 +1,6 @@
 use crate::cdp::{self, Cdp};
 use crate::trace::NetRequest;
-use cdp_client::protected::Protected;
+use cdp_client::protected::{canonical_cookie_domain, Protected};
 use serde_json::{json, Value};
 
 pub const CURRENT_VALUES: &str = "Cookie values are from the current cookie jar, not necessarily from this request.\n";
@@ -52,13 +52,35 @@ pub fn saved_scopes(scopes: &[Value]) -> Vec<Value> {
 }
 
 pub fn hydrate(cdp: &mut Cdp, target: &str, request: &mut NetRequest, command: &str) -> Result<bool, String> {
-    if request.cookie_scopes.is_empty() || !matches!(command, "request" | "request-headers" | "response-headers") {
+    if !matches!(command, "request" | "request-headers" | "response-headers") {
         return Ok(false);
     }
+    let current = command != "response-headers"
+        && request.request_headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        && request.cookie_scopes.iter().all(|scope| field(scope, "header") != "cookie")
+        && !cdp.guard().cookie_url(&request.url);
+    if request.cookie_scopes.is_empty() && !current { return Ok(false); }
     let session = cdp::attach(cdp, target)?;
     let result = cdp.call("Network.getAllCookies", json!({}), Some(&session));
     cdp::detach(cdp, &session);
-    Ok(fill(request, &result?, command))
+    let jar = result?;
+    if current { request.cookie_scopes.extend(current_scopes(request, &jar)); }
+    Ok(fill(request, &jar, command))
+}
+
+pub fn current_scopes(request: &NetRequest, jar: &Value) -> Vec<Value> {
+    let Ok(url) = url::Url::parse(&request.url) else { return Vec::new(); };
+    let host = url.host_str().unwrap_or_default();
+    jar.get("cookies").and_then(Value::as_array).into_iter().flatten().filter_map(|cookie| {
+        let domain = canonical_cookie_domain(field(cookie, "domain"))?;
+        let path = field(cookie, "path");
+        let matches_domain = host == domain || field(cookie, "domain").starts_with('.') && host.ends_with(&format!(".{domain}"));
+        let matches_path = url.path() == path || url.path().strip_prefix(path).is_some_and(|rest| path.ends_with('/') || rest.starts_with('/'));
+        if !matches_domain || !matches_path || path.is_empty() || Protected::default().cookie_scope(&domain)
+            || cookie.get("secure").and_then(Value::as_bool) == Some(true) && url.scheme() != "https"
+        { return None; }
+        Some(json!({ "header": "cookie", "name": field(cookie, "name"), "domain": field(cookie, "domain"), "path": path }))
+    }).collect()
 }
 
 pub fn fill(request: &mut NetRequest, jar: &Value, command: &str) -> bool {
