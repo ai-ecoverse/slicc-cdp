@@ -957,7 +957,7 @@ mod tests {
             )
             .unwrap();
             until_allowed_error(&mut cdp, &mut raw, &target, &session, &format!("{seven}/nowhere?secret=SCRIPTSECRET"));
-            cdp.call("Runtime.evaluate", json!({ "expression": "document.cookie" }), Some(&session)).unwrap();
+            refused(cdp.call("Runtime.evaluate", json!({ "expression": "document.cookie" }), Some(&session)), "content of a protected error page");
             let reattached = client::attach(&mut cdp, &target).unwrap();
             client::detach(&mut cdp, &reattached);
             let info = cdp

@@ -264,6 +264,9 @@ impl Cdp {
             if self.guard_sessions.contains(session) {
                 return Err(self.refusal());
             }
+            if !recovery(method, params) && self.session_target(session).and_then(|target| self.documents.get(&target)).is_some_and(|doc| self.sealed(doc)) {
+                return Err(self.refusal());
+            }
             if !harmless(method, params) {
                 if let Some(target) = self.session_target(session) {
                     if self.documents.get(&target).is_some_and(|doc| doc.navigating || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) {
@@ -1037,6 +1040,11 @@ impl Cdp {
             })
     }
 
+    fn sealed(&self, doc: &MainDocument) -> bool {
+        (self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty())
+            && (doc.unreachable_url.is_empty() || self.guard.url(&doc.unreachable_url))
+    }
+
     fn masked_error(&self, doc: &MainDocument, reported: &str) -> bool {
         doc.unreachable_url.is_empty()
             && self.guard.error_document(&doc.url, &doc.origin)
@@ -1793,6 +1801,21 @@ fn unguarded(message: String) -> String {
     }
 }
 
+fn recovery(method: &str, params: &Value) -> bool {
+    match method {
+        "Page.enable" | "Page.disable" | "Page.navigate" | "Page.reload" | "Page.stopLoading" | "Page.navigateToHistoryEntry"
+        | "Page.getNavigationHistory" | "Page.getFrameTree" | "Page.close" | "Runtime.enable" | "Runtime.disable"
+        | "Runtime.runIfWaitingForDebugger" | "Network.enable" | "Network.disable" | "Log.enable" | "Log.disable"
+        | "Fetch.enable" | "Fetch.disable" | "Fetch.continueRequest" | "Fetch.failRequest" | "Fetch.fulfillRequest"
+        | "Fetch.continueResponse" | "Fetch.continueWithAuth" => true,
+        "Runtime.evaluate" => {
+            matches!(params.get("expression").and_then(Value::as_str), Some("document.readyState" | "0"))
+                && params.as_object().is_some_and(|object| object.keys().all(|key| matches!(key.as_str(), "expression" | "returnByValue")))
+        }
+        _ => false,
+    }
+}
+
 fn harmless(method: &str, params: &Value) -> bool {
     match method {
         "Fetch.disable" => true,
@@ -2464,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn permitted_error_document_responses_redact_history_and_runtime_without_losing_ids() {
+    fn permitted_error_document_redacts_history_and_refuses_runtime_without_losing_ids() {
         struct HistoryResponses(UrlBackend);
         impl Transport for HistoryResponses {
             fn send_text(&mut self, text: &str) -> Result<(), String> {
@@ -2510,10 +2533,12 @@ mod tests {
                 assert_eq!(history["entries"][1][key], origin, "{key}");
             }
             assert!(!history.to_string().contains("HISTORY_MARK"));
-            let runtime = cdp.call("Runtime.evaluate", json!({"expression":"location.href","returnByValue":true}), Some("S")).unwrap();
-            assert_eq!(runtime["result"]["value"]["url"], origin);
-            assert_eq!(runtime["result"]["value"]["text"], origin);
-            assert!(!runtime.to_string().contains("HISTORY_MARK"));
+            let sent = cdp.next_id;
+            for expression in ["location.href", "Array.from(document.documentElement.innerHTML, c => c.codePointAt(0))"] {
+                assert!(cdp.call("Runtime.evaluate", json!({"expression":expression,"returnByValue":true}), Some("S")).is_err(), "{expression}");
+            }
+            assert_eq!(cdp.next_id, sent);
+            assert!(cdp.call("Page.reload", json!({}), Some("S")).is_ok());
             assert!(!cdp.session_blocked("S"));
         }
     }

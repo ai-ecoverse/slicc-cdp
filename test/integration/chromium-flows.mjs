@@ -610,10 +610,8 @@ async function protectedFlow(runner, site, wsUrl) {
     await raw.send('Target.detachFromTarget', { sessionId: observer });
     assert.match(await raw.targetUrl(tab), vaultURL);
     if (frame.url === 'chrome-error://chromewebdata/') {
-      const blocked = await runner.playwright(['eval', 'location.href', '--tab', tab], cwd);
-      assert.equal(blocked.code, 0, blocked.stderr);
-      assert.match(blocked.stdout, /chrome-error:\/\/chromewebdata\//);
-      assert.doesNotMatch(blocked.stdout + blocked.stderr, /SECRET|vault|n=refresh/);
+      await refused(['eval', 'document.documentElement.innerHTML', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
       const afterList = await runner.playwright(['tab-list'], cwd);
       assert.doesNotMatch(afterList.stdout, /SECRET|n=refresh/);
       const recovered = await runner.playwright(['goto', `${site.origin}/one`, '--tab', tab], cwd);

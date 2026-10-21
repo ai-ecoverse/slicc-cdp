@@ -56,7 +56,7 @@ function run(args, home) {
   });
 }
 
-test('a fresh playwright-cli drives an opened about:blank tab whose blocked vault error page an upstream guard masked', {
+test('a fresh playwright-cli can recover an opened about:blank tab whose blocked vault error page an upstream guard masked, but not read it', {
   timeout: 60_000,
 }, async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-error-page-'));
@@ -74,9 +74,22 @@ test('a fresh playwright-cli drives an opened about:blank tab whose blocked vaul
     assert.match(blank.stderr, /a browser-side navigation to about:/, blank.stderr);
     const spaced = await pw(['goto', ' about:blank']);
     assert.doesNotMatch(spaced.stderr, new RegExp(SEVEN), spaced.stderr);
-    const origin = await pw(['eval', 'self.origin']);
-    assert.equal(origin.code, 0, origin.stderr);
-    assert.match(origin.stdout, /fake-eval/);
+    const from = fake.calls.length;
+    const content = await pw(['eval', 'document.documentElement.innerHTML']);
+    assert.notEqual(content.code, 0);
+    assert.match(content.stderr, new RegExp(SEVEN), content.stderr);
+    assert.ok(
+      fake.calls
+        .slice(from)
+        .every(
+          (call) =>
+            call.method !== 'Runtime.evaluate' ||
+            /^(document\.readyState|0)$/.test(call.params?.expression)
+        ),
+      'the masked error page ran a caller expression'
+    );
+    const reload = await pw(['reload']);
+    assert.doesNotMatch(reload.stderr, new RegExp(SEVEN), reload.stderr);
 
     tab.url = 'http://vault.sliccy.ai/vault';
     const vault = await pw(['eval', 'self.origin']);
