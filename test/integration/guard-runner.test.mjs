@@ -162,6 +162,7 @@ test('published guard set through the Rust guarded client', {
           chromeUrlsAttach: true,
           extensionWorld: true,
           browserContexts: true,
+          discovery: true,
         },
         variant: Object.keys(set.variants),
         parallel,

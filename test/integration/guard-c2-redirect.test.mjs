@@ -34,78 +34,86 @@ before(() => {
 });
 
 for (const transport of ['native', 'wasi']) {
-  test(`published C2 redirects and fragments through ${transport}`, {
-    timeout: 300000,
-  }, async (t) => {
-    const fixture = requireRedirectRegistration(await fixtureServer());
-    const targets = origins(fixture);
-    const previous = process.env.SLICC_GUARD_TRANSPORT;
-    let browser;
-    try {
-      process.env.SLICC_GUARD_TRANSPORT = transport;
-      browser = await launchBrowser(browserArgs());
-      const execution = await run(selected, {
-        fixture,
-        targets,
-        capabilities: {
-          scope: 'slicc-cdp',
-          autoAttach: true,
-          browserSession: true,
-          browserContexts: true,
-        },
-        variant: Object.keys(selected.variants),
-        parallel: 1,
-        clientFactory: async ({ variant, detachDelay }) => {
-          t.signal.throwIfAborted();
-          const client = await recordedClient((onMessage) =>
-            guarded(browser.wsUrl, targets.client, { variant, detachDelay, onMessage })
-          );
-          let unguarded;
-          try {
-            unguarded = await recordedClient((onMessage) => observer(browser.wsUrl, onMessage));
-          } catch (error) {
-            await client.close();
-            throw error;
-          }
-          return {
-            client,
-            unguarded,
-            close: async () => {
+  for (const id of redirectIds) {
+    const rowSet = { ...selected, vectors: selected.vectors.filter((vector) => vector.id === id) };
+    test(`published ${id} redirects and fragments through ${transport}`, {
+      timeout: 300000,
+    }, async (t) => {
+      const fixture = requireRedirectRegistration(await fixtureServer());
+      const targets = origins(fixture);
+      const previous = process.env.SLICC_GUARD_TRANSPORT;
+      let browser;
+      try {
+        process.env.SLICC_GUARD_TRANSPORT = transport;
+        browser = await launchBrowser(browserArgs());
+        const execution = await run(rowSet, {
+          fixture,
+          targets,
+          capabilities: {
+            scope: 'slicc-cdp',
+            autoAttach: true,
+            browserSession: true,
+            browserContexts: true,
+            discovery: true,
+          },
+          variant: Object.keys(selected.variants),
+          parallel: 1,
+          clientFactory: async ({ variant, detachDelay }) => {
+            t.signal.throwIfAborted();
+            const client = await recordedClient((onMessage) =>
+              guarded(browser.wsUrl, targets.client, { variant, detachDelay, onMessage })
+            );
+            let unguarded;
+            try {
+              unguarded = await recordedClient((onMessage) => observer(browser.wsUrl, onMessage));
+            } catch (error) {
               await client.close();
-              await unguarded.close();
-            },
-          };
-        },
-        log: (row) => console.log(JSON.stringify({ transport, ...row })),
-      });
-      const report = summary({
-        set: selected,
-        results: execution.results,
-        guard: 'slicc-cdp',
-        sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
-      });
-      report.transport = transport;
-      const file = `${process.env.SLICC_GUARD_REPORT ?? path.join(tmpdir(), 'slicc-cdp-guard-runner-report.md')}.c2-${transport}.json`;
-      await writeFile(file, JSON.stringify(report, null, 2));
-      console.log(report.line);
-      for (const id of redirectIds) {
-        const rows = report.results.filter((row) => row.id === id);
-        assert.equal(rows.length, Object.keys(selected.variants).length, `${id}: variants missing`);
-        for (const row of rows)
-          assert.deepEqual(
-            [row.control, row.guarded, row.live],
-            ['pass', 'pass', 'pass'],
-            `${transport} ${id} ${row.variant}: ${JSON.stringify(row)}`
+              throw error;
+            }
+            return {
+              client,
+              unguarded,
+              close: async () => {
+                await client.close();
+                await unguarded.close();
+              },
+            };
+          },
+          log: (row) => console.log(JSON.stringify({ transport, ...row })),
+        });
+        const report = summary({
+          set: rowSet,
+          results: execution.results,
+          guard: 'slicc-cdp',
+          sha: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+        });
+        report.transport = transport;
+        const file = `${process.env.SLICC_GUARD_REPORT ?? path.join(tmpdir(), 'slicc-cdp-guard-runner-report.md')}.c2-${transport}-${id}.json`;
+        await writeFile(file, JSON.stringify(report, null, 2));
+        console.log(`C2-FOCUS ${report.line}`);
+        {
+          const rows = report.results.filter((row) => row.id === id);
+          assert.equal(
+            rows.length,
+            Object.keys(selected.variants).length,
+            `${id}: variants missing`
           );
+          for (const row of rows)
+            assert.deepEqual(
+              [row.control, row.guarded, row.live],
+              ['pass', 'pass', 'pass'],
+              `${transport} ${id} ${row.variant}: ${JSON.stringify(row)}`
+            );
+        }
+        assert.deepEqual(report.missing, []);
+        assert.equal(report.observerSkipped, 0);
+        assert.equal(report.pass, true, report.line);
+      } finally {
+        await browser?.close();
+        await fixture.close();
+        if (previous === undefined) delete process.env.SLICC_GUARD_TRANSPORT;
+        else process.env.SLICC_GUARD_TRANSPORT = previous;
       }
-      assert.deepEqual(report.missing, []);
-      assert.equal(report.observerSkipped, 0);
-      assert.equal(report.pass, true, report.line);
-    } finally {
-      await browser?.close();
-      await fixture.close();
-      if (previous === undefined) delete process.env.SLICC_GUARD_TRANSPORT;
-      else process.env.SLICC_GUARD_TRANSPORT = previous;
-    }
-  });
+    });
+  }
 }
