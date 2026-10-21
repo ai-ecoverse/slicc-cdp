@@ -635,7 +635,9 @@ function targetOf(stdout) {
 }
 
 function refOf(stdout, role, name) {
-  const match = stdout.match(new RegExp(`(?<![A-Za-z])${role} "${name}" \\[ref=(e\\d+)\\]`));
+  const match = stdout.match(
+    new RegExp(`(?<![A-Za-z])${role} "${name}"(?: \\[[^\\]]+\\])*? \\[ref=(e\\d+)\\]`)
+  );
   if (!match) throw new Error(`missing ${role} ${name}\n${stdout}`);
   return match[1];
 }
