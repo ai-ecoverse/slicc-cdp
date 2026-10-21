@@ -9,7 +9,7 @@ export function origins(fixture) {
     client: origin('client.guard.test'),
     ordinary: origin('plain.guard.test'),
     cross: origin('cross.other.test'),
-    'ordinary-same-site': origin('same.guard.test'),
+    'ordinary-same-site': null,
   };
 }
 

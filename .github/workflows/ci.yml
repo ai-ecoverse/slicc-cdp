@@ -87,6 +87,43 @@ jobs:
         run: |
           if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
           npm run -s browser -- $deps
+      - run: node scripts/gate.mjs integration -- npm run test:integration
+        env:
+          SLICC_INTEGRATION_JOB: integration
+          SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
+          SLICC_REDIRECT_EVIDENCE: ${{ runner.temp }}/slicc-cdp-redirect-report
+      - name: Guard regression report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guard-regression-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/slicc-cdp-guard-runner-report.md*
+            ${{ runner.temp }}/slicc-cdp-redirect-report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  redirect-regressions:
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner }}
+    timeout-minutes: 30
+    env:
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Chrome for Testing (pinned in package.json config.chrome)
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          npm run -s browser -- $deps
       - name: Native and WASI published C2 redirect controls and fragments
         run: node --test --test-concurrency=1 --test-reporter=spec test/integration/guard-c2-redirect.test.mjs
         env:
@@ -95,15 +132,11 @@ jobs:
         run: node --test --test-concurrency=1 --test-reporter=spec test/integration/redirect-navigation.test.mjs
         env:
           SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
-      - run: node scripts/gate.mjs integration -- npm run test:integration
-        env:
-          SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
-          SLICC_REDIRECT_EVIDENCE: ${{ runner.temp }}/slicc-cdp-redirect-report
       - name: Guard regression report
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: guard-regression-${{ github.run_attempt }}
+          name: redirect-regression-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/slicc-cdp-guard-runner-report.md*
             ${{ runner.temp }}/slicc-cdp-redirect-report/
