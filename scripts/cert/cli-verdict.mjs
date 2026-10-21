@@ -1,5 +1,15 @@
 import { writeSync } from 'node:fs';
 
+export function writeStdout(text) {
+  return new Promise((resolve, reject) => {
+    process.stdout.write(text, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+export function writeJson(document) {
+  return writeStdout(`${JSON.stringify(document)}\n`);
+}
+
 export function cliVerdict(prefix, refusal = 'early refusal') {
   let printed = false;
   const print = (status, detail = '') => {
