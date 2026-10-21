@@ -328,11 +328,17 @@ impl Cdp {
                 return Err(format!("{}\n", self.guard.refusal_for_url(&url)));
             }
         }
+        if let Some(frame) = params.get("frameId").and_then(Value::as_str) {
+            if self.frame_refused(frame, session_id)? {
+                let url = self.frames.get(frame).and_then(|known| known.first()).map(String::as_str).unwrap_or("");
+                return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+            }
+        }
         if !matches!(method, "Target.getTargetInfo" | "Target.detachFromTarget") {
-            for key in ["targetId", "frameId"] {
+            for key in ["targetId"] {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
-                    if (key == "frameId" && self.frame_protected(&target)) || self.target_protected(&target, key == "frameId")? {
+                    if self.target_protected(&target, false)? {
                         let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
                         return Err(format!("{}\n", self.guard.refusal_for_url(url)));
                     }
@@ -419,6 +425,9 @@ impl Cdp {
             if let Some(uuid) = result.get("uuid").and_then(|v| v.as_str()) {
                 self.streams.insert(format!("blob:{uuid}"));
             }
+        }
+        if method == "Page.getFrameTree" {
+            self.record_frames(&result);
         }
         match method {
             "Target.attachToTarget" => {
@@ -869,6 +878,40 @@ impl Cdp {
         }
         if !self.guard_sessions.contains(session_id) {
             self.block(session_id);
+        }
+    }
+
+    fn frame_refused(&mut self, frame_id: &str, session_id: Option<&str>) -> Result<bool, String> {
+        if self.frame_protected(frame_id) || self.frames.contains_key(frame_id) {
+            return Ok(self.frame_protected(frame_id));
+        }
+        match self.target_protected(frame_id, false) {
+            Ok(protected) => return Ok(protected),
+            Err(message) if transport_error(&message) => return Err(message),
+            Err(_) => {}
+        }
+        if let Some(session) = session_id {
+            match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
+                Ok(tree) => self.record_frames(&tree),
+                Err(message) if transport_error(&message) => return Err(message),
+                Err(_) => {}
+            }
+        }
+        Ok(!self.frames.contains_key(frame_id) || self.frame_protected(frame_id))
+    }
+
+    fn record_frames(&mut self, tree: &Value) {
+        let Some(node) = tree.get("frameTree").or_else(|| tree.get("frame").map(|_| tree)) else {
+            return;
+        };
+        let frame = node.get("frame").unwrap_or(&Value::Null);
+        let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
+        if !text("id").is_empty() {
+            let url = format!("{}{}", text("url"), text("urlFragment"));
+            self.frames.insert(text("id").to_string(), vec![url, text("securityOrigin").to_string()]);
+        }
+        for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() {
+            self.record_frames(child);
         }
     }
 

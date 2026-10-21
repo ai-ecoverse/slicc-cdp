@@ -67,7 +67,12 @@ const tree = {
   ],
 };
 
-export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = false } = {}) {
+export async function fakeCdp({
+  refuse = [],
+  refusalMessage,
+  noisyRefusal = false,
+  childFrames = [],
+} = {}) {
   const calls = [];
   const targets = [];
   const sessions = new Map();
@@ -134,7 +139,9 @@ export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = fals
         case 'Target.getTargets':
           return answer({ targetInfos: targets.map(info) });
         case 'Target.getTargetInfo': {
-          const found = targets.find((item) => item.targetId === params.targetId) ?? target;
+          const found =
+            targets.find((item) => item.targetId === params.targetId) ??
+            (childFrames.some((child) => child.frame.id === params.targetId) ? undefined : target);
           if (!found) return send({ id, error: { code: -32602, message: 'No target' } });
           return answer({ targetInfo: info(found) });
         }
@@ -166,6 +173,7 @@ export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = fals
           return answer({
             frameTree: {
               frame: { id: target?.targetId ?? 'F', loaderId: 'L', url: target?.url ?? '' },
+              childFrames,
             },
           });
         case 'Page.navigate': {
