@@ -507,6 +507,7 @@ fn build_snapshot(cdp: &mut Cdp, session: &str, invocation: &Invocation) -> Resu
         guard: cdp.guard().clone(),
         iframes: !flag_true(&invocation.flags, "no-iframes"),
         extra: std::cell::Cell::new(0),
+        seen: std::cell::RefCell::new([root.frame_id.clone()].into()),
     };
     let depth = match invocation.flags.get("depth") {
         Some(text) => Some(text.parse::<i64>().map_err(|_| {
@@ -530,6 +531,7 @@ struct Walk<'a> {
     guard: cdp_client::protected::Protected,
     iframes: bool,
     extra: std::cell::Cell<usize>,
+    seen: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl Walk<'_> {
@@ -570,7 +572,9 @@ impl Walk<'_> {
             let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) else {
                 continue;
             };
-            if node.get("role").and_then(serde_json::Value::as_str) != Some("iframe") {
+            if node.get("role").and_then(serde_json::Value::as_str) != Some("iframe")
+                || !self.seen.borrow_mut().insert(content.to_string())
+            {
                 continue;
             }
             let active = node.get("active").and_then(serde_json::Value::as_bool) == Some(true);

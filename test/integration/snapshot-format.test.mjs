@@ -246,3 +246,26 @@ for (const [label, start] of [
     });
   });
 }
+
+test('native snapshot stops when an iframe points back at a frame it already captured', async () => {
+  const loop = {
+    json: [{ role: 'iframe', ref: 'e1' }],
+    refs: [{ ref: 'e1', selector: ':root' }],
+    base: pageUrl('frames'),
+    nodes: [{ backendNodeId: 1, frameId: 'TAB1' }],
+  };
+  const fake = await fakeCdp({
+    aria: () => loop,
+    location: { href: pageUrl('frames'), title: titles.frames },
+  });
+  const runner = await nativeRunner();
+  try {
+    assert.equal((await runner.run(fake.url, ['open', pageUrl('frames')])).code, 0);
+    const shot = await runner.run(fake.url, ['snapshot']);
+    assert.equal(shot.code, 0, shot.stderr);
+    assert.match(shot.stdout, /```yaml\n- iframe \[ref=e1\]\n```/);
+  } finally {
+    await runner.close();
+    await fake.close();
+  }
+});

@@ -69,9 +69,12 @@ function ariaOptions(expression) {
 }
 
 function ariaAnswer(capture, location, expression) {
+  if (capture?.exception) {
+    return { result: { type: 'object' }, exceptionDetails: { text: capture.exception } };
+  }
   if (capture) {
-    const { json, refs, base } = capture;
-    return { result: { type: 'object', value: { json, refs, base } } };
+    const { json, refs, base, iframeDepths } = capture;
+    return { result: { type: 'object', value: { json, refs, base, iframeDepths } } };
   }
   if (expression.startsWith('globalThis[')) {
     return { result: { type: 'object', subtype: 'array', objectId: 'ARIA' } };
@@ -206,10 +209,16 @@ export async function fakeCdp({
           return answer({ executionContextId: 7 });
         case 'Runtime.getProperties':
           return answer({
-            result: lastAria.nodes.map((_, index) => ({
-              name: String(index),
-              value: { type: 'object', subtype: 'node', objectId: `NODE${index}` },
-            })),
+            result: lastAria.nodes.flatMap((node, index) =>
+              node
+                ? [
+                    {
+                      name: String(index),
+                      value: { type: 'object', subtype: 'node', objectId: `NODE${index}` },
+                    },
+                  ]
+                : []
+            ),
           });
         case 'DOM.describeNode': {
           const index = Number(String(params.objectId).replace('NODE', ''));
@@ -224,6 +233,12 @@ export async function fakeCdp({
         case 'Runtime.evaluate': {
           const options = ariaOptions(params.expression ?? '');
           const capture = options ? aria(options, params) : undefined;
+          if (capture?.error) return send({ id, error: { code: -32000, message: capture.error } });
+          if (!capture && lastAria.handle && params.expression?.startsWith('globalThis[')) {
+            if (lastAria.handle === 'error')
+              return send({ id, error: { code: -32000, message: 'handle refused' } });
+            return answer({ result: { type: 'undefined' } });
+          }
           if (capture) lastAria = capture;
           const answered = ariaAnswer(capture, location, params.expression ?? '');
           if (answered) return answer(answered);

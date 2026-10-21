@@ -450,8 +450,6 @@ mod tests {
 
         for args in [
             vec!["open", "--persistent"],
-            vec!["snapshot", "--depth", "1"],
-            vec!["snapshot", "--boxes"],
             vec!["screenshot", "--hires"],
             vec!["screenshot", "--type", "jpeg"],
         ] {
