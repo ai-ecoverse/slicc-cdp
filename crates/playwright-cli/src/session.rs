@@ -275,7 +275,12 @@ fn stored_headers(headers: &[(String, String)], base: &str) -> Vec<(String, Stri
             if names_secret(name, SECRET_HEADERS) {
                 (name.clone(), REDACTED.to_string())
             } else if names_secret(name, &["cookie"]) {
-                let hidden = Protected::default().cookie_url(base);
+                let guard = Protected::default();
+                let hidden = if name.eq_ignore_ascii_case("set-cookie") {
+                    cdp_client::shield::set_cookie_hidden(&guard, value, base)
+                } else {
+                    guard.url(base)
+                };
                 (name.clone(), if hidden { REDACTED.to_string() } else { value.clone() })
             } else if url_header(name) {
                 (name.clone(), stored_header_url(name, value, base))
@@ -594,7 +599,10 @@ fn secret_text(text: &str) -> bool {
 }
 
 fn stored_console(entry: &ConsoleEntry) -> Option<Value> {
-    if secret_text(&entry.text) {
+    if secret_text(&entry.text)
+        || Protected::default().cookie_url(&entry.url)
+            && entry.text.to_ascii_lowercase().contains("cookie") && entry.text.contains('=')
+    {
         return None;
     }
     let mut text = entry.text.clone();

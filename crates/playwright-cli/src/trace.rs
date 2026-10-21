@@ -105,6 +105,7 @@ fn tolerate(cdp: &mut Cdp, method: &str, session: &str) -> Result<(), String> {
 
 pub fn absorb(cdp: &mut Cdp, session: &str) -> Result<(Vec<ConsoleEntry>, Vec<NetRequest>), String> {
     flush(cdp, session)?;
+    cdp.call("Network.getAllCookies", json!({}), Some(session))?;
     let events = cdp.events().to_vec();
     let (console, mut raws) = from_events(&events, session);
     fetch_bodies(cdp, session, &mut raws)?;

@@ -43,7 +43,7 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
 }
 
 fn execute(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command: &str) -> Result<String, String> {
-    if command == "cookie-list" && option(invocation, "domain").is_some_and(|domain| cdp.guard().cookie_domain(domain)) {
+    if matches!(command, "cookie-list" | "cookie-set") && invocation.flags.get("domain").is_some_and(|domain| cdp.guard().cookie_scope(domain)) {
         return Err(cdp::COOKIES.to_string());
     }
     let page = target(cdp, invocation, state)?;
@@ -53,7 +53,7 @@ fn execute(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
         if domain.is_empty() {
             return Err(NO_PAIR.to_string());
         }
-        if cdp.guard().cookie_domain(&domain) {
+        if cdp.guard().cookie_scope(&domain) {
             return Err(cdp::COOKIES.to_string());
         }
         set = Some(domain);

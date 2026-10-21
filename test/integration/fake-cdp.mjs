@@ -81,6 +81,7 @@ export async function fakeCdp({
   noisyRefusal = false,
   cookies = [],
   traffic = [],
+  consoleLines = [],
   answers = {},
 } = {}) {
   const calls = [];
@@ -192,6 +193,15 @@ export async function fakeCdp({
           event('Page.frameNavigated', {
             frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
           });
+          for (const [index, entry] of consoleLines.entries()) {
+            event('Runtime.consoleAPICalled', {
+              type: 'log',
+              executionContextId: 1,
+              timestamp: index + 1,
+              args: [{ type: 'string', value: entry.text }],
+              stackTrace: { callFrames: [{ url: entry.url ?? params.url, lineNumber: 0 }] },
+            });
+          }
           for (const item of traffic) {
             requests += 1;
             const requestId = `R${requests}`;
@@ -207,7 +217,7 @@ export async function fakeCdp({
             });
             event('Network.requestWillBeSentExtraInfo', {
               requestId,
-              associatedCookies: [],
+              associatedCookies: item.associatedCookies ?? [],
               headers: item.requestHeaders,
             });
             event('Network.responseReceived', {

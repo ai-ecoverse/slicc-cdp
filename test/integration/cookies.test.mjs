@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fakeCdp } from './fake-cdp.mjs';
 import { HARNESS_PORTS } from './ports.mjs';
-import { kernelRunner } from './runners.mjs';
+import { kernelRunner, kernelSessionFile } from './runners.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const native = path.join(
@@ -121,6 +121,11 @@ const runners = {
     const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-cookies-'));
     return {
       run: (args) => nativeRun(args, home, fake.url),
+      saved: async () => {
+        const files = await readdir(home, { recursive: true });
+        const file = files.find((name) => name.includes('sessions') && name.endsWith('.json'));
+        return readFile(path.join(home, file), 'utf8');
+      },
       close: () => rm(home, { recursive: true, force: true }),
     };
   },
@@ -131,12 +136,17 @@ const runners = {
       fake.url
     );
     const cwd = await runner.fresh();
-    return { run: (args) => runner.playwright(args, cwd), close: () => runner.close() };
+    return {
+      run: (args) => runner.playwright(args, cwd),
+      saved: async () =>
+        new TextDecoder().decode(await runner.readFile(kernelSessionFile('/root', cwd))),
+      close: () => runner.close(),
+    };
   },
 };
 
-async function withBrowser(kind, body) {
-  const fake = await fakeCdp({ cookies: jar, traffic });
+async function withBrowser(kind, body, options = {}) {
+  const fake = await fakeCdp({ cookies: jar, traffic, ...options });
   const runner = await runners[kind](fake);
   const seen = [];
   const run = async (args) => {
@@ -157,7 +167,7 @@ async function withBrowser(kind, body) {
     return result.stderr;
   };
   try {
-    await body({ fake, run, ok, refused });
+    await body({ fake, run, ok, refused, saved: runner.saved });
     for (const text of seen) {
       for (const secret of secrets) assert.ok(!text.includes(secret), `${secret} leaked: ${text}`);
     }
@@ -183,6 +193,208 @@ function count(fake, method) {
 const code = (line) => `### Ran Playwright code\n\`\`\`js\n${line}\n\`\`\`\n`;
 
 for (const kind of ['native', 'wasi']) {
+  test(`${kind}: review regression refuses noncanonical protected or invalid cookie domains`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(kind, async ({ fake, ok, refused }) => {
+      await ok(['open', 'https://shop.example.test/app']);
+      const reads = count(fake, 'Network.getAllCookies');
+      for (const domain of [
+        'sliccy.ai:443',
+        '..sliccy.ai',
+        'sliccy.ai..',
+        'SEVEN。SLICCY。AI',
+        'ＳＬＩＣＣＹ．ＡＩ',
+        'seven｡sliccy｡ai',
+        '.AI.',
+        'ai:80',
+        'sliccy..ai',
+        'ordinary..test',
+        '',
+        '.',
+        'user@sliccy.ai',
+        'sliccy.ai/path',
+        'example.test@sliccy.ai',
+        'sliccy.ai@example.test',
+        'example.test/path',
+        'example.test?x=sliccy.ai',
+        'example.test#sliccy.ai',
+        ' example.test ',
+        'xn--.test',
+        'sliccy.ai:bogus',
+        'https://sliccy.ai',
+      ]) {
+        assert.equal(
+          await refused(['cookie-set', 'probe', 'fixture-value', '--domain', domain]),
+          refusal
+        );
+        assert.equal(await refused(['cookie-list', '--domain', domain]), refusal);
+      }
+      assert.equal(count(fake, 'Network.setCookie'), 0);
+      assert.equal(count(fake, 'Network.getAllCookies'), reads);
+      for (const domain of [
+        'EXAMPLE.TEST.',
+        '.example.test',
+        '..example.test..',
+        'example.test:443',
+        'ＥＸＡＭＰＬＥ．ＴＥＳＴ',
+        'bücher.test',
+        'xn--bcher-kva.test',
+      ]) {
+        await ok(['cookie-set', 'ordinary', 'fixture-value', '--domain', domain]);
+      }
+      const writes = count(fake, 'Network.setCookie');
+      await ok(['open', 'https://sliccy.ai../app']);
+      assert.equal(await refused(['cookie-set', 'probe', 'fixture-value']), refusal);
+      assert.equal(count(fake, 'Network.setCookie'), writes);
+    });
+  });
+
+  test(`${kind}: review regression hides protected cookie scopes without hiding ordinary host-only cookies`, {
+    timeout: 120_000,
+  }, async () => {
+    const parent = cookie('shared', 'fixture-parent-scope', '.ai');
+    const ordinary = cookie('shared', 'fixture-host-only', 'shop.example.ai');
+    await withBrowser(
+      kind,
+      async ({ ok, saved }) => {
+        await ok(['open', 'https://shop.example.ai/app']);
+        assert.equal(await ok(['request-headers', '1']), 'cookie: [redacted]\n');
+        assert.equal(await ok(['request-headers', '2']), 'cookie: shared=fixture-host-only\n');
+        assert.equal(await ok(['request-headers', '7']), 'cookie: [redacted]\n');
+        assert.equal(await ok(['request-headers', '8']), 'cookie: [redacted]\n');
+        assert.equal(
+          await ok(['response-headers', '2']),
+          'set-cookie: fresh=fixture-host-fresh; Path=/\n'
+        );
+        for (const index of [1, 3, 4, 5, 6]) {
+          assert.equal(await ok(['response-headers', String(index)]), 'set-cookie: [redacted]\n');
+        }
+        for (const index of [1, 3, 4, 5, 6]) {
+          const detail = await ok(['request', String(index)]);
+          assert.ok(detail.includes('set-cookie: [redacted]'), detail);
+        }
+        const stored = await saved();
+        for (const value of [
+          'fixture-parent-scope',
+          'fixture-parent-new',
+          'fixture-explicit',
+          'fixture-multi',
+          'fixture-idn',
+          'fixture-invalid',
+          'fixture-deleted',
+          'fixture-unknown',
+        ]) {
+          assert.ok(!stored.includes(value), stored);
+        }
+        assert.ok(stored.includes('fixture-host-only'), stored);
+      },
+      {
+        cookies: [...jar, parent, ordinary],
+        traffic: [
+          {
+            url: 'https://shop.example.ai/parent',
+            requestHeaders: { Cookie: 'shared=fixture-parent-scope' },
+            responseHeaders: { 'Set-Cookie': 'shared=fixture-parent-new; Domain=.ai' },
+            associatedCookies: [{ cookie: parent, blockedReasons: [] }],
+          },
+          {
+            url: 'https://shop.example.ai/ordinary',
+            requestHeaders: { Cookie: 'shared=fixture-host-only' },
+            responseHeaders: { 'Set-Cookie': 'fresh=fixture-host-fresh; Path=/' },
+            associatedCookies: [{ cookie: ordinary, blockedReasons: [] }],
+          },
+          {
+            url: 'https://shop.example.test/explicit',
+            requestHeaders: {},
+            responseHeaders: { 'Set-Cookie': 'shared=fixture-explicit; dOmAiN=.sliccy.ai' },
+          },
+          {
+            url: 'https://shop.example.test/multi',
+            requestHeaders: {},
+            responseHeaders: {
+              'Set-Cookie':
+                'fresh=fixture-normal\nshared=fixture-multi; Domain=ai\nother=fixture-other',
+            },
+          },
+          {
+            url: 'https://shop.example.test/idn',
+            requestHeaders: {},
+            responseHeaders: { 'Set-Cookie': 'shared=fixture-idn; Domain=SEVEN。SLICCY。AI' },
+          },
+          {
+            url: 'https://shop.example.test/invalid',
+            requestHeaders: {},
+            responseHeaders: { 'Set-Cookie': 'shared=fixture-invalid; Domain=ordinary..test' },
+          },
+          {
+            url: 'https://shop.example.ai/deleted',
+            requestHeaders: { Cookie: 'old=fixture-deleted' },
+            responseHeaders: {},
+            associatedCookies: [
+              { cookie: cookie('old', 'fixture-deleted', '.ai'), blockedReasons: [] },
+            ],
+          },
+          {
+            url: 'https://shop.example.ai/unknown',
+            requestHeaders: { Cookie: 'unknown=fixture-unknown' },
+            responseHeaders: {},
+          },
+        ],
+      }
+    );
+  });
+
+  test(`${kind}: review regression never persists console output containing protected cookie values`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(
+      kind,
+      async ({ ok, saved }) => {
+        await ok(['open', 'https://shop.example.ai/app']);
+        const text = await ok(['console']);
+        assert.ok(text.includes('kept: cookie banner shown'), text);
+        assert.ok(text.includes('document.cookie = theme=fixture-dark'), text);
+        assert.ok(text.includes('shared=fixture-host-only'), text);
+        assert.ok(!text.includes('fixture-parent-scope'), text);
+        assert.ok(!text.includes('fixture-quoted'), text);
+        assert.ok(!text.includes('fixture-rotated'), text);
+        const stored = await saved();
+        assert.ok(!stored.includes('fixture-parent-scope'), stored);
+        assert.ok(!stored.includes('fixture-quoted'), stored);
+        assert.ok(!stored.includes('fixture-rotated'), stored);
+        assert.ok(!stored.includes('document.cookie = unknown=fixture-unknown'), stored);
+        assert.ok(stored.includes('fixture-dark'), stored);
+      },
+      {
+        cookies: [
+          ...jar,
+          cookie('shared', 'fixture-parent-scope', '.ai'),
+          cookie('shared', 'fixture-host-only', 'shop.example.ai'),
+          cookie('quoted', 'fixture-quoted"\\☃', '.ai'),
+        ],
+        traffic: [
+          {
+            url: 'https://shop.example.ai/rotate',
+            requestHeaders: {},
+            responseHeaders: { 'Set-Cookie': 'rotated=fixture-rotated; Domain=.ai' },
+          },
+        ],
+        consoleLines: [
+          { text: 'document.cookie = shared=fixture-parent-scope' },
+          { text: 'shared=fixture-parent-scope', url: 'https://cdn.example.test/app.js' },
+          { text: 'fixture-parent-scope', url: 'https://cdn.example.test/app.js' },
+          { text: 'document.cookie = unknown=fixture-unknown' },
+          { text: 'kept: cookie banner shown' },
+          { text: 'document.cookie = theme=fixture-dark', url: 'https://shop.example.test/app.js' },
+          { text: 'shared=fixture-host-only' },
+          { text: 'fixture-quoted"\\☃', url: 'https://cdn.example.test/app.js' },
+          { text: 'fixture-rotated', url: 'https://cdn.example.test/app.js' },
+        ],
+      }
+    );
+  });
+
   test(`${kind}: cookie help pages match upstream playwright-cli 0.1.22`, {
     timeout: 120_000,
   }, async () => {
