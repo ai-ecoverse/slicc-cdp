@@ -457,7 +457,7 @@ fn cmd_snapshot(
     };
     let built = build_snapshot(cdp, &session, invocation);
     let watched = browser::watch_detach(cdp, state, &target, &session);
-    let (text, refs) = match built {
+    let (header, body, refs) = match built {
         Ok(value) => value,
         Err(message) => return Output::err(message),
     };
@@ -466,75 +466,124 @@ fn cmd_snapshot(
     }
     state.current = Some(target.clone());
     state.snapshots.insert(target, refs);
+    let mut lines = header;
+    lines.push("### Snapshot".to_string());
     if let Some(filename) = invocation.flags.get("filename") {
-        return match write_text(filename, &text) {
-            Ok(()) => Output::ok(format!("Snapshot saved to {filename}\n")),
-            Err(message) => Output::err(message),
-        };
-    }
-    Output::ok(format!("{text}\n"))
-}
-
-fn build_snapshot(
-    cdp: &mut Cdp,
-    session: &str,
-    invocation: &Invocation,
-) -> Result<(String, BTreeMap<String, RefRec>), String> {
-    let (url, title) = browser::page_location(cdp, session)?;
-    let url = sanitize::display_url(&url);
-    let title = sanitize::browser_message(&title);
-    if let Some(frame_id) = invocation.flags.get("frame") {
-        let frames = browser::frame_tree(cdp, session)?;
-        if !frames.iter().any(|frame| frame.frame_id == *frame_id) {
-            return Err(format!(
-                "Unknown frame ID \"{frame_id}\" for tab {}. Run 'playwright-cli frames --tab={}' to list frame IDs.\n",
-                invocation.flags.get("tab").map(String::as_str).unwrap_or("<targetId>"),
-                invocation.flags.get("tab").map(String::as_str).unwrap_or("<targetId>")
-            ));
+        if let Err(message) = write_text(filename, &body) {
+            return Output::err(message);
         }
-        let nodes = browser::accessibility_tree(cdp, session, Some(frame_id))?;
-        let root = single_root(nodes);
-        let (body, mut refs) = snapshot::render_tree(&root, "f1");
-        snapshot::tag_frame_refs(&mut refs, frame_id, "f1");
-        let text = format!("Page URL: {url}\nPage Title: {title}\n\n{body}");
-        return Ok((text, refs));
-    }
-    let nodes = browser::accessibility_tree(cdp, session, None)?;
-    let root = single_root(nodes);
-    let (body, mut refs) = snapshot::render_tree(&root, "");
-    let body = if flag_true(&invocation.flags, "no-iframes") {
-        body
+        lines.push(format!("- [Snapshot]({})", sanitize::terminal(filename)));
     } else {
-        let frames = browser::frame_tree(cdp, session).unwrap_or_default();
-        let (stitched, assigned) =
-            snapshot::stitch_iframes(&body, &url, &frames, |frame, prefix| {
-                let nodes =
-                    browser::accessibility_tree(cdp, session, Some(&frame.frame_id)).ok()?;
-                let root = single_root(nodes);
-                let (text, frame_refs) = snapshot::render_tree(&root, prefix);
-                for (id, mut rec) in frame_refs {
-                    rec.frame_id = Some(frame.frame_id.clone());
-                    refs.insert(id, rec);
-                }
-                Some(text)
-            });
-        let _ = assigned;
-        stitched
-    };
-    let text = format!("Page URL: {url}\nPage Title: {title}\n\n{body}");
-    Ok((text, refs))
+        lines.extend(["```yaml".to_string(), body, "```".to_string()]);
+    }
+    Output::ok(format!("{}\n", lines.join("\n")))
 }
 
-fn single_root(mut nodes: Vec<crate::snapshot::AxNode>) -> crate::snapshot::AxNode {
-    if nodes.len() == 1 {
-        return nodes.pop().unwrap();
+type Built = (Vec<String>, String, BTreeMap<String, RefRec>);
+
+fn build_snapshot(cdp: &mut Cdp, session: &str, invocation: &Invocation) -> Result<Built, String> {
+    let (url, title) = browser::page_location(cdp, session)?;
+    let mut header = vec!["### Page".to_string(), format!("- Page URL: {}", sanitize::display_url(&url))];
+    if !title.is_empty() {
+        header.push(format!("- Page Title: {}", sanitize::browser_message(&title)));
     }
-    crate::snapshot::AxNode {
-        role: "RootWebArea".to_string(),
-        name: String::new(),
-        value: String::new(),
-        backend_node_id: None,
-        children: nodes,
+    let frames = browser::frame_tree(cdp, session)?;
+    let chosen = invocation.flags.get("frame");
+    let root = match chosen {
+        Some(frame_id) => frames.iter().find(|frame| frame.frame_id == *frame_id).ok_or_else(|| {
+            let tab = invocation.flags.get("tab").map(String::as_str).unwrap_or("<targetId>");
+            format!(
+                "Unknown frame ID \"{frame_id}\" for tab {tab}. Run 'playwright-cli frames --tab={tab}' to list frame IDs.\n"
+            )
+        })?,
+        None => frames
+            .iter()
+            .find(|frame| frame.parent_frame_id.is_none())
+            .ok_or_else(|| "snapshot: the tab has no main frame\n".to_string())?,
+    };
+    let walk = Walk {
+        session,
+        frames: &frames,
+        guard: cdp.guard().clone(),
+        iframes: !flag_true(&invocation.flags, "no-iframes"),
+        extra: std::cell::Cell::new(0),
+    };
+    let depth = match invocation.flags.get("depth") {
+        Some(text) => Some(text.parse::<i64>().map_err(|_| {
+            format!("snapshot: --depth must be a number, not \"{}\"\n", sanitize::terminal(text))
+        })?),
+        None => None,
+    };
+    let options = snapshot::Options {
+        focused: if chosen.is_some() { None } else { Some(true) },
+        depth,
+        boxes: flag_true(&invocation.flags, "boxes"),
+    };
+    let mut refs = BTreeMap::new();
+    let nodes = walk.frame(cdp, &root.frame_id, options, chosen.is_some(), &mut refs)?;
+    Ok((header, sanitize::terminal(&snapshot::render(&nodes)), refs))
+}
+
+struct Walk<'a> {
+    session: &'a str,
+    frames: &'a [snapshot::FrameRec],
+    guard: cdp_client::protected::Protected,
+    iframes: bool,
+    extra: std::cell::Cell<usize>,
+}
+
+impl Walk<'_> {
+    fn frame(
+        &self,
+        cdp: &mut Cdp,
+        frame_id: &str,
+        options: snapshot::Options,
+        child: bool,
+        refs: &mut BTreeMap<String, RefRec>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let prefix = snapshot::frame_prefix(self.frames, frame_id, || {
+            self.extra.set(self.extra.get() + 1);
+            self.frames.len() + self.extra.get()
+        });
+        let capture = browser::aria_capture(cdp, self.session, frame_id, &prefix, options)?;
+        let mut nodes = capture.json;
+        snapshot::redact_links(&mut nodes, &capture.base, &self.guard);
+        let labels = snapshot::labels(&nodes);
+        for rec in &capture.refs {
+            refs.insert(
+                rec.id.clone(),
+                RefRec {
+                    backend_node_id: rec.backend_node_id,
+                    selector: rec.selector.clone(),
+                    frame_id: child.then(|| frame_id.to_string()),
+                    label: labels.get(&rec.id).cloned().flatten(),
+                },
+            );
+        }
+        if !self.iframes {
+            return Ok(nodes);
+        }
+        for rec in &capture.refs {
+            let Some(content) = rec.content_frame.as_deref() else {
+                continue;
+            };
+            let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) else {
+                continue;
+            };
+            if node.get("role").and_then(serde_json::Value::as_str) != Some("iframe") {
+                continue;
+            }
+            let active = node.get("active").and_then(serde_json::Value::as_bool) == Some(true);
+            let inner_options =
+                snapshot::child_options(options, active, capture.iframe_depths.get(&rec.id).copied());
+            let inner = self.frame(cdp, content, inner_options, true, refs);
+            if let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) {
+                if let Some(inner) = inner.ok().filter(|inner| !inner.is_empty()) {
+                    node["children"] = serde_json::Value::Array(inner);
+                }
+            }
+        }
+        Ok(nodes)
     }
 }
 

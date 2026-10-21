@@ -1,13 +1,10 @@
+use cdp_client::protected::Protected;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AxNode {
-    pub role: String,
-    pub name: String,
-    pub value: String,
-    pub backend_node_id: Option<u64>,
-    pub children: Vec<AxNode>,
-}
+pub const SCRIPT: &str = include_str!("aria-snapshot.js");
+
+pub const ELEMENTS_KEY: &str = "__sliccAriaElements";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefRec {
@@ -17,221 +14,400 @@ pub struct RefRec {
     pub label: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedRef {
+    pub id: String,
+    pub selector: String,
+    pub backend_node_id: Option<u64>,
+    pub content_frame: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capture {
+    pub json: Vec<Value>,
+    pub refs: Vec<CapturedRef>,
+    pub iframe_depths: BTreeMap<String, i64>,
+    pub base: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Options {
+    pub focused: Option<bool>,
+    pub depth: Option<i64>,
+    pub boxes: bool,
+}
+
 pub fn ref_label(role: &str, name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let full = format!("{role} \"{}\"", escape_yaml(name));
-    Some(cap_chars(&full, 80))
+    let full = format!("{role} \"{}\"", escape_label(name));
+    Some(full.chars().take(80).collect())
 }
 
-fn cap_chars(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.replace('\\', "\\\\").replace('"', "\\\"").chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
     }
-    value.chars().take(max).collect()
+    out
 }
 
-pub fn render_tree(node: &AxNode, frame_prefix: &str) -> (String, BTreeMap<String, RefRec>) {
-    let mut refs = BTreeMap::new();
-    let mut counter = 0u32;
-    let lines = render_node(node, frame_prefix, "", &mut counter, &mut refs);
-    (lines.join("\n"), refs)
+pub fn expression(prefix: &str, options: Options) -> String {
+    let options = json!({
+        "prefix": prefix,
+        "focused": options.focused,
+        "depth": options.depth,
+        "boxes": options.boxes,
+        "key": ELEMENTS_KEY,
+    });
+    format!("{SCRIPT}\nsliccAriaSnapshot({options})")
 }
 
-fn render_node(
-    node: &AxNode,
-    frame_prefix: &str,
-    indent: &str,
-    counter: &mut u32,
-    refs: &mut BTreeMap<String, RefRec>,
-) -> Vec<String> {
-    let role = node.role.to_ascii_lowercase();
-    let name = node.name.clone();
-    let value = node.value.clone();
-    let mut ref_id = String::new();
-    if node_needs_ref(&role, &name) {
-        *counter += 1;
-        ref_id = format!("{frame_prefix}e{counter}");
-        refs.insert(
-            ref_id.clone(),
-            RefRec {
-                backend_node_id: node.backend_node_id,
-                selector: build_ref_selector(&role, &name),
-                frame_id: None,
-                label: ref_label(&role, &name),
-            },
-        );
+pub fn parse_capture(value: &Value) -> Result<Capture, String> {
+    let json = value
+        .get("json")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "snapshot: the page returned no tree\n".to_string())?;
+    let refs = value
+        .get("refs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(CapturedRef {
+                        id: item.get("ref")?.as_str()?.to_string(),
+                        selector: item
+                            .get("selector")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        backend_node_id: None,
+                        content_frame: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let base = value
+        .get("base")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let iframe_depths = value
+        .get("iframeDepths")
+        .and_then(Value::as_object)
+        .map(|depths| {
+            depths
+                .iter()
+                .filter_map(|(id, depth)| Some((id.clone(), depth.as_i64()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Capture { json, refs, iframe_depths, base })
+}
+
+pub fn labels(nodes: &[Value]) -> BTreeMap<String, Option<String>> {
+    let mut out = BTreeMap::new();
+    fn walk(node: &Value, out: &mut BTreeMap<String, Option<String>>) {
+        if let Some(id) = node.get("ref").and_then(Value::as_str) {
+            let role = node.get("role").and_then(Value::as_str).unwrap_or("");
+            let name = node.get("name").and_then(Value::as_str).unwrap_or("");
+            out.insert(id.to_string(), ref_label(role, name));
+        }
+        for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
+            walk(child, out);
+        }
     }
-    let mut line = format!("{indent}- {role}");
-    if !name.is_empty() {
-        line.push_str(&format!(" \"{}\"", escape_yaml(&name)));
+    for node in nodes {
+        walk(node, &mut out);
     }
-    if !ref_id.is_empty() {
-        line.push_str(&format!(" [ref={ref_id}]"));
+    out
+}
+
+pub fn find_mut<'a>(nodes: &'a mut [Value], id: &str) -> Option<&'a mut Value> {
+    for node in nodes {
+        if node.get("ref").and_then(Value::as_str) == Some(id) {
+            return Some(node);
+        }
+        if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
+            if let Some(found) = find_mut(children, id) {
+                return Some(found);
+            }
+        }
     }
-    if !value.is_empty() {
-        line.push_str(&format!(": \"{}\"", escape_yaml(&value)));
+    None
+}
+
+pub fn redact_links(nodes: &mut [Value], base: &str, guard: &Protected) {
+    for node in nodes {
+        if let Some(Value::String(url)) = node.get_mut("url") {
+            *url = link(url, base, guard);
+        }
+        if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
+            redact_links(children, base, guard);
+        }
     }
-    let mut lines = vec![line];
-    let child_indent = format!("{indent}  ");
-    for child in &node.children {
-        lines.extend(render_node(
-            child,
-            frame_prefix,
-            &child_indent,
-            counter,
-            refs,
+}
+
+pub fn link(raw: &str, base: &str, guard: &Protected) -> String {
+    let absolute = cdp_client::sanitize::is_absolute_url(raw);
+    let resolved = if absolute {
+        raw.to_string()
+    } else {
+        cdp_client::sanitize::join_url(base, raw).unwrap_or_else(|| raw.to_string())
+    };
+    if guard.url_read_only(&resolved) || cdp_client::shield::redact_text(guard, &resolved).1 {
+        return url::Url::parse(&resolved)
+            .ok()
+            .map(|parsed| parsed.origin().ascii_serialization())
+            .filter(|origin| origin != "null")
+            .unwrap_or_else(|| "about:blank".to_string());
+    }
+    crate::sanitize::href(raw)
+}
+
+pub fn render(nodes: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for node in nodes {
+        visit(node, 0, &mut lines);
+    }
+    lines.join("\n")
+}
+
+fn indent(depth: usize) -> String {
+    "  ".repeat(depth)
+}
+
+fn visit_text(text: &str, depth: usize, lines: &mut Vec<String>) {
+    lines.push(format!("{}- text: {}", indent(depth), yaml_value(text)));
+}
+
+fn visit(node: &Value, depth: usize, lines: &mut Vec<String>) {
+    let text = node.get("text").and_then(Value::as_str);
+    if node.get("role").and_then(Value::as_str) == Some("text") {
+        visit_text(text.unwrap_or(""), depth, lines);
+        return;
+    }
+    let key = format!("{}- {}", indent(depth), yaml_key(&create_key(node)));
+    let props: Vec<(&str, &str)> = ["url", "placeholder"]
+        .into_iter()
+        .filter_map(|name| node.get(name).and_then(Value::as_str).map(|value| (name, value)))
+        .collect();
+    let children = node
+        .get("children")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    match text {
+        None if props.is_empty() && children.is_empty() => lines.push(key),
+        Some(text) if props.is_empty() => lines.push(format!("{key}: {}", yaml_value(text))),
+        _ => {
+            lines.push(format!("{key}:"));
+            for (name, value) in props {
+                lines.push(format!("{}- /{name}: {}", indent(depth + 1), yaml_value(value)));
+            }
+            if let Some(text) = text {
+                visit_text(text, depth + 1, lines);
+                return;
+            }
+            for child in children {
+                match child.as_str() {
+                    Some(text) => visit_text(text, depth + 1, lines),
+                    None => visit(child, depth + 1, lines),
+                }
+            }
+        }
+    }
+}
+
+fn create_key(node: &Value) -> String {
+    let field = |name: &str| node.get(name).filter(|value| !value.is_null());
+    let flag = |name: &str| field(name).and_then(Value::as_bool) == Some(true);
+    let word = |name: &str| field(name).and_then(Value::as_str);
+    let mut key = word("role").unwrap_or("").to_string();
+    if let Some(name) = word("name").filter(|name| !name.is_empty()) {
+        if name.encode_utf16().count() <= 900 {
+            key.push(' ');
+            key.push_str(&serde_json::to_string(name).unwrap_or_default());
+        }
+    }
+    let tristate = |name: &str| {
+        if word(name) == Some("mixed") {
+            format!(" [{name}=mixed]")
+        } else if flag(name) {
+            format!(" [{name}]")
+        } else {
+            String::new()
+        }
+    };
+    key.push_str(&tristate("checked"));
+    for name in ["disabled", "expanded", "active"] {
+        if flag(name) {
+            key.push_str(&format!(" [{name}]"));
+        }
+    }
+    match word("invalid") {
+        Some(kind @ ("grammar" | "spelling")) => key.push_str(&format!(" [invalid={kind}]")),
+        _ if flag("invalid") => key.push_str(" [invalid]"),
+        _ => {}
+    }
+    if let Some(level) = field("level").and_then(Value::as_f64).filter(|level| *level != 0.0) {
+        key.push_str(&format!(" [level={}]", field("level").map(Value::to_string).unwrap_or_else(|| level.to_string())));
+    }
+    key.push_str(&tristate("pressed"));
+    if flag("selected") {
+        key.push_str(" [selected]");
+    }
+    if flag("ariaHidden") {
+        key.push_str(" [aria-hidden]");
+    }
+    if let Some(id) = word("ref").filter(|id| !id.is_empty()) {
+        key.push_str(&format!(" [ref={id}]"));
+        if word("cursor") == Some("pointer") {
+            key.push_str(" [cursor=pointer]");
+        }
+    }
+    if let Some(bounds) = field("box") {
+        let part = |name: &str| bounds.get(name).map(Value::to_string).unwrap_or_default();
+        key.push_str(&format!(
+            " [box={},{},{},{}]",
+            part("x"),
+            part("y"),
+            part("width"),
+            part("height")
         ));
     }
-    lines
+    key
 }
 
-fn node_needs_ref(role: &str, name: &str) -> bool {
-    if matches!(role, "none" | "presentation" | "generic" | "rootwebarea") {
+fn js_space(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | '\n'
+            | '\u{b}'
+            | '\u{c}'
+            | '\r'
+            | ' '
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+fn js_number(text: &str) -> bool {
+    let text = text.trim_matches(js_space);
+    if text.is_empty() || matches!(text, "Infinity" | "+Infinity" | "-Infinity") {
+        return true;
+    }
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        let head = text.get(..2).map(str::to_ascii_lowercase);
+        if head.as_deref() == Some(prefix) {
+            let digits = &text[2..];
+            return !digits.is_empty() && digits.chars().all(|ch| ch.is_digit(radix));
+        }
+    }
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], Some(&unsigned[at + 1..])),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = |part: &str| part.chars().all(|ch| ch.is_ascii_digit());
+    if whole.is_empty() && fraction.is_empty() || !digits(whole) || !digits(fraction) {
         return false;
     }
-    !name.is_empty() || matches!(role, "textbox" | "button" | "link" | "checkbox" | "radio")
-}
-
-fn build_ref_selector(role: &str, name: &str) -> String {
-    let escaped = escape_css(name);
-    if role == "button" && !name.is_empty() {
-        return [
-            format!("button[aria-label=\"{escaped}\"]"),
-            format!("button[title=\"{escaped}\"]"),
-            format!("[role=\"button\"][aria-label=\"{escaped}\"]"),
-            format!("[role=\"button\"][title=\"{escaped}\"]"),
-            format!("input[type=\"button\"][value=\"{escaped}\"]"),
-            format!("input[type=\"submit\"][value=\"{escaped}\"]"),
-            format!("input[type=\"reset\"][value=\"{escaped}\"]"),
-        ]
-        .join(", ");
-    }
-    if role == "link" && !name.is_empty() {
-        return format!(
-            "a[aria-label=\"{escaped}\"], a[title=\"{escaped}\"], [role=\"link\"][aria-label=\"{escaped}\"], [role=\"link\"][title=\"{escaped}\"]"
-        );
-    }
-    if role == "textbox" {
-        if name.is_empty() {
-            return "input, textarea, [contenteditable]".to_string();
+    match exponent {
+        None => true,
+        Some(exponent) => {
+            let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+            !exponent.is_empty() && digits(exponent)
         }
-        return format!(
-            "input[aria-label=\"{escaped}\"], textarea[aria-label=\"{escaped}\"], [contenteditable][aria-label=\"{escaped}\"], input[placeholder=\"{escaped}\"], textarea[placeholder=\"{escaped}\"], [contenteditable][placeholder=\"{escaped}\"], input[title=\"{escaped}\"], textarea[title=\"{escaped}\"], [contenteditable][title=\"{escaped}\"]"
-        );
     }
-    if role == "checkbox" {
-        return "input[type=\"checkbox\"]".to_string();
-    }
-    if role == "radio" {
-        return "input[type=\"radio\"]".to_string();
-    }
-    if !name.is_empty() {
-        return format!("[aria-label=\"{escaped}\"], [title=\"{escaped}\"]");
-    }
-    format!("[role=\"{role}\"]")
 }
 
-pub fn escape_yaml(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let mut result = String::with_capacity(escaped.len());
-    for ch in escaped.chars() {
+fn needs_quotes(text: &str) -> bool {
+    let first = text.chars().next();
+    let Some(first) = first else {
+        return true;
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let last = chars[chars.len() - 1];
+    if js_space(first) || js_space(last) {
+        return true;
+    }
+    if chars.iter().any(|&ch| {
+        matches!(ch as u32, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f..=0x9f)
+    }) {
+        return true;
+    }
+    if first == '-' {
+        return true;
+    }
+    for (at, &ch) in chars.iter().enumerate() {
+        let next = chars.get(at + 1).copied();
+        if matches!(ch, '\n' | ':') && next.is_none_or(js_space) {
+            return true;
+        }
+        if js_space(ch) && next == Some('#') {
+            return true;
+        }
+        if matches!(ch, '\n' | '\r' | '{' | '}' | '`') {
+            return true;
+        }
+    }
+    if "&*],?!>|@\"'#%[".contains(first) {
+        return true;
+    }
+    js_number(text)
+        || ["y", "n", "yes", "no", "true", "false", "on", "off", "null"]
+            .contains(&text.to_lowercase().as_str())
+}
+
+pub fn yaml_key(text: &str) -> String {
+    if !needs_quotes(text) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+pub fn yaml_value(text: &str) -> String {
+    if !needs_quotes(text) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
         match ch {
-            '\n' => result.push_str("\\n"),
-            '\t' => result.push_str("\\t"),
-            '\x1b' => result.push_str("\\x1b"),
-            '\x07' => result.push_str("\\x07"),
-            '\r' => result.push_str("\\r"),
-            '\x7f' => result.push_str("\\x7f"),
-            c if c.is_control() && (c as u32) < 0x20 => {
-                result.push_str(&format!("\\x{:02x}", c as u32));
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if matches!(c as u32, 0x00..=0x1f | 0x7f..=0x9f) => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
             }
-            c if (0x80..=0x9f).contains(&(c as u32)) => {
-                result.push_str(&format!("\\u{{{:x}}}", c as u32));
-            }
-            _ => result.push(ch),
+            c => out.push(c),
         }
     }
-    result
-}
-
-fn escape_css(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-pub fn text_of(value: &serde_json::Value, fallback: &str) -> String {
-    match value {
-        serde_json::Value::Null => fallback.to_string(),
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Number(number) => number.to_string(),
-        serde_json::Value::Bool(flag) => flag.to_string(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| fallback.to_string()),
-    }
-}
-
-pub fn ax_from_cdp(nodes: &[serde_json::Value]) -> Vec<AxNode> {
-    use std::collections::HashMap;
-    let mut by_id: HashMap<String, &serde_json::Value> = HashMap::new();
-    for node in nodes {
-        if let Some(id) = node.get("nodeId").and_then(|v| v.as_str()) {
-            by_id.insert(id.to_string(), node);
-        }
-    }
-    let roots: Vec<String> = nodes
-        .iter()
-        .filter(|node| node.get("parentId").and_then(|v| v.as_str()).is_none())
-        .filter_map(|node| {
-            node.get("nodeId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect();
-    fn child_ids<'a>(node: &'a serde_json::Value) -> Vec<&'a str> {
-        node.get("childIds")
-            .and_then(|v| v.as_array())
-            .map(|ids| ids.iter().filter_map(|id| id.as_str()).collect())
-            .unwrap_or_default()
-    }
-    fn build(id: &str, by_id: &HashMap<String, &serde_json::Value>) -> Vec<AxNode> {
-        let Some(node) = by_id.get(id) else {
-            return Vec::new();
-        };
-        let mut children = Vec::new();
-        for child in child_ids(node) {
-            children.extend(build(child, by_id));
-        }
-        if node
-            .get("ignored")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            return children;
-        }
-        let role = node
-            .get("role")
-            .map(|v| text_of(v.get("value").unwrap_or(v), "unknown"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let name = node
-            .get("name")
-            .map(|v| text_of(v.get("value").unwrap_or(v), ""))
-            .unwrap_or_default();
-        let value = node
-            .get("value")
-            .map(|v| text_of(v.get("value").unwrap_or(v), ""))
-            .unwrap_or_default();
-        let backend_node_id = node.get("backendDOMNodeId").and_then(|v| v.as_u64());
-        vec![AxNode {
-            role,
-            name,
-            value,
-            backend_node_id,
-            children,
-        }]
-    }
-    roots.iter().flat_map(|id| build(id, &by_id)).collect()
+    out.push('"');
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -241,9 +417,9 @@ pub struct FrameRec {
     pub url: String,
 }
 
-pub fn flatten_frame_tree(tree: &serde_json::Value) -> Vec<FrameRec> {
+pub fn flatten_frame_tree(tree: &Value) -> Vec<FrameRec> {
     let mut out = Vec::new();
-    fn walk(node: &serde_json::Value, parent: Option<&str>, out: &mut Vec<FrameRec>) {
+    fn walk(node: &Value, parent: Option<&str>, out: &mut Vec<FrameRec>) {
         let Some(frame) = node.get("frame") else {
             return;
         };
@@ -273,286 +449,203 @@ pub fn flatten_frame_tree(tree: &serde_json::Value) -> Vec<FrameRec> {
     out
 }
 
-pub fn stitch_iframes(
-    content: &str,
-    base_url: &str,
-    frames: &[FrameRec],
-    mut render_frame: impl FnMut(&FrameRec, &str) -> Option<String>,
-) -> (String, Vec<(String, String)>) {
-    let children: Vec<&FrameRec> = frames
+pub fn child_options(options: Options, active: bool, iframe_depth: Option<i64>) -> Options {
+    Options {
+        focused: options.focused.map(|focused| focused && active),
+        depth: options
+            .depth
+            .filter(|depth| *depth != 0)
+            .map(|depth| depth - iframe_depth.unwrap_or(0) - 1),
+        boxes: options.boxes,
+    }
+}
+
+pub fn frame_prefix(frames: &[FrameRec], frame_id: &str, fallback: impl FnOnce() -> usize) -> String {
+    let seq = frames
         .iter()
-        .filter(|frame| frame.parent_frame_id.is_some())
-        .collect();
-    if children.is_empty() {
-        return (content.to_string(), Vec::new());
-    }
-    let mut stitched = Vec::new();
-    let mut matched = Vec::new();
-    let mut frame_index = 0u32;
-    let mut assigned = Vec::new();
-    for line in content.split('\n') {
-        stitched.push(line.to_string());
-        let Some(indent) = iframe_indent(line) else {
-            continue;
-        };
-        let Some(src) = iframe_src(line) else {
-            continue;
-        };
-        let Some(frame) = children.iter().copied().find(|frame| {
-            !matched.iter().any(|id: &String| id == &frame.frame_id)
-                && urls_match(&src, &frame.url, base_url)
-        }) else {
-            continue;
-        };
-        matched.push(frame.frame_id.clone());
-        frame_index += 1;
-        let prefix = format!("f{frame_index}");
-        if let Some(text) = render_frame(frame, &prefix) {
-            for child_line in text.split('\n') {
-                if child_line.is_empty() {
-                    continue;
-                }
-                stitched.push(format!("{indent}  {child_line}"));
-            }
-            assigned.push((prefix, frame.frame_id.clone()));
-        }
-    }
-    (stitched.join("\n"), assigned)
-}
-
-fn iframe_indent(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with("- iframe") {
-        return None;
-    }
-    let rest = &trimmed["- iframe".len()..];
-    if rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':') {
-        let indent_len = line.len() - trimmed.len();
-        Some(line[..indent_len].to_string())
+        .position(|frame| frame.frame_id == frame_id)
+        .unwrap_or_else(fallback);
+    if seq == 0 {
+        String::new()
     } else {
-        None
+        format!("f{seq}")
     }
 }
 
-fn iframe_src(line: &str) -> Option<String> {
-    let marker = ": \"";
-    let start = line.rfind(marker)? + marker.len();
-    let end = line[start..].rfind('"')? + start;
-    Some(unescape_yaml(&line[start..end]))
-}
-
-fn unescape_yaml(value: &str) -> String {
-    let mut out = String::new();
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some(other) => out.push(other),
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn urls_match(src: &str, frame_url: &str, base: &str) -> bool {
-    normalize_url(src, Some(base))
-        .zip(normalize_url(frame_url, None))
-        .map(|(left, right)| left == right)
-        .unwrap_or(false)
-        || src == frame_url
-}
-
-fn normalize_url(raw: &str, base: Option<&str>) -> Option<String> {
-    let absolute = if raw.contains("://") {
-        raw.to_string()
-    } else if let Some(base) = base {
-        join_url(base, raw)?
-    } else {
-        return None;
-    };
-    let (scheme_host, rest) = split_origin(&absolute)?;
-    let rest = rest.split('#').next().unwrap_or(rest);
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let path = path.trim_end_matches('/');
-    if query.is_empty() {
-        Some(format!("{scheme_host}{path}"))
-    } else {
-        Some(format!("{scheme_host}{path}?{query}"))
-    }
-}
-
-fn split_origin(url: &str) -> Option<(&str, &str)> {
-    let idx = url.find("://")?;
-    let after = idx + 3;
-    let slash = url[after..]
-        .find('/')
-        .map(|pos| after + pos)
-        .unwrap_or(url.len());
-    Some((&url[..slash], &url[slash..]))
-}
-
-fn join_url(base: &str, raw: &str) -> Option<String> {
-    if raw.starts_with('/') {
-        let (origin, _) = split_origin(base)?;
-        return Some(format!("{origin}{raw}"));
-    }
-    let (origin, path) = split_origin(base)?;
-    let path = path.split('?').next().unwrap_or(path);
-    let path = path.split('#').next().unwrap_or(path);
-    let dir = match path.rfind('/') {
-        Some(pos) => &path[..=pos],
-        None => "/",
-    };
-    Some(format!("{origin}{dir}{raw}"))
-}
-
-pub fn tag_frame_refs(refs: &mut BTreeMap<String, RefRec>, frame_id: &str, prefix: &str) {
-    for (id, rec) in refs.iter_mut() {
-        if id.starts_with(prefix) {
-            rec.frame_id = Some(frame_id.to_string());
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn node(role: &str, name: &str, children: Vec<AxNode>) -> AxNode {
-        AxNode {
-            role: role.to_string(),
-            name: name.to_string(),
-            value: String::new(),
-            backend_node_id: None,
-            children,
+    fn fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/integration/fixtures/snapshot")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    #[test]
+    fn renders_upstream_json_exactly_as_upstream_prints_it() {
+        for name in ["example", "forms", "links", "frames"] {
+            let json: Value = serde_json::from_str(&fixture(&format!("{name}.upstream.json"))).unwrap();
+            let yaml = fixture(&format!("{name}.upstream.yml"));
+            assert_eq!(render(json.as_array().unwrap()), yaml.trim_end_matches('\n'), "{name}");
         }
     }
 
     #[test]
-    fn refs_are_e1_e2_and_skip_generic() {
-        let tree = node(
-            "RootWebArea",
-            "Example",
-            vec![
-                node("generic", "", vec![node("button", "Submit", vec![])]),
-                node("link", "Home", vec![]),
-                node("textbox", "Search", vec![]),
-            ],
-        );
-        let (text, refs) = render_tree(&tree, "");
-        assert!(text.contains("button \"Submit\" [ref=e1]"));
-        assert!(text.contains("link \"Home\" [ref=e2]"));
-        assert!(text.contains("textbox \"Search\" [ref=e3]"));
-        assert!(refs.contains_key("e1"));
-        assert!(!text.contains("[ref=e0]"));
-    }
-
-    #[test]
-    fn iframe_prefix_reaches_f1e5() {
-        let mut children = Vec::new();
-        for name in ["A", "B", "C", "D", "E"] {
-            children.push(node("button", name, vec![]));
-        }
-        let tree = node("RootWebArea", "Frame", children);
-        let (text, refs) = render_tree(&tree, "f1");
-        assert!(text.contains("[ref=f1e5]"));
-        assert!(refs.contains_key("f1e5"));
-        assert!(!refs.contains_key("e5"));
-    }
-
-    #[test]
-    fn non_string_value_renders() {
-        let tree = AxNode {
-            role: "textbox".to_string(),
-            name: "{\"label\":\"Message\"}".to_string(),
-            value: "0".to_string(),
-            backend_node_id: Some(44),
-            children: vec![],
-        };
-        let (text, refs) = render_tree(&tree, "");
-        assert!(text.contains("textbox"));
-        assert!(text.contains("Message"));
-        assert!(text.contains("[ref=e1]"));
-        assert!(text.contains(": \"0\""));
-        assert_eq!(refs["e1"].backend_node_id, Some(44));
+    fn keys_carry_every_upstream_attribute() {
+        let node = json!({
+            "role": "checkbox", "name": "A", "checked": "mixed", "disabled": true, "expanded": true,
+            "active": true, "invalid": "spelling", "level": 2, "pressed": true, "selected": true,
+            "ariaHidden": true, "ref": "e1", "cursor": "pointer",
+            "box": { "x": 1, "y": 2, "width": 3, "height": 4 }
+        });
         assert_eq!(
-            refs["e1"].label.as_deref(),
-            Some("textbox \"{\\\"label\\\":\\\"Message\\\"}\"")
+            render(&[node]),
+            "- checkbox \"A\" [checked=mixed] [disabled] [expanded] [active] [invalid=spelling] [level=2] [pressed] [selected] [aria-hidden] [ref=e1] [cursor=pointer] [box=1,2,3,4]"
         );
+        let plain = json!({ "role": "button", "checked": true, "invalid": true, "pressed": "mixed", "level": 0, "ref": "" });
+        assert_eq!(render(&[plain]), "- button [checked] [invalid] [pressed=mixed]");
+        let long = json!({ "role": "img", "name": "x".repeat(901), "cursor": "pointer" });
+        assert_eq!(render(&[long]), "- img");
     }
 
     #[test]
-    fn ref_label_quotes_the_name_and_caps_at_80() {
-        let tree = node("button", "Sign in", vec![]);
-        let (_, refs) = render_tree(&tree, "");
-        assert_eq!(refs["e1"].label.as_deref(), Some("button \"Sign in\""));
-        let quoted = node("button", "Say \"hi\"", vec![]);
-        let (_, refs) = render_tree(&quoted, "");
-        assert_eq!(
-            refs["e1"].label.as_deref(),
-            Some("button \"Say \\\"hi\\\"\"")
-        );
-        let long = "é".repeat(90);
-        let wide = node("button", &long, vec![]);
-        let (_, refs) = render_tree(&wide, "");
-        let label = refs["e1"].label.clone().unwrap();
-        assert_eq!(label.chars().count(), 80);
-        assert!(label.starts_with("button \""));
-        let bare = node("textbox", "", vec![]);
-        let (_, refs) = render_tree(&bare, "");
-        assert!(refs["e1"].label.is_none());
-    }
-
-    #[test]
-    fn stitch_inserts_child_frame_under_iframe_line() {
-        let content = "- RootWebArea \"Page\"\n  - iframe \"Ad\": \"https://cdn.example/ad\"";
-        let frames = vec![
-            FrameRec {
-                frame_id: "main".to_string(),
-                parent_frame_id: None,
-                url: "https://example.com/".to_string(),
-            },
-            FrameRec {
-                frame_id: "child".to_string(),
-                parent_frame_id: Some("main".to_string()),
-                url: "https://cdn.example/ad".to_string(),
-            },
+    fn text_children_props_and_top_level_text_render_like_upstream() {
+        let nodes = [
+            json!({ "role": "text", "text": "top" }),
+            json!({ "role": "text" }),
+            json!({ "role": "textbox", "placeholder": "Find", "text": "abc" }),
+            json!({ "role": "link", "url": "/a", "children": ["one", { "role": "img", "name": "Logo" }] }),
         ];
-        let (text, assigned) =
-            stitch_iframes(content, "https://example.com/", &frames, |_, prefix| {
-                Some(format!("- button \"Go\" [ref={prefix}e5]"))
-            });
-        assert!(text.contains("[ref=f1e5]"));
-        assert_eq!(assigned, vec![("f1".to_string(), "child".to_string())]);
+        assert_eq!(
+            render(&nodes),
+            "- text: top\n- text: \"\"\n- textbox:\n  - /placeholder: Find\n  - text: abc\n- link:\n  - /url: /a\n  - text: one\n  - img \"Logo\""
+        );
     }
 
     #[test]
-    fn escape_yaml_sanitizes_control_chars() {
-        assert_eq!(escape_yaml("hello\x1bworld"), "hello\\x1bworld");
-        assert_eq!(escape_yaml("bell\x07here"), "bell\\x07here");
-        assert_eq!(escape_yaml("cr\rhere"), "cr\\rhere");
-        assert_eq!(escape_yaml("del\x7fhere"), "del\\x7fhere");
-        assert_eq!(escape_yaml("c1\u{0080}here"), "c1\\u{80}here");
-        assert_eq!(escape_yaml("tab\there"), "tab\\there");
+    fn yaml_quoting_follows_upstream_rules() {
+        for (text, quoted) in [
+            ("plain words", false),
+            ("", true),
+            (" lead", true),
+            ("trail\u{3000}", true),
+            ("bell\u{7}", true),
+            ("c1\u{85}x", true),
+            ("-dash", true),
+            ("key: value", true),
+            ("ends:", true),
+            ("a:b", false),
+            ("line\nbreak", true),
+            ("cr\rhere", true),
+            ("x #tag", true),
+            ("x#tag", false),
+            ("&anchor", true),
+            ("[list", true),
+            ("brace{", true),
+            ("tick`", true),
+            ("Yes", true),
+            ("null", true),
+            ("12", true),
+            ("-3.5e+2", true),
+            (".5", true),
+            ("5.", true),
+            ("1e", false),
+            ("e5", false),
+            (".", false),
+            ("0x1F", true),
+            ("0b102", false),
+            ("0o17", true),
+            ("0x", false),
+            ("+Infinity", true),
+            ("1.2.3", false),
+            ("1e+", false),
+        ] {
+            assert_eq!(needs_quotes(text), quoted, "{text:?}");
+        }
+        assert_eq!(yaml_value("a\\\"\u{8}\u{c}\n\r\t\u{1}\u{9f}é"), "\"a\\\\\\\"\\b\\f\\n\\r\\t\\x01\\x9fé\"");
+        assert_eq!(yaml_value("fine"), "fine");
+        assert_eq!(yaml_key("it's: x"), "'it''s: x'");
+        assert_eq!(yaml_key("fine"), "fine");
     }
 
     #[test]
-    fn snapshot_escapes_terminal_injection_in_name() {
-        let node = AxNode {
-            role: "button".to_string(),
-            name: "Click \x1b[2J me".to_string(),
-            value: String::new(),
-            backend_node_id: Some(1),
-            children: vec![],
-        };
-        let (text, _refs) = render_tree(&node, "");
-        assert!(!text.contains('\x1b'), "{text}");
-        assert!(text.contains("\\x1b"), "{text}");
+    fn links_are_redacted_like_every_other_url() {
+        let guard = Protected::default();
+        let base = "http://127.0.0.1:1/snapshot/links.html";
+        crate::sanitize::set_full_urls(false);
+        assert_eq!(link("https://seven.sliccy.ai/os/?k=SECRET#inbox", base, &guard), "https://seven.sliccy.ai");
+        assert_eq!(link("//vault.sliccy.ai/v/item?x=SECRET", base, &guard), "http://vault.sliccy.ai");
+        assert_eq!(link("/x?y=SECRET", "https://seven.sliccy.ai", &guard), "https://seven.sliccy.ai");
+        assert_eq!(link("/next?page=3#top", base, &guard), "/next?page=\u{2026}#\u{2026}");
+        assert_eq!(link("https://example.org/a?token=SECRET#frag", base, &guard), "https://example.org/a?token=\u{2026}#\u{2026}");
+        assert_eq!(link("relative", "", &guard), "relative");
+        assert_eq!(link("about:blank#x", base, &guard), "about:blank#\u{2026}");
+        crate::sanitize::set_full_urls(true);
+        assert_eq!(link("/next?page=3", base, &guard), "/next?page=3");
+        assert_eq!(link("https://seven.sliccy.ai/os/?k=SECRET", base, &guard), "https://seven.sliccy.ai");
+        crate::sanitize::set_full_urls(false);
+        let mut nodes = vec![json!({ "role": "list", "children": ["x", { "role": "link", "url": "/a?b=SECRET" }] })];
+        redact_links(&mut nodes, base, &guard);
+        assert_eq!(nodes[0]["children"][1]["url"], "/a?b=\u{2026}");
+    }
+
+    #[test]
+    fn captures_parse_and_index_their_refs() {
+        assert!(parse_capture(&Value::Null).is_err());
+        let capture = parse_capture(&json!({
+            "json": [{ "role": "generic", "ref": "e1", "children": ["t", { "role": "button", "name": "Say \"hi\"\n", "ref": "e2" }] }],
+            "refs": [{ "ref": "e1", "selector": ":root > :nth-child(2)" }, { "ref": "e2" }, { "selector": "x" }],
+            "iframeDepths": { "e2": 1, "e3": "x" },
+            "base": "http://h/"
+        }))
+        .unwrap();
+        assert_eq!(capture.refs.len(), 2);
+        assert_eq!(capture.refs[1].selector, "");
+        assert_eq!(capture.base, "http://h/");
+        assert_eq!(capture.iframe_depths, BTreeMap::from([("e2".to_string(), 1)]));
+        let labels = labels(&capture.json);
+        assert_eq!(labels["e1"], None);
+        assert_eq!(labels["e2"].as_deref(), Some("button \"Say \\\"hi\\\"\\n\""));
+        let mut nodes = capture.json.clone();
+        assert_eq!(find_mut(&mut nodes, "e2").unwrap()["role"], "button");
+        assert!(find_mut(&mut nodes, "e9").is_none());
+        assert_eq!(parse_capture(&json!({ "json": [] })).unwrap().base, "");
+    }
+
+    #[test]
+    fn labels_escape_and_cap_at_80() {
+        assert_eq!(ref_label("button", ""), None);
+        assert_eq!(ref_label("button", "a\tb\r\u{1b}").as_deref(), Some("button \"a\\tb\\r\\u{1b}\""));
+        let label = ref_label("button", &"é".repeat(90)).unwrap();
+        assert_eq!(label.chars().count(), 80);
+    }
+
+    #[test]
+    fn frames_number_like_the_frame_tree_and_the_script_gets_its_options() {
+        let frames = flatten_frame_tree(&json!({ "frameTree": {
+            "frame": { "id": "M", "url": "http://h/" },
+            "childFrames": [{ "frame": { "id": "C" } }, { "frame": {} }, { "nope": 1 }]
+        }}));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].parent_frame_id.as_deref(), Some("M"));
+        assert_eq!(frames[1].url, "");
+        assert!(flatten_frame_tree(&json!({})).is_empty());
+        assert_eq!(flatten_frame_tree(&json!({ "frame": { "id": "X" } })).len(), 1);
+        assert_eq!(frame_prefix(&frames, "M", || 9), "");
+        assert_eq!(frame_prefix(&frames, "C", || 9), "f1");
+        assert_eq!(frame_prefix(&frames, "Z", || 9), "f9");
+        let options = Options { focused: Some(false), depth: Some(3), boxes: true };
+        let expression = expression("f1", options);
+        assert!(expression.starts_with(SCRIPT));
+        assert!(expression.ends_with(&format!(
+            "\nsliccAriaSnapshot({{\"boxes\":true,\"depth\":3,\"focused\":false,\"key\":\"{ELEMENTS_KEY}\",\"prefix\":\"f1\"}})"
+        )));
+        assert_eq!(child_options(options, true, Some(1)), Options { focused: Some(false), depth: Some(1), boxes: true });
+        let top = Options { focused: Some(true), depth: Some(0), boxes: false };
+        assert_eq!(child_options(top, true, None), Options { focused: Some(true), depth: None, boxes: false });
+        assert_eq!(child_options(Options::default(), false, Some(2)), Options::default());
     }
 }

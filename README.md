@@ -43,6 +43,8 @@ curlwright -i https://example.com/
 
 Seven's origins, the vault, browser pages, extensions and local files are always off limits.
 
+`snapshot` prints the same tree as `@playwright/cli`: the same role names and refs, with `[active]`, `[cursor=pointer]` and `/url:`. It runs Playwright's own aria snapshot code, taken from `playwright-core` 1.64 (Apache-2.0, Copyright Microsoft Corporation), in an isolated world, in `crates/playwright-cli/src/aria-snapshot.js`. A `/url:` is redacted like every other URL: a protected origin shows only its origin, and query values, fragments and credentials show as `…` unless `--full-urls` is given.
+
 ## Develop
 
 ```sh
@@ -100,7 +102,6 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Input`
 - `Network`
 - `Fetch`
-- `Accessibility`
 
 ## Crates
 
