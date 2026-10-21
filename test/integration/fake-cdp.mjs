@@ -72,6 +72,7 @@ export async function fakeCdp({
   refusalMessage,
   noisyRefusal = false,
   childFrames = [],
+  intercept,
 } = {}) {
   const calls = [];
   const targets = [];
@@ -113,6 +114,7 @@ export async function fakeCdp({
       const event = (name, eventParams) =>
         send({ method: name, params: eventParams, ...(sessionId ? { sessionId } : {}) });
       const target = sessionId ? sessions.get(sessionId) : undefined;
+      if (intercept?.(message, send)) return;
       if (method === 'Slicc.action') clearInterval(noise);
       if (refuse.includes(method)) {
         send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
