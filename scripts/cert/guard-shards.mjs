@@ -1,3 +1,5 @@
+import { actualFailure, incompleteExecution } from './execution-failure.mjs';
+
 const partitions = [
   { id: 'a', targets: ['seven', 'ordinary', 'chrome-newtab', 'chrome-passwords'] },
   { id: 'b', targets: ['vault', 'chrome-new-tab-page', 'chrome-settings'] },
@@ -37,7 +39,10 @@ export function guardShardPlan(set) {
 }
 
 function checkRows(report, shard, issues) {
-  const actual = Array.isArray(report?.results) ? report.results.map(guardRowKey).sort() : null;
+  const actual =
+    Array.isArray(report?.results) && report.results.every((row) => row && typeof row === 'object')
+      ? report.results.map(guardRowKey).sort()
+      : null;
   if (
     !actual ||
     new Set(actual).size !== actual.length ||
@@ -68,7 +73,11 @@ function checkBinding(plan, shard, document, issues) {
 }
 
 export function guardSetupTimeoutCount(report) {
-  if (!Array.isArray(report?.results)) return null;
+  if (
+    !Array.isArray(report?.results) ||
+    report.results.some((row) => !row || typeof row !== 'object')
+  )
+    return null;
   const setupError =
     /CDP timeout Target\.(createTarget|attachToTarget)|debugging port.*did not answer|browser websocket failed/i;
   return report.results.filter((row) =>
@@ -78,9 +87,12 @@ export function guardSetupTimeoutCount(report) {
 
 function checkExecution(shard, document, report, issues) {
   const status = document.suite?.status;
-  if (status === 'INCOMPLETE' || !document.suite)
-    issues.incomplete.push('guard shard ' + shard.id + ' execution incomplete');
-  else if (status === 'FAIL' || (report && report.pass === false))
+  const unavailable =
+    status === 'INCOMPLETE' ||
+    !document.suite ||
+    (status === 'FAIL' && incompleteExecution(document.suite) && !actualFailure(document.suite));
+  if (unavailable) issues.incomplete.push('guard shard ' + shard.id + ' execution incomplete');
+  if (actualFailure(document.suite) || (!unavailable && report && report.pass === false))
     issues.failures.push('guard shard ' + shard.id + ' failed');
   else if (status !== 'PASS')
     issues.incomplete.push('guard shard ' + shard.id + ' execution status unavailable');
@@ -113,6 +125,10 @@ export function recordGuardShards(plan, documents) {
   )
     issues.failures.push('guard shard plan does not partition the full row universe');
   for (const document of documents) {
+    if (!document || typeof document !== 'object') {
+      issues.incomplete.push('guard shard document unavailable');
+      continue;
+    }
     const shard = plan.shards.find((shard) => shard.id === document.id);
     if (!shard || seen.has(document.id)) {
       issues.failures.push('unknown or duplicate guard shard ' + document.id);

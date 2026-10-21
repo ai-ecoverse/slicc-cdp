@@ -79,7 +79,7 @@ for (const transport of ['native', 'wasi']) {
               },
             };
           },
-          log: (row) => console.log(JSON.stringify({ transport, ...row })),
+          log: (row) => console.log(JSON.stringify({ ...row, transport })),
         });
         const report = summary({
           set: rowSet,
@@ -93,10 +93,15 @@ for (const transport of ['native', 'wasi']) {
         console.log(`C2-FOCUS ${report.line}`);
         {
           const rows = report.results.filter((row) => row.id === id);
-          assert.equal(
-            rows.length,
-            Object.keys(selected.variants).length,
-            `${id}: variants missing`
+          const expected = rowSet.vectors.flatMap((vector) =>
+            vector.targets.flatMap((target) =>
+              Object.keys(rowSet.variants).map((variant) => `${target}/${variant}`)
+            )
+          );
+          assert.deepEqual(
+            rows.map((row) => `${row.target}/${row.variant}`).sort(),
+            expected.sort(),
+            `${id}: target or variant missing or duplicated`
           );
           for (const row of rows)
             assert.deepEqual(

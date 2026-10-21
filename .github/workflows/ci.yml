@@ -87,12 +87,12 @@ jobs:
         run: |
           if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
           npm run -s browser -- $deps
-      - name: Native and WASI CLI redirect refusal and ordinary recovery
-        run: node --test --test-concurrency=1 --test-reporter=spec test/integration/redirect-navigation.test.mjs
-        env:
-          SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
       - name: Native and WASI published C2 redirect controls and fragments
         run: node --test --test-concurrency=1 --test-reporter=spec test/integration/guard-c2-redirect.test.mjs
+        env:
+          SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
+      - name: Native and WASI CLI redirect refusal and ordinary recovery
+        run: node --test --test-concurrency=1 --test-reporter=spec test/integration/redirect-navigation.test.mjs
         env:
           SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
       - run: node scripts/gate.mjs integration -- npm run test:integration

@@ -337,6 +337,17 @@ export function referenceCorpus(pin) {
   return identity;
 }
 
+export function referenceVectors(corpus) {
+  const pin = { version: corpus.version, integrity: corpus.integrity };
+  const identity = referenceCorpus(pin);
+  const bytes = readFileSync(
+    path.join(root, '.cert/execution-corpus', pin.version, 'package/guard-vectors.json')
+  );
+  if (hash(bytes) !== identity.sha256 || identity.sha256 !== corpus.sha256)
+    throw integrity('reference vector bytes differ from independently checked corpus');
+  return JSON.parse(bytes);
+}
+
 export function expectedExecutionIdentity(
   subject,
   harness,
@@ -422,6 +433,19 @@ function completeIdentity(actual) {
   );
 }
 
+function validateShardIdentities(execution, expected, label, emit) {
+  if (Array.isArray(execution.shards)) {
+    for (const shard of execution.shards) {
+      if (!completeIdentity(shard.suite?.identity))
+        emit('INCOMPLETE', `${label}: shard ${shard.id} validated identity absent`);
+      else if (!isDeepStrictEqual(shard.suite.identity, expected))
+        emit('FAIL', `${label}: shard ${shard.id} execution identity differs`);
+    }
+    if (execution.native)
+      validateExecutionIdentity(execution.native, expected, `${label} native`, emit);
+  }
+}
+
 export function validateExecutionIdentity(execution, expected, label, emit) {
   const actual = execution?.identity;
   if (
@@ -436,6 +460,7 @@ export function validateExecutionIdentity(execution, expected, label, emit) {
   }
   if (!isDeepStrictEqual(actual, expected))
     emit('FAIL', `${label}: execution identity differs from independent source/corpus`);
+  validateShardIdentities(execution, expected, label, emit);
   const reports = [
     execution.guardReport?.report,
     ...(Array.isArray(execution.attempts) ? execution.attempts : []).flatMap((attempt) =>

@@ -1,5 +1,9 @@
 import { isDeepStrictEqual } from 'node:util';
 import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
+import { actualFailure, incompleteExecution } from './execution-failure.mjs';
+import { guardEvidenceProtocol, guardToolsProtocol } from './guard-protocol.mjs';
+import { aggregateGuardReports } from './guard-shard-report.mjs';
+import { guardShardPlan } from './guard-shards.mjs';
 import { biosFindings } from './pr-bios-result.mjs';
 
 export function validateSuite(execution, label, emit, candidate = true) {
@@ -16,17 +20,7 @@ export function validateSuite(execution, label, emit, candidate = true) {
     emit('INCOMPLETE', `${label}: execution absent`);
     return;
   }
-  if (
-    execution.status === 'INCOMPLETE' ||
-    execution.missing?.length ||
-    execution.rows.some(
-      (row) =>
-        row.skip ||
-        row.todo ||
-        ['cancelledByParent', 'testTimeoutFailure'].includes(row.failureType)
-    )
-  )
-    emit('INCOMPLETE', `${label}: unfinished/skipped worker`);
+  if (incompleteExecution(execution)) emit('INCOMPLETE', `${label}: unfinished/skipped worker`);
   for (const file of execution.files) {
     if (
       !execution.rows.some(
@@ -38,11 +32,7 @@ export function validateSuite(execution, label, emit, candidate = true) {
     )
       emit('INCOMPLETE', `${label}: missing worker ${file}`);
   }
-  if (
-    candidate &&
-    (execution.status === 'FAIL' || execution.rows.some((row) => row.type === 'test:fail'))
-  )
-    emit('FAIL', `${label}: candidate failed`);
+  if (candidate && actualFailure(execution)) emit('FAIL', `${label}: candidate failed`);
 }
 
 function validateGuardRows(report, leg, vectors, emit) {
@@ -69,12 +59,43 @@ function validateGuardRows(report, leg, vectors, emit) {
   }
 }
 
+function validateGuardShards(execution, subject, plan, vectors, leg, emit, producingTools) {
+  const protocol = guardEvidenceProtocol(execution, producingTools);
+  if (protocol === 'LEGACY') return;
+  if (protocol !== 'CURRENT') {
+    emit('INCOMPLETE', `guard ${leg}: current shard protocol or verified legacy evidence absent`);
+    return;
+  }
+  const expectedPlan = { ...guardShardPlan(vectors), head: subject.commit, run: plan.run };
+  if (!isDeepStrictEqual(execution.guardShards.plan, expectedPlan))
+    emit('INCOMPLETE', `guard ${leg}: shard plan contradicts independent corpus/source`);
+  if (!Array.isArray(execution.shards)) emit('INCOMPLETE', `guard ${leg}: shard executions absent`);
+  else {
+    const aggregate = aggregateGuardReports(vectors, expectedPlan, execution.shards);
+    for (const reason of aggregate.coverage.incomplete)
+      emit('INCOMPLETE', `guard ${leg}: ${reason}`);
+    for (const reason of aggregate.coverage.failures)
+      if (
+        leg === 'positive' ||
+        !/^guard shard [a-d] failed$|^guard shard rows failed$/.test(reason)
+      )
+        emit('FAIL', `guard ${leg}: ${reason}`);
+    if (
+      !isDeepStrictEqual(execution.report, aggregate.report) ||
+      !isDeepStrictEqual(execution.guardReport?.report, aggregate.report)
+    )
+      emit('FAIL', `guard ${leg}: aggregate differs from captured shard rows`);
+  }
+}
+
 export function validateGuard(guard, plan, vectors, emit) {
+  const producingTools = guardToolsProtocol(plan.tools);
   for (const leg of ['positive', 'negative']) {
     const execution = guard?.executions?.[leg];
     const subject =
       leg === 'positive' ? { version: plan.version, commit: plan.commit } : plan.baseline;
     validateSuite(execution, `guard ${leg}`, emit, leg === 'positive');
+    validateGuardShards(execution, subject, plan, vectors, leg, emit, producingTools);
     const report = execution?.report;
     if (
       !Array.isArray(report?.results) ||
