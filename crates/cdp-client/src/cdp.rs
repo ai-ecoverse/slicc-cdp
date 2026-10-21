@@ -57,6 +57,7 @@ pub struct Cdp {
     guards: BTreeMap<String, String>,
     guard_sessions: BTreeSet<String>,
     guarding: BTreeSet<String>,
+    probing: BTreeSet<String>,
     abandoned: BTreeSet<String>,
     unguarded_optional: BTreeMap<String, BTreeSet<String>>,
     notices: Vec<String>,
@@ -103,6 +104,7 @@ impl Cdp {
             guards: BTreeMap::new(),
             guard_sessions: BTreeSet::new(),
             guarding: BTreeSet::new(),
+            probing: BTreeSet::new(),
             abandoned: BTreeSet::new(),
             unguarded_optional: BTreeMap::new(),
             notices: Vec::new(),
@@ -632,6 +634,9 @@ impl Cdp {
         };
         if info.is_object() {
             self.targets.insert(target_id.to_string(), info.clone());
+            if self.documents.get(target_id).is_some_and(|doc| doc.probed) {
+                self.documents.remove(target_id);
+            }
             self.probe_error(&info);
         }
         let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -992,10 +997,14 @@ impl Cdp {
         {
             return;
         }
+        self.probing.insert(target.clone());
         self.guarding.insert(target.clone());
         let attached = self.raw_call("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None, OPTIONAL_STEP);
         self.guarding.remove(&target);
-        let Some(session) = attached.ok().map(|value| text(&value, "sessionId")).filter(|session| !session.is_empty()) else { return };
+        let Some(session) = attached.ok().map(|value| text(&value, "sessionId")).filter(|session| !session.is_empty()) else {
+            self.probing.remove(&target);
+            return;
+        };
         self.guard_sessions.insert(session.clone());
         let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&session), OPTIONAL_STEP).ok()
             .and_then(|tree| tree.pointer("/frameTree/frame").cloned())
@@ -1005,6 +1014,7 @@ impl Cdp {
             None => None,
         };
         let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session }), None, OPTIONAL_STEP);
+        self.probing.remove(&target);
         let (Some(frame), Some(history)) = (frame, history) else { return };
         if self.documents.contains_key(&target) || !self.ordinary_history(&history, &url) {
             return;
@@ -1277,7 +1287,7 @@ impl Cdp {
                 if !target.is_empty() {
                     self.targets.insert(target.clone(), info.clone());
                 }
-                if self.info_protected(&info, &[]) && !self.documents.contains_key(&target) {
+                if self.info_protected(&info, &[]) && !self.documents.contains_key(&target) && !self.probing.contains(&target) {
                     self.protect_target(&target);
                 }
                 if self.info_protected(&info, &[]) || self.discovery_redacted(&info) {
@@ -1290,7 +1300,11 @@ impl Cdp {
             }
             "Target.attachedToTarget" => {
                 if let Some(info) = params.get("targetInfo") {
-                    value["params"]["targetInfo"] = self.redact(info, &[]);
+                    value["params"]["targetInfo"] = if info.get("targetId").and_then(Value::as_str).is_some_and(|target| self.probing.contains(target)) {
+                        shield::redacted(info)
+                    } else {
+                        self.redact(info, &[])
+                    };
                 }
             }
             "Target.targetDestroyed" => {

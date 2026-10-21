@@ -137,58 +137,60 @@ test('a caller-observed recovery from an error page stays drivable when the guar
   }
 });
 
-test('a fresh playwright-cli recovers an ordinary tab from a protected error page and still refuses one with protected history', {
-  timeout: 60_000,
-}, async () => {
-  const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-error-page-'));
-  const fake = await fakeCdp();
-  const pw = (args) => run(['--cdp', fake.url, ...args], home);
-  const start = 'http://ordinary.example/doc';
-  const failed = 'https://seven.sliccy.ai/auth/callback?code=MARK#access_token=MARK';
-  const errored = (tab, entries) => {
-    tab.url = failed;
-    tab.frame = {
-      id: tab.targetId,
-      loaderId: 'LERR',
-      url: ERROR_PAGE,
-      securityOrigin: '://',
-      unreachableUrl: failed,
+for (const attachEvents of [false, true]) {
+  test(`a fresh playwright-cli recovers an ordinary tab from a protected error page and still refuses one with protected history${attachEvents ? ', with attach events' : ''}`, {
+    timeout: 60_000,
+  }, async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-error-page-'));
+    const fake = await fakeCdp({ attachEvents });
+    const pw = (args) => run(['--cdp', fake.url, ...args], home);
+    const start = 'http://ordinary.example/doc';
+    const failed = 'https://seven.sliccy.ai/auth/callback?code=MARK#access_token=MARK';
+    const errored = (tab, entries) => {
+      tab.url = failed;
+      tab.frame = {
+        id: tab.targetId,
+        loaderId: 'LERR',
+        url: ERROR_PAGE,
+        securityOrigin: '://',
+        unreachableUrl: failed,
+      };
+      tab.history = { currentIndex: entries.length - 1, entries };
     };
-    tab.history = { currentIndex: entries.length - 1, entries };
-  };
-  const entry = (id, url, transitionType = 'typed') => ({
-    id,
-    url,
-    userTypedURL: url,
-    title: url,
-    transitionType,
-  });
-  try {
-    const opened = await pw(['open', start]);
-    assert.equal(opened.code, 0, opened.stderr);
-    const [tab] = fake.targets;
-    errored(tab, [entry(1, start), entry(2, failed)]);
-    const destination = 'http://ordinary.example/recovered';
-    const recovered = await pw(['goto', destination, '--tab', tab.targetId]);
-    assert.equal(recovered.code, 0, recovered.stderr);
-    assert.doesNotMatch(`${recovered.stdout}${recovered.stderr}`, /MARK/);
-    assert.equal(tab.url, destination);
-    const body = await pw(['eval', 'document.body.textContent', '--tab', tab.targetId]);
-    assert.equal(body.code, 0, body.stderr);
+    const entry = (id, url, transitionType = 'typed') => ({
+      id,
+      url,
+      userTypedURL: url,
+      title: url,
+      transitionType,
+    });
+    try {
+      const opened = await pw(['open', start]);
+      assert.equal(opened.code, 0, opened.stderr);
+      const [tab] = fake.targets;
+      errored(tab, [entry(1, start), entry(2, failed)]);
+      const destination = 'http://ordinary.example/recovered';
+      const recovered = await pw(['goto', destination, '--tab', tab.targetId]);
+      assert.equal(recovered.code, 0, recovered.stderr);
+      assert.doesNotMatch(`${recovered.stdout}${recovered.stderr}`, /MARK/);
+      assert.equal(tab.url, destination);
+      const body = await pw(['eval', 'document.body.textContent', '--tab', tab.targetId]);
+      assert.equal(body.code, 0, body.stderr);
 
-    for (const entries of [
-      [entry(1, failed)],
-      [entry(1, 'https://seven.sliccy.ai/'), entry(2, start), entry(3, failed)],
-      [entry(1, start), entry(2, failed, 'reload')],
-    ]) {
-      errored(tab, entries);
-      const refused = await pw(['goto', destination, '--tab', tab.targetId]);
-      assert.notEqual(refused.code, 0, JSON.stringify(entries));
-      assert.match(refused.stderr, new RegExp(SEVEN), refused.stderr);
-      assert.equal(tab.url, failed);
+      for (const entries of [
+        [entry(1, failed)],
+        [entry(1, 'https://seven.sliccy.ai/'), entry(2, start), entry(3, failed)],
+        [entry(1, start), entry(2, failed, 'reload')],
+      ]) {
+        errored(tab, entries);
+        const refused = await pw(['goto', destination, '--tab', tab.targetId]);
+        assert.notEqual(refused.code, 0, JSON.stringify(entries));
+        assert.match(refused.stderr, new RegExp(SEVEN), refused.stderr);
+        assert.equal(tab.url, failed);
+      }
+    } finally {
+      await fake.close();
+      await rm(home, { recursive: true, force: true });
     }
-  } finally {
-    await fake.close();
-    await rm(home, { recursive: true, force: true });
-  }
-});
+  });
+}
