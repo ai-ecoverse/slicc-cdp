@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { observerSend } from './guard-client.mjs';
+
+async function observerSend(send) {
+  const { observerSend: wrap } = await import('./guard-client.mjs');
+  return wrap(send);
+}
 
 function transient() {
   const message = 'Inspected target navigated or closed';
@@ -16,7 +20,7 @@ test('observer retries a transient frame-tree navigation error without changing 
   const result = { frameTree: { frame } };
   const params = {};
   let calls = 0;
-  const send = observerSend(async (method, supplied, session) => {
+  const send = await observerSend(async (method, supplied, session) => {
     assert.equal(method, 'Page.getFrameTree');
     assert.equal(supplied, params);
     assert.equal(session, 'S');
@@ -30,7 +34,7 @@ test('observer retries a transient frame-tree navigation error without changing 
 test('observer caps retries rather than hiding a closed or unsettled target', async () => {
   const error = transient();
   let calls = 0;
-  const send = observerSend(async () => {
+  const send = await observerSend(async () => {
     calls++;
     throw error;
   });
@@ -46,7 +50,7 @@ test('observer never retries commands that drive a target', async () => {
     'Target.attachToTarget',
   ]) {
     let calls = 0;
-    const send = observerSend(async () => {
+    const send = await observerSend(async () => {
       calls++;
       throw transient();
     });
@@ -61,7 +65,7 @@ test('observer never retries other errors or loses their refusal', async () => {
     Object.assign(new Error('No frame'), { cdp: { code: -32000, message: 'No frame' } }),
   ]) {
     let calls = 0;
-    const send = observerSend(async () => {
+    const send = await observerSend(async () => {
       calls++;
       throw error;
     });
