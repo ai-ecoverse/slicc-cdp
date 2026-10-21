@@ -1,10 +1,12 @@
 # slicc-cdp
 
-Browser automation for [SLICC](https://sliccy.ai) over the Chrome DevTools Protocol.
+The CLIs your agent already knows, where you need them and to the point.
 
 - `playwright-cli`: a playwright-cli-compatible command line. Not affiliated with Microsoft Playwright.
 - `curlwright`: curl, run as `fetch()` inside an open tab, with its cookies.
 - `@ai-ecoverse/slicc-cdp`: the Node `CDPClient` and the kernel builds of both commands.
+
+Compared with Microsoft's `@playwright/cli`, `playwright-cli` is one 4.6 MB binary instead of 18 MB of npm packages plus Node. It starts in 9 ms instead of 236 ms, and runs each browser command 3 to 20 times faster.
 
 ## Install
 
