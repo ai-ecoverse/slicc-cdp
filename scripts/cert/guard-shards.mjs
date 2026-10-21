@@ -1,3 +1,5 @@
+import { actualFailure, incompleteExecution } from './execution-failure.mjs';
+
 const partitions = [
   { id: 'a', targets: ['seven', 'ordinary', 'chrome-newtab', 'chrome-passwords'] },
   { id: 'b', targets: ['vault', 'chrome-new-tab-page', 'chrome-settings'] },
@@ -85,9 +87,12 @@ export function guardSetupTimeoutCount(report) {
 
 function checkExecution(shard, document, report, issues) {
   const status = document.suite?.status;
-  if (status === 'INCOMPLETE' || !document.suite)
-    issues.incomplete.push('guard shard ' + shard.id + ' execution incomplete');
-  else if (status === 'FAIL' || (report && report.pass === false))
+  const unavailable =
+    status === 'INCOMPLETE' ||
+    !document.suite ||
+    (status === 'FAIL' && incompleteExecution(document.suite) && !actualFailure(document.suite));
+  if (unavailable) issues.incomplete.push('guard shard ' + shard.id + ' execution incomplete');
+  if (actualFailure(document.suite) || (!unavailable && report && report.pass === false))
     issues.failures.push('guard shard ' + shard.id + ' failed');
   else if (status !== 'PASS')
     issues.incomplete.push('guard shard ' + shard.id + ' execution status unavailable');

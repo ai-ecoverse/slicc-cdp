@@ -2,6 +2,7 @@ import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { save } from './common.mjs';
+import { classifyExecution, unavailableRow } from './execution-failure.mjs';
 import { observeIdentity } from './execution-identity.mjs';
 import { boundedBudget, suitePolicy } from './suite-policy.mjs';
 import { executeWorker, guardFile } from './suite-worker.mjs';
@@ -47,6 +48,7 @@ export async function suite({
         rows: [],
         attempts: [],
         missing: files,
+        ...(error.certStatus === 'FAIL' ? { failureKind: 'integrity' } : {}),
       };
       save(`${out}.json`, result);
       return result;
@@ -149,18 +151,14 @@ export async function suite({
         worker.reporterComplete === false ||
         worker.guardReport?.status === 'INCOMPLETE'
     ) ||
-    rows.some(
-      (row) =>
-        row.skip ||
-        row.todo ||
-        ['cancelledByParent', 'testTimeoutFailure'].includes(row.failureType)
-    );
+    rows.some(unavailableRow);
+  const guardReport = workers.find((worker) => worker.file === guardFile)?.guardReport ?? null;
   const result = {
-    status: incomplete
-      ? 'INCOMPLETE'
-      : workers.some((worker) => worker.exit !== 0) || rows.some((row) => row.type === 'test:fail')
-        ? 'FAIL'
-        : 'PASS',
+    status: classifyExecution(
+      { rows, files, guardReport },
+      incomplete,
+      workers.some((worker) => worker.exit !== 0)
+    ),
     files,
     missing,
     rows,
@@ -169,7 +167,7 @@ export async function suite({
     elapsedMs: Math.round(performance.now() - started),
     retryNotRunReason:
       retry && repeated.length && !retryBudgetAvailable ? 'suite budget exhausted' : null,
-    guardReport: workers.find((worker) => worker.file === guardFile)?.guardReport ?? null,
+    guardReport,
     ...(executionIdentity ? { identity: executionIdentity } : {}),
   };
   save(`${out}.json`, result);

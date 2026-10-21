@@ -50,7 +50,7 @@
     }
   },
   "scripts": {
-    "prepare": "lefthook install",
+    "prepare": "slicc-install-hooks",
     "build:wasm": "cargo build --locked --release --target wasm32-wasip1 -p slicc-cdp -p curlwright && mkdir -p bin && cp target/wasm32-wasip1/release/playwright-cli.wasm bin/playwright-cli.wasm && cp target/wasm32-wasip1/release/curlwright.wasm bin/curlwright.wasm",
     "prepublishOnly": "npm run build:wasm",
     "lint": "slicc-lint",
@@ -69,8 +69,8 @@
   },
   "devDependencies": {
     "@ai-ecoverse/slicc-browsers": "1.10.3",
-    "@ai-ecoverse/slicc-kernel": "1.138.0",
-    "@ai-ecoverse/slicc-shared-web": "2.1.0",
+    "@ai-ecoverse/slicc-kernel": "1.142.1",
+    "@ai-ecoverse/slicc-shared-web": "2.4.0",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.2.2",
     "semantic-release": "25.0.9"

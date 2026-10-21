@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util';
 import { json, save } from './common.mjs';
+import { actualFailure, behaviourFailure, unavailableRow } from './execution-failure.mjs';
 
 const { values } = parseArgs({
   options: {
@@ -57,8 +58,8 @@ const results = tests.map((test) => {
   if (
     !current.length ||
     !previous.length ||
-    current.some((row) => row.skip || row.todo) ||
-    previous.some((row) => row.skip || row.todo)
+    current.some(unavailableRow) ||
+    previous.some(unavailableRow)
   )
     incomplete.push(`named proof ${test.id} did not run on both versions`);
   else if (!current.some((row) => row.type === 'test:pass'))
@@ -85,15 +86,12 @@ for (const [leg, execution] of [
   )
     incomplete.push(`named proof ${leg} worker did not complete`);
 }
-if (
-  expected.length &&
-  (positive.status === 'FAIL' || (positive.rows ?? []).some((row) => row.type === 'test:fail'))
-)
+if (expected.length && actualFailure(positive))
   failures.push('named proof candidate worker failed');
 const observed = [
   ...new Set(
     previousRows
-      .filter((row) => behavioural(row) && row.type === 'test:fail')
+      .filter((row) => behavioural(row) && behaviourFailure(row))
       .map((row) => {
         const test = tests.find((test) => match(row, test));
         return test?.id ?? row.proofId ?? `${row.worker ?? row.file}#${row.name}`;

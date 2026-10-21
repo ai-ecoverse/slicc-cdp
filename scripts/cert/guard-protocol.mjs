@@ -5,12 +5,16 @@ import { root } from './common.mjs';
 const beforeShards = '615e5f2663412f444b32f9ef96e6654c8dddef92';
 const guardFile = 'test/integration/guard-runner.test.mjs';
 
-export function guardToolsProtocol(commit, directory = root, cutoff = beforeShards) {
+export function guardToolsProtocol(
+  commit,
+  directory = root,
+  cutoff = beforeShards,
+  stage = 'scripts/cert/guard-suite.mjs'
+) {
   if (!/^[a-f0-9]{40}$/.test(commit ?? '') || !/^[a-f0-9]{40}$/.test(cutoff)) return 'UNKNOWN';
   const git = (args) =>
     spawnSync('git', args, { cwd: directory, timeout: 120000, encoding: 'utf8' });
-  if (git(['cat-file', '-e', `${commit}:scripts/cert/guard-suite.mjs`]).status === 0)
-    return 'CURRENT';
+  if (git(['cat-file', '-e', `${commit}:${stage}`]).status === 0) return 'CURRENT';
   const ancestry = git(['merge-base', '--is-ancestor', commit, cutoff]);
   if (ancestry.status === 0) return 'LEGACY';
   return ancestry.status === 1 ? 'CURRENT' : 'UNKNOWN';
