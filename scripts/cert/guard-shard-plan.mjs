@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { cliVerdict } from './cli-verdict.mjs';
+import { cliVerdict, writeJson } from './cli-verdict.mjs';
 import { save } from './common.mjs';
 import { guardShardPlan } from './guard-shards.mjs';
 
@@ -34,11 +34,9 @@ if (process.env.GITHUB_OUTPUT)
       }) +
       '\n'
   );
-console.log(
-  JSON.stringify({
-    targets: plan.targets,
-    rows: plan.keys.length,
-    shards: plan.shards.map(({ id, targets, expectedRows }) => ({ id, targets, expectedRows })),
-  })
-);
+await writeJson({
+  targets: plan.targets,
+  rows: plan.keys.length,
+  shards: plan.shards.map(({ id, targets, expectedRows }) => ({ id, targets, expectedRows })),
+});
 verdict('PASS', plan.keys.length + ' planned rows across four fixed shards');

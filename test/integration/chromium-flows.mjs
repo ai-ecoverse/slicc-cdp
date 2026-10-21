@@ -596,24 +596,38 @@ async function protectedFlow(runner, site, wsUrl) {
     assert.equal(opened.code, 0, opened.stderr);
     const tab = targetOf(opened.stdout);
     await runner.playwright(['goto', `${site.origin}/refresh`], cwd);
+    const { sessionId: observer } = await raw.send('Target.attachToTarget', {
+      targetId: tab,
+      flatten: true,
+    });
+    const vaultURL = /^http:\/\/vault\.sliccy\.ai\//;
     const deadline = Date.now() + 15000;
+    let frame;
     for (;;) {
-      const probe = await runner.playwright(['eval', 'location.href'], cwd);
-      if (probe.code !== 0 && refusal.test(probe.stderr)) break;
-      assert.ok(
-        Date.now() < deadline,
-        `the refreshed tab was never refused: ${probe.stdout}${probe.stderr}`
-      );
+      ({ frame } = (await raw.send('Page.getFrameTree', {}, observer)).frameTree);
+      if (vaultURL.test(frame.unreachableUrl ?? '') || vaultURL.test(frame.url)) break;
+      assert.ok(Date.now() < deadline, `the refresh never reached the vault: ${frame.url}`);
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    assert.match(await raw.targetUrl(tab), /^http:\/\/vault\.sliccy\.ai\//);
-    await refused(['eval', 'document.cookie', '--tab', tab], cwd);
-    await refused(['snapshot', '--tab', tab], cwd);
-    await refused(['screenshot', '--tab', tab, '--filename', 'y.png'], cwd);
-    await refused(['press', 'a', '--tab', tab], cwd);
-    await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
-    const afterList = await runner.playwright(['tab-list'], cwd);
-    assert.doesNotMatch(afterList.stdout, new RegExp(escapeReg(tab)));
+    await raw.send('Target.detachFromTarget', { sessionId: observer });
+    assert.match(await raw.targetUrl(tab), vaultURL);
+    if (frame.url === 'chrome-error://chromewebdata/') {
+      await refused(['eval', 'document.documentElement.innerHTML', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
+      const afterList = await runner.playwright(['tab-list'], cwd);
+      assert.doesNotMatch(afterList.stdout, /SECRET|n=refresh/);
+      const recovered = await runner.playwright(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+      assert.equal(recovered.code, 0, recovered.stderr);
+      assert.equal(await raw.targetUrl(tab), `${site.origin}/one`);
+    } else {
+      await refused(['eval', 'document.cookie', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
+      await refused(['screenshot', '--tab', tab, '--filename', 'y.png'], cwd);
+      await refused(['press', 'a', '--tab', tab], cwd);
+      await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+      const afterList = await runner.playwright(['tab-list'], cwd);
+      assert.doesNotMatch(afterList.stdout, new RegExp(escapeReg(tab)));
+    }
     const requests = await runner.playwright(['requests', '--tab', tab], cwd);
     assert.doesNotMatch(requests.stdout + requests.stderr, /vault|n=refresh/);
     await runner.playwright(['unroute'], cwd);

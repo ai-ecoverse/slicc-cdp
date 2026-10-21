@@ -965,6 +965,10 @@ fn cmd_console(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> O
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    if cdp.content_blocked(&session) {
+        cdp::detach(cdp, &session);
+        return Output::err(format!("{}\n", cdp.guard().refusal()));
+    }
     if let Err(message) = browser::watch_detach(cdp, state, &target, &session) {
         return Output::err(message);
     }

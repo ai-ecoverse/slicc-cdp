@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { cliVerdict } from './cli-verdict.mjs';
+import { cliVerdict, writeJson } from './cli-verdict.mjs';
 import { json, root, run, save } from './common.mjs';
 import { client, hash, residual, reviewerPaths } from './pr-common.mjs';
 
@@ -156,7 +156,7 @@ if (process.env.GITHUB_OUTPUT)
     process.env.GITHUB_OUTPUT,
     `go=${plan.go}\nreport=${plan.report}\nversion=${plan.version ?? ''}\nrust=${plan.rust ?? ''}\nhead=${plan.head}\ncommit=${plan.commit ?? ''}\nbase=${plan.base ?? ''}\ntest_only=${plan.go && plan.testOnly}\n`
   );
-console.log(JSON.stringify(plan));
+await writeJson(plan);
 printVerdict(
   plan.go || plan.status === 'PASS' ? 'PASS' : plan.status,
   `go=${plan.go} document=${plan.status}`

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { cliVerdict } from './cli-verdict.mjs';
+import { cliVerdict, writeJson } from './cli-verdict.mjs';
 import { json, root, save } from './common.mjs';
 import { guardSetupTimeoutCount } from './guard-shards.mjs';
 import { suite } from './suite.mjs';
@@ -40,15 +40,13 @@ const document = {
   measurementOnly: true,
 };
 save(values.out, document);
-console.log(
-  JSON.stringify({
-    id: shard.id,
-    status: result.status,
-    wallTimeMs: document.wallTimeMs,
-    suiteTimeMs: result.elapsedMs,
-    setupTimeoutCount,
-    rows: report?.results?.length ?? 0,
-  })
-);
+await writeJson({
+  id: shard.id,
+  status: result.status,
+  wallTimeMs: document.wallTimeMs,
+  suiteTimeMs: result.elapsedMs,
+  setupTimeoutCount,
+  rows: report?.results?.length ?? 0,
+});
 process.exitCode = result.status === 'PASS' ? 0 : 1;
 verdict(result.status, shard.id);

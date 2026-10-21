@@ -195,6 +195,92 @@ function count(fake, method) {
 const code = (line) => `### Ran Playwright code\n\`\`\`js\n${line}\n\`\`\`\n`;
 
 for (const kind of ['native', 'wasi']) {
+  for (const attachEvents of [false, true]) {
+    test(`${kind}: error-page recovery preserves the cookie boundary${attachEvents ? ' with attach events' : ''}`, {
+      timeout: 120_000,
+    }, async () => {
+      await withBrowser(
+        kind,
+        async ({ fake, run, ok, saved }) => {
+          const start = 'https://shop.example.test/app';
+          await ok(['open', start]);
+          const [tab] = fake.targets;
+          const failed = 'https://vault.sliccy.ai/landing?code=fixture-error-secret';
+          tab.url = 'https://vault.sliccy.ai';
+          tab.frame = {
+            id: tab.targetId,
+            loaderId: 'LERR',
+            url: 'chrome-error://chromewebdata/',
+            securityOrigin: '://',
+            unreachableUrl: failed,
+          };
+          tab.history = {
+            currentIndex: 1,
+            entries: [start, failed].map((url, index) => ({
+              id: index + 1,
+              url,
+              userTypedURL: url,
+              title: url,
+              transitionType: 'typed',
+            })),
+          };
+          const reads = count(fake, 'Network.getAllCookies');
+          for (const args of [
+            ['cookie-list'],
+            ['cookie-get', 'sid'],
+            ['cookie-clear'],
+            ['cookie-set', 'probe', 'fixture-value', '--domain', 'shop.example.test'],
+            ['request-headers', '1'],
+            ['console'],
+          ]) {
+            const result = await run(args);
+            assert.equal(result.code, 1, result.stdout);
+            assert.equal(result.stdout, '');
+            assert.ok(result.stderr.startsWith('slicc: refused:'), result.stderr);
+            assert.ok(!result.stderr.includes('fixture-error-secret'), result.stderr);
+          }
+          assert.equal(count(fake, 'Network.getAllCookies'), reads);
+          assert.equal(count(fake, 'Network.setCookie'), 0);
+          assert.equal(count(fake, 'Network.deleteCookies'), 0);
+          assert.equal(await ok(['reload']), 'Reloaded\n');
+          assert.equal(count(fake, 'Network.getAllCookies'), reads);
+          await ok(['goto', 'https://shop.example.test/recovered', '--tab', tab.targetId]);
+          assert.ok((await ok(['cookie-get', 'sid'])).includes('sid=fixture-sid-1'));
+          assert.ok((await ok(['request-headers', '1'])).includes('sid=fixture-sid-1'));
+          const stored = await saved();
+          for (const value of [
+            'fixture-sid-1',
+            'fixture-dark',
+            'fixture-error-secret',
+            ...secrets,
+          ]) {
+            assert.ok(!stored.includes(value), stored);
+          }
+          tab.url = 'https://vault.sliccy.ai';
+          tab.frame = {
+            id: tab.targetId,
+            loaderId: 'LREAL',
+            url: 'https://vault.sliccy.ai/landing',
+            securityOrigin: 'https://vault.sliccy.ai',
+          };
+          const writes = count(fake, 'Network.setCookie');
+          const result = await run([
+            'cookie-set',
+            'probe',
+            'fixture-value',
+            '--domain',
+            'shop.example.test',
+          ]);
+          assert.equal(result.code, 1, result.stdout);
+          assert.equal(result.stdout, '');
+          assert.ok(result.stderr.startsWith('slicc: refused:'), result.stderr);
+          assert.equal(count(fake, 'Network.setCookie'), writes);
+        },
+        { attachEvents }
+      );
+    });
+  }
+
   test(`${kind}: saved headers contain only cookie scopes and output uses current jar values`, {
     timeout: 120_000,
   }, async () => {
