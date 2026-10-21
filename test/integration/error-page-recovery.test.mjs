@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fakeCdp } from './fake-cdp.mjs';
+import { guarded } from './guard-client.mjs';
 import { HARNESS_PORTS } from './ports.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -207,3 +208,115 @@ for (const attachEvents of [false, true]) {
     }
   });
 }
+
+const seeded = (targetId, failed, entries) => ({
+  targetId,
+  url: failed,
+  frame: {
+    id: targetId,
+    loaderId: 'LERR',
+    url: ERROR_PAGE,
+    securityOrigin: '://',
+    unreachableUrl: failed,
+  },
+  history: { currentIndex: entries.length - 1, entries },
+});
+
+const visit = (id, url) => ({ id, url, userTypedURL: url, title: url, transitionType: 'typed' });
+
+async function bridged(options, body) {
+  execFileSync(
+    'cargo',
+    ['build', '--locked', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'],
+    { stdio: 'inherit' }
+  );
+  const backend = await fakeCdp(options);
+  let client;
+  try {
+    client = await guarded(backend.url, 'https://private.example.invalid', {
+      variant: 'prompt',
+      detachDelay: 0,
+    });
+    await body(backend, client);
+  } finally {
+    await client?.close();
+    await backend.close();
+  }
+}
+
+test('discovery of an already open protected error tab leaves it to the recovery probe', {
+  timeout: 120_000,
+}, async () => {
+  const failed = 'https://seven.sliccy.ai/auth/callback?code=MARK';
+  const start = 'http://ordinary.example/doc';
+  await bridged({ discoverEvents: true }, async (backend, client) => {
+    backend.targets.push(seeded('ERRTAB', failed, [visit(1, start), visit(2, failed)]));
+    const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+    assert.notEqual(targetId, 'ERRTAB');
+    const discovered = client.events.filter(
+      (event) => event.params?.targetInfo?.targetId === 'ERRTAB'
+    );
+    assert.ok(discovered.length > 0, 'discovery reported the open error tab');
+    assert.ok(discovered.every((event) => !JSON.stringify(event).includes('MARK')));
+    const { sessionId } = await client.send('Target.attachToTarget', {
+      targetId: 'ERRTAB',
+      flatten: true,
+    });
+    await client.send('Page.navigate', { url: 'http://ordinary.example/next' }, sessionId);
+    assert.equal(
+      backend.targets.find((item) => item.targetId === 'ERRTAB').url,
+      'http://ordinary.example/next'
+    );
+  });
+});
+
+test('an unobserved protected commit after a recoverable error page is caught before recovery commands run', {
+  timeout: 120_000,
+}, async () => {
+  const failed = 'https://seven.sliccy.ai/auth/callback?code=MARK';
+  const start = 'http://ordinary.example/doc';
+  const guardSession = (calls, sessionId) =>
+    calls.some(
+      (call) =>
+        call.sessionId === sessionId &&
+        call.method === 'Fetch.enable' &&
+        call.params?.patterns?.some((item) => item.resourceType === 'Document')
+    );
+  await bridged(
+    {
+      refuseWhen: (message, calls) =>
+        message.method === 'Page.enable' && guardSession(calls, message.sessionId),
+    },
+    async (backend, client) => {
+      const tab = seeded('ERRTAB', failed, [visit(1, start), visit(2, failed)]);
+      backend.targets.push(tab);
+      const { sessionId } = await client.send('Target.attachToTarget', {
+        targetId: 'ERRTAB',
+        flatten: true,
+      });
+      tab.frame = {
+        id: 'ERRTAB',
+        loaderId: 'LREAL',
+        url: 'https://seven.sliccy.ai/auth/callback',
+        securityOrigin: 'https://seven.sliccy.ai',
+      };
+      const from = backend.calls.length;
+      for (const [method, params] of [
+        ['Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }],
+        ['Page.getNavigationHistory', {}],
+      ]) {
+        await assert.rejects(client.send(method, params, sessionId), /slicc: refused:/, method);
+      }
+      assert.ok(
+        backend.calls
+          .slice(from)
+          .every(
+            (call) =>
+              call.sessionId !== sessionId ||
+              !['Runtime.evaluate', 'Page.getNavigationHistory'].includes(call.method)
+          ),
+        'a recovery command reached the protected document'
+      );
+    }
+  );
+});

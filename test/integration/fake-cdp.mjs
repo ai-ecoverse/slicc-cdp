@@ -73,6 +73,7 @@ export async function fakeCdp({
   refusalMessage,
   noisyRefusal = false,
   attachEvents = false,
+  discoverEvents = false,
 } = {}) {
   const calls = [];
   const targets = [];
@@ -138,6 +139,12 @@ export async function fakeCdp({
         return;
       }
       switch (method) {
+        case 'Target.setDiscoverTargets':
+          answer({});
+          if (discoverEvents && params.discover)
+            for (const item of targets)
+              send({ method: 'Target.targetCreated', params: { targetInfo: info(item) } });
+          return;
         case 'Target.getTargets':
           return answer({ targetInfos: targets.map(info) });
         case 'Target.getTargetInfo': {

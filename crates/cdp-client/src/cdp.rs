@@ -264,6 +264,9 @@ impl Cdp {
             if self.guard_sessions.contains(session) {
                 return Err(self.refusal());
             }
+            if self.session_target(session).is_some_and(|target| !self.refresh(&target)) {
+                return Err(self.refusal());
+            }
             if !recovery(method, params) && self.session_target(session).and_then(|target| self.documents.get(&target)).is_some_and(|doc| self.sealed(doc)) {
                 return Err(self.refusal());
             }
@@ -639,6 +642,8 @@ impl Cdp {
             self.targets.insert(target_id.to_string(), info.clone());
             if self.documents.get(target_id).is_some_and(|doc| doc.probed) {
                 self.documents.remove(target_id);
+            } else if !self.refresh(target_id) {
+                return Ok(true);
             }
             self.probe_error(&info);
         }
@@ -990,14 +995,34 @@ impl Cdp {
         self.documents.get(target_id).is_some_and(|doc| doc.probed && !doc.previous)
     }
 
+    fn refresh(&mut self, target: &str) -> bool {
+        let Some(doc) = self.documents.get(target) else { return true };
+        if doc.navigating || doc.probed || !(self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) {
+            return true;
+        }
+        let Some(guard) = self.guards.get(target).cloned() else { return true };
+        let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok().and_then(|tree| tree.pointer("/frameTree/frame").cloned());
+        match frame {
+            Some(frame) if self.guards.get(target) == Some(&guard) => {
+                self.main_commit(&guard, &frame);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn probe_candidate(&self, info: &Value) -> bool {
+        let text = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or("");
+        let target = text("targetId");
+        !target.is_empty() && text("type") == "page" && text("openerId").is_empty() && self.guard.url(text("url")) && !self.guard.unparseable(text("url"))
+            && !self.documents.contains_key(target) && !self.abandoned.contains(target) && !self.guards.contains_key(target)
+    }
+
     fn probe_error(&mut self, info: &Value) {
         let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).unwrap_or("").to_string();
         let target = text(info, "targetId");
         let url = text(info, "url");
-        if target.is_empty() || text(info, "type") != "page" || !text(info, "openerId").is_empty() || !self.guard.url(&url)
-            || self.documents.contains_key(&target) || self.protected_targets.contains(&target) || self.abandoned.contains(&target)
-            || self.guards.contains_key(&target)
-        {
+        if !self.probe_candidate(info) || self.protected_targets.contains(&target) {
             return;
         }
         self.probing.insert(target.clone());
@@ -1295,7 +1320,7 @@ impl Cdp {
                 if !target.is_empty() {
                     self.targets.insert(target.clone(), info.clone());
                 }
-                if self.info_protected(&info, &[]) && !self.documents.contains_key(&target) && !self.probing.contains(&target) {
+                if self.info_protected(&info, &[]) && !self.documents.contains_key(&target) && !self.probing.contains(&target) && !self.probe_candidate(&info) {
                     self.protect_target(&target);
                 }
                 if self.info_protected(&info, &[]) || self.discovery_redacted(&info) {
