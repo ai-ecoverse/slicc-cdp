@@ -43,6 +43,8 @@ curlwright -i https://example.com/
 
 Seven's origins, the vault, browser pages, extensions and local files are always off limits.
 
+The cookie commands, `cookie-list`, `cookie-get`, `cookie-set`, `cookie-delete` and `cookie-clear`, work like Microsoft's and print values as they are. So do `Cookie` and `Set-Cookie` in `request-headers`, `response-headers` and `request`. Seven's and the vault's cookies are never listed, read, set or deleted. Naming their domain is refused, `cookie-clear` leaves them, and requests to their origins are not recorded.
+
 ## Develop
 
 ```sh

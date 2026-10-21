@@ -1,3 +1,4 @@
+use cdp_client::protected::Protected;
 use crate::route::{self, Route};
 use crate::snapshot::RefRec;
 use crate::trace::{self, ConsoleEntry, NetRequest};
@@ -258,7 +259,7 @@ fn encode(session: &Session) -> Value {
 }
 
 const REDACTED: &str = "[redacted]";
-const SECRET_HEADERS: &[&str] = &["token", "secret", "key", "auth", "session", "csrf", "cookie"];
+const SECRET_HEADERS: &[&str] = &["token", "secret", "key", "auth", "session", "csrf"];
 const SECRET_QUERY: &[&str] = &["token", "secret", "key", "auth", "code", "sig", "session", "password"];
 
 fn names_secret(name: &str, words: &[&str]) -> bool {
@@ -273,6 +274,9 @@ fn stored_headers(headers: &[(String, String)], base: &str) -> Vec<(String, Stri
             let lowered = value.trim_start().to_ascii_lowercase();
             if names_secret(name, SECRET_HEADERS) {
                 (name.clone(), REDACTED.to_string())
+            } else if names_secret(name, &["cookie"]) {
+                let hidden = Protected::default().cookie_url(base);
+                (name.clone(), if hidden { REDACTED.to_string() } else { value.clone() })
             } else if url_header(name) {
                 (name.clone(), stored_header_url(name, value, base))
             } else if lowered.starts_with("http://") || lowered.starts_with("https://") {
@@ -585,7 +589,6 @@ fn secret_text(text: &str) -> bool {
         || holds_high_entropy(text)
         || holds_credential(&lowered, "bearer ")
         || holds_credential(&lowered, "basic ")
-        || (lowered.contains("cookie") && lowered.contains('='))
         || holds_jwt(text)
         || holds_secret_pair(text)
 }
@@ -1015,9 +1018,9 @@ mod tests {
         let written = encode(&session).to_string();
         let again = decode(&written);
         let kept: Vec<&str> = again.console["T"].iter().map(|entry| entry.text.as_str()).collect();
-        assert_eq!(kept.len(), 4, "{kept:?}");
-        assert_eq!(&kept[..3], ["kept: cookie banner shown", "kept: the session ended", "kept: basic usage"]);
-        assert!(kept[3].ends_with("…[truncated]") && kept[3].len() < 2100);
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert_eq!(&kept[..4], ["document.cookie = sid=abc; theme=dark", "kept: cookie banner shown", "kept: the session ended", "kept: basic usage"]);
+        assert!(kept[4].ends_with("…[truncated]") && kept[4].len() < 2100);
         assert!(again.console["T"].iter().all(|entry| entry.url == "https://example.test/app.js?sig=[redacted]"));
         assert_eq!(session.console["T"].len(), 10);
     }
@@ -1064,7 +1067,7 @@ mod tests {
             }],
         );
         let written = encode(&session).to_string();
-        for secret in ["session=secret", "Bearer abc", "Basic def", "csrf1", "key1", "a=b", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
+        for secret in ["Bearer abc", "Basic def", "csrf1", "key1", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
             assert!(!written.contains(secret), "{secret} was written: {written}");
         }
         assert_eq!(session.requests["T"][0].request_headers[0].1, "session=secret");
@@ -1115,7 +1118,7 @@ mod tests {
         assert_eq!(
             again.requests["T"][0].request_headers,
             vec![
-                pair("cookie", "[redacted]"),
+                pair("cookie", "session=secret"),
                 pair("Authorization", "[redacted]"),
                 pair("Proxy-Authorization", "[redacted]"),
                 pair("X-CSRF-Token", "[redacted]"),
@@ -1127,7 +1130,7 @@ mod tests {
         assert_eq!(
             again.requests["T"][0].response_headers,
             vec![
-                pair("Set-Cookie", "[redacted]"),
+                pair("Set-Cookie", "a=b"),
                 pair("x-session-id", "[redacted]"),
                 pair("content-type", "text/plain"),
                 pair("location", "https://example.test/cb?state=1&code=[redacted]"),

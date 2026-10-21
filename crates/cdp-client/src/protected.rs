@@ -150,6 +150,23 @@ impl Protected {
             .any(|host| under(host, &domain))
     }
 
+    pub fn cookie_url(&self, text: &str) -> bool {
+        let Some(url) = self.unwrap(parse(text)) else {
+            return true;
+        };
+        let host = host_of(&url);
+        if host.is_empty() || self.url(text) {
+            return true;
+        }
+        if !matches!(url.host(), Some(url::Host::Domain(_))) {
+            return self.cookie_domain(&host);
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        (0..labels.len()).any(|at| {
+            (at == 0 || labels.len() - at > 1) && self.cookie_domain(&labels[at..].join("."))
+        })
+    }
+
     pub fn storage_key(&self, key: &str) -> bool {
         let mut parts = key.split('^');
         let first = parts.next().unwrap_or("");

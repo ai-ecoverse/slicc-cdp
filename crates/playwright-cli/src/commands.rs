@@ -3,6 +3,7 @@ use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::connect;
+use crate::cookies;
 use crate::launch::{self, Started};
 use crate::sanitize;
 use crate::session::{self, Session};
@@ -16,6 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let command = invocation.command.as_deref().unwrap_or("");
     if let Some(message) = trace::precheck(command, &invocation.positionals) {
+        return Output::err(message);
+    }
+    if let Some(message) = cookies::precheck(command, invocation) {
         return Output::err(message);
     }
     if let Some(message) = launch::reject_wasm_flags(command, &invocation.flags) {
@@ -154,6 +158,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
+        _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
         "go-forward" => cmd_go_forward(&mut cdp, &mut state, invocation, &mut report),
@@ -892,7 +897,7 @@ fn with_ref(
     }
 }
 
-fn resolve_target(
+pub(crate) fn resolve_target(
     cdp: &mut Cdp,
     invocation: &Invocation,
     state: &mut Session,
