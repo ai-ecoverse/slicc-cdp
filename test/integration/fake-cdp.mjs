@@ -125,6 +125,17 @@ export async function fakeCdp({
       const answer = (result) => send({ id, result, ...(sessionId ? { sessionId } : {}) });
       const event = (name, eventParams) =>
         send({ method: name, params: eventParams, ...(sessionId ? { sessionId } : {}) });
+      const emitConsole = (url) => {
+        for (const [index, entry] of consoleLines.entries()) {
+          event('Runtime.consoleAPICalled', {
+            type: 'log',
+            executionContextId: 1,
+            timestamp: index + 1,
+            args: [{ type: 'string', value: entry.text }],
+            stackTrace: { callFrames: [{ url: entry.url ?? url, lineNumber: 0 }] },
+          });
+        }
+      };
       const target = sessionId ? sessions.get(sessionId) : undefined;
       if (method === 'Slicc.action') clearInterval(noise);
       if (refuse.includes(method)) {
@@ -193,15 +204,7 @@ export async function fakeCdp({
           event('Page.frameNavigated', {
             frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
           });
-          for (const [index, entry] of consoleLines.entries()) {
-            event('Runtime.consoleAPICalled', {
-              type: 'log',
-              executionContextId: 1,
-              timestamp: index + 1,
-              args: [{ type: 'string', value: entry.text }],
-              stackTrace: { callFrames: [{ url: entry.url ?? params.url, lineNumber: 0 }] },
-            });
-          }
+          emitConsole(params.url);
           for (const item of traffic) {
             requests += 1;
             const requestId = `R${requests}`;
@@ -245,6 +248,10 @@ export async function fakeCdp({
           event('Page.loadEventFired', { timestamp: 1 });
           return;
         }
+        case 'Runtime.enable':
+          answer({});
+          if (target?.url && target.url !== 'about:blank') emitConsole(target.url);
+          return;
         case 'Network.getAllCookies':
           return answer({ cookies: jar.map((cookie) => ({ ...cookie })) });
         case 'Network.setCookie': {

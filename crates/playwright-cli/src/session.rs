@@ -1,4 +1,3 @@
-use cdp_client::protected::Protected;
 use crate::route::{self, Route};
 use crate::snapshot::RefRec;
 use crate::trace::{self, ConsoleEntry, NetRequest};
@@ -275,13 +274,7 @@ fn stored_headers(headers: &[(String, String)], base: &str) -> Vec<(String, Stri
             if names_secret(name, SECRET_HEADERS) {
                 (name.clone(), REDACTED.to_string())
             } else if names_secret(name, &["cookie"]) {
-                let guard = Protected::default();
-                let hidden = if name.eq_ignore_ascii_case("set-cookie") {
-                    cdp_client::shield::set_cookie_hidden(&guard, value, base)
-                } else {
-                    guard.url(base)
-                };
-                (name.clone(), if hidden { REDACTED.to_string() } else { value.clone() })
+                (name.clone(), REDACTED.to_string())
             } else if url_header(name) {
                 (name.clone(), stored_header_url(name, value, base))
             } else if lowered.starts_with("http://") || lowered.starts_with("https://") {
@@ -599,9 +592,8 @@ fn secret_text(text: &str) -> bool {
 }
 
 fn stored_console(entry: &ConsoleEntry) -> Option<Value> {
-    if secret_text(&entry.text)
-        || Protected::default().cookie_url(&entry.url)
-            && entry.text.to_ascii_lowercase().contains("cookie") && entry.text.contains('=')
+    if secret_text(&entry.text) || entry.cookie_value
+        || entry.text.to_ascii_lowercase().contains("cookie") && entry.text.contains('=')
     {
         return None;
     }
@@ -1003,6 +995,7 @@ mod tests {
             url: "https://example.test/app.js?sig=abc123#L4".to_string(),
             line: 1,
             stamp: String::new(),
+            cookie_value: false,
         };
         let texts = [
             "Authorization: Bearer abcdefgh12345678",
@@ -1026,9 +1019,9 @@ mod tests {
         let written = encode(&session).to_string();
         let again = decode(&written);
         let kept: Vec<&str> = again.console["T"].iter().map(|entry| entry.text.as_str()).collect();
-        assert_eq!(kept.len(), 5, "{kept:?}");
-        assert_eq!(&kept[..4], ["document.cookie = sid=abc; theme=dark", "kept: cookie banner shown", "kept: the session ended", "kept: basic usage"]);
-        assert!(kept[4].ends_with("…[truncated]") && kept[4].len() < 2100);
+        assert_eq!(kept.len(), 4, "{kept:?}");
+        assert_eq!(&kept[..3], ["kept: cookie banner shown", "kept: the session ended", "kept: basic usage"]);
+        assert!(kept[3].ends_with("…[truncated]") && kept[3].len() < 2100);
         assert!(again.console["T"].iter().all(|entry| entry.url == "https://example.test/app.js?sig=[redacted]"));
         assert_eq!(session.console["T"].len(), 10);
     }
@@ -1045,6 +1038,7 @@ mod tests {
                 url: "https://user:secret@example.test/a?q=1#h".to_string(),
                 line: 4,
                 stamp: "9.5".to_string(),
+                cookie_value: false,
             }],
             vec![NetRequest {
                 method: "GET".to_string(),
@@ -1072,10 +1066,11 @@ mod tests {
                 request_body: Some("body".to_string()),
                 response_body: Some("BODY7SECRET".to_string()),
                 response_base64: true,
+                cookie_scopes: Vec::new(),
             }],
         );
         let written = encode(&session).to_string();
-        for secret in ["Bearer abc", "Basic def", "csrf1", "key1", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
+        for secret in ["session=secret", "a=b", "Bearer abc", "Basic def", "csrf1", "key1", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
             assert!(!written.contains(secret), "{secret} was written: {written}");
         }
         assert_eq!(session.requests["T"][0].request_headers[0].1, "session=secret");
@@ -1092,6 +1087,7 @@ mod tests {
                     url: "https://user:secret@example.test/a?q=1#h".to_string(),
                     line: 4,
                     stamp: "9.5".to_string(),
+                    cookie_value: false,
                 },
                 ConsoleEntry {
                     kind: "log".to_string(),
@@ -1099,6 +1095,7 @@ mod tests {
                     url: "https://user:secret@example.test/a?q=1#h".to_string(),
                     line: 4,
                     stamp: "9.75".to_string(),
+                    cookie_value: false,
                 },
             ],
             Vec::new(),
@@ -1114,6 +1111,7 @@ mod tests {
                 url: String::new(),
                 line: 0,
                 stamp: String::new(),
+                cookie_value: false,
             }],
             Vec::new(),
         );
@@ -1126,7 +1124,7 @@ mod tests {
         assert_eq!(
             again.requests["T"][0].request_headers,
             vec![
-                pair("cookie", "session=secret"),
+                pair("cookie", "[redacted]"),
                 pair("Authorization", "[redacted]"),
                 pair("Proxy-Authorization", "[redacted]"),
                 pair("X-CSRF-Token", "[redacted]"),
@@ -1138,7 +1136,7 @@ mod tests {
         assert_eq!(
             again.requests["T"][0].response_headers,
             vec![
-                pair("Set-Cookie", "a=b"),
+                pair("Set-Cookie", "[redacted]"),
                 pair("x-session-id", "[redacted]"),
                 pair("content-type", "text/plain"),
                 pair("location", "https://example.test/cb?state=1&code=[redacted]"),

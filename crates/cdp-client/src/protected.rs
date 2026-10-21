@@ -352,11 +352,10 @@ pub fn canonical_cookie_domain(domain: &str) -> Option<String> {
     if domain.is_empty() || domain.chars().any(|ch| ch.is_whitespace() || matches!(ch, '/' | '\\' | '@' | '?' | '#')) {
         return None;
     }
-    let url = parse(&format!("http://{domain}/"))?;
+    let normalized = domain.replace(['。', '．', '｡'], ".");
+    let normalized = normalized.trim_start_matches('.');
+    let url = parse(&format!("http://{normalized}/"))?;
     let host = host_of(&url).trim_matches('.').to_string();
-    if host.is_empty() || url.path() != "/" || !url.username().is_empty() || url.password().is_some() {
-        return None;
-    }
     if matches!(url.host(), Some(url::Host::Domain(_))) && host.split('.').any(|label| {
         label.is_empty() || label.starts_with('-') || label.ends_with('-')
             || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')

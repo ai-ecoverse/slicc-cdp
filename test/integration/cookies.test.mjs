@@ -17,6 +17,8 @@ const native = path.join(
 );
 const wasm = path.join(root, 'target/wasm32-wasip1/debug');
 const refusal = "slicc: refused: cookies on seven's origin\n";
+const currentValues =
+  'Cookie values are from the current cookie jar, not necessarily from this request.\n';
 const secrets = [
   'fixture-seven-secret',
   'fixture-seven-sid',
@@ -193,6 +195,132 @@ function count(fake, method) {
 const code = (line) => `### Ran Playwright code\n\`\`\`js\n${line}\n\`\`\`\n`;
 
 for (const kind of ['native', 'wasi']) {
+  test(`${kind}: saved headers contain only cookie scopes and output uses current jar values`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(
+      kind,
+      async ({ fake, ok, saved }) => {
+        await ok(['open', 'https://shop.example.test/app']);
+        const first = await saved();
+        for (const secret of [
+          'fixture-sid-1',
+          'fixture-dark',
+          'fixture-fresh',
+          'fixture-auth',
+          'fixture-token',
+        ]) {
+          assert.ok(!first.includes(secret), first);
+        }
+        const requests = Object.values(JSON.parse(first).requests).flat();
+        assert.deepEqual(requests[0].cookieScopes, [
+          { header: 'cookie', name: 'sid', domain: 'shop.example.test', path: '/' },
+          { header: 'cookie', name: 'theme', domain: '.example.test', path: '/app' },
+          { header: 'set-cookie', name: 'fresh', domain: 'shop.example.test', path: '/' },
+        ]);
+        fake.jar.find((item) => item.name === 'sid' && item.domain === 'shop.example.test').value =
+          'fixture-current';
+        fake.jar.splice(
+          fake.jar.findIndex((item) => item.name === 'theme'),
+          1
+        );
+        const output = await ok(['request-headers', '1']);
+        assert.ok(output.includes('sid=fixture-current; theme=[redacted]'), output);
+        assert.ok(output.includes(currentValues.trim()), output);
+        assert.ok(!output.includes('fixture-sid-1'), output);
+        const after = await saved();
+        for (const secret of [
+          'fixture-current',
+          'fixture-sid-1',
+          'fixture-dark',
+          'fixture-fresh',
+          'fixture-auth',
+          'fixture-token',
+        ]) {
+          assert.ok(!after.includes(secret), after);
+        }
+      },
+      {
+        cookies: [...jar, cookie('fresh', 'fixture-fresh', 'shop.example.test')],
+        traffic: [
+          {
+            url: 'https://shop.example.test/api?access_token=fixture-token',
+            requestHeaders: {
+              Cookie: 'sid=fixture-sid-1; theme=fixture-dark',
+              Authorization: 'Bearer fixture-auth',
+            },
+            responseHeaders: { 'Set-Cookie': 'fresh=fixture-fresh; Path=/' },
+          },
+        ],
+      }
+    );
+  });
+
+  test(`${kind}: removed ordinary cookies retain only their scopes from CDP metadata`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(
+      kind,
+      async ({ ok, saved }) => {
+        await ok(['open', 'https://shop.example.test/app']);
+        const output = await ok(['request-headers', '1']);
+        assert.equal(output, `cookie: sid=fixture-sid-1; old=[redacted]\n${currentValues}`);
+        const text = await saved();
+        assert.ok(!text.includes('fixture-old'), text);
+        assert.ok(!text.includes('fixture-sid-1'), text);
+        const requests = Object.values(JSON.parse(text).requests).flat();
+        assert.deepEqual(requests[0].cookieScopes[1], {
+          header: 'cookie',
+          name: 'old',
+          domain: 'shop.example.test',
+          path: '/',
+        });
+      },
+      {
+        traffic: [
+          {
+            url: 'https://shop.example.test/api',
+            requestHeaders: { Cookie: 'sid=fixture-sid-1; old=fixture-old' },
+            responseHeaders: {},
+            associatedCookies: [
+              { cookie: cookie('old', 'fixture-old', 'shop.example.test'), blockedReasons: [] },
+            ],
+          },
+        ],
+      }
+    );
+  });
+
+  test(`${kind}: IPv4 cookie scopes are canonical hosts, not parent-domain walks`, {
+    timeout: 120_000,
+  }, async () => {
+    await withBrowser(
+      kind,
+      async ({ ok, saved }) => {
+        await ok(['open', 'http://127.0.0.1:9944/app']);
+        assert.equal(
+          await ok(['request-headers', '1']),
+          `cookie: session=fixture-ip; flavor=fixture-ip-domain\n${currentValues}`
+        );
+        const text = await saved();
+        assert.ok(!text.includes('fixture-ip'), text);
+      },
+      {
+        cookies: [
+          cookie('session', 'fixture-ip', '127.0.0.1'),
+          cookie('flavor', 'fixture-ip-domain', '.127.0.0.1'),
+        ],
+        traffic: [
+          {
+            url: 'http://127.0.0.1:9944/api/me',
+            requestHeaders: { Cookie: 'session=fixture-ip; flavor=fixture-ip-domain' },
+            responseHeaders: {},
+          },
+        ],
+      }
+    );
+  });
+
   test(`${kind}: review regression refuses noncanonical protected or invalid cookie domains`, {
     timeout: 120_000,
   }, async () => {
@@ -260,12 +388,15 @@ for (const kind of ['native', 'wasi']) {
       async ({ ok, saved }) => {
         await ok(['open', 'https://shop.example.ai/app']);
         assert.equal(await ok(['request-headers', '1']), 'cookie: [redacted]\n');
-        assert.equal(await ok(['request-headers', '2']), 'cookie: shared=fixture-host-only\n');
+        assert.equal(
+          await ok(['request-headers', '2']),
+          `cookie: shared=fixture-host-only\n${currentValues}`
+        );
         assert.equal(await ok(['request-headers', '7']), 'cookie: [redacted]\n');
         assert.equal(await ok(['request-headers', '8']), 'cookie: [redacted]\n');
         assert.equal(
           await ok(['response-headers', '2']),
-          'set-cookie: fresh=fixture-host-fresh; Path=/\n'
+          `set-cookie: fresh=fixture-host-fresh; Domain=shop.example.ai; Path=/\n${currentValues}`
         );
         for (const index of [1, 3, 4, 5, 6]) {
           assert.equal(await ok(['response-headers', String(index)]), 'set-cookie: [redacted]\n');
@@ -287,10 +418,16 @@ for (const kind of ['native', 'wasi']) {
         ]) {
           assert.ok(!stored.includes(value), stored);
         }
-        assert.ok(stored.includes('fixture-host-only'), stored);
+        assert.ok(!stored.includes('fixture-host-only'), stored);
+        assert.ok(!stored.includes('fixture-host-fresh'), stored);
       },
       {
-        cookies: [...jar, parent, ordinary],
+        cookies: [
+          ...jar,
+          parent,
+          ordinary,
+          cookie('fresh', 'fixture-host-fresh', 'shop.example.ai'),
+        ],
         traffic: [
           {
             url: 'https://shop.example.ai/parent',
@@ -364,7 +501,8 @@ for (const kind of ['native', 'wasi']) {
         assert.ok(!stored.includes('fixture-quoted'), stored);
         assert.ok(!stored.includes('fixture-rotated'), stored);
         assert.ok(!stored.includes('document.cookie = unknown=fixture-unknown'), stored);
-        assert.ok(stored.includes('fixture-dark'), stored);
+        assert.ok(!stored.includes('fixture-dark'), stored);
+        assert.ok(!stored.includes('fixture-host-only'), stored);
       },
       {
         cookies: [
@@ -372,6 +510,7 @@ for (const kind of ['native', 'wasi']) {
           cookie('shared', 'fixture-parent-scope', '.ai'),
           cookie('shared', 'fixture-host-only', 'shop.example.ai'),
           cookie('quoted', 'fixture-quoted"\\☃', '.ai'),
+          cookie('rotated', 'fixture-rotated', '.ai'),
         ],
         traffic: [
           {
@@ -571,23 +710,31 @@ for (const kind of ['native', 'wasi']) {
   test(`${kind}: request headers show ordinary cookie values and hide protected requests`, {
     timeout: 120_000,
   }, async () => {
-    await withBrowser(kind, async ({ ok }) => {
-      await ok(['open', 'https://shop.example.test/app']);
-      const listed = await ok(['requests']);
-      assert.ok(listed.includes('https://shop.example.test/api/me'), listed);
-      assert.ok(!listed.includes('sliccy'), listed);
-      assert.equal(
-        await ok(['request-headers', '1']),
-        'accept: */*\ncookie: sid=fixture-sid-1; theme=fixture-dark\n'
-      );
-      assert.equal(
-        await ok(['response-headers', '1']),
-        'content-type: text/plain\nset-cookie: fresh=fixture-fresh; Path=/; Secure\n'
-      );
-      const detail = await ok(['request', '1']);
-      assert.ok(detail.includes('    cookie: sid=fixture-sid-1; theme=fixture-dark'), detail);
-      assert.ok(detail.includes('    set-cookie: fresh=fixture-fresh; Path=/; Secure'), detail);
-      assert.ok(!detail.includes('[redacted]'), detail);
-    });
+    await withBrowser(
+      kind,
+      async ({ ok }) => {
+        await ok(['open', 'https://shop.example.test/app']);
+        const listed = await ok(['requests']);
+        assert.ok(listed.includes('https://shop.example.test/api/me'), listed);
+        assert.ok(!listed.includes('sliccy'), listed);
+        assert.equal(
+          await ok(['request-headers', '1']),
+          `accept: */*\ncookie: sid=fixture-sid-1; theme=fixture-dark\n${currentValues}`
+        );
+        assert.equal(
+          await ok(['response-headers', '1']),
+          `content-type: text/plain\nset-cookie: fresh=fixture-fresh; Domain=shop.example.test; Path=/\n${currentValues}`
+        );
+        const detail = await ok(['request', '1']);
+        assert.ok(detail.includes('    cookie: sid=fixture-sid-1; theme=fixture-dark'), detail);
+        assert.ok(
+          detail.includes('    set-cookie: fresh=fixture-fresh; Domain=shop.example.test; Path=/'),
+          detail
+        );
+        assert.ok(detail.includes(currentValues.trim()), detail);
+        assert.ok(!detail.includes('[redacted]'), detail);
+      },
+      { cookies: [...jar, cookie('fresh', 'fixture-fresh', 'shop.example.test')] }
+    );
   });
 }
