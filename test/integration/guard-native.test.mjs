@@ -9,6 +9,14 @@ import { browserArgs, origins } from './guard-fixture.mjs';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const variants = { prompt: 2000, lagging: 8000 };
 
+async function until(check, ms, what) {
+  const deadline = Date.now() + ms;
+  while (!(await check())) {
+    assert(Date.now() < deadline, `timed out waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
 async function open(client, url) {
   const { targetId } = await client.send('Target.createTarget', {
     url: 'about:blank',
@@ -151,7 +159,10 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
             );
             await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, sessionId);
             stop = intercept(client, sessionId, dest, 'FULFILLED');
-            const trigger = `${targets.ordinary}/page?k=deferred&defer=3000&to=${encodeURIComponent(dest)}&tag=${tag}`;
+            const trigger = `${targets.ordinary}/page?k=href&to=${encodeURIComponent(dest)}&tag=${tag}`;
+            const beacon = (entry) =>
+              new URL(entry.url).pathname === '/beacon' &&
+              new URL(entry.url).searchParams.get('tag') === tag;
             const loaded = client.waitEvent(
               (event) => event.method === 'Page.loadEventFired' && event.sessionId === sessionId,
               15000
@@ -165,16 +176,43 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
               sessionId
             );
             await loaded;
-            await sleep(1500);
+            await until(() => fixture.log().some(beacon), 15000, 'beacon before exit');
+            assert(
+              client.events.some(
+                (event) =>
+                  event.method === 'Fetch.requestPaused' && event.params.request.url === trigger
+              )
+            );
+            assert(
+              fixture
+                .log()
+                .some((entry) => entry.url === trigger && entry.headers['x-probe'] === tag)
+            );
             await stop();
             stop = undefined;
             const exited = Date.now();
             await client.close();
-            await sleep(3000 + detachDelay);
+            await until(
+              async () =>
+                !(await raw.send('Target.getTargetInfo', { targetId })).targetInfo.attached,
+              15000,
+              'target detached after exit'
+            );
             const { sessionId: observed } = await raw.send('Target.attachToTarget', {
               targetId,
               flatten: true,
             });
+            await raw.send('Page.enable', {}, observed);
+            const arrived = raw.waitEvent(
+              (event) => event.method === 'Page.loadEventFired' && event.sessionId === observed,
+              15000
+            );
+            await raw.send(
+              'Runtime.evaluate',
+              { expression: 'setTimeout(go,0);true', returnByValue: true },
+              observed
+            );
+            await arrived;
             const read = await raw.send(
               'Runtime.evaluate',
               {
@@ -188,16 +226,7 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
             const hits = fixture.log().filter((entry) => entry.url === dest);
             assert(hits.length > 0);
             assert(hits.every((entry) => entry.time >= exited && !entry.headers['x-probe']));
-            assert(
-              !fixture
-                .log()
-                .some(
-                  (entry) =>
-                    new URL(entry.url).pathname === '/beacon' &&
-                    entry.time >= exited &&
-                    new URL(entry.url).searchParams.get('tag') === tag
-                )
-            );
+            assert(!fixture.log().some((entry) => beacon(entry) && entry.time >= exited));
             assert(
               !client.events.some(
                 (event) =>
