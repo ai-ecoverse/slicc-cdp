@@ -16,12 +16,12 @@ function history(t) {
   git('config', 'user.name', 'Protocol fixture');
   git('config', 'user.email', 'protocol@example.invalid');
   writeFileSync(path.join(directory, 'old-fields.json'), '{"monolithic":true}');
-  git('add', '.');
+  git('add', '-A', '--', ':/');
   git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'old producing tools');
   const old = git('rev-parse', 'HEAD');
   mkdirSync(path.join(directory, 'scripts/cert'), { recursive: true });
   writeFileSync(path.join(directory, 'scripts/cert/guard-suite.mjs'), 'export const schema = 2;');
-  git('add', '.');
+  git('add', '-A', '--', ':/');
   git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'current producing tools');
   return { directory, old, current: git('rev-parse', 'HEAD') };
 }
