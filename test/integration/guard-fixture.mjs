@@ -44,7 +44,7 @@ export function browserStartup(launch, report = () => {}) {
   };
 }
 
-export function browserArgs({ privileged = false } = {}) {
+export function browserArgs({ privileged = false, siteIsolationOff = false } = {}) {
   const hosts = [
     'seven.sliccy.ai',
     'vault.sliccy.ai',
@@ -68,6 +68,7 @@ export function browserArgs({ privileged = false } = {}) {
     '--disable-sync',
     '--password-store=basic',
     '--use-mock-keychain',
-    `--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable${privileged ? '' : ',WebUIOmniboxPopup,WebUIOmniboxFullPopup,WebUIOmniboxAimPopup'}`,
+    ...(siteIsolationOff ? ['--disable-site-isolation-trials'] : []),
+    `--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable${privileged ? '' : ',WebUIOmniboxPopup,WebUIOmniboxFullPopup,WebUIOmniboxAimPopup'}${siteIsolationOff ? ',IsolateOrigins,site-per-process' : ''}`,
   ];
 }

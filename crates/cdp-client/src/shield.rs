@@ -714,15 +714,36 @@ mod tests {
         }
     }
 
-    fn until_blocked(cdp: &mut Cdp, session: &str) {
+    fn until_allowed_error(cdp: &mut Cdp, raw: &mut Raw, target: &str, session: &str, failed_url: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !cdp.session_blocked(session) {
-            assert!(
-                Instant::now() < deadline,
-                "session {session} was never blocked"
-            );
-            let _ = cdp.pump(Instant::now() + Duration::from_millis(200));
+        while !cdp.paused_trail.iter().any(|(_, url, reason)| url == failed_url && matches!(*reason, "guard session" | "reaches a protected origin")) {
+            assert!(Instant::now() < deadline, "protected document request was not intercepted: {failed_url}");
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
         }
+        let observer = raw.session(target);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
+            let tree = raw.call("Page.getFrameTree", json!({}), Some(&observer));
+            let info = raw.call("Target.getTargetInfo", json!({ "targetId": target }), None);
+            let qualifies = tree.as_ref().ok().and_then(|tree| tree.pointer("/frameTree/frame")).is_some_and(|frame| {
+                cdp.guard().error_document(
+                    frame["url"].as_str().unwrap_or(""),
+                    frame["securityOrigin"].as_str().unwrap_or(""),
+                ) && frame["unreachableUrl"].as_str() == Some(failed_url)
+                    && frame.get("parentId").is_none()
+            }) && info.as_ref().ok().and_then(|info| info.pointer("/targetInfo/url")).and_then(Value::as_str) == Some(failed_url);
+            if qualifies {
+                let ready = cdp.call("Runtime.evaluate", json!({ "expression": "document.readyState", "returnByValue": true }), Some(session));
+                if ready.as_ref().ok().and_then(|out| out.pointer("/result/value")).and_then(Value::as_str) == Some("complete") {
+                    assert!(!cdp.session_blocked(session));
+                    assert!(!cdp.target_protected(target, false).unwrap());
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?}");
+        }
+        raw.call("Target.detachFromTarget", json!({ "sessionId": observer }), None).unwrap();
     }
 
     fn page_ids(raw: &mut Raw) -> std::collections::BTreeSet<String> {
@@ -935,23 +956,10 @@ mod tests {
                 Some(&session),
             )
             .unwrap();
-            until_blocked(&mut cdp, &session);
-            refused(
-                cdp.call(
-                    "Runtime.evaluate",
-                    json!({ "expression": "document.cookie" }),
-                    Some(&session),
-                ),
-                "evaluate after a script navigation to seven",
-            );
-            refused(
-                cdp.call(
-                    "Target.attachToTarget",
-                    json!({ "targetId": target, "flatten": true }),
-                    None,
-                ),
-                "reattach after a script navigation to seven",
-            );
+            until_allowed_error(&mut cdp, &mut raw, &target, &session, &format!("{seven}/nowhere?secret=SCRIPTSECRET"));
+            refused(cdp.call("Runtime.evaluate", json!({ "expression": "document.cookie" }), Some(&session)), "content of a protected error page");
+            let reattached = client::attach(&mut cdp, &target).unwrap();
+            client::detach(&mut cdp, &reattached);
             let info = cdp
                 .call("Target.getTargetInfo", json!({ "targetId": target }), None)
                 .unwrap();
@@ -984,37 +992,11 @@ mod tests {
                 let body = format!("<!doctype html><meta http-equiv=\"refresh\" content=\"0;url={landing}\"><title>refresh</title>");
                 seen.decide(&paused, &Decision::Fulfill(Fulfill::html(200, body)))
                     .unwrap();
-                until_blocked(&mut seen, &session);
+                until_allowed_error(&mut seen, &mut raw, &target, &session, &landing);
             }
-            for (method, params) in [
-                (
-                    "Runtime.evaluate",
-                    json!({ "expression": "document.cookie" }),
-                ),
-                ("Page.captureScreenshot", json!({})),
-                (
-                    "DOMSnapshot.captureSnapshot",
-                    json!({ "computedStyles": [] }),
-                ),
-                (
-                    "Input.dispatchKeyEvent",
-                    json!({ "type": "keyDown", "key": "a" }),
-                ),
-                ("DOM.getDocument", json!({})),
-                ("Network.getCookies", json!({})),
-                ("Page.navigate", json!({ "url": format!("{app}/") })),
-                ("Fetch.enable", json!({})),
-            ] {
-                refused(cdp.call(method, params, Some(&session)), method);
-            }
-            refused(
-                cdp.call(
-                    "Target.attachToTarget",
-                    json!({ "targetId": target, "flatten": true }),
-                    None,
-                ),
-                "reattach after the meta refresh",
-            );
+            let reattached = client::attach(&mut cdp, &target).unwrap();
+            client::detach(&mut cdp, &reattached);
+            refused(cdp.call("Page.navigate", json!({ "url": landing }), Some(&session)), "a protected destination is still refused from an error page");
             let url = raw
                 .call("Target.getTargetInfo", json!({ "targetId": target }), None)
                 .unwrap()["targetInfo"]["url"]
@@ -1350,7 +1332,7 @@ mod tests {
                 Some(&session),
             )
             .unwrap();
-            until_blocked(&mut cdp, &session);
+            until_allowed_error(&mut cdp, &mut raw, &target, &session, &format!("{seven}/nowhere?n=away"));
             assert!(
                 seen.borrow().iter().all(|url| !url.contains("sliccy")),
                 "{:?}",
@@ -1392,6 +1374,7 @@ mod tests {
                 "{vault}/landing?leak={}",
                 url::form_urlencoded::byte_serialize(leak.as_bytes()).collect::<String>()
             );
+            let failed_url = landing.clone();
             crate::fetch::enable(&mut cdp, &session, &[Pattern::request("*")]).unwrap();
             cdp.set_decider(
                 &session,
@@ -1405,7 +1388,7 @@ mod tests {
                 })),
             );
             let _ = cdp.notify("Page.navigate", json!({ "url": refresh }), Some(&session));
-            until_blocked(&mut cdp, &session);
+            until_allowed_error(&mut cdp, &mut raw, &target, &session, &failed_url);
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {
                 let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
@@ -1808,7 +1791,7 @@ mod tests {
             guard_evidence(&cdp, &mut raw, &app, &slow, "/dump", &main_trigger)
         );
         main_trigger.as_ref().unwrap();
-        until_blocked(&mut cdp, &session);
+        until_allowed_error(&mut cdp, &mut raw, &tab, &session, &main);
         assert_eq!(
             fixture_hits(&app, "/dump"),
             "0",

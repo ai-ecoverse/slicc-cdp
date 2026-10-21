@@ -72,10 +72,10 @@ const extensionPath = fileURLToPath(
   new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
 );
 
-async function guardBrowser(startup, { privileged, extension, target, slot }) {
+async function guardBrowser(startup, { privileged, extension, target, slot, siteIsolationOff }) {
   const browser = await startup.start(
     [
-      ...browserArgs({ privileged: privileged || extension }),
+      ...browserArgs({ privileged: privileged || extension, siteIsolationOff }),
       ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
     ],
     { target, slot }
@@ -163,6 +163,8 @@ test('published guard set through the Rust guarded client', {
           extensionWorld: true,
           browserContexts: true,
           discovery: true,
+          clientExit: true,
+          siteIsolationOff: true,
         },
         variant: Object.keys(set.variants),
         parallel,
@@ -176,17 +178,20 @@ test('published guard set through the Rust guarded client', {
             startup.markRowStarted();
             return {};
           }
-          if (!browsers.has(slot))
+          const siteIsolationOff = vector.requires?.includes('siteIsolationOff') === true;
+          const key = `${slot}/${siteIsolationOff ? 'shared' : 'isolated'}`;
+          if (!browsers.has(key))
             browsers.set(
-              slot,
+              key,
               guardBrowser(startup, {
                 privileged: vector.id.startsWith('C8.'),
                 extension: selected.vectors.some((row) => row.id.startsWith('C9.')),
                 target,
                 slot,
+                siteIsolationOff,
               })
             );
-          const browser = await browsers.get(slot);
+          const browser = await browsers.get(key);
           const client = await recordedClient((onMessage) =>
             guarded(browser.wsUrl, targets.client, { variant, detachDelay, onMessage })
           );
@@ -196,7 +201,7 @@ test('published guard set through the Rust guarded client', {
           } catch (error) {
             await client.close();
             await browser.close();
-            browsers.delete(slot);
+            browsers.delete(key);
             throw error;
           }
           let diagnostic;
