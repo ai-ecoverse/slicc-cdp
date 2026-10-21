@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { cliVerdict } from './cli-verdict.mjs';
+import { cliVerdict, writeStdout } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
 import {
   expectedExecutionIdentity,
@@ -402,5 +402,5 @@ const record = {
 };
 save(path.join(options.out, 'record.json'), record);
 writeFileSync(path.join(options.out, 'line.txt'), `${line}\n`);
-console.log(line);
+await writeStdout(`${line}\n`);
 printVerdict(record.status, options.out);

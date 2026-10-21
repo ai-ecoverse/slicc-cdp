@@ -121,11 +121,35 @@ impl Protected {
         self.rules.target_types.iter().any(|item| item == kind)
     }
 
+    pub fn error_page_url(&self, document_url: &str) -> bool {
+        self.rules.error_page.target == "previous"
+            && !self.rules.error_page.url.is_empty()
+            && document_url == self.rules.error_page.url
+    }
+
+    pub fn error_document(&self, document_url: &str, origin: &str) -> bool {
+        self.error_page_url(document_url) && origin == "://"
+    }
+
+    pub fn error_redaction(&self) -> bool {
+        self.rules.error_page.redact == "origin"
+    }
+
     pub fn target(&self, text: &str, previous: bool, opener: Opener) -> bool {
         if self.inheriting(text) {
             return previous || matches!(opener, Opener::Protected | Opener::Unknown);
         }
         self.url(text)
+    }
+
+    pub fn target_with_document(&self, text: &str, previous: bool, opener: Opener, document_url: Option<&str>, unreachable_url: Option<&str>, navigating: bool) -> bool {
+        if document_url.is_some_and(|url| self.error_page_url(url))
+            && unreachable_url == Some(text)
+            && !navigating
+        {
+            return previous;
+        }
+        self.target(text, previous, opener)
     }
 
     pub fn cookie_domain(&self, domain: &str) -> bool {
@@ -441,7 +465,7 @@ mod tests {
             };
             assert_eq!(
                 guard.target_type(vector.kind.as_deref().unwrap_or(""))
-                    || guard.target(&vector.url, vector.previous, opener),
+                    || guard.target_with_document(&vector.url, vector.previous, opener, vector.document_url.as_deref(), vector.unreachable_url.as_deref(), vector.navigating),
                 vector.protected,
                 "{vector:?}"
             );

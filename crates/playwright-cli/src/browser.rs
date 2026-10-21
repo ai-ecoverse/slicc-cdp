@@ -39,7 +39,7 @@ pub fn list_pages(cdp: &mut Cdp) -> Result<Vec<PageInfo>, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if is_internal(&url, &title) || target_id.is_empty() || cdp.is_protected_target(&target_id) {
+        if is_internal(&url, &title) && !cdp.recovering(&target_id) || target_id.is_empty() || cdp.is_protected_target(&target_id) {
             continue;
         }
         pages.push(PageInfo {

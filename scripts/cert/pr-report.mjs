@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { cliVerdict } from './cli-verdict.mjs';
+import { cliVerdict, writeJson } from './cli-verdict.mjs';
 import { identity, json, root, run, save } from './common.mjs';
 import { client, context, hash, required, residual } from './pr-common.mjs';
 
@@ -325,6 +325,6 @@ try {
 if (values.out) save(values.out, record);
 if (process.env.GITHUB_STEP_SUMMARY)
   writeFileSync(process.env.GITHUB_STEP_SUMMARY, `${record.line ?? record.reason}\n`);
-console.log(JSON.stringify(record));
+await writeJson(record);
 if (!['PASS', 'NOOP'].includes(record.status)) process.exitCode = 1;
 printVerdict(record.status === 'NOOP' ? 'PASS' : record.status, `document=${record.status}`);

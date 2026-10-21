@@ -112,10 +112,33 @@ test('frame-scoped reads require verified URL and origin records', async () => {
   }
 });
 
+test('a matching ordinary navigation does not invalidate fresh frame discovery', async () => {
+  let injected = false;
+  await fixture(
+    {
+      childFrames: [{ frame: { ...ordinary } }],
+      intercept: (message, send) => {
+        if (!injected && message.method === 'Page.getFrameTree') {
+          injected = true;
+          navigation(message, send, ordinary);
+        }
+      },
+    },
+    async (client, sessionId) => {
+      await read(client, sessionId);
+      assert.equal(injected, true);
+    }
+  );
+});
+
 test('ordinary frame-scoped replies are checked against the current tree', async () => {
   await fixture({ childFrames: [{ frame: { ...ordinary } }] }, async (client, sessionId, calls) => {
     await read(client, sessionId);
-    assert.equal(calls.filter((call) => call.method === 'Page.getFrameTree').length, 2);
+    assert.equal(
+      calls.filter((call) => call.method === 'Page.getFrameTree' && call.sessionId === sessionId)
+        .length,
+      2
+    );
     assert.equal(calls.filter((call) => call.method === 'Accessibility.getFullAXTree').length, 1);
   });
 });

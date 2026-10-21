@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { cliVerdict } from './cli-verdict.mjs';
+import { cliVerdict, writeJson } from './cli-verdict.mjs';
 import { args, identity, json, save } from './common.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { biosCalls, selectBiosPin } from './pr-bios-result.mjs';
@@ -60,6 +60,6 @@ try {
   if (temporary) rmSync(temporary, { recursive: true, force: true });
 }
 save(options.out, result);
-console.log(JSON.stringify(result));
+await writeJson(result);
 if (result.status === 'FAIL') process.exitCode = 1;
 printVerdict(result.status, options.out);
