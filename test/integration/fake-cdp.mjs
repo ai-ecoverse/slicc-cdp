@@ -67,8 +67,15 @@ const tree = {
   ],
 };
 
-export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = false } = {}) {
+export async function fakeCdp({
+  refuse = [],
+  refusalMessage,
+  noisyRefusal = false,
+  pauseNavigation = false,
+} = {}) {
   const calls = [];
+  const navigationPauses = new Map();
+  const fetchSessions = new Set();
   const targets = [];
   const sessions = new Map();
   let next = 0;
@@ -168,14 +175,39 @@ export async function fakeCdp({ refuse = [], refusalMessage, noisyRefusal = fals
               frame: { id: target?.targetId ?? 'F', loaderId: 'L', url: target?.url ?? '' },
             },
           });
+        case 'Fetch.enable':
+          fetchSessions.add(sessionId);
+          return answer({});
+        case 'Fetch.disable':
+          fetchSessions.delete(sessionId);
+          return answer({});
+        case 'Fetch.continueRequest': {
+          const complete = navigationPauses.get(params.requestId);
+          navigationPauses.delete(params.requestId);
+          complete?.();
+          return answer({});
+        }
         case 'Page.navigate': {
-          if (target) target.url = params.url;
-          answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
-          event('Page.frameNavigated', {
-            frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
-          });
-          event('Page.domContentEventFired', { timestamp: 1 });
-          event('Page.loadEventFired', { timestamp: 1 });
+          const complete = () => {
+            if (target) target.url = params.url;
+            answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
+            event('Page.frameNavigated', {
+              frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
+            });
+            event('Page.domContentEventFired', { timestamp: 1 });
+            event('Page.loadEventFired', { timestamp: 1 });
+          };
+          if (pauseNavigation && fetchSessions.has(sessionId)) {
+            const requestId = `NAV-${sessionId}`;
+            navigationPauses.set(requestId, complete);
+            event('Fetch.requestPaused', {
+              requestId,
+              networkId: `NET-${sessionId}`,
+              frameId: target?.targetId ?? 'F',
+              resourceType: 'Document',
+              request: { url: params.url, method: 'GET', headers: {} },
+            });
+          } else complete();
           return;
         }
         case 'Page.createIsolatedWorld':

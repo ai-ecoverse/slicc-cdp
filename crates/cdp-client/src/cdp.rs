@@ -31,9 +31,17 @@ const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
+struct Navigation {
+    params: Value,
+    session: Option<String>,
+    reply: Option<Value>,
+    detached: bool,
+}
+
 pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: i64,
+    navigations: BTreeMap<i64, Navigation>,
     events: Vec<Value>,
     guard: Protected,
     paused: VecDeque<Paused>,
@@ -80,6 +88,7 @@ impl Cdp {
         Self {
             ws,
             next_id: 0,
+            navigations: BTreeMap::new(),
             events: Vec::new(),
             guard: Protected::default(),
             paused: VecDeque::new(),
@@ -217,6 +226,35 @@ impl Cdp {
         self.after(method, &params, session_id, result)
     }
 
+    pub fn start_navigation(&mut self, params: Value, session: Option<&str>) -> Result<i64, String> {
+        let session = session.filter(|session| !session.is_empty());
+        self.admit("Page.navigate", &params, session)?;
+        let id = self.send("Page.navigate", params.clone(), session)?;
+        self.navigations.insert(id, Navigation { params, session: session.map(str::to_string), reply: None, detached: false });
+        Ok(id)
+    }
+
+    pub fn poll_navigation(&mut self, id: i64) -> Option<Result<Value, String>> {
+        let navigation = self.navigations.get(&id)?;
+        let refused = navigation.detached || navigation.session.as_deref().is_some_and(|session| self.blocked.contains(session) && !harmless("Page.navigate", &navigation.params));
+        if refused {
+            self.navigations.remove(&id);
+            return Some(Err(self.refusal()));
+        }
+        navigation.reply.as_ref()?;
+        let navigation = self.navigations.remove(&id).unwrap();
+        let reply = navigation.reply.unwrap();
+        if let Some(error) = reply.get("error") {
+            let (message, _) = shield::redact_text(&self.guard, error.get("message").and_then(Value::as_str).unwrap_or("CDP error"));
+            return Some(Err(format!("Page.navigate: {message}\n")));
+        }
+        Some(self.after("Page.navigate", &navigation.params, navigation.session.as_deref(), reply.get("result").cloned().unwrap_or(Value::Null)))
+    }
+
+    pub fn cancel_navigation(&mut self, id: i64) {
+        self.navigations.remove(&id);
+    }
+
     pub fn notify(
         &mut self,
         method: &str,
@@ -342,6 +380,9 @@ impl Cdp {
                     }
                 }
             }
+        }
+        if matches!(method, "Fetch.continueRequest" | "Network.continueInterceptedRequest") && params.get("url").and_then(Value::as_str).is_some_and(|url| self.resource_protected(session_id.unwrap_or(""), url)) {
+            return Err(self.refusal());
         }
         if shield::interception_method(method) {
             let id = shield::request_key(params).unwrap_or_default();
@@ -1210,37 +1251,79 @@ impl Cdp {
         }
     }
 
+    fn redirect_headers(headers: &mut Value) {
+        let allowed = |name: &str| !matches!(name.to_ascii_lowercase().as_str(), "cookie" | "set-cookie" | "authorization" | "proxy-authorization" | "www-authenticate" | "proxy-authenticate");
+        match headers {
+            Value::Object(fields) => fields.retain(|name, value| allowed(name) && value.is_string()),
+            Value::Array(fields) => {
+                fields.retain(|field| field.get("name").and_then(Value::as_str).is_some_and(allowed) && field.get("value").is_some_and(Value::is_string));
+                for field in fields { if let Some(fields) = field.as_object_mut() { fields.retain(|name, _| matches!(name.as_str(), "name" | "value")); } }
+            }
+            _ => *headers = json!({}),
+        }
+    }
+
     fn visible_redirect(&self, value: &mut Value) -> bool {
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+        if self.guard_sessions.contains(&session) { return false }
         let id = value.pointer("/params/requestId").and_then(Value::as_str).unwrap_or("").to_string();
-        if value.get("method").and_then(Value::as_str) != Some("Network.requestWillBeSent") || !self.seen_network.contains_key(&(session, id)) || !value.pointer("/params/redirectResponse/status").and_then(Value::as_u64).is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) {
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        if method == "Network.responseReceivedExtraInfo" && !self.requests.contains_key(&id) { return false }
+        let status = match method.as_str() {
+            "Network.requestWillBeSent" => value.pointer("/params/redirectResponse/status"),
+            "Network.responseReceived" => value.pointer("/params/response/status"),
+            "Network.responseReceivedExtraInfo" => value.pointer("/params/statusCode"),
+            "Fetch.requestPaused" => value.pointer("/params/responseStatusCode"),
+            _ => return false,
+        }.and_then(Value::as_u64);
+        if !status.is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) || method == "Network.requestWillBeSent" && !self.seen_network.contains_key(&(session, id)) {
             return false;
         }
-        let params = &mut value["params"];
-        let request = json!({"url":params.pointer("/request/url").cloned().unwrap_or(Value::Null),"method":params.pointer("/request/method").and_then(Value::as_str).filter(|method| matches!(*method, "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH")).unwrap_or("GET"),"headers":{}});
-        let mut response = params["redirectResponse"].clone();
-        if let Some(fields) = response.as_object_mut() { fields.retain(|key, _| matches!(key.as_str(), "url" | "status" | "connectionReused" | "connectionId" | "encodedDataLength" | "fromDiskCache" | "fromServiceWorker" | "fromPrefetchCache" | "timing" | "responseTime")); }
-        response["statusText"] = json!("");
-        response["headers"] = json!({});
-        let location = params.pointer("/redirectResponse/headers").and_then(Value::as_object).and_then(|headers| headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("Location"))).map(|(_, location)| location.clone());
-        if let Some(location) = location { response["headers"] = json!({"Location":location}); }
-        if let Some(fields) = params.as_object_mut() { fields.retain(|key, _| matches!(key.as_str(), "requestId" | "loaderId" | "frameId" | "timestamp" | "wallTime" | "type")); }
-        params["request"] = request;
-        params["redirectResponse"] = response;
-        shield::redact_strings(&self.guard, value);
+        let mut redacted = value.clone();
+        if !shield::redact_strings(&self.guard, &mut redacted) { return false }
+        let params = &mut redacted["params"];
+        if method == "Network.responseReceivedExtraInfo" {
+            if let Some(fields) = params.as_object_mut() { fields.retain(|key, _| matches!(key.as_str(), "requestId" | "statusCode" | "headers" | "headersText")); }
+            Self::redirect_headers(&mut params["headers"]);
+            if params.get("headersText").is_some() {
+                let headers = params["headers"].as_object().map(|headers| headers.iter().map(|(name, value)| format!("{name}: {}\r\n", value.as_str().unwrap())).collect::<String>()).unwrap_or_default();
+                params["headersText"] = json!(format!("HTTP/1.1 {}\r\n{headers}\r\n", status.unwrap()));
+            }
+        } else {
+            let request = json!({"url":params.pointer("/request/url").cloned().unwrap_or(Value::Null),"method":params.pointer("/request/method").and_then(Value::as_str).filter(|method| matches!(*method, "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE" | "PATCH")).unwrap_or("GET"),"headers":{}});
+            if method == "Fetch.requestPaused" {
+                if let Some(fields) = params.as_object_mut() { fields.retain(|key, _| matches!(key.as_str(), "requestId" | "networkId" | "frameId" | "resourceType" | "responseStatusCode" | "responseHeaders")); }
+                Self::redirect_headers(&mut params["responseHeaders"]);
+                params["responseStatusText"] = json!("");
+                params["request"] = request;
+            } else {
+                let key = if method == "Network.requestWillBeSent" { "redirectResponse" } else { "response" };
+                let mut response = params[key].clone();
+                if let Some(fields) = response.as_object_mut() { fields.retain(|key, _| matches!(key.as_str(), "url" | "status" | "headers" | "connectionReused" | "connectionId" | "encodedDataLength" | "fromDiskCache" | "fromServiceWorker" | "fromPrefetchCache" | "timing" | "responseTime")); }
+                response["statusText"] = json!("");
+                Self::redirect_headers(&mut response["headers"]);
+                if let Some(fields) = params.as_object_mut() { fields.retain(|key, _| matches!(key.as_str(), "requestId" | "loaderId" | "frameId" | "timestamp" | "wallTime" | "type")); }
+                if method == "Network.requestWillBeSent" { params["request"] = request; }
+                params[key] = response;
+            }
+        }
+        *value = redacted;
         true
     }
 
     fn deliver(&mut self, mut value: Value) {
         self.watch(&mut value);
         let key = (value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string(), value.pointer("/params/requestId").and_then(Value::as_str).unwrap_or("").to_string());
-        if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Network.")) && self.terminal_network.contains(&key) { return }
+        let terminal = self.terminal_network.contains(&key);
+        if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Network.") && method != "Network.responseReceivedExtraInfo") && terminal { return }
         let guarded = self.blocked.contains(&key.0) || shield::loaded_urls_protected(&self.guard, &value["params"]) || self.hidden(&value) || self.redirects.contains(&key.1);
         if guarded && self.visible_redirect(&mut value) {
+            let hop = value.get("method").and_then(Value::as_str) == Some("Network.requestWillBeSent");
             self.events.push(value.clone());
-            self.fail_seen_network(&value);
+            if hop { self.fail_seen_network(&value); }
             return;
         }
+        if terminal { return }
         if self.worlds.event(&value, &self.guard) {
             if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
                 let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
@@ -1296,7 +1379,9 @@ impl Cdp {
         if let Some(id) = id {
             if self.requests.get(&id) == Some(&false) {
                 if let Some(held) = self.held.remove(&id) {
-                    self.events.extend(held);
+                    for mut event in held {
+                        if !self.redirects.contains(&id) || self.visible_redirect(&mut event) { self.events.push(event); }
+                    }
                 }
             }
         }
@@ -1422,6 +1507,10 @@ impl Cdp {
 
     fn absorb(&mut self, mut value: Value) {
         if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
+            if let Some(navigation) = self.navigations.get_mut(&id) {
+                navigation.reply = Some(value);
+                return;
+            }
             if let Some((session, request)) = self.answering.remove(&id) {
                 if value.get("error").is_none() {
                     self.settle(&session, &request);
@@ -1439,6 +1528,12 @@ impl Cdp {
                 }
             }
             return;
+        }
+        if value.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget") {
+            let session = value.pointer("/params/sessionId").and_then(Value::as_str);
+            for navigation in self.navigations.values_mut() {
+                if navigation.session.as_deref() == session { navigation.detached = true; }
+            }
         }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.authRequired")
             && self.challenge_protected(&value)
@@ -1516,10 +1611,7 @@ impl Cdp {
                 return;
             }
             if protected {
-                if redirect && !authority_protected && !self.guard.url(&paused.full_url()) && !self.blocked.contains(&paused.session_id) {
-                    if let Some(request) = value.pointer_mut("/params/request").and_then(Value::as_object_mut) {
-                        request.retain(|key, _| !key.starts_with("postData") && !key.to_ascii_lowercase().ends_with("fragment"));
-                    }
+                if redirect && !authority_protected && self.visible_redirect(&mut value) {
                     self.events.push(value);
                 }
                 self.answer_protected(&paused);
@@ -1951,6 +2043,8 @@ mod tests {
     include!("redirect_race_test.rs");
     include!("redirect_terminal_test.rs");
     include!("redirect_terminal_guard_test.rs");
+    include!("redirect_c2_carrier_test.rs");
+    include!("navigation_queue_test.rs");
     include!("redirect_fragment_test.rs");
     include!("redirect_review_test.rs");
     include!("redirect_relation_test.rs");
