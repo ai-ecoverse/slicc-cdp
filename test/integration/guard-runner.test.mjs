@@ -230,11 +230,51 @@ test('published guard set through the Rust guarded client', {
               }
             };
           }
+          let c9;
+          if (vector.id === 'C9.world-debugger') {
+            c9 = { variant, slot, start: Date.now(), from: unguarded.events.length, calls: [] };
+            const send = unguarded.send;
+            unguarded.send = async (method, params = {}, sessionId) => {
+              const call = { at: Date.now() - c9.start, method, s: sessionId?.slice(0, 6) };
+              c9.calls.push(call);
+              try {
+                const result = await send(method, params, sessionId);
+                call.done = Date.now() - c9.start;
+                if (method.startsWith('Debugger.') || method === 'Runtime.evaluate')
+                  call.r = JSON.stringify(result).slice(0, 160);
+                return result;
+              } catch (error) {
+                call.done = Date.now() - c9.start;
+                call.e = error.message.slice(0, 160);
+                throw error;
+              }
+            };
+          }
           startup.markRowStarted();
           return {
             client,
             unguarded,
             close: async () => {
+              if (c9)
+                process.stdout.write(
+                  `C9DIAG ${JSON.stringify({
+                    ...c9,
+                    events: unguarded.events
+                      .slice(c9.from)
+                      .filter((event) =>
+                        /^(Debugger\.(paused|resumed)|Runtime\.executionContext(Created|Destroyed)|Target\.(attached|detached)|Page\.frameNavigated)/.test(
+                          event.method
+                        )
+                      )
+                      .map((event) => [
+                        event.method,
+                        event.diagAt - c9.start,
+                        event.sessionId?.slice(0, 6),
+                        event.params?.context?.origin ?? event.params?.reason ?? '',
+                        event.params?.callFrames?.[0]?.url ?? event.params?.context?.id ?? '',
+                      ]),
+                  })}\n`
+                );
               if (diagnostic)
                 diagnostic.afterCleanup = diagnostic.references.map((details) =>
                   structuredClone(details)

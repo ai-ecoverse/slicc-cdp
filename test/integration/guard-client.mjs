@@ -10,6 +10,7 @@ function channel(write, onMessage) {
   const pending = new Map();
   let id = 0;
   const receive = (message) => {
+    Object.defineProperty(message, 'diagAt', { value: Date.now(), enumerable: false });
     onMessage?.(message);
     if (message.event) events.push(message.event);
     else if (message.method) events.push(message);
