@@ -1,0 +1,76 @@
+name: Document checks
+
+on:
+  pull_request:
+    paths:
+      - crates/cdp-client/**
+      - test/integration/*document*
+      - test/integration/cdp-proxy.mjs
+      - test/integration/guard-client.mjs
+      - test/integration/fake-cdp.mjs
+      - .github/workflows/document-check.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: document-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  document-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SLICC_CDP_PORTS: 9300-9309
+      CARGO_BUILD_JOBS: 4
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install Chromium
+        run: npm run -s browser -- --with-deps
+      - name: Verify current document commands
+        run: |
+          cargo test --locked -p slicc-cdp-client --test document-freshness
+          node --test test/integration/document-freshness.test.mjs test/integration/current-document.test.mjs
+      - name: Verify regression sensitivity
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git grep -q 'fn verify_document' "$BASE" -- crates/cdp-client/src/cdp.rs; then
+            echo 'baseline already verifies current documents'
+            exit 0
+          fi
+          git show "$BASE:crates/cdp-client/src/cdp.rs" > crates/cdp-client/src/cdp.rs
+          if cargo test --locked -p slicc-cdp-client --test document-freshness > /tmp/document-rust.log 2>&1; then
+            echo 'expected the baseline document test to fail'
+            exit 1
+          fi
+          grep -q 'the client command reached the current document\|before_attach=false, notify=false: Ok' /tmp/document-rust.log
+          if node --test --test-reporter=tap test/integration/current-document.test.mjs > /tmp/document-browser.tap 2>&1; then
+            echo 'expected the baseline browser tests to fail'
+            exit 1
+          fi
+          grep -q '# fail 2' /tmp/document-browser.tap
+          test "$(grep -c 'did not match the regular expression' /tmp/document-browser.tap)" = 2
+          echo 'baseline document tests rejected'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: document-checks
+          path: |
+            /tmp/document-rust.log
+            /tmp/document-browser.tap
+          if-no-files-found: ignore
+          retention-days: 7

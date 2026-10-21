@@ -156,11 +156,14 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
   }
 }
 
-export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
+export async function guarded(
+  ws,
+  origin,
+  { variant, detachDelay, onMessage, transport = process.env.SLICC_GUARD_TRANSPORT }
+) {
   if (!['prompt', 'lagging'].includes(variant) || !Number.isInteger(detachDelay))
     throw new Error('invalid guard variant');
-  if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
-    return wasiGuarded(ws, origin, { variant, detachDelay, onMessage });
+  if (transport === 'wasi') return wasiGuarded(ws, origin, { variant, detachDelay, onMessage });
   const child = spawn(bridge, [ws, origin], { stdio: ['pipe', 'pipe', 'inherit'] });
   const client = channel((message) => child.stdin.write(`${message}\n`), onMessage);
   createInterface({ input: child.stdout }).on('line', (line) => client.receive(JSON.parse(line)));

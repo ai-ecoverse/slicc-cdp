@@ -78,6 +78,8 @@ export async function cdpProxy(
     transform = (message) => message,
     observe = () => {},
     before = [],
+    holdEvents = () => false,
+    responseBarrier = () => null,
   } = {}
 ) {
   const pending = Object.fromEntries(
@@ -85,6 +87,8 @@ export async function cdpProxy(
   );
   const upstream = new URL(wsUrl);
   const replies = [];
+  const heldEvents = [];
+  const releases = [];
   const sockets = new Set();
   let delayed = false;
   const server = net.createServer((client) => {
@@ -196,6 +200,19 @@ export async function cdpProxy(
       for (const frame of out) {
         const message = json(frame);
         if (message) observe('browser', message);
+        if (message?.method && holdEvents(message)) {
+          heldEvents.push(message);
+          releases.push(() => toClient(frame.raw));
+          continue;
+        }
+        const barrier = message?.id !== undefined ? responseBarrier(message) : null;
+        if (barrier) {
+          Promise.resolve(barrier).then(
+            () => toClient(frame.raw),
+            () => client.destroy()
+          );
+          continue;
+        }
         if (!browserEvents && message?.method && !message.sessionId) continue;
         if (message?.id !== undefined && acked.delete(message.id)) continue;
         if (message?.id !== undefined && injected.delete(message.id)) {
@@ -235,6 +252,10 @@ export async function cdpProxy(
   return {
     url: `ws://127.0.0.1:${server.address().port}${upstream.pathname}`,
     replies,
+    heldEvents,
+    releaseEvents: () => {
+      for (const release of releases.splice(0)) release();
+    },
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));

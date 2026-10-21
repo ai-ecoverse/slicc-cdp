@@ -74,10 +74,13 @@ export async function fakeCdp({
   noisyRefusal = false,
   attachEvents = false,
   discoverEvents = false,
+  delayHistoryEvents = false,
 } = {}) {
   const calls = [];
   const targets = [];
   const sessions = new Map();
+  const heldEvents = [];
+  const releaseEvents = [];
   let next = 0;
   let tabs = 0;
   const info = (target) => ({
@@ -239,6 +242,28 @@ export async function fakeCdp({
             model: { content: [0, 0, 10, 0, 10, 10, 0, 10], width: 10, height: 10 },
           });
         case 'Runtime.evaluate':
+          if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {
+            target.history.currentIndex -= 1;
+            target.url = target.history.entries[target.history.currentIndex].url;
+            target.frame = {
+              id: target.targetId,
+              url: target.url,
+              securityOrigin: new URL(target.url).origin,
+            };
+            for (const [peer, found] of sessions) {
+              if (found !== target || !paged.has(peer)) continue;
+              const restored = {
+                method: 'Page.frameNavigated',
+                sessionId: peer,
+                params: { type: 'BackForwardCacheRestore', frame: target.frame },
+              };
+              if (delayHistoryEvents) {
+                heldEvents.push(restored);
+                releaseEvents.push(() => send(restored));
+              } else send(restored);
+            }
+            return answer({ result: { type: 'undefined' } });
+          }
           if (params.expression === 'document.readyState')
             return answer({ result: { type: 'string', value: 'complete' } });
           return answer({ result: { type: 'string', value: 'fake-eval' } });
@@ -272,6 +297,10 @@ export async function fakeCdp({
     url: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`,
     calls,
     targets,
+    heldEvents,
+    releaseEvents: () => {
+      for (const release of releaseEvents.splice(0)) release();
+    },
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));

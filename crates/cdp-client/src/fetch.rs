@@ -1401,6 +1401,7 @@ mod tests {
                 "Fetch.enable" if message["sessionId"] == "S1" => {
                     vec![ok(message), queued.borrow_mut().take().unwrap()]
                 }
+                "Page.getFrameTree" => vec![json!({"id":message["id"],"result":{"frameTree":{"frame":{"id":"F1","url":"about:blank","securityOrigin":"://"}}}})],
                 "Fetch.getResponseBody" => vec![
                     json!({ "id": message["id"], "result": { "body": base64_encode(b"<p>hi</p>"), "base64Encoded": true } }),
                 ],
@@ -1438,8 +1439,11 @@ mod tests {
                 "Page.enable",
                 "Runtime.enable",
                 "Page.getFrameTree",
+                "Page.getFrameTree",
                 "Fetch.enable",
+                "Page.getFrameTree",
                 "Fetch.getResponseBody",
+                "Page.getFrameTree",
                 "Fetch.fulfillRequest",
                 "Fetch.disable",
                 "Target.detachFromTarget"

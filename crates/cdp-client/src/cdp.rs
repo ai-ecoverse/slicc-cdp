@@ -72,7 +72,7 @@ pub struct Cdp {
     handed: BTreeSet<(String, String)>,
     answering: BTreeMap<i64, (String, String)>,
     held: BTreeMap<String, Vec<Value>>,
-    streams: BTreeSet<String>,
+    streams: BTreeMap<String, Option<String>>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
@@ -119,7 +119,7 @@ impl Cdp {
             handed: BTreeSet::new(),
             answering: BTreeMap::new(),
             held: BTreeMap::new(),
-            streams: BTreeSet::new(),
+            streams: BTreeMap::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
@@ -407,8 +407,19 @@ impl Cdp {
         }
         if method == "IO.read" {
             let handle = params.get("handle").and_then(|v| v.as_str()).unwrap_or("");
-            if !self.streams.contains(handle) {
+            if !self.streams.contains_key(handle) {
                 return Err(STREAM.into());
+            }
+        }
+        if matches!(method, "IO.read" | "IO.close") {
+            let target = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned().flatten();
+            if target.is_none_or(|target| !self.verify_document(&target) || self.protected_targets.contains(&target)) {
+                return Err(self.refusal());
+            }
+        }
+        if let Some(session) = session_id {
+            if !harmless(method, params) && self.session_target(session).is_some_and(|target| !self.verify_document(&target) || self.blocked.contains(session)) {
+                return Err(self.refusal());
             }
         }
         Ok(())
@@ -445,15 +456,16 @@ impl Cdp {
         if method == "Runtime.compileScript" {
             self.worlds.script(session_id.unwrap_or(""), &result);
         }
+        let stream_target = session_id.and_then(|session| self.session_target(session));
         if let Some(stream) = result.get("stream").and_then(|v| v.as_str()) {
-            self.streams.insert(stream.to_string());
+            self.streams.insert(stream.to_string(), stream_target.clone());
         }
         if let Some(stream) = result.pointer("/resource/stream").and_then(|v| v.as_str()) {
-            self.streams.insert(stream.to_string());
+            self.streams.insert(stream.to_string(), stream_target.clone());
         }
         if method == "IO.resolveBlob" {
             if let Some(uuid) = result.get("uuid").and_then(|v| v.as_str()) {
-                self.streams.insert(format!("blob:{uuid}"));
+                self.streams.insert(format!("blob:{uuid}"), stream_target);
             }
         }
         match method {
@@ -993,6 +1005,23 @@ impl Cdp {
 
     pub fn recovering(&self, target_id: &str) -> bool {
         self.documents.get(target_id).is_some_and(|doc| doc.probed && !doc.previous)
+    }
+
+    fn verify_document(&mut self, target: &str) -> bool {
+        let Some(guard) = self.guards.get(target).cloned() else {
+            return self.targets.get(target).and_then(|info| info.get("type")).and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "worker" | "service_worker" | "shared_worker"));
+        };
+        let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok().and_then(|tree| tree.pointer("/frameTree/frame").cloned());
+        match frame {
+            Some(frame) if self.guards.get(target) == Some(&guard)
+                && frame.get("parentId").is_none()
+                && ["id", "url"].iter().all(|key| frame.get(*key).and_then(Value::as_str).is_some_and(|value| !value.is_empty())) => {
+                self.main_commit(&guard, &frame);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn refresh(&mut self, target: &str) -> bool {
@@ -2237,6 +2266,37 @@ mod tests {
         cdp
     }
 
+    fn observe_document(cdp: &mut Cdp) {
+        struct Observed {
+            inner: Box<dyn Transport>,
+            frame: Value,
+            inbox: VecDeque<String>,
+        }
+        impl Transport for Observed {
+            fn send_text(&mut self, text: &str) -> Result<(), String> {
+                let call: Value = serde_json::from_str(text).unwrap();
+                if call["method"] == "Page.getFrameTree" {
+                    self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":self.frame}}}).to_string());
+                    Ok(())
+                } else {
+                    self.inner.send_text(text)
+                }
+            }
+            fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+                match self.inbox.pop_front() {
+                    Some(text) => Ok(Some(text)),
+                    None => self.inner.recv_text(deadline),
+                }
+            }
+        }
+        let doc = &cdp.documents["T"];
+        let frame = json!({"id":doc.frame_id,"url":doc.url,"securityOrigin":doc.origin,"unreachableUrl":doc.unreachable_url});
+        let inner = std::mem::replace(&mut cdp.ws, Box::new(Pending { inbox:VecDeque::new(), answer: |_| Vec::new() }));
+        cdp.ws = Box::new(Observed { inner, frame, inbox:VecDeque::new() });
+        cdp.guards.insert("T".into(), "G".into());
+        cdp.guard_sessions.insert("G".into());
+    }
+
     fn error_commit(cdp: &mut Cdp, unreachable: &str, origin: &str) {
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":origin,"unreachableUrl":unreachable}}}));
     }
@@ -2261,6 +2321,7 @@ mod tests {
         let found = cdp.call("Target.getTargetInfo", json!({"targetId":"T"}), None).unwrap();
         assert_eq!(found["targetInfo"]["url"], "https://seven.sliccy.ai");
         assert_eq!(found["targetInfo"]["title"], "https://seven.sliccy.ai");
+        observe_document(&mut cdp);
         for method in ["Page.reload", "Page.navigate", "Target.closeTarget"] {
             let (params, session) = if method == "Target.closeTarget" {
                 (json!({"targetId":"T"}), None)
@@ -2280,6 +2341,7 @@ mod tests {
         assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some("S")).is_err());
         error_commit(&mut cdp, "https://seven.sliccy.ai/path?secret#fragment", "://");
         assert!(!cdp.target_protected("T", false).unwrap());
+        observe_document(&mut cdp);
         assert!(cdp.call("Page.reload", json!({}), Some("S")).is_ok());
     }
 
@@ -2325,6 +2387,7 @@ mod tests {
         cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":"S","params":{"frameId":"F","navigationType":"sameDocument","url":url}}));
         assert!(!cdp.target_protected("T", false).unwrap());
         assert!(cdp.frame_protected("CHILD"));
+        observe_document(&mut cdp);
         assert!(cdp.call("Page.reload", json!({}), Some("S")).is_ok());
     }
 
@@ -2355,11 +2418,13 @@ mod tests {
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test"}}}));
         cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":"S","params":{"frameId":"F","url":"https://example.test/next"}}));
         assert!(!cdp.target_protected("T", false).unwrap());
+        observe_document(&mut cdp);
         assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some("S")).is_ok());
         let mut cdp = url_backend("http://ordinary.invalid/");
         cdp.session_targets.insert("S".into(), "T".into());
         error_commit(&mut cdp, "http://ordinary.invalid/", "://");
         assert!(!cdp.target_protected("T", false).unwrap());
+        observe_document(&mut cdp);
         assert!(cdp.call("Page.navigate", json!({"url":"about:blank"}), Some("S")).is_ok());
     }
 
@@ -2516,6 +2581,7 @@ mod tests {
         error_commit(&mut cdp, "https://seven.sliccy.ai/doc#access_token=MARK", "://");
         cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://seven.sliccy.ai/doc#access_token=MARK","title":"MARK"}}}));
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"about:blank","securityOrigin":"://"}}}));
+        observe_document(&mut cdp);
         assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.readyState"}), Some("S")).is_ok());
         assert!(!cdp.session_blocked("S"));
         assert!(!cdp.is_protected_target("T"));
@@ -2557,6 +2623,7 @@ mod tests {
             error_commit(&mut cdp, attempted, "://");
             assert!(!cdp.target_protected("T", false).unwrap());
             assert!(!cdp.session_blocked("S"));
+            observe_document(&mut cdp);
             let origin = url::Url::parse(attempted).unwrap().origin().ascii_serialization();
             let history = cdp.call("Page.getNavigationHistory", json!({}), Some("S")).unwrap();
             assert_eq!(history["currentIndex"], 1);
@@ -2572,7 +2639,7 @@ mod tests {
             for expression in ["location.href", "Array.from(document.documentElement.innerHTML, c => c.codePointAt(0))"] {
                 assert!(cdp.call("Runtime.evaluate", json!({"expression":expression,"returnByValue":true}), Some("S")).is_err(), "{expression}");
             }
-            assert_eq!(cdp.next_id, sent);
+            assert_eq!(cdp.next_id, sent + 2);
             assert!(cdp.call("Page.reload", json!({}), Some("S")).is_ok());
             assert!(!cdp.session_blocked("S"));
         }
@@ -2613,6 +2680,7 @@ mod tests {
             assert!(cdp.documents.contains_key("T"));
             assert!(!cdp.abandoned.contains("T"));
             assert!(!cdp.session_blocked("S"));
+            observe_document(&mut cdp);
             assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.readyState"}), Some("S")).is_ok());
         }
     }
