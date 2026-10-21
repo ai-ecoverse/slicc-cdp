@@ -320,3 +320,43 @@ test('an unobserved protected commit after a recoverable error page is caught be
     }
   );
 });
+
+test('a fresh playwright-cli recovers a blocked tab whose target info an upstream guard reports as the protected origin, and still refuses a real protected page', {
+  timeout: 60_000,
+}, async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-error-page-'));
+  const fake = await fakeCdp({ attachEvents: true });
+  const pw = (args) => run(['--cdp', fake.url, ...args], home);
+  const start = 'http://ordinary.example/page';
+  const origin = 'http://vault.sliccy.ai';
+  const failed = `${origin}/landing?n=refresh&k=MARK`;
+  try {
+    const opened = await pw(['open', start]);
+    assert.equal(opened.code, 0, opened.stderr);
+    const [tab] = fake.targets;
+    for (const current of [failed, origin]) {
+      Object.assign(tab, seeded(tab.targetId, failed, [visit(1, start), visit(2, current)]));
+      tab.url = origin;
+      const destination = `http://ordinary.example/after-${current === origin ? 'origin' : 'url'}`;
+      const recovered = await pw(['goto', destination, '--tab', tab.targetId]);
+      assert.equal(recovered.code, 0, recovered.stderr);
+      assert.doesNotMatch(`${recovered.stdout}${recovered.stderr}`, /MARK/);
+      assert.equal(tab.url, destination);
+    }
+    tab.url = origin;
+    tab.frame = {
+      id: tab.targetId,
+      loaderId: 'LREAL',
+      url: `${origin}/landing`,
+      securityOrigin: origin,
+    };
+    tab.history = { currentIndex: 1, entries: [visit(1, start), visit(2, `${origin}/landing`)] };
+    const refused = await pw(['goto', 'http://ordinary.example/never', '--tab', tab.targetId]);
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.stderr, new RegExp(SEVEN), refused.stderr);
+    assert.equal(tab.url, origin);
+  } finally {
+    await fake.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -581,10 +581,10 @@ impl Cdp {
                 return doc.previous || self.guard.url(url) || doc.navigation_url.is_empty() || self.guard.url(&doc.navigation_url);
             }
             if (self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) && !self.masked_error(doc, url) {
-                if !self.guard.error_document(&doc.url, &doc.origin) || doc.unreachable_url.is_empty() || doc.unreachable_url != url {
+                if !self.guard.error_document(&doc.url, &doc.origin) || !self.reported_unreachable(&doc.unreachable_url, url) {
                     return true;
                 }
-                return self.guard.target_with_document(url, doc.previous, Opener::None,
+                return self.guard.target_with_document(&doc.unreachable_url, doc.previous, Opener::None,
                     Some(&doc.url), Some(&doc.unreachable_url), doc.navigating);
             }
             if doc.previous {
@@ -1036,7 +1036,7 @@ impl Cdp {
         self.guard_sessions.insert(session.clone());
         let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&session), OPTIONAL_STEP).ok()
             .and_then(|tree| tree.pointer("/frameTree/frame").cloned())
-            .filter(|frame| self.guard.error_document(&text(frame, "url"), &text(frame, "securityOrigin")) && text(frame, "unreachableUrl") == url);
+            .filter(|frame| self.guard.error_document(&text(frame, "url"), &text(frame, "securityOrigin")) && self.reported_unreachable(&text(frame, "unreachableUrl"), &url));
         let history = match frame {
             Some(_) => self.raw_call("Page.getNavigationHistory", json!({}), Some(&session), OPTIONAL_STEP).ok(),
             None => None,
@@ -1044,13 +1044,23 @@ impl Cdp {
         let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session }), None, OPTIONAL_STEP);
         self.probing.remove(&target);
         let (Some(frame), Some(history)) = (frame, history) else { return };
-        if self.documents.contains_key(&target) || !self.ordinary_history(&history, &url) {
+        let unreachable_url = text(&frame, "unreachableUrl");
+        if self.documents.contains_key(&target) || !self.ordinary_history(&history, &unreachable_url) {
             return;
         }
         self.documents.insert(target, MainDocument {
-            frame_id: text(&frame, "id"), url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url: url,
+            frame_id: text(&frame, "id"), url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
             navigating: false, navigation_url: String::new(), previous: false, probed: true,
         });
+    }
+
+    fn reported_unreachable(&self, unreachable: &str, reported: &str) -> bool {
+        !unreachable.is_empty()
+            && (reported == unreachable
+                || url::Url::parse(unreachable).is_ok_and(|parsed| {
+                    let origin = parsed.origin().ascii_serialization();
+                    reported == origin || reported.strip_suffix('/') == Some(origin.as_str())
+                }))
     }
 
     fn ordinary_history(&self, history: &Value, url: &str) -> bool {
@@ -1058,7 +1068,7 @@ impl Cdp {
         let current = history.get("currentIndex").and_then(Value::as_u64).and_then(|index| usize::try_from(index).ok()).unwrap_or(0);
         current >= 1
             && entries.get(current).is_some_and(|entry| {
-                entry.get("url").and_then(Value::as_str) == Some(url) && entry.get("transitionType").and_then(Value::as_str) != Some("reload")
+                self.reported_unreachable(url, entry.get("url").and_then(Value::as_str).unwrap_or("")) && entry.get("transitionType").and_then(Value::as_str) != Some("reload")
             })
             && entries.iter().enumerate().all(|(index, entry)| {
                 index == current || ["url", "userTypedURL"].iter().all(|key| !self.guard.url(entry.get(*key).and_then(Value::as_str).unwrap_or("")))
