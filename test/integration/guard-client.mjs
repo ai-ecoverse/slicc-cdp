@@ -181,6 +181,25 @@ export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
   };
 }
 
+export function observerSend(send) {
+  return async (method, params = {}, sessionId) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await send(method, params, sessionId);
+      } catch (error) {
+        if (
+          method !== 'Page.getFrameTree' ||
+          attempt >= 2 ||
+          error.cdp?.code !== -32000 ||
+          error.cdp?.message !== 'Inspected target navigated or closed'
+        )
+          throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  };
+}
+
 export async function observer(wsUrl) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
@@ -192,7 +211,7 @@ export async function observer(wsUrl) {
   ws.addEventListener('close', client.stop);
   return {
     events: client.events,
-    send: client.send,
+    send: observerSend(client.send),
     waitEvent: client.waitEvent,
     close: async () => {
       if (ws.readyState === WebSocket.CLOSED) return;
