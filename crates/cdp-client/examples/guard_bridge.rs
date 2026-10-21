@@ -7,6 +7,9 @@ use std::io::BufRead;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+const BUSY: Duration = Duration::from_millis(5);
+const IDLE: Duration = Duration::from_millis(50);
+
 fn emit(value: Value) {
     println!("{value}");
     io::stdout().flush().unwrap();
@@ -70,9 +73,12 @@ fn main() {
     let mut input = input();
     let mut seen = 0;
     let mut pending = BTreeMap::<u64, (String, String, Instant)>::new();
+    let mut wait = BUSY;
     loop {
+        let mut busy = !pending.is_empty();
         match input() {
             Ok(line) => {
+                busy = true;
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let method = message["method"].as_str().unwrap();
                 let mut params = message["params"].clone();
@@ -107,8 +113,9 @@ fn main() {
             Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        let _ = cdp.pump(Instant::now() + Duration::from_millis(5));
+        busy |= cdp.pump(Instant::now() + wait).unwrap_or(false);
         while let Ok(Some(paused)) = cdp.next_paused(None, Duration::ZERO) {
+            busy = true;
             let headers: BTreeMap<String, String> = paused.headers.into_iter().collect();
             emit(
                 json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"responseHeaders":paused.response_headers.as_ref().map(|headers| headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>()),"request":{"url":paused.url,"method":paused.method,"headers":headers}}}}),
@@ -117,7 +124,9 @@ fn main() {
         for event in &cdp.events()[seen..] {
             emit(json!({"event":event}));
         }
+        busy |= cdp.events().len() > seen;
         seen = cdp.events().len();
+        wait = if busy { BUSY } else { (wait * 2).min(IDLE) };
         let mut done = Vec::new();
         for (id, (key, session, started)) in &pending {
             let expression = format!("JSON.stringify(globalThis[{key:?}])");
