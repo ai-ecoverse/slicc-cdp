@@ -69,10 +69,13 @@ jobs:
           name: guard-shard-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .cert
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Exact Rust using the runner's installed rustup
+      - name: Exact Rust with rustup bootstrap when missing
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           rust=$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$rust"
+          fi
           rustup toolchain install "$rust" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Pinned Chromium and required system libraries
