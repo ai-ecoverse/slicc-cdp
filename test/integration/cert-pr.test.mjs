@@ -70,7 +70,7 @@ function fixture(t, file = 'src/client.js', contents = 'changed\n') {
   });
   writeFileSync(path.join(directory, 'rust-toolchain.toml'), '[toolchain]\nchannel = "1.99.1"\n');
   writeFileSync(path.join(directory, 'Cargo.lock'), 'version = 4\n');
-  git('add', '.');
+  git('add', '-A', '--', ':/');
   git('commit', '--quiet', '-m', 'initial');
   const base = git('rev-parse', 'HEAD');
   git('checkout', '--quiet', '-b', 'proposal');
@@ -79,7 +79,7 @@ function fixture(t, file = 'src/client.js', contents = 'changed\n') {
     path.join(directory, file),
     typeof contents === 'function' ? contents(read(path.join(directory, file))) : contents
   );
-  git('add', '.');
+  git('add', '-A', '--', ':/');
   git('commit', '--quiet', '-m', 'ci: public change');
   const head = git('rev-parse', 'HEAD');
   git('checkout', '--quiet', 'main');
