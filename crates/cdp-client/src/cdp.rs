@@ -39,6 +39,7 @@ struct MainDocument {
     navigating: bool,
     navigation_url: String,
     previous: bool,
+    probed: bool,
 }
 
 pub struct Cdp {
@@ -76,6 +77,7 @@ pub struct Cdp {
     worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
     documents: BTreeMap<String, MainDocument>,
+    unobserved: BTreeSet<String>,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
@@ -121,6 +123,7 @@ impl Cdp {
             worlds: Worlds::default(),
             frames: BTreeMap::new(),
             documents: BTreeMap::new(),
+            unobserved: BTreeSet::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -496,6 +499,9 @@ impl Cdp {
                     .cloned()
                     .unwrap_or_default();
                 for info in &infos {
+                    self.probe_error(info);
+                }
+                for info in &infos {
                     if let Some(id) = info.get("targetId").and_then(|v| v.as_str()) {
                         self.targets.insert(id.to_string(), info.clone());
                     }
@@ -515,6 +521,7 @@ impl Cdp {
                 if let Some(info) = result.get("targetInfo").cloned() {
                     let target = info.get("targetId").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     self.targets.insert(target.clone(), info.clone());
+                    self.probe_error(&info);
                     let protected = self.info_protected(&info, &[]);
                     if protected && !self.documents.contains_key(&target) {
                         self.protect_target(&target);
@@ -625,6 +632,7 @@ impl Cdp {
         };
         if info.is_object() {
             self.targets.insert(target_id.to_string(), info.clone());
+            self.probe_error(&info);
         }
         let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let opener = match info
@@ -828,6 +836,9 @@ impl Cdp {
             } else {
                 self.raw_call(method, params, Some(&session), span)
             };
+            if method == "Page.enable" && answer.is_err() {
+                self.unobserved.insert(target_id.to_string());
+            }
             let failed = match answer {
                 Ok(_) => None,
                 Err(message) if optional && message == format!("{method} timed out\n") => {
@@ -857,11 +868,11 @@ impl Cdp {
                 return Err(unguarded(message));
             }
         }
-        if !self.documents.contains_key(target_id) {
+        if self.documents.get(target_id).is_none_or(|doc| doc.probed) {
             let left = budget.saturating_duration_since(Instant::now());
             if !left.is_zero() {
                 if let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left.min(OPTIONAL_STEP)) {
-                    if !self.documents.contains_key(target_id) {
+                    if self.documents.get(target_id).is_none_or(|doc| doc.probed) {
                         if let Some(frame) = tree.pointer("/frameTree/frame") {
                             self.main_commit(&session, frame);
                         }
@@ -934,7 +945,7 @@ impl Cdp {
 
     fn main_commit(&mut self, session: &str, frame: &Value) {
         let Some(target) = self.session_target(session) else { return };
-        if self.guards.get(&target).is_some_and(|guard| guard != session) {
+        if self.guards.get(&target).is_some_and(|guard| guard != session) && !self.unobserved.contains(&target) {
             if self.guard.url(frame.get("url").and_then(Value::as_str).unwrap_or(""))
                 || self.guard.url(frame.get("securityOrigin").and_then(Value::as_str).unwrap_or(""))
             {
@@ -958,13 +969,62 @@ impl Cdp {
             self.guard.target(&url, self.protected_targets.contains(&target), Opener::None) || self.guard.url(&origin)
         };
         self.documents.insert(target.clone(), MainDocument {
-            frame_id: frame_id.to_string(), url, origin, unreachable_url, navigating: false, navigation_url: String::new(), previous: protected,
+            frame_id: frame_id.to_string(), url, origin, unreachable_url, navigating: false, navigation_url: String::new(), previous: protected, probed: false,
         });
         if protected {
             self.protect_target(&target);
         } else if !self.abandoned.contains(&target) {
             self.protected_targets.remove(&target);
         }
+    }
+
+    pub fn recovering(&self, target_id: &str) -> bool {
+        self.documents.get(target_id).is_some_and(|doc| doc.probed && !doc.previous)
+    }
+
+    fn probe_error(&mut self, info: &Value) {
+        let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        let target = text(info, "targetId");
+        let url = text(info, "url");
+        if target.is_empty() || text(info, "type") != "page" || !text(info, "openerId").is_empty() || !self.guard.url(&url)
+            || self.documents.contains_key(&target) || self.protected_targets.contains(&target) || self.abandoned.contains(&target)
+            || self.guards.contains_key(&target)
+        {
+            return;
+        }
+        self.guarding.insert(target.clone());
+        let attached = self.raw_call("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None, OPTIONAL_STEP);
+        self.guarding.remove(&target);
+        let Some(session) = attached.ok().map(|value| text(&value, "sessionId")).filter(|session| !session.is_empty()) else { return };
+        self.guard_sessions.insert(session.clone());
+        let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&session), OPTIONAL_STEP).ok()
+            .and_then(|tree| tree.pointer("/frameTree/frame").cloned())
+            .filter(|frame| self.guard.error_document(&text(frame, "url"), &text(frame, "securityOrigin")) && text(frame, "unreachableUrl") == url);
+        let history = match frame {
+            Some(_) => self.raw_call("Page.getNavigationHistory", json!({}), Some(&session), OPTIONAL_STEP).ok(),
+            None => None,
+        };
+        let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session }), None, OPTIONAL_STEP);
+        let (Some(frame), Some(history)) = (frame, history) else { return };
+        if self.documents.contains_key(&target) || !self.ordinary_history(&history, &url) {
+            return;
+        }
+        self.documents.insert(target, MainDocument {
+            frame_id: text(&frame, "id"), url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url: url,
+            navigating: false, navigation_url: String::new(), previous: false, probed: true,
+        });
+    }
+
+    fn ordinary_history(&self, history: &Value, url: &str) -> bool {
+        let entries = history.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+        let current = history.get("currentIndex").and_then(Value::as_u64).and_then(|index| usize::try_from(index).ok()).unwrap_or(0);
+        current >= 1
+            && entries.get(current).is_some_and(|entry| {
+                entry.get("url").and_then(Value::as_str) == Some(url) && entry.get("transitionType").and_then(Value::as_str) != Some("reload")
+            })
+            && entries.iter().enumerate().all(|(index, entry)| {
+                index == current || ["url", "userTypedURL"].iter().all(|key| !self.guard.url(entry.get(*key).and_then(Value::as_str).unwrap_or("")))
+            })
     }
 
     fn masked_error(&self, doc: &MainDocument, reported: &str) -> bool {
@@ -1173,7 +1233,7 @@ impl Cdp {
                     return;
                 }
                 if let Some(target) = session.as_deref().and_then(|session| self.session_target(session)) {
-                    if self.guards.get(&target).is_some_and(|guard| Some(guard) != session.as_ref()) {
+                    if self.guards.get(&target).is_some_and(|guard| Some(guard) != session.as_ref()) && !self.unobserved.contains(&target) {
                         return;
                     }
                     if let Some(doc) = self.documents.get_mut(&target) {
@@ -1238,6 +1298,7 @@ impl Cdp {
                     self.guards.remove(target);
                     self.targets.remove(target);
                     self.documents.remove(target);
+                    self.unobserved.remove(target);
                 }
             }
             "Target.detachedFromTarget" => {

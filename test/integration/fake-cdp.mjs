@@ -69,6 +69,7 @@ const tree = {
 
 export async function fakeCdp({
   refuse = [],
+  refuseWhen,
   refusalMessage,
   noisyRefusal = false,
   attachEvents = false,
@@ -103,6 +104,7 @@ export async function fakeCdp({
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     let noise;
+    const paged = new Set();
     socket.on('close', () => clearInterval(noise));
     const send = (message) => {
       if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
@@ -114,7 +116,7 @@ export async function fakeCdp({
         send({ method: name, params: eventParams, ...(sessionId ? { sessionId } : {}) });
       const target = sessionId ? sessions.get(sessionId) : undefined;
       if (method === 'Slicc.action') clearInterval(noise);
-      if (refuse.includes(method)) {
+      if (refuse.includes(method) || refuseWhen?.(message, calls)) {
         send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
         if (noisyRefusal) {
           noise = setInterval(
@@ -183,12 +185,38 @@ export async function fakeCdp({
               },
             },
           });
+        case 'Page.enable':
+          paged.add(sessionId);
+          return answer({});
+        case 'Page.getNavigationHistory':
+          return answer(
+            target?.history ?? {
+              currentIndex: 0,
+              entries: [
+                {
+                  id: 1,
+                  url: target?.url ?? '',
+                  userTypedURL: '',
+                  title: '',
+                  transitionType: 'typed',
+                },
+              ],
+            }
+          );
         case 'Page.navigate': {
-          if (target) target.url = params.url;
+          if (target) {
+            target.url = params.url;
+            delete target.frame;
+            delete target.history;
+          }
           answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
-          event('Page.frameNavigated', {
+          const committed = {
             frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
-          });
+          };
+          for (const [peer, found] of sessions)
+            if (target && found === target && peer !== sessionId && paged.has(peer))
+              send({ method: 'Page.frameNavigated', params: committed, sessionId: peer });
+          event('Page.frameNavigated', committed);
           event('Page.domContentEventFired', { timestamp: 1 });
           event('Page.loadEventFired', { timestamp: 1 });
           return;
