@@ -565,7 +565,7 @@ impl Cdp {
             if doc.navigating {
                 return doc.previous || self.guard.url(url) || doc.navigation_url.is_empty() || self.guard.url(&doc.navigation_url);
             }
-            if self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() {
+            if (self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) && !self.masked_error(doc, url) {
                 if !self.guard.error_document(&doc.url, &doc.origin) || doc.unreachable_url.is_empty() || doc.unreachable_url != url {
                     return true;
                 }
@@ -946,12 +946,14 @@ impl Cdp {
         let url = format!("{}{}", frame.get("url").and_then(Value::as_str).unwrap_or(""), frame.get("urlFragment").and_then(Value::as_str).unwrap_or(""));
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
         let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
+        let reported = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str);
+        let unknown = unreachable_url.is_empty() && reported.is_none_or(|reported| self.guard.url(reported));
         let previous = self.documents.get(&target).map(|doc| doc.previous).unwrap_or_else(|| {
-            self.protected_targets.contains(&target) || unreachable_url.is_empty() || self.guard.url(&unreachable_url)
+            self.protected_targets.contains(&target) || unknown || self.guard.url(&unreachable_url)
         });
         let error = self.guard.error_page_url(&url) || !unreachable_url.is_empty();
         let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if error {
-            previous || unreachable_url.is_empty() || !self.guard.error_document(&url, &origin)
+            previous || unknown || !self.guard.error_document(&url, &origin)
         } else {
             self.guard.target(&url, self.protected_targets.contains(&target), Opener::None) || self.guard.url(&origin)
         };
@@ -963,6 +965,12 @@ impl Cdp {
         } else if !self.abandoned.contains(&target) {
             self.protected_targets.remove(&target);
         }
+    }
+
+    fn masked_error(&self, doc: &MainDocument, reported: &str) -> bool {
+        doc.unreachable_url.is_empty()
+            && self.guard.error_document(&doc.url, &doc.origin)
+            && !self.guard.url(reported)
     }
 
     fn committed_protected(&mut self, session_id: &str) {

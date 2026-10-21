@@ -176,7 +176,11 @@ export async function fakeCdp({
         case 'Page.getFrameTree':
           return answer({
             frameTree: {
-              frame: { id: target?.targetId ?? 'F', loaderId: 'L', url: target?.url ?? '' },
+              frame: target?.frame ?? {
+                id: target?.targetId ?? 'F',
+                loaderId: 'L',
+                url: target?.url ?? '',
+              },
             },
           });
         case 'Page.navigate': {
@@ -232,6 +236,7 @@ export async function fakeCdp({
   return {
     url: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`,
     calls,
+    targets,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
