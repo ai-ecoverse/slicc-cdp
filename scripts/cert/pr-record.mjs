@@ -4,10 +4,12 @@ import { cliVerdict } from './cli-verdict.mjs';
 import { args, digest, identity, json, root, run, save } from './common.mjs';
 import {
   expectedExecutionIdentity,
+  referenceVectors,
   sourceIdentity,
   subjectIdentity,
   validateExecutionIdentity,
 } from './execution-identity.mjs';
+import { validateIntegrationShards } from './integration-shards.mjs';
 import { artifactFindings, artifactInventory } from './pr-artifact-binding.mjs';
 import { selectBiosPin } from './pr-bios-result.mjs';
 import { biosExecutionRows } from './pr-bios-rows.mjs';
@@ -178,6 +180,20 @@ try {
       files
     );
     validateExecutionIdentity(execution, expected, label, emit);
+    if (
+      scope !== 'guard' &&
+      expected.corpus &&
+      execution?.files?.includes('test/integration/guard-runner.test.mjs')
+    )
+      validateIntegrationShards(
+        execution,
+        expected,
+        referenceVectors(expected.corpus),
+        plan.run,
+        label,
+        emit,
+        label !== 'integration negative'
+      );
     executionIdentities[label] = { expected, observed: execution?.identity ?? null };
   }
 } catch (error) {
