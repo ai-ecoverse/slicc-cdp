@@ -1185,6 +1185,7 @@ impl Cdp {
     fn fail_seen_network(&mut self, value: &Value) {
         let Some(id) = value.pointer("/params/networkId").and_then(Value::as_str).or_else(|| value.pointer("/params/requestId").and_then(Value::as_str)) else { return };
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+        if self.guard_sessions.contains(session) && self.request_state(id) != Some(true) { return }
         let target = self.session_target(session);
         let keys: Vec<_> = self.seen_network.keys().filter(|(peer, request)| request == id && (peer == session || target.is_some() && self.session_target(peer) == target)).cloned().collect();
         for key in keys {
@@ -1949,6 +1950,7 @@ mod tests {
     include!("redirect_matrix_test.rs");
     include!("redirect_race_test.rs");
     include!("redirect_terminal_test.rs");
+    include!("redirect_terminal_guard_test.rs");
     include!("redirect_fragment_test.rs");
     include!("redirect_review_test.rs");
     include!("redirect_relation_test.rs");
