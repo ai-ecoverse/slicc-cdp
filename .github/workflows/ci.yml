@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.8.2
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.9.0
     secrets: inherit
     with:
       test-glob: test/integration/*.test.mjs
@@ -159,8 +159,11 @@ jobs:
         run: |
           scripts/sign-macos.sh "ai.sliccy.playwright-cli:dist/playwright-cli-$LABEL" "ai.sliccy.curlwright:dist/curlwright-$LABEL"
           for bin in "dist/playwright-cli-$LABEL" "dist/curlwright-$LABEL"; do
-            codesign -dv --verbose=2 "$bin" 2>&1 | grep -q 'Authority=Developer ID Application'
-            spctl -a -vv -t install "$bin" 2>&1 | tee /dev/stderr | grep -q 'source=Notarized Developer ID'
+            signed=$(codesign -dv --verbose=2 "$bin" 2>&1)
+            printf '%s\n' "$signed" | grep 'Authority=Developer ID Application'
+            gatekeeper=$(spctl -a -vv -t install "$bin" 2>&1)
+            printf '%s\n' "$gatekeeper"
+            printf '%s\n' "$gatekeeper" | grep -x 'source=Notarized Developer ID'
           done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -207,8 +210,12 @@ jobs:
           for name in $expected; do test -f "artifacts/$name" || { echo "::error::missing asset $name"; exit 1; }; done
           gh release upload "$TAG" artifacts/* --clobber --repo "$GITHUB_REPOSITORY"
           uploaded=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
-          for name in $expected; do printf '%s\n' "$uploaded" | grep -qx "$name" || { echo "::error::$name is not on $TAG"; exit 1; }; done
-          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+          for name in $expected; do printf '%s\n' "$uploaded" | grep -x "$name" > /dev/null || { echo "::error::$name is not on $TAG"; exit 1; }; done
+          highest=$(git ls-remote --tags --refs origin 'refs/tags/v*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          latest=false
+          [ "$TAG" = "$highest" ] && latest=true
+          echo "$TAG is published; the highest release tag is $highest, so latest=$latest" >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "$TAG" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"
 
   sliccy-browser:
     needs: ci

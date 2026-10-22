@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { launchBrowser } from '../../src/index.js';
-import { launchBrowser as launchSuiteBrowser } from './browser.mjs';
+import { launchBrowser as launchSuiteBrowser, rawSocket } from './browser.mjs';
 import './watchdog.mjs';
 
 const fatal = 'FATAL:zygote_host_impl_linux.cc(130)] No usable sandbox!';
@@ -59,5 +59,20 @@ test('the suite browser fails within seconds with the stderr of a Chrome that ex
     if (saved === undefined) delete process.env.CHROMIUM_EXECUTABLE;
     else process.env.CHROMIUM_EXECUTABLE = saved;
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the suite browser reports how Chrome died after it started, and nothing while it runs', async () => {
+  const browser = await launchSuiteBrowser();
+  try {
+    assert.equal(browser.died(), null);
+    const socket = await rawSocket(browser.wsUrl);
+    socket.send('Browser.crash').catch(() => {});
+    const deadline = Date.now() + 15000;
+    while (!browser.died() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    socket.close();
+    assert.match(browser.died() ?? 'still running', /^chromium exited (signal [A-Z]+|code -?\d+)/);
+  } finally {
+    await browser.close();
   }
 });

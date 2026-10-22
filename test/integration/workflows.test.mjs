@@ -112,6 +112,11 @@ test('the crates, binaries and release assets follow only a release on main', ()
   assert.match(job('crates'), /run: cargo fetch --locked\n[\s\S]*scripts\/publish-crates\.sh/);
   assert.match(job('binaries'), /scripts\/sign-macos\.sh/);
   assert.match(job('binaries'), /source=Notarized Developer ID/);
+  assert.doesNotMatch(
+    job('binaries'),
+    /\| *(tee|grep -q)\b/,
+    'grep -q and tee in a pipe can kill its writer with SIGPIPE under pipefail'
+  );
   for (const label of [
     'darwin-amd64',
     'darwin-arm64',
@@ -122,7 +127,14 @@ test('the crates, binaries and release assets follow only a release on main', ()
   ])
     assert.match(job('binaries'), new RegExp(`label: ${label} `), label);
   assert.match(job('assets'), /release-checksums\.mjs/);
-  assert.match(job('assets'), /--draft=false --latest/);
+  assert.match(job('assets'), /--draft=false --latest="\$latest"/);
+  assert.match(job('assets'), /\[ "\$TAG" = "\$highest" \] && latest=true/);
+  assert.match(job('assets'), /git ls-remote --tags --refs origin 'refs\/tags\/v\*'/);
+  assert.doesNotMatch(
+    ci,
+    /grep -q/,
+    'grep -q in a pipe can kill its writer with SIGPIPE under pipefail'
+  );
   for (const name of ['released', 'crates', 'binaries', 'assets', 'sliccy-browser'])
     assert.match(job(name), /\n {4}permissions:\n/, name);
 });
