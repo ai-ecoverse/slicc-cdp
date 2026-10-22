@@ -46,6 +46,7 @@ pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: i64,
     events: Vec<Value>,
+    trace_cookies: Vec<Value>,
     guard: Protected,
     paused: VecDeque<Paused>,
     deciders: BTreeMap<String, Decider>,
@@ -96,6 +97,7 @@ impl Cdp {
             ws,
             next_id: 0,
             events: Vec::new(),
+            trace_cookies: Vec::new(),
             guard: Protected::default(),
             paused: VecDeque::new(),
             deciders: BTreeMap::new(),
@@ -162,6 +164,11 @@ impl Cdp {
 
     pub fn session_blocked(&self, session_id: &str) -> bool {
         self.blocked.contains(session_id)
+    }
+
+    pub fn content_blocked(&self, session_id: &str) -> bool {
+        self.blocked.contains(session_id) || self.guard_sessions.contains(session_id)
+            || self.session_target(session_id).and_then(|target| self.documents.get(&target)).is_some_and(|doc| self.sealed(doc))
     }
 
     pub fn is_protected_target(&self, target_id: &str) -> bool {
@@ -567,6 +574,9 @@ impl Cdp {
                 }
             }
             _ if shield::cookie_reader(method) => {
+                let mut cookies = result.get("cookies").and_then(Value::as_array).cloned().unwrap_or_default();
+                cookies.extend(self.trace_cookies.iter().cloned());
+                shield::redact_cookie_events(&self.guard, &mut self.events, &json!({ "cookies": cookies }));
                 shield::drop_protected_cookies(&self.guard, &mut result);
             }
             _ => {}
@@ -1176,7 +1186,10 @@ impl Cdp {
             Self::collect_frames(node, &mut frames);
         }
         let updates = self.frame_versions.iter().filter(|(_, version)| **version > epoch).collect::<Vec<_>>();
-        !updates.is_empty() && updates.iter().all(|(id, _)| self.frames.get(*id).is_some_and(|known| frames.get(*id) == Some(known)))
+        !updates.is_empty() && updates.iter().all(|(id, _)| self.frames.get(*id).is_some_and(|known| {
+            frames.get(*id).is_some_and(|fresh| known.get(..2) == fresh.get(..2)
+                && known.iter().skip(2).all(|origin| Some(origin) == fresh.get(1)))
+        }))
     }
 
     fn record_frames(&mut self, tree: &Value, session: &str) {
@@ -1607,6 +1620,9 @@ impl Cdp {
         }
         if method.ends_with("ExtraInfo") {
             if let Some(id) = id.clone() {
+                if let Some(cookies) = value.pointer("/params/associatedCookies").and_then(Value::as_array) {
+                    self.trace_cookies.extend(cookies.iter().filter_map(|item| item.get("cookie").cloned()));
+                }
                 shield::strip_protected_associated(&self.guard, &mut value);
                 if self.requests.get(&id) != Some(&false) {
                     self.held.entry(id).or_default().push(value);

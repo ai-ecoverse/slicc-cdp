@@ -11,4 +11,6 @@ chromiumSuite('chromium through the native binaries and the kernel', [
   'kernel playwright-cli',
   'kernel curlwright',
   'kernel route',
+  'native cookies',
+  'kernel cookies',
 ]);

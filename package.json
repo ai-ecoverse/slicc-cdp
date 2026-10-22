@@ -69,8 +69,8 @@
   },
   "devDependencies": {
     "@ai-ecoverse/slicc-browsers": "1.12.0",
-    "@ai-ecoverse/slicc-kernel": "1.143.5",
-    "@ai-ecoverse/slicc-shared-web": "2.7.4",
+    "@ai-ecoverse/slicc-kernel": "1.144.1",
+    "@ai-ecoverse/slicc-shared-web": "2.7.8",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.2.2",
     "semantic-release": "25.0.9"

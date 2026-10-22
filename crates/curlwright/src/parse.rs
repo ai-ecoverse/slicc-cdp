@@ -129,7 +129,7 @@ fn rejected_reason(name: &str) -> Option<&'static str> {
             "the tab's own cookies are already sent; set one with `playwright-cli cookie-set`"
         }
         "cookie-jar" => {
-            "cookies live in the browser profile; read them with `playwright-cli cookies`"
+            "cookies live in the browser profile; read them with `playwright-cli cookie-list`"
         }
         "limit-rate" => "a page cannot throttle a fetch",
         "continue-at" => "a page fetch cannot resume; use `-H 'Range: bytes=N-'`",

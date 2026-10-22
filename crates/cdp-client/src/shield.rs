@@ -439,7 +439,7 @@ fn site_protected(guard: &Protected, site: &str) -> bool {
 
 fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
     if let Some(domain) = cookie.get("domain").and_then(|v| v.as_str()) {
-        if guard.cookie_domain(domain) {
+        if guard.cookie_scope(domain) {
             return true;
         }
     }
@@ -509,6 +509,99 @@ pub fn drop_protected_cookies(guard: &Protected, result: &mut Value) {
     if let Some(cookies) = result.get_mut("cookies").and_then(|v| v.as_array_mut()) {
         cookies.retain(|cookie| !cookie_protected(guard, cookie));
     }
+}
+
+pub fn set_cookie_hidden(guard: &Protected, value: &str, base: &str) -> bool {
+    if guard.url(base) {
+        return true;
+    }
+    value.lines().any(|line| {
+        let domains: Vec<&str> = line.split(';').skip(1).filter_map(|attribute| {
+            let (name, value) = attribute.trim().split_once('=')?;
+            name.trim().eq_ignore_ascii_case("domain").then_some(value.trim())
+        }).collect();
+        if domains.is_empty() {
+            host_of(base).is_none_or(|host| guard.cookie_scope(&host))
+        } else {
+            domains.iter().any(|domain| guard.cookie_scope(domain))
+        }
+    })
+}
+
+fn contains_cookie_value(value: &Value, protected_values: &[String]) -> bool {
+    match value {
+        Value::String(text) => protected_values.iter().any(|value| text.contains(value)),
+        Value::Array(items) => items.iter().any(|item| contains_cookie_value(item, protected_values)),
+        Value::Object(items) => items.values().any(|item| contains_cookie_value(item, protected_values)),
+        _ => false,
+    }
+}
+
+fn cookie_event_base(event: &Value, urls: &std::collections::BTreeMap<String, String>) -> String {
+    event.pointer("/params/request/url").or_else(|| event.pointer("/params/response/url"))
+        .and_then(Value::as_str).map(str::to_string).or_else(|| {
+            urls.get(event.pointer("/params/requestId")?.as_str()?).cloned()
+        }).unwrap_or_default()
+}
+
+pub fn redact_cookie_events(guard: &Protected, events: &mut Vec<Value>, jar: &Value) {
+    let cookies: Vec<&Value> = jar.get("cookies").and_then(Value::as_array).into_iter().flatten().collect();
+    let mut protected_values: Vec<String> = cookies.iter().filter(|cookie| cookie_protected(guard, cookie))
+        .filter_map(|cookie| cookie.get("value").and_then(Value::as_str)).filter(|value| !value.is_empty()).map(str::to_string).collect();
+    let urls: std::collections::BTreeMap<String, String> = events.iter().filter_map(|event| {
+        Some((event.pointer("/params/requestId")?.as_str()?.to_string(), event.pointer("/params/request/url")?.as_str()?.to_string()))
+    }).collect();
+    for event in events.iter() {
+        let base = cookie_event_base(event, &urls);
+        for pointer in ["/params/headers", "/params/response/headers"] {
+            if let Some(headers) = event.pointer(pointer).and_then(Value::as_object) {
+                for (_, value) in headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie")) {
+                    for line in value.as_str().unwrap_or_default().lines() {
+                        if set_cookie_hidden(guard, line, &base) {
+                            if let Some((_, value)) = line.split(';').next().unwrap_or_default().split_once('=') {
+                                let value = value.trim();
+                                if !value.is_empty() {
+                                    protected_values.push(value.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    events.retain_mut(|event| {
+        if event.get("method").and_then(Value::as_str) == Some("Runtime.consoleAPICalled") {
+            if event.pointer("/params/args").is_some_and(|args| contains_cookie_value(args, &protected_values)) {
+                return false;
+            }
+        }
+        let base = cookie_event_base(event, &urls);
+        for pointer in ["/params/headers", "/params/request/headers", "/params/response/headers"] {
+            let Some(headers) = event.pointer_mut(pointer).and_then(Value::as_object_mut) else { continue; };
+            for (name, value) in headers {
+                let Some(text) = value.as_str() else { continue; };
+                let hidden = if name.eq_ignore_ascii_case("set-cookie") {
+                    set_cookie_hidden(guard, text, &base)
+                } else if name.eq_ignore_ascii_case("cookie") {
+                    text.split(';').any(|pair| {
+                        let Some((name, value)) = pair.trim().split_once('=') else { return true; };
+                        let matching: Vec<&&Value> = cookies.iter().filter(|cookie| {
+                            cookie.get("name").and_then(Value::as_str) == Some(name.trim())
+                                && cookie.get("value").and_then(Value::as_str) == Some(value.trim())
+                        }).collect();
+                        if matching.is_empty() { guard.cookie_url(&base) } else {
+                            matching.iter().any(|cookie| cookie_protected(guard, cookie))
+                        }
+                    })
+                } else { false };
+                if hidden {
+                    *value = Value::String("[redacted]".to_string());
+                }
+            }
+        }
+        true
+    });
 }
 
 pub fn strip_protected_associated(guard: &Protected, event: &mut Value) {
