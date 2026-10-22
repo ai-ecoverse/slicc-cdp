@@ -49,6 +49,8 @@ The cookie commands, `cookie-list`, `cookie-get`, `cookie-set`, `cookie-delete` 
 
 Saved sessions never contain cookie values or value hashes. They retain only cookie names and scopes (domain and path), with Cookie and Set-Cookie header values redacted. `request-headers`, `response-headers` and `request` look up those scopes in the live guarded cookie jar and label any values they show as current jar values, not necessarily what was sent at that time. Removed and protected cookies stay `[redacted]`. A header with no retained scopes can show current cookies applicable to its URL only when that URL cannot share a protected parent-domain cookie. Cookie-bearing console messages may be shown live but are not saved.
 
+`webmcp-list` succeeds with an empty list (`--json`: `[]`) or “No WebMCP tools on this page” when WebMCP is available but has no registered tools. If `document.modelContext` is absent or null, both `webmcp-list` and `webmcp-call` print “WebMCP is unavailable on this page” to stderr, leave stdout empty and exit 2. Evaluation and connection failures exit 1.
+
 ## Develop
 
 ```sh

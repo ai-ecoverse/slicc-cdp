@@ -579,7 +579,9 @@ fn implemented_page(name: &str) -> Option<String> {
                 "",
                 "Evaluates document.modelContext.getTools() in the page's main world.",
                 "Chrome includes declarative form[toolname] tools in getTools().",
-                "If modelContext is absent, returns an empty list.",
+                "An empty tool list succeeds (exit 0).",
+                "If document.modelContext is absent, reports WebMCP unavailable (exit 2).",
+                "Evaluation or connection failures exit 1.",
             ],
             &[],
             &[
