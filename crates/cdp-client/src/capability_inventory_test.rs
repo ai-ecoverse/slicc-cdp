@@ -4,7 +4,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "DOM.describeNode", "DOM.getFrameOwner", "DOM.resolveNode", "DOM.setFileInputFiles",
         "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.insertText",
         "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree",
-        "Page.getNavigationHistory", "Page.navigate", "Page.printToPDF", "Page.reload",
+        "Page.getNavigationHistory", "Page.getPermissionsPolicyState", "Page.navigate", "Page.printToPDF", "Page.reload",
         "Runtime.callFunctionOn", "Runtime.evaluate", "Runtime.getProperties", "Runtime.releaseObjectGroup",
         "Debugger.resume",
     ]);

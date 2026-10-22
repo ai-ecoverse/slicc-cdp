@@ -16,6 +16,7 @@ struct Arm {
     revoked: bool,
     pending_contexts: BTreeMap<i64, Instant>,
     loaders: BTreeMap<String, String>,
+    documents: BTreeMap<String, Value>,
 }
 
 #[derive(Clone)]
@@ -67,6 +68,23 @@ impl Cdp {
         &self.webmcp.samples
     }
 
+    pub fn webmcp_document(&mut self, session: &str, frame: &str) -> Result<Value, String> {
+        if self.content_blocked(session) { return Err(self.refusal()); }
+        let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+        let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
+        let epoch = self.frame_epoch;
+        let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP)?;
+        if epoch != self.frame_epoch || !self.webmcp_tree_verified(&tree, Some(frame)) || self.content_blocked(session) { return Err(self.refusal()); }
+        let document = Self::webmcp_frame(&tree["frameTree"], frame).ok_or_else(|| self.refusal())?;
+        Ok(json!({"frameId":frame,"loaderId":document["loaderId"],"origin":document["securityOrigin"],"parentFrameId":document.get("parentId")}))
+    }
+
+    pub fn webmcp_snapshot(&self) -> Vec<Value> {
+        self.webmcp.arms.iter().filter(|(session, arm)| !arm.revoked && !self.content_blocked(session)).map(|(session, arm)| {
+            json!({"session":session,"bridge":arm.bridge,"target":self.session_target(session),"documents":arm.documents})
+        }).collect()
+    }
+
     pub fn webmcp_alive(&self, session: &str) -> bool {
         self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked) && !self.content_blocked(session)
     }
@@ -97,11 +115,12 @@ impl Cdp {
         let source = format!("const {bridge} = (function {GATE}() {{ 'use strict'; let {PERMIT} = false; debugger; if (!{PERMIT}) return; return {SHIM}; }})();");
         let mut loaders = BTreeMap::new();
         if let Some(tree) = seed { Self::webmcp_loaders(&tree["frameTree"], &mut loaders); }
-        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), loaders });
+        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), loaders, documents: BTreeMap::new() });
         self.raw_call("Runtime.disable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Runtime.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.worlds.enable(session);
         self.raw_call("Page.enable", json!({}), Some(session), OPTIONAL_STEP)?;
+        self.raw_call("Network.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Debugger.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         let added = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":!pending}), Some(session), OPTIONAL_STEP);
         let identifier = added.ok().and_then(|result| result.get("identifier").and_then(Value::as_str).map(str::to_string));
@@ -238,7 +257,12 @@ impl Cdp {
         let started = Instant::now();
         self.webmcp.paused.insert(session.to_string());
         let deadline = started + Duration::from_secs(2);
-        let verified = self.webmcp_verify_pause(session, value, deadline);
+        let verified = self.webmcp_verify_pause(session, value, deadline).and_then(|verified| {
+            if self.webmcp.quarantined.contains(session) {
+                self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(session), deadline.saturating_duration_since(Instant::now()))?;
+            }
+            Ok(verified)
+        });
         let mut admitted = false;
         if let Ok((call, epoch, _)) = &verified {
             let result = self.raw_call("Debugger.evaluateOnCallFrame", json!({"callFrameId":call,"expression":format!("{PERMIT} = true"),"returnByValue":true,"silent":true}), Some(session), deadline.saturating_duration_since(Instant::now()));
@@ -309,6 +333,20 @@ impl Cdp {
             return true;
         }
         if !self.webmcp.arms.contains_key(session) { return false; }
+        if method == "Network.responseReceived" && value.pointer("/params/type").and_then(Value::as_str) == Some("Document") {
+            let params = &value["params"];
+            let url = params.pointer("/response/url").and_then(Value::as_str).unwrap_or("");
+            let frame = params.get("frameId").and_then(Value::as_str).unwrap_or("");
+            let loader = params.get("loaderId").and_then(Value::as_str).unwrap_or("");
+            if !frame.is_empty() && !loader.is_empty() && !self.guard.url(url) {
+                let policy = params.pointer("/response/headers").and_then(Value::as_object).and_then(|headers| headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("permissions-policy"))).map(|(_, value)| value.as_str().unwrap_or("tools=()")).unwrap_or("");
+                let policy = if policy.len() > 16384 { "tools=()" } else { policy };
+                let origin = url::Url::parse(url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
+                if let Some(arm) = self.webmcp.arms.get_mut(session) {
+                    arm.documents.insert(format!("{frame}:{loader}"), json!({"frameId":frame,"loaderId":loader,"origin":origin,"policy":policy}));
+                }
+            }
+        }
         if method == "Page.frameNavigated" {
             if let Some(arm) = self.webmcp.arms.get_mut(session) {
                 Self::webmcp_loaders(&json!({"frame":value["params"]["frame"]}), &mut arm.loaders);

@@ -18,6 +18,8 @@ mod snapshot;
 mod spec;
 mod trace;
 mod webmcp;
+mod webmcp_frames;
+mod webmcp_polyfill;
 
 pub use args::Output;
 

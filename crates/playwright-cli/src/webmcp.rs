@@ -6,6 +6,10 @@ use crate::session::Session;
 use serde_json::{json, Value};
 
 pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -> Output {
+    list_from(cdp, state, tab, json, &[])
+}
+
+pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool, from: &[String]) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -18,12 +22,14 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = evaluate_list(cdp, &session);
+    let result = crate::webmcp_frames::list(cdp, state, &target, &session, from);
     let _ = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(tools) => {
             state.current = Some(target);
             if json {
+                let mut tools = tools;
+                redact_output(&mut tools);
                 Output::ok(format!("{}\n", crate::sanitize::json_c1(&tools.to_string())))
             } else {
                 Output::ok(format_list(&tools))
@@ -82,6 +88,10 @@ pub fn call(
     tab: Option<&str>,
     allow_consequential: bool,
 ) -> Output {
+    call_from(cdp, state, name, input_json, tab, allow_consequential, &[], None)
+}
+
+pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &str, tab: Option<&str>, allow_consequential: bool, from: &[String], frame: Option<&str>) -> Output {
     let parsed: Value = match serde_json::from_str(input_json) {
         Ok(value) => value,
         Err(err) => {
@@ -111,14 +121,7 @@ pub fn call(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let native = native_webmcp_object_input(cdp, &session);
-    let result = evaluate_call(cdp, &session, name, &parsed, native);
-    let outcome = match result {
-        Ok(CallOutcome::Consequential(_)) if allow_consequential => {
-            evaluate_call_force(cdp, &session, name, &parsed, native)
-        }
-        other => other,
-    };
+    let outcome = crate::webmcp_frames::call(cdp, state, &target, &session, from, frame, name, &parsed, allow_consequential).and_then(parse_value);
     let _ = browser::watch_detach(cdp, state, &target, &session);
     match outcome {
         Ok(outcome) => {
@@ -267,7 +270,7 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
+pub(crate) fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     let result = cdp.call("Browser.getVersion", json!({}), None).ok()?;
     let product = result.pointer("/product").and_then(|v| v.as_str()).unwrap_or("");
     let version_part = product
@@ -399,6 +402,10 @@ fn parse_call_result(
         .pointer("/result/value")
         .cloned()
         .unwrap_or(Value::Null);
+    parse_value(value)
+}
+
+fn parse_value(value: Value) -> Result<CallOutcome, String> {
     if let Some(error) = value.get("__webmcp_error").and_then(|v| v.as_str()) {
         return match error {
             "absent" => Ok(CallOutcome::Absent),
@@ -437,6 +444,15 @@ fn parse_call_result(
         return Ok(CallOutcome::Result(text.to_string()));
     }
     Err("webmcp-call: unexpected evaluation result\n".into())
+}
+
+fn redact_output(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = sanitize::browser_message(text),
+        Value::Array(values) => values.iter_mut().for_each(redact_output),
+        Value::Object(values) => values.values_mut().for_each(redact_output),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
