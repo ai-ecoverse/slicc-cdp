@@ -7,6 +7,7 @@ import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
+import { guardDiagnostics } from './guard-diagnostics.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 
 export const published = JSON.parse(
@@ -149,6 +150,8 @@ export async function runPartition(t, id) {
     );
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
   const diagnostics = [];
+  const tracedClients = new WeakMap();
+  const activeTraceEvents = new Set();
   const startup = browserStartup(launchBrowser, (retry) => {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
   });
@@ -197,12 +200,32 @@ export async function runPartition(t, id) {
               })
             );
           const browser = await browsers.get(slot);
-          const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
+          const trace = ['C5.document', 'C5.continue-request'].includes(vector.id)
+            ? await guardDiagnostics(browser.wsUrl, { id: vector.id, target, variant, slot })
+            : null;
+          let client;
+          try {
+            client = await guarded(trace?.url ?? browser.wsUrl, targets.client, {
+              variant,
+              detachDelay,
+              onMessage: trace?.onMessage,
+            });
+          } catch (error) {
+            await trace?.close();
+            throw error;
+          }
+          if (trace) {
+            trace.wrap(client);
+            tracedClients.set(client.events, trace);
+            activeTraceEvents.add(client.events);
+            diagnostics.push(trace.record);
+          }
           let unguarded;
           try {
             unguarded = await observer(browser.wsUrl);
           } catch (error) {
             await client.close();
+            await trace?.close();
             await browser.close();
             browsers.delete(slot);
             throw error;
@@ -251,13 +274,21 @@ export async function runPartition(t, id) {
                 diagnostic.afterCleanup = diagnostic.references.map((details) =>
                   structuredClone(details)
                 );
-              await client.close();
-              await unguarded.close();
+              try {
+                await client.close();
+                await unguarded.close();
+              } finally {
+                activeTraceEvents.delete(client.events);
+                await trace?.close();
+              }
             },
           };
         },
         debug: (details) => {
           if (!details.events?.length) return;
+          for (const events of activeTraceEvents) {
+            if (events.includes(details.events[0])) tracedClients.get(events)?.snapshot(details);
+          }
           const diagnostic = diagnostics.find((record) =>
             record.events.includes(details.events[0])
           );
