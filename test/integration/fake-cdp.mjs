@@ -86,6 +86,8 @@ export async function fakeCdp({
   answers = {},
   attachEvents = false,
   discoverEvents = false,
+  childFrames = [],
+  intercept,
 } = {}) {
   const calls = [];
   const jar = cookies.map((cookie) => ({ ...cookie }));
@@ -141,6 +143,7 @@ export async function fakeCdp({
         }
       };
       const target = sessionId ? sessions.get(sessionId) : undefined;
+      if (intercept?.(message, send)) return;
       if (method === 'Slicc.action') clearInterval(noise);
       if (refuse.includes(method) || refuseWhen?.(message, calls)) {
         send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
@@ -174,7 +177,9 @@ export async function fakeCdp({
         case 'Target.getTargets':
           return answer({ targetInfos: targets.map(info) });
         case 'Target.getTargetInfo': {
-          const found = targets.find((item) => item.targetId === params.targetId) ?? target;
+          const found =
+            targets.find((item) => item.targetId === params.targetId) ??
+            (childFrames.some((child) => child.frame.id === params.targetId) ? undefined : target);
           if (!found) return send({ id, error: { code: -32602, message: 'No target' } });
           return answer({ targetInfo: info(found) });
         }
@@ -215,7 +220,9 @@ export async function fakeCdp({
                 id: target?.targetId ?? 'F',
                 loaderId: 'L',
                 url: target?.url ?? '',
+                securityOrigin: new URL(target?.url ?? 'about:blank').origin,
               },
+              childFrames,
             },
           });
         case 'Page.enable':
@@ -244,7 +251,12 @@ export async function fakeCdp({
           }
           answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
           const committed = {
-            frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
+            frame: {
+              id: target?.targetId ?? 'F',
+              loaderId: `L${next}`,
+              url: params.url,
+              securityOrigin: new URL(params.url).origin,
+            },
           };
           for (const [peer, found] of sessions)
             if (target && found === target && peer !== sessionId && paged.has(peer))

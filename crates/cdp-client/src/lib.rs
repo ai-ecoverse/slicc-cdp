@@ -2,6 +2,8 @@ pub mod cdp;
 pub mod connect;
 pub mod contract;
 pub mod fetch;
+#[cfg(test)]
+mod frames_test;
 pub mod hash;
 pub mod net;
 pub mod ports;

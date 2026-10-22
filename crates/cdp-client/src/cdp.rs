@@ -78,6 +78,9 @@ pub struct Cdp {
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
+    frame_sessions: BTreeMap<String, BTreeSet<String>>,
+    frame_epoch: u64,
+    frame_versions: BTreeMap<String, u64>,
     documents: BTreeMap<String, MainDocument>,
     unobserved: BTreeSet<String>,
     #[cfg(test)]
@@ -126,6 +129,9 @@ impl Cdp {
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
             frames: BTreeMap::new(),
+            frame_sessions: BTreeMap::new(),
+            frame_epoch: 0,
+            frame_versions: BTreeMap::new(),
             documents: BTreeMap::new(),
             unobserved: BTreeSet::new(),
             #[cfg(test)]
@@ -221,6 +227,7 @@ impl Cdp {
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
         }
+        let frame_epoch = self.frame_epoch;
         let result = self.raw_call(method, params.clone(), session_id, timeout)?;
         if let (true, Some(session), Some(id)) = (
             shield::answers_interception(method),
@@ -233,6 +240,17 @@ impl Cdp {
             if self.blocked.contains(session) && !harmless(method, &params) {
                 return Err(self.refusal());
             }
+        }
+        if let Some(frame) = params.get("frameId").and_then(Value::as_str) {
+            if self.frame_refused(frame, session_id)? {
+                return Err(self.refusal());
+            }
+        }
+        if crosses_frames(method, &params) && self.frame_tree_refused(session_id)? {
+            return Err(self.refusal());
+        }
+        if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params)) && frame_epoch != self.frame_epoch {
+            return Err(self.refusal());
         }
         self.after(method, &params, session_id, result)
     }
@@ -295,6 +313,9 @@ impl Cdp {
             return Err(self.refusal());
         }
         if !shield::body_method(method) && self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Err(self.refusal());
+        }
+        if crosses_frames(method, params) && self.frame_tree_refused(session_id)? {
             return Err(self.refusal());
         }
         if Worlds::selectors(params) || Worlds::sensitive(method) {
@@ -371,11 +392,17 @@ impl Cdp {
                 return Err(format!("{}\n", self.guard.refusal_for_url(&url)));
             }
         }
+        if let Some(frame) = params.get("frameId").and_then(Value::as_str) {
+            if self.frame_refused(frame, session_id)? {
+                let url = self.frames.get(frame).and_then(|known| known.first()).map(String::as_str).unwrap_or("");
+                return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+            }
+        }
         if !matches!(method, "Target.getTargetInfo" | "Target.detachFromTarget") {
-            for key in ["targetId", "frameId"] {
+            for key in ["targetId"] {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
-                    if (key == "frameId" && self.frame_protected(&target)) || self.target_protected(&target, key == "frameId")? {
+                    if self.target_protected(&target, false)? {
                         let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
                         return Err(format!("{}\n", self.guard.refusal_for_url(url)));
                     }
@@ -1106,6 +1133,89 @@ impl Cdp {
         }
     }
 
+    fn frame_tree_refused(&mut self, session_id: Option<&str>) -> Result<bool, String> {
+        let Some(session) = session_id else {
+            return Ok(true);
+        };
+        let tree = match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
+            Ok(tree) => tree,
+            Err(message) if transport_error(&message) => return Err(message),
+            Err(_) => return Ok(true),
+        };
+        Ok(tree.get("frameTree").is_none_or(|node| self.tree_node_refused(node)))
+    }
+
+    fn tree_node_refused(&self, node: &Value) -> bool {
+        let frame = node.get("frame").unwrap_or(&Value::Null);
+        let unknown = ["id", "url", "securityOrigin"].iter().any(|key| frame.get(key).and_then(Value::as_str).is_none_or(|text| !frame_text_known(text)));
+        unknown || self.frame_protected(frame.get("id").and_then(Value::as_str).unwrap_or(""))
+            || node.get("childFrames").is_some_and(|children| children.as_array().is_none_or(|children| children.iter().any(|child| self.tree_node_refused(child))))
+    }
+
+    fn frame_refused(&mut self, frame_id: &str, session_id: Option<&str>) -> Result<bool, String> {
+        let known = self.frames.contains_key(frame_id);
+        if self.frame_protected(frame_id) || known && !self.frame_verified(frame_id) {
+            return Ok(true);
+        }
+        let target_allowed = match self.target_protected(frame_id, false) {
+            Ok(true) => return Ok(true),
+            Ok(false) => self.targets.get(frame_id).is_some_and(|info| info.get("targetId").and_then(Value::as_str) == Some(frame_id)
+                && info.get("url").and_then(Value::as_str).is_some_and(frame_text_known)),
+            Err(message) if transport_error(&message) => return Err(message),
+            Err(_) => false,
+        };
+        let Some(session) = session_id else {
+            return Ok(!target_allowed);
+        };
+        match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
+            Ok(_) => Ok(!self.frame_sessions.get(session).is_some_and(|frames| frames.contains(frame_id)) || !self.frame_verified(frame_id)),
+            Err(message) if transport_error(&message) => Err(message),
+            Err(message) if message.contains("slicc: refused:") => Ok(true),
+            Err(_) => Ok(known || !target_allowed),
+        }
+    }
+
+    fn frame_verified(&self, frame_id: &str) -> bool {
+        frame_text_known(frame_id) && !self.protected_targets.contains(frame_id)
+            && self.frames.get(frame_id).is_some_and(|known| known.len() >= 2 && known.iter().all(|text| frame_text_known(text) && !self.guard.url(text)))
+    }
+
+    fn tree_matches_updates(&self, tree: &Value, epoch: u64) -> bool {
+        let mut frames = BTreeMap::new();
+        if let Some(node) = tree.get("frameTree") {
+            Self::collect_frames(node, &mut frames);
+        }
+        let updates = self.frame_versions.iter().filter(|(_, version)| **version > epoch).collect::<Vec<_>>();
+        !updates.is_empty() && updates.iter().all(|(id, _)| self.frames.get(*id).is_some_and(|known| {
+            frames.get(*id).is_some_and(|fresh| known.get(..2) == fresh.get(..2)
+                && known.iter().skip(2).all(|origin| Some(origin) == fresh.get(1)))
+        }))
+    }
+
+    fn record_frames(&mut self, tree: &Value, session: &str) {
+        let mut frames = BTreeMap::new();
+        if let Some(node) = tree.get("frameTree") {
+            Self::collect_frames(node, &mut frames);
+        }
+        let ids = frames.keys().cloned().collect::<BTreeSet<_>>();
+        for id in self.frame_sessions.insert(session.to_string(), ids.clone()).unwrap_or_default().difference(&ids) {
+            self.frames.remove(id);
+        }
+        self.frames.extend(frames);
+    }
+
+    fn collect_frames(node: &Value, frames: &mut BTreeMap<String, Vec<String>>) {
+        let frame = node.get("frame").unwrap_or(&Value::Null);
+        let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
+        if !text("id").is_empty() {
+            let url = format!("{}{}", text("url"), text("urlFragment"));
+            frames.insert(text("id").to_string(), vec![url, text("securityOrigin").to_string()]);
+        }
+        for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() {
+            Self::collect_frames(child, frames);
+        }
+    }
+
     fn frame_protected(&self, frame_id: &str) -> bool {
         if frame_id.is_empty() {
             return false;
@@ -1267,7 +1377,27 @@ impl Cdp {
         } {
             self.source_resources.insert((session.clone().unwrap_or_default(), id.to_string()), url.to_string());
         }
+        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument") {
+            self.frame_epoch += 1;
+        }
         match method.as_str() {
+            "Page.frameAttached" | "Page.frameDetached" => {
+                if let Some(id) = params.get("frameId").and_then(Value::as_str) {
+                    self.frames.remove(id);
+                    self.frame_versions.insert(id.to_string(), self.frame_epoch);
+                    for frames in self.frame_sessions.values_mut() {
+                        frames.remove(id);
+                    }
+                }
+            }
+            "Page.navigatedWithinDocument" => {
+                if let Some(id) = params.get("frameId").and_then(Value::as_str) {
+                    self.frame_versions.insert(id.to_string(), self.frame_epoch);
+                    if let Some(known) = self.frames.get_mut(id).and_then(|known| known.first_mut()) {
+                        *known = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                    }
+                }
+            }
             "Page.frameNavigated" => {
                 let Some(session) = session else { return };
                 let frame = params.get("frame").cloned().unwrap_or(Value::Null);
@@ -1283,6 +1413,8 @@ impl Cdp {
                     .to_string();
                 if let Some(id) = frame.get("id").and_then(|v| v.as_str()) {
                     self.frames.insert(id.to_string(), vec![url.clone(), origin.clone()]);
+                    self.frame_versions.insert(id.to_string(), self.frame_epoch);
+                    self.frame_sessions.entry(session.clone()).or_default().insert(id.to_string());
                 }
                 if frame.get("parentId").is_none() {
                     self.main_commit(&session, &frame);
@@ -1515,6 +1647,7 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
+        let frame_epoch = self.frame_epoch;
         let id = self.send(method, params, session_id)?;
         let deadline = Instant::now() + timeout;
         let was_blocked = session_id.is_some_and(|session| self.blocked.contains(session));
@@ -1534,7 +1667,14 @@ impl Cdp {
                     let (text, _) = shield::redact_text(&self.guard, text);
                     return Err(format!("{method}: {text}\n"));
                 }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                let result = value.get("result").cloned().unwrap_or(Value::Null);
+                if method == "Page.getFrameTree" {
+                    if frame_epoch != self.frame_epoch && !self.tree_matches_updates(&result, frame_epoch) {
+                        return Err(self.refusal());
+                    }
+                    self.record_frames(&result, session_id.unwrap_or(""));
+                }
+                return Ok(result);
             }
             let detached = value.get("method").and_then(|v| v.as_str())
                 == Some("Target.detachedFromTarget")
@@ -1847,6 +1987,16 @@ fn unguarded(message: String) -> String {
     } else {
         UNGUARDED.to_string()
     }
+}
+
+fn frame_text_known(text: &str) -> bool {
+    !matches!(text, "" | "null" | "://")
+}
+
+fn crosses_frames(method: &str, params: &Value) -> bool {
+    matches!(method, "DOMSnapshot.captureSnapshot" | "DOMSnapshot.getSnapshot" | "DOM.getFlattenedDocument")
+        || method.starts_with("DOM.") && (params.get("pierce").and_then(Value::as_bool) == Some(true)
+            || params.get("depth").and_then(Value::as_i64).is_some_and(|depth| depth < 0 || depth > 1))
 }
 
 fn recovery(method: &str, params: &Value) -> bool {
