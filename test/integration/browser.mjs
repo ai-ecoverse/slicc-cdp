@@ -4,9 +4,9 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { cleanupGrace } from './cleanup.mjs';
-
 const workerDeadline = Date.now() + Number(process.env.SLICC_ROW_TIMEOUT_MS ?? 605000);
+const cleanupGrace = (deadlineAt = workerDeadline - 5000) =>
+  Math.max(30000, deadlineAt - Date.now());
 const { findBrowser } = await import(
   process.env.SLICC_FIXTURE_BROWSER_API ?? '../../src/browser.js'
 );
