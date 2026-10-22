@@ -25,7 +25,7 @@ jobs:
     secrets: inherit
     with:
       test-glob: test/integration/*.test.mjs
-      shards: 4
+      shards: 8
       timeout-minutes: 30
       review-timeout-minutes: 90
       review-prompt: |
