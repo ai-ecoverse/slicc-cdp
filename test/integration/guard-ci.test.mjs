@@ -4,6 +4,7 @@ import test from 'node:test';
 import { guardShardPlan } from '../../scripts/cert/guard-shards.mjs';
 import { assertPartitionUnion, planPartitions } from '../../scripts/guard-ci.mjs';
 import { integrationArguments } from '../../scripts/integration-selection.mjs';
+import { fixture } from './cert-fixture.mjs';
 
 const vectors = JSON.parse(
   await readFile(
@@ -14,20 +15,20 @@ const vectors = JSON.parse(
 const plan = planPartitions(vectors);
 const head = 'pure-ci-subject';
 const run = 'pure-ci-run';
-const documents = () =>
-  plan.shards.map((shard) => ({
+const documents = () => {
+  const original = fixture().guard.executions.positive.report;
+  return plan.shards.map((shard) => ({
     id: shard.id,
     head,
     run,
     report: {
+      ...original,
       sha: head,
       selection: { targets: shard.targets },
-      results: shard.keys.map((key) => {
-        const [id, target, variant] = JSON.parse(key);
-        return { id, target, variant };
-      }),
+      results: original.results.filter((row) => shard.targets.includes(row.target)),
     },
   }));
+};
 
 test('normal CI reuses the cert partition library with an exact disjoint full row universe', async () => {
   assert.deepEqual(plan, guardShardPlan(vectors));
@@ -40,6 +41,49 @@ test('normal CI reuses the cert partition library with an exact disjoint full ro
   assert.equal(new Set([...general, ...focused, ...guarded]).size, all.length);
   assert.deepEqual(guarded, ['test/integration/guard-runner.test.mjs']);
 });
+
+for (const defect of [
+  'failed leg',
+  'incomplete leg',
+  'unsupported skip',
+  'eligible applicability forgery',
+  'C2 skip',
+  'shared iframe skip',
+  'false producer pass',
+  'wrong corpus',
+]) {
+  test(`guard union rejects behavioural defect ${defect} even with complete keys`, () => {
+    const input = documents();
+    const row = input
+      .flatMap((document) => document.report.results)
+      .find((row) =>
+        defect === 'shared iframe skip'
+          ? row.id === 'C4.iframe-preattach.blank.shared'
+          : defect === 'unsupported skip'
+            ? row.id === 'C1.href'
+            : row.id === 'C2.redirect-body'
+      );
+    if (defect === 'failed leg') row.guarded = 'fail';
+    if (defect === 'incomplete leg') row.live = 'incomplete';
+    if (
+      [
+        'unsupported skip',
+        'eligible applicability forgery',
+        'C2 skip',
+        'shared iframe skip',
+      ].includes(defect)
+    ) {
+      row.control = row.guarded = row.live = 'skip';
+      row.reason =
+        defect === 'eligible applicability forgery'
+          ? 'not-applicable'
+          : 'not-supported:browserSession';
+    }
+    if (defect === 'false producer pass') input[0].report.pass = false;
+    if (defect === 'wrong corpus') input[0].report.set = 'unverified corpus';
+    assert.throws(() => assertPartitionUnion(vectors, input, head, run));
+  });
+}
 
 for (const defect of [
   'missing partition',

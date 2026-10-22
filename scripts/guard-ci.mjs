@@ -3,10 +3,39 @@ import { spawnSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { skipReason } from '@ai-ecoverse/slicc-browsers/guard-driver.mjs';
+import { summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { guardRowKey, guardShardPlan } from './cert/guard-shards.mjs';
 import { suitePolicy } from './cert/suite-policy.mjs';
+import { integrationArguments } from './integration-selection.mjs';
 
-export const guardFile = 'test/integration/guard-runner.test.mjs';
+export function assertPartitionVerdicts(vectors, report, head) {
+  const checked = summary({ set: vectors, results: report.results, guard: 'slicc-cdp', sha: head });
+  assert.equal(report.guard, 'slicc-cdp', 'guard scope binding');
+  assert.equal(report.set, checked.set, 'guard corpus binding');
+  assert.equal(report.pass, true, 'guard producer verdict must pass');
+  assert.equal(checked.pass, true, 'recomputed guard verdict must pass');
+  for (const row of report.results) {
+    const vector = vectors.vectors.find((vector) => vector.id === row.id);
+    const legs = [row.control, row.guarded, row.live];
+    const mandatory =
+      row.id.startsWith('C2.redirect-') || /^C4\.iframe-preattach\..*\.shared$/.test(row.id);
+    if (legs.every((leg) => leg === 'pass')) continue;
+    assert.equal(mandatory, false, `${row.id} must pass without skips`);
+    if (vector?.kind === 'text' && legs.every((leg) => leg === 'not-run')) continue;
+    const canonical = skipReason(vector, row.target, 'slicc-cdp');
+    const originUnavailable =
+      row.reason === 'not-applicable:no-ordinary-same-site-origin' &&
+      JSON.stringify(vector).includes('{ordinary-same-site}');
+    assert.ok(
+      legs.every((leg) => leg === 'skip') &&
+        typeof row.reason === 'string' &&
+        row.reason.startsWith('not-applicable') &&
+        (row.reason === canonical || originUnavailable),
+      `${row.id} has no allowed applicability skip`
+    );
+  }
+}
 
 export function planPartitions(vectors) {
   const plan = guardShardPlan(vectors);
@@ -32,6 +61,19 @@ export function assertPartitionUnion(vectors, documents, head, run) {
     const keys = document.report.results.map(guardRowKey).sort();
     assert.equal(new Set(keys).size, keys.length, 'guard partition repeats rows');
     assert.deepEqual(keys, shard.keys, 'guard partition must record every assigned row');
+    assertPartitionVerdicts(
+      {
+        ...vectors,
+        vectors: vectors.vectors
+          .map((vector) => ({
+            ...vector,
+            targets: vector.targets.filter((target) => shard.targets.includes(target)),
+          }))
+          .filter((vector) => vector.targets.length),
+      },
+      document.report,
+      head
+    );
     union.push(...keys);
   }
   assert.equal(new Set(union).size, union.length, 'guard executed partitions overlap');
@@ -61,9 +103,10 @@ async function main() {
     );
     await mkdir(directory, { recursive: true });
     const report = path.join(directory, 'guard.md');
+    const files = await integrationArguments('guard');
     const outcome = spawnSync(
       process.execPath,
-      ['scripts/test-integration.mjs', '--test-concurrency=1', guardFile],
+      ['scripts/test-integration.mjs', '--test-concurrency=1', ...files],
       {
         stdio: 'inherit',
         env: {

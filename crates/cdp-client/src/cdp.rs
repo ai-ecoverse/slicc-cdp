@@ -1232,12 +1232,8 @@ impl Cdp {
         false
     }
 
-    fn resource_url(url: &str) -> String {
-        url::Url::parse(url).map(|mut url| { url.set_fragment(None); url.to_string() }).unwrap_or_else(|_| url.to_string())
-    }
-
     fn protect_resource(&mut self, session: &str, url: &str) {
-        let url = Self::resource_url(url);
+        let Some(url) = self.guard.resource_key(url) else { return };
         self.protected_resources.insert((session.to_string(), url.clone()));
         if let Some(target) = self.session_target(session) {
             self.protected_target_resources.insert((target, url));
@@ -1245,7 +1241,7 @@ impl Cdp {
     }
 
     fn resource_protected(&self, session: &str, url: &str) -> bool {
-        let key = Self::resource_url(url);
+        let Some(key) = self.guard.resource_key(url) else { return true };
         self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), key.clone()))
             || self.session_target(session).is_some_and(|target| self.protected_target_resources.contains(&(target, key)))
     }
@@ -1599,26 +1595,16 @@ impl Cdp {
             }
             return;
         }
+        if guarded && !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") {
+            self.fail_seen_network(&value);
+            return;
+        }
         self.adopt_guard_attach(&value);
         if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") && shield::loaded_urls_protected(&self.guard, &value["params"]) {
             self.fail_seen_network(&value);
             return;
         }
-        let redacted = shield::redact_strings(&self.guard, &mut value);
-        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-        let tainted = value.pointer("/params/requestId").and_then(Value::as_str).is_some_and(|id| self.redirects.contains(id));
-        if tainted {
-            let request = value.pointer("/params/request");
-            let opaque_request = request.and_then(Value::as_object).is_some_and(|request| request.keys().any(|key| key.starts_with("postData") || key.to_ascii_lowercase().ends_with("fragment")));
-            let safe_request = method == "Network.requestWillBeSent" && request.and_then(|request| request.get("url")).and_then(Value::as_str).is_some_and(|url| !self.guard.url(url)) && !opaque_request;
-            if opaque_request || !redacted && !safe_request {
-                self.fail_seen_network(&value);
-                return;
-            }
-            if let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) {
-                params.retain(|key, _| key != "documentURL" && !key.to_ascii_lowercase().ends_with("fragment"));
-            }
-        }
+        shield::redact_strings(&self.guard, &mut value);
         if self.hidden(&value) {
             self.fail_seen_network(&value);
             return;
@@ -2331,6 +2317,7 @@ mod tests {
     include!("redirect_terminal_test.rs");
     include!("redirect_terminal_guard_test.rs");
     include!("redirect_c2_carrier_test.rs");
+    include!("redirect_grok_test.rs");
     include!("navigation_queue_test.rs");
     include!("redirect_fragment_test.rs");
     include!("redirect_review_test.rs");
