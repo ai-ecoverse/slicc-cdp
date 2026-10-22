@@ -15,6 +15,7 @@ struct Backend {
     block_tree: bool,
     next_worker_url: Option<String>,
     navigation_event: bool,
+    attach_event: Option<Value>,
     event_loader: String,
     event_session: Option<String>,
     sessions: BTreeMap<String, String>,
@@ -55,6 +56,7 @@ impl Transport for Fake {
                 json!({})
             }
             "Runtime.evaluate" => {
+                if let Some(event) = backend.attach_event.take() { backend.inbox.push_back(event.to_string()); }
                 if let Some(next) = backend.next_tree.take() { backend.tree = next; }
                 if let Some(url) = backend.next_worker_url.take() { backend.worker.as_mut().unwrap()["url"] = json!(url); }
                 if backend.navigation_event {
@@ -84,7 +86,7 @@ impl Transport for Fake {
 
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
-        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, next_worker_url:None, navigation_event:false,
+        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, next_worker_url:None, navigation_event:false, attach_event:None,
         event_loader:"L2".into(), event_session:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
@@ -230,12 +232,17 @@ fn content_commands_require_verified_child_frames_and_contexts() {
 }
 
 #[test]
-fn document_changes_discard_content_responses_and_notification_results() {
+fn protected_or_unknown_changes_discard_content_responses_and_notification_results() {
     for notify in [false, true] {
-        for event in [false, true] {
+        for protected in [false, true] {
             let (mut cdp, backend) = fixture();
             let session = attach(&mut cdp, "T");
-            if event { backend.borrow_mut().navigation_event = true; } else { backend.borrow_mut().next_tree = Some(tree("L2")); }
+            let mut next = tree("L2");
+            if protected {
+                next["frameTree"]["frame"]["url"] = json!("https://vault.sliccy.ai/document");
+                next["frameTree"]["frame"]["securityOrigin"] = json!("https://vault.sliccy.ai");
+            } else { next["frameTree"]["frame"].as_object_mut().unwrap().remove("securityOrigin"); }
+            backend.borrow_mut().next_tree = Some(next);
             let result = if notify {
                 cdp.notify("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).map(|_| json!({}))
             } else {
@@ -246,6 +253,104 @@ fn document_changes_discard_content_responses_and_notification_results() {
     }
     let (mut cdp, _) = fixture();
     refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some("UNKNOWN")));
+}
+
+#[test]
+fn guard_created_blank_documents_have_creation_and_history_evidence() {
+    for shape in ["ordinary", "multiple-history", "unknown-history", "opener", "loader-changed", "frame-changed"] {
+        let (mut cdp, backend) = fixture();
+        backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
+        backend.borrow_mut().history = match shape {
+            "multiple-history" => Some(json!({"currentIndex":1,"entries":[{"id":1,"url":"https://vault.sliccy.ai/"},{"id":2,"url":"about:blank"}]})),
+            "unknown-history" => None,
+            _ => Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]})),
+        };
+        if shape == "opener" { attach(&mut cdp, "OWNER"); backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":"about:blank","openerId":"OWNER"})); }
+        match cdp.call("Target.createTarget", json!({"url":"about:blank"}), None) {
+            Ok(_) => {},
+            Err(message) => { assert_eq!(shape, "opener"); assert!(message.starts_with("slicc: refused:")); continue; }
+        }
+        let session = attach(&mut cdp, "T");
+        if shape == "loader-changed" { backend.borrow_mut().tree["frameTree"]["frame"]["loaderId"] = json!("OTHER"); }
+        if shape == "frame-changed" { backend.borrow_mut().tree["frameTree"]["frame"]["id"] = json!("OTHER"); }
+        let result = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));
+        if shape == "ordinary" { result.unwrap(); } else { refused(result); }
+    }
+}
+
+#[test]
+fn creation_receipts_require_fresh_matching_browser_evidence_after_reconnect() {
+    let (mut cdp, backend) = fixture();
+    backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
+    backend.borrow_mut().history = Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]}));
+    cdp.call("Target.createTarget", json!({"url":"about:blank"}), None).unwrap();
+    let proof = cdp.created_blank("T").unwrap();
+    let mut reconnect = Cdp::from_transport(Box::new(Fake(backend.clone())));
+    let session = attach(&mut reconnect, "T");
+    refused(reconnect.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+    assert!(!reconnect.restore_created_blank("T", &json!(["F","OTHER",1])));
+    assert!(reconnect.restore_created_blank("T", &proof));
+    reconnect.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+    backend.borrow_mut().history = Some(json!({"currentIndex":1,"entries":[{"id":1,"url":"about:blank"},{"id":2,"url":"https://vault.sliccy.ai/"}]}));
+    let mut next = Cdp::from_transport(Box::new(Fake(backend.clone())));
+    let next_session = attach(&mut next, "T");
+    assert!(!next.restore_created_blank("T", &proof));
+    refused(next.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&next_session)));
+}
+
+#[test]
+fn allowed_document_and_frame_changes_keep_content_responses() {
+    for notify in [false, true] {
+        for shape in ["document", "iframe", "iframe-error"] {
+            let (mut cdp, backend) = fixture();
+            let session = attach(&mut cdp, "T");
+            let mut next = tree(if shape == "document" { "L2" } else { "L1" });
+            if shape != "document" {
+                let error = shape == "iframe-error";
+                next["frameTree"]["childFrames"] = json!([{"frame":{"id":"CHILD","parentId":"F","loaderId":"LC","url":if error { "chrome-error://chromewebdata/" } else { "https://ordinary.example/child" },"securityOrigin":if error { "://" } else { "https://ordinary.example" },"unreachableUrl":if error { "https://vault.sliccy.ai/" } else { "" }}}]);
+                let guard = backend.borrow().sessions.iter().find(|(id, _)| *id != &session).unwrap().0.clone();
+                backend.borrow_mut().attach_event = Some(json!({"method":"Page.frameAttached","sessionId":guard,"params":{"frameId":"CHILD","parentFrameId":"F"}}));
+            }
+            backend.borrow_mut().next_tree = Some(next);
+            if notify { cdp.notify("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap(); } else {
+                assert_eq!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap()["result"]["value"], "document-value");
+            }
+            cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn error_children_require_a_known_unprotected_predecessor() {
+    for protected in [false, true] {
+        let (mut cdp, backend) = fixture();
+        let session = attach(&mut cdp, "T");
+        let guard = backend.borrow().sessions.iter().find(|(id, _)| *id != &session).unwrap().0.clone();
+        if protected {
+            backend.borrow_mut().attach_event = Some(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":{"id":"CHILD","parentId":"F","loaderId":"OLD","url":"https://vault.sliccy.ai/","securityOrigin":"https://vault.sliccy.ai"}}}));
+        }
+        let mut next = tree("L1");
+        next["frameTree"]["childFrames"] = json!([{"frame":{"id":"CHILD","parentId":"F","loaderId":"ERR","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":"https://vault.sliccy.ai/"}}]);
+        backend.borrow_mut().next_tree = Some(next);
+        refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+    }
+}
+
+#[test]
+fn content_probes_reuse_one_private_session_without_detaching_callers() {
+    let (mut cdp, backend) = fixture();
+    let session = attach(&mut cdp, "T");
+    let guards: Vec<String> = backend.borrow().sessions.keys().filter(|id| **id != session).cloned().collect();
+    assert_eq!(guards.len(), 1);
+    let from = backend.borrow().calls.len();
+    for _ in 0..12 {
+        cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+    }
+    let backend = backend.borrow();
+    let calls = &backend.calls[from..];
+    assert!(!calls.iter().any(|call| matches!(call["method"].as_str(), Some("Target.attachToTarget" | "Target.detachFromTarget" | "Page.enable"))));
+    assert!(calls.iter().filter(|call| call["method"] == "Page.getFrameTree").all(|call| call["sessionId"] == guards[0]));
+    assert!(!cdp.events().iter().any(|event| event["method"] == "Target.detachedFromTarget"));
 }
 
 #[test]
@@ -273,7 +378,8 @@ fn catalog_exceptions_and_initial_blank_documents_have_verified_metadata() {
     for shape in ["blank", "newtab"] {
         let (mut cdp, backend) = fixture();
         if shape == "blank" {
-            backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"","url":"about:blank","securityOrigin":"://"}}});
+            backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
+            backend.borrow_mut().history = Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]}));
         } else {
             backend.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"CHILD","loaderId":"LC","url":"chrome-untrusted://new-tab-page/","securityOrigin":"://"}}]);
         }

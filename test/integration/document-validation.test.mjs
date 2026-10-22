@@ -18,17 +18,63 @@ const frame = (loaderId) => ({
 });
 
 for (const transport of ['native', 'wasi']) {
-  for (const shape of ['worker', 'child', 'response', 'stream']) {
+  test(`guard-created blank content remains readable (${transport})`, {
+    timeout: 60000,
+  }, async () => {
+    const backend = await fakeCdp();
+    let client;
+    try {
+      client = await guarded(backend.url, 'https://private.example.invalid', {
+        transport,
+        variant: 'lagging',
+        detachDelay: 0,
+      });
+      const { targetId } = await client.send('Target.createTarget', { url: 'about:blank' });
+      const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
+      const from = backend.calls.length;
+      await client.send('Runtime.evaluate', { expression: 'document.title' }, sessionId);
+      await client.send('Runtime.evaluate', { expression: 'document.title' }, sessionId);
+      assert.ok(
+        !backend.calls.slice(from).some((call) => call.method === 'Target.detachFromTarget')
+      );
+    } finally {
+      await client?.close();
+      await backend.close();
+    }
+  });
+  for (const shape of ['worker', 'child', 'response', 'stream', 'ordinary-response', 'new-frame']) {
     test(`document validation ${shape} (${transport})`, { timeout: 60000 }, async () => {
       let target;
       const backend = await fakeCdp({
         refuseWhen: (message) => {
           if (
-            shape === 'response' &&
+            ['response', 'ordinary-response', 'new-frame'].includes(shape) &&
             message.method === 'Runtime.evaluate' &&
             message.params?.expression === 'document.title'
-          )
-            target.frame = frame('L2');
+          ) {
+            if (shape === 'new-frame') {
+              target.childFrames = [
+                {
+                  frame: {
+                    id: 'NEW',
+                    parentId: 'T',
+                    loaderId: 'LC',
+                    url: 'https://ordinary.example/child',
+                    securityOrigin: 'https://ordinary.example',
+                  },
+                },
+              ];
+            } else {
+              target.frame =
+                shape === 'ordinary-response'
+                  ? frame('L2')
+                  : {
+                      ...frame('L2'),
+                      url: 'https://seven.sliccy.ai/',
+                      securityOrigin: 'https://seven.sliccy.ai',
+                    };
+            }
+          }
           return false;
         },
       });
@@ -69,11 +115,22 @@ for (const transport of ['native', 'wasi']) {
         const from = backend.calls.length;
         const method = shape === 'stream' ? 'IO.read' : 'Runtime.evaluate';
         const params = shape === 'stream' ? { handle: 'H' } : { expression: 'document.title' };
-        await assert.rejects(
-          client.send(method, params, shape === 'stream' ? undefined : sessionId),
-          /slicc: refused:/
-        );
-        if (shape !== 'response')
+        if (['ordinary-response', 'new-frame'].includes(shape)) {
+          await client.send(method, params, sessionId);
+          await client.send(method, params, sessionId);
+          const probes = backend.calls
+            .slice(from)
+            .filter((call) => call.method === 'Page.getFrameTree');
+          assert.equal(new Set(probes.map((call) => call.sessionId)).size, 1);
+          assert.ok(
+            !backend.calls.slice(from).some((call) => call.method === 'Target.detachFromTarget')
+          );
+        } else
+          await assert.rejects(
+            client.send(method, params, shape === 'stream' ? undefined : sessionId),
+            /slicc: refused:/
+          );
+        if (!['response', 'ordinary-response', 'new-frame'].includes(shape))
           assert.ok(!backend.calls.slice(from).some((call) => call.method === method));
         else
           assert.ok(

@@ -93,11 +93,13 @@ pub struct Cdp {
     streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
     document_epochs: BTreeMap<String, u64>,
     document_versions: BTreeMap<(String, String), String>,
+    created_blanks: BTreeMap<String, (String, String, i64)>,
     context_frames: BTreeMap<(String, String), String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
+    frame_decisions: BTreeMap<String, bool>,
     documents: BTreeMap<String, MainDocument>,
     unobserved: BTreeSet<String>,
     #[cfg(test)]
@@ -144,11 +146,13 @@ impl Cdp {
             streams: BTreeMap::new(),
             document_epochs: BTreeMap::new(),
             document_versions: BTreeMap::new(),
+            created_blanks: BTreeMap::new(),
             context_frames: BTreeMap::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
             frames: BTreeMap::new(),
+            frame_decisions: BTreeMap::new(),
             documents: BTreeMap::new(),
             unobserved: BTreeSet::new(),
             #[cfg(test)]
@@ -281,7 +285,7 @@ impl Cdp {
         let checks = self.prepare(method, &params, session_id)?;
         let result = self.raw_call(method, params.clone(), session_id, timeout)?;
         if content_command(method, &params) == Some(true) {
-            self.verify_checks(&checks)?;
+            self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"))?;
         }
         if let (true, Some(session), Some(id)) = (
             shield::answers_interception(method),
@@ -525,11 +529,10 @@ impl Cdp {
         Ok(checks)
     }
 
-    fn verify_checks(&mut self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+    fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool) -> Result<(), String> {
         for (target, expected) in checks {
-            if self.document_state(target, true).as_ref() != Some(expected) {
-                return Err(self.refusal());
-            }
+            let current = self.document_state(target, true).ok_or_else(|| self.refusal())?;
+            if same_document && &current != expected { return Err(self.refusal()) }
         }
         Ok(())
     }
@@ -850,11 +853,53 @@ impl Cdp {
                 Err(error) => format!("{message}slicc: refused: cleanup: {}\n", error.trim()),
             });
         }
+        self.record_initial_blank(&target);
         if !url.eq_ignore_ascii_case("about:blank") {
             let guard = self.guards.get(&target).cloned();
             self.send("Page.navigate", json!({ "url": url }), guard.as_deref())?;
         }
         Ok(result)
+    }
+
+    fn record_initial_blank(&mut self, target: &str) {
+        if let Some(recorded) = self.initial_blank_evidence(target, true) {
+            self.created_blanks.insert(target.to_string(), recorded);
+        }
+    }
+
+    pub fn created_blank(&self, target: &str) -> Option<Value> {
+        self.created_blanks.get(target).map(|(frame, loader, entry)| json!([frame, loader, entry]))
+    }
+
+    pub fn restore_created_blank(&mut self, target: &str, proof: &Value) -> bool {
+        let expected = proof.as_array().filter(|values| values.len() == 3).and_then(|values| {
+            Some((values[0].as_str()?.to_string(), values[1].as_str()?.to_string(), values[2].as_i64()?))
+        });
+        let Some(expected) = expected else { return false };
+        if self.initial_blank_evidence(target, false).as_ref() != Some(&expected) { return false }
+        self.created_blanks.insert(target.to_string(), expected);
+        true
+    }
+
+    fn initial_blank_evidence(&mut self, target: &str, empty: bool) -> Option<(String, String, i64)> {
+        let guard = self.guards.get(target)?.clone();
+        let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
+        let info = result.get("targetInfo")?;
+        if info.get("targetId").and_then(Value::as_str) != Some(target)
+            || info.get("type").and_then(Value::as_str) != Some("page")
+            || info.get("url").and_then(Value::as_str) != Some("about:blank")
+            || info.get("openerId").is_some() || info.get("openerFrameId").is_some() { return None }
+        let history = self.raw_call("Page.getNavigationHistory", json!({}), Some(&guard), DOCUMENT_CHECK).ok()?;
+        let entries = history.get("entries")?.as_array()?;
+        if history.get("currentIndex").and_then(Value::as_i64) != Some(0) || entries.len() != 1
+            || entries[0].get("url").and_then(Value::as_str) != Some("about:blank") { return None }
+        let entry = entries[0].get("id")?.as_i64()?;
+        let state = self.document_state(target, false)?;
+        if empty && state.frames.len() != 1 { return None }
+        let (id, evidence) = state.frames.iter().find(|(_, evidence)| evidence[4].is_empty())?;
+        if evidence[1] != "about:blank" || !evidence[3].is_empty()
+            || matches!(evidence[2].as_str(), "" | "null") || self.guard.url(&evidence[2]) { return None }
+        Some((id.clone(), evidence[0].clone(), entry))
     }
 
     fn wait_destroyed(&mut self, target: &str, mark: usize, timeout: Duration) -> Result<(), String> {
@@ -1152,19 +1197,17 @@ impl Cdp {
         if content && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or(""))
             && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
         {
-            let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
-            let info = result.get("targetInfo")?;
-            if info.get("targetId").and_then(Value::as_str) != Some(target)
-                || info.get("type").and_then(Value::as_str) != Some("page")
-                || info.get("url").and_then(Value::as_str).is_none_or(|url| !self.guard.inheriting(url)) { return None }
-            if info.get("openerId").is_some() || info.get("openerFrameId").is_some()
-                || frame.get("url").and_then(Value::as_str) != Some("about:blank")
-                || frame.get("loaderId").and_then(Value::as_str) != Some("") { return None }
+            let known = self.created_blanks.get(target).is_some_and(|(id, loader, _)|
+                frame.get("id").and_then(Value::as_str) == Some(id.as_str())
+                    && frame.get("loaderId").and_then(Value::as_str) == Some(loader.as_str())
+                    && frame.get("url").and_then(Value::as_str) == Some("about:blank"));
+            if !known { return None }
         }
         self.main_commit(&guard, frame);
         if self.protected_targets.contains(target) { return None }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
+            if content { self.frame_decisions.insert(id.clone(), false); }
             if !evidence[0].is_empty() {
                 self.document_versions.insert((target.to_string(), id.clone()), evidence[0].clone());
             }
@@ -1180,7 +1223,9 @@ impl Cdp {
             || frame.get("parentId").is_some_and(|id| id.as_str() != parent) { return false }
         let initial_blank = text("url") == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some("")
             && (root || parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2])));
-        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank;
+        let allowed_error = !root && self.guard.error_document(text("url"), text("securityOrigin"))
+            && !text("unreachableUrl").is_empty() && self.frame_decisions.get(text("id")) == Some(&false);
+        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || allowed_error;
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
             || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
             || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))) { return false }
@@ -1484,6 +1529,15 @@ impl Cdp {
             self.source_resources.insert((session.clone().unwrap_or_default(), id.to_string()), url.to_string());
         }
         match method.as_str() {
+            "Page.frameAttached" => {
+                if session.as_ref().is_some_and(|session| self.guard_sessions.contains(session)) {
+                    if let (Some(id), Some(parent)) = (params.get("frameId").and_then(Value::as_str), params.get("parentFrameId").and_then(Value::as_str)) {
+                        if let Some(protected) = self.frame_decisions.get(parent).copied() {
+                            self.frame_decisions.entry(id.to_string()).or_insert(protected);
+                        }
+                    }
+                }
+            }
             "Page.frameNavigated" => {
                 let Some(session) = session else { return };
                 let frame = params.get("frame").cloned().unwrap_or(Value::Null);
@@ -1499,6 +1553,11 @@ impl Cdp {
                     .to_string();
                 if let Some(id) = frame.get("id").and_then(|v| v.as_str()) {
                     self.frames.insert(id.to_string(), vec![url.clone(), origin.clone()]);
+                    if self.guard.url(&url) || self.guard.url(&origin) {
+                        self.frame_decisions.insert(id.to_string(), true);
+                    } else if !self.guard.error_page_url(&url) && !matches!(origin.as_str(), "" | "null" | "://") {
+                        self.frame_decisions.insert(id.to_string(), false);
+                    }
                 }
                 if frame.get("parentId").is_none() {
                     self.main_commit(&session, &frame);
@@ -1580,6 +1639,7 @@ impl Cdp {
                 if let Some(target) = params.get("targetId").and_then(|v| v.as_str()) {
                     self.guards.remove(target);
                     self.targets.remove(target);
+                    self.created_blanks.remove(target);
                     self.documents.remove(target);
                     self.unobserved.remove(target);
                 }

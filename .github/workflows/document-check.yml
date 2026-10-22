@@ -54,7 +54,15 @@ jobs:
             exit 0
           fi
           git show "$BASE:crates/cdp-client/src/cdp.rs" > crates/cdp-client/src/cdp.rs
-          if cargo test --locked -p slicc-cdp-client --test document-validation -- --skip same_generation_updates_and_other_targets_do_not_invalidate_content --skip current_policy_is_still_checked_when_a_loader_id_is_unchanged --skip catalog_exceptions_and_initial_blank_documents_have_verified_metadata --skip inherited_child_documents_require_verified_unprotected_origins --skip opaque_blank_roots_require_verified_creation_evidence --skip history_commands_refuse_unavailable_or_unknown_destination_evidence --skip fetch_answers_do_not_probe_a_paused_document --skip ordinary_navigation_readiness_and_settings_do_not_require_frame_reads --skip ordinary_new_tab_settings_and_basics_keep_content_checks --skip unknown_commands_and_readiness_with_selectors_fail_closed > /tmp/document-validation.log 2>&1; then
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('test/integration/document-validation.rs')
+          source = path.read_text()
+          for name in ['guard_created_blank_documents_have_creation_and_history_evidence', 'creation_receipts_require_fresh_matching_browser_evidence_after_reconnect']:
+              source = source.replace(f'fn {name}(', f'#[cfg(any())]\nfn {name}(')
+          path.write_text(source)
+          PY
+          if cargo test --locked -p slicc-cdp-client --test document-validation -- --skip same_generation_updates_and_other_targets_do_not_invalidate_content --skip current_policy_is_still_checked_when_a_loader_id_is_unchanged --skip catalog_exceptions_and_initial_blank_documents_have_verified_metadata --skip inherited_child_documents_require_verified_unprotected_origins --skip opaque_blank_roots_require_verified_creation_evidence --skip history_commands_refuse_unavailable_or_unknown_destination_evidence --skip fetch_answers_do_not_probe_a_paused_document --skip ordinary_navigation_readiness_and_settings_do_not_require_frame_reads --skip ordinary_new_tab_settings_and_basics_keep_content_checks --skip unknown_commands_and_readiness_with_selectors_fail_closed --skip guard_created_blank_documents_have_creation_and_history_evidence --skip creation_receipts_require_fresh_matching_browser_evidence_after_reconnect --skip allowed_document_and_frame_changes_keep_content_responses --skip content_probes_reuse_one_private_session_without_detaching_callers --skip error_children_require_a_known_unprotected_predecessor > /tmp/document-validation.log 2>&1; then
             echo 'expected the baseline validation tests to fail'
             exit 1
           fi

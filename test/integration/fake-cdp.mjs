@@ -193,7 +193,7 @@ export async function fakeCdp({
           const created = {
             targetId: `TAB${tabs}`,
             url,
-            loaderId: url === 'about:blank' ? '' : `L${++loaders}`,
+            loaderId: `L${++loaders}`,
           };
           targets.push(created);
           return answer({ targetId: created.targetId });

@@ -132,11 +132,15 @@ pub fn create_target(
     let (console, requests) = traced?;
     session::push_trace(state, &target_id, console, requests);
     session::note_owned(state, &target_id);
+    if let Some(proof) = cdp.created_blank(&target_id) { state.created_blanks.insert(target_id.clone(), proof); }
     Ok(target_id)
 }
 
 pub fn watch_attach(cdp: &mut Cdp, state: &Session, target_id: &str) -> Result<String, String> {
     let session = cdp::attach(cdp, target_id)?;
+    if state.owned.iter().any(|owned| owned == target_id) {
+        if let Some(proof) = state.created_blanks.get(target_id) { cdp.restore_created_blank(target_id, proof); }
+    }
     if let Err(message) = trace::enable(cdp, &session) {
         cdp::detach(cdp, &session);
         return Err(message);
