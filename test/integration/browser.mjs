@@ -62,8 +62,12 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   child.stderr.on('data', (chunk) => {
     chromeLog = (chromeLog + chunk.toString('utf8')).slice(-4000);
   });
+  let stopped = false;
+  let diedFirst = null;
   const stop = async () => {
     const running = child.exitCode === null && !child.signalCode;
+    if (!stopped && !running) diedFirst = chromeStatus(child, chromeLog);
+    stopped = true;
     try {
       if (process.platform === 'win32') child.kill('SIGKILL');
       else process.kill(-child.pid, 'SIGKILL');
@@ -86,6 +90,7 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       port,
       wsUrl,
       died() {
+        if (stopped) return diedFirst;
         return child.exitCode !== null || child.signalCode ? chromeStatus(child, chromeLog) : null;
       },
       async close() {
