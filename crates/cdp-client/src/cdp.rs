@@ -76,6 +76,7 @@ pub struct Cdp {
     protected_body_requests: BTreeSet<String>,
     seen_network: BTreeMap<(String, String), String>,
     terminal_network: BTreeSet<(String, String)>,
+    client_navigation_urls: BTreeMap<String, String>,
     request_aliases: BTreeMap<String, BTreeSet<String>>,
     request_resources: BTreeMap<String, BTreeSet<(String, String)>>,
     protected_request_pages: BTreeSet<(String, String)>,
@@ -132,6 +133,7 @@ impl Cdp {
             protected_body_requests: BTreeSet::new(),
             seen_network: BTreeMap::new(),
             terminal_network: BTreeSet::new(),
+            client_navigation_urls: BTreeMap::new(),
             request_aliases: BTreeMap::new(),
             request_resources: BTreeMap::new(),
             protected_request_pages: BTreeSet::new(),
@@ -241,6 +243,7 @@ impl Cdp {
     ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
         self.admit(method, &params, session_id)?;
+        if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
         }
@@ -275,6 +278,7 @@ impl Cdp {
     pub fn start_navigation(&mut self, params: Value, session: Option<&str>) -> Result<i64, String> {
         let session = session.filter(|session| !session.is_empty());
         self.admit("Page.navigate", &params, session)?;
+        self.remember_navigation(&params, session);
         let id = self.send("Page.navigate", params.clone(), session)?;
         self.navigations.insert(id, Navigation { params, session: session.map(str::to_string), reply: None, detached: false });
         Ok(id)
@@ -1677,6 +1681,12 @@ impl Cdp {
         !self.guard.url(url) && !self.guard.url(&shield::web_socket_as_http(url)) && url::Url::parse(&shield::web_socket_as_http(url)).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
     }
 
+    fn remember_navigation(&mut self, params: &Value, session: Option<&str>) {
+        if let Some((session, url)) = session.zip(params["url"].as_str()).filter(|(_, url)| self.ordinary_redirect_url(url)) {
+            self.client_navigation_urls.insert(session.to_string(), url.to_string());
+        }
+    }
+
     fn ordinary_network_source(&self, session: &str, id: &str) -> Option<String> {
         let resources: Vec<_> = self.request_resources.get(id).into_iter().flatten().filter(|(peer, _)| peer == session).map(|(_, url)| url).collect();
         if resources.is_empty() || resources.iter().any(|url| !self.ordinary_redirect_url(url)) { return None }
@@ -1901,7 +1911,10 @@ impl Cdp {
             self.fail_seen_network(&value);
             return;
         }
+        let echoed_url = (value["method"] == "Network.requestWillBeSent" && value["params"]["type"] == "Document" && !guarded
+            && !self.protected_body_requests.contains(&key.1) && self.client_navigation_urls.get(&key.0).is_some_and(|url| value.pointer("/params/request/url").and_then(Value::as_str) == Some(url.as_str()))).then(|| value["params"]["request"]["url"].clone());
         shield::redact_strings(&self.guard, &mut value);
+        if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
         if self.hidden(&value) {
             self.fail_seen_network(&value);
             return;
@@ -2651,6 +2664,7 @@ mod tests {
     include!("redirect_scope_review_test.rs");
     include!("ordinary_network_review_test.rs");
     include!("pause_metadata_recovery_test.rs");
+    include!("navigation_echo_test.rs");
     include!("redirect_target_taint_test.rs");
     include!("redirect_resource_control_test.rs");
     include!("navigation_queue_test.rs");

@@ -12,6 +12,7 @@ import { recordedClient, requireRedirectRegistration } from './guard-c2-support.
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 import { inboundClients } from './inbound-clients.mjs';
+import { isExpectedX1Failure150, recordX1Client, x1Disposition, x1Privacy } from './x1-known.mjs';
 
 const { containsSecret } = await import(
   new URL('./redirect-secret.mjs', import.meta.resolve('@ai-ecoverse/slicc-browsers/package.json'))
@@ -242,19 +243,22 @@ export function isExpectedBfcacheFailure477(row) {
 }
 
 export function expectedFailureDispositions(results) {
-  return results.filter(isExpectedBfcacheFailure477).map((row) => ({
-    id: row.id,
-    target: row.target,
-    variant: row.variant,
-    reason: expectedBfcacheFailureReason,
-    ...(isExpectedBfcacheHistoryFailure477(row)
-      ? {
-          class: 'history-no-answer-ordinary-B',
-          auditDifference: row.guardedPrivacy.auditDifference,
-          deletionHook: 'slicc-cdp#478 or fixed slicc-browsers vectors',
-        }
-      : {}),
-  }));
+  return results
+    .filter(isExpectedBfcacheFailure477)
+    .map((row) => ({
+      id: row.id,
+      target: row.target,
+      variant: row.variant,
+      reason: expectedBfcacheFailureReason,
+      ...(isExpectedBfcacheHistoryFailure477(row)
+        ? {
+            class: 'history-no-answer-ordinary-B',
+            auditDifference: row.guardedPrivacy.auditDifference,
+            deletionHook: 'slicc-cdp#478 or fixed slicc-browsers vectors',
+          }
+        : {}),
+    }))
+    .concat(results.filter(isExpectedX1Failure150).map(x1Disposition));
 }
 
 export const published = JSON.parse(
@@ -351,7 +355,18 @@ export function verdictProblems(results) {
       problems.push(`${where} lacks measured non-exposure or discloses protected content`);
       continue;
     }
-    if (isExpectedBfcacheFailure477(row)) continue;
+    if (
+      row.id === 'X1.after-exit' &&
+      row.x1Privacy &&
+      (row.x1Privacy.measured !== true ||
+        row.x1Privacy.markerExposed !== false ||
+        row.x1Privacy.protectedExposed !== false ||
+        row.x1Privacy.screenshotExposed !== false)
+    ) {
+      problems.push(`${where} lacks measured X1 non-exposure or discloses protected content`);
+      continue;
+    }
+    if (isExpectedBfcacheFailure477(row) || isExpectedX1Failure150(row)) continue;
     if (legs.every((leg) => leg === 'pass')) continue;
     if (expectedBfcacheFailure477.has(row.id)) {
       problems.push(
@@ -410,7 +425,8 @@ export function assertGuardReport(report, id, head) {
   assert.deepEqual(checked.missing, [], 'guard rows must not be missing');
   assert.deepEqual(checked.forged, [], 'guard rows must not be forged');
   assert.ok(
-    checked.pass || report.results.some(isExpectedBfcacheFailure477),
+    checked.pass ||
+      report.results.some((row) => isExpectedBfcacheFailure477(row) || isExpectedX1Failure150(row)),
     'raw failures require the exact expected class'
   );
   assert.deepEqual(
@@ -532,6 +548,7 @@ export async function runPartition(t, id) {
   const diagnostics = [];
   const recordedRows = [];
   const restoreClients = new Map();
+  const exitClients = new Map();
   const startup = browserStartup(launchBrowser, (retry) => {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
   });
@@ -631,6 +648,16 @@ export async function runPartition(t, id) {
             (resource) => resource.close(),
             remaining()
           );
+          if (vector.id === 'X1.after-exit') {
+            const key = `${vector.id}/${target}/${variant}`;
+            if (!exitClients.has(key))
+              exitClients.set(key, {
+                actors: [],
+                ordinary: targets.ordinary,
+                protectedOrigin: targets[target],
+              });
+            exitClients.get(key).actors.push(recordX1Client(client));
+          }
           let unguarded;
           try {
             unguarded = await acquire(
@@ -707,6 +734,10 @@ export async function runPartition(t, id) {
           diagnostic.references.push(details);
         },
         log: (row) => {
+          if (row.id === 'X1.after-exit') {
+            const exit = exitClients.get(`${row.id}/${row.target}/${row.variant}`);
+            row.x1Privacy = x1Privacy(exit?.actors, exit ?? {});
+          }
           if (expectedBfcacheFailure477.has(row.id))
             row.guardedPrivacy = bfcachePrivacy(
               row,
@@ -773,7 +804,7 @@ export async function runPartition(t, id) {
   report.expectedFailures = expectedFailureDispositions(report.results);
   const problems = verdictProblems(report.results);
   const ms = Date.now() - started;
-  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS or its declared skip'}\n\n${table(report.results)}\n`;
+  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS, its declared skip, or an exact recorded expected failure'}\n\n${table(report.results)}\n`;
   const file =
     process.env.SLICC_GUARD_REPORT ??
     path.join(fileURLToPath(new URL('../../artifacts/', import.meta.url)), `guard-${id}.md`);
@@ -821,6 +852,10 @@ export async function runPartition(t, id) {
   assertGuardReport(report, id, report.sha);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  assert.deepEqual(problems, [], 'every row is PASS or its declared not-applicable skip');
+  assert.deepEqual(
+    problems,
+    [],
+    'every row is PASS, its declared not-applicable skip, or an exact expected failure'
+  );
   assert.ok(report.pass || report.expectedFailures.length > 0, report.line);
 }
