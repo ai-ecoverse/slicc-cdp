@@ -104,7 +104,9 @@ test('persistent page capabilities are denied before later documents', {
             );
             await navigated;
           } else {
-            await raw.send(
+            const parent = await raw.send('Page.getFrameTree', {}, sessionId);
+            const from = raw.events.length;
+            const inserted = await raw.send(
               'Runtime.evaluate',
               {
                 expression: `new Promise(resolve=>{const frame=document.createElement('iframe');frame.onload=()=>resolve(true);frame.src=${JSON.stringify(`${sites.seven}/doc`)};document.body.append(frame);})`,
@@ -113,12 +115,20 @@ test('persistent page capabilities are denied before later documents', {
               },
               sessionId
             );
-            const tree = await raw.send('Page.getFrameTree', {}, sessionId);
-            const frame = tree.frameTree.childFrames?.[0]?.frame;
-            assert.ok(frame);
+            assert.equal(inserted.exceptionDetails, undefined);
+            assert.equal(inserted.result.value, true);
+            const childFrameId = raw.events
+              .slice(from)
+              .find(
+                (event) =>
+                  event.method === 'Page.frameAttached' &&
+                  event.sessionId === sessionId &&
+                  event.params.parentFrameId === parent.frameTree.frame.id
+              )?.params.frameId;
+            assert.ok(childFrameId, 'the child is attached to the verified parent frame');
             const targets = await raw.send('Target.getTargets', {});
             const oopif = targets.targetInfos.find(
-              (info) => info.type === 'iframe' && info.targetId === frame.id
+              (info) => info.type === 'iframe' && info.targetId === childFrameId
             );
             if (oopif) {
               const { sessionId: child } = await raw.send('Target.attachToTarget', {
@@ -133,7 +143,7 @@ test('persistent page capabilities are denied before later documents', {
                   event.method === 'Runtime.executionContextCreated' &&
                   event.sessionId === sessionId &&
                   event.params.context.auxData?.isDefault &&
-                  event.params.context.auxData.frameId === frame.id
+                  event.params.context.auxData.frameId === childFrameId
               )?.params.context;
               assert.ok(childContext);
               assert.deepEqual(await read(raw, sessionId, childContext.id), {
