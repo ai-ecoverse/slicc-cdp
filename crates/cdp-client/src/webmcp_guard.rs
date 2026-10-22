@@ -194,6 +194,7 @@ impl Cdp {
 
     fn webmcp_verify_pause(&mut self, session: &str, paused: &Value, deadline: Instant) -> Result<(String, u64, i64), String> {
         let call = paused.pointer("/params/callFrames/0").ok_or_else(|| self.refusal())?;
+        if call.get("functionName").and_then(Value::as_str) != Some(GATE) { return Err(self.refusal()); }
         let script = call.pointer("/location/scriptId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
         let context_id = *self.webmcp.scripts.get(&(session.to_string(), script.to_string())).ok_or_else(|| self.refusal())?;
         let context = self.webmcp.contexts.get(&(session.to_string(), context_id)).cloned().ok_or_else(|| self.refusal())?;

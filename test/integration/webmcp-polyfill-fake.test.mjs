@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { kernelRunner } from './runners.mjs';
 import { webmcpBackend } from './webmcp-backend.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -268,6 +269,30 @@ await test('fake: parent policy, child policy and absent iframe delegation each 
         },
       ]
     );
+  }
+});
+
+await test('fake: WASI holder accepts EOF and removes future injection without a binding', async () => {
+  const backend = await webmcpBackend();
+  let runner;
+  try {
+    runner = await kernelRunner(
+      path.join(root, 'target/wasm32-wasip1/debug/playwright-cli.wasm'),
+      path.join(root, 'target/wasm32-wasip1/debug/curlwright.wasm'),
+      backend.url
+    );
+    const cwd = await runner.fresh();
+    const held = await runner.playwright(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, {
+      stdin: '',
+    });
+    assert.equal(held.code, 0, held.stderr);
+    const status = JSON.parse(held.stdout.trim());
+    assert.equal(status.mode, 'polyfill');
+    assert.equal(backend.scripts.size, 0);
+    assert.ok(backend.calls.every((call) => call.method !== 'Runtime.addBinding'));
+  } finally {
+    await runner?.close();
+    await backend.close();
   }
 });
 

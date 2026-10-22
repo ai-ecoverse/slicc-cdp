@@ -123,11 +123,32 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
     server = createServer(
       { key: await readFile(keyPath), cert: await readFile(certPath) },
       (req, res) => {
+        if (req.url === '/error') {
+          req.socket.destroy();
+          return;
+        }
         const policy = req.url === '/deny' ? { 'permissions-policy': 'tools=()' } : {};
         res.writeHead(200, { 'content-type': 'text/html', ...policy });
-        res.end(`<!doctype html><title>WebMCP local fixture</title><script>
+        const child = req.url === '/same' || req.url === '/cross';
+        const names = child
+          ? [req.url === '/same' ? 'same_child' : 'cross_child']
+          : [
+              'get_inbox_state',
+              'list_threads',
+              'open_thread',
+              'list_folders',
+              'search_threads',
+              'get_preferences',
+              'set_preferences',
+              'send_reply',
+            ];
+        const frames =
+          req.url === '/frames'
+            ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe><iframe src="${protectedUrl}"></iframe>`
+            : '';
+        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
 if (document.modelContext) {
-  for (const name of ['get_inbox_state','list_threads','open_thread','list_folders','search_threads','get_preferences','set_preferences','send_reply']) document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  for (const name of ${JSON.stringify(names)}) document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
 }
 </script>`);
       }
@@ -140,7 +161,8 @@ if (document.modelContext) {
       '--ignore-certificate-errors',
       '--no-proxy-server',
       '--disable-features=WebMCP,WebMCPTesting',
-      '--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1, MAP vault.sliccy.ai 127.0.0.1',
+      '--site-per-process',
+      '--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1, MAP vault.sliccy.ai 127.0.0.1, MAP foreign.test 127.0.0.1',
     ]);
     raw = await observer(browser.wsUrl);
     const { targetId } = await raw.send('Target.createTarget', {
@@ -163,8 +185,11 @@ if (document.modelContext) {
     assert.equal(status.mode, 'polyfill');
     assert.ok(status.pauseMicros.length >= 2);
     assert.equal(JSON.stringify(status).includes('__wmcp_'), false);
+    const navigationStarted = performance.now();
+    await navigate(raw, sessionId, `${ordinary}/tools`);
+    const holderNavigationMs = performance.now() - navigationStarted;
     t.diagnostic(
-      `webmcp-gate-measurement ${JSON.stringify({ baselineNavigationMs: baselineMs, pauseMicros: status.pauseMicros })}`
+      `webmcp-gate-measurement ${JSON.stringify({ baselineNavigationMs: baselineMs, holderNavigationMs, navigationOverheadMs: holderNavigationMs - baselineMs, pauseMicros: status.pauseMicros })}`
     );
     assert.deepEqual(await hasShim(raw, sessionId), { secure: true, api: true, alias: true });
     const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
@@ -191,6 +216,41 @@ if (document.modelContext) {
     const denied = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(denied.code, 0, denied.stderr);
     assert.deepEqual(JSON.parse(denied.stdout), []);
+    await navigate(raw, sessionId, `${ordinary}/frames`);
+    const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+    assert.equal(same.code, 0, same.stderr);
+    assert.equal(JSON.parse(same.stdout).length, 9);
+    const cross = await once(browser.wsUrl, cwd, [
+      'webmcp-list',
+      '--tab',
+      targetId,
+      '--json',
+      '--from-origin',
+      `https://foreign.test:${port}`,
+    ]);
+    assert.equal(cross.code, 0, cross.stderr);
+    assert.equal(JSON.parse(cross.stdout).length, 10);
+    const crossCall = await once(browser.wsUrl, cwd, [
+      'webmcp-call',
+      'cross_child',
+      '{}',
+      '--tab',
+      targetId,
+      '--from-origin',
+      `https://foreign.test:${port}`,
+    ]);
+    assert.equal(crossCall.code, 0, crossCall.stderr);
+    assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
+    const targetInfos = (await raw.send('Target.getTargets', {})).targetInfos;
+    const protectedChild = targetInfos.find(
+      (target) => target.type === 'iframe' && target.url === protectedUrl
+    );
+    assert.ok(protectedChild, 'protected OOPIF was not created');
+    const childSession = (
+      await raw.send('Target.attachToTarget', { targetId: protectedChild.targetId, flatten: true })
+    ).sessionId;
+    assert.equal((await hasShim(raw, childSession)).api, false);
+    await raw.send('Target.detachFromTarget', { sessionId: childSession });
     const restored = raw.waitEvent(
       (event) => event.method === 'Page.frameNavigated' && event.sessionId === sessionId,
       15000
@@ -205,6 +265,25 @@ if (document.modelContext) {
     holder = undefined;
     await navigate(raw, sessionId, `${ordinary}/tools`);
     assert.equal((await hasShim(raw, sessionId)).api, false);
+    for (const destination of [protectedUrl, `https://vault.sliccy.ai:${port}/error`]) {
+      holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+      assert.equal((await holder.ready).mode, 'polyfill');
+      await navigate(raw, sessionId, destination);
+      assert.equal((await hasShim(raw, sessionId)).api, false);
+      const deniedCall = await once(browser.wsUrl, cwd, [
+        'webmcp-call',
+        'get_inbox_state',
+        '{}',
+        '--tab',
+        targetId,
+      ]);
+      assert.notEqual(deniedCall.code, 0);
+      assert.equal(deniedCall.stdout, '');
+      await holder.ended;
+      holder = undefined;
+      await navigate(raw, sessionId, `${ordinary}/tools`);
+      assert.equal((await hasShim(raw, sessionId)).api, false);
+    }
   } finally {
     holder?.child.kill('SIGKILL');
     await raw?.close();
