@@ -73,6 +73,11 @@ test('the shards split exactly the files npm test runs, on the Node the package 
   assert.equal(pkg.engines.node, '>=24');
   assert.match(pkg.scripts.pretest, /cargo build --locked -p slicc-cdp -p curlwright/);
   assert.match(pkg.scripts.pretest, /--target wasm32-wasip1/);
+  assert.match(pkg.scripts.pretest, /cargo build --locked -p slicc-cdp-client --examples/);
+  assert.match(
+    pkg.scripts.pretest,
+    /--target wasm32-wasip1 -p slicc-cdp-client --example guard_bridge/
+  );
   assert.match(pkg.scripts.pretest, /npm run -s browser/);
   assert.match(pkg.scripts.browser, /install-browser --version "\$npm_package_config_chrome"/);
   assert.equal(pkg.scripts['test:integration'], undefined);

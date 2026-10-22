@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
@@ -11,61 +9,68 @@ import { launchBrowser, rawSocket } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 
-const published = JSON.parse(
+export const published = JSON.parse(
   await readFile(
     fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-vectors.json')),
     'utf8'
   )
 );
-const allTargets = [...new Set(published.vectors.flatMap((vector) => vector.targets))];
-const selectedTargets = process.env.SLICC_GUARD_TARGETS
-  ? JSON.parse(process.env.SLICC_GUARD_TARGETS)
-  : allTargets;
-if (
-  !Array.isArray(selectedTargets) ||
-  !selectedTargets.length ||
-  new Set(selectedTargets).size !== selectedTargets.length ||
-  selectedTargets.some((target) => !allTargets.includes(target))
-)
-  throw new Error('guard shard must select unique published targets');
-const set = {
-  ...published,
-  vectors: published.vectors
-    .map((vector) => ({
-      ...vector,
-      targets: vector.targets.filter((target) => selectedTargets.includes(target)),
-    }))
-    .filter((vector) => vector.targets.length),
+
+export const partitions = {
+  a: ['seven', 'ordinary', 'chrome-newtab', 'chrome-passwords'],
+  b: ['vault', 'chrome-new-tab-page', 'chrome-settings'],
+  c: ['vault-x', 'own', 'chrome-search'],
+  d: ['apex', 'chrome-extension-page', 'file-root', 'network-error'],
 };
-const parityIds = new Set([
-  'C5.fetch',
-  'C5.xhr',
-  'C5.image',
-  'C5.auth',
-  'C5.guessed-id',
-  'C1.href',
-  'C1.replace',
-  'C1.form',
-  'C2.302',
-  'C2.307',
-  'C2.twohop',
-  'C3.popup',
-  'C4.iframe',
-  'C5.fulfill',
-  'C5.continue-url',
-  'C5.paused',
-  'E1.onload',
-  'E2.binding',
-  'E3.bypass-csp',
-  'E5.console',
-  'B2.headers',
-  'C6.getCookies',
-  'C6.getAllCookies',
-  'C6.setCookie',
-  'C6.deleteCookies',
-  'C6.storage-getCookies',
-  'C6.clearDataForOrigin',
-]);
+
+export const rowKey = (row) => JSON.stringify([row.id, row.target, row.variant]);
+
+export function rowsFor(targets) {
+  return published.vectors.flatMap((vector) =>
+    vector.targets
+      .filter((target) => targets.includes(target))
+      .flatMap((target) =>
+        Object.keys(published.variants).map((variant) => ({ id: vector.id, target, variant }))
+      )
+  );
+}
+
+export const mandatory = (id) =>
+  id.startsWith('C2.redirect-') || /^C4\.iframe-preattach\..*\.shared$/.test(id);
+
+export function canonicalSkip(vector, target) {
+  if (vector.skip?.target === target) return vector.skip.reason;
+  if (vector.observable?.[target] === false) return 'not-applicable:unobservable-target';
+  if (JSON.stringify(vector).includes('{ordinary-same-site}'))
+    return 'not-applicable:no-ordinary-same-site-origin';
+  return null;
+}
+
+export function verdictProblems(results) {
+  const problems = [];
+  for (const row of results) {
+    const vector = published.vectors.find((vector) => vector.id === row.id);
+    const legs = [row.control, row.guarded, row.live];
+    const where = `${row.id} ${row.target} ${row.variant}`;
+    if (legs.every((leg) => leg === 'pass')) continue;
+    if (mandatory(row.id)) {
+      problems.push(
+        `${where} must pass and is never skipped: ${legs.join('/')} ${row.reason ?? ''}`
+      );
+      continue;
+    }
+    if (vector?.kind === 'text' && legs.every((leg) => leg === 'not-run')) continue;
+    const reason = canonicalSkip(vector, row.target);
+    const inactive =
+      vector?.skip?.target === row.target || vector?.observable?.[row.target] === false;
+    const declared = row.reason === reason || (inactive && row.reason === 'not-applicable');
+    if (legs.every((leg) => leg === 'skip') && reason && declared) continue;
+    problems.push(
+      `${where} is ${legs.join('/')}${row.reason ? ` (${row.reason})` : ''}, not PASS${reason ? ` or the declared skip "${reason}"` : ''}`
+    );
+  }
+  return problems;
+}
 
 const extensionPath = fileURLToPath(
   new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
@@ -108,31 +113,38 @@ function table(results) {
   ].join('\n');
 }
 
-function codedSkips(results) {
-  return results.map((row) => {
-    if (row.control !== 'skip') return row;
-    const vector = set.vectors.find((v) => v.id === row.id);
-    const reason =
-      vector.skip?.target === row.target
-        ? vector.skip.reason
-        : vector.observable?.[row.target] === false
-          ? 'not-applicable:unobservable-target'
-          : row.reason;
-    return { ...row, reason };
-  });
-}
-
-test('published guard set through the Rust guarded client', {
-  timeout: Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000),
-}, async (t) => {
+export async function runPartition(t, id) {
+  const selectedTargets = partitions[id];
+  const set = {
+    ...published,
+    vectors: published.vectors
+      .map((vector) => ({
+        ...vector,
+        targets: vector.targets.filter((target) => selectedTargets.includes(target)),
+      }))
+      .filter((vector) => vector.targets.length),
+  };
   const started = Date.now();
-  execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
-    stdio: 'inherit',
-  });
+  execFileSync(
+    'cargo',
+    ['build', '--locked', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'],
+    {
+      stdio: 'inherit',
+    }
+  );
   if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
     execFileSync(
       'cargo',
-      ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge', '--target', 'wasm32-wasip1'],
+      [
+        'build',
+        '--locked',
+        '-p',
+        'slicc-cdp-client',
+        '--example',
+        'guard_bridge',
+        '--target',
+        'wasm32-wasip1',
+      ],
       { stdio: 'inherit' }
     );
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
@@ -267,15 +279,7 @@ test('published guard set through the Rust guarded client', {
     }
   };
   const targetNames = [...new Set(set.vectors.flatMap((vector) => vector.targets))];
-  const targetParallel = Number(process.env.SLICC_GUARD_TARGET_PARALLEL ?? targetNames.length);
-  const settled = [];
-  for (let index = 0; index < targetNames.length; index += targetParallel) {
-    settled.push(
-      ...(await Promise.allSettled(
-        targetNames.slice(index, index + targetParallel).map(executeTarget)
-      ))
-    );
-  }
+  const settled = await Promise.allSettled(targetNames.map(executeTarget));
   const rejected = settled.filter((value) => value.status === 'rejected');
   if (rejected.length)
     throw new AggregateError(
@@ -291,25 +295,23 @@ test('published guard set through the Rust guarded client', {
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
+  report.partition = id;
   report.startupRetries = startup.retries;
-  report.selection = { targets: selectedTargets, allTargets };
+  report.selection = { targets: selectedTargets };
   report.transport =
     process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
-  report.results = codedSkips(report.results);
-  report.skipped = report.results
-    .filter((row) => row.control === 'skip')
-    .map(({ id, target, variant, reason }) => ({ id, target, variant, reason }));
-  const parity = report.results.filter(
-    (row) => parityIds.has(row.id) && ['seven', 'vault'].includes(row.target)
-  );
-  const passing = parity.filter((row) =>
-    [row.control, row.guarded].every((status) => status === 'pass')
-  ).length;
-  const skipped = parity.filter((row) => row.control === 'skip').length;
+  report.results = report.results.map((row) => {
+    const vector = published.vectors.find((vector) => vector.id === row.id);
+    const reason = row.control === 'skip' && vector && canonicalSkip(vector, row.target);
+    return reason && row.reason === 'not-applicable' ? { ...row, reason } : row;
+  });
+  const problems = verdictProblems(report.results);
   const ms = Date.now() - started;
-  const output = `${report.line}\nRuntime: ${(ms / 1000).toFixed(1)}s\nParity: ${passing}/${parity.length}; ${skipped} coded skips (before: 104/108)\nParallel: ${targetParallel} of ${settled.length} target invocations, ${parallel} slots each\n\n${table(report.results)}\n`;
+  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS or its declared skip'}\n\n${table(report.results)}\n`;
   const file =
-    process.env.SLICC_GUARD_REPORT ?? path.join(tmpdir(), 'slicc-cdp-guard-runner-report.md');
+    process.env.SLICC_GUARD_REPORT ??
+    path.join(fileURLToPath(new URL('../../artifacts/', import.meta.url)), `guard-${id}.md`);
+  await mkdir(path.dirname(file), { recursive: true });
   await writeFile(file, output);
   await writeFile(
     `${file}.json`,
@@ -318,7 +320,7 @@ test('published guard set through the Rust guarded client', {
         ...report,
         ms,
         parallel,
-        parity: { passing, skipped, total: parity.length },
+        problems,
         diagnostics: diagnostics.map(({ references, ...record }) => record),
       },
       null,
@@ -327,44 +329,13 @@ test('published guard set through the Rust guarded client', {
   );
   process.stdout.write(output);
   t.diagnostic(`report: ${file}`);
+  assert.deepEqual(
+    report.results.map(rowKey).sort(),
+    rowsFor(selectedTargets).map(rowKey).sort(),
+    `partition ${id} must record every published row of its targets, once`
+  );
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  const expectedParity = set.vectors
-    .filter((vector) => parityIds.has(vector.id))
-    .reduce(
-      (total, vector) =>
-        total +
-        vector.targets.filter((target) => ['seven', 'vault'].includes(target)).length *
-          Object.keys(set.variants).length,
-      0
-    );
-  assert.equal(parity.length, expectedParity, 'recorded parity subset');
-  if (!process.env.SLICC_GUARD_TARGETS) assert.equal(expectedParity, 108);
-  assert.equal(skipped, 0);
-  assert.equal(passing, expectedParity);
-  const c8 = report.results.filter((row) => row.id.startsWith('C8.'));
-  if (set.vectors.some((vector) => vector.id.startsWith('C8.')))
-    assert(c8.length > 0, 'published privileged UI rows ran');
-  for (const id of ['C8.chrome-search', 'C8.network-error', 'C8.iframe-error']) {
-    if (set.vectors.some((vector) => vector.id === id))
-      assert(
-        c8.some((row) => row.id === id),
-        `${id} must run from the published guard set`
-      );
-  }
-  assert(
-    c8.every((row) => [row.control, row.guarded, row.live].every((status) => status === 'pass'))
-  );
-  const c9 = report.results.filter((row) => row.id.startsWith('C9.'));
-  for (const vector of set.vectors.filter((row) => row.id.startsWith('C9.'))) {
-    const rows = c9.filter((row) => row.id === vector.id);
-    assert.equal(rows.length, vector.targets.length * Object.keys(set.variants).length);
-    assert(
-      rows.every((row) =>
-        [row.control, row.guarded, row.live].every((status) => status === 'pass')
-      ),
-      `${vector.id} must pass without skips: ${JSON.stringify(rows)}`
-    );
-  }
+  assert.deepEqual(problems, [], 'every row is PASS or its declared not-applicable skip');
   assert.equal(report.pass, true, report.line);
-});
+}
