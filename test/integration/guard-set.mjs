@@ -24,6 +24,51 @@ export const expectedBfcacheFailure477 = new Set([
 ]);
 export const expectedBfcacheFailureReason = 'slicc-cdp#477';
 
+export function containsMarkerToken(value, marker) {
+  const pattern = new RegExp(
+    `(^|[^A-Za-z0-9_-])${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[^A-Za-z0-9_-])`
+  );
+  const seen = new Set();
+  const objects = new Set();
+  const visit = (item, depth = 0) => {
+    if (item && typeof item === 'object') {
+      if (objects.has(item)) return false;
+      objects.add(item);
+      return Object.values(item).some((field) => visit(field, depth));
+    }
+    if (typeof item !== 'string') return false;
+    let logical = item;
+    for (let pass = 0; pass < 8; pass++) {
+      const decoded = logical.replace(/%([0-9a-f]{2})|\\u([0-9a-f]{4})/gi, (_, percent, unicode) =>
+        String.fromCharCode(parseInt(percent ?? unicode, 16))
+      );
+      if (decoded === logical) break;
+      logical = decoded;
+    }
+    if (pattern.test(logical)) return true;
+    const key = `${depth}:${item}`;
+    if (depth >= 8 || seen.has(key)) return false;
+    seen.add(key);
+    const decoded = [];
+    try {
+      decoded.push(decodeURIComponent(item));
+    } catch {}
+    try {
+      decoded.push(JSON.parse(item));
+    } catch {}
+    try {
+      decoded.push(JSON.parse(`"${item}"`));
+    } catch {}
+    for (const [chunk] of item.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g)) {
+      const normalized = chunk.replaceAll('-', '+').replaceAll('_', '/').replace(/=+$/, '');
+      for (let offset = 0; offset < 4; offset++)
+        decoded.push(Buffer.from(normalized.slice(offset), 'base64').toString('utf8'));
+    }
+    return decoded.some((candidate) => candidate !== item && visit(candidate, depth + 1));
+  };
+  return visit(value);
+}
+
 export function bfcachePrivacy(row, messages) {
   const url = row.evidence?.guarded?.restore?.seed?.protectedURL;
   if (typeof url !== 'string' || !Array.isArray(messages) || !messages.length)
@@ -38,10 +83,20 @@ export function bfcachePrivacy(row, messages) {
   if (!tag) return { measured: false };
   return {
     measured: true,
-    markerExposed: containsSecret(messages, `bfcache-marker-${tag}`),
+    markerExposed: containsMarkerToken(messages, `bfcache-marker-${tag}`),
+    ordinaryBMarkerObserved: containsMarkerToken(messages, `bfcache-marker-${tag}-b`),
+    upstreamMarkerSubstring: containsSecret(messages, `bfcache-marker-${tag}`),
+    markerIdentity: 'whole-token',
+    auditDifference:
+      !containsMarkerToken(messages, `bfcache-marker-${tag}`) &&
+      containsSecret(messages, `bfcache-marker-${tag}`) &&
+      containsMarkerToken(messages, `bfcache-marker-${tag}-b`)
+        ? 'upstream substring matches the public ordinary-B marker; no whole P marker token delivered'
+        : null,
     protectedPathExposed:
       containsSecret(messages, `${parsed.origin}${parsed.pathname}`) ||
-      containsSecret(messages, `${parsed.host}${parsed.pathname}`),
+      containsSecret(messages, `${parsed.host}${parsed.pathname}`) ||
+      containsMarkerToken(messages, `${parsed.pathname}${parsed.search}`),
   };
 }
 
@@ -49,7 +104,7 @@ export function bfcacheScreenshotExposed(row) {
   return (
     row.evidence?.guarded?.restore?.probes?.some(
       (probe) =>
-        probe.protectedCurrent &&
+        probe.protectedCurrent !== false &&
         probe.method === 'Page.captureScreenshot' &&
         probe.reply?.ok &&
         probe.reply?.result?.data
@@ -57,7 +112,116 @@ export function bfcacheScreenshotExposed(row) {
   );
 }
 
+export function historyRepliesProvenOrdinaryB(restore) {
+  const url = restore?.seed?.ordinaryAnswer?.result?.frameTree?.frame?.url;
+  const protectedURL = restore?.seed?.protectedURL;
+  if (typeof url !== 'string' || typeof protectedURL !== 'string') return false;
+  let ordinary;
+  let protectedPage;
+  try {
+    ordinary = new URL(url);
+    protectedPage = new URL(protectedURL);
+  } catch {
+    return false;
+  }
+  const tag = protectedPage.searchParams.get('n');
+  if (
+    !tag ||
+    ordinary.origin === protectedPage.origin ||
+    ordinary.pathname !== '/bfcache' ||
+    ordinary.searchParams.get('n') !== `${tag}-b`
+  )
+    return false;
+  const marker = `bfcache-marker-${tag}-b`;
+  const isB = (state) =>
+    state?.origin === ordinary.origin &&
+    state.marker === marker &&
+    state.stored === marker &&
+    state.persisted === false;
+  if (!isB(restore.beforeRelease) || !isB(restore.sideEffect)) return false;
+  if (
+    !Array.isArray(restore.probes) ||
+    !restore.probes.length ||
+    restore.probes.some((probe) => probe.protectedCurrent !== false)
+  )
+    return false;
+  const answered = restore.probes.filter((probe) => probe.outcome === 'answered');
+  const required = [
+    'Runtime.evaluate',
+    'Runtime.callFunctionOn',
+    'DOM.getDocument',
+    'Accessibility.getFullAXTree',
+    'Page.captureScreenshot',
+  ];
+  if (required.some((method) => !answered.some((probe) => probe.method === method))) return false;
+  return answered.every((probe) => {
+    if (!probe.reply?.ok) return false;
+    const result = probe.reply.result;
+    if (probe.method === 'Page.captureScreenshot')
+      return (
+        typeof result?.data === 'string' &&
+        result.data.length > 0 &&
+        restore.screenshotProof?.url === url &&
+        restore.screenshotProof.reply?.ok === true &&
+        result.data === restore.screenshotProof.reply.result?.data
+      );
+    if (probe.method === 'DOM.getDocument') return result?.root?.documentURL === url;
+    if (probe.method === 'Accessibility.getFullAXTree')
+      return (
+        Array.isArray(result?.nodes) && result.nodes.some((node) => node.name?.value === marker)
+      );
+    if (['Runtime.evaluate', 'Runtime.callFunctionOn'].includes(probe.method)) {
+      let state;
+      try {
+        state = JSON.parse(result?.result?.value);
+      } catch {
+        return false;
+      }
+      return state?.origin === ordinary.origin && state.marker === marker;
+    }
+    return probe.method === 'Input.dispatchKeyEvent';
+  });
+}
+
+export function isExpectedBfcacheHistoryFailure477(row) {
+  const restore = row.evidence?.guarded?.restore;
+  const observation = row.observations?.guarded;
+  const audit = row.guardedPrivacy;
+  return (
+    row.id === 'C8.protected-bfcache-restore.history' &&
+    ['seven', 'vault'].includes(row.target) &&
+    ['prompt', 'lagging'].includes(row.variant) &&
+    row.control === 'pass' &&
+    row.guarded === 'fail' &&
+    row.live === 'pass' &&
+    observation?.markerHidden === false &&
+    observation.originHidden === true &&
+    observation.restoredObserved === 'incomplete' &&
+    observation.sideEffectAbsent === 'incomplete' &&
+    observation.probesRefusedOrUnforwarded === false &&
+    observation.sessionLive === true &&
+    restore?.trigger?.ok === false &&
+    restore.trigger.error?.message === 'no answer' &&
+    restore.delay?.acknowledged === true &&
+    restore.delay.seeding?.protectedObserved === true &&
+    restore.delay.seeding?.ordinaryObserved === true &&
+    restore.delay.release?.ok === true &&
+    restore.delay.release.result?.delayedEvents === 0 &&
+    restore.restoreAt === undefined &&
+    audit?.measured === true &&
+    audit.markerIdentity === 'whole-token' &&
+    audit.markerExposed === false &&
+    audit.protectedPathExposed === false &&
+    audit.upstreamMarkerSubstring === true &&
+    audit.ordinaryBMarkerObserved === true &&
+    typeof audit.auditDifference === 'string' &&
+    audit.auditDifference.length > 0 &&
+    historyRepliesProvenOrdinaryB(restore)
+  );
+}
+
 export function isExpectedBfcacheFailure477(row) {
+  if (isExpectedBfcacheHistoryFailure477(row)) return true;
   const observation = row.observations?.guarded;
   const audit = row.guardedPrivacy;
   return (
@@ -75,6 +239,22 @@ export function isExpectedBfcacheFailure477(row) {
     (observation.sideEffectAbsent === false || observation.probesRefusedOrUnforwarded === false) &&
     !bfcacheScreenshotExposed(row)
   );
+}
+
+export function expectedFailureDispositions(results) {
+  return results.filter(isExpectedBfcacheFailure477).map((row) => ({
+    id: row.id,
+    target: row.target,
+    variant: row.variant,
+    reason: expectedBfcacheFailureReason,
+    ...(isExpectedBfcacheHistoryFailure477(row)
+      ? {
+          class: 'history-no-answer-ordinary-B',
+          auditDifference: row.guardedPrivacy.auditDifference,
+          deletionHook: 'slicc-cdp#478 or fixed slicc-browsers vectors',
+        }
+      : {}),
+  }));
 }
 
 export const published = JSON.parse(
@@ -134,6 +314,24 @@ export function canonicalSkip(vector, target) {
   return probe.forged.length === 0 ? reason : null;
 }
 
+export function validApplicabilitySkip(vector, row) {
+  if (!vector || typeof row.reason !== 'string' || !row.reason.startsWith('not-applicable'))
+    return false;
+  const set = {
+    ...published,
+    variants: { [row.variant]: published.variants[row.variant] },
+    vectors: [{ ...vector, targets: [row.target] }],
+  };
+  return (
+    summary({
+      set,
+      results: [{ ...row, transport: 'cdp', control: 'skip', guarded: 'skip', live: 'skip' }],
+      guard: 'slicc-cdp',
+      sha: 'applicability-reason-check',
+    }).forged.length === 0
+  );
+}
+
 export function verdictProblems(results) {
   const problems = [];
   for (const row of results) {
@@ -145,7 +343,8 @@ export function verdictProblems(results) {
       (row.guardedPrivacy?.measured !== true ||
         row.guardedPrivacy.markerExposed !== false ||
         row.guardedPrivacy.protectedPathExposed !== false ||
-        row.observations?.guarded?.markerHidden === false ||
+        (row.observations?.guarded?.markerHidden === false &&
+          !isExpectedBfcacheHistoryFailure477(row)) ||
         row.observations?.guarded?.originHidden === false ||
         bfcacheScreenshotExposed(row))
     ) {
@@ -168,7 +367,7 @@ export function verdictProblems(results) {
     }
     if (vector?.kind === 'text' && legs.every((leg) => leg === 'not-run')) continue;
     const reason = canonicalSkip(vector, row.target);
-    const declared = typeof row.reason === 'string' && row.reason === reason;
+    const declared = validApplicabilitySkip(vector, row);
     if (legs.every((leg) => leg === 'skip') && reason && declared) continue;
     problems.push(
       `${where} is ${legs.join('/')}${row.reason ? ` (${row.reason})` : ''}, not PASS${reason ? ` or the declared skip "${reason}"` : ''}`
@@ -571,14 +770,7 @@ export async function runPartition(t, id) {
   report.selection = { targets: selectedTargets };
   report.transport =
     process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
-  report.expectedFailures = report.results
-    .filter(isExpectedBfcacheFailure477)
-    .map(({ id, target, variant }) => ({
-      id,
-      target,
-      variant,
-      reason: expectedBfcacheFailureReason,
-    }));
+  report.expectedFailures = expectedFailureDispositions(report.results);
   const problems = verdictProblems(report.results);
   const ms = Date.now() - started;
   const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS or its declared skip'}\n\n${table(report.results)}\n`;

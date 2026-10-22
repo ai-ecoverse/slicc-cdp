@@ -451,7 +451,7 @@ impl Cdp {
                 }
             }
         }
-        if matches!(method, "Fetch.continueRequest" | "Network.continueInterceptedRequest") && params.get("url").and_then(Value::as_str).is_some_and(|url| self.resource_protected(session_id.unwrap_or(""), url)) {
+        if matches!(method, "Fetch.continueRequest" | "Network.continueInterceptedRequest") && params.get("url").and_then(Value::as_str).is_some_and(|url| self.redirector_protected(url)) {
             return Err(self.refusal());
         }
         if shield::interception_method(method) {
@@ -1350,9 +1350,14 @@ impl Cdp {
         }
     }
 
-    fn resource_protected(&self, session: &str, url: &str) -> bool {
+    fn redirector_protected(&self, url: &str) -> bool {
         let Some(key) = self.guard.resource_key(url) else { return true };
         self.guard.url(url) || self.protected_resources.iter().any(|(_, resource)| resource == &key)
+    }
+
+    fn resource_protected(&self, session: &str, url: &str) -> bool {
+        let Some(key) = self.guard.resource_key(url) else { return true };
+        self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), key.clone()))
             || self.session_target(session).is_some_and(|target| self.protected_target_resources.contains(&(target, key)))
     }
 
@@ -2469,6 +2474,7 @@ mod tests {
     include!("redirect_c2_carrier_test.rs");
     include!("redirect_grok_test.rs");
     include!("redirect_target_taint_test.rs");
+    include!("redirect_resource_control_test.rs");
     include!("navigation_queue_test.rs");
     include!("redirect_fragment_test.rs");
     include!("redirect_review_test.rs");
