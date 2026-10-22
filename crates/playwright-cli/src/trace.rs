@@ -11,6 +11,7 @@ pub struct ConsoleEntry {
     pub url: String,
     pub line: u64,
     pub stamp: String,
+    pub cookie_value: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub struct NetRequest {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub response_base64: bool,
+    pub cookie_scopes: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -104,9 +106,26 @@ fn tolerate(cdp: &mut Cdp, method: &str, session: &str) -> Result<(), String> {
 }
 
 pub fn absorb(cdp: &mut Cdp, session: &str) -> Result<(Vec<ConsoleEntry>, Vec<NetRequest>), String> {
+    if cdp.content_blocked(session) { return Ok((Vec::new(), Vec::new())); }
     flush(cdp, session)?;
+    if cdp.content_blocked(session) { return Err(format!("{}\n", cdp.guard().refusal())); }
+    let jar = cdp.call("Network.getAllCookies", json!({}), Some(session))?;
     let events = cdp.events().to_vec();
-    let (console, mut raws) = from_events(&events, session);
+    let (mut console, mut raws) = from_events(&events, session);
+    let mut cookies = jar.get("cookies").and_then(Value::as_array).cloned().unwrap_or_default();
+    for event in &events {
+        if let Some(associated) = event.pointer("/params/associatedCookies").and_then(Value::as_array) {
+            cookies.extend(associated.iter().filter_map(|item| item.get("cookie").cloned()));
+        }
+    }
+    let scope_jar = json!({ "cookies": cookies });
+    for entry in &mut console {
+        entry.cookie_value = cookies.iter().filter_map(|cookie| cookie.get("value").and_then(Value::as_str))
+            .any(|value| !value.is_empty() && entry.text.contains(value));
+    }
+    for raw in &mut raws {
+        raw.item.cookie_scopes = crate::cookie_headers::scopes(&raw.item, &scope_jar);
+    }
     fetch_bodies(cdp, session, &mut raws)?;
     let requests = raws.into_iter().map(|raw| raw.item).collect();
     Ok((console, requests))
@@ -262,6 +281,7 @@ fn console_from(params: &Value) -> Option<ConsoleEntry> {
         url,
         line,
         stamp: timestamp_text(params.get("timestamp")),
+        cookie_value: false,
     })
 }
 
@@ -359,6 +379,7 @@ fn on_request(raws: &mut Vec<RawRequest>, params: &Value) {
             request_body: post,
             response_body: None,
             response_base64: false,
+            cookie_scopes: Vec::new(),
         },
     });
 }
@@ -916,6 +937,7 @@ pub fn console_from_json(value: &Value) -> Option<ConsoleEntry> {
         url: value.get("url").and_then(|item| item.as_str()).unwrap_or("").to_string(),
         line: value.get("line").and_then(|item| item.as_u64()).unwrap_or(0),
         stamp: timestamp_text(value.get("stamp")),
+        cookie_value: false,
     })
 }
 
@@ -933,6 +955,7 @@ pub fn request_json(request: &NetRequest) -> Value {
         "requestBody": request.request_body,
         "responseBody": request.response_body,
         "responseBase64": request.response_base64,
+        "cookieScopes": crate::cookie_headers::saved_scopes(&request.cookie_scopes),
     })
 }
 
@@ -974,6 +997,7 @@ pub fn request_from_json(value: &Value) -> Option<NetRequest> {
             .to_string(),
         request_headers: pairs_from(value.get("requestHeaders")),
         response_headers: pairs_from(value.get("responseHeaders")),
+        cookie_scopes: crate::cookie_headers::saved_scopes(value.get("cookieScopes").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()),
         request_body: value
             .get("requestBody")
             .and_then(|item| item.as_str())
@@ -1286,6 +1310,7 @@ mod tests {
             mime: String::new(),
             request_headers: Vec::new(),
             response_headers: Vec::new(),
+            cookie_scopes: Vec::new(),
             request_body: None,
             response_body: None,
             response_base64: false,
@@ -1303,6 +1328,7 @@ mod tests {
             url: "http://example.com/\x07bell".to_string(),
             line: 1,
             stamp: String::new(),
+            cookie_value: false,
         }];
         let text = render_console(&entries, "info").unwrap();
         assert!(!text.contains('\x1b'), "{text}");
@@ -1322,6 +1348,7 @@ mod tests {
             mime: String::new(),
             request_headers: Vec::new(),
             response_headers: Vec::new(),
+            cookie_scopes: Vec::new(),
             request_body: None,
             response_body: None,
             response_base64: false,
@@ -1343,6 +1370,7 @@ mod tests {
             mime: String::new(),
             request_headers: vec![("X-Evil".to_string(), "\x1b[2Jvalue".to_string())],
             response_headers: Vec::new(),
+            cookie_scopes: Vec::new(),
             request_body: None,
             response_body: None,
             response_base64: false,

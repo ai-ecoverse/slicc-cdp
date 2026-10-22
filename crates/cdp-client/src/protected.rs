@@ -174,6 +174,25 @@ impl Protected {
             .any(|host| under(host, &domain))
     }
 
+    pub fn cookie_scope(&self, domain: &str) -> bool {
+        canonical_cookie_domain(domain).is_none_or(|host| self.cookie_domain(&host))
+    }
+
+    pub fn cookie_url(&self, text: &str) -> bool {
+        let Some(url) = self.unwrap(parse(text)) else {
+            return true;
+        };
+        let host = host_of(&url);
+        if host.is_empty() || self.url(text) {
+            return true;
+        }
+        if !matches!(url.host(), Some(url::Host::Domain(_))) {
+            return self.cookie_domain(&host);
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        (0..labels.len()).any(|at| self.cookie_scope(&labels[at..].join(".")))
+    }
+
     pub fn storage_key(&self, key: &str) -> bool {
         let mut parts = key.split('^');
         let first = parts.next().unwrap_or("");
@@ -351,6 +370,23 @@ fn host_glob(glob: &[u8], text: &[u8]) -> bool {
         },
         literal => text.first() == Some(&literal) && host_glob(rest, &text[1..]),
     }
+}
+
+pub fn canonical_cookie_domain(domain: &str) -> Option<String> {
+    if domain.is_empty() || domain.chars().any(|ch| ch.is_whitespace() || matches!(ch, '/' | '\\' | '@' | '?' | '#')) {
+        return None;
+    }
+    let normalized = domain.replace(['。', '．', '｡'], ".");
+    let normalized = normalized.trim_start_matches('.');
+    let url = parse(&format!("http://{normalized}/"))?;
+    let host = host_of(&url).trim_matches('.').to_string();
+    if matches!(url.host(), Some(url::Host::Domain(_))) && host.split('.').any(|label| {
+        label.is_empty() || label.starts_with('-') || label.ends_with('-')
+            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return None;
+    }
+    Some(host)
 }
 
 fn parse(text: &str) -> Option<Url> {

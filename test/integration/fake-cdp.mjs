@@ -67,11 +67,23 @@ const tree = {
   ],
 };
 
+function cookieDomain(domain) {
+  return domain.startsWith('.') ? domain : `.${domain}`;
+}
+
+function sameCookie(a, b) {
+  return a.name === b.name && a.domain === b.domain && a.path === b.path;
+}
+
 export async function fakeCdp({
   refuse = [],
   refuseWhen,
   refusalMessage,
   noisyRefusal = false,
+  cookies = [],
+  traffic = [],
+  consoleLines = [],
+  answers = {},
   attachEvents = false,
   discoverEvents = false,
   pauseNavigation = false,
@@ -79,6 +91,8 @@ export async function fakeCdp({
   const calls = [];
   const navigationPauses = new Map();
   const fetchSessions = new Set();
+  const jar = cookies.map((cookie) => ({ ...cookie }));
+  let requests = 0;
   const targets = [];
   const sessions = new Map();
   const sessionSends = new Map();
@@ -127,6 +141,17 @@ export async function fakeCdp({
       const answer = (result) => send({ id, result, ...(sessionId ? { sessionId } : {}) });
       const event = (name, eventParams) =>
         send({ method: name, params: eventParams, ...(sessionId ? { sessionId } : {}) });
+      const emitConsole = (url) => {
+        for (const [index, entry] of consoleLines.entries()) {
+          event('Runtime.consoleAPICalled', {
+            type: 'log',
+            executionContextId: 1,
+            timestamp: index + 1,
+            args: [{ type: 'string', value: entry.text }],
+            stackTrace: { callFrames: [{ url: entry.url ?? url, lineNumber: 0 }] },
+          });
+        }
+      };
       const target = sessionId ? sessions.get(sessionId) : undefined;
       if (method === 'Slicc.action') clearInterval(noise);
       if (refuse.includes(method) || refuseWhen?.(message, calls)) {
@@ -150,6 +175,7 @@ export async function fakeCdp({
         }
         return;
       }
+      if (answers[method]) return answer(answers[method]);
       switch (method) {
         case 'Target.setDiscoverTargets':
           answer({});
@@ -256,6 +282,46 @@ export async function fakeCdp({
                   sessionId: peer,
                 });
             event('Page.frameNavigated', committed);
+            emitConsole(params.url);
+            for (const item of traffic) {
+              requests += 1;
+              const requestId = `R${requests}`;
+              event('Network.requestWillBeSent', {
+                requestId,
+                loaderId: `L${next}`,
+                documentURL: params.url,
+                request: { url: item.url, method: 'GET', headers: {} },
+                timestamp: 1,
+                wallTime: 1,
+                initiator: { type: 'other' },
+                type: 'Fetch',
+              });
+              event('Network.requestWillBeSentExtraInfo', {
+                requestId,
+                associatedCookies: item.associatedCookies ?? [],
+                headers: item.requestHeaders,
+              });
+              event('Network.responseReceived', {
+                requestId,
+                loaderId: `L${next}`,
+                timestamp: 1,
+                type: 'Fetch',
+                response: {
+                  url: item.url,
+                  status: 200,
+                  statusText: 'OK',
+                  headers: { 'content-type': 'text/plain' },
+                  mimeType: 'text/plain',
+                },
+              });
+              event('Network.responseReceivedExtraInfo', {
+                requestId,
+                blockedCookies: [],
+                statusCode: 200,
+                headers: item.responseHeaders,
+              });
+              event('Network.loadingFinished', { requestId, timestamp: 1, encodedDataLength: 0 });
+            }
             event('Page.domContentEventFired', { timestamp: 1 });
             event('Page.loadEventFired', { timestamp: 1 });
           };
@@ -271,6 +337,47 @@ export async function fakeCdp({
             });
           } else complete();
           return;
+        }
+        case 'Runtime.enable':
+          answer({});
+          if (target?.url && target.url !== 'about:blank') emitConsole(target.url);
+          return;
+        case 'Network.getAllCookies':
+          return answer({ cookies: jar.map((cookie) => ({ ...cookie })) });
+        case 'Network.setCookie': {
+          const cookie = {
+            name: params.name,
+            value: params.value,
+            domain: cookieDomain(params.domain),
+            path: params.path ?? '/',
+            expires: params.expires ?? -1,
+            size: params.name.length + params.value.length,
+            httpOnly: params.httpOnly ?? false,
+            secure: params.secure ?? false,
+            session: params.expires === undefined,
+            ...(params.sameSite ? { sameSite: params.sameSite } : {}),
+            priority: 'Medium',
+            sameParty: false,
+            sourceScheme: 'Secure',
+            sourcePort: 443,
+          };
+          const index = jar.findIndex((item) => sameCookie(item, cookie));
+          if (index >= 0) jar.splice(index, 1, cookie);
+          else jar.push(cookie);
+          return answer({ success: true });
+        }
+        case 'Network.deleteCookies': {
+          for (let index = jar.length - 1; index >= 0; index -= 1) {
+            const item = jar[index];
+            if (
+              item.name === params.name &&
+              item.domain === params.domain &&
+              (!params.path || item.path === params.path) &&
+              JSON.stringify(item.partitionKey) === JSON.stringify(params.partitionKey)
+            )
+              jar.splice(index, 1);
+          }
+          return answer({});
         }
         case 'Page.createIsolatedWorld':
           return answer({ executionContextId: 7 });
@@ -315,6 +422,7 @@ export async function fakeCdp({
   return {
     url: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`,
     calls,
+    jar,
     targets,
     close: async () => {
       for (const socket of sockets) socket.destroy();
