@@ -3,10 +3,11 @@ import { execFileSync } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test, { before } from 'node:test';
+import { before } from 'node:test';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import {
   recordedClient,
   redirectIds,

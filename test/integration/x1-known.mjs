@@ -66,10 +66,12 @@ function scalarClasses(text, tags) {
     spans.push([start, end]);
   }
   for (const match of text.matchAll(
-    /\b(?:[a-z0-9-]+\.)*sliccy\.ai(?::\d+)?(?:\/[^\s"'<>)\]}]*|[?#][^\s"'<>)\]}]*)/gi
+    /\b(?:[a-z0-9-]+\.)+[a-z0-9-]+(?::\d+)?(?:\/[^\s"'<>)\]}]*|[?#][^\s"'<>)\]}]*)/gi
   )) {
-    if (!spans.some(([start, end]) => match.index >= start && match.index < end))
+    if (!spans.some(([start, end]) => match.index >= start && match.index < end)) {
       inspect(`http://${match[0]}`);
+      spans.push([match.index, match.index + match[0].length]);
+    }
   }
   const outside = text
     .split('')

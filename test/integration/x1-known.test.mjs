@@ -275,6 +275,40 @@ test('origin-only references in any field are public but protected URL component
   );
 });
 
+test('ordinary scheme-less auto-titles are parsed in their own realm without exempting private titles', () => {
+  const { actors, row } = evidence();
+  const message = JSON.parse(actors[1].messages[1]);
+  actors[1].messages.push(
+    JSON.stringify({
+      method: 'Target.targetInfoChanged',
+      params: { targetInfo: { title: 'plain.guard.test:18100/doc?n=exit-public-1' } },
+    })
+  );
+  actors[1].messages.push(
+    JSON.stringify({
+      method: 'Target.targetInfoChanged',
+      params: {
+        targetInfo: { title: `plain.guard.test:18100/page?tag=public-1&to=${protectedOrigin}` },
+      },
+    })
+  );
+  row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+  assert.equal(isExpectedX1Failure150(row), true);
+  for (const title of [
+    'seven.sliccy.ai:18100/canary/public-1',
+    'public-1',
+    'canary-marker seven.sliccy.ai:18100',
+  ]) {
+    const bad = evidence();
+    bad.actors[1].messages.push(
+      JSON.stringify({ method: 'Target.targetInfoChanged', params: { targetInfo: { title } } })
+    );
+    bad.row.x1Privacy = x1Privacy(bad.actors, { ordinary, protectedOrigin });
+    assert.equal(isExpectedX1Failure150(bad.row), false);
+  }
+  assert.equal(message.method, 'Fetch.requestPaused');
+});
+
 test('private URL audit decodes nested carriers and case variants', () => {
   for (const encode of [
     (s) => s,

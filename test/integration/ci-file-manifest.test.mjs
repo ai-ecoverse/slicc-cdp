@@ -19,7 +19,19 @@ test('the pipeline test-glob owns every guard partition, union and redirect file
     /uses: ai-ecoverse\/slicc-shared-web\/\.github\/workflows\/pipeline\.yml@/
   );
   assert.match(workflow, /test-glob: test\/integration\/\*\.test\.mjs/);
-  assert.ok(packageJson.scripts.test.includes('test/integration/*.test.mjs'));
+  assert.match(packageJson.scripts.test, /node scripts\/test-integration\.mjs$/);
+  const entry = await readFile(path.join(root, 'scripts/test-integration.mjs'), 'utf8');
+  assert.match(
+    entry,
+    /const files = \['test\/integration\/\*\.test\.mjs', \.\.\.process\.argv\.slice\(2\)\]/
+  );
+  assert.match(entry, /prepareChromeReport\(process\.env,/);
+  assert.match(entry, /spawnSync\(process\.execPath, \[\.\.\.testArguments, \.\.\.files\]/);
+  const argumentsSource = await readFile(
+    path.join(root, 'test/integration/test-arguments.mjs'),
+    'utf8'
+  );
+  assert.ok(argumentsSource.includes("'--test-concurrency=1'"));
   for (const file of [
     'guard-a.test.mjs',
     'guard-b.test.mjs',
