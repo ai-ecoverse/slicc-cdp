@@ -8,8 +8,12 @@ export async function inboundClients(
   origin,
   { variant, detachDelay, protectedOrigin, ordinaryOrigin }
 ) {
-  const guardedGate = new InboundGate({ protectedOrigin, ordinaryOrigin });
   const controlGate = new InboundGate({ protectedOrigin, ordinaryOrigin });
+  const guardedGate = new InboundGate({
+    protectedOrigin,
+    ordinaryOrigin,
+    seedSource: (targetId) => controlGate.observedSeed(targetId),
+  });
   const guardedProxy = await cdpProxy(wsUrl, { inbound: guardedGate });
   let controlProxy;
   let client;

@@ -5,17 +5,23 @@ import { InboundGate } from './inbound-gate.mjs';
 for (const side of ['guarded', 'control']) {
   test(`deterministic ${side} BFCache gate holds restore traffic until explicit release`, async () => {
     let clock = 1000;
-    const gate = new InboundGate({
+    const options = {
       protectedOrigin: 'https://private.test',
       ordinaryOrigin: 'https://public.test',
       now: () => clock,
       wait: async (ms) => {
         clock += ms;
       },
-    });
-    gate.outbound({ id: 7, method: 'Target.attachToTarget', params: { targetId: 'PAGE' } });
-    gate.inbound({ id: 7, result: { sessionId: 'SUBJECT' } }, () => {});
-    gate.inbound(
+    };
+    const observerGate = new InboundGate(options);
+    const gate =
+      side === 'control'
+        ? observerGate
+        : new InboundGate({
+            ...options,
+            seedSource: (targetId) => observerGate.observedSeed(targetId),
+          });
+    observerGate.inbound(
       {
         method: 'Target.attachedToTarget',
         params: { sessionId: 'READER', targetInfo: { targetId: 'PAGE' } },
@@ -26,10 +32,12 @@ for (const side of ['guarded', 'control']) {
       'https://private.test/bfcache?n=gate-proof',
       'https://public.test/bfcache?n=gate-proof-b',
     ])
-      gate.inbound(
-        { method: 'Page.frameNavigated', sessionId: 'SUBJECT', params: { frame: { url } } },
+      observerGate.inbound(
+        { method: 'Page.frameNavigated', sessionId: 'READER', params: { frame: { url } } },
         () => {}
       );
+    gate.outbound({ id: 7, method: 'Target.attachToTarget', params: { targetId: 'PAGE' } });
+    gate.inbound({ id: 7, result: { sessionId: 'SUBJECT' } }, () => {});
     const hook = gate.arm({ targetId: 'PAGE', sessionId: 'SUBJECT', ms: 1500, side, gate: true });
     assert.equal(hook.protectedObserved, true);
     assert.equal(hook.ordinaryObserved, true);

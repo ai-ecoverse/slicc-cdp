@@ -1,11 +1,12 @@
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class InboundGate {
-  constructor({ protectedOrigin, ordinaryOrigin, now = Date.now, wait = sleep }) {
+  constructor({ protectedOrigin, ordinaryOrigin, now = Date.now, wait = sleep, seedSource }) {
     this.protectedOrigin = new URL(protectedOrigin).origin;
     this.ordinaryOrigin = new URL(ordinaryOrigin).origin;
     this.now = now;
     this.wait = wait;
+    this.seedSource = seedSource;
     this.requests = new Map();
     this.sessions = new Map();
     this.seeds = new Map();
@@ -74,6 +75,11 @@ export class InboundGate {
     this.record(message);
   }
 
+  observedSeed(targetId) {
+    const seed = this.seeds.get(targetId);
+    return seed ? Object.freeze({ ...seed }) : undefined;
+  }
+
   arm({ targetId, sessionId, ms, side, gate }) {
     if (this.closed || this.active) throw new Error('inbound gate unavailable');
     if (
@@ -85,7 +91,7 @@ export class InboundGate {
       throw new Error('inbound gate requires an explicit 1500ms minimum hold');
     if (this.sessions.get(sessionId) !== targetId)
       throw new Error('inbound gate session target mismatch');
-    const seed = this.seeds.get(targetId);
+    const seed = this.seedSource ? this.seedSource(targetId) : this.observedSeed(targetId);
     const active = {
       targetId,
       sessionId,
