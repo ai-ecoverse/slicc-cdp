@@ -384,6 +384,9 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
+        if shield::persistent_capability(method) {
+            return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
+        }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
         {
@@ -2144,7 +2147,13 @@ impl Cdp {
                 self.protected_request_pages.insert((paused.session_id.clone(), paused.request_id.clone()));
                 if let Some(network) = &paused.network_id { self.protected_request_pages.insert((paused.session_id.clone(), network.clone())); }
             }
+            #[cfg(test)]
+            let observed_url = paused.url.clone();
+            let ordinary_url = (!redirect && !loaded_protected && !initiated && !self.guard_sessions.contains(&paused.session_id) && !self.redirect_page_protected(&value)
+                && !self.protected_body_requests.contains(&paused.request_id)
+                && self.ordinary_redirect_url(&paused.url)).then(|| paused.url.clone());
             shield::redact_strings(&self.guard, &mut value);
+            if let Some(url) = ordinary_url { value["params"]["request"]["url"] = json!(url); }
             paused = Paused::from_event(&value).unwrap();
             self.requests.insert(paused.request_id.clone(), loaded_protected || initiated);
             if let Some(network) = &paused.network_id {
@@ -2167,7 +2176,7 @@ impl Cdp {
                     "queued"
                 };
                 self.paused_trail
-                    .push((paused.session_id.clone(), paused.url.clone(), reason));
+                    .push((paused.session_id.clone(), observed_url, reason));
             }
             if self.guard_sessions.contains(&paused.session_id) {
                 if reaches && paused.resource_type == "Document" {
@@ -2631,6 +2640,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
+    include!("persistent_test.rs");
     include!("redirect_test.rs");
     include!("redirect_matrix_test.rs");
     include!("redirect_race_test.rs");
@@ -2640,6 +2650,7 @@ mod tests {
     include!("redirect_grok_test.rs");
     include!("redirect_scope_review_test.rs");
     include!("ordinary_network_review_test.rs");
+    include!("pause_metadata_recovery_test.rs");
     include!("redirect_target_taint_test.rs");
     include!("redirect_resource_control_test.rs");
     include!("navigation_queue_test.rs");
