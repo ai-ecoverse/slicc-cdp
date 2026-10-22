@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -39,8 +39,8 @@ export async function waitExit(exited, timeoutMs = cleanupGrace()) {
 
 export async function launchBrowser(extraArgs = [], options = {}) {
   options.signal?.throwIfAborted();
-  let port = options.port ?? (await freePort());
-  while (port >= 9222 && port <= 9229) port = await freePort();
+  let port = options.port ?? 0;
+  if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let chromeLog = '';
   const child = spawn(
@@ -102,9 +102,17 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   options.signal?.addEventListener('abort', abort, { once: true });
   try {
     options.signal?.throwIfAborted();
+    const status = () => chromeStatus(child, chromeLog);
+    if (!port)
+      port = await activePort(
+        userDataDir,
+        status,
+        options.signal,
+        options.deadlineAt ?? workerDeadline
+      );
     const version = await waitVersion(
       port,
-      () => chromeStatus(child, chromeLog),
+      status,
       options.signal,
       options.deadlineAt ?? workerDeadline
     );
@@ -139,6 +147,26 @@ function chromeStatus(child, log) {
     return `chromium exited ${how}${tail ? `\n${tail}` : ''}`;
   }
   return tail;
+}
+
+async function activePort(userDataDir, status, signal, deadlineAt) {
+  const deadline = deadlineAt;
+  while (Date.now() < deadline) {
+    signal?.throwIfAborted();
+    const early = status();
+    if (early.startsWith('chromium exited')) throw new Error(early);
+    const text = await readFile(path.join(userDataDir, 'DevToolsActivePort'), 'utf8').catch(
+      () => ''
+    );
+    const port = Number(text.split('\n')[0]);
+    if (Number.isInteger(port) && port > 0) {
+      if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
+      return port;
+    }
+    await delay(100);
+  }
+  const detail = status();
+  throw new Error(`chromium wrote no DevToolsActivePort${detail ? `\n${detail}` : ''}`);
 }
 
 async function waitVersion(port, status, signal, deadlineAt) {

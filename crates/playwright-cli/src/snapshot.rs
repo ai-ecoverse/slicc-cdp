@@ -6,12 +6,15 @@ pub const SCRIPT: &str = include_str!("aria-snapshot.js");
 
 pub const ELEMENTS_KEY: &str = "__sliccAriaElements";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RefRec {
     pub backend_node_id: Option<u64>,
     pub selector: String,
     pub frame_id: Option<String>,
     pub label: Option<String>,
+    pub target: Option<String>,
+    pub owner: Option<u64>,
+    pub page: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,11 +415,12 @@ pub fn yaml_value(text: &str) -> String {
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FrameRec {
     pub frame_id: String,
     pub parent_frame_id: Option<String>,
     pub url: String,
+    pub target: Option<String>,
 }
 
 pub fn flatten_frame_tree(tree: &Value) -> Vec<FrameRec> {
@@ -436,6 +440,7 @@ pub fn flatten_frame_tree(tree: &Value) -> Vec<FrameRec> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            target: None,
         });
         if let Some(children) = node.get("childFrames").and_then(|v| v.as_array()) {
             for child in children {

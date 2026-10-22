@@ -125,12 +125,13 @@ export async function fakeCdp({
   let tabs = 0;
   const info = (target) => ({
     targetId: target.targetId,
-    type: 'page',
+    type: target.type ?? 'page',
     url: target.url,
     title: target.url,
     attached: false,
     canAccessOpener: false,
     browserContextId: 'CTX',
+    ...(target.parentFrameId ? { parentFrameId: target.parentFrameId } : {}),
   });
   const server = createServer((req, res) => {
     res.writeHead(404);
@@ -251,6 +252,7 @@ export async function fakeCdp({
         case 'Browser.getVersion':
           return answer({ product: 'Chrome/140.0.0.0', protocolVersion: '1.3' });
         case 'Page.getFrameTree':
+          if (target?.tree) return answer({ frameTree: target.tree });
           if (frameTree) return answer({ frameTree });
           return answer({
             frameTree: {
@@ -441,7 +443,7 @@ export async function fakeCdp({
           });
         case 'Runtime.evaluate': {
           const options = ariaOptions(params.expression ?? '');
-          const capture = options ? aria(options, params) : undefined;
+          const capture = options ? aria(options, params, target) : undefined;
           if (capture?.error) return send({ id, error: { code: -32000, message: capture.error } });
           if (!capture && lastAria.handle && params.expression?.startsWith('globalThis[')) {
             if (lastAria.handle === 'error')
