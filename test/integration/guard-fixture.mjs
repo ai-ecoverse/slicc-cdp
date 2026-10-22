@@ -1,6 +1,6 @@
 export function guardConcurrency(targetCount, env = process.env) {
   const parallel = Number(env.SLICC_GUARD_PARALLEL ?? 4);
-  const targetParallel = Number(env.SLICC_GUARD_TARGET_PARALLEL ?? Math.min(4, targetCount));
+  const targetParallel = Number(env.SLICC_GUARD_TARGET_PARALLEL ?? Math.min(16, targetCount));
   if (
     ![targetCount, parallel, targetParallel].every((value) => Number.isInteger(value) && value > 0)
   )

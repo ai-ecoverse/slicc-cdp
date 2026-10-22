@@ -5,8 +5,10 @@ import { guardConcurrency } from './guard-fixture.mjs';
 test('the full guard set defaults to a bounded browser budget', () => {
   const { parallel, targetParallel } = guardConcurrency(14, {});
   assert.equal(parallel, 4);
-  assert.equal(targetParallel, 4);
-  assert.equal(parallel * targetParallel, 16);
+  assert.equal(targetParallel, 14);
+  assert.equal(parallel * targetParallel, 56);
+  const larger = guardConcurrency(40, {});
+  assert.equal(larger.parallel * larger.targetParallel, 64);
 });
 
 test('a single selected target does not expand the target budget', () => {
