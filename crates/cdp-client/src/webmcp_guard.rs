@@ -278,8 +278,9 @@ impl Cdp {
             }
         }
         if !admitted {
+            let removable = self.webmcp.arms.get(session).is_some_and(|arm| arm.identifier.is_some());
             self.webmcp_revoke(session);
-            let _ = self.webmcp_rearm_blank_child(session, value, deadline);
+            if removable { let _ = self.webmcp_rearm_blank_child(session, value, deadline); }
         }
         let resumed = self.raw_call("Debugger.resume", json!({}), Some(session), Duration::from_secs(2));
         if resumed.is_err() {
