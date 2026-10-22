@@ -7,6 +7,4 @@ target/
 bin/*.wasm
 .playwright-cli/
 .build/
-.cert/*
-!.cert/proofs.json
 crates/*/README.md
