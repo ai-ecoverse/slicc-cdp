@@ -12,7 +12,7 @@ pub fn global_help() -> String {
         "Usage: playwright-cli -s=<session> <command> [args] [options]".to_string(),
         String::new(),
         "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when that port is absent or unreachable, attaches to the first of those ports whose /json/version answers, with or without a seven tab. A probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy. The wasm build still uses port 9222.".to_string(),
-        "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
+        "A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
         "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.".to_string(),
         String::new(),
