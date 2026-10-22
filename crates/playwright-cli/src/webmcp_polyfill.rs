@@ -77,6 +77,7 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: 
             return Err("webmcp-polyfill: target closed, changed or was refused by the guard\n".into());
         }
         cdp.pump(Instant::now() + Duration::from_millis(50))?;
+        for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
         if current != saved {
             save(cdp, state, target, &owner)?;

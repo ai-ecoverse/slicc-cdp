@@ -96,7 +96,7 @@ export async function webmcpBackend({
   const fake = await fakeCdp({
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
-      onCommand(message, pages);
+      if (onCommand(message, pages, send) === true) return true;
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) => send({ method, params, sessionId: peer });
       const created = (peer) => {
@@ -239,7 +239,7 @@ export async function webmcpBackend({
           if (!page.loader.startsWith('L-') && !page.loaded) {
             page.loaded = true;
             for (const definition of page.definitions || [])
-              page.document.modelContext?.registerTool(definition);
+              page.document.modelContext?.registerTool?.(definition);
           }
         }
         answer({});

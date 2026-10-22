@@ -56,7 +56,7 @@ function command(endpoint, cwd, args) {
     }, reject);
   });
   ready.catch(() => {});
-  return { child, ended, ready };
+  return { child, ended, ready, stderr: () => stderr };
 }
 
 async function once(endpoint, cwd, args) {
@@ -229,7 +229,7 @@ if (document.modelContext) {
       `https://foreign.test:${port}`,
     ]);
     assert.equal(cross.code, 0, cross.stderr);
-    assert.equal(JSON.parse(cross.stdout).length, 10);
+    assert.equal(JSON.parse(cross.stdout).length, 10, holder.stderr());
     const crossCall = await once(browser.wsUrl, cwd, [
       'webmcp-call',
       'cross_child',

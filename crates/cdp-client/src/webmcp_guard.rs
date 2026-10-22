@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const SHIM: &str = include_str!("webmcp-shim.js");
-const SHIM_HASH: &str = "a843559656c288b312d48369ac32f1d3baae9095667d4ff37da74685b1d3e1db";
+const SHIM_HASH: &str = "911b9c665b7bf8183de1d4eeebb4a96d72ddcfe7b6b222316998c595b410fe53";
 const GATE: &str = "__slicc_webmcp_gate";
 const PERMIT: &str = "__slicc_webmcp_admitted";
 
@@ -365,18 +365,24 @@ impl Cdp {
         self.webmcp.quarantined.insert(child.to_string());
         self.webmcp.parents.insert(child.to_string(), parent.to_string());
         self.targets.insert(target.to_string(), info.clone());
+        let mut stage = "target";
         let installed = (|| -> Result<(), String> {
             if !allowed { return Err(self.refusal()); }
+            stage = "guard setup";
             self.touch(target)?;
+            stage = "protected target";
             if self.is_protected_target(target) { return Err(self.refusal()); }
+            stage = "guard frame tree";
             let guard = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
             let seed = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP)?;
             if !self.webmcp_tree_verified(&seed, None) { return Err(self.refusal()); }
+            stage = "pinned installer";
             self.webmcp_install(child, true, Some(&seed))?;
             Ok(())
         })().is_ok();
         let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), Duration::from_secs(2));
         if !installed {
+            self.notices.push(format!("webmcp-polyfill: child refused at {stage}\n"));
             self.webmcp_revoke(child);
             let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, Duration::from_secs(2));
             self.blocked.insert(child.to_string());

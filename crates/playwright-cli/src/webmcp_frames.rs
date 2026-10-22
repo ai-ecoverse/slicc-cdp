@@ -6,6 +6,8 @@ use crate::webmcp_polyfill::bridge_name;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+const PAGE_DEFINED: &str = "(() => { const api = document.modelContext; return !!api && !api.__slicc_webmcp_shim && (!('modelContext' in Document.prototype) || Object.prototype.hasOwnProperty.call(document, 'modelContext')); })()";
+
 const CAP: &str = r#"const cap = (value, limit = 65536) => {
   if (typeof value !== 'string') return '';
   const length = value.length < limit ? value.length : limit;
@@ -62,6 +64,7 @@ struct Scope {
     bridge: Option<String>,
     policy: Option<String>,
     path: Vec<usize>,
+    page_defined: bool,
 }
 
 #[derive(Clone)]
@@ -108,7 +111,7 @@ pub fn call(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &
         }
         let native = tool.kind == "native";
         let object_input = crate::webmcp::chrome_major_version(cdp).is_some_and(|major| major >= 155);
-        revalidate(cdp, &tool.scope, &collected)?;
+        revalidate(cdp, &tool.scope, &collected, tool.kind != "native")?;
         let input_expression = if object_input { input.to_string() } else { format!("JSON.stringify({input})") };
         let bridge = tool.scope.bridge.as_deref().unwrap_or("undefined");
         let expression = if native {
@@ -153,7 +156,7 @@ try {{
         let child = cdp.webmcp_document(&tool.scope.session, &tool.scope.frame)?;
         if child.get("loaderId").and_then(Value::as_str) != Some(&tool.scope.loader) { return Err("webmcp: document changed\n".into()); }
         let evaluated = evaluate(cdp, scope, &expression, native).and_then(|value| {
-            revalidate(cdp, &tool.scope, &collected)?;
+            revalidate(cdp, &tool.scope, &collected, tool.kind != "native")?;
             Ok(value)
         });
         match evaluated {
@@ -214,7 +217,7 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     if native && available {
         let mut selected = Vec::new();
         for scope in scopes.values() {
-            if (scope.origin == top || from.contains(&scope.origin)) && allowed(cdp, scope, &frames, &scopes, &owners)? {
+            if (scope.origin == top || from.contains(&scope.origin)) && allowed(cdp, scope, &frames, &scopes, &owners, false)? {
                 selected.push(json!({"frameId":scope.frame,"origin":scope.origin,"path":scope.path}));
             }
         }
@@ -237,6 +240,8 @@ try {{
         for value in decode_tools(&value)? {
             let Some(id) = value.get("frameId").and_then(Value::as_str) else { continue };
             let Some(scope) = scopes.get(id) else { continue };
+            let mut value = value;
+            value["policy"] = json!("allowed");
             result.push(Tool { value, scope: scope.clone(), kind: "native".into(), native_scope: Some(root_scope.clone()) });
         }
     }
@@ -244,7 +249,8 @@ try {{
         for scope in scopes.values() {
             if result.iter().any(|tool| tool.scope.frame == scope.frame) { continue; }
             if scope.origin != top && !from.contains(&scope.origin) { continue; }
-            if !allowed(cdp, scope, &frames, &scopes, &owners)? { continue; }
+            if !allowed(cdp, scope, &frames, &scopes, &owners, true)? { continue; }
+            let unknown = scope.page_defined && scope.policy.is_none() && scope.path.is_empty() && native_policy(cdp, scope)?.is_none();
             let bridge = scope.bridge.as_deref().unwrap_or("undefined");
             let expression = format!(r#"(async () => {{ 'use strict'; {CAP}
 try {{
@@ -266,6 +272,7 @@ try {{
                 tool["origin"] = json!(scope.origin);
                 tool["frameId"] = json!(scope.frame);
                 tool["polyfilled"] = json!(value.get("kind").and_then(Value::as_str) == Some("bridge"));
+                tool["policy"] = json!(if unknown { "unknown" } else { "allowed" });
                 tool.as_object_mut().unwrap().remove("exposedTo");
                 result.push(Tool { value: tool, scope: scope.clone(), kind: value.get("kind").and_then(Value::as_str).unwrap_or("page").to_string(), native_scope: None });
             }
@@ -280,7 +287,7 @@ try {{
     Ok(Collected { tools: result, available, frames, scopes })
 }
 
-fn revalidate(cdp: &mut Cdp, scope: &Scope, collected: &Collected) -> Result<(), String> {
+fn revalidate(cdp: &mut Cdp, scope: &Scope, collected: &Collected, compatibility: bool) -> Result<(), String> {
     let mut current = scope;
     let mut seen = BTreeSet::new();
     let mut owners = BTreeMap::new();
@@ -297,7 +304,9 @@ fn revalidate(cdp: &mut Cdp, scope: &Scope, collected: &Collected) -> Result<(),
         owners.insert(current.frame.clone(), value);
         current = parent;
     }
-    if !allowed(cdp, scope, &collected.frames, &collected.scopes, &owners)? { return Err("webmcp-call: tool permission changed\n".into()); }
+    let mut approved = scope.clone();
+    approved.page_defined = scope.page_defined && evaluate(cdp, scope, PAGE_DEFINED, false)?.as_bool() == Some(true);
+    if !allowed(cdp, &approved, &collected.frames, &collected.scopes, &owners, compatibility)? { return Err("webmcp-call: tool permission changed\n".into()); }
     Ok(())
 }
 
@@ -341,7 +350,9 @@ fn build_scope(cdp: &mut Cdp, state: &Session, target: &str, session: &str, fram
     let remembered = state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).and_then(|entry| entry.get("sessions")).and_then(Value::as_array).and_then(|entries| entries.iter().find(|entry| entry.get("target").and_then(Value::as_str) == Some(&frame_target)));
     let bridge = remembered.and_then(|entry| entry.get("bridge")).and_then(Value::as_str).filter(|name| bridge_name(name)).map(str::to_string);
     let policy = remembered.and_then(|entry| entry.get("documents")).and_then(|documents| documents.get(format!("{}:{}", frame.frame_id, loader))).filter(|entry| entry.get("origin").and_then(Value::as_str) == Some(&origin)).and_then(|entry| entry.get("policy")).and_then(Value::as_str).map(str::to_string);
-    scopes.insert(frame.frame_id.clone(), Scope { session, frame: frame.frame_id.clone(), origin, loader, isolated, isolated_unique, main, bridge, policy, path: Vec::new() });
+    let mut scope = Scope { session, frame: frame.frame_id.clone(), origin, loader, isolated, isolated_unique, main, bridge, policy, path: Vec::new(), page_defined: false };
+    scope.page_defined = evaluate(cdp, &scope, PAGE_DEFINED, false)?.as_bool() == Some(true);
+    scopes.insert(frame.frame_id.clone(), scope);
     Ok(())
 }
 
@@ -384,10 +395,14 @@ fn native_policy(cdp: &mut Cdp, scope: &Scope) -> Result<Option<bool>, String> {
         Err(message) if message.starts_with("Page.getPermissionsPolicyState:") && (message.contains("wasn't found") || message.contains("Method not found")) => return Ok(None),
         Err(message) => return Err(message),
     };
-    Ok(value.get("states").and_then(Value::as_array).and_then(|states| states.iter().find(|state| state.get("feature").and_then(Value::as_str) == Some("tools"))).and_then(|state| state.get("allowed").and_then(Value::as_bool)))
+    let states = value.get("states").and_then(Value::as_array).ok_or_else(|| "webmcp: unverified Permissions Policy response\n".to_string())?;
+    match states.iter().find(|state| state.get("feature").and_then(Value::as_str) == Some("tools")) {
+        Some(state) => state.get("allowed").and_then(Value::as_bool).map(Some).ok_or_else(|| "webmcp: unverified tools Permissions Policy state\n".to_string()),
+        None => Ok(None),
+    }
 }
 
-fn allowed(cdp: &mut Cdp, scope: &Scope, frames: &[FrameRec], scopes: &BTreeMap<String, Scope>, owners: &BTreeMap<String, Value>) -> Result<bool, String> {
+fn allowed(cdp: &mut Cdp, scope: &Scope, frames: &[FrameRec], scopes: &BTreeMap<String, Scope>, owners: &BTreeMap<String, Value>, compatibility: bool) -> Result<bool, String> {
     let native = native_policy(cdp, scope)?;
     if native == Some(false) { return Ok(false); }
     let mut current = scope;
@@ -400,7 +415,7 @@ fn allowed(cdp: &mut Cdp, scope: &Scope, frames: &[FrameRec], scopes: &BTreeMap<
         if !seen.insert(current.frame.clone()) { return Ok(false); }
         match current.policy.as_deref() {
             Some(header) if !header_allows(header, &current.origin, &current.origin) => return Ok(false),
-            None if current_native.is_none() => return Ok(false),
+            None if current_native.is_none() && !(compatibility && current.frame == scope.frame && scope.page_defined && frames.iter().any(|frame| frame.frame_id == scope.frame && frame.parent_frame_id.is_none())) => return Ok(false),
             _ => {}
         }
         let Some(parent) = frames.iter().find(|frame| frame.frame_id == current.frame).and_then(|frame| frame.parent_frame_id.as_deref()) else { return Ok(true); };

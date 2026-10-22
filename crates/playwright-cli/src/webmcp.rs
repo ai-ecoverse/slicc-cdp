@@ -62,6 +62,7 @@ fn format_list(tools: &Value) -> String {
                 .unwrap_or(""),
         );
         let mut flags = Vec::new();
+        if tool.get("policy").and_then(Value::as_str) == Some("unknown") { flags.push("policy: unknown, top-level page-defined"); }
         if let Some(ann) = tool.get("annotations") {
             if ann.get("consequentialHint").and_then(|v| v.as_bool()) == Some(true) {
                 flags.push("consequential");

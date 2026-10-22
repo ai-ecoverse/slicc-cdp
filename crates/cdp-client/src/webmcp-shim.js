@@ -155,6 +155,7 @@
       if (signal && onabort) apply(remove, signal, ['abort', onabort]);
     }
   };
+  define(context, '__slicc_webmcp_shim', { value: true });
   define(context, Symbol.toStringTag, { value: 'ModelContext' });
   define(context, 'registerTool', { value: registerTool });
   define(context, 'getTools', { value: getTools });

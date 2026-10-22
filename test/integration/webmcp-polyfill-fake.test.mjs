@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -269,6 +269,95 @@ await test('fake: parent policy, child policy and absent iframe delegation each 
         },
       ]
     );
+  }
+});
+
+await test('fake: unknown policy compatibility is visible and only allows a top-level page-defined API', async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-compat-'));
+  const children = [{ id: 'SAME', origin: 'https://ordinary.test' }];
+  const backend = await webmcpBackend({ children });
+  const api = (name) => ({
+    getTools: async () => [
+      { name, inputSchema: { type: 'object' }, annotations: { readOnly: true } },
+    ],
+    executeTool: async (_tool, input) => ({ name, input: JSON.parse(input) }),
+  });
+  try {
+    backend.page.document.modelContext = api('legacy');
+    backend.pages.get('SAME').document.modelContext = api('iframe');
+    const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.deepEqual(
+      JSON.parse(listed.stdout).map(({ name, policy }) => ({ name, policy })),
+      [{ name: 'legacy', policy: 'unknown' }]
+    );
+    const human = await run(['webmcp-list', '--tab', 'TAB'], cwd, backend.url);
+    assert.match(human.stdout, /policy: unknown, top-level page-defined/);
+    const called = await run(
+      ['webmcp-call', 'legacy', '{"value":1}', '--tab', 'TAB'],
+      cwd,
+      backend.url
+    );
+    assert.equal(called.code, 0, called.stderr);
+    assert.deepEqual(JSON.parse(called.stdout), { name: 'legacy', input: { value: 1 } });
+    assert.notEqual(
+      (await run(['webmcp-call', 'iframe', '{}', '--tab', 'TAB'], cwd, backend.url)).code,
+      0
+    );
+  } finally {
+    await backend.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+  await fixture('tools=()', async (backend, cwd) => {
+    backend.page.document.modelContext = api('legacy');
+    const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.deepEqual(JSON.parse(listed.stdout), []);
+  });
+  await fixture('', async (_backend, cwd) => {
+    const configDir =
+      process.platform === 'darwin' ? path.join(cwd, 'Library', 'Application Support') : cwd;
+    const dir = path.join(configDir, 'slicc', 'playwright-cli', 'sessions');
+    const file = path.join(dir, (await readdir(dir))[0]);
+    const state = JSON.parse(await readFile(file, 'utf8'));
+    state.webmcp = {};
+    await writeFile(file, JSON.stringify(state));
+    const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, _backend.url);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.deepEqual(JSON.parse(listed.stdout), []);
+  });
+});
+
+await test('fake: malformed native tools policy fails closed instead of using header fallback', async () => {
+  for (const result of [
+    {},
+    { states: 'unknown' },
+    { states: [{ feature: 'tools' }] },
+    { states: [{ feature: 'tools', allowed: null }] },
+  ]) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-policy-'));
+    const backend = await webmcpBackend({
+      native: true,
+      onCommand(command, _pages, send) {
+        if (command.method !== 'Page.getPermissionsPolicyState') return;
+        send({ id: command.id, result });
+        return true;
+      },
+    });
+    try {
+      for (const command of [
+        ['webmcp-list', '--json'],
+        ['webmcp-call', 'anything', '{}'],
+      ]) {
+        const output = await run([...command, '--tab', 'TAB'], cwd, backend.url);
+        assert.equal(output.code, 1, output.stderr);
+        assert.equal(output.stdout, '');
+        assert.match(output.stderr, /unverified .*Permissions Policy/);
+      }
+    } finally {
+      await backend.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
   }
 });
 
