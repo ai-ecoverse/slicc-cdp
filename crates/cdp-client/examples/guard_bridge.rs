@@ -87,6 +87,15 @@ fn document_changed(cdp: &mut Cdp, pending: &Pending) -> bool {
         .is_some_and(|(_, loader)| loader != pending.document.loader)
 }
 
+fn completion(value: &Value) -> Option<Result<Value, String>> {
+    let state = value.pointer("/result/value").and_then(Value::as_str).and_then(|text| serde_json::from_str::<Value>(text).ok())?;
+    if state["done"] != true { return None }
+    Some(match state.get("error") {
+        Some(error) => Err(error.as_str().unwrap_or("").to_string()),
+        None => Ok(json!({"result":{"type":"object","value":state["value"]}})),
+    })
+}
+
 fn poll(cdp: &mut Cdp, pending: &Pending) -> Option<Result<Value, String>> {
     if superseded(cdp, pending) { return Some(Err(SUPERSEDED.to_string())) }
     let expression = format!("JSON.stringify(globalThis[{:?}])", pending.key);
@@ -189,7 +198,7 @@ fn main() {
                     let key = format!("__guard_bridge_{id}");
                     let expression =
                         serde_json::to_string(params["expression"].as_str().unwrap()).unwrap();
-                    let script = format!("(() => {{ const key = {key:?}; globalThis[key] = {{ done: false }}; Promise.resolve((0, eval)({expression})).then(value => {{ globalThis[key] = {{ done: true, value }}; }}, error => {{ globalThis[key] = {{ done: true, error: String(error) }}; }}); return true; }})()");
+                    let script = format!("(() => {{ const key = {key:?}; globalThis[key] = {{ done: false }}; const value = (0, eval)({expression}); if (value && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function') {{ Promise.resolve(value).then(value => {{ globalThis[key] = {{ done: true, value }}; }}, error => {{ globalThis[key] = {{ done: true, error: String(error) }}; }}); }} else {{ globalThis[key] = {{ done: true, value }}; }} return JSON.stringify(globalThis[key]); }})()");
                     let document = session.and_then(|session| bind_document(&mut cdp, session, &params));
                     let from = cdp.events().len();
                     let mut original = params.clone();
@@ -204,7 +213,10 @@ fn main() {
                     }
                     match cdp.call("Runtime.evaluate", original, session) {
                         Ok(value) if value.get("exceptionDetails").is_none() => {
-                            if let Some(document) = document {
+                            if let Some(result) = completion(&value) {
+                                diagnostic(id, "original", document.as_ref(), result.as_ref().err().map(String::as_str));
+                                answer(json!(id), result);
+                            } else if let Some(document) = document {
                                 diagnostic(id, "original", Some(&document), None);
                                 pending.insert(id, Pending { key, session:session.unwrap_or("").to_string(), document, from, started:Instant::now() });
                             } else {

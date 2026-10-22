@@ -69,9 +69,9 @@ for (const transport of ['native', 'wasi']) {
               });
           }
           if (message.method !== 'Runtime.evaluate') return false;
-          if (message.params.expression.includes('Promise.resolve((0, eval)')) {
+          if (message.params.expression.includes('globalThis[key] = { done: false }')) {
             started = true;
-            reply(message, send, true);
+            reply(message, send, JSON.stringify({ done: false }));
             if (['navigation', 'quiet-navigation'].includes(mode)) {
               changed = true;
               backend.targets[0].frame = frame('L2');
@@ -145,6 +145,157 @@ for (const transport of ['native', 'wasi']) {
       }
     });
   }
+}
+
+for (const transport of ['native', 'wasi']) {
+  test(`guard promise bridge ${transport}: synchronous navigation releases paused Fetch input`, {
+    timeout: 60000,
+  }, async () => {
+    let backend;
+    let session;
+    let started = false;
+    let paused = false;
+    let rendererProbes = 0;
+    let polls = 0;
+    let fulfilled = false;
+    const heldTrees = [];
+    const answers = [];
+    let documentReady;
+    const documentAnswered = new Promise((resolve) => {
+      documentReady = resolve;
+    });
+    const messages = [];
+    let client;
+    backend = await fakeCdp({
+      intercept: (message, send) => {
+        if (message.method === 'Page.getFrameTree' && paused) {
+          rendererProbes += 1;
+          heldTrees.push(() =>
+            send({
+              id: message.id,
+              sessionId: message.sessionId,
+              result: { frameTree: { frame: backend.targets[0].frame } },
+            })
+          );
+          return true;
+        }
+        if (
+          message.method === 'Runtime.evaluate' &&
+          message.params.expression.includes('globalThis[key] = { done: false }')
+        ) {
+          started = true;
+          paused = true;
+          reply(message, send, JSON.stringify({ done: true, value: 'actual-synchronous-outcome' }));
+          for (const [requestId, resourceType] of [
+            ['BEACON', 'Ping'],
+            ['DOCUMENT', 'Document'],
+          ])
+            send({
+              method: 'Fetch.requestPaused',
+              sessionId: session,
+              params: {
+                requestId,
+                frameId: 'TAB',
+                resourceType,
+                request: {
+                  url: `https://ordinary.example/${requestId}`,
+                  method: 'GET',
+                  headers: {},
+                },
+              },
+            });
+          return true;
+        }
+        if (
+          message.method === 'Runtime.evaluate' &&
+          message.params.expression.startsWith('JSON.stringify(globalThis[')
+        ) {
+          polls += 1;
+          return true;
+        }
+        if (message.method === 'Fetch.fulfillRequest' && message.params.requestId === 'DOCUMENT') {
+          fulfilled = true;
+          paused = false;
+          backend.targets[0].frame = frame('L2');
+          send({ id: message.id, sessionId: message.sessionId, result: {} });
+          send({
+            method: 'Page.frameNavigated',
+            sessionId: session,
+            params: { frame: backend.targets[0].frame },
+          });
+          for (const release of heldTrees.splice(0)) release();
+          return true;
+        }
+        return false;
+      },
+    });
+    backend.targets.push({
+      targetId: 'TAB',
+      type: 'page',
+      url: frame('L1').url,
+      frame: frame('L1'),
+    });
+    try {
+      client = await guarded(backend.url, 'https://private.example.invalid', {
+        variant: 'prompt',
+        detachDelay: 0,
+        transport,
+        onMessage: (message) => {
+          messages.push(message);
+          const event = message.event;
+          if (event?.method === 'Fetch.requestPaused' && event.sessionId === session) {
+            const document = event.params.requestId === 'DOCUMENT';
+            const answer = client.send(
+              document ? 'Fetch.fulfillRequest' : 'Fetch.continueRequest',
+              document
+                ? { requestId: 'DOCUMENT', responseCode: 200, body: 'Zm9yZ2Vk' }
+                : { requestId: event.params.requestId },
+              session
+            );
+            answers.push(answer);
+            if (document) answer.then(documentReady, documentReady);
+          }
+        },
+      });
+      session = (await client.send('Target.attachToTarget', { targetId: 'TAB', flatten: true }))
+        .sessionId;
+      await client.send('Page.enable', {}, session);
+      await client.send(
+        'Fetch.enable',
+        { patterns: [{ urlPattern: '*', requestStage: 'Request' }] },
+        session
+      );
+      const result = await client.send(
+        'Runtime.evaluate',
+        {
+          expression: 'location.href = "https://ordinary.example/next"',
+          awaitPromise: true,
+          returnByValue: true,
+        },
+        session
+      );
+      assert.equal(result.result.value, 'actual-synchronous-outcome');
+      await client.send('Browser.getVersion');
+      await documentAnswered;
+      await Promise.all(answers);
+      assert.equal(started, true);
+      assert.equal(fulfilled, true);
+      assert.equal(rendererProbes, 0);
+      assert.equal(polls, 0);
+      assert(
+        messages.some(
+          (message) => message.diagnostic?.phase === 'original' && !message.diagnostic.error
+        )
+      );
+      assert(
+        !messages.some((message) => ['poll', 'superseded'].includes(message.diagnostic?.phase))
+      );
+    } finally {
+      await client?.close();
+      await Promise.allSettled(answers);
+      await backend.close();
+    }
+  });
 }
 
 test('C5 diagnostics hash values but preserve commands, error classes and physical detach evidence', async () => {
