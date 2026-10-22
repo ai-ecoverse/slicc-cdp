@@ -220,6 +220,61 @@ test('#150 rejects screenshots, missing audit, other failures and incorrect legs
   }
 });
 
+test('ordinary absolute canary URLs are not mistaken for protected relative paths', () => {
+  for (const value of [
+    `${ordinary}/canary/control`,
+    `${ordinary}/page?to=${ordinary}/canary/control`,
+    JSON.stringify({ url: `${ordinary}/canary/control` }),
+  ])
+    assert.equal(protectedX1Exposure(value), false);
+  assert.equal(protectedX1Exposure('/canary/private'), true);
+  assert.equal(protectedX1Exposure(`${protectedOrigin}/canary/private`), true);
+});
+
+test('origin-only references in any field are public but protected URL components remain secret', () => {
+  const { actors, row } = evidence();
+  const message = JSON.parse(actors[1].messages[1]);
+  message.params.headers = { Reference: `${protectedOrigin}/` };
+  message.params.frame = { url: `${ordinary}/page?tag=public-1&to=${protectedOrigin}` };
+  actors[1].messages[1] = JSON.stringify(message);
+  row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+  assert.equal(isExpectedX1Failure150(row), true);
+  assert(row.x1Privacy.diagnostics.some((entry) => entry.valueClass === 'protected-origin-only'));
+  for (const entry of row.x1Privacy.diagnostics) {
+    assert.match(entry.valueHash, /^[a-f0-9]{64}$/);
+    assert.equal(Object.hasOwn(entry, 'value'), false);
+    assert.equal(Object.hasOwn(entry, 'raw'), false);
+  }
+  for (const suffix of [
+    '/canary/secret',
+    '/private',
+    '?code=secret',
+    '/?code=secret',
+    '#secret',
+    '/#secret',
+  ]) {
+    assert.equal(protectedX1Exposure(`${protectedOrigin}${suffix}`), true);
+  }
+  for (const value of [
+    protectedOrigin,
+    `${protectedOrigin}/`,
+    protectedOrigin.toUpperCase(),
+    encodeURIComponent(`${protectedOrigin}/`),
+  ])
+    assert.equal(protectedX1Exposure(value), false);
+  const leaked = evidence();
+  const bad = JSON.parse(leaked.actors[1].messages[1]);
+  bad.params.title = 'public-1';
+  leaked.actors[1].messages[1] = JSON.stringify(bad);
+  leaked.row.x1Privacy = x1Privacy(leaked.actors, { ordinary, protectedOrigin });
+  assert.equal(isExpectedX1Failure150(leaked.row), false);
+  assert(
+    leaked.row.x1Privacy.diagnostics.some(
+      (entry) => entry.field === '$.params.title' && entry.valueClass === 'protected-canary-tag'
+    )
+  );
+});
+
 test('private URL audit decodes nested carriers and case variants', () => {
   for (const encode of [
     (s) => s,

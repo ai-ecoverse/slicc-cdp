@@ -2163,6 +2163,7 @@ impl Cdp {
             #[cfg(test)]
             let observed_url = paused.url.clone();
             let ordinary_url = (!redirect && !loaded_protected && !initiated && !self.guard_sessions.contains(&paused.session_id) && !self.redirect_page_protected(&value)
+                && paused.resource_type == "Document" && self.client_navigation_urls.get(&paused.session_id) == Some(&paused.url)
                 && !self.protected_body_requests.contains(&paused.request_id)
                 && self.ordinary_redirect_url(&paused.url)).then(|| paused.url.clone());
             shield::redact_strings(&self.guard, &mut value);

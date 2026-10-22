@@ -173,14 +173,7 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
               (event) => event.method === 'Page.loadEventFired' && event.sessionId === sessionId,
               15000
             );
-            await client.send(
-              'Runtime.evaluate',
-              {
-                expression: `setTimeout(()=>{location.href=${JSON.stringify(trigger)}},0);true`,
-                returnByValue: true,
-              },
-              sessionId
-            );
+            await client.send('Page.navigate', { url: trigger }, sessionId);
             await loaded;
             await until(
               () => fixture.log().some((entry) => entry.url === trigger),

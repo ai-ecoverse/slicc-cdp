@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 const { containsSecret } = await import(
   new URL('./redirect-secret.mjs', import.meta.resolve('@ai-ecoverse/slicc-browsers/package.json'))
     .href
@@ -28,18 +30,71 @@ export function recordX1Client(client) {
   return actor;
 }
 
-export function protectedX1Exposure(value, depth = 0, seen = new Set()) {
-  if (value && typeof value === 'object')
-    return Object.values(value).some((field) => protectedX1Exposure(field, depth, seen));
-  if (typeof value !== 'string') return false;
-  if (
-    /(?:[a-z][a-z0-9+.-]*:\/\/|\/\/)(?:[a-z0-9-]+\.)*sliccy\.ai\b|(?:[a-z0-9-]+\.)*sliccy\.ai(?::\d+)?\/|\/canary\//i.test(
-      value
+function protectedRealm(url) {
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  return host === 'sliccy.ai' || host.endsWith('.sliccy.ai');
+}
+
+function scalarClasses(text, tags) {
+  const classes = new Set();
+  const spans = [];
+  const inspect = (candidate) => {
+    let url;
+    try {
+      url = new URL(candidate.startsWith('//') ? `http:${candidate}` : candidate);
+    } catch {
+      if (/sliccy\.ai/i.test(candidate)) classes.add('protected-url-unparseable');
+      return;
+    }
+    if (!protectedRealm(url)) return;
+    if (
+      (url.pathname !== '/' && url.pathname !== '') ||
+      url.href.includes('?') ||
+      url.href.includes('#') ||
+      url.username ||
+      url.password
     )
-  )
-    return true;
+      classes.add('protected-url-path-query-fragment');
+    else classes.add('protected-origin-only');
+  };
+  for (const match of text.matchAll(/[a-z][a-z0-9+.-]*:\/\/|(?<![:/])\/\//gi)) {
+    const start = match.index;
+    const suffix = text.slice(start);
+    const end =
+      start + (suffix.search(/[\s"'<>)\]}]/) < 0 ? suffix.length : suffix.search(/[\s"'<>)\]}]/));
+    inspect(text.slice(start, end));
+    spans.push([start, end]);
+  }
+  for (const match of text.matchAll(
+    /\b(?:[a-z0-9-]+\.)*sliccy\.ai(?::\d+)?(?:\/[^\s"'<>)\]}]*|[?#][^\s"'<>)\]}]*)/gi
+  )) {
+    if (!spans.some(([start, end]) => match.index >= start && match.index < end))
+      inspect(`http://${match[0]}`);
+  }
+  const outside = text
+    .split('')
+    .map((char, index) =>
+      spans.some(([start, end]) => index >= start && index < end) ? ' ' : char
+    )
+    .join('');
+  if (/\/canary\/[^\s"'<>]+/.test(outside)) classes.add('protected-relative-canary-path');
+  if (tags.some((tag) => tag && outside.includes(tag))) classes.add('protected-canary-tag');
+  return classes;
+}
+
+export function x1ValueClasses(value, tags = [], depth = 0, seen = new Set()) {
+  const classes = new Set();
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return classes;
+    seen.add(value);
+    for (const field of Object.values(value))
+      for (const kind of x1ValueClasses(field, tags, depth, seen)) classes.add(kind);
+    return classes;
+  }
+  if (typeof value !== 'string') return classes;
+  for (const kind of scalarClasses(value, tags)) classes.add(kind);
   const key = `${depth}:${value}`;
-  if (depth >= 8 || seen.has(key)) return false;
+  if (depth >= 8 || seen.has(key)) return classes;
   seen.add(key);
   const decoded = [];
   try {
@@ -54,8 +109,23 @@ export function protectedX1Exposure(value, depth = 0, seen = new Set()) {
   for (const [chunk] of value.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g))
     for (let offset = 0; offset < 4; offset++)
       decoded.push(Buffer.from(chunk.slice(offset), 'base64').toString('utf8'));
-  return decoded.some((item) => item !== value && protectedX1Exposure(item, depth + 1, seen));
+  for (const item of decoded)
+    if (item !== value)
+      for (const kind of x1ValueClasses(item, tags, depth + 1, seen)) classes.add(kind);
+  return classes;
 }
+
+export function protectedX1Exposure(value) {
+  return [...x1ValueClasses(value)].some((kind) => kind !== 'protected-origin-only');
+}
+
+function stringFields(value, path = '$') {
+  if (typeof value === 'string') return [{ field: path, value }];
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([key, item]) => stringFields(item, `${path}.${key}`));
+}
+
+const valueHash = (value) => createHash('sha256').update(value).digest('hex');
 
 export function x1Privacy(actors, { ordinary, protectedOrigin }) {
   if (
@@ -81,16 +151,41 @@ export function x1Privacy(actors, { ordinary, protectedOrigin }) {
   }
   const echoes = [];
   const exposures = [];
+  const diagnostics = [];
+  const tags = actors.flatMap((actor) =>
+    actor.calls.flatMap((call) => {
+      if (call.method !== 'Page.navigate' || typeof call.params?.url !== 'string') return [];
+      try {
+        const to = new URL(new URL(call.params.url).searchParams.get('to'));
+        return protectedRealm(to) && to.pathname.startsWith('/canary/')
+          ? [to.pathname.slice('/canary/'.length)]
+          : [];
+      } catch {
+        return [];
+      }
+    })
+  );
   let markerExposed = false;
   let protectedExposed = false;
   let screenshotExposed = false;
   for (const [actorIndex, actor] of actors.entries()) {
-    screenshotExposed ||= actor.calls.some(
-      (call) =>
+    for (const [callIndex, call] of actor.calls.entries()) {
+      if (
         call.method === 'Page.captureScreenshot' &&
         typeof call.result?.data === 'string' &&
         call.result.data.length > 0
-    );
+      ) {
+        screenshotExposed = true;
+        diagnostics.push({
+          actorIndex,
+          callIndex,
+          event: 'Page.captureScreenshot',
+          field: '$.result.data',
+          valueClass: 'screenshot-unverified',
+          valueHash: valueHash(call.result.data),
+        });
+      }
+    }
     for (const [messageIndex, text] of actor.messages.entries()) {
       let message;
       try {
@@ -100,13 +195,25 @@ export function x1Privacy(actors, { ordinary, protectedOrigin }) {
       }
       if (!message || typeof message !== 'object' || Array.isArray(message))
         return { measured: false };
+      for (const { field, value } of stringFields(message)) {
+        if (containsSecret(value, marker))
+          diagnostics.push({
+            actorIndex,
+            messageIndex,
+            event: message.method ?? 'response',
+            field,
+            valueClass: 'protected-canary-marker',
+            valueHash: valueHash(value),
+          });
+      }
       markerExposed ||= containsSecret(message, marker);
       const params = message.params;
       if (
         ['Network.requestWillBeSent', 'Fetch.requestPaused'].includes(message.method) &&
         typeof params?.request?.url === 'string' &&
         typeof params.requestId === 'string' &&
-        params.requestId.length > 0
+        params.requestId.length > 0 &&
+        !containsSecret(params.request.url, marker)
       ) {
         const callIndex = actor.calls.findIndex((call) => {
           if (
@@ -118,7 +225,15 @@ export function x1Privacy(actors, { ordinary, protectedOrigin }) {
           )
             return false;
           try {
-            if (new URL(call.params.url).origin !== ordinary) return false;
+            const outgoing = new URL(call.params.url);
+            if (
+              outgoing.origin !== ordinary ||
+              outgoing.pathname !== '/page' ||
+              outgoing.searchParams.get('k') !== 'href' ||
+              !outgoing.searchParams.has('tag') ||
+              !outgoing.searchParams.has('to')
+            )
+              return false;
           } catch {
             return false;
           }
@@ -144,7 +259,20 @@ export function x1Privacy(actors, { ordinary, protectedOrigin }) {
           delete params.request.url;
         }
       }
-      const exposed = protectedX1Exposure(message);
+      let exposed = false;
+      for (const { field, value } of stringFields(message)) {
+        for (const valueClass of x1ValueClasses(value, tags)) {
+          diagnostics.push({
+            actorIndex,
+            messageIndex,
+            event: message.method ?? 'response',
+            field,
+            valueClass,
+            valueHash: valueHash(value),
+          });
+          if (valueClass !== 'protected-origin-only') exposed = true;
+        }
+      }
       if (exposed)
         exposures.push({
           actorIndex,
@@ -176,6 +304,7 @@ export function x1Privacy(actors, { ordinary, protectedOrigin }) {
     protectedOrigin: origin,
     echoes,
     exposures,
+    diagnostics,
   };
 }
 
