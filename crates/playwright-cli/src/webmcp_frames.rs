@@ -85,11 +85,12 @@ pub fn origins(values: &[&str]) -> Result<Vec<String>, String> {
 }
 
 pub fn list(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String]) -> Result<Value, String> {
-    with_tools(cdp, state, target, session, from, |_, tools| Ok(Value::Array(tools.into_iter().map(|tool| tool.value).collect())))
+    with_tools(cdp, state, target, session, from, |_, tools, available| if available { Ok(Value::Array(tools.into_iter().map(|tool| tool.value).collect())) } else { Ok(Value::Null) })
 }
 
 pub fn call(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], frame: Option<&str>, name: &str, input: &Value, allow: bool) -> Result<Value, String> {
-    with_tools(cdp, state, target, session, from, |cdp, tools| {
+    with_tools(cdp, state, target, session, from, |cdp, tools, available| {
+        if !available { return Ok(json!({"__webmcp_error":"absent"})); }
         let matches = tools.iter().filter(|tool| tool.value.get("name").and_then(Value::as_str) == Some(name) && frame.is_none_or(|frame| frame == tool.scope.frame)).collect::<Vec<_>>();
         if matches.is_empty() { return Ok(json!({"__webmcp_error":"unknown","tools":tools.iter().filter_map(|tool| tool.value.get("name")).collect::<Vec<_>>()})); }
         if matches.len() != 1 { return Err("webmcp-call: ambiguous tool name; select --frame <frameId>\n".into()); }
@@ -150,15 +151,15 @@ try {{
     })
 }
 
-fn with_tools(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Vec<Tool>) -> Result<Value, String>) -> Result<Value, String> {
+fn with_tools(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Vec<Tool>, bool) -> Result<Value, String>) -> Result<Value, String> {
     if from.iter().any(|origin| cdp.guard().url(origin)) { return Err(format!("{}\n", cdp.guard().refusal())); }
     let mut opened = Vec::new();
-    let result = collect(cdp, state, target, session, from, &mut opened).and_then(|tools| invoke(cdp, tools));
+    let result = collect(cdp, state, target, session, from, &mut opened).and_then(|(tools, available)| invoke(cdp, tools, available));
     for child in opened { cdp::detach(cdp, &child); }
     result
 }
 
-fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], opened: &mut Vec<String>) -> Result<Vec<Tool>, String> {
+fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], opened: &mut Vec<String>) -> Result<(Vec<Tool>, bool), String> {
     let frames = browser::page_frames(cdp, session)?;
     let root = frames.first().ok_or_else(|| "webmcp: unverified frame tree\n".to_string())?;
     let mut scopes = BTreeMap::new();
@@ -196,6 +197,7 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     }
     let root_scope = scopes[&root.frame_id].clone();
     let native = evaluate(cdp, &root_scope, "'modelContext' in Document.prototype", true)?.as_bool() == Some(true);
+    let available = native || evaluate(cdp, &root_scope, "document.modelContext != null", false)?.as_bool() == Some(true);
     let mut result = Vec::new();
     if native {
         let mut selected = Vec::new();
@@ -262,12 +264,13 @@ try {{
         if current.get("loaderId").and_then(Value::as_str) != Some(&scope.loader) { return Err("webmcp: document changed\n".into()); }
     }
     result.sort_by(|a, b| a.value["name"].as_str().cmp(&b.value["name"].as_str()).then(a.scope.frame.cmp(&b.scope.frame)));
-    Ok(result)
+    let available = available || !result.is_empty();
+    Ok((result, available))
 }
 
 fn decode_tools(value: &Value) -> Result<Vec<Value>, String> {
     if value.get("__webmcp_error").is_some() { return Err("webmcp-list: page result exceeds the limit or listing failed\n".into()); }
-    let text = value.get("toolsJson").and_then(Value::as_str).unwrap_or("[]");
+    let text = value.get("toolsJson").and_then(Value::as_str).filter(|text| text.len() <= 393216).ok_or_else(|| "webmcp-list: unexpected evaluation result\n".to_string())?;
     serde_json::from_str::<Value>(text).map_err(|_| "webmcp-list: invalid tool metadata\n".to_string())?.as_array().cloned().ok_or_else(|| "webmcp-list: invalid tool metadata\n".into())
 }
 
@@ -276,7 +279,10 @@ fn evaluate(cdp: &mut Cdp, scope: &Scope, expression: &str, native: bool) -> Res
     if before.get("loaderId").and_then(Value::as_str) != Some(&scope.loader) || before.get("origin").and_then(Value::as_str) != Some(&scope.origin) { return Err("webmcp: document changed\n".into()); }
     let context = if native { &scope.isolated_unique } else { scope.main.as_ref().ok_or_else(|| "webmcp: unverified page context\n".to_string())? };
     let response = cdp.call("Runtime.evaluate", json!({"expression":expression,"uniqueContextId":context,"awaitPromise":true,"returnByValue":true,"userGesture":true}), Some(&scope.session))?;
-    if response.get("exceptionDetails").is_some() { return Err("webmcp: page evaluation failed\n".into()); }
+    if let Some(details) = response.get("exceptionDetails") {
+        let message = details.pointer("/exception/description").and_then(Value::as_str).or_else(|| details.get("text").and_then(Value::as_str)).unwrap_or("page evaluation failed");
+        return Err(format!("webmcp: {}\n", crate::sanitize::browser_message(message)));
+    }
     let after = cdp.webmcp_document(&scope.session, &scope.frame)?;
     if before != after { return Err("webmcp: document changed\n".into()); }
     let value = response.pointer("/result/value").cloned().unwrap_or(Value::Null);

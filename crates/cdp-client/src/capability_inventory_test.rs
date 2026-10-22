@@ -5,7 +5,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.insertText",
         "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree",
         "Page.getNavigationHistory", "Page.getPermissionsPolicyState", "Page.navigate", "Page.printToPDF", "Page.reload",
-        "Runtime.callFunctionOn", "Runtime.evaluate", "Runtime.getProperties", "Runtime.releaseObjectGroup",
+        "Runtime.callFunctionOn", "Runtime.compileScript", "Runtime.evaluate", "Runtime.getProperties", "Runtime.releaseObjectGroup",
         "Debugger.resume",
     ]);
     let observation = set(&[
@@ -32,6 +32,12 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     }
     for method in &methods {
         assert_eq!(inventory.iter().filter(|class| class.contains(method)).count(), 1, "unclassified or ambiguous method: {method}");
+        if method == "Runtime.compileScript" {
+            let source = fs::read_to_string(root().join("crates/playwright-cli/src/browser.rs")).unwrap();
+            let compile = source.split("let mut compile =").nth(1).unwrap().split("let parsed =").next().unwrap();
+            assert!(compile.contains("\"persistScript\": false"));
+            assert!(!compile.contains("\"persistScript\": true"));
+        }
         if crate::shield::persistent_capability(method) {
             if vetted_shim.contains(method) {
                 let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();

@@ -595,7 +595,9 @@ fn implemented_page(name: &str) -> Option<String> {
                 "Same-origin frames are included. Cross-origin tools require --from-origin.",
                 "The tools Permissions Policy and exposedTo are enforced before listing.",
                 "Chrome includes declarative form[toolname] tools in getTools().",
-                "If modelContext is absent, returns an empty list.",
+                "An empty tool list succeeds (exit 0).",
+                "If document.modelContext is absent, reports WebMCP unavailable (exit 2).",
+                "Evaluation or connection failures exit 1.",
             ],
             &[],
             &[
