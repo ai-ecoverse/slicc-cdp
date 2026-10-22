@@ -172,6 +172,9 @@ fn decode(text: &str) -> Session {
                                 .and_then(|v| v.as_str())
                                 .filter(|label| !label.is_empty())
                                 .map(str::to_string),
+                            target: rec.get("targetId").and_then(|v| v.as_str()).map(str::to_string),
+                            owner: rec.get("ownerNodeId").and_then(|v| v.as_u64()),
+                            page: None,
                         },
                     );
                 }
@@ -239,6 +242,8 @@ fn encode(session: &Session) -> Value {
                     "selector": rec.selector,
                     "frameId": rec.frame_id,
                     "label": rec.label,
+                    "targetId": rec.target,
+                    "ownerNodeId": rec.owner,
                 }),
             );
         }
@@ -965,6 +970,7 @@ mod tests {
                 selector: "button".to_string(),
                 frame_id: None,
                 label: Some("button \"Sign in\"".to_string()),
+                ..RefRec::default()
             },
         );
         refs.insert(
@@ -974,6 +980,9 @@ mod tests {
                 selector: "input".to_string(),
                 frame_id: Some("F".to_string()),
                 label: Some(String::new()),
+                target: Some("F".to_string()),
+                owner: Some(9),
+                page: Some("S".to_string()),
             },
         );
         let session = Session {
@@ -985,6 +994,10 @@ mod tests {
         assert_eq!(stored_label(&again, "T", "e1"), Some("button \"Sign in\""));
         assert!(stored_label(&again, "T", "e2").is_none());
         assert_eq!(again.snapshots["T"]["e2"].frame_id.as_deref(), Some("F"));
+        assert_eq!(again.snapshots["T"]["e2"].target.as_deref(), Some("F"));
+        assert_eq!(again.snapshots["T"]["e2"].owner, Some(9));
+        assert_eq!(again.snapshots["T"]["e2"].page, None);
+        assert_eq!(again.snapshots["T"]["e1"].target, None);
     }
 
     #[test]
