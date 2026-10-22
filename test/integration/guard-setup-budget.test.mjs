@@ -42,9 +42,21 @@ async function drive(proxy, site) {
   }
 }
 
+async function ownChrome(work) {
+  const browser = await launchBrowser();
+  try {
+    return await work(browser);
+  } catch (error) {
+    const died = browser.died();
+    if (died) throw new Error(`Chrome died during the subtest: ${died}`, { cause: error });
+    throw error;
+  } finally {
+    await browser.close();
+  }
+}
+
 test('the guard setup shares one budget, tolerates slow optional steps and fails closed', async (t) => {
   const site = await startServer();
-  const browser = await launchBrowser();
   try {
     const flows = {
       'a 12 s Page.enable is optional and the tab still works': {
@@ -60,121 +72,132 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
       'browser-level events never arrive and the tab still works': { browserEvents: false },
     };
     for (const [name, options] of Object.entries(flows)) {
-      await t.test(name, async () => {
-        const { stderr = '', ...proxied } = options;
-        const proxy = await cdpProxy(browser.wsUrl, proxied);
-        try {
-          const { opened, snapshot } = await drive(proxy, site);
-          assert.equal(opened.code, 0, `${opened.stdout}\n${opened.stderr}`);
-          assert.equal(opened.stderr, stderr);
-          assert.ok(!snapshot.stderr.includes('slicc: guard:'), snapshot.stderr);
-          assert.equal(snapshot.code, 0, `${snapshot.stdout}\n${snapshot.stderr}`);
-          assert.match(snapshot.stdout, new RegExp(`Page URL: ${site.origin}/one`));
-        } finally {
-          await proxy.close();
-        }
-      });
+      await t.test(name, () =>
+        ownChrome(async (browser) => {
+          const { stderr = '', ...proxied } = options;
+          const proxy = await cdpProxy(browser.wsUrl, proxied);
+          try {
+            const { opened, snapshot } = await drive(proxy, site);
+            assert.equal(opened.code, 0, `${opened.stdout}\n${opened.stderr}`);
+            assert.equal(opened.stderr, stderr);
+            assert.ok(!snapshot.stderr.includes('slicc: guard:'), snapshot.stderr);
+            assert.equal(snapshot.code, 0, `${snapshot.stdout}\n${snapshot.stderr}`);
+            assert.match(snapshot.stdout, new RegExp(`Page URL: ${site.origin}/one`));
+          } finally {
+            await proxy.close();
+          }
+        })
+      );
     }
-    await t.test('curlwright says when it skipped a slow optional guard step', async () => {
-      const proxy = await cdpProxy(browser.wsUrl, {
-        delays: { 'Runtime.enable': { ms: 12000 } },
-      });
-      const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-budget-curl-'));
-      try {
-        const listed = await fetch(`http://${new URL(browser.wsUrl).host}/json/list`);
-        const tab = (await listed.json()).find((info) => info.url === `${site.origin}/one`).id;
-        const fetched = await runProcess(
-          curlwright,
-          ['--cdp', proxy.url, '--tab', tab, '-s', `${site.origin}/one`],
+    await t.test('curlwright says when it skipped a slow optional guard step', () =>
+      ownChrome(async (browser) => {
+        const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-budget-curl-'));
+        const opened = await runProcess(
+          playwright,
+          ['--cdp', browser.wsUrl, 'open', `${site.origin}/one`],
           cwd,
           120000
         );
-        assert.equal(fetched.code, 0, fetched.stderr);
-        assert.equal(fetched.stderr, notice('Runtime.enable'));
-      } finally {
-        await proxy.close();
-        await rm(cwd, { recursive: true, force: true });
-      }
-    });
+        assert.equal(opened.code, 0, `${opened.stdout}\n${opened.stderr}`);
+        const proxy = await cdpProxy(browser.wsUrl, {
+          delays: { 'Runtime.enable': { ms: 12000 } },
+        });
+        try {
+          const listed = await fetch(`http://${new URL(browser.wsUrl).host}/json/list`);
+          const tab = (await listed.json()).find((info) => info.url === `${site.origin}/one`).id;
+          const fetched = await runProcess(
+            curlwright,
+            ['--cdp', proxy.url, '--tab', tab, '-s', `${site.origin}/one`],
+            cwd,
+            120000
+          );
+          assert.equal(fetched.code, 0, fetched.stderr);
+          assert.equal(fetched.stderr, notice('Runtime.enable'));
+        } finally {
+          await proxy.close();
+          await rm(cwd, { recursive: true, force: true });
+        }
+      })
+    );
     for (const browserEvents of [true, false]) {
       await t.test(
         browserEvents
           ? 'a required step past the shared budget is refused, named, and closed'
           : 'a required step past the shared budget is closed without browser-level events',
-        async () => {
-          const before = await pages(browser.wsUrl);
-          const traffic = [];
-          const proxy = await cdpProxy(browser.wsUrl, {
-            browserEvents,
-            observe: (direction, message) =>
-              traffic.push({ at: performance.now(), direction, message }),
-            delays: {
-              'Fetch.enable': { ms: 12000 },
-              'Network.enable': { ms: 12000 },
-              'Network.setBypassServiceWorker': { ms: 12000 },
-            },
-          });
-          try {
-            const { opened, snapshot } = await drive(proxy, site);
-            assert.equal(snapshot, undefined);
-            assert.notEqual(opened.code, 0);
-            assert.equal(opened.stdout, '');
-            assert.equal(
-              opened.stderr,
-              `${unguarded}: Network.setBypassServiceWorker timed out\n`,
-              opened.stderr
-            );
-            const after = await pages(browser.wsUrl);
-            const inspector = await rawSocket(browser.wsUrl);
-            let targets;
-            try {
-              targets = await inspector.send('Target.getTargets');
-            } finally {
-              inspector.close();
-            }
-            const create = traffic.find(
-              ({ direction, message }) =>
-                direction === 'client' && message.method === 'Target.createTarget'
-            );
-            const created = traffic.find(
-              ({ direction, message }) =>
-                direction === 'browser' && message.id === create?.message.id
-            );
-            const targetId = created?.message.result?.targetId;
-            const close = traffic.find(
-              ({ direction, message }) =>
-                direction === 'client' &&
-                message.method === 'Target.closeTarget' &&
-                message.params.targetId === targetId
-            );
-            const closeReply = traffic.find(
-              ({ direction, message }) =>
-                direction === 'browser' && message.id === close?.message.id
-            );
-            const evidence = JSON.stringify({
+        () =>
+          ownChrome(async (browser) => {
+            const before = await pages(browser.wsUrl);
+            const traffic = [];
+            const proxy = await cdpProxy(browser.wsUrl, {
               browserEvents,
-              opened,
-              before,
-              after,
-              targets,
-              targetId,
-              close,
-              closeReply,
-              traffic,
+              observe: (direction, message) =>
+                traffic.push({ at: performance.now(), direction, message }),
+              delays: {
+                'Fetch.enable': { ms: 12000 },
+                'Network.enable': { ms: 12000 },
+                'Network.setBypassServiceWorker': { ms: 12000 },
+              },
             });
-            assert.deepEqual(
-              after.filter((id) => !before.includes(id)),
-              [],
-              `the refused tab was left open: ${evidence}`
-            );
-          } finally {
-            await proxy.close();
-          }
-        }
+            try {
+              const { opened, snapshot } = await drive(proxy, site);
+              assert.equal(snapshot, undefined);
+              assert.notEqual(opened.code, 0);
+              assert.equal(opened.stdout, '');
+              assert.equal(
+                opened.stderr,
+                `${unguarded}: Network.setBypassServiceWorker timed out\n`,
+                opened.stderr
+              );
+              const after = await pages(browser.wsUrl);
+              const inspector = await rawSocket(browser.wsUrl);
+              let targets;
+              try {
+                targets = await inspector.send('Target.getTargets');
+              } finally {
+                inspector.close();
+              }
+              const create = traffic.find(
+                ({ direction, message }) =>
+                  direction === 'client' && message.method === 'Target.createTarget'
+              );
+              const created = traffic.find(
+                ({ direction, message }) =>
+                  direction === 'browser' && message.id === create?.message.id
+              );
+              const targetId = created?.message.result?.targetId;
+              const close = traffic.find(
+                ({ direction, message }) =>
+                  direction === 'client' &&
+                  message.method === 'Target.closeTarget' &&
+                  message.params.targetId === targetId
+              );
+              const closeReply = traffic.find(
+                ({ direction, message }) =>
+                  direction === 'browser' && message.id === close?.message.id
+              );
+              const evidence = JSON.stringify({
+                browserEvents,
+                opened,
+                before,
+                after,
+                targets,
+                targetId,
+                close,
+                closeReply,
+                traffic,
+              });
+              assert.deepEqual(
+                after.filter((id) => !before.includes(id)),
+                [],
+                `the refused tab was left open: ${evidence}`
+              );
+            } finally {
+              await proxy.close();
+            }
+          })
       );
     }
   } finally {
-    await browser.close();
     await site.close();
   }
 });
