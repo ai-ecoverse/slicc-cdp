@@ -144,18 +144,24 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
             const tag = `exit-${target}-${variant}`;
             const dest = `${targets[target]}/canary/${tag}`;
             const { targetId, sessionId } = await open(client, `${targets.ordinary}/doc`);
-            await client.send(
-              'Page.addScriptToEvaluateOnNewDocument',
-              {
-                source: `navigator.sendBeacon(${JSON.stringify(`${targets.ordinary}/beacon?tag=${tag}`)},location.href)`,
-              },
-              sessionId
+            await assert.rejects(
+              client.send(
+                'Page.addScriptToEvaluateOnNewDocument',
+                {
+                  source: `navigator.sendBeacon(${JSON.stringify(`${targets.ordinary}/beacon?tag=${tag}`)},location.href)`,
+                },
+                sessionId
+              ),
+              /slicc: refused:/
             );
             await client.send('Network.enable', {}, sessionId);
-            await client.send(
-              'Network.setExtraHTTPHeaders',
-              { headers: { 'x-probe': tag } },
-              sessionId
+            await assert.rejects(
+              client.send(
+                'Network.setExtraHTTPHeaders',
+                { headers: { 'x-probe': tag } },
+                sessionId
+              ),
+              /slicc: refused:/
             );
             await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, sessionId);
             stop = intercept(client, sessionId, dest, 'FULFILLED');
@@ -176,7 +182,12 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
               sessionId
             );
             await loaded;
-            await until(() => fixture.log().some(beacon), 15000, 'beacon before exit');
+            await until(
+              () => fixture.log().some((entry) => entry.url === trigger),
+              15000,
+              'ordinary navigation before exit'
+            );
+            assert(!fixture.log().some(beacon));
             assert(
               client.events.some(
                 (event) =>
@@ -184,9 +195,7 @@ test('native-only C5.script and X1.after-exit', { timeout: 180000 }, async (t) =
               )
             );
             assert(
-              fixture
-                .log()
-                .some((entry) => entry.url === trigger && entry.headers['x-probe'] === tag)
+              fixture.log().some((entry) => entry.url === trigger && !entry.headers['x-probe'])
             );
             await stop();
             stop = undefined;

@@ -70,11 +70,16 @@ test('every Rust CLI and client method has an explicit content policy', async ()
   const client = await readFile(path.join(root, 'crates/cdp-client/src/cdp.rs'), 'utf8');
   const policy = client.split('fn content_command(', 2)[1]?.split('\nfn harmless(', 1)[0];
   assert.ok(policy, 'the content classifier is required');
-  const content = policy.match(/match method \{([\s\S]*?)=> Some\(true\),/)?.[1];
+  const refused = policy.match(/match method \{([\s\S]*?)=> None,/)?.[1];
+  const content = policy.match(/=> None,([\s\S]*?)=> Some\(true\),/)?.[1];
   const control = policy.match(/=> Some\(true\),([\s\S]*?)=> Some\(false\),/)?.[1];
-  assert.ok(content && control, 'explicit content and control arms are required');
+  assert.ok(
+    refused && content && control,
+    'explicit refusal, content and control arms are required'
+  );
   assert.match(policy, /if method == "Page\.addScriptToEvaluateOnNewDocument" \{\s*return Some\(/);
   const classified = new Set([
+    ...literals(refused),
     ...literals(content),
     ...literals(control),
     'Page.addScriptToEvaluateOnNewDocument',

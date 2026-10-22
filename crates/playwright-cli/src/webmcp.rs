@@ -23,6 +23,9 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -
     match result {
         Ok(tools) => {
             state.current = Some(target);
+            if tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent") {
+                return unavailable("webmcp-list");
+            }
             if json {
                 Output::ok(format!("{}\n", crate::sanitize::json_c1(&tools.to_string())))
             } else {
@@ -30,6 +33,14 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -
             }
         }
         Err(message) => Output::err(message),
+    }
+}
+
+fn unavailable(command: &str) -> Output {
+    Output {
+        stdout: String::new(),
+        stderr: format!("{command}: WebMCP is unavailable on this page (document.modelContext is absent)\n"),
+        code: 2,
     }
 }
 
@@ -125,11 +136,7 @@ pub fn call(
             state.current = Some(target);
             match outcome {
                 CallOutcome::Result(text) => Output::ok(format!("{}\n", sanitize::browser_message(&text))),
-                CallOutcome::Absent => Output {
-                    stdout: String::new(),
-                    stderr: "webmcp-call: page does not support WebMCP (document.modelContext is absent)\n".into(),
-                    code: 2,
-                },
+                CallOutcome::Absent => unavailable("webmcp-call"),
                 CallOutcome::Unknown(available) => {
                     let list = if available.is_empty() {
                         String::new()
@@ -224,8 +231,11 @@ fn resolve(
 
 fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     let expression = r#"(async () => {
+  if (!('modelContext' in document) || !document.modelContext) {
+    return { __webmcp_error: 'absent' };
+  }
   const tools = [];
-  if ('modelContext' in document && document.modelContext) {
+  {
     const list = await document.modelContext.getTools();
     for (const t of list) {
       let schema = t.inputSchema || null;
@@ -263,7 +273,10 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     let value = result
         .pointer("/result/value")
         .cloned()
-        .unwrap_or(json!([]));
+        .unwrap_or(Value::Null);
+    if !value.is_array() && value.get("__webmcp_error").and_then(Value::as_str) != Some("absent") {
+        return Err("webmcp-list: unexpected evaluation result\n".into());
+    }
     Ok(value)
 }
 

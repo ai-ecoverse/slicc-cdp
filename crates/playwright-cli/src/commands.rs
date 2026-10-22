@@ -891,9 +891,9 @@ fn cmd_eval(
         let value = if let Some(frame_id) = invocation.flags.get("frame") {
             let child = browser::frame_session(cdp, &session, frame_id)?;
             let scope = child.as_deref().unwrap_or(&session);
-            let value = browser::evaluate_in_frame(cdp, scope, frame_id, &expression).or_else(|err| {
+            let value = browser::evaluate_called(cdp, scope, Some(frame_id), &expression).or_else(|err| {
                 retry_await(err, &expression, |source| {
-                    browser::evaluate_in_frame(cdp, scope, frame_id, source)
+                    browser::evaluate_called(cdp, scope, Some(frame_id), source)
                 })
             });
             if let Some(child) = child.as_deref() {
@@ -901,9 +901,9 @@ fn cmd_eval(
             }
             value?
         } else {
-            browser::evaluate(cdp, &session, &expression, true).or_else(|err| {
+            browser::evaluate_called(cdp, &session, None, &expression).or_else(|err| {
                 retry_await(err, &expression, |source| {
-                    browser::evaluate(cdp, &session, source, true)
+                    browser::evaluate_called(cdp, &session, None, source)
                 })
             })?
         };

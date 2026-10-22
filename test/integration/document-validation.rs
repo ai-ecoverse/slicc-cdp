@@ -17,6 +17,7 @@ struct Backend {
     context_origin: Option<Value>,
     next_worker_url: Option<String>,
     navigation_event: bool,
+    block_during_execution: bool,
     attach_event: Option<Value>,
     event_loader: String,
     event_session: Option<String>,
@@ -62,7 +63,16 @@ impl Transport for Fake {
                 backend.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":7,"uniqueId":"child-context","name":"child-world","origin":"https://ordinary.example","auxData":{"frameId":"CHILD","isDefault":false}}}}).to_string());
                 json!({})
             }
+            "Target.detachFromTarget" => {
+                if backend.block_during_execution {
+                    backend.inbox.push_front(json!({"method":"Target.detachedFromTarget","params":{"sessionId":call["params"]["sessionId"]}}).to_string());
+                }
+                json!({})
+            }
             "Runtime.evaluate" => {
+                if backend.block_during_execution {
+                    backend.inbox.push_back(json!({"method":"Page.frameNavigated","sessionId":call["sessionId"],"params":{"frame":{"id":"F","loaderId":"LPROTECTED","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai"}}}).to_string());
+                }
                 if let Some(event) = backend.attach_event.take() { backend.inbox.push_back(event.to_string()); }
                 if let Some(next) = backend.next_tree.take() { backend.tree = next; }
                 if let Some(url) = backend.next_worker_url.take() { backend.worker.as_mut().unwrap()["url"] = json!(url); }
@@ -97,7 +107,7 @@ impl Transport for Fake {
 
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
-        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, context_origin:None, next_worker_url:None, navigation_event:false, attach_event:None,
+        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, attach_event:None,
         event_loader:"L2".into(), event_session:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
@@ -149,14 +159,20 @@ fn ordinary_navigation_readiness_and_settings_do_not_require_frame_reads() {
         ("Page.navigateToHistoryEntry", json!({"entryId":1})),
         ("Runtime.enable", json!({})), ("DOM.enable", json!({})),
         ("Network.enable", json!({})), ("Accessibility.enable", json!({})),
-        ("Network.setExtraHTTPHeaders", json!({"headers":{"X-Test":"ordinary"}})),
-        ("Emulation.setFocusEmulationEnabled", json!({"enabled":true})),
         ("Runtime.evaluate", json!({"expression":"document.readyState","returnByValue":true})),
         ("Runtime.evaluate", json!({"expression":"document.readyState === 'complete' ? location.href : ''","returnByValue":true})),
         ("Runtime.evaluate", json!({"expression":"0","returnByValue":true})),
-        ("Page.addScriptToEvaluateOnNewDocument", json!({"source":"globalThis.ready=true"})),
         ("Target.activateTarget", json!({"targetId":"T"})),
     ] { cdp.call(method, params, Some(&session)).unwrap(); }
+    for (method, params) in [
+        ("Network.setExtraHTTPHeaders", json!({"headers":{"X-Test":"ordinary"}})),
+        ("Emulation.setFocusEmulationEnabled", json!({"enabled":true})),
+        ("Page.addScriptToEvaluateOnNewDocument", json!({"source":"globalThis.ready=true"})),
+    ] {
+        let from = backend.borrow().calls.len();
+        refused(cdp.call(method, params, Some(&session)));
+        assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == method));
+    }
     assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Page.getFrameTree"));
     refused(cdp.call("DOM.getDocument", json!({}), Some(&session)));
 }
@@ -497,6 +513,37 @@ fn current_policy_is_still_checked_when_a_loader_id_is_unchanged() {
     next["frameTree"]["frame"]["securityOrigin"] = json!("https://seven.sliccy.ai");
     backend.borrow_mut().next_tree = Some(next);
     refused(cdp.call("DOM.getDocument", json!({}), Some(&session)));
+}
+
+#[test]
+fn pinned_ordinary_results_are_received_before_guard_requested_detachment() {
+    let (mut cdp, backend) = fixture();
+    let session = attach(&mut cdp, "T");
+    backend.borrow_mut().block_during_execution = true;
+    let result = cdp.call("Runtime.evaluate", json!({"expression":"location.href"}), Some(&session)).unwrap();
+    assert_eq!(result["result"]["value"], "document-value");
+    assert!(cdp.session_blocked(&session));
+    assert!(backend.borrow().calls.iter().any(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == session));
+    let from = backend.borrow().calls.len();
+    refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+    assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+}
+
+#[test]
+fn nonpersisting_compilation_is_bound_to_verified_private_contexts() {
+    let (mut cdp, backend) = fixture();
+    let session = attach(&mut cdp, "T");
+    let from = backend.borrow().calls.len();
+    cdp.call("Runtime.compileScript", json!({"expression":"() => document.title","persistScript":false,"sourceURL":""}), Some(&session)).unwrap();
+    let state = backend.borrow();
+    let compile = state.calls[from..].iter().find(|call| call["method"] == "Runtime.compileScript").unwrap();
+    assert_ne!(compile["sessionId"], session);
+    assert_eq!(compile["params"]["executionContextId"], 1);
+    assert!(compile["params"].get("uniqueContextId").is_none());
+    drop(state);
+    let from = backend.borrow().calls.len();
+    refused(cdp.call("Runtime.compileScript", json!({"expression":"document.title","persistScript":true}), Some(&session)));
+    assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.compileScript"));
 }
 
 #[test]

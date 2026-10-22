@@ -20,17 +20,81 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn classify(url: &str) -> Result<Start, String> {
+pub const DEFAULT_PORT: u16 = 9222;
+
+fn classify(raw: &str) -> Result<Start, String> {
+    let Some(url) = with_scheme(raw) else {
+        return Err(format!(
+            "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://)\n"
+        ));
+    };
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("ws://") || lower.starts_with("wss://") {
-        Ok(Start::Direct(url.to_string()))
+    if let Some(http) = pathless_socket(&url) {
+        Ok(Start::Discover(discovery_url(&http)))
+    } else if lower.starts_with("ws://") || lower.starts_with("wss://") {
+        Ok(Start::Direct(url))
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        Ok(Start::Discover(discovery_url(url)))
+        Ok(Start::Discover(discovery_url(&url)))
     } else {
         Err(format!(
-            "unsupported CDP URL \"{url}\" (expected ws://, wss://, http://, or https://)\n"
+            "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://)\n"
         ))
     }
+}
+
+pub fn with_scheme(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.contains("://") {
+        return Some(raw.to_string());
+    }
+    if raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        let port: u16 = raw.parse().ok().filter(|port| *port != 0)?;
+        return Some(format!("http://localhost:{port}"));
+    }
+    if raw.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Some(format!("http://[{raw}]:{DEFAULT_PORT}"));
+    }
+    let cut = raw.find(['/', '?', '#']).unwrap_or(raw.len());
+    let (authority, rest) = raw.split_at(cut);
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, after) = inner.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        let port = match after {
+            "" => None,
+            text => Some(text.strip_prefix(':')?),
+        };
+        (format!("[{host}]"), port)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => (authority.to_string(), None),
+        }
+    };
+    if host.is_empty() || host.contains('@') {
+        return None;
+    }
+    let port = match port {
+        Some(text) => text.parse::<u16>().ok().filter(|port| *port != 0)?,
+        None => DEFAULT_PORT,
+    };
+    Some(format!("http://{host}:{port}{rest}"))
+}
+
+fn pathless_socket(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let http = match scheme.to_ascii_lowercase().as_str() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return None,
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() || authority.contains(['/', '?', '#']) {
+        return None;
+    }
+    Some(format!("{http}://{authority}"))
 }
 
 pub fn discovery_url(http_url: &str) -> String {
@@ -149,6 +213,44 @@ mod tests {
             append_runtime("ws://127.0.0.1:9222/p", None),
             "ws://127.0.0.1:9222/p"
         );
+    }
+
+    #[test]
+    fn every_spelling_of_localhost_is_a_cdp_endpoint() {
+        let discover = |url: &str| Start::Discover(url.to_string());
+        for (raw, want) in [
+            ("9222", "http://localhost:9222/json/version"),
+            ("9444", "http://localhost:9444/json/version"),
+            ("localhost", "http://localhost:9222/json/version"),
+            ("localhost:9444", "http://localhost:9444/json/version"),
+            ("127.0.0.1:9444", "http://127.0.0.1:9444/json/version"),
+            ("0.0.0.0:9444", "http://0.0.0.0:9444/json/version"),
+            ("::1", "http://[::1]:9222/json/version"),
+            ("[::1]", "http://[::1]:9222/json/version"),
+            ("[::1]:9444", "http://[::1]:9444/json/version"),
+            ("localhost:9444/json/version", "http://localhost:9444/json/version"),
+            ("http://localhost:9444", "http://localhost:9444/json/version"),
+            ("ws://localhost:9444", "http://localhost:9444/json/version"),
+            ("ws://[::1]:9444/", "http://[::1]:9444/json/version"),
+            ("wss://example.test:9444", "https://example.test:9444/json/version"),
+        ] {
+            assert_eq!(choose_start(Some(raw), None).unwrap(), discover(want), "{raw}");
+        }
+        assert_eq!(
+            choose_start(Some("ws://localhost:9444/devtools/browser/x"), None).unwrap(),
+            Start::Direct("ws://localhost:9444/devtools/browser/x".to_string())
+        );
+        assert_eq!(
+            choose_start(Some("ws://localhost:9444?x=1"), None).unwrap(),
+            Start::Direct("ws://localhost:9444?x=1".to_string())
+        );
+        for bad in ["0", "70000", "localhost:x", "[::1", "[nope]:9444", "[::1]x", "[::1]:", "a@b:9444", ":9444", "ftp://x"] {
+            assert!(choose_start(Some(bad), None).is_err(), "{bad}");
+        }
+        assert_eq!(with_scheme("  "), None);
+        assert_eq!(pathless_socket("http://x"), None);
+        assert_eq!(pathless_socket("ws://"), None);
+        assert_eq!(pathless_socket("nothing"), None);
     }
 
     #[test]

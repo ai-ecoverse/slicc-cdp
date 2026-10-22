@@ -294,7 +294,7 @@ fn all_visible_remote_handles_remain_usable() {
     }
     cdp.call(
         "Runtime.compileScript",
-        json!({"expression":"1","executionContextId":1}),
+        json!({"expression":"1","executionContextId":1,"persistScript":false}),
         Some("S"),
     )
     .unwrap();

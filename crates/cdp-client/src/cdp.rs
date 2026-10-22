@@ -111,6 +111,7 @@ pub struct Cdp {
     created_contexts: BTreeSet<(String, i64)>,
     cached_documents: BTreeMap<String, DocumentState>,
     paused_documents: BTreeSet<(String, String)>,
+    executing_sessions: BTreeSet<String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
@@ -172,6 +173,7 @@ impl Cdp {
             created_contexts: BTreeSet::new(),
             cached_documents: BTreeMap::new(),
             paused_documents: BTreeSet::new(),
+            executing_sessions: BTreeSet::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
@@ -338,17 +340,25 @@ impl Cdp {
         let checks = self.prepare(method, &params, session_id)?;
         let pinned = self.pin_execution(method, &params, session_id, &checks)?;
         let object_pin = method == "Runtime.callFunctionOn" && params.get("objectId").is_some() && !checks.is_empty();
-        let executed = pinned.is_some() || object_pin;
+        let executed = pinned.is_some() && method != "Runtime.compileScript" || object_pin;
         let mut sent = params.clone();
         if let Some(unique) = &pinned {
             sent.as_object_mut().ok_or_else(|| self.refusal())?.remove("contextId");
             sent.as_object_mut().unwrap().remove("executionContextId");
             sent.as_object_mut().unwrap().remove("executionContextUniqueId");
             sent.as_object_mut().unwrap().remove("executionContextName");
-            sent["uniqueContextId"] = json!(unique);
+            if method == "Runtime.compileScript" {
+                let target = session_id.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
+                let guard = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)).ok_or_else(|| self.refusal())?;
+                let proof = self.context_proofs.get(&(guard.clone(), unique.clone())).ok_or_else(|| self.refusal())?;
+                sent["executionContextId"] = json!(proof.id);
+            } else { sent["uniqueContextId"] = json!(unique); }
         }
+        let compile_session = if method == "Runtime.compileScript" {
+            session_id.and_then(|session| self.session_target(session)).and_then(|target| self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target))).cloned()
+        } else { None };
         let frame_epoch = self.frame_epoch;
-        let result = self.raw_call_execution(method, sent, session_id, timeout, executed)?;
+        let result = self.raw_call_execution(method, sent, compile_session.as_deref().or(session_id), timeout, executed)?;
         if content_command(method, &params) == Some(true) && !executed {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"))?;
         }
@@ -467,6 +477,9 @@ impl Cdp {
         }
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
+        }
+        if shield::persistent_capability(method) {
+            return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
@@ -638,7 +651,7 @@ impl Cdp {
     }
 
     fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &[(String, DocumentState)]) -> Result<Option<String>, String> {
-        if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") || checks.is_empty() { return Ok(None) }
+        if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.compileScript") || checks.is_empty() { return Ok(None) }
         if method == "Runtime.callFunctionOn" && params.get("objectId").is_some() { return Ok(None) }
         let session = session.ok_or_else(|| self.refusal())?;
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
@@ -1302,6 +1315,10 @@ impl Cdp {
                 self.paused.push_back(paused);
             }
         }
+        if !self.executing_sessions.contains(session_id) { self.detach_blocked(session_id); }
+    }
+
+    fn detach_blocked(&mut self, session_id: &str) {
         let _ = self.send("Fetch.disable", json!({}), Some(session_id));
         let _ = self.send(
             "Target.detachFromTarget",
@@ -2154,6 +2171,24 @@ impl Cdp {
         timeout: Duration,
         pinned: bool,
     ) -> Result<Value, String> {
+        let active = pinned.then_some(session_id).flatten();
+        if let Some(session) = active { self.executing_sessions.insert(session.to_string()); }
+        let result = self.raw_call_wait(method, params, session_id, timeout, pinned);
+        if let Some(session) = active {
+            self.executing_sessions.remove(session);
+            if self.blocked.contains(session) { self.detach_blocked(session); }
+        }
+        result
+    }
+
+    fn raw_call_wait(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        pinned: bool,
+    ) -> Result<Value, String> {
         let frame_epoch = self.frame_epoch;
         let id = self.send(method, params, session_id)?;
         let deadline = Instant::now() + timeout;
@@ -2529,10 +2564,13 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
         && matches!(params.get("expression").and_then(Value::as_str), Some("document.readyState" | "0" | "document.readyState === 'complete' ? location.href : ''"))
         && params.as_object().is_some_and(|object| object.keys().all(|key| matches!(key.as_str(), "expression" | "returnByValue")))
     { return Some(false) }
+    if method == "Runtime.compileScript" && params.get("persistScript").and_then(Value::as_bool) != Some(false) { return None }
     if method == "Page.addScriptToEvaluateOnNewDocument" {
         return Some(params.get("runImmediately").is_some_and(|value| value != &json!(false)));
     }
     match method {
+        "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
+        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" => None,
         "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.awaitPromise" | "Runtime.compileScript" | "Runtime.runScript"
         | "Runtime.getProperties" | "Runtime.getExceptionDetails" | "Runtime.queryObjects" | "Runtime.globalLexicalScopeNames" | "Runtime.getHeapUsage" | "Runtime.discardConsoleEntries"
         | "DOM.collectClassNamesFromSubtree" | "DOM.copyTo" | "DOM.describeNode" | "DOM.focus" | "DOM.getAttributes" | "DOM.getBoxModel" | "DOM.getContentQuads"
@@ -2902,6 +2940,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
+    include!("persistent_test.rs");
     include!("redirect_test.rs");
     include!("redirect_matrix_test.rs");
     include!("redirect_race_test.rs");
