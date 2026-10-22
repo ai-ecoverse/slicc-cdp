@@ -114,6 +114,49 @@ test('eval calls a function expression on its own object and prints what it retu
   });
 });
 
+test('eval normalizes function expressions without turning scripts into expressions', async () => {
+  for (const [source, normalized, framed] of [
+    ['function () {}', '(function () {}\n)', false],
+    ['function named() { return 4; }', '(function named() { return 4; }\n)', false],
+    ['async function () {}', '(async function () {}\n)', true],
+    [
+      'function helper() { return 7; }; helper()',
+      'function helper() { return 7; }; helper()',
+      false,
+    ],
+  ]) {
+    const answers = remote(
+      () => ({ type: 'function', objectId: 'FN' }),
+      () => ({ type: 'undefined' })
+    );
+    const intercept = (message, send) => {
+      if (message.method === 'Runtime.compileScript') {
+        send({
+          id: message.id,
+          sessionId: message.sessionId,
+          result: source.includes('; helper()')
+            ? { exceptionDetails: { text: 'SyntaxError' } }
+            : {},
+        });
+        return true;
+      }
+      return answers(message, send);
+    };
+    await withFake(intercept, async (fake, pw) => {
+      const result = await pw(['eval', ...(framed ? ['--frame', 'TAB'] : []), source]);
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stdout, 'undefined\n');
+      const [compiled] = sent(fake, 'Runtime.compileScript');
+      assert.equal(compiled.params.persistScript, false);
+      assert.equal(compiled.params.executionContextId, framed ? 7 : undefined);
+      const [evaluated] = sent(fake, 'Runtime.evaluate').filter(
+        (call) => call.params.objectGroup === 'slicc-eval'
+      );
+      assert.equal(evaluated.params.expression, normalized);
+    });
+  }
+});
+
 test('eval of a plain expression prints its value as before', async () => {
   const values = [
     [{ type: 'number', value: 2, description: '2' }, '2\n', 0],
@@ -208,12 +251,17 @@ for (const kind of ['native', 'kernel']) {
         ['() => 1', '1'],
         ['async () => { await new Promise((r) => setTimeout(r, 10)); return 2; }', '2'],
         ['function () { return document.title; }', 'Callback'],
+        ['function () {}', 'undefined'],
+        ['function named() { return 4; }', '4'],
+        ['async function () {}', 'undefined'],
         ['async function () { return [1, 2]; }', '[\n  1,\n  2\n]'],
         ['() => ({ a: 1 })', '{\n  "a": 1\n}'],
         ['() => undefined', 'undefined'],
         ['1 + 1', '2'],
         ['({ a: 1 })', '{\n  "a": 1\n}'],
         ['document.title = "page"; document.title', 'page'],
+        ['function helper() { return 7; }; helper()', '7'],
+        ['window.runs = (window.runs || 0) + 1; window.runs', '1'],
         ['await Promise.resolve(3)', '3'],
         ['typeof (() => 1)', 'function'],
       ];
@@ -230,7 +278,7 @@ for (const kind of ['native', 'kernel']) {
         assert.match(result.stderr, /nope/);
       });
     } finally {
-      await runner?.close().catch(() => {});
+      await Promise.resolve(runner?.close()).catch(() => {});
       await browser?.close().catch(() => {});
       await site.close().catch(() => {});
     }

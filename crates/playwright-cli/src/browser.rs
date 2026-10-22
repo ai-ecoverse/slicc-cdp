@@ -491,7 +491,19 @@ pub fn evaluate_called(
         params["contextId"] = world
             .get("executionContextId")
             .cloned()
-            .ok_or_else(|| "Page.createIsolatedWorld returned no executionContextId\n".to_string())?;
+            .ok_or("Page.createIsolatedWorld returned no executionContextId\n".to_string())?;
+    }
+    let source = expression.trim();
+    if source.starts_with("function") || source.starts_with("async function") {
+        let wrapped = format!("({source}\n)");
+        let mut compile = json!({ "expression": wrapped, "sourceURL": "", "persistScript": false });
+        if let Some(context) = params.get("contextId") {
+            compile["executionContextId"] = context.clone();
+        }
+        let parsed = cdp.call("Runtime.compileScript", compile, Some(session))?;
+        if parsed.get("exceptionDetails").is_none() {
+            params["expression"] = json!(wrapped);
+        }
     }
     let value = cdp
         .call("Runtime.evaluate", params, Some(session))
