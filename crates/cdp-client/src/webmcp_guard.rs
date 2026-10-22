@@ -15,6 +15,8 @@ struct Arm {
     admitted: usize,
     revoked: bool,
     pending_contexts: BTreeMap<i64, Instant>,
+    pending_frames: BTreeMap<String, (String, Instant)>,
+    accepted: BTreeSet<(String, String, String)>,
     loaders: BTreeMap<String, String>,
     documents: BTreeMap<String, Value>,
 }
@@ -91,7 +93,7 @@ impl Cdp {
 
     pub(super) fn webmcp_sweep(&mut self) {
         let now = Instant::now();
-        let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && arm.pending_contexts.values().any(|deadline| *deadline <= now)).map(|(session, _)| session.clone()).collect::<Vec<_>>();
+        let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
             self.webmcp_revoke(&session);
             let _ = self.send("Debugger.resume", json!({}), Some(&session));
@@ -115,7 +117,7 @@ impl Cdp {
         let source = format!("const {bridge} = (function {GATE}() {{ 'use strict'; let {PERMIT} = false; debugger; if (!{PERMIT}) return; return {SHIM}; }})();");
         let mut loaders = BTreeMap::new();
         if let Some(tree) = seed { Self::webmcp_loaders(&tree["frameTree"], &mut loaders); }
-        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), loaders, documents: BTreeMap::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
         self.raw_call("Runtime.disable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Runtime.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.worlds.enable(session);
@@ -134,10 +136,10 @@ impl Cdp {
         }
         if !pending {
             let until = Instant::now() + Duration::from_secs(2);
-            while self.webmcp.arms.get(session).is_some_and(|arm| arm.admitted == 0 && !arm.revoked) && Instant::now() < until {
+            while self.webmcp.arms.get(session).is_some_and(|arm| (arm.admitted == 0 || !arm.pending_contexts.is_empty()) && !arm.revoked) && Instant::now() < until {
                 if !self.pump(until)? { break; }
             }
-            if self.webmcp.arms.get(session).is_none_or(|arm| arm.admitted == 0 || arm.revoked) {
+            if self.webmcp.arms.get(session).is_none_or(|arm| arm.admitted == 0 || !arm.pending_contexts.is_empty() || arm.revoked) {
                 self.webmcp_revoke(session);
                 let _ = self.raw_call("Debugger.resume", json!({}), Some(session), Duration::from_secs(2));
                 return Err(self.refusal());
@@ -288,7 +290,14 @@ impl Cdp {
         if admitted {
             if let Some(arm) = self.webmcp.arms.get_mut(session) {
                 arm.admitted += 1;
-                if let Ok((_, _, context)) = &verified { arm.pending_contexts.remove(context); }
+                if let Ok((_, _, id)) = &verified {
+                    arm.pending_contexts.remove(id);
+                    if let Some(context) = self.webmcp.contexts.get(&(session.to_string(), *id)) {
+                        arm.pending_frames.remove(&context.frame);
+                        if arm.accepted.len() >= 1024 { arm.accepted.clear(); }
+                        arm.accepted.insert((context.frame.clone(), context.loader.clone(), context.unique.clone()));
+                    }
+                }
             }
             self.webmcp.samples.push(started.elapsed().as_micros());
             if self.webmcp.quarantined.remove(session) {
@@ -316,7 +325,16 @@ impl Cdp {
         self.webmcp.quarantined.insert(child.to_string());
         self.webmcp.parents.insert(child.to_string(), parent.to_string());
         self.targets.insert(target.to_string(), info.clone());
-        let installed = allowed && self.touch(target).is_ok() && !self.is_protected_target(target) && self.webmcp_install(child, true, None).is_ok();
+        let installed = (|| -> Result<(), String> {
+            if !allowed { return Err(self.refusal()); }
+            self.touch(target)?;
+            if self.is_protected_target(target) { return Err(self.refusal()); }
+            let guard = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
+            let seed = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP)?;
+            if !self.webmcp_tree_verified(&seed, None) { return Err(self.refusal()); }
+            self.webmcp_install(child, true, Some(&seed))?;
+            Ok(())
+        })().is_ok();
         let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), Duration::from_secs(2));
         if !installed {
             self.webmcp_revoke(child);
@@ -348,16 +366,39 @@ impl Cdp {
             }
         }
         if method == "Page.frameNavigated" {
+            let invalid = !self.webmcp_tree_verified(&json!({"frameTree":{"frame":value["params"]["frame"]}}), None);
+            if invalid { self.webmcp_revoke(session); }
             if let Some(arm) = self.webmcp.arms.get_mut(session) {
-                Self::webmcp_loaders(&json!({"frame":value["params"]["frame"]}), &mut arm.loaders);
+                let frame = &value["params"]["frame"];
+                Self::webmcp_loaders(&json!({"frame":frame}), &mut arm.loaders);
+                if let (Some(id), Some(loader)) = (frame.get("id").and_then(Value::as_str), frame.get("loaderId").and_then(Value::as_str)) {
+                    let restored = value.pointer("/params/type").and_then(Value::as_str) == Some("BackForwardCacheRestore") && arm.accepted.iter().any(|(known, generation, _)| known == id && generation == loader);
+                    if restored { arm.pending_frames.remove(id); }
+                    else { arm.pending_frames.insert(id.to_string(), (loader.to_string(), Instant::now() + Duration::from_secs(2))); }
+                }
+            }
+        }
+        if method == "Page.frameDetached" {
+            if let Some(frame) = value.pointer("/params/frameId").and_then(Value::as_str) {
+                if let Some(arm) = self.webmcp.arms.get_mut(session) {
+                    arm.pending_frames.remove(frame);
+                    arm.loaders.remove(frame);
+                    for ((owner, id), context) in &self.webmcp.contexts { if owner == session && context.frame == frame { arm.pending_contexts.remove(id); } }
+                }
+                self.webmcp.contexts.retain(|(owner, _), context| owner != session || context.frame != frame);
             }
         }
         if method == "Runtime.executionContextCreated" {
             let context = &value["params"]["context"];
             if context.pointer("/auxData/isDefault").and_then(Value::as_bool) == Some(true) {
                 if let Some(id) = context.get("id").and_then(Value::as_i64) {
+                    let frame = context.pointer("/auxData/frameId").and_then(Value::as_str).unwrap_or("");
+                    let unique = context.get("uniqueId").and_then(Value::as_str).unwrap_or("");
                     if let Some(arm) = self.webmcp.arms.get_mut(session) {
-                        arm.pending_contexts.insert(id, Instant::now() + Duration::from_secs(2));
+                        let loader = arm.loaders.get(frame).map(String::as_str).unwrap_or("");
+                        if !arm.accepted.contains(&(frame.to_string(), loader.to_string(), unique.to_string())) {
+                            arm.pending_contexts.insert(id, Instant::now() + Duration::from_secs(2));
+                        }
                     }
                     self.webmcp.contexts.insert((session.to_string(), id), Context {
                         frame: context.pointer("/auxData/frameId").and_then(Value::as_str).unwrap_or("").to_string(),

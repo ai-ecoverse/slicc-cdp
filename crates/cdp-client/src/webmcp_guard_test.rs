@@ -252,6 +252,57 @@ fn holder_missing_pause_forged_gate_unknown_context_and_verification_error_fail_
 }
 
 #[test]
+fn holder_future_document_missing_pause_is_removed_even_without_context_events() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp("H").unwrap();
+    let mut next = frame("https://ordinary.test/next");
+    next["frameTree"]["frame"]["loaderId"] = json!("NEXT");
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":next["frameTree"]["frame"]})));
+    cdp.webmcp.arms.get_mut("H").unwrap().pending_frames.get_mut("F").unwrap().1 = Instant::now();
+    cdp.webmcp_sweep();
+    assert!(!cdp.webmcp_alive("H"));
+    assert!(!state.borrow().installed);
+}
+
+#[test]
+fn holder_known_ordinary_bfcache_restore_keeps_an_inert_installer() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp("H").unwrap();
+    cdp.absorb(event("Runtime.executionContextsCleared", json!({})));
+    cdp.absorb(event("Page.frameNavigated", json!({"type":"BackForwardCacheRestore","frame":state.borrow().tree["frameTree"]["frame"]})));
+    cdp.absorb(context("F", "https://ordinary.test"));
+    let arm = cdp.webmcp.arms.get("H").unwrap();
+    assert!(arm.pending_frames.is_empty());
+    assert!(arm.pending_contexts.is_empty());
+    cdp.webmcp_sweep();
+    assert!(cdp.webmcp_alive("H"));
+}
+
+#[test]
+fn holder_changed_loader_and_context_destroyed_before_pause_are_denied() {
+    for destroyed in [false, true] {
+        let (mut cdp, state) = client();
+        cdp.start_webmcp("H").unwrap();
+        state.borrow_mut().api = false;
+        state.borrow_mut().tree["frameTree"]["frame"]["loaderId"] = json!("NEXT");
+        if destroyed { cdp.absorb(event("Runtime.executionContextDestroyed", json!({"executionContextId":7}))); }
+        cdp.absorb(paused());
+        no_protected_api(&mut cdp, &state);
+    }
+}
+
+#[test]
+fn holder_detached_frame_clears_its_missing_pause_deadline() {
+    let (mut cdp, _) = client();
+    cdp.start_webmcp("H").unwrap();
+    cdp.absorb(context("REMOVED", "https://ordinary.test"));
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":{"id":"REMOVED","loaderId":"CHILD","url":"https://ordinary.test/frame","securityOrigin":"https://ordinary.test","parentId":"F"}})));
+    cdp.absorb(event("Page.frameDetached", json!({"frameId":"REMOVED"})));
+    assert!(cdp.webmcp.arms["H"].pending_frames.is_empty());
+    assert!(!cdp.webmcp.contexts.values().any(|context| context.frame == "REMOVED"));
+}
+
+#[test]
 fn ordinary_documents_without_holder_pay_no_debugger_or_init_overhead() {
     let (mut cdp, state) = client();
     cdp.call("Runtime.evaluate", json!({"expression":"1"}), Some("H")).unwrap();

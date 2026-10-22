@@ -1,74 +1,113 @@
 import vm from 'node:vm';
 import { fakeCdp } from './fake-cdp.mjs';
 
-export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
+export async function webmcpBackend({ policy = '', definitions = [], children = [] } = {}) {
   let next = 0;
-  let page;
+  let pages;
   const sessions = new Map();
   const scripts = new Map();
   const permitted = new Map();
-  const makePage = (loader) => {
-    class Document {}
-    class Navigator {}
-    const document = new Document();
-    const navigator = new Navigator();
-    const location = { origin: 'https://ordinary.test' };
-    const window = { frames: [], document, location };
-    const context = vm.createContext({
-      Document,
-      Navigator,
-      document,
-      navigator,
-      window,
-      location,
-      isSecureContext: true,
-      EventTarget,
-      Event,
-      AbortController,
-      DOMException,
-    });
-    return { document, context, loader, window };
+  const paused = new Map();
+  const queues = new Map();
+  const configs = [
+    { id: 'TAB', origin: 'https://ordinary.test', policy, definitions },
+    ...children,
+  ];
+  const reset = (loader) => {
+    pages = new Map(
+      configs.map((config, index) => {
+        class Document {}
+        class Navigator {}
+        const document = new Document();
+        const navigator = new Navigator();
+        const location = { origin: config.origin };
+        const window = { frames: [], document, location };
+        const context = vm.createContext({
+          Document,
+          Navigator,
+          document,
+          navigator,
+          window,
+          location,
+          isSecureContext: true,
+          EventTarget,
+          Event,
+          AbortController,
+          DOMException,
+        });
+        return [
+          config.id,
+          {
+            ...config,
+            document,
+            context,
+            loader: `${loader}-${config.id}`,
+            window,
+            main: index * 2 + 1,
+            isolated: index * 2 + 2,
+          },
+        ];
+      })
+    );
+    pages.get('TAB').window.frames = children.map((child) => pages.get(child.id).window);
   };
-  page = makePage('L');
-  const frame = () => ({
-    id: 'TAB',
+  reset('L');
+  const frame = (page) => ({
+    id: page.id,
     loaderId: page.loader,
-    url: 'https://ordinary.test/',
-    securityOrigin: 'https://ordinary.test',
+    url: `${page.origin}/`,
+    securityOrigin: page.origin,
+    ...(page.id === 'TAB' ? {} : { parentId: 'TAB' }),
+  });
+  const tree = () => ({
+    frame: frame(pages.get('TAB')),
+    childFrames: children.map((child) => ({ frame: frame(pages.get(child.id)) })),
   });
   const fake = await fakeCdp({
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) => send({ method, params, sessionId: peer });
-      const created = (peer) =>
-        event(
-          'Runtime.executionContextCreated',
-          {
-            context: {
-              id: 1,
-              uniqueId: `main-${page.loader}`,
-              origin: 'https://ordinary.test',
-              auxData: { frameId: 'TAB', isDefault: true },
+      const created = (peer) => {
+        for (const page of pages.values())
+          event(
+            'Runtime.executionContextCreated',
+            {
+              context: {
+                id: page.main,
+                uniqueId: `main-${page.loader}`,
+                origin: page.origin,
+                auxData: { frameId: page.id, isDefault: true },
+              },
             },
-          },
-          peer
-        );
+            peer
+          );
+      };
       const pause = (peer) => {
-        event('Debugger.scriptParsed', { scriptId: peer, executionContextId: 1 }, peer);
+        const frameId = queues.get(peer)?.shift();
+        if (!frameId) return false;
+        paused.set(peer, frameId);
+        const page = pages.get(frameId);
+        const scriptId = `${peer}-${frameId}`;
+        event('Debugger.scriptParsed', { scriptId, executionContextId: page.main }, peer);
         event(
           'Debugger.paused',
           {
             callFrames: [
               {
-                callFrameId: peer,
+                callFrameId: scriptId,
                 functionName: '__slicc_webmcp_gate',
-                location: { scriptId: peer, lineNumber: 0, columnNumber: 0 },
+                location: { scriptId, lineNumber: 0, columnNumber: 0 },
               },
             ],
           },
           peer
         );
+        return true;
+      };
+      const begin = (peer) => {
+        queues.set(peer, [...pages.keys()]);
+        pause(peer);
       };
       if (method === 'Target.attachToTarget') {
         const peer = `PEER${++next}`;
@@ -83,7 +122,7 @@ export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
         return true;
       }
       if (method === 'Page.getFrameTree') {
-        answer({ frameTree: { frame: frame() } });
+        answer({ frameTree: tree() });
         return true;
       }
       if (method === 'Browser.getVersion') {
@@ -96,26 +135,46 @@ export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
         return true;
       }
       if (method === 'Page.createIsolatedWorld') {
+        const page = pages.get(params.frameId);
         event('Runtime.executionContextCreated', {
           context: {
-            id: 2,
+            id: page.isolated,
             uniqueId: `isolated-${page.loader}`,
-            origin: 'https://ordinary.test',
+            origin: page.origin,
             name: 'slicc-webmcp',
-            auxData: { frameId: 'TAB', isDefault: false },
+            auxData: { frameId: page.id, isDefault: false },
           },
         });
-        answer({ executionContextId: 2 });
+        answer({ executionContextId: page.isolated });
         return true;
       }
       if (method === 'Page.getPermissionsPolicyState') {
         answer({ states: [] });
         return true;
       }
+      if (method === 'DOM.getFrameOwner') {
+        answer({ backendNodeId: children.findIndex((child) => child.id === params.frameId) + 1 });
+        return true;
+      }
+      if (method === 'DOM.resolveNode') {
+        answer({ object: { type: 'object', objectId: `owner-${params.backendNodeId}` } });
+        return true;
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const index = Number(params.objectId.slice(6)) - 1;
+        const child = children[index];
+        answer({
+          result: {
+            type: 'object',
+            value: { index, allow: child.allow || '', srcOrigin: child.origin },
+          },
+        });
+        return true;
+      }
       if (method === 'Page.addScriptToEvaluateOnNewDocument') {
         scripts.set(sessionId, params.source);
         answer({ identifier: sessionId });
-        if (params.runImmediately) pause(sessionId);
+        if (params.runImmediately) begin(sessionId);
         return true;
       }
       if (method === 'Page.removeScriptToEvaluateOnNewDocument') {
@@ -134,7 +193,8 @@ export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
         return true;
       }
       if (method === 'Debugger.resume') {
-        if (permitted.get(sessionId) && scripts.has(sessionId)) {
+        const page = pages.get(paused.get(sessionId));
+        if (page && permitted.get(sessionId) && scripts.has(sessionId)) {
           vm.runInContext(
             scripts
               .get(sessionId)
@@ -142,43 +202,53 @@ export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
             page.context
           );
           permitted.set(sessionId, false);
-          if (page.loader !== 'L' && !page.loaded) {
+          if (!page.loader.startsWith('L-') && !page.loaded) {
             page.loaded = true;
-            for (const definition of definitions)
+            for (const definition of page.definitions || [])
               page.document.modelContext?.registerTool(definition);
-            for (const peer of sessions.keys())
-              event('Page.loadEventFired', { timestamp: 1 }, peer);
           }
         }
         answer({});
+        if (!pause(sessionId) && page?.loaded)
+          for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
         return true;
       }
       if (method === 'Page.reload') {
-        page = makePage(`RELOAD${next}`);
+        reset(`RELOAD${next}`);
         answer({});
         for (const peer of sessions.keys()) {
-          event('Page.frameNavigated', { frame: frame() }, peer);
+          for (const page of pages.values())
+            event('Page.frameNavigated', { frame: frame(page) }, peer);
           event('Runtime.executionContextsCleared', {}, peer);
           created(peer);
-          event(
-            'Network.responseReceived',
-            {
-              frameId: 'TAB',
-              loaderId: page.loader,
-              type: 'Document',
-              response: {
-                url: 'https://ordinary.test/',
-                status: 200,
-                headers: { 'permissions-policy': policy },
+          for (const page of pages.values())
+            event(
+              'Network.responseReceived',
+              {
+                frameId: page.id,
+                loaderId: page.loader,
+                type: 'Document',
+                response: {
+                  url: `${page.origin}/`,
+                  status: 200,
+                  headers: { 'permissions-policy': page.policy || '' },
+                },
               },
-            },
-            peer
-          );
-          if (scripts.has(peer)) pause(peer);
+              peer
+            );
+          if (scripts.has(peer)) begin(peer);
         }
         return true;
       }
       if (method === 'Runtime.evaluate') {
+        const page =
+          [...pages.values()].find(
+            (page) =>
+              params.uniqueContextId === `main-${page.loader}` ||
+              params.uniqueContextId === `isolated-${page.loader}` ||
+              params.contextId === page.main ||
+              params.contextId === page.isolated
+          ) || pages.get('TAB');
         if (params.expression === 'document.readyState') {
           answer({ result: { type: 'string', value: 'complete' } });
           return true;
@@ -193,14 +263,14 @@ export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
         });
         return true;
       }
-      if (method === 'Page.enable' || method === 'Network.enable' || method === 'Debugger.enable') {
-        answer({});
-        return true;
-      }
       if (
-        method === 'Debugger.resume' ||
-        method === 'Runtime.disable' ||
-        method === 'Target.setAutoAttach'
+        [
+          'Page.enable',
+          'Network.enable',
+          'Debugger.enable',
+          'Runtime.disable',
+          'Target.setAutoAttach',
+        ].includes(method)
       ) {
         answer({});
         return true;
@@ -209,17 +279,14 @@ export async function webmcpBackend({ policy = '', definitions = [] } = {}) {
     },
   });
   fake.targets.push({ targetId: 'TAB', url: 'https://ordinary.test/' });
-  const finishLoad = () => {
-    if (!page.document.modelContext) return false;
-    for (const definition of definitions) page.document.modelContext.registerTool(definition);
-    return true;
-  };
   return {
     ...fake,
     get page() {
-      return page;
+      return pages.get('TAB');
     },
-    finishLoad,
+    get pages() {
+      return pages;
+    },
     sessions,
     scripts,
   };

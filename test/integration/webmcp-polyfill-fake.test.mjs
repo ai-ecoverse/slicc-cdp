@@ -66,10 +66,11 @@ async function run(args, cwd, endpoint) {
   return process.ended;
 }
 
-async function fixture(policy, check) {
+async function fixture(policy, check, children = []) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-fake-'));
   const backend = await webmcpBackend({
     policy,
+    children,
     definitions: [
       {
         name: 'greet',
@@ -93,7 +94,16 @@ async function fixture(policy, check) {
   let holder;
   try {
     holder = launch(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, backend.url);
-    const status = await holder.ready;
+    let status;
+    try {
+      status = await holder.ready;
+    } catch (error) {
+      error.message += `\nCDP tail: ${backend.calls
+        .slice(-50)
+        .map((call) => `${call.method}:${call.sessionId || ''}`)
+        .join(', ')}`;
+      throw error;
+    }
     assert.equal(status.mode, 'polyfill');
     assert.equal(status.reloaded, true);
     assert.equal(JSON.stringify(status).includes('__wmcp_'), false);
@@ -143,6 +153,122 @@ await test('fake: holder reload, private bridge listing/calling, consequential g
     assert.equal(large.code, 0, large.stderr);
     assert.equal(large.stdout.trim().length, 65536);
   });
+});
+
+await test('fake: same-origin aggregation and explicit foreign exposure/delegation with ambiguous tool selection', async () => {
+  await fixture(
+    '',
+    async (backend, cwd) => {
+      const list = async (extra = []) => {
+        const result = await run(
+          ['webmcp-list', '--tab', 'TAB', '--json', ...extra],
+          cwd,
+          backend.url
+        );
+        assert.equal(result.code, 0, result.stderr);
+        return JSON.parse(result.stdout);
+      };
+      const ordinary = await list();
+      assert.equal(ordinary.length, 4);
+      assert.equal(ordinary.filter((tool) => tool.name === 'greet').length, 2);
+      const cross = await list([
+        '--from-origin',
+        'https://foreign.test',
+        '--from-origin',
+        'https://foreign.test/',
+      ]);
+      assert.equal(cross.length, 5);
+      assert.equal(cross.find((tool) => tool.name === 'foreign').origin, 'https://foreign.test');
+      assert.equal(
+        cross.some((tool) => tool.name === 'hidden'),
+        false
+      );
+      const ambiguous = await run(['webmcp-call', 'greet', '{}', '--tab', 'TAB'], cwd, backend.url);
+      assert.notEqual(ambiguous.code, 0);
+      assert.match(ambiguous.stderr, /ambiguous/);
+      const selected = await run(
+        ['webmcp-call', 'greet', '{}', '--tab', 'TAB', '--frame', 'SAME'],
+        cwd,
+        backend.url
+      );
+      assert.equal(selected.code, 0, selected.stderr);
+      assert.equal(selected.stdout.trim(), 'same-origin child');
+      const denied = await run(['webmcp-call', 'foreign', '{}', '--tab', 'TAB'], cwd, backend.url);
+      assert.equal(denied.code, 2);
+      const called = await run(
+        ['webmcp-call', 'foreign', '{}', '--tab', 'TAB', '--from-origin', 'https://foreign.test'],
+        cwd,
+        backend.url
+      );
+      assert.equal(called.code, 0, called.stderr);
+      assert.equal(called.stdout.trim(), 'foreign child');
+    },
+    [
+      {
+        id: 'SAME',
+        origin: 'https://ordinary.test',
+        definitions: [{ name: 'greet', execute: () => 'same-origin child' }],
+      },
+      {
+        id: 'CROSS',
+        origin: 'https://foreign.test',
+        allow: 'tools *',
+        definitions: [
+          { name: 'foreign', exposedTo: ['https://ordinary.test'], execute: () => 'foreign child' },
+          {
+            name: 'hidden',
+            exposedTo: ['https://other.test'],
+            execute: () => assert.fail('unexposed tool invoked'),
+          },
+        ],
+      },
+    ]
+  );
+});
+
+await test('fake: parent policy, child policy and absent iframe delegation each deny exposed foreign tools', async () => {
+  for (const [parentPolicy, childPolicy, allow] of [
+    ['tools=(self)', '', 'tools *'],
+    ['', 'tools=()', 'tools *'],
+    ['', '', ''],
+  ]) {
+    await fixture(
+      parentPolicy,
+      async (backend, cwd) => {
+        const listed = await run(
+          ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://foreign.test'],
+          cwd,
+          backend.url
+        );
+        assert.equal(listed.code, 0, listed.stderr);
+        assert.equal(
+          JSON.parse(listed.stdout).some((tool) => tool.name === 'foreign'),
+          false
+        );
+        const called = await run(
+          ['webmcp-call', 'foreign', '{}', '--tab', 'TAB', '--from-origin', 'https://foreign.test'],
+          cwd,
+          backend.url
+        );
+        assert.equal(called.code, 2);
+      },
+      [
+        {
+          id: 'CROSS',
+          origin: 'https://foreign.test',
+          policy: childPolicy,
+          allow,
+          definitions: [
+            {
+              name: 'foreign',
+              exposedTo: ['https://ordinary.test'],
+              execute: () => assert.fail('policy-denied tool invoked'),
+            },
+          ],
+        },
+      ]
+    );
+  }
 });
 
 await test('fake: tools Permissions Policy denies bridge listing and invocation', async () => {

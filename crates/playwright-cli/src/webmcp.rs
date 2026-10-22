@@ -5,10 +5,6 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
-pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -> Output {
-    list_from(cdp, state, tab, json, &[])
-}
-
 pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool, from: &[String]) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
@@ -80,6 +76,7 @@ fn format_list(tools: &Value) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+#[cfg(test)]
 pub fn call(
     cdp: &mut Cdp,
     state: &mut Session,
@@ -225,6 +222,7 @@ fn resolve(
     )
 }
 
+#[cfg(test)]
 fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     let expression = r#"(async () => {
   const tools = [];
@@ -270,7 +268,7 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-pub(crate) fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
+pub fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     let result = cdp.call("Browser.getVersion", json!({}), None).ok()?;
     let product = result.pointer("/product").and_then(|v| v.as_str()).unwrap_or("");
     let version_part = product
@@ -279,6 +277,7 @@ pub(crate) fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     version_part.split('.').next()?.parse().ok()
 }
 
+#[cfg(test)]
 fn native_webmcp_object_input(cdp: &mut Cdp, session: &str) -> bool {
     let chrome = chrome_major_version(cdp);
     if chrome.is_some_and(|v| v < 155) {
@@ -299,6 +298,7 @@ fn native_webmcp_object_input(cdp: &mut Cdp, session: &str) -> bool {
     native && chrome.is_some_and(|v| v >= 155)
 }
 
+#[cfg(test)]
 fn input_expression(input: &Value, native: bool) -> String {
     if native {
         format!("JSON.parse({})", json!(input.to_string()))
@@ -315,6 +315,7 @@ enum CallOutcome {
     Threw(String),
 }
 
+#[cfg(test)]
 fn evaluate_call(
     cdp: &mut Cdp,
     session: &str,
@@ -348,6 +349,7 @@ fn evaluate_call(
     parse_call_result(cdp, session, &expression)
 }
 
+#[cfg(test)]
 fn evaluate_call_force(
     cdp: &mut Cdp,
     session: &str,
@@ -375,6 +377,7 @@ fn evaluate_call_force(
     parse_call_result(cdp, session, &expression)
 }
 
+#[cfg(test)]
 fn parse_call_result(
     cdp: &mut Cdp,
     session: &str,

@@ -54,11 +54,11 @@ const meta = (t) => ({name:t.name,title:t.title || null,description:t.descriptio
 struct Scope {
     session: String,
     frame: String,
-    target: String,
     origin: String,
     loader: String,
     isolated: i64,
-    main: Option<i64>,
+    isolated_unique: String,
+    main: Option<String>,
     bridge: Option<String>,
     policy: Option<String>,
     path: Vec<usize>,
@@ -198,7 +198,12 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     let native = evaluate(cdp, &root_scope, "'modelContext' in Document.prototype", true)?.as_bool() == Some(true);
     let mut result = Vec::new();
     if native {
-        let selected = scopes.values().filter(|scope| (scope.origin == top || from.contains(&scope.origin)) && allowed(cdp, scope, &frames, &scopes, &owners).unwrap_or(false)).map(|scope| json!({"frameId":scope.frame,"origin":scope.origin,"path":scope.path})).collect::<Vec<_>>();
+        let mut selected = Vec::new();
+        for scope in scopes.values() {
+            if (scope.origin == top || from.contains(&scope.origin)) && allowed(cdp, scope, &frames, &scopes, &owners)? {
+                selected.push(json!({"frameId":scope.frame,"origin":scope.origin,"path":scope.path}));
+            }
+        }
         let expression = format!(r#"(async () => {{ 'use strict'; {CAP}
 try {{
  const api = document.modelContext;
@@ -269,8 +274,8 @@ fn decode_tools(value: &Value) -> Result<Vec<Value>, String> {
 fn evaluate(cdp: &mut Cdp, scope: &Scope, expression: &str, native: bool) -> Result<Value, String> {
     let before = cdp.webmcp_document(&scope.session, &scope.frame)?;
     if before.get("loaderId").and_then(Value::as_str) != Some(&scope.loader) || before.get("origin").and_then(Value::as_str) != Some(&scope.origin) { return Err("webmcp: document changed\n".into()); }
-    let context = if native { scope.isolated } else { scope.main.ok_or_else(|| "webmcp: unverified page context\n".to_string())? };
-    let response = cdp.call("Runtime.evaluate", json!({"expression":expression,"contextId":context,"awaitPromise":true,"returnByValue":true,"userGesture":true}), Some(&scope.session))?;
+    let context = if native { &scope.isolated_unique } else { scope.main.as_ref().ok_or_else(|| "webmcp: unverified page context\n".to_string())? };
+    let response = cdp.call("Runtime.evaluate", json!({"expression":expression,"uniqueContextId":context,"awaitPromise":true,"returnByValue":true,"userGesture":true}), Some(&scope.session))?;
     if response.get("exceptionDetails").is_some() { return Err("webmcp: page evaluation failed\n".into()); }
     let after = cdp.webmcp_document(&scope.session, &scope.frame)?;
     if before != after { return Err("webmcp: document changed\n".into()); }
@@ -287,16 +292,16 @@ fn build_scope(cdp: &mut Cdp, state: &Session, target: &str, session: &str, fram
     let document = cdp.webmcp_document(&session, &frame.frame_id)?;
     let world = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame.frame_id,"worldName":"slicc-webmcp"}), Some(&session))?;
     let isolated = world.get("executionContextId").and_then(Value::as_i64).ok_or_else(|| "webmcp: unverified isolated context\n".to_string())?;
-    let main = cdp.events().iter().rev().find_map(|event| {
-        (event.get("sessionId").and_then(Value::as_str) == Some(&session) && event.get("method").and_then(Value::as_str) == Some("Runtime.executionContextCreated") && event.pointer("/params/context/auxData/isDefault").and_then(Value::as_bool) == Some(true) && event.pointer("/params/context/auxData/frameId").and_then(Value::as_str) == Some(&frame.frame_id)).then(|| event.pointer("/params/context/id").and_then(Value::as_i64)).flatten()
-    });
+    let isolated_unique = active_context(cdp.events(), &session, &frame.frame_id, Some(isolated)).ok_or_else(|| "webmcp: unverified isolated context\n".to_string())?;
+    let main = active_context(cdp.events(), &session, &frame.frame_id, None);
+    if cdp.webmcp_document(&session, &frame.frame_id)? != document { return Err("webmcp: document changed\n".into()); }
     let frame_target = frame.target.as_deref().unwrap_or(target).to_string();
     let loader = document.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
     let origin = document.get("origin").and_then(Value::as_str).unwrap_or("").to_string();
     let remembered = state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).and_then(|entry| entry.get("sessions")).and_then(Value::as_array).and_then(|entries| entries.iter().find(|entry| entry.get("target").and_then(Value::as_str) == Some(&frame_target)));
     let bridge = remembered.and_then(|entry| entry.get("bridge")).and_then(Value::as_str).filter(|name| bridge_name(name)).map(str::to_string);
     let policy = remembered.and_then(|entry| entry.get("documents")).and_then(|documents| documents.get(format!("{}:{}", frame.frame_id, loader))).filter(|entry| entry.get("origin").and_then(Value::as_str) == Some(&origin)).and_then(|entry| entry.get("policy")).and_then(Value::as_str).map(str::to_string);
-    scopes.insert(frame.frame_id.clone(), Scope { session, frame: frame.frame_id.clone(), target: frame_target, origin, loader, isolated, main, bridge, policy, path: Vec::new() });
+    scopes.insert(frame.frame_id.clone(), Scope { session, frame: frame.frame_id.clone(), origin, loader, isolated, isolated_unique, main, bridge, policy, path: Vec::new() });
     Ok(())
 }
 
@@ -308,14 +313,45 @@ fn owner(cdp: &mut Cdp, parent: &Scope, child: &str) -> Result<Value, String> {
     result.pointer("/result/value").cloned().ok_or_else(|| "webmcp: unverified frame owner\n".into())
 }
 
+fn active_context(events: &[Value], session: &str, frame: &str, requested: Option<i64>) -> Option<String> {
+    let mut destroyed = BTreeSet::new();
+    for event in events.iter().rev().filter(|event| event.get("sessionId").and_then(Value::as_str) == Some(session)) {
+        match event.get("method").and_then(Value::as_str) {
+            Some("Runtime.executionContextsCleared") => break,
+            Some("Runtime.executionContextDestroyed") => {
+                if let Some(id) = event.pointer("/params/executionContextId").and_then(Value::as_i64) { destroyed.insert(id); }
+            }
+            Some("Runtime.executionContextCreated") => {
+                let context = &event["params"]["context"];
+                let id = context.get("id").and_then(Value::as_i64)?;
+                if destroyed.contains(&id) || context.pointer("/auxData/frameId").and_then(Value::as_str) != Some(frame) { continue; }
+                if requested.map_or_else(|| context.pointer("/auxData/isDefault").and_then(Value::as_bool) == Some(true), |requested| requested == id) {
+                    return context.get("uniqueId").and_then(Value::as_str).filter(|unique| !unique.is_empty()).map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn native_policy(cdp: &mut Cdp, scope: &Scope) -> Result<Option<bool>, String> {
+    let value = match cdp.call("Page.getPermissionsPolicyState", json!({"frameId":scope.frame}), Some(&scope.session)) {
+        Ok(value) => value,
+        Err(message) if message.starts_with("Page.getPermissionsPolicyState:") && (message.contains("wasn't found") || message.contains("Method not found")) => return Ok(None),
+        Err(message) => return Err(message),
+    };
+    Ok(value.get("states").and_then(Value::as_array).and_then(|states| states.iter().find(|state| state.get("feature").and_then(Value::as_str) == Some("tools"))).and_then(|state| state.get("allowed").and_then(Value::as_bool)))
+}
+
 fn allowed(cdp: &mut Cdp, scope: &Scope, frames: &[FrameRec], scopes: &BTreeMap<String, Scope>, owners: &BTreeMap<String, Value>) -> Result<bool, String> {
-    let native = cdp.call("Page.getPermissionsPolicyState", json!({"frameId":scope.frame}), Some(&scope.session)).ok().and_then(|value| value.get("states").and_then(Value::as_array).and_then(|states| states.iter().find(|state| state.get("feature").and_then(Value::as_str) == Some("tools"))).and_then(|state| state.get("allowed").and_then(Value::as_bool)));
+    let native = native_policy(cdp, scope)?;
     if native == Some(false) { return Ok(false); }
     let mut current = scope;
     let mut seen = BTreeSet::new();
     loop {
         let current_native = if current.frame == scope.frame { native } else {
-            cdp.call("Page.getPermissionsPolicyState", json!({"frameId":current.frame}), Some(&current.session)).ok().and_then(|value| value.get("states").and_then(Value::as_array).and_then(|states| states.iter().find(|state| state.get("feature").and_then(Value::as_str) == Some("tools"))).and_then(|state| state.get("allowed").and_then(Value::as_bool)))
+            native_policy(cdp, current)?
         };
         if current_native == Some(false) { return Ok(false); }
         if !seen.insert(current.frame.clone()) { return Ok(false); }
@@ -338,13 +374,23 @@ fn exposed(tool: &Value, top: &str) -> bool {
 }
 
 fn header_allows(header: &str, own: &str, origin: &str) -> bool {
-    let entries = header.split(',').filter_map(|entry| entry.trim().split_once('=').filter(|(name, _)| name.trim() == "tools")).collect::<Vec<_>>();
-    if entries.is_empty() { return !header.split(',').any(|entry| entry.trim() == "tools"); }
+    let entries = header.split(',').filter(|entry| entry.trim().starts_with("tools")).collect::<Vec<_>>();
+    if entries.is_empty() { return true; }
     if entries.len() != 1 { return false; }
-    let value = entries[0].1.trim();
+    let Some((name, value)) = entries[0].trim().split_once('=') else { return false };
+    if name.trim() != "tools" { return false; }
+    let value = value.trim();
     if value == "*" { return true; }
     let Some(values) = value.strip_prefix('(').and_then(|value| value.strip_suffix(')')) else { return false };
-    values.split_whitespace().any(|value| value == "self" && own == origin || value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).is_some_and(|value| value == origin))
+    let mut matched = false;
+    for value in values.split_whitespace() {
+        if value == "self" { matched |= own == origin; continue; }
+        let Some(value) = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')) else { return false };
+        let Ok(parsed) = url::Url::parse(value) else { return false };
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() || !parsed.username().is_empty() || parsed.password().is_some() { return false; }
+        matched |= parsed.origin().ascii_serialization() == origin;
+    }
+    matched
 }
 
 fn iframe_allows(allow: &str, parent: &str, child: &str, src: &str) -> bool {

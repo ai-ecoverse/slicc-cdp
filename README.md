@@ -51,6 +51,28 @@ The cookie commands, `cookie-list`, `cookie-get`, `cookie-set`, `cookie-delete` 
 
 Saved sessions never contain cookie values or value hashes. They retain only cookie names and scopes (domain and path), with Cookie and Set-Cookie header values redacted. `request-headers`, `response-headers` and `request` look up those scopes in the live guarded cookie jar and label any values they show as current jar values, not necessarily what was sent at that time. Removed and protected cookies stay `[redacted]`. A header with no retained scopes can show current cookies applicable to its URL only when that URL cannot share a protected parent-domain cookie. Cookie-bearing console messages may be shown live but are not saved.
 
+## WebMCP
+
+`webmcp-list` and `webmcp-call` prefer native WebMCP, including declarative tools when the browser supports them. For an app that registers JavaScript tools without native WebMCP, keep a dedicated holder running:
+
+```sh
+playwright-cli --cdp 9333 webmcp-polyfill --tab <targetId> --reload
+```
+
+The holder is a foreground process: keep stdin open, and close stdin to stop it. Its first stdout line is JSON with `mode`, `tab`, `late`, `reloaded` and measured `pauseMicros`. `--reload` is opt-in: it reloads only the selected tab so registration during page load sees the API. Without it, the shim installs into the already-loaded document and `late: true` warns that load-time registrations may have been missed. An existing native or page-provided API is not replaced. The shim's document and navigator aliases remain replaceable; the holder retains its registered tools through a private, random lexical bridge, not a page-callable binding.
+
+From another terminal, using the same CDP endpoint and saved session:
+
+```sh
+playwright-cli --cdp 9333 webmcp-list --tab <targetId> --json
+playwright-cli --cdp 9333 webmcp-call get_inbox_state '{}' --tab <targetId>
+playwright-cli --cdp 9333 webmcp-call send_reply '{}' --tab <targetId> --allow-consequential
+```
+
+Same-origin frames are included. A cross-origin provider additionally requires repeatable `--from-origin <http(s)-origin>`, explicit `exposedTo` permission for the caller's origin, the `tools` Permissions Policy and iframe delegation along the entire ancestor chain. `--json` includes each provider's `frameId`; use `webmcp-call ... --frame <frameId>` to resolve duplicate names. Unknown policy is denied: on browsers without native `tools` policy introspection, the holder must observe the document response, normally through `--reload`. Tool lists and call results are capped at 65,536 characters per page response. The shim supports JavaScript tool registration, not declarative HTML tools.
+
+Only the hash-pinned shim can use the dedicated installer. Its inert pre-execution gate pauses each new document, verifies fresh guard-owned frame, loader and context evidence, then permits the shim body. Protected or unverified documents, including child frames, never pass the gate; errors, missing pauses or changed document evidence remove the installer and resume without the shim. No holder means no debugger gate or extra navigation pause. Stopping the holder removes future injection; an already-installed ordinary document API lasts until that document is discarded. Browser-backed tests and navigation/pause measurements run on CI only.
+
 ## Develop
 
 ```sh
@@ -107,7 +129,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Network.setRequestInterception`
 - `Fetch.*`
 
-The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including init scripts, bindings, page overrides and automatic debugger-waiting attachment. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
+The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including generic init scripts, bindings, page overrides and automatic debugger-waiting attachment. The dedicated WebMCP installer is the sole vetted-shim exception: it accepts a session, never client-provided source, and gates the pinned bytes on guard-owned document verification. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
 
 ### Session-level domains
 
