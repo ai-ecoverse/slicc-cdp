@@ -105,12 +105,18 @@ export async function cdpProxy(
       if (!client.destroyed) client.write(bytes);
     };
     client.on('data', (chunk) => {
-      if (!upgraded.up) {
-        upgraded.up = true;
-        browser.write(chunk);
-        return;
-      }
       fromClient = Buffer.concat([fromClient, chunk]);
+      if (!upgraded.up) {
+        const end = fromClient.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const head = fromClient
+          .subarray(0, end + 4)
+          .toString('latin1')
+          .replace(/^sec-websocket-extensions:.*\r\n/gim, '');
+        browser.write(Buffer.from(head, 'latin1'));
+        fromClient = Buffer.from(fromClient.subarray(end + 4));
+        upgraded.up = true;
+      }
       const { out, rest } = frames(fromClient);
       fromClient = Buffer.from(rest);
       for (const frame of out) {
@@ -189,12 +195,14 @@ export async function cdpProxy(
       }
     });
     browser.on('data', (chunk) => {
-      if (!upgraded.down) {
-        upgraded.down = true;
-        toClient(chunk);
-        return;
-      }
       fromBrowser = Buffer.concat([fromBrowser, chunk]);
+      if (!upgraded.down) {
+        const end = fromBrowser.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        toClient(fromBrowser.subarray(0, end + 4));
+        fromBrowser = Buffer.from(fromBrowser.subarray(end + 4));
+        upgraded.down = true;
+      }
       const { out, rest } = frames(fromBrowser);
       fromBrowser = Buffer.from(rest);
       for (const frame of out) {
