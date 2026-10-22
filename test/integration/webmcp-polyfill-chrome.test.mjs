@@ -176,20 +176,27 @@ if (document.modelContext) {
     const protectedEntry = (
       await raw.send('Page.getNavigationHistory', {}, sessionId)
     ).entries.find((entry) => entry.url === protectedUrl);
-    const before = performance.now();
-    await navigate(raw, sessionId, `${ordinary}/tools`);
-    const baselineMs = performance.now() - before;
+    const baselineSamples = [];
+    for (let sample = 0; sample < 5; sample++) {
+      const started = performance.now();
+      await navigate(raw, sessionId, `${ordinary}/tools?baseline=${sample}`);
+      baselineSamples.push(performance.now() - started);
+    }
     assert.equal((await hasShim(raw, sessionId)).api, false);
     holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
     const status = await holder.ready;
     assert.equal(status.mode, 'polyfill');
     assert.ok(status.pauseMicros.length >= 2);
     assert.equal(JSON.stringify(status).includes('__wmcp_'), false);
-    const navigationStarted = performance.now();
-    await navigate(raw, sessionId, `${ordinary}/tools`);
-    const holderNavigationMs = performance.now() - navigationStarted;
+    const holderSamples = [];
+    for (let sample = 0; sample < 5; sample++) {
+      const started = performance.now();
+      await navigate(raw, sessionId, `${ordinary}/tools?holder=${sample}`);
+      holderSamples.push(performance.now() - started);
+    }
+    const median = (samples) => [...samples].sort((a, b) => a - b)[2];
     t.diagnostic(
-      `webmcp-gate-measurement ${JSON.stringify({ baselineNavigationMs: baselineMs, holderNavigationMs, navigationOverheadMs: holderNavigationMs - baselineMs, pauseMicros: status.pauseMicros })}`
+      `webmcp-gate-measurement ${JSON.stringify({ baselineNavigationMs: baselineSamples, holderNavigationMs: holderSamples, medianNavigationOverheadMs: median(holderSamples) - median(baselineSamples), pauseMicros: status.pauseMicros })}`
     );
     assert.deepEqual(await hasShim(raw, sessionId), { secure: true, api: true, alias: true });
     const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
