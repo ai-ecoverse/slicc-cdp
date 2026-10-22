@@ -26,6 +26,7 @@ struct Arm {
     admitted: usize,
     revoked: bool,
     pending_contexts: BTreeMap<i64, Instant>,
+    pending_install: Option<Instant>,
     pending_frames: BTreeMap<String, (String, Instant)>,
     accepted: BTreeSet<(String, String, String)>,
     loaders: BTreeMap<String, String>,
@@ -93,7 +94,7 @@ impl Cdp {
     }
 
     pub fn webmcp_snapshot(&self) -> Vec<Value> {
-        self.webmcp.arms.iter().filter(|(session, arm)| !arm.revoked && !self.content_blocked(session)).map(|(session, arm)| {
+        self.webmcp.arms.iter().filter(|(session, arm)| !arm.revoked && !self.webmcp.quarantined.contains(*session) && !self.content_blocked(session)).map(|(session, arm)| {
             json!({"session":session,"bridge":arm.bridge,"target":self.session_target(session),"documents":arm.documents})
         }).collect()
     }
@@ -104,7 +105,7 @@ impl Cdp {
 
     pub(super) fn webmcp_sweep(&mut self) {
         let now = Instant::now();
-        let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
+        let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
             self.webmcp_revoke(&session);
             let _ = self.send("Debugger.resume", json!({}), Some(&session));
@@ -124,14 +125,14 @@ impl Cdp {
         let source = format!("const {bridge} = (function {GATE}() {{ 'use strict'; let {PERMIT} = false; debugger; if (!{PERMIT}) return; return {shim}; }})();");
         let mut loaders = BTreeMap::new();
         if let Some(tree) = seed { Self::webmcp_loaders(&tree["frameTree"], &mut loaders); }
-        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), pending_install: pending.then(|| Instant::now() + Duration::from_secs(2)), pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
         self.raw_call("Runtime.disable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Runtime.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.worlds.enable(session);
         self.raw_call("Page.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Network.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Debugger.enable", json!({}), Some(session), OPTIONAL_STEP)?;
-        let added = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":true}), Some(session), OPTIONAL_STEP);
+        let added = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":seed.is_some()}), Some(session), OPTIONAL_STEP);
         let identifier = added.ok().and_then(|result| result.get("identifier").and_then(Value::as_str).map(str::to_string));
         let Some(identifier) = identifier else {
             self.webmcp_revoke(session);
@@ -311,6 +312,7 @@ impl Cdp {
         let context = self.webmcp.contexts.get(&(session.to_string(), id)).filter(|context| *context == expected).cloned().ok_or_else(|| self.refusal())?;
         let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
         arm.admitted += 1;
+        arm.pending_install = None;
         arm.pending_contexts.remove(&id);
         arm.pending_frames.remove(&context.frame);
         if arm.accepted.len() >= 1024 { arm.accepted.clear(); }
@@ -365,7 +367,7 @@ impl Cdp {
         let target = info.get("targetId").and_then(Value::as_str).unwrap_or("");
         let url = info.get("url").and_then(Value::as_str).unwrap_or("");
         let allowed = info.get("type").and_then(Value::as_str) == Some("iframe") && !target.is_empty()
-            && url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+            && (url.is_empty() || url == "about:blank" || url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")))
             && !self.guard.url(url) && !self.info_protected(info, &[]) && !self.content_blocked(parent);
         self.session_targets.insert(child.to_string(), target.to_string());
         self.guard_sessions.insert(child.to_string());
@@ -382,9 +384,14 @@ impl Cdp {
             stage = "guard frame tree";
             let guard = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
             let seed = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP)?;
-            if !self.webmcp_tree_verified(&seed, None) { return Err(self.refusal()); }
+            let verified = self.webmcp_tree_verified(&seed, None);
+            let future_only = seed.pointer("/frameTree/frame/id").and_then(Value::as_str) == Some(target)
+                && seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|url| url.is_empty() || url == "about:blank")
+                && seed.pointer("/frameTree/frame/unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty())
+                && self.webmcp_alive(parent);
+            if !verified && !future_only { return Err(self.refusal()); }
             stage = "pinned installer";
-            self.webmcp_install(child, true, Some(&seed))?;
+            self.webmcp_install(child, true, verified.then_some(&seed))?;
             Ok(())
         })().is_ok();
         let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), Duration::from_secs(2));
@@ -483,6 +490,7 @@ impl Cdp {
             }
         }
         if method == "Runtime.executionContextsCleared" {
+            arm.pending_contexts.clear();
             self.webmcp.contexts.retain(|(owner, _), _| owner != session);
             self.webmcp.scripts.retain(|(owner, _), _| owner != session);
         }

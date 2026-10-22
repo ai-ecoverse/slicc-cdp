@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -58,7 +59,7 @@ function launch(args, cwd, endpoint) {
     }, reject);
   });
   ready.catch(() => {});
-  return { child, ended, ready };
+  return { child, ended, ready, stdout: () => stdout, stderr: () => stderr };
 }
 
 async function run(args, cwd, endpoint) {
@@ -67,11 +68,12 @@ async function run(args, cwd, endpoint) {
   return process.ended;
 }
 
-async function fixture(policy, check, children = []) {
+async function fixture(policy, check, children = [], onCommand = () => {}) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-fake-'));
   const backend = await webmcpBackend({
     policy,
     children,
+    onCommand,
     definitions: [
       {
         name: 'greet',
@@ -154,6 +156,73 @@ await test('fake: holder reload, private bridge listing/calling, consequential g
     assert.equal(large.code, 0, large.stderr);
     assert.equal(large.stdout.trim().length, 65536);
   });
+});
+
+await test('fake: document readiness follows generation metadata persistence', async () => {
+  const backend = await webmcpBackend({ definitions: [{ name: 'ready', execute: () => true }] });
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-ready-'));
+  const holder = launch(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, backend.url);
+  try {
+    await holder.ready;
+    const complete = new Promise((resolve, reject) => {
+      let text = '';
+      const timer = setTimeout(
+        () =>
+          reject(
+            new Error(`document readiness did not arrive: ${holder.stdout()} ${holder.stderr()}`)
+          ),
+        15000
+      );
+      holder.child.stdout.on('data', (bytes) => {
+        text += bytes;
+        for (const line of text.split('\n').slice(0, -1)) {
+          const value = JSON.parse(line);
+          if (value.event !== 'document-ready') continue;
+          clearTimeout(timer);
+          resolve(value);
+        }
+      });
+    });
+    const reload = await run(['reload', '--tab', 'TAB'], cwd, backend.url);
+    assert.equal(reload.code, 0, reload.stderr);
+    const ready = await complete;
+    assert.equal(ready.tab, 'TAB');
+    assert.equal(typeof ready.loaderId, 'string');
+    const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.equal(JSON.parse(listed.stdout).length, 1);
+    holder.child.stdin.end();
+    assert.equal((await holder.ended).code, 0);
+  } finally {
+    holder.child.kill('SIGKILL');
+    await backend.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+await test('fake: collection refreshes holder policy metadata after its initial session snapshot', async () => {
+  let file;
+  let fresh;
+  await fixture(
+    '',
+    async (backend, cwd) => {
+      const config =
+        process.platform === 'darwin' ? path.join(cwd, 'Library', 'Application Support') : cwd;
+      const dir = path.join(config, 'slicc', 'playwright-cli', 'sessions');
+      file = path.join(dir, (await readdir(dir))[0]);
+      fresh = await readFile(file, 'utf8');
+      const stale = JSON.parse(fresh);
+      for (const entry of stale.webmcp.TAB.sessions) entry.documents = {};
+      await writeFile(file, JSON.stringify(stale));
+      const result = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).length, 3);
+    },
+    [],
+    (command) => {
+      if (file && command.method === 'Page.createIsolatedWorld') writeFileSync(file, fresh);
+    }
+  );
 });
 
 await test('fake: same-origin aggregation and explicit foreign exposure/delegation with ambiguous tool selection', async () => {

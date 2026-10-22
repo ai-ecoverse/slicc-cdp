@@ -9,8 +9,10 @@ export async function webmcpBackend({
   onCommand = () => {},
 } = {}) {
   let next = 0;
+  let reloads = 0;
   let pages;
   const sessions = new Map();
+  const writers = new Map();
   const scripts = new Map();
   const permitted = new Map();
   const paused = new Map();
@@ -98,7 +100,8 @@ export async function webmcpBackend({
       const { id, method, params = {}, sessionId } = message;
       if (onCommand(message, pages, send) === true) return true;
       const answer = (result) => send({ id, result });
-      const event = (method, params, peer = sessionId) => send({ method, params, sessionId: peer });
+      const event = (method, params, peer = sessionId) =>
+        (writers.get(peer) || send)({ method, params, sessionId: peer });
       const created = (peer) => {
         for (const page of pages.values())
           event(
@@ -143,11 +146,13 @@ export async function webmcpBackend({
       if (method === 'Target.attachToTarget') {
         const peer = `PEER${++next}`;
         sessions.set(peer, params.targetId);
+        writers.set(peer, send);
         answer({ sessionId: peer });
         return true;
       }
       if (method === 'Target.detachFromTarget') {
         sessions.delete(params.sessionId);
+        writers.delete(params.sessionId);
         scripts.delete(params.sessionId);
         answer({});
         return true;
@@ -261,7 +266,7 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.reload') {
-        reset(`RELOAD${next}`);
+        reset(`RELOAD${++reloads}`);
         answer({});
         for (const peer of sessions.keys()) {
           for (const page of pages.values())

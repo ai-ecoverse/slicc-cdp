@@ -138,6 +138,23 @@ fn numeric_context_reuse_during_permission_or_resume_revokes_the_installer() {
     }
 }
 
+#[test]
+fn quarantined_future_installer_does_not_run_in_the_existing_document() {
+    for destination in ["https://ordinary.test/", "https://seven.sliccy.ai/"] {
+        let (mut cdp, state) = client();
+        state.borrow_mut().tree = frame("about:blank");
+        cdp.webmcp.quarantined.insert("H".into());
+        cdp.webmcp_install("H", true, None).unwrap();
+        assert!(!state.borrow().api);
+        assert!(cdp.webmcp_snapshot().is_empty());
+        assert!(state.borrow().sent.iter().any(|call| call["method"] == "Page.addScriptToEvaluateOnNewDocument" && call["params"]["runImmediately"] == false));
+        cdp.absorb(event("Page.frameNavigated", json!({"frame":frame(destination)["frameTree"]["frame"]})));
+        enter_document(&mut cdp, &state, frame(destination), "F");
+        if destination.contains("seven") { no_protected_api(&mut cdp, &state); }
+        else { assert!(state.borrow().api); assert_eq!(cdp.take_webmcp_children().len(), 1); }
+    }
+}
+
 fn enter_document(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, tree: Value, frame: &str) {
     {
         let mut backend = state.borrow_mut();

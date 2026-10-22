@@ -27,6 +27,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     let ours = state.webmcp.get(target).and_then(|entry| entry.get("owner")).and_then(Value::as_str);
     if ours.is_some() && ours != previous_owner.as_deref() && latest.webmcp.get(target).and_then(|entry| entry.get("owner")).and_then(Value::as_str) == ours {
         latest.webmcp.remove(target);
+        if let Err(message) = session::save_webmcp(&latest) { return Output::err(message); }
     }
     latest.webmcp_connection = state.webmcp_connection.clone();
     *state = latest;
@@ -41,7 +42,7 @@ fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str) -> Result<(),
     latest.webmcp_connection = state.webmcp_connection.clone();
     let data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot()});
     latest.webmcp.insert(target.to_string(), data.clone());
-    session::save(&latest)?;
+    session::save_webmcp(&latest)?;
     state.webmcp.insert(target.to_string(), data);
     Ok(())
 }
@@ -70,7 +71,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
     let world = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame,"worldName":"slicc-webmcp"}), Some(session))?;
     let native = cdp.call("Runtime.evaluate", json!({"expression":"'modelContext' in Document.prototype","contextId":world["executionContextId"],"returnByValue":true}), Some(session))?.pointer("/result/value").and_then(Value::as_bool) == Some(true);
     let mode = if native { json!("native") } else { browser::evaluate(cdp, session, &format!("(() => {{ 'use strict'; if (typeof {owner} !== 'undefined' && {owner}) return 'polyfill'; return document.modelContext ? 'page' : 'unavailable'; }})()"), false)?.value };
-    let status = json!({"mode":mode,"tab":target,"late":!reload,"reloaded":reload,"pauseMicros":cdp.webmcp_pause_micros()});
+    let status = json!({"event":"ready","loaderId":tree["frameTree"]["frame"]["loaderId"],"mode":mode,"tab":target,"late":!reload,"reloaded":reload,"pauseMicros":cdp.webmcp_pause_micros()});
     println!("{status}");
     io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
     let mut saved = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
@@ -82,6 +83,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         if !cdp.webmcp_alive(session) {
             return Err("webmcp-polyfill: target closed, changed or was refused by the guard\n".into());
         }
+        let from = cdp.events().len();
         cdp.pump(Instant::now() + Duration::from_millis(50))?;
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
@@ -91,6 +93,13 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         }
         for (_target, child, _bridge) in cdp.take_webmcp_children() {
             cdp.webmcp_auto_attach(&child)?;
+        }
+        let loaded = cdp.events()[from..].iter().any(|event| event["method"] == "Page.loadEventFired" && event["sessionId"] == session);
+        if loaded && cdp.webmcp_alive(session) {
+            let document = cdp.webmcp_document(session, frame)?;
+            save(cdp, state, target, &owner)?;
+            println!("{}", json!({"event":"document-ready","tab":target,"loaderId":document["loaderId"]}));
+            io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
         }
         if cdp.events().iter().rev().any(|event| event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed") && event.pointer("/params/targetId").and_then(Value::as_str) == Some(target)) {
             return Ok(());

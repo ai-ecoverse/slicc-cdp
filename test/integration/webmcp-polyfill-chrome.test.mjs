@@ -26,8 +26,16 @@ function command(endpoint, cwd, args) {
   });
   let stdout = '';
   let stderr = '';
+  const documentWaiters = new Set();
+  let parsed = 0;
   child.stdout.on('data', (data) => {
     stdout += data;
+    const lines = stdout.split('\n');
+    while (parsed < lines.length - 1) {
+      const value = JSON.parse(lines[parsed++]);
+      if (value.event === 'document-ready')
+        for (const resolve of [...documentWaiters]) resolve(value);
+    }
   });
   child.stderr.on('data', (data) => {
     stderr += data;
@@ -56,7 +64,26 @@ function command(endpoint, cwd, args) {
     }, reject);
   });
   ready.catch(() => {});
-  return { child, ended, ready, stderr: () => stderr };
+  const documentReady = () =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        documentWaiters.delete(done);
+        reject(new Error(`document readiness did not arrive: ${stderr}`));
+      }, 15000);
+      const done = (value) => {
+        clearTimeout(timer);
+        documentWaiters.delete(done);
+        resolve(value);
+      };
+      documentWaiters.add(done);
+      ended.then((result) => {
+        if (!documentWaiters.has(done)) return;
+        clearTimeout(timer);
+        documentWaiters.delete(done);
+        reject(new Error(`holder ended before document readiness: ${result.stderr}`));
+      }, reject);
+    });
+  return { child, ended, ready, documentReady, stderr: () => stderr };
 }
 
 async function once(endpoint, cwd, args) {
@@ -191,7 +218,9 @@ if (document.modelContext) {
     const holderSamples = [];
     for (let sample = 0; sample < 5; sample++) {
       const started = performance.now();
+      const complete = holder.documentReady();
       await navigate(raw, sessionId, `${ordinary}/tools?holder=${sample}`);
+      await complete;
       holderSamples.push(performance.now() - started);
     }
     const median = (samples) => [...samples].sort((a, b) => a - b)[2];
@@ -219,11 +248,15 @@ if (document.modelContext) {
       targetId,
     ]);
     assert.equal(consequential.code, 2);
+    const denyReady = holder.documentReady();
     await navigate(raw, sessionId, `${ordinary}/deny`);
+    await denyReady;
     const denied = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(denied.code, 0, denied.stderr);
     assert.deepEqual(JSON.parse(denied.stdout), []);
+    const framesReady = holder.documentReady();
     await navigate(raw, sessionId, `${ordinary}/frames`);
+    await framesReady;
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);
     assert.equal(JSON.parse(same.stdout).length, 9);

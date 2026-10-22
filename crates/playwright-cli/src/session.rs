@@ -701,6 +701,14 @@ pub fn stored_label<'a>(session: &'a Session, target: &str, id: &str) -> Option<
 }
 
 pub fn save(session: &Session) -> Result<(), String> {
+    store(session, false)
+}
+
+pub fn save_webmcp(session: &Session) -> Result<(), String> {
+    store(session, true)
+}
+
+fn store(session: &Session, webmcp_writer: bool) -> Result<(), String> {
     let mut stored = session.clone();
     if usable_endpoint(stored.endpoint.as_deref(), stored.provenance.as_deref()).is_none() {
         stored.endpoint = None;
@@ -712,6 +720,9 @@ pub fn save(session: &Session) -> Result<(), String> {
         }
         return Err("session: user config dir is not absolute\n".into());
     };
+    if !webmcp_writer && file.exists() {
+        stored.webmcp = load_at(&file).webmcp;
+    }
     write_at(&file, &stored)
 }
 
