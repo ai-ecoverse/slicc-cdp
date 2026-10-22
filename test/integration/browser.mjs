@@ -3,6 +3,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { requireChrome } from './chrome-policy.mjs';
+import { chromeLaunched } from './chrome-report.mjs';
 
 const { findBrowser } = await import(
   process.env.SLICC_FIXTURE_BROWSER_API ?? '../../src/browser.js'
@@ -35,6 +37,7 @@ export async function waitExit(exited, timeoutMs = 5000) {
 }
 
 export async function launchBrowser(extraArgs = [], options = {}) {
+  requireChrome();
   let port = options.port ?? 0;
   if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
@@ -84,6 +87,7 @@ export async function launchBrowser(extraArgs = [], options = {}) {
     if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || /:922[2-9]\//.test(wsUrl)) {
       throw new Error(`unexpected debugger url ${wsUrl}`);
     }
+    chromeLaunched();
     return {
       port,
       wsUrl,
@@ -100,6 +104,14 @@ export async function launchBrowser(extraArgs = [], options = {}) {
     await rm(userDataDir, { recursive: true, force: true });
     throw error;
   }
+}
+
+export async function launchManagedBrowser(options) {
+  requireChrome();
+  const browser = await import('../../src/browser.js');
+  const launched = await browser.launchBrowser(options);
+  chromeLaunched();
+  return launched;
 }
 
 function chromeStatus(child, log) {

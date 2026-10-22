@@ -1,4 +1,4 @@
-import test from 'node:test';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { partitions, runPartition } from './guard-set.mjs';
 
 test(
