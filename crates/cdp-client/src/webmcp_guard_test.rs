@@ -155,6 +155,44 @@ fn vetted_webmcp_installer_admits_only_guard_verified_documents() {
 }
 
 #[test]
+fn paused_child_installation_covers_the_existing_verified_document() {
+    let (mut cdp, state) = client();
+    let seed = state.borrow().tree.clone();
+    cdp.webmcp_install("H", true, Some(&seed)).unwrap();
+    assert!(state.borrow().api);
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Page.addScriptToEvaluateOnNewDocument" && command["params"]["runImmediately"] == true));
+}
+
+#[test]
+fn initial_blank_child_remains_inert_and_replaces_the_removed_script_before_resume() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp("H").unwrap();
+    let mut tree = frame("https://ordinary.test/");
+    let child = json!({"id":"CHILD","parentId":"F","url":"about:blank","securityOrigin":"https://ordinary.test","loaderId":"BLANK"});
+    tree["frameTree"]["childFrames"] = json!([{"frame":child}]);
+    state.borrow_mut().tree = tree.clone();
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":child})));
+    assert!(cdp.webmcp_alive("H"));
+    enter_document(&mut cdp, &state, tree, "CHILD");
+    assert!(!state.borrow().api);
+    assert!(state.borrow().installed);
+    assert!(cdp.webmcp_alive("H"));
+    let backend = state.borrow();
+    let removed = backend.sent.iter().rposition(|command| command["method"] == "Page.removeScriptToEvaluateOnNewDocument").unwrap();
+    let replaced = backend.sent.iter().rposition(|command| command["method"] == "Page.addScriptToEvaluateOnNewDocument" && command["params"]["runImmediately"] == false).unwrap();
+    let resumed = backend.sent.iter().rposition(|command| command["method"] == "Debugger.resume").unwrap();
+    assert!(removed < replaced && replaced < resumed);
+}
+
+#[test]
+fn an_unverified_blank_top_document_cannot_rearm() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp("H").unwrap();
+    enter_document(&mut cdp, &state, frame("about:blank"), "F");
+    no_protected_api(&mut cdp, &state);
+}
+
+#[test]
 fn holder_navigation_and_history_cannot_inject_protected_documents() {
     for origin in ["https://seven.sliccy.ai/", "https://vault.sliccy.ai/", "https://catalog.test/"] {
         for _variant in ["navigation", "history"] {

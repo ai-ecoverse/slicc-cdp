@@ -23,7 +23,7 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
     match result {
         Ok(tools) => {
             state.current = Some(target);
-            if tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent") {
+            if tools.is_null() || tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent") {
                 return unavailable("webmcp-list");
             }
             if json {

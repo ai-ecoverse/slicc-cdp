@@ -124,7 +124,7 @@ impl Cdp {
         self.raw_call("Page.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Network.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Debugger.enable", json!({}), Some(session), OPTIONAL_STEP)?;
-        let added = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":!pending}), Some(session), OPTIONAL_STEP);
+        let added = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":true}), Some(session), OPTIONAL_STEP);
         let identifier = added.ok().and_then(|result| result.get("identifier").and_then(Value::as_str).map(str::to_string));
         let Some(identifier) = identifier else {
             self.webmcp_revoke(session);
@@ -277,7 +277,10 @@ impl Cdp {
                 let _ = self.raw_call("Debugger.evaluateOnCallFrame", json!({"callFrameId":call,"expression":format!("{PERMIT} = false"),"returnByValue":true,"silent":true}), Some(session), Duration::from_secs(2));
             }
         }
-        if !admitted { self.webmcp_revoke(session); }
+        if !admitted {
+            self.webmcp_revoke(session);
+            let _ = self.webmcp_rearm_blank_child(session, value, deadline);
+        }
         let resumed = self.raw_call("Debugger.resume", json!({}), Some(session), Duration::from_secs(2));
         if resumed.is_err() {
             admitted = false;
@@ -311,6 +314,41 @@ impl Cdp {
             }
         }
         if self.webmcp.deferred.contains(session) { self.block(session); }
+    }
+
+    fn webmcp_rearm_blank_child(&mut self, session: &str, paused: &Value, deadline: Instant) -> Result<(), String> {
+        if self.content_blocked(session) || self.webmcp.quarantined.contains(session) { return Err(self.refusal()); }
+        let call = paused.pointer("/params/callFrames/0").ok_or_else(|| self.refusal())?;
+        if call.get("functionName").and_then(Value::as_str) != Some(GATE) { return Err(self.refusal()); }
+        let script = call.pointer("/location/scriptId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+        let id = *self.webmcp.scripts.get(&(session.to_string(), script.to_string())).ok_or_else(|| self.refusal())?;
+        let context = self.webmcp.contexts.get(&(session.to_string(), id)).cloned().ok_or_else(|| self.refusal())?;
+        let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+        let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
+        let epoch = self.frame_epoch;
+        let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()))?;
+        let top = &tree["frameTree"]["frame"];
+        let child = Self::webmcp_frame(&tree["frameTree"], &context.frame).ok_or_else(|| self.refusal())?;
+        let arm = self.webmcp.arms.get(session).ok_or_else(|| self.refusal())?;
+        if epoch != self.frame_epoch || Instant::now() >= deadline || !self.webmcp_tree_verified(&tree, None)
+            || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed)
+            || child.get("url").and_then(Value::as_str) != Some("about:blank") || child.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty())
+            || child.get("parentId") != top.get("id") || child.get("securityOrigin") != top.get("securityOrigin")
+            || child.get("securityOrigin").and_then(Value::as_str) != Some(&context.origin) || context.unique.is_empty()
+            || !arm.accepted.iter().any(|(frame, loader, _)| Some(frame.as_str()) == top.get("id").and_then(Value::as_str) && Some(loader.as_str()) == top.get("loaderId").and_then(Value::as_str)) {
+            return Err(self.refusal());
+        }
+        let source = arm.source.clone();
+        let result = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":false}), Some(session), deadline.saturating_duration_since(Instant::now()))?;
+        let identifier = result.get("identifier").and_then(Value::as_str).ok_or_else(|| self.refusal())?.to_string();
+        let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
+        arm.identifier = Some(identifier);
+        if epoch != self.frame_epoch || Instant::now() >= deadline || self.blocked.contains(session) { self.webmcp_revoke(session); return Err(self.refusal()); }
+        let arm = self.webmcp.arms.get_mut(session).unwrap();
+        arm.revoked = false;
+        arm.pending_contexts.remove(&id);
+        arm.pending_frames.remove(&context.frame);
+        Ok(())
     }
 
     fn webmcp_adopt_child(&mut self, value: &Value, parent: &str) {
@@ -368,7 +406,9 @@ impl Cdp {
         }
         if method == "Page.frameNavigated" {
             let invalid = !self.webmcp_tree_verified(&json!({"frameTree":{"frame":value["params"]["frame"]}}), None);
-            if invalid { self.webmcp_revoke(session); }
+            let frame = &value["params"]["frame"];
+            let initial_child = frame.get("parentId").is_some() && frame.get("url").and_then(Value::as_str) == Some("about:blank") && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty());
+            if invalid && !initial_child { self.webmcp_revoke(session); }
             if let Some(arm) = self.webmcp.arms.get_mut(session) {
                 let frame = &value["params"]["frame"];
                 Self::webmcp_loaders(&json!({"frame":frame}), &mut arm.loaders);

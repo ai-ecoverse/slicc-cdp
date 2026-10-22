@@ -272,6 +272,92 @@ await test('fake: parent policy, child policy and absent iframe delegation each 
   }
 });
 
+await test('fake: native prototype does not make an absent or null page API available', async () => {
+  for (const api of [undefined, null, { getTools: async () => [] }]) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-availability-'));
+    const backend = await webmcpBackend({ native: true });
+    try {
+      Object.defineProperty(backend.page.document, 'modelContext', { value: api });
+      for (const args of [
+        ['webmcp-list', '--json'],
+        ['webmcp-call', 'anything', '{}'],
+      ]) {
+        const result = await run([...args, '--tab', 'TAB'], cwd, backend.url);
+        if (api == null) {
+          assert.equal(result.code, 2, result.stderr);
+          assert.equal(result.stdout, '');
+          assert.match(result.stderr, /WebMCP is unavailable/);
+        } else if (args[0] === 'webmcp-list') {
+          assert.equal(result.code, 0, result.stderr);
+          assert.equal(result.stdout, '[]\n');
+        } else {
+          assert.match(result.stderr, /unknown tool/);
+        }
+      }
+    } finally {
+      await backend.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+});
+
+await test('fake: native child calls recheck loader, policy and delegation and preserve protected refusals', async () => {
+  for (const mode of ['stable', 'loader', 'policy', 'delegation', 'protected', 'during']) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-native-'));
+    let invoked = 0;
+    let backend;
+    const children = [
+      {
+        id: 'CROSS',
+        origin: 'https://cross.test',
+        allow: 'tools *',
+        definitions: [
+          {
+            name: 'child',
+            annotations: { readOnly: true },
+            execute: () => {
+              invoked++;
+              if (mode === 'during') backend.pages.get('CROSS').loader = 'NAVIGATED';
+              return { invoked };
+            },
+          },
+        ],
+      },
+    ];
+    try {
+      backend = await webmcpBackend({
+        native: true,
+        children,
+        onCommand(command, pages) {
+          if (command.method !== 'Browser.getVersion') return;
+          if (mode === 'loader') pages.get('CROSS').loader = 'NAVIGATED';
+          if (mode === 'policy') pages.get('CROSS').permitted = false;
+          if (mode === 'delegation') children[0].allow = "tools 'none'";
+          if (mode === 'protected') pages.get('CROSS').origin = 'https://seven.sliccy.ai';
+        },
+      });
+      const called = await run(
+        ['webmcp-call', 'child', '{}', '--tab', 'TAB', '--from-origin', 'https://cross.test'],
+        cwd,
+        backend.url
+      );
+      if (mode === 'stable' || mode === 'during') {
+        assert.equal(called.code, 0, called.stderr);
+        assert.deepEqual(JSON.parse(called.stdout), mode === 'during' ? null : { invoked: 1 });
+        assert.equal(invoked, 1);
+      } else {
+        assert.notEqual(called.code, 0, mode);
+        assert.equal(called.stdout, '', mode);
+        assert.equal(invoked, 0, mode);
+        if (mode === 'protected') assert.match(called.stderr, /slicc: refused:/);
+      }
+    } finally {
+      await backend?.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+});
+
 await test('fake: WASI holder accepts EOF and removes future injection without a binding', async () => {
   const backend = await webmcpBackend();
   let runner;

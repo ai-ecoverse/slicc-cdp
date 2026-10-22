@@ -1,7 +1,13 @@
 import vm from 'node:vm';
 import { fakeCdp } from './fake-cdp.mjs';
 
-export async function webmcpBackend({ policy = '', definitions = [], children = [] } = {}) {
+export async function webmcpBackend({
+  policy = '',
+  definitions = [],
+  children = [],
+  native = false,
+  onCommand = () => {},
+} = {}) {
   let next = 0;
   let pages;
   const sessions = new Map();
@@ -39,6 +45,7 @@ export async function webmcpBackend({ policy = '', definitions = [], children = 
           config.id,
           {
             ...config,
+            Document,
             document,
             context,
             loader: `${loader}-${config.id}`,
@@ -50,6 +57,29 @@ export async function webmcpBackend({ policy = '', definitions = [], children = 
       })
     );
     pages.get('TAB').window.frames = children.map((child) => pages.get(child.id).window);
+    if (native) {
+      for (const page of pages.values()) {
+        const tools = (page.definitions || []).map((tool) => ({
+          ...tool,
+          window: page.window,
+          origin: page.origin,
+        }));
+        page.nativeTools = tools;
+        Object.defineProperty(page.Document.prototype, 'modelContext', {
+          value: {
+            getTools: async ({ fromOrigins = [] } = {}) =>
+              [...pages.values()]
+                .filter(
+                  (provider) =>
+                    provider.origin === page.origin || fromOrigins.includes(provider.origin)
+                )
+                .flatMap((provider) => provider.nativeTools),
+            executeTool: async (tool, input) =>
+              tool.execute(input, { signal: new AbortController().signal }),
+          },
+        });
+      }
+    }
   };
   reset('L');
   const frame = (page) => ({
@@ -66,6 +96,7 @@ export async function webmcpBackend({ policy = '', definitions = [], children = 
   const fake = await fakeCdp({
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
+      onCommand(message, pages);
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) => send({ method, params, sessionId: peer });
       const created = (peer) => {
@@ -149,7 +180,10 @@ export async function webmcpBackend({ policy = '', definitions = [], children = 
         return true;
       }
       if (method === 'Page.getPermissionsPolicyState') {
-        answer({ states: [] });
+        const page = pages.get(params.frameId);
+        answer({
+          states: native ? [{ feature: 'tools', allowed: page?.permitted !== false }] : [],
+        });
         return true;
       }
       if (method === 'DOM.getFrameOwner') {
