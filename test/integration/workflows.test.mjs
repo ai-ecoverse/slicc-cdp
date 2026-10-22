@@ -104,7 +104,7 @@ test('the crates, binaries and release assets follow only a release on main', ()
   }
   assert.match(job('assets'), /needs: \[released, binaries\]\n/);
   assert.match(job('crates'), /id-token: write/);
-  assert.match(job('crates'), /scripts\/publish-crates\.sh/);
+  assert.match(job('crates'), /run: cargo fetch --locked\n[\s\S]*scripts\/publish-crates\.sh/);
   assert.match(job('binaries'), /scripts\/sign-macos\.sh/);
   assert.match(job('binaries'), /source=Notarized Developer ID/);
   for (const label of [

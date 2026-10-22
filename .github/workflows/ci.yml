@@ -83,6 +83,8 @@ jobs:
 
       - run: rustup toolchain install "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --profile minimal
 
+      - run: cargo fetch --locked
+
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9
         id: auth
 
