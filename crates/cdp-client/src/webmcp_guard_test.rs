@@ -18,6 +18,7 @@ struct BackendState {
     race: bool,
     forged: bool,
     fail_tree: bool,
+    context_race: String,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -71,6 +72,11 @@ impl Transport for Backend {
             "Debugger.getScriptSource" => json!({"scriptSource":if state.forged { "function __slicc_webmcp_gate() { debugger; }" } else { &state.source }}),
             "Debugger.evaluateOnCallFrame" => {
                 state.permitted = params["expression"].as_str().unwrap().ends_with("true");
+                if state.context_race == "permit" && state.permitted {
+                    let mut changed = context("F", "https://ordinary.test");
+                    changed["params"]["context"]["uniqueId"] = json!("REUSED_CONTEXT");
+                    state.inbox.push_back(changed.to_string());
+                }
                 if state.race && state.permitted {
                     state.tree = frame("https://seven.sliccy.ai/");
                     let changed = state.tree["frameTree"]["frame"].clone();
@@ -80,6 +86,12 @@ impl Transport for Backend {
             }
             "Debugger.resume" => {
                 state.api = state.permitted;
+                if state.context_race == "resume" && state.permitted {
+                    let mut changed = context("F", "https://ordinary.test");
+                    changed["params"]["context"]["uniqueId"] = json!("REUSED_CONTEXT");
+                    state.inbox.push_back(changed.to_string());
+                    state.api = false;
+                }
                 state.permitted = false;
                 json!({})
             }
@@ -113,6 +125,17 @@ fn client() -> (Cdp, Rc<RefCell<BackendState>>) {
     cdp.targets.insert("T".into(), json!({"targetId":"T","type":"page","url":"https://ordinary.test/"}));
     cdp.main_commit("G", &state.borrow().tree["frameTree"]["frame"]);
     (cdp, state)
+}
+
+#[test]
+fn numeric_context_reuse_during_permission_or_resume_revokes_the_installer() {
+    for stage in ["permit", "resume"] {
+        let (mut cdp, state) = client();
+        state.borrow_mut().context_race = stage.to_string();
+        assert!(cdp.start_webmcp("H").is_err(), "{stage}");
+        no_protected_api(&mut cdp, &state);
+        assert!(cdp.webmcp_snapshot().is_empty());
+    }
 }
 
 fn enter_document(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, tree: Value, frame: &str) {

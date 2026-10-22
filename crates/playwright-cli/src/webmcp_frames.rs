@@ -191,14 +191,7 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
             if !scopes.contains_key(&item.frame_id) {
                 if build_scope(cdp, state, target, session, item, &mut scopes, opened).is_err() { continue; }
             }
-            if let Some(parent) = item.parent_frame_id.as_ref().and_then(|id| scopes.get(id)).cloned() {
-                let owner = owner(cdp, &parent, &item.frame_id)?;
-                if let Some(scope) = scopes.get_mut(&item.frame_id) {
-                    scope.path = parent.path.clone();
-                    scope.path.push(owner["index"].as_u64().ok_or_else(|| "webmcp: unverified frame owner\n".to_string())? as usize);
-                }
-                owners.insert(item.frame_id.clone(), owner);
-            }
+            owners.extend(link_owner(cdp, &mut scopes, item)?.map(|owner| (item.frame_id.clone(), owner)));
         }
     }
     let root_scope = scopes[&root.frame_id].clone();
@@ -382,6 +375,15 @@ fn owner(cdp: &mut Cdp, parent: &Scope, child: &str) -> Result<Value, String> {
     if result.get("exceptionDetails").is_some() { return Err("webmcp: unverified frame owner\n".into()); }
     if cdp.webmcp_document(&parent.session, &parent.frame)? != before { return Err("webmcp: document changed\n".into()); }
     result.pointer("/result/value").cloned().ok_or_else(|| "webmcp: unverified frame owner\n".into())
+}
+
+fn link_owner(cdp: &mut Cdp, scopes: &mut BTreeMap<String, Scope>, frame: &FrameRec) -> Result<Option<Value>, String> {
+    let Some(parent) = frame.parent_frame_id.as_ref().and_then(|id| scopes.get(id)).cloned() else { return Ok(None); };
+    let owner = owner(cdp, &parent, &frame.frame_id)?;
+    let scope = scopes.get_mut(&frame.frame_id).ok_or_else(|| "webmcp: unverified frame scope\n".to_string())?;
+    scope.path = parent.path;
+    scope.path.push(owner["index"].as_u64().ok_or_else(|| "webmcp: unverified frame owner\n".to_string())? as usize);
+    Ok(Some(owner))
 }
 
 fn active_context(events: &[Value], session: &str, frame: &str, requested: Option<i64>) -> Option<String> {
