@@ -174,7 +174,7 @@ pub fn mentions(guard: &Protected, value: &Value) -> bool {
     }
 }
 
-fn decode_percent(text: &str) -> String {
+pub(crate) fn decode_percent(text: &str) -> String {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut index = 0;

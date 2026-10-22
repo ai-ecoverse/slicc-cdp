@@ -7,9 +7,8 @@ fn c2_assert_carriers(headers: &Value) {
     for key in ["Location", "Content-Location", "Refresh", "Link"] {
         assert_eq!(headers[key], expected[key], "{key}");
     }
-    assert_eq!(headers["X-Control"], "ordinary");
-    assert_eq!(headers["X-Private"], "https://seven.sliccy.ai");
-    assert!(headers.get("Set-Cookie").is_none());
+    assert_eq!(headers.as_object().unwrap().len(), 4);
+    for name in ["X-Control", "X-Private", "Set-Cookie"] { assert!(headers.get(name).is_none()); }
 }
 
 #[test]
