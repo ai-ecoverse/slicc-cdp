@@ -113,6 +113,30 @@ pub fn browser_wide(
     Some(format!("slicc: refused: {reason}\n"))
 }
 
+pub fn persistent_capability(method: &str) -> bool {
+    match method.split_once('.') {
+        Some(("Emulation", command)) => !matches!(command, "canEmulate" | "getScreenInfos"),
+        Some(("Network", command)) => {
+            command.starts_with("set") && !matches!(command, "setCookie" | "setCookies")
+                || command.starts_with("emulate")
+                || matches!(command, "overrideNetworkState" | "clearAcceptedEncodings")
+        }
+        Some(("Page", command)) => {
+            command.starts_with("addScriptToEvaluateOn")
+                || command.starts_with("set") && !matches!(command, "setDocumentContent" | "setLifecycleEventsEnabled")
+                || command == "startScreencast"
+        }
+        Some(("Runtime", command)) => command == "addBinding" || command.starts_with("set"),
+        Some(("Debugger", command)) => command.starts_with("set"),
+        Some(("Input" | "Security", command)) => command.starts_with("set"),
+        Some(("Overlay", command)) => !matches!(command, "enable" | "disable" | "hideHighlight" | "getHighlightObjectForTest" | "getGridHighlightObjectsForTest" | "getSourceOrderHighlightObjectForTest"),
+        Some(("Browser", command)) => matches!(command, "setDownloadBehavior" | "setWindowBounds" | "setContentsSize"),
+        Some(("Profiler", command)) => matches!(command, "start" | "startPreciseCoverage"),
+        Some(("HeapProfiler", command)) => matches!(command, "startSampling" | "startTrackingHeapObjects" | "takeHeapSnapshot"),
+        _ => false,
+    }
+}
+
 pub fn body_method(method: &str) -> bool {
     BODY_METHODS.contains(&method)
 }

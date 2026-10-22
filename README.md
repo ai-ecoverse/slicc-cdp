@@ -105,6 +105,8 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Network.setRequestInterception`
 - `Fetch.*`
 
+The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including init scripts, bindings, page overrides and automatic debugger-waiting attachment. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
+
 ### Session-level domains
 
 - `Page`
