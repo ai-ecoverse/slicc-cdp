@@ -7,7 +7,15 @@ import test from 'node:test';
 
 const root = path.resolve(import.meta.dirname, '../..');
 
-for (const mode of ['reject', 'hang', 'falsy'])
+for (const mode of [
+  'reject',
+  'hang',
+  'falsy',
+  'registration',
+  'fixture-hang',
+  'client-hang',
+  'observer-hang',
+])
   test(`guard ${mode} availability cannot strand a worker or discard measured evidence`, async () => {
     const folder = await mkdtemp(path.join(tmpdir(), 'guard-disposal-regression-'));
     const vectors = path.join(folder, 'vectors.json');
@@ -26,6 +34,7 @@ for (const mode of ['reject', 'hang', 'falsy'])
       SLICC_GUARD_REPORT: report,
       SLICC_GUARD_TARGETS: '["ordinary"]',
       SLICC_GUARD_SHA: 'fake-owned-worker',
+      SLICC_GUARD_TIMEOUT: '12000',
     };
     delete environment.NODE_TEST_CONTEXT;
     const worker = spawn(
@@ -50,7 +59,7 @@ for (const mode of ['reject', 'hang', 'falsy'])
     const deadline = setTimeout(() => {
       expired = true;
       worker.kill('SIGKILL');
-    }, 8000);
+    }, 13000);
     try {
       const [status] = await new Promise((resolve) =>
         worker.once('close', (...details) => resolve(details))
@@ -58,13 +67,14 @@ for (const mode of ['reject', 'hang', 'falsy'])
       assert.equal(expired, false, output);
       assert.equal(status, 1, output);
       const evidence = JSON.parse(await readFile(`${report}.json`, 'utf8'));
-      assert.equal(evidence.results.length, mode === 'falsy' ? 0 : 1);
+      const measured = ['reject', 'hang'].includes(mode);
+      assert.equal(evidence.results.length, measured ? 1 : 0);
       assert.equal(
         evidence.pass,
-        mode !== 'falsy',
+        measured,
         'disposal availability must not rewrite candidate observations'
       );
-      if (mode === 'falsy') assert.equal(evidence.missing.length, 1);
+      if (!measured) assert.equal(evidence.missing.length, 1);
       else assert.equal(evidence.results[0].guarded, 'pass');
       assert.equal(Object.hasOwn(evidence, 'harnessErrors'), false);
       const availability = JSON.parse(await readFile(`${report}.availability.json`, 'utf8'));
@@ -72,11 +82,13 @@ for (const mode of ['reject', 'hang', 'falsy'])
       assert.equal(availability.failures[0].target, 'ordinary');
       assert.match(
         JSON.stringify(availability),
-        mode === 'hang'
+        mode.includes('hang')
           ? /deadline exceeded/
-          : mode === 'falsy'
-            ? /"message":"0"/
-            : /forced browser disposal rejection/
+          : mode === 'registration'
+            ? /redirectSecret fixture registration required/
+            : mode === 'falsy'
+              ? /"message":"0"/
+              : /forced browser disposal rejection/
       );
     } finally {
       clearTimeout(deadline);

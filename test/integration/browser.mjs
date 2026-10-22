@@ -4,6 +4,7 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+const workerDeadline = Date.now() + Number(process.env.SLICC_ROW_TIMEOUT_MS ?? 605000);
 const { findBrowser } = await import(
   process.env.SLICC_FIXTURE_BROWSER_API ?? '../../src/browser.js'
 );
@@ -83,7 +84,12 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   options.signal?.addEventListener('abort', abort, { once: true });
   try {
     options.signal?.throwIfAborted();
-    const version = await waitVersion(port, () => chromeStatus(child, chromeLog), options.signal);
+    const version = await waitVersion(
+      port,
+      () => chromeStatus(child, chromeLog),
+      options.signal,
+      options.deadlineAt ?? workerDeadline
+    );
     const wsUrl = version.webSocketDebuggerUrl;
     if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || /:922[2-9]\//.test(wsUrl)) {
       throw new Error(`unexpected debugger url ${wsUrl}`);
@@ -114,8 +120,8 @@ function chromeStatus(child, log) {
   return tail;
 }
 
-async function waitVersion(port, status, signal) {
-  const deadline = Date.now() + 20000;
+async function waitVersion(port, status, signal, deadlineAt) {
+  const deadline = deadlineAt;
   let last = 'no response';
   while (Date.now() < deadline) {
     signal?.throwIfAborted();
@@ -123,7 +129,10 @@ async function waitVersion(port, status, signal) {
     if (early.startsWith('chromium exited')) throw new Error(early);
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
-        signal: AbortSignal.any([AbortSignal.timeout(1000), ...(signal ? [signal] : [])]),
+        signal: AbortSignal.any([
+          AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+          ...(signal ? [signal] : []),
+        ]),
       });
       if (response.ok) return await response.json();
       last = `status ${response.status}`;

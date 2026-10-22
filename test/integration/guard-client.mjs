@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-import { deadline } from './cleanup.mjs';
+import { acquire, deadline } from './cleanup.mjs';
 
 const bridge = fileURLToPath(new URL('../../target/debug/examples/guard_bridge', import.meta.url));
 
@@ -61,14 +61,22 @@ function channel(write, onMessage) {
   };
 }
 
-async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
+async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage, signal, deadlineAt }) {
   const { createNodeKernel } = await import('@ai-ecoverse/slicc-kernel/node');
   const { bridge: browserBridge } = await import('./browser.mjs');
-  const kernel = await createNodeKernel({ cdp: browserBridge(ws) });
+  const kernel = await acquire(
+    () => createNodeKernel({ cdp: browserBridge(ws) }),
+    'wasi-kernel-startup',
+    (resource) => resource.terminate(),
+    Math.max(1, deadlineAt - Date.now())
+  );
+  const abort = () => kernel.terminate();
+  signal?.addEventListener('abort', abort, { once: true });
   let terminal;
   let client;
   let closing = false;
   try {
+    signal?.throwIfAborted();
     await kernel.writeFile(
       '/node_modules/guard/package.json',
       JSON.stringify({
@@ -129,7 +137,10 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
       await Promise.race([
         started,
         new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('WASI guard bridge startup timed out')), 10000);
+          timer = setTimeout(
+            () => reject(new Error('WASI guard bridge startup timed out')),
+            Math.max(1, deadlineAt - Date.now())
+          );
         }),
       ]);
     } finally {
@@ -142,6 +153,7 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
       variant,
       detachDelay,
       close: async () => {
+        signal?.removeEventListener('abort', abort);
         closing = true;
         terminal.signal('SIGKILL');
         client.stop();
@@ -158,6 +170,7 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
       },
     };
   } catch (error) {
+    signal?.removeEventListener('abort', abort);
     closing = true;
     terminal?.signal('SIGKILL');
     client?.stop();
@@ -166,13 +179,36 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
   }
 }
 
-export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
+export async function guarded(
+  ws,
+  origin,
+  { variant, detachDelay, onMessage, signal, deadlineAt = Date.now() + 35000 }
+) {
+  signal?.throwIfAborted();
   if (!['prompt', 'lagging'].includes(variant) || !Number.isInteger(detachDelay))
     throw new Error('invalid guard variant');
   if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
-    return wasiGuarded(ws, origin, { variant, detachDelay, onMessage });
+    return acquire(
+      (ownedSignal) =>
+        wasiGuarded(ws, origin, {
+          variant,
+          detachDelay,
+          onMessage,
+          deadlineAt,
+          signal: AbortSignal.any([ownedSignal, ...(signal ? [signal] : [])]),
+        }),
+      'wasi-guard-startup',
+      (resource) => resource.close(),
+      Math.max(1, deadlineAt - Date.now())
+    );
   const child = spawn(bridge, [ws, origin], { stdio: ['pipe', 'pipe', 'inherit'] });
   const client = channel((message) => child.stdin.write(`${message}\n`), onMessage);
+  const abort = () => {
+    child.kill('SIGKILL');
+    child.stdin.destroy();
+    child.stdout.destroy();
+  };
+  signal?.addEventListener('abort', abort, { once: true });
   createInterface({ input: child.stdout }).on('line', (line) => client.receive(JSON.parse(line)));
   child.on('error', client.stop);
   child.stdin.on('error', client.stop);
@@ -187,6 +223,7 @@ export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
     detachDelay,
     close: () =>
       (closing ??= (async () => {
+        signal?.removeEventListener('abort', abort);
         client.stop();
         child.stdin.end();
         let forced;
@@ -231,12 +268,27 @@ export function observerSend(send) {
   };
 }
 
-export async function observer(wsUrl, onMessage) {
+export async function observer(wsUrl, onMessage, { signal, deadlineAt = Date.now() + 35000 } = {}) {
+  signal?.throwIfAborted();
   const ws = new WebSocket(wsUrl);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve, { once: true });
-    ws.addEventListener('error', reject, { once: true });
-  });
+  const abort = () => ws.close();
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    await deadline(
+      () =>
+        new Promise((resolve, reject) => {
+          ws.addEventListener('open', resolve, { once: true });
+          ws.addEventListener('error', reject, { once: true });
+        }),
+      'observer-websocket-startup',
+      Math.max(1, deadlineAt - Date.now()),
+      abort
+    );
+  } catch (error) {
+    signal?.removeEventListener('abort', abort);
+    abort();
+    throw error;
+  }
   const client = channel((message) => ws.send(message), onMessage);
   ws.addEventListener('message', (event) => client.receive(JSON.parse(event.data)));
   ws.addEventListener('close', client.stop);
@@ -245,6 +297,7 @@ export async function observer(wsUrl, onMessage) {
     send: observerSend(client.send),
     waitEvent: client.waitEvent,
     close: async () => {
+      signal?.removeEventListener('abort', abort);
       if (ws.readyState === WebSocket.CLOSED) return;
       const closed = new Promise((resolve) =>
         ws.addEventListener('close', resolve, { once: true })

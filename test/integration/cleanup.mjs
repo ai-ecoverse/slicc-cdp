@@ -23,6 +23,37 @@ export async function deadline(task, phase, ms = 5000, abort = () => {}) {
   }
 }
 
+export async function acquire(task, phase, dispose, ms = 10000) {
+  const controller = new AbortController();
+  let abandoned = false;
+  const work = Promise.resolve()
+    .then(() => task(controller.signal))
+    .then(async (resource) => {
+      if (abandoned) {
+        try {
+          await deadline(() => dispose(resource), `${phase}-late-cleanup`);
+        } catch (error) {
+          process.stderr.write(
+            `HARNESS-AVAILABILITY ${JSON.stringify({ phase: `${phase}-late-cleanup`, error: normalizeError(error) })}\n`
+          );
+        }
+      }
+      return resource;
+    });
+  try {
+    return await deadline(
+      () => work,
+      phase,
+      ms,
+      (error) => controller.abort(error)
+    );
+  } catch (error) {
+    abandoned = true;
+    controller.abort(error);
+    throw error;
+  }
+}
+
 export async function cleanup(tasks, ...failures) {
   const results = await Promise.allSettled(
     tasks.map((task, index) => deadline(task, `cleanup-${index}`))

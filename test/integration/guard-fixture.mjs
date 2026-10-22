@@ -26,7 +26,7 @@ export function browserStartup(launch, report = () => {}) {
     },
     async start(args, details = {}) {
       try {
-        return await launch(args);
+        return await launch(args, details);
       } catch (error) {
         if (
           rowStarted ||
@@ -38,7 +38,7 @@ export function browserStartup(launch, report = () => {}) {
         const retry = { ...details, attempt: 1, reason: error.message };
         retries.push(retry);
         report({ ...retry });
-        return launch(args);
+        return launch(args, details);
       }
     },
   };

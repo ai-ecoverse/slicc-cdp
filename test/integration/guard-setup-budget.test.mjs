@@ -6,6 +6,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser, rawSocket } from './browser.mjs';
 import { cdpProxy } from './cdp-proxy.mjs';
+import { cleanup } from './cleanup.mjs';
 import { runProcess } from './runners.mjs';
 import { startServer } from './server.mjs';
 import './watchdog.mjs';
@@ -44,8 +45,9 @@ async function drive(proxy, site) {
 
 test('the guard setup shares one budget, tolerates slow optional steps and fails closed', async (t) => {
   const site = await startServer();
-  const browser = await launchBrowser();
+  let browser;
   try {
+    browser = await launchBrowser([], { signal: t.signal });
     const flows = {
       'a 12 s Page.enable is optional and the tab still works': {
         delays: { 'Page.enable': { ms: 12000 } },
@@ -174,7 +176,6 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
       );
     }
   } finally {
-    await browser.close();
-    await site.close();
+    await cleanup([() => browser?.close(), () => site.close()]);
   }
 });

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
-import { cleanup, deadline, normalizeError } from './cleanup.mjs';
+import { acquire, cleanup, deadline, normalizeError } from './cleanup.mjs';
 import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
@@ -75,7 +75,7 @@ const extensionPath = fileURLToPath(
 
 async function guardBrowser(
   startup,
-  { privileged, extension, target, slot, siteIsolationOff, signal }
+  { privileged, extension, target, slot, siteIsolationOff, signal, deadlineAt }
 ) {
   const controller = new AbortController();
   const started = await deadline(
@@ -85,10 +85,10 @@ async function guardBrowser(
           ...browserArgs({ privileged: privileged || extension, siteIsolationOff }),
           ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
         ],
-        { target, slot, signal: AbortSignal.any([signal, controller.signal]) }
+        { target, slot, signal: AbortSignal.any([signal, controller.signal]), deadlineAt }
       ),
     'browser-startup',
-    45000,
+    Math.max(1, deadlineAt - Date.now()),
     (error) => controller.abort(error)
   );
   const browser = {
@@ -107,7 +107,7 @@ async function guardBrowser(
     raw = await deadline(
       () => rawSocket(browser.wsUrl),
       'extension-socket-startup',
-      10000,
+      Math.max(1, deadlineAt - Date.now()),
       (error) => controller.abort(error)
     );
     const { id } = await deadline(
@@ -117,7 +117,7 @@ async function guardBrowser(
           enableInIncognito: true,
         }),
       'extension-load',
-      35000,
+      Math.max(1, deadlineAt - Date.now()),
       (error) => controller.abort(error)
     );
     assert.equal(id, 'ankmbodmgimjemnojmeddfcdlbocolob');
@@ -140,24 +140,12 @@ function table(results) {
   ].join('\n');
 }
 
-function codedSkips(results) {
-  return results.map((row) => {
-    if (row.control !== 'skip') return row;
-    const vector = set.vectors.find((v) => v.id === row.id);
-    const reason =
-      vector.skip?.target === row.target
-        ? vector.skip.reason
-        : vector.observable?.[row.target] === false
-          ? 'not-applicable:unobservable-target'
-          : row.reason;
-    return { ...row, reason };
-  });
-}
-
 test('published guard set through the Rust guarded client', {
   timeout: Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000),
 }, async (t) => {
   const started = Date.now();
+  const setupDeadline = started + Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000) - 5000;
+  const remaining = () => Math.max(1, setupDeadline - Date.now());
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',
   });
@@ -174,8 +162,7 @@ test('published guard set through the Rust guarded client', {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
   });
   const executeTarget = async (target) => {
-    const fixture = requireRedirectRegistration(await fixtureServer());
-    const targets = origins(fixture);
+    let fixture;
     const browsers = new Map();
     const selected = {
       ...set,
@@ -185,6 +172,14 @@ test('published guard set through the Rust guarded client', {
     };
     const failures = [];
     try {
+      fixture = await acquire(
+        (signal) => fixtureServer({ signal }),
+        'fixture-startup',
+        (resource) => resource.close(),
+        remaining()
+      );
+      requireRedirectRegistration(fixture);
+      const targets = origins(fixture);
       const execution = await run(selected, {
         fixture,
         targets,
@@ -223,15 +218,36 @@ test('published guard set through the Rust guarded client', {
                 slot,
                 siteIsolationOff,
                 signal: t.signal,
+                deadlineAt: setupDeadline,
               })
             );
           const browser = await browsers.get(key);
-          const client = await recordedClient((onMessage) =>
-            guarded(browser.wsUrl, targets.client, { variant, detachDelay, onMessage })
+          const client = await acquire(
+            (signal) =>
+              recordedClient((onMessage) =>
+                guarded(browser.wsUrl, targets.client, {
+                  variant,
+                  detachDelay,
+                  onMessage,
+                  signal,
+                  deadlineAt: setupDeadline,
+                })
+              ),
+            'guarded-client-startup',
+            (resource) => resource.close(),
+            remaining()
           );
           let unguarded;
           try {
-            unguarded = await recordedClient((onMessage) => observer(browser.wsUrl, onMessage));
+            unguarded = await acquire(
+              (signal) =>
+                recordedClient((onMessage) =>
+                  observer(browser.wsUrl, onMessage, { signal, deadlineAt: setupDeadline })
+                ),
+              'observer-startup',
+              (resource) => resource.close(),
+              remaining()
+            );
           } catch (error) {
             try {
               await cleanup([() => client.close(), () => browser.close()], error);
@@ -311,7 +327,7 @@ test('published guard set through the Rust guarded client', {
       await cleanup(
         [
           ...[...browsers.values()].map((browser) => async () => (await browser).close()),
-          () => fixture.close(),
+          () => fixture?.close(),
         ],
         ...failures
       );
@@ -347,7 +363,6 @@ test('published guard set through the Rust guarded client', {
   report.selection = { targets: selectedTargets, allTargets };
   report.transport =
     process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
-  report.results = codedSkips(report.results);
   report.skipped = report.results
     .filter((row) => row.control === 'skip')
     .map(({ id, target, variant, reason }) => ({ id, target, variant, reason }));
