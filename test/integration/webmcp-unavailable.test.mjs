@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { launchBrowser } from './browser.mjs';
+import { chromeTest as it } from './chrome-policy.mjs';
 import { fakeCdp } from './fake-cdp.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
@@ -164,7 +165,7 @@ for (const kind of ['native', 'kernel']) {
     }
   });
 
-  test(`Chrome WebMCP ${kind}: disabled and null modelContext are unavailable`, async (t) => {
+  it(`Chrome WebMCP ${kind}: disabled and null modelContext are unavailable`, async (t) => {
     const site = await startServer();
     let browser;
     let runner;

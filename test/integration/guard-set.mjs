@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { requireChrome } from './chrome-policy.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 
@@ -114,6 +115,7 @@ function table(results) {
 }
 
 export async function runPartition(t, id) {
+  requireChrome();
   const selectedTargets = partitions[id];
   const set = {
     ...published,

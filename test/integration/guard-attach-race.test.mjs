@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
 import { cdpProxy } from './cdp-proxy.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { killTree } from './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
