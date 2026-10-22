@@ -1720,7 +1720,7 @@ impl Cdp {
             match name.to_ascii_lowercase().as_str() {
                 "location" if navigation && redirect => Self::redirect_header_value(&self.guard, name, text, source).is_some_and(|url| self.guard.url(&url)),
                 "location" | "content-location" if !navigation => sensitive(text),
-                "refresh" => Self::redirect_header_value(&self.guard, name, text, source).is_some_and(|text| text.split_once(";url=").is_some_and(|(_, url)| self.guard.url(url))),
+                "refresh" => Self::redirect_header_value(&self.guard, name, text, source).is_none_or(|text| text.split_once(";url=").is_none_or(|(_, url)| self.guard.url(url))),
                 "link" => text.split(',').any(|part| part.trim().strip_prefix('<').and_then(|part| part.split_once('>')).is_some_and(|(target, _)| sensitive(target))),
                 _ => false,
             }
@@ -1753,8 +1753,34 @@ impl Cdp {
             || !hop && params.get("documentURL").and_then(Value::as_str).is_some_and(|url| self.guard.url(url))
     }
 
+    fn refresh_parts(text: &str) -> Option<(&str, Option<&str>)> {
+        let text = text.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+        let bytes = text.as_bytes();
+        let mut at = bytes.iter().take_while(|byte| byte.is_ascii_digit()).count();
+        if at == 0 { return None }
+        if bytes.get(at) == Some(&b'.') {
+            at += 1;
+            while bytes.get(at).is_some_and(u8::is_ascii_digit) { at += 1; }
+        }
+        let delay = &text[..at];
+        let tail = text[at..].trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+        if tail.is_empty() { return Some((delay, None)) }
+        let mut target = tail.strip_prefix(';').or_else(|| tail.strip_prefix(','))?.trim_matches(|ch: char| ch.is_ascii_whitespace());
+        if target.get(..3).is_some_and(|key| key.eq_ignore_ascii_case("url")) {
+            if let Some(value) = target[3..].trim_start_matches(|ch: char| ch.is_ascii_whitespace()).strip_prefix('=') {
+                target = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+            }
+        }
+        if let Some(quote) = target.chars().next().filter(|ch| matches!(ch, '\'' | '"')) {
+            target = &target[1..];
+            target = target.split(quote).next().unwrap_or("");
+        }
+        target = target.trim_matches(|ch: char| ch.is_ascii_whitespace());
+        Some((delay, (!target.is_empty()).then_some(target)))
+    }
+
     fn redirect_header_value(guard: &Protected, name: &str, text: &str, source: &str) -> Option<String> {
-        if text.is_empty() || text.chars().any(char::is_control) { return None }
+        if text.is_empty() || text.chars().any(|ch| ch.is_control() && !(name.eq_ignore_ascii_case("refresh") && ch == '\t')) { return None }
         let origin = |target: &str| {
             let mut target = target.trim().to_string();
             for _ in 0..8 {
@@ -1770,11 +1796,8 @@ impl Cdp {
         match name.to_ascii_lowercase().as_str() {
             "location" | "content-location" => origin(text),
             "refresh" => {
-                let (delay, target) = text.split_once(';')?;
-                let delay = delay.trim().parse::<u64>().ok()?;
-                let (key, target) = target.trim().split_once('=')?;
-                if !key.trim().eq_ignore_ascii_case("url") { return None }
-                Some(format!("{delay};url={}", origin(target.trim().trim_matches(['\'', '"']))?))
+                let (delay, target) = Self::refresh_parts(text)?;
+                Some(format!("{delay};url={}", origin(target.unwrap_or(source))?))
             }
             "link" => text.split(',').map(|part| {
                 let (target, params) = part.trim().strip_prefix('<')?.split_once('>')?;
@@ -2666,6 +2689,8 @@ mod tests {
     include!("ordinary_network_review_test.rs");
     include!("pause_metadata_recovery_test.rs");
     include!("navigation_echo_test.rs");
+    include!("refresh_review_test.rs");
+    include!("refresh_forms_review_test.rs");
     include!("redirect_target_taint_test.rs");
     include!("redirect_resource_control_test.rs");
     include!("navigation_queue_test.rs");
