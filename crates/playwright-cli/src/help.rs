@@ -102,7 +102,7 @@ pub fn global_help() -> String {
     lines.push("Options:".to_string());
     lines.push(row(
         "--cdp <url>",
-        "WebSocket URL, or an http URL used for /json/version",
+        "a port or host[:port] (localhost, default 9222), a ws:// URL with a path, or an http URL (or path-less ws://) used for /json/version; loopback names try ::1 and 127.0.0.1",
     ));
     lines.push(row(
         "-s, --session <name>",
