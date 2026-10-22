@@ -5,6 +5,8 @@ mod browser;
 mod cdp;
 mod commands;
 mod connect;
+mod cookie_headers;
+mod cookies;
 mod discover;
 #[cfg(test)]
 #[path = "../../../test/integration/document-client.rs"]
