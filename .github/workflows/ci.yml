@@ -67,16 +67,18 @@ jobs:
       chromium: false
       runs-on: ${{ needs.runner.outputs.runner }}
   integration:
-    needs: [integration-suite, redirect-regressions]
+    needs: [integration-suite, guard-partitions, guard-union, redirect-regressions]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require both complete integration owners
+      - name: Require every complete integration owner
         env:
           SUITE_RESULT: ${{ needs.integration-suite.result }}
           REDIRECT_RESULT: ${{ needs.redirect-regressions.result }}
-        run: test "$SUITE_RESULT" = success && test "$REDIRECT_RESULT" = success
+          GUARD_RESULT: ${{ needs.guard-partitions.result }}
+          UNION_RESULT: ${{ needs.guard-union.result }}
+        run: test "$SUITE_RESULT" = success && test "$REDIRECT_RESULT" = success && test "$GUARD_RESULT" = success && test "$UNION_RESULT" = success
 
   integration-suite:
     needs: runner
@@ -114,6 +116,74 @@ jobs:
             ${{ runner.temp }}/slicc-cdp-redirect-report/
           if-no-files-found: ignore
           retention-days: 7
+
+  guard-partitions:
+    name: guard-${{ matrix.shard }}
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c, d]
+    env:
+      LEFTHOOK: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '\"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Chrome for Testing (pinned in package.json config.chrome)
+        run: |
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
+          npm run -s browser -- $deps
+      - name: Execute every assigned published guard row
+        run: node scripts/gate.mjs guard-ci -- node scripts/guard-ci.mjs run "${{ matrix.shard }}" "${{ runner.temp }}/guard-ci"
+      - name: Owned guard partition report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guard-ci-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/guard-ci/
+          if-no-files-found: error
+          retention-days: 7
+
+  guard-union:
+    needs: [guard-partitions]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: guard-ci-${{ github.run_attempt }}-a
+          path: ${{ runner.temp }}/guard-union/a
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: guard-ci-${{ github.run_attempt }}-b
+          path: ${{ runner.temp }}/guard-union/b
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: guard-ci-${{ github.run_attempt }}-c
+          path: ${{ runner.temp }}/guard-union/c
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: guard-ci-${{ github.run_attempt }}-d
+          path: ${{ runner.temp }}/guard-union/d
+      - name: Require the exact complete row universe
+        run: node scripts/gate.mjs guard-ci -- node scripts/guard-ci.mjs union "${{ runner.temp }}/guard-union"
 
   redirect-regressions:
     needs: runner

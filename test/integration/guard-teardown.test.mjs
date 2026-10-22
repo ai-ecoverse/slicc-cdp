@@ -34,7 +34,7 @@ for (const mode of [
       SLICC_GUARD_REPORT: report,
       SLICC_GUARD_TARGETS: '["ordinary"]',
       SLICC_GUARD_SHA: 'fake-owned-worker',
-      SLICC_GUARD_TIMEOUT: '12000',
+      SLICC_GUARD_TIMEOUT: '120000',
     };
     delete environment.NODE_TEST_CONTEXT;
     const worker = spawn(
@@ -49,17 +49,24 @@ for (const mode of [
       { cwd: root, env: environment }
     );
     let output = '';
+    let expired = false;
+    let ready = false;
+    const expire = () => {
+      expired = true;
+      worker.kill('SIGKILL');
+    };
+    let deadline = setTimeout(expire, Number(process.env.SLICC_ROW_TIMEOUT_MS ?? 605000) - 30000);
     worker.stdout.on('data', (chunk) => {
       output += chunk;
+      if (!ready && output.includes('FAKE-WORKER-READY')) {
+        ready = true;
+        clearTimeout(deadline);
+        deadline = setTimeout(expire, 60000);
+      }
     });
     worker.stderr.on('data', (chunk) => {
       output += chunk;
     });
-    let expired = false;
-    const deadline = setTimeout(() => {
-      expired = true;
-      worker.kill('SIGKILL');
-    }, 13000);
     try {
       const [status] = await new Promise((resolve) =>
         worker.once('close', (...details) => resolve(details))

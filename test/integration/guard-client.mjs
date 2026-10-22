@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-import { acquire, deadline } from './cleanup.mjs';
+import { acquire, cleanupGrace, deadline } from './cleanup.mjs';
 
 const bridge = fileURLToPath(new URL('../../target/debug/examples/guard_bridge', import.meta.url));
 
@@ -161,7 +161,7 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage, signal
           await deadline(
             () => terminal.exited.catch(() => {}),
             'wasi-bridge-close',
-            5000,
+            cleanupGrace(deadlineAt + 30000),
             () => kernel.terminate()
           );
         } finally {
@@ -227,18 +227,21 @@ export async function guarded(
         client.stop();
         child.stdin.end();
         let forced;
-        const timer = setTimeout(() => {
-          forced = Object.assign(new Error('native bridge cleanup deadline; forced SIGKILL'), {
-            code: 'HARNESS_AVAILABILITY',
-            phase: 'native-bridge-close',
-          });
-          process.stderr.write(
-            `HARNESS-AVAILABILITY ${JSON.stringify({ phase: forced.phase, message: forced.message })}\n`
-          );
-          child.kill('SIGKILL');
-          child.stdin.destroy();
-          child.stdout.destroy();
-        }, 5000);
+        const timer = setTimeout(
+          () => {
+            forced = Object.assign(new Error('native bridge cleanup deadline; forced SIGKILL'), {
+              code: 'HARNESS_AVAILABILITY',
+              phase: 'native-bridge-close',
+            });
+            process.stderr.write(
+              `HARNESS-AVAILABILITY ${JSON.stringify({ phase: forced.phase, message: forced.message })}\n`
+            );
+            child.kill('SIGKILL');
+            child.stdin.destroy();
+            child.stdout.destroy();
+          },
+          cleanupGrace(deadlineAt + 30000)
+        );
         try {
           await closed;
           if (forced) throw forced;

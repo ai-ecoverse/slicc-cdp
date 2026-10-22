@@ -7,14 +7,23 @@ export const redirectFiles = [
   'test/integration/redirect-navigation.test.mjs',
 ];
 
+export const guardFiles = ['test/integration/guard-runner.test.mjs'];
+
 export function integrationFiles(files, group = 'all') {
-  if (!['all', 'integration', 'redirects'].includes(group))
+  if (!['all', 'integration', 'redirects', 'guard'].includes(group))
     throw new Error(`unknown integration job ${group}`);
   if (new Set(files).size !== files.length) throw new Error('duplicate integration test file');
   if (redirectFiles.some((file) => !files.includes(file)))
     throw new Error('required redirect regression file missing');
+  if (guardFiles.some((file) => !files.includes(file)))
+    throw new Error('required guard regression file missing');
   return files
-    .filter((file) => group === 'all' || redirectFiles.includes(file) === (group === 'redirects'))
+    .filter((file) => {
+      if (group === 'all') return true;
+      if (group === 'guard') return guardFiles.includes(file);
+      if (group === 'redirects') return redirectFiles.includes(file);
+      return !redirectFiles.includes(file) && !guardFiles.includes(file);
+    })
     .sort();
 }
 

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
-import { acquire, cleanup, deadline, normalizeError } from './cleanup.mjs';
+import { acquire, cleanup, cleanupGrace, deadline, normalizeError } from './cleanup.mjs';
 import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
@@ -97,7 +97,7 @@ async function guardBrowser(
       deadline(
         () => started.close(),
         'browser-close',
-        5000,
+        cleanupGrace(deadlineAt + 30000),
         (error) => controller.abort(error)
       ),
   };
@@ -144,7 +144,7 @@ test('published guard set through the Rust guarded client', {
   timeout: Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000),
 }, async (t) => {
   const started = Date.now();
-  const setupDeadline = started + Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000) - 5000;
+  const setupDeadline = started + Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000) - 35000;
   const remaining = () => Math.max(1, setupDeadline - Date.now());
   execFileSync('cargo', ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'], {
     stdio: 'inherit',

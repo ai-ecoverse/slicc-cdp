@@ -1,11 +1,21 @@
 import { registerHooks } from 'node:module';
 import { createServer } from 'node:net';
+import { mock } from 'node:test';
+import { setTimeout as wallTimer } from 'node:timers';
 import { pathToFileURL } from 'node:url';
 import { fixture as syntheticEvidence } from './cert-fixture.mjs';
 
+const simulated = process.env.TEARDOWN_MODE !== 'roundtrip';
+if (simulated) mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+const exhaust = (phase) =>
+  wallTimer(() => mock.timers.tick(phase === 'cleanup' ? 115000 : 85000), 100);
+
 const state = {
   async fixture() {
-    if (process.env.TEARDOWN_MODE === 'fixture-hang') return new Promise(() => {});
+    if (process.env.TEARDOWN_MODE === 'fixture-hang') {
+      exhaust('startup');
+      return new Promise(() => {});
+    }
     const server = createServer();
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     return {
@@ -17,13 +27,19 @@ const state = {
     return {
       wsUrl: 'ws://teardown.invalid',
       async close() {
-        if (process.env.TEARDOWN_MODE === 'hang') return new Promise(() => {});
+        if (process.env.TEARDOWN_MODE === 'hang') {
+          exhaust('cleanup');
+          return new Promise(() => {});
+        }
         throw new Error('forced browser disposal rejection');
       },
     };
   },
   async connection(role) {
-    if (process.env.TEARDOWN_MODE === `${role}-hang`) return new Promise(() => {});
+    if (process.env.TEARDOWN_MODE === `${role}-hang`) {
+      exhaust('startup');
+      return new Promise(() => {});
+    }
     return { events: [], send: async () => ({}), close: async () => {} };
   },
   async run(set, options) {
@@ -100,3 +116,4 @@ registerHooks({
     return nextLoad(url, context);
   },
 });
+process.stdout.write('FAKE-WORKER-READY\n');

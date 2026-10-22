@@ -4,6 +4,8 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { cleanupGrace } from './cleanup.mjs';
+
 const workerDeadline = Date.now() + Number(process.env.SLICC_ROW_TIMEOUT_MS ?? 605000);
 const { findBrowser } = await import(
   process.env.SLICC_FIXTURE_BROWSER_API ?? '../../src/browser.js'
@@ -21,7 +23,7 @@ export function freePort() {
   });
 }
 
-export async function waitExit(exited, timeoutMs = 5000) {
+export async function waitExit(exited, timeoutMs = cleanupGrace()) {
   let timer;
   try {
     await Promise.race([
@@ -64,20 +66,36 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   child.stderr.on('data', (chunk) => {
     chromeLog = (chromeLog + chunk.toString('utf8')).slice(-4000);
   });
-  const stop = async () => {
-    const running = child.exitCode === null && !child.signalCode;
-    try {
-      if (process.platform === 'win32') child.kill('SIGKILL');
-      else process.kill(-child.pid, 'SIGKILL');
-    } catch {
-      if (running) child.kill('SIGKILL');
-    }
-    try {
-      if (running) await waitExit(exited);
-    } finally {
-      child.stderr.destroy();
-    }
-  };
+  let stopping;
+  const stop = () =>
+    (stopping ??= (async () => {
+      const running = child.exitCode === null && !child.signalCode;
+      const sendSignal = (signal) => {
+        try {
+          if (process.platform === 'win32') child.kill(signal);
+          else process.kill(-child.pid, signal);
+        } catch {
+          if (child.exitCode === null && !child.signalCode) child.kill(signal);
+        }
+      };
+      try {
+        if (running) {
+          sendSignal('SIGTERM');
+          try {
+            await waitExit(exited, cleanupGrace((options.deadlineAt ?? workerDeadline) + 30000));
+          } catch (error) {
+            sendSignal('SIGKILL');
+            process.stderr.write(
+              'HARNESS-AVAILABILITY {"phase":"browser-close","message":"grace expired; forced SIGKILL"}\n'
+            );
+            await waitExit(exited, cleanupGrace((options.deadlineAt ?? workerDeadline) + 30000));
+            throw error;
+          }
+        }
+      } finally {
+        child.stderr.destroy();
+      }
+    })());
   const abort = () => {
     void stop().catch(() => {});
   };

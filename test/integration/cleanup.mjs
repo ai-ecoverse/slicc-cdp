@@ -1,4 +1,11 @@
-export async function deadline(task, phase, ms = 5000, abort = () => {}) {
+const workerDeadline =
+  Date.now() +
+  Number(process.env.SLICC_GUARD_TIMEOUT ?? process.env.SLICC_ROW_TIMEOUT_MS ?? 605000);
+
+export const cleanupGrace = (deadlineAt = workerDeadline - 5000) =>
+  Math.max(30000, deadlineAt - Date.now());
+
+export async function deadline(task, phase, ms = cleanupGrace(), abort = () => {}) {
   let timer;
   try {
     return await Promise.race([
