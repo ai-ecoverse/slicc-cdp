@@ -273,7 +273,7 @@ impl Cdp {
         }
         let checks = self.prepare(method, &params, session_id)?;
         let result = self.raw_call(method, params.clone(), session_id, timeout)?;
-        if stable_command(method) {
+        if content_command(method, &params) == Some(true) {
             self.verify_checks(&checks)?;
         }
         if let (true, Some(session), Some(id)) = (
@@ -304,7 +304,7 @@ impl Cdp {
         if matches!(method, "Target.createTarget" | "Target.attachToTarget") {
             return Err(format!("{method} must be a call, not a notify\n"));
         }
-        if stable_command(method) {
+        if content_command(method, &params) == Some(true) {
             self.call(method, params, session_id)?;
             return Ok(());
         }
@@ -484,7 +484,9 @@ impl Cdp {
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+        let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
+        if !content { return Ok(checks) }
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
@@ -493,27 +495,26 @@ impl Cdp {
             checks.push((target, current));
         }
         if let Some(session) = session {
-            if !harmless(method, params) {
-                let target = self.session_target(session).ok_or_else(|| self.refusal())?;
-                if !checks.iter().any(|(known, _)| known == &target) {
-                    let state = self.document_state(&target, stable_command(method)).ok_or_else(|| self.refusal())?;
-                    if self.blocked.contains(session) { return Err(self.refusal()) }
-                    for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
-                        if let Some(value) = params.get(key) {
-                            let frame = if key == "frameId" {
-                                value.as_str().map(str::to_string)
-                            } else {
-                                let label = if matches!(key, "contextId" | "executionContextId") { "id" } else if key == "executionContextName" { "name" } else { "unique" };
-                                let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
-                                self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
-                            };
-                            if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
-                        }
+            let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+            if !checks.iter().any(|(known, _)| known == &target) {
+                let state = self.document_state(&target, true).ok_or_else(|| self.refusal())?;
+                if self.blocked.contains(session) { return Err(self.refusal()) }
+                for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
+                    if let Some(value) = params.get(key) {
+                        let frame = if key == "frameId" {
+                            value.as_str().map(str::to_string)
+                        } else {
+                            let label = if matches!(key, "contextId" | "executionContextId") { "id" } else if key == "executionContextName" { "name" } else { "unique" };
+                            let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                            self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
+                        };
+                        if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
-                    checks.push((target, state));
                 }
+                checks.push((target, state));
             }
         }
+        if checks.is_empty() { return Err(self.refusal()) }
         Ok(checks)
     }
 
@@ -2066,12 +2067,68 @@ fn recovery(method: &str, params: &Value) -> bool {
     }
 }
 
-fn stable_command(method: &str) -> bool {
-    !method.starts_with("Target.") && !method.starts_with("Browser.") && !method.starts_with("Slicc.")
-        && !matches!(method, "Page.navigate" | "Page.reload" | "Page.stopLoading" | "Page.navigateToHistoryEntry" | "Page.enable" | "Page.disable"
-            | "Page.getFrameTree" | "Page.getNavigationHistory" | "Page.close" | "Runtime.enable" | "Runtime.disable" | "Runtime.runIfWaitingForDebugger"
-            | "Network.enable" | "Network.disable" | "Fetch.enable" | "Fetch.disable" | "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"
-            | "Fetch.continueResponse" | "Fetch.continueWithAuth")
+fn content_command(method: &str, params: &Value) -> Option<bool> {
+    if method == "Runtime.evaluate"
+        && matches!(params.get("expression").and_then(Value::as_str), Some("document.readyState" | "0" | "document.readyState === 'complete' ? location.href : ''"))
+        && params.as_object().is_some_and(|object| object.keys().all(|key| matches!(key.as_str(), "expression" | "returnByValue")))
+    { return Some(false) }
+    if method == "Page.addScriptToEvaluateOnNewDocument" {
+        return Some(params.get("runImmediately").is_some_and(|value| value != &json!(false)));
+    }
+    match method {
+        "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.awaitPromise" | "Runtime.compileScript" | "Runtime.runScript"
+        | "Runtime.getProperties" | "Runtime.getExceptionDetails" | "Runtime.queryObjects" | "Runtime.globalLexicalScopeNames" | "Runtime.getHeapUsage" | "Runtime.discardConsoleEntries"
+        | "DOM.collectClassNamesFromSubtree" | "DOM.copyTo" | "DOM.describeNode" | "DOM.focus" | "DOM.getAttributes" | "DOM.getBoxModel" | "DOM.getContentQuads"
+        | "DOM.getDocument" | "DOM.getFlattenedDocument" | "DOM.getNodesForSubtreeByStyle" | "DOM.getNodeForLocation" | "DOM.getOuterHTML" | "DOM.getRelayoutBoundary" | "DOM.getSearchResults"
+        | "DOM.hideHighlight" | "DOM.highlightNode" | "DOM.highlightRect" | "DOM.markUndoableState" | "DOM.moveTo" | "DOM.performSearch" | "DOM.pushNodeByPathToFrontend"
+        | "DOM.pushNodesByBackendIdsToFrontend" | "DOM.querySelector" | "DOM.querySelectorAll" | "DOM.redo" | "DOM.removeAttribute" | "DOM.removeNode" | "DOM.requestChildNodes" | "DOM.requestNode"
+        | "DOM.resolveNode" | "DOM.setAttributeValue" | "DOM.setAttributesAsText" | "DOM.setFileInputFiles" | "DOM.setNodeName" | "DOM.setNodeValue" | "DOM.setOuterHTML" | "DOM.undo"
+        | "DOM.getFrameOwner" | "DOM.getNodeStackTraces" | "DOM.getFileInfo" | "DOM.getDetachedDomNodes" | "DOM.getTopLayerElements" | "DOM.discardSearchResults" | "DOM.forceShowPopover"
+        | "DOMSnapshot.captureSnapshot" | "DOMSnapshot.getSnapshot" | "DOMDebugger.getEventListeners"
+        | "Input.dispatchDragEvent" | "Input.dispatchKeyEvent" | "Input.dispatchMouseEvent" | "Input.dispatchTouchEvent" | "Input.emulateTouchFromMouseEvent" | "Input.insertText"
+        | "Input.synthesizePinchGesture" | "Input.synthesizeScrollGesture" | "Input.synthesizeTapGesture" | "Input.cancelDragging" | "Input.imeSetComposition"
+        | "Accessibility.getFullAXTree" | "Accessibility.getPartialAXTree" | "Accessibility.getRootAXNode" | "Accessibility.getAXNodeAndAncestors" | "Accessibility.getChildAXNodes" | "Accessibility.queryAXTree"
+        | "Page.captureScreenshot" | "Page.captureSnapshot" | "Page.printToPDF" | "Page.getResourceContent" | "Page.searchInResource" | "Page.getLayoutMetrics" | "Page.setDocumentContent"
+        | "Page.getAppManifest" | "Page.getInstallabilityErrors" | "Page.getAppId" | "Page.startScreencast" | "Page.generateTestReport"
+        | "Network.getResponseBody" | "Network.getRequestPostData" | "Network.getResponseBodyForInterception" | "Network.searchInResponseBody" | "Network.loadNetworkResource"
+        | "Network.streamResourceContent" | "Network.takeResponseBodyForInterceptionAsStream" | "Network.replayXHR" | "Audits.getEncodedResponse"
+        | "Fetch.getResponseBody" | "Fetch.takeResponseBodyAsStream" | "IO.read" | "IO.close" | "IO.resolveBlob"
+        | "Debugger.evaluateOnCallFrame" | "Debugger.getScriptSource" | "Debugger.searchInContent" | "Debugger.setScriptSource" | "Debugger.setVariableValue" | "Debugger.restartFrame" | "Debugger.stepInto" | "Debugger.stepOut" | "Debugger.stepOver"
+        | "Debugger.getWasmBytecode" | "Debugger.disassembleWasmModule" | "Debugger.nextWasmDisassemblyChunk" | "Debugger.getPossibleBreakpoints" | "Debugger.pause"
+        | "HeapProfiler.takeHeapSnapshot" | "HeapProfiler.getHeapObjectId" | "HeapProfiler.getObjectByHeapObjectId" | "HeapProfiler.getSamplingProfile" | "HeapProfiler.stopSampling" | "HeapProfiler.stopTrackingHeapObjects"
+        | "Target.sendMessageToTarget" | "Target.exposeDevToolsProtocol"
+        | "Profiler.stop" | "Profiler.takePreciseCoverage" | "Profiler.getBestEffortCoverage" | "CSS.getStyleSheetText" | "CSS.getComputedStyleForNode" | "CSS.getMatchedStylesForNode" | "CSS.getInlineStylesForNode"
+        | "CSS.setStyleSheetText" | "CSS.setStyleTexts" | "CSS.setEffectivePropertyValueForNode" | "CSS.getMediaQueries" | "CSS.getPlatformFontsForNode" => Some(true),
+        "Page.enable" | "Page.disable" | "Page.navigate" | "Page.reload" | "Page.stopLoading" | "Page.navigateToHistoryEntry" | "Page.close" | "Page.bringToFront"
+        | "Page.getFrameTree" | "Page.getResourceTree" | "Page.getNavigationHistory" | "Page.createIsolatedWorld" | "Page.setLifecycleEventsEnabled" | "Page.removeScriptToEvaluateOnNewDocument"
+        | "Page.setBypassCSP" | "Page.setWebLifecycleState" | "Page.setInterceptFileChooserDialog" | "Page.stopScreencast" | "Page.screencastFrameAck" | "Page.setDownloadBehavior" | "Page.getCookies" | "Page.deleteCookie"
+        | "Runtime.enable" | "Runtime.disable" | "Runtime.runIfWaitingForDebugger" | "Runtime.addBinding" | "Runtime.removeBinding" | "Runtime.releaseObject" | "Runtime.releaseObjectGroup" | "Runtime.getIsolateId"
+        | "Runtime.setAsyncCallStackDepth" | "Runtime.setCustomObjectFormatterEnabled" | "Runtime.setMaxCallStackSizeToCapture" | "Runtime.terminateExecution"
+        | "DOM.enable" | "DOM.disable" | "DOM.setNodeStackTracesEnabled" | "DOMSnapshot.enable" | "DOMSnapshot.disable" | "Accessibility.enable" | "Accessibility.disable" | "CSS.enable" | "CSS.disable"
+        | "Input.setIgnoreInputEvents" | "Input.setInterceptDrags" | "Fetch.enable" | "Fetch.disable" | "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest" | "Fetch.continueWithAuth" | "Fetch.continueResponse"
+        | "Network.enable" | "Network.disable" | "Network.setBypassServiceWorker" | "Network.setCacheDisabled" | "Network.setExtraHTTPHeaders" | "Network.setRequestInterception" | "Network.continueInterceptedRequest"
+        | "Network.setUserAgentOverride" | "Network.setBlockedURLs" | "Network.emulateNetworkConditions" | "Network.emulateNetworkConditionsByRule" | "Network.overrideNetworkState"
+        | "Network.getCookies" | "Network.getAllCookies" | "Network.setCookie" | "Network.setCookies" | "Network.deleteCookies" | "Network.clearBrowserCookies" | "Network.clearBrowserCache" | "Network.setAcceptedEncodings" | "Network.clearAcceptedEncodingsOverride"
+        | "Target.attachToTarget" | "Target.attachToBrowserTarget" | "Target.detachFromTarget" | "Target.createTarget" | "Target.closeTarget" | "Target.activateTarget" | "Target.getTargets" | "Target.getTargetInfo"
+        | "Target.setDiscoverTargets" | "Target.setAutoAttach" | "Target.autoAttachRelated" | "Target.createBrowserContext" | "Target.disposeBrowserContext" | "Target.getBrowserContexts"
+        | "Browser.getVersion" | "Browser.close" | "Browser.getWindowForTarget" | "Browser.getWindowBounds" | "Browser.setWindowBounds" | "Browser.grantPermissions" | "Browser.resetPermissions" | "Browser.setPermission"
+        | "Browser.setDownloadBehavior" | "Browser.cancelDownload" | "Browser.getBrowserCommandLine" | "Browser.getHistograms" | "Browser.getHistogram" | "Browser.executeBrowserCommand" | "Browser.setDockTile"
+        | "Emulation.setCPUThrottlingRate" | "Emulation.setFocusEmulationEnabled" | "Emulation.setDeviceMetricsOverride" | "Emulation.clearDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled"
+        | "Emulation.setUserAgentOverride" | "Emulation.setLocaleOverride" | "Emulation.setTimezoneOverride" | "Emulation.setEmulatedMedia" | "Emulation.setGeolocationOverride" | "Emulation.clearGeolocationOverride"
+        | "Emulation.setScriptExecutionDisabled" | "Emulation.setEmulatedVisionDeficiency" | "Emulation.setEmitTouchEventsForMouse" | "Emulation.setScrollbarsHidden" | "Emulation.setDefaultBackgroundColorOverride"
+        | "Debugger.enable" | "Debugger.disable" | "Debugger.resume" | "Debugger.setBreakpoint" | "Debugger.setBreakpointByUrl" | "Debugger.removeBreakpoint"
+        | "Debugger.setBreakpointsActive" | "Debugger.setPauseOnExceptions" | "Debugger.setSkipAllPauses" | "Debugger.setAsyncCallStackDepth" | "Debugger.setBlackboxPatterns" | "Debugger.setBlackboxedRanges"
+        | "Profiler.enable" | "Profiler.disable" | "Profiler.start" | "Profiler.startPreciseCoverage" | "Profiler.stopPreciseCoverage" | "Profiler.setSamplingInterval"
+        | "HeapProfiler.enable" | "HeapProfiler.disable" | "HeapProfiler.startSampling" | "HeapProfiler.startTrackingHeapObjects" | "HeapProfiler.collectGarbage"
+        | "Log.enable" | "Log.disable" | "Log.clear" | "Log.startViolationsReport" | "Log.stopViolationsReport" | "Audits.enable" | "Audits.disable"
+        | "Storage.getCookies" | "Storage.setCookies" | "Storage.clearCookies" | "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota" | "Storage.getStorageKeyForFrame"
+        | "CacheStorage.requestCacheNames" | "CacheStorage.requestEntries" | "CacheStorage.requestCachedResponse" | "CacheStorage.deleteCache" | "CacheStorage.deleteEntry"
+        | "IndexedDB.enable" | "IndexedDB.disable" | "IndexedDB.requestDatabaseNames" | "IndexedDB.requestDatabase" | "IndexedDB.requestData" | "IndexedDB.deleteDatabase" | "IndexedDB.deleteObjectStoreEntries" | "IndexedDB.clearObjectStore" | "IndexedDB.getMetadata" | "IndexedDB.releaseObject"
+        | "FileSystem.getDirectory" | "ServiceWorker.enable" | "ServiceWorker.disable" | "ServiceWorker.unregister" | "ServiceWorker.startWorker" | "ServiceWorker.stopWorker" | "ServiceWorker.stopAllWorkers" | "ServiceWorker.updateRegistration"
+        | "PWA.install" | "PWA.launch" | "PWA.uninstall" | "Extensions.loadUnpacked" | "Extensions.uninstall" | "Extensions.getExtensions" | "SystemInfo.getInfo" | "SystemInfo.getProcessInfo"
+        | "Tracing.start" | "Tracing.end" | "Tracing.getCategories" | "Tracing.recordClockSyncMarker" | "Tracing.requestMemoryDump" | "Slicc.action" => Some(false),
+        _ => None,
+    }
 }
 
 fn harmless(method: &str, params: &Value) -> bool {

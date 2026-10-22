@@ -6,6 +6,7 @@ on:
       - crates/cdp-client/**
       - test/integration/*document*
       - test/integration/cdp-proxy*.mjs
+      - test/integration/content-*.test.mjs
       - test/integration/guard-client.mjs
       - test/integration/fake-cdp.mjs
       - .github/workflows/document-check.yml
@@ -43,7 +44,7 @@ jobs:
       - name: Verify current document commands
         run: |
           cargo test --locked -p slicc-cdp-client --test document-freshness --test document-validation
-          node scripts/gate.mjs document --tap -- node --test --test-reporter=tap --test-concurrency=1 test/integration/document-freshness.test.mjs test/integration/document-validation.test.mjs test/integration/cdp-proxy.test.mjs test/integration/current-document.test.mjs
+          node scripts/gate.mjs document --tap -- node --test --test-reporter=tap --test-concurrency=1 test/integration/document-freshness.test.mjs test/integration/document-validation.test.mjs test/integration/cdp-proxy.test.mjs test/integration/content-control.test.mjs test/integration/content-inventory.test.mjs test/integration/current-document.test.mjs
       - name: Verify regression sensitivity
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -53,7 +54,7 @@ jobs:
             exit 0
           fi
           git show "$BASE:crates/cdp-client/src/cdp.rs" > crates/cdp-client/src/cdp.rs
-          if cargo test --locked -p slicc-cdp-client --test document-validation -- --skip same_generation_updates_and_other_targets_do_not_invalidate_content --skip current_policy_is_still_checked_when_a_loader_id_is_unchanged --skip catalog_exceptions_and_initial_blank_documents_have_verified_metadata --skip inherited_child_documents_require_verified_unprotected_origins --skip opaque_blank_roots_require_verified_creation_evidence --skip history_commands_refuse_unavailable_or_unknown_destination_evidence > /tmp/document-validation.log 2>&1; then
+          if cargo test --locked -p slicc-cdp-client --test document-validation -- --skip same_generation_updates_and_other_targets_do_not_invalidate_content --skip current_policy_is_still_checked_when_a_loader_id_is_unchanged --skip catalog_exceptions_and_initial_blank_documents_have_verified_metadata --skip inherited_child_documents_require_verified_unprotected_origins --skip opaque_blank_roots_require_verified_creation_evidence --skip history_commands_refuse_unavailable_or_unknown_destination_evidence --skip fetch_answers_do_not_probe_a_paused_document --skip ordinary_navigation_readiness_and_settings_do_not_require_frame_reads --skip ordinary_new_tab_settings_and_basics_keep_content_checks --skip unknown_commands_and_readiness_with_selectors_fail_closed > /tmp/document-validation.log 2>&1; then
             echo 'expected the baseline validation tests to fail'
             exit 1
           fi

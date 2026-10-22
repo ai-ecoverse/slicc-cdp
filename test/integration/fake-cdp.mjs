@@ -76,6 +76,7 @@ export async function fakeCdp({
   discoverEvents = false,
   delayHistoryEvents = false,
   onUpgrade,
+  onCommand,
 } = {}) {
   const calls = [];
   const targets = [];
@@ -84,6 +85,7 @@ export async function fakeCdp({
   const releaseEvents = [];
   let next = 0;
   let tabs = 0;
+  let loaders = 0;
   const info = (target) => ({
     targetId: target.targetId,
     type: target.type ?? 'page',
@@ -144,6 +146,7 @@ export async function fakeCdp({
         }
         return;
       }
+      onCommand?.(message, event);
       switch (method) {
         case 'Target.setDiscoverTargets':
           answer({});
@@ -160,7 +163,12 @@ export async function fakeCdp({
         }
         case 'Target.createTarget': {
           tabs += 1;
-          const created = { targetId: `TAB${tabs}`, url: params.url ?? 'about:blank' };
+          const url = params.url ?? 'about:blank';
+          const created = {
+            targetId: `TAB${tabs}`,
+            url,
+            loaderId: url === 'about:blank' ? '' : `L${++loaders}`,
+          };
           targets.push(created);
           return answer({ targetId: created.targetId });
         }
@@ -193,7 +201,7 @@ export async function fakeCdp({
             frameTree: {
               frame: target?.frame ?? {
                 id: target?.targetId ?? 'F',
-                loaderId: 'L',
+                loaderId: target?.loaderId ?? 'L',
                 url: target?.url ?? '',
                 securityOrigin:
                   target?.url && new URL(target.url).origin !== 'null'
@@ -222,14 +230,16 @@ export async function fakeCdp({
             }
           );
         case 'Page.navigate': {
+          const loaderId = `L${++loaders}`;
           if (target) {
             target.url = params.url;
+            target.loaderId = loaderId;
             delete target.frame;
             delete target.history;
           }
-          answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
+          answer({ frameId: target?.targetId ?? 'F', loaderId });
           const committed = {
-            frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
+            frame: { id: target?.targetId ?? 'F', loaderId, url: params.url },
           };
           for (const [peer, found] of sessions)
             if (target && found === target && peer !== sessionId && paged.has(peer))
