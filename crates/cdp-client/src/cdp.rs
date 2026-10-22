@@ -73,6 +73,7 @@ pub struct Cdp {
     discovering: bool,
     requests: BTreeMap<String, bool>,
     redirects: BTreeSet<String>,
+    protected_body_requests: BTreeSet<String>,
     seen_network: BTreeMap<(String, String), String>,
     terminal_network: BTreeSet<(String, String)>,
     request_aliases: BTreeMap<String, BTreeSet<String>>,
@@ -128,6 +129,7 @@ impl Cdp {
             discovering: false,
             requests: BTreeMap::new(),
             redirects: BTreeSet::new(),
+            protected_body_requests: BTreeSet::new(),
             seen_network: BTreeMap::new(),
             terminal_network: BTreeSet::new(),
             request_aliases: BTreeMap::new(),
@@ -1331,6 +1333,7 @@ impl Cdp {
     }
 
     fn content_refused(&self, method: &str, params: &Value, session: &str) -> bool {
+        if shield::body_method(method) && shield::request_key(params).is_some_and(|id| self.protected_body_requests.contains(&id)) { return true }
         if shield::body_method(method) && shield::request_key(params).is_some_and(|id| self.request_state(&id) == Some(true)) {
             return true;
         }
@@ -1361,6 +1364,15 @@ impl Cdp {
         let Some(key) = self.guard.resource_key(url) else { return true };
         self.guard.url(url) || self.protected_resources.contains(&(session.to_string(), key.clone()))
             || self.session_target(session).is_some_and(|target| self.protected_target_resources.contains(&(target, key)))
+    }
+
+    fn protect_body_request(&mut self, id: &str) {
+        let mut ids = self.request_aliases.get(id).cloned().unwrap_or_default();
+        ids.insert(id.to_string());
+        for id in ids {
+            self.protected_body_requests.insert(id.clone());
+            for (peer, url) in self.request_resources.get(&id).cloned().unwrap_or_default() { self.protect_resource(&peer, &url); }
+        }
     }
 
     fn mark_redirect(&mut self, id: &str) {
@@ -1394,7 +1406,7 @@ impl Cdp {
             if let Some(url) = shield::request_url(&params) {
                 let resource = (session.clone().unwrap_or_default(), url.clone());
                 self.request_resources.entry(id.to_string()).or_default().insert(resource.clone());
-                if self.redirects.contains(id) || self.guard.url(&url) {
+                if self.redirects.contains(id) || self.protected_body_requests.contains(id) || self.guard.url(&url) {
                     self.protect_resource(&resource.0, &resource.1);
                 }
                 let initiator = ["documentURL"]
@@ -1414,15 +1426,13 @@ impl Cdp {
             }
         }
         if let Some(id) = params.get("requestId").and_then(Value::as_str) {
-            if shield::scheme_less_protected(&self.guard, &params) {
+            let authority = if method == "Network.requestWillBeSentExtraInfo" { params.clone() } else { params.get("request").cloned().unwrap_or(Value::Null) };
+            if shield::scheme_less_protected(&self.guard, &authority) {
                 self.requests.insert(id.to_string(), true);
-                self.mark_redirect(id);
+                for (peer, url) in self.request_resources.get(id).cloned().unwrap_or_default() { self.protect_resource(&peer, &url); }
             }
-            for key in ["response", "redirectResponse", "headers", "headersText", "requestHeadersText", "responseHeaders"] {
-                if params.get(key).is_some_and(|item| shield::redact_strings(&self.guard, &mut json!({key:item}))) {
-                    self.mark_redirect(id);
-                }
-            }
+            if self.protected_carrier(value, false) { self.protect_body_request(id); }
+            if self.actual_redirect_carrier(value) { self.mark_redirect(id); }
         }
         if let Some((id, url)) = match method.as_str() {
             "Debugger.scriptParsed" | "Debugger.scriptFailedToParse" => params.get("scriptId").and_then(Value::as_str).zip(params.get("url").and_then(Value::as_str)),
@@ -1664,6 +1674,60 @@ impl Cdp {
         !self.guard.url(url) && !self.guard.url(&shield::web_socket_as_http(url)) && url::Url::parse(&shield::web_socket_as_http(url)).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
     }
 
+    fn ordinary_network_source(&self, session: &str, id: &str) -> Option<String> {
+        let resources: Vec<_> = self.request_resources.get(id).into_iter().flatten().filter(|(peer, _)| peer == session).map(|(_, url)| url).collect();
+        if resources.is_empty() || resources.iter().any(|url| !self.ordinary_redirect_url(url)) { return None }
+        resources.first().map(|url| (*url).clone())
+    }
+
+    fn actual_redirect_carrier(&self, value: &Value) -> bool {
+        self.protected_carrier(value, true)
+    }
+
+    fn protected_carrier(&self, value: &Value, navigation: bool) -> bool {
+        let params = &value["params"];
+        let method = value["method"].as_str().unwrap_or("");
+        if navigation && method == "Network.requestWillBeSentExtraInfo" { return false }
+        let (headers, status, source) = match method {
+            "Network.requestWillBeSent" => (params.pointer("/redirectResponse/headers"), params.pointer("/redirectResponse/status"), params.pointer("/redirectResponse/url").and_then(Value::as_str).map(str::to_string)),
+            "Network.responseReceived" => (params.pointer("/response/headers"), params.pointer("/response/status"), params.pointer("/response/url").and_then(Value::as_str).map(str::to_string)),
+            "Fetch.requestPaused" => (params.get("responseHeaders"), params.get("responseStatusCode"), params.pointer("/request/url").and_then(Value::as_str).map(str::to_string)),
+            "Network.responseReceivedExtraInfo" | "Network.requestWillBeSentExtraInfo" => (params.get("headers"), params.get("statusCode"), self.ordinary_network_source(value["sessionId"].as_str().unwrap_or(""), params["requestId"].as_str().unwrap_or(""))),
+            _ => return false,
+        };
+        let source = source.as_deref().unwrap_or("https://ordinary.invalid/");
+        let redirect = status.and_then(Value::as_u64).is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308));
+        let sensitive = |target: &str| {
+            if Self::redirect_header_value(&self.guard, "location", target, source).is_none_or(|url| !self.guard.url(&url)) { return false }
+            let mut target = target.to_string();
+            for _ in 0..8 { let decoded = shield::decode_percent(&target); if decoded == target { break } target = decoded; }
+            url::Url::parse(source).ok().and_then(|base| base.join(&target).ok()).is_some_and(|url| !url.path().trim_matches('/').is_empty() || url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() || url.password().is_some())
+        };
+        let protected = |name: &str, text: &str| {
+            match name.to_ascii_lowercase().as_str() {
+                "location" if navigation && redirect => Self::redirect_header_value(&self.guard, name, text, source).is_some_and(|url| self.guard.url(&url)),
+                "location" | "content-location" if !navigation => sensitive(text),
+                "refresh" => Self::redirect_header_value(&self.guard, name, text, source).is_some_and(|text| text.split_once(";url=").is_some_and(|(_, url)| self.guard.url(url))),
+                "link" => text.split(',').any(|part| part.trim().strip_prefix('<').and_then(|part| part.split_once('>')).is_some_and(|(target, _)| sensitive(target))),
+                _ => false,
+            }
+        };
+        let found = match headers {
+            Some(Value::Object(headers)) => headers.iter().any(|(name, value)| value.as_str().is_some_and(|text| protected(name, text))),
+            Some(Value::Array(headers)) => headers.iter().any(|field| field["name"].as_str().zip(field["value"].as_str()).is_some_and(|(name, text)| protected(name, text))),
+            _ => false,
+        };
+        found || ["headersText", "requestHeadersText"].iter().filter(|field| !navigation || **field == "headersText").any(|field| params.get(*field).and_then(Value::as_str).is_some_and(|text| text.lines().filter_map(|line| line.split_once(':')).any(|(name, value)| protected(name.trim(), value.trim()))))
+    }
+
+    fn ordinary_late_extra_info(&self, value: &Value) -> bool {
+        let session = value["sessionId"].as_str().unwrap_or("");
+        let id = value["params"]["requestId"].as_str().unwrap_or("");
+        self.requests.get(id) == Some(&false) && !self.redirects.contains(id) && !self.protected_body_requests.contains(id) && !self.guard_sessions.contains(session)
+            && !self.redirect_page_protected(value) && !shield::loaded_urls_protected(&self.guard, &value["params"])
+            && self.ordinary_network_source(session, id).is_some()
+    }
+
     fn redirect_page_protected(&self, value: &Value) -> bool {
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let params = &value["params"];
@@ -1744,11 +1808,7 @@ impl Cdp {
             "Network.requestWillBeSent" => params.pointer("/redirectResponse/url").and_then(Value::as_str).map(str::to_string),
             "Network.responseReceived" => params.pointer("/response/url").and_then(Value::as_str).map(str::to_string),
             "Fetch.requestPaused" => params.pointer("/request/url").and_then(Value::as_str).map(str::to_string),
-            "Network.responseReceivedExtraInfo" => {
-                let resources: Vec<_> = self.request_resources.get(&id).into_iter().flatten().filter(|(peer, _)| peer == &session).map(|(_, url)| url).collect();
-                if resources.is_empty() || resources.iter().any(|url| !self.ordinary_redirect_url(url)) { return false }
-                resources.first().map(|url| (*url).clone())
-            }
+            "Network.responseReceivedExtraInfo" => self.ordinary_network_source(&session, &id),
             _ => return false,
         };
         let Some(source) = source.filter(|url| self.ordinary_redirect_url(url)) else { return false };
@@ -1813,7 +1873,8 @@ impl Cdp {
         self.watch(&mut value);
         let key = (value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string(), value.pointer("/params/requestId").and_then(Value::as_str).unwrap_or("").to_string());
         let terminal = self.terminal_network.contains(&key);
-        if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Network.") && method != "Network.responseReceivedExtraInfo") && terminal { return }
+        let late_ordinary = terminal && matches!(value["method"].as_str(), Some("Network.responseReceivedExtraInfo" | "Network.requestWillBeSentExtraInfo")) && self.ordinary_late_extra_info(&value);
+        if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Network.") && method != "Network.responseReceivedExtraInfo") && terminal && !late_ordinary { return }
         let guarded = self.blocked.contains(&key.0) || shield::loaded_urls_protected(&self.guard, &value["params"]) || self.hidden(&value) || self.redirects.contains(&key.1);
         if guarded && self.visible_redirect(&mut value) {
             let hop = value.get("method").and_then(Value::as_str) == Some("Network.requestWillBeSent");
@@ -1821,7 +1882,7 @@ impl Cdp {
             if hop { self.fail_seen_network(&value); }
             return;
         }
-        if terminal { return }
+        if terminal && !late_ordinary { return }
         if self.worlds.event(&value, &self.guard) {
             if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
                 let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
@@ -1865,7 +1926,7 @@ impl Cdp {
                 }
             }
         }
-        self.visible_network(&value);
+        if !terminal { self.visible_network(&value); }
         self.events.push(value);
         if let Some(id) = id {
             if self.requests.get(&id) == Some(&false) {
@@ -2057,13 +2118,21 @@ impl Cdp {
                 if self.redirects.contains(network) {
                     self.mark_redirect(network);
                 }
+                if self.protected_body_requests.contains(network) { self.protect_body_request(network); }
             }
-            let authority_protected = shield::scheme_less_protected(&self.guard, &value["params"]);
-            let reaches = fetch::reaches_protected(&self.guard, &paused) || authority_protected;
+            let authority_protected = shield::scheme_less_protected(&self.guard, &value["params"]["request"]);
+            let redirect = self.actual_redirect_carrier(&value);
+            if self.protected_carrier(&value, false) {
+                self.protect_body_request(&paused.request_id);
+                if let Some(network) = &paused.network_id { self.protect_body_request(network); self.protect_resource(&paused.session_id, &paused.url); }
+            }
+            let reaches = self.guard.url(&paused.full_url()) || redirect || authority_protected;
+            let loaded_protected = self.guard.url(&paused.full_url()) || authority_protected;
             let protected = reaches;
-            let mut headers = json!({"headers":paused.headers,"responseHeaders":paused.response_headers});
-            let redirect = shield::redact_strings(&self.guard, &mut headers);
-            if redirect || reaches {
+            if loaded_protected {
+                self.protect_resource(&paused.session_id, &paused.full_url());
+            }
+            if redirect {
                 self.mark_redirect(&paused.request_id);
                 if let Some(network) = &paused.network_id {
                     self.mark_redirect(network);
@@ -2075,11 +2144,8 @@ impl Cdp {
                 self.protected_request_pages.insert((paused.session_id.clone(), paused.request_id.clone()));
                 if let Some(network) = &paused.network_id { self.protected_request_pages.insert((paused.session_id.clone(), network.clone())); }
             }
-            if redirect {
-                shield::redact_strings(&self.guard, &mut value);
-                paused = Paused::from_event(&value).unwrap();
-            }
-            let loaded_protected = self.guard.url(&paused.full_url()) || authority_protected;
+            shield::redact_strings(&self.guard, &mut value);
+            paused = Paused::from_event(&value).unwrap();
             self.requests.insert(paused.request_id.clone(), loaded_protected || initiated);
             if let Some(network) = &paused.network_id {
                 let entry = self.requests.entry(network.clone()).or_insert(false);
@@ -2573,6 +2639,7 @@ mod tests {
     include!("redirect_c2_carrier_test.rs");
     include!("redirect_grok_test.rs");
     include!("redirect_scope_review_test.rs");
+    include!("ordinary_network_review_test.rs");
     include!("redirect_target_taint_test.rs");
     include!("redirect_resource_control_test.rs");
     include!("navigation_queue_test.rs");
