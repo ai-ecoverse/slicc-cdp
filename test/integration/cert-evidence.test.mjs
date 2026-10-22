@@ -196,6 +196,11 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
       const row = docs.guard.executions.positive.report.results.find((row) => row.id === 'C1.href');
       row.control = row.guarded = row.live = 'skip';
     },
+    'runner-supported skip of a required guard row': (docs) => {
+      const row = docs.guard.executions.positive.report.results.find((row) => row.id === 'C1.href');
+      row.control = row.guarded = row.live = 'skip';
+      row.reason = 'not-supported:browserSession';
+    },
     'missing fresh tag verification': (docs) => {
       delete docs.registry.tagCommit;
     },
@@ -232,9 +237,12 @@ test('missing or mismatched required evidence is INCOMPLETE, never a candidate',
       change(documents);
       const result = conclude(documents);
       assert.equal(result.status, 1);
-      assert.equal(result.record.status, 'INCOMPLETE', result.record.line);
+      const expectedStatus = name === 'skipped executable guard row' ? 'FAIL' : 'INCOMPLETE';
+      assert.equal(result.record.status, expectedStatus, result.record.line);
       assert.equal(result.record.certified, false);
-      assert.match(result.record.line, /^cert-ci: INCOMPLETE/);
+      assert.match(result.record.line, new RegExp(`^cert-ci: ${expectedStatus}`));
+      if (expectedStatus === 'FAIL')
+        assert.ok(result.record.line.includes('guard: recomputed positive summary failed'));
     });
 });
 

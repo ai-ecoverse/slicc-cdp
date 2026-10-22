@@ -67,6 +67,18 @@ jobs:
       chromium: false
       runs-on: ${{ needs.runner.outputs.runner }}
   integration:
+    needs: [integration-suite, redirect-regressions]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both complete integration owners
+        env:
+          SUITE_RESULT: ${{ needs.integration-suite.result }}
+          REDIRECT_RESULT: ${{ needs.redirect-regressions.result }}
+        run: test "$SUITE_RESULT" = success && test "$REDIRECT_RESULT" = success
+
+  integration-suite:
     needs: runner
     runs-on: ${{ needs.runner.outputs.runner }}
     timeout-minutes: 50
@@ -125,11 +137,11 @@ jobs:
           if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
           npm run -s browser -- $deps
       - name: Native and WASI published C2 redirect controls and fragments
-        run: node --test --test-concurrency=1 --test-reporter=spec test/integration/guard-c2-redirect.test.mjs
+        run: node scripts/gate.mjs redirect-c2 --tap -- node --test --test-concurrency=1 --test-reporter=tap test/integration/guard-c2-redirect.test.mjs
         env:
           SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
       - name: Native and WASI CLI redirect refusal and ordinary recovery
-        run: node --test --test-concurrency=1 --test-reporter=spec test/integration/redirect-navigation.test.mjs
+        run: node scripts/gate.mjs redirect-navigation --tap -- node --test --test-concurrency=1 --test-reporter=tap test/integration/redirect-navigation.test.mjs
         env:
           SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
       - name: Guard regression report

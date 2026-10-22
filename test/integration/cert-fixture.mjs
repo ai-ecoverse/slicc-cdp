@@ -55,6 +55,9 @@ export function fixture() {
             control: state,
             guarded: state,
             live: state,
+            ...(state === 'skip'
+              ? { reason: vector.skip?.target === target ? vector.skip.reason : 'not-applicable' }
+              : {}),
           };
         })
       )
