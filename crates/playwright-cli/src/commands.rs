@@ -847,19 +847,12 @@ fn cmd_eval(
         Err(message) => return Output::err(message),
     };
     let result: Result<String, String> = (|| {
-        let value = if let Some(frame_id) = invocation.flags.get("frame") {
-            browser::evaluate_in_frame(cdp, &session, frame_id, &expression).or_else(|err| {
-                retry_await(err, &expression, |source| {
-                    browser::evaluate_in_frame(cdp, &session, frame_id, source)
-                })
-            })?
-        } else {
-            browser::evaluate(cdp, &session, &expression, true).or_else(|err| {
-                retry_await(err, &expression, |source| {
-                    browser::evaluate(cdp, &session, source, true)
-                })
-            })?
-        };
+        let frame = invocation.flags.get("frame").map(String::as_str);
+        let value = browser::evaluate_called(cdp, &session, frame, &expression).or_else(|err| {
+            retry_await(err, &expression, |source| {
+                browser::evaluate_called(cdp, &session, frame, source)
+            })
+        })?;
         Ok(browser::format_eval(&value))
     })();
     let watched = browser::watch_detach(cdp, state, &target, &session);
