@@ -338,6 +338,9 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
+        if shield::persistent_capability(method) {
+            return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
+        }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
         {
@@ -2317,6 +2320,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
+    include!("persistent_test.rs");
     include!("redirect_test.rs");
     include!("redirect_matrix_test.rs");
     include!("redirect_race_test.rs");
