@@ -327,10 +327,30 @@ export async function fakeCdp({
         }
         case 'Page.printToPDF':
           return answer({ stream: 'H' });
-        case 'Runtime.enable':
+        case 'Runtime.enable': {
+          const frame = target?.frame ?? {
+            id: target?.targetId ?? 'F',
+            loaderId: target?.loaderId ?? 'L',
+            securityOrigin:
+              target?.url && new URL(target.url).origin !== 'null'
+                ? new URL(target.url).origin
+                : '://',
+          };
+          event('Runtime.executionContextCreated', {
+            context: {
+              id: 1,
+              uniqueId: `default:${target?.targetId}:${frame.loaderId}`,
+              origin: frame.securityOrigin,
+              name: '',
+              auxData: { frameId: frame.id, isDefault: true },
+            },
+          });
+          for (const world of target?.worlds ?? [])
+            event('Runtime.executionContextCreated', { context: world });
           answer({});
           if (target?.url && target.url !== 'about:blank') emitConsole(target.url);
           return;
+        }
         case 'Network.getAllCookies':
           return answer({ cookies: jar.map((cookie) => ({ ...cookie })) });
         case 'Network.setCookie': {
@@ -368,8 +388,20 @@ export async function fakeCdp({
           }
           return answer({});
         }
-        case 'Page.createIsolatedWorld':
+        case 'Page.createIsolatedWorld': {
+          const world = {
+            id: 7,
+            uniqueId: `world:${target?.targetId}:${target?.loaderId ?? 'L'}`,
+            origin:
+              target?.url && new URL(target.url).origin !== 'null'
+                ? new URL(target.url).origin
+                : '://',
+            name: params.worldName ?? '',
+            auxData: { frameId: params.frameId, isDefault: false },
+          };
+          if (target) target.worlds = [world];
           return answer({ executionContextId: 7 });
+        }
         case 'Accessibility.getFullAXTree':
           return answer(tree);
         case 'DOM.resolveNode':

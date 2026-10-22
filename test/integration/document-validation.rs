@@ -52,6 +52,9 @@ impl Transport for Fake {
                 history
             }
             "Runtime.enable" => {
+                let current = if backend.sessions.get(call["sessionId"].as_str().unwrap_or("")).is_some_and(|target| target == "OWNER") { backend.owner_tree.clone().unwrap_or_else(|| backend.tree.clone()) } else { backend.tree.clone() };
+                let main = current.pointer("/frameTree/frame").cloned().unwrap_or(Value::Null);
+                backend.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":1,"uniqueId":format!("main:{}",main["loaderId"].as_str().unwrap_or("")),"name":"","origin":main["securityOrigin"],"auxData":{"frameId":main["id"],"isDefault":true}}}}).to_string());
                 backend.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":7,"uniqueId":"child-context","name":"child-world","origin":"https://ordinary.example","auxData":{"frameId":"CHILD","isDefault":false}}}}).to_string());
                 json!({})
             }
@@ -69,6 +72,10 @@ impl Transport for Fake {
                     Some("document.readyState === 'complete' ? location.href : ''") => json!({"result":{"type":"string","value":backend.tree.pointer("/frameTree/frame/url").and_then(Value::as_str).unwrap_or("")}}),
                     _ => json!({"result":{"type":"string","value":"document-value"}}),
                 }
+            }
+            "DOM.getDocument" => {
+                if let Some(next) = backend.next_tree.take() { backend.tree = next; }
+                json!({"root":{"nodeId":1,"nodeName":"document-value"}})
             }
             "Page.printToPDF" => json!({"stream":"H"}),
             _ => json!({}),
@@ -244,9 +251,9 @@ fn protected_or_unknown_changes_discard_content_responses_and_notification_resul
             } else { next["frameTree"]["frame"].as_object_mut().unwrap().remove("securityOrigin"); }
             backend.borrow_mut().next_tree = Some(next);
             let result = if notify {
-                cdp.notify("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).map(|_| json!({}))
+                cdp.notify("DOM.getDocument", json!({}), Some(&session)).map(|_| json!({}))
             } else {
-                cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session))
+                cdp.call("DOM.getDocument", json!({}), Some(&session))
             };
             refused(result);
         }

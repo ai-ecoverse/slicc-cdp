@@ -10,34 +10,22 @@
       "rangeStrategy": "bump"
     },
     {
-      "description": "sliccy-browser pins slicc-cdp to the certified version by hand.",
+      "description": "sliccy-browser pins slicc-cdp by hand, in the pull request that bumps its own version for ci.yml to publish.",
       "matchFileNames": ["packages/sliccy-browser/package.json"],
       "matchPackageNames": ["@ai-ecoverse/slicc-cdp"],
       "enabled": false
     },
     {
-      "matchManagers": ["github-actions"],
-      "matchPackageNames": ["ai-ecoverse/slicc-shared-web"],
-      "additionalBranchPrefix": "workflow-",
-      "commitMessageTopic": "slicc-shared-web reusable workflows",
-      "semanticCommitType": "ci"
+      "description": "Majors open as drafts with no automerge, so a person reads them before they ship.",
+      "matchUpdateTypes": ["major"],
+      "draftPR": true,
+      "automerge": false
     },
     {
-      "description": "Changes that reach the shipped wasm or binaries wait for the PR certification: Renovate's pull requests aren't drafts, so cert-review-pr reviews them, and Renovate merges only when every check, cert-review included, is green.",
-      "matchManagers": ["cargo"],
-      "platformAutomerge": false
-    },
-    {
-      "description": "Runtime npm dependencies of the published package wait for the PR certification the same way.",
-      "matchManagers": ["npm"],
-      "matchFileNames": ["package.json"],
-      "matchDepTypes": ["dependencies", "optionalDependencies", "peerDependencies"],
-      "platformAutomerge": false
-    },
-    {
-      "description": "Workflow and action bumps that build or publish the shipped artifacts wait for the PR certification the same way.",
-      "matchManagers": ["github-actions"],
-      "platformAutomerge": false
+      "description": "Updates to files under .github/ (the pipeline pin and the release actions) change CI itself: drafts with no automerge.",
+      "matchFileNames": [".github/**"],
+      "draftPR": true,
+      "automerge": false
     }
   ],
   "customDatasources": {

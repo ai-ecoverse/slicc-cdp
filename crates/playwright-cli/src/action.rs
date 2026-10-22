@@ -386,6 +386,9 @@ mod tests {
                 _ => json!({}),
             };
             let mut frames = vec![json!({"id": id, "result": result}).to_string()];
+            if method == "Runtime.enable" {
+                frames.insert(0, json!({"method":"Runtime.executionContextCreated","sessionId":value["sessionId"],"params":{"context":{"id":1,"uniqueId":"peer-context","origin":"https://app.example","name":"","auxData":{"isDefault":true,"frameId":"F"}}}}).to_string());
+            }
             if method == "Page.navigate" {
                 let url = params
                     .get("url")

@@ -20,7 +20,14 @@ impl Transport for Scripted {
                 let frame = |id: &str| json!({"id":id,"loaderId":"L","url":"https://example.test/","securityOrigin":"https://example.test"});
                 let children = ["F1","MAIN","FRAME","FCHILD"].iter().map(|id| json!({"frame":frame(id)})).collect::<Vec<_>>();
                 json!({"frameTree":{"frame":frame("F"),"childFrames":children}})
-            } else { json!({}) })
+            } else {
+                if method == "Runtime.enable" {
+                    for id in 1..=64 {
+                        self.incoming.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":"fixture-guard","params":{"context":{"id":id,"uniqueId":format!("fixture-context:{id}"),"origin":"https://example.test","name":"","auxData":{"frameId":"F","isDefault":id == 1}}}}).to_string());
+                    }
+                }
+                json!({})
+            })
         } else if method == "Target.getTargetInfo" && call["params"]["targetId"] == "fixture-page" {
             Some(json!({"targetInfo":{"targetId":"fixture-page","type":"page","url":"https://example.test/"}}))
         } else if method == "Target.attachToTarget" && call["params"]["targetId"] == "fixture-page" {

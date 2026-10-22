@@ -49,6 +49,16 @@ impl PartialEq for DocumentState {
     }
 }
 
+#[derive(Clone)]
+struct ContextProof {
+    id: i64,
+    frame: String,
+    origin: String,
+    name: String,
+    loader: Option<String>,
+    default: bool,
+}
+
 struct MainDocument {
     frame_id: String,
     url: String,
@@ -96,6 +106,11 @@ pub struct Cdp {
     document_versions: BTreeMap<(String, String), String>,
     created_blanks: BTreeMap<String, (String, String, i64)>,
     context_frames: BTreeMap<(String, String), String>,
+    context_proofs: BTreeMap<(String, String), ContextProof>,
+    runtime_sessions: BTreeMap<String, String>,
+    created_contexts: BTreeSet<(String, i64)>,
+    cached_documents: BTreeMap<String, DocumentState>,
+    paused_documents: BTreeSet<(String, String)>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
@@ -152,6 +167,11 @@ impl Cdp {
             document_versions: BTreeMap::new(),
             created_blanks: BTreeMap::new(),
             context_frames: BTreeMap::new(),
+            context_proofs: BTreeMap::new(),
+            runtime_sessions: BTreeMap::new(),
+            created_contexts: BTreeSet::new(),
+            cached_documents: BTreeMap::new(),
+            paused_documents: BTreeSet::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
@@ -178,6 +198,12 @@ impl Cdp {
                 let call: Value = serde_json::from_str(text).unwrap();
                 if call["method"] == "Page.getFrameTree" && call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:") || session == "S" || session == "OTHER") {
                     self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":{"id":"F","loaderId":"L","url":"https://example.test/","securityOrigin":"https://example.test"}}}}).to_string());
+                    Ok(())
+                } else if call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:")) && matches!(call["method"].as_str(), Some("Runtime.disable" | "Runtime.enable")) {
+                    if call["method"] == "Runtime.enable" {
+                        self.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":1,"uniqueId":"fixture-context","origin":"https://example.test","name":"","auxData":{"frameId":"F","isDefault":true}}}}).to_string());
+                    }
+                    self.inbox.push_back(json!({"id":call["id"],"result":{}}).to_string());
                     Ok(())
                 } else { self.inner.send_text(text) }
             }
@@ -290,9 +316,20 @@ impl Cdp {
             return self.create_target(params, timeout);
         }
         let checks = self.prepare(method, &params, session_id)?;
+        let pinned = self.pin_execution(method, &params, session_id, &checks)?;
+        let object_pin = method == "Runtime.callFunctionOn" && params.get("objectId").is_some() && !checks.is_empty();
+        let executed = pinned.is_some() || object_pin;
+        let mut sent = params.clone();
+        if let Some(unique) = &pinned {
+            sent.as_object_mut().ok_or_else(|| self.refusal())?.remove("contextId");
+            sent.as_object_mut().unwrap().remove("executionContextId");
+            sent.as_object_mut().unwrap().remove("executionContextUniqueId");
+            sent.as_object_mut().unwrap().remove("executionContextName");
+            sent["uniqueContextId"] = json!(unique);
+        }
         let frame_epoch = self.frame_epoch;
-        let result = self.raw_call(method, params.clone(), session_id, timeout)?;
-        if content_command(method, &params) == Some(true) {
+        let result = self.raw_call_execution(method, sent, session_id, timeout, executed)?;
+        if content_command(method, &params) == Some(true) && !executed {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"))?;
         }
         if let (true, Some(session), Some(id)) = (
@@ -303,7 +340,7 @@ impl Cdp {
             self.settle(session, &id);
         }
         if let Some(session) = session_id {
-            if self.blocked.contains(session) && !harmless(method, &params) {
+            if self.blocked.contains(session) && !harmless(method, &params) && !executed {
                 return Err(self.refusal());
             }
         }
@@ -526,18 +563,33 @@ impl Cdp {
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
+        if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
+            if !self.storage_scope_verified(params) { return Err(self.refusal()) }
+            return Ok(checks);
+        }
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
-            let current = self.document_state(&target, true).ok_or_else(|| self.refusal())?;
+            let current = self.document_state_for(&target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
             if current != expected { return Err(self.refusal()) }
             checks.push((target, current));
         }
         if let Some(session) = session {
             let target = self.session_target(session).ok_or_else(|| self.refusal())?;
             if !checks.iter().any(|(known, _)| known == &target) {
-                let scope = params.get("frameId").and_then(Value::as_str).filter(|_| !crosses_frames(method, params));
-                let state = self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())?;
+                let selected_frame = params.get("frameId").and_then(Value::as_str).map(str::to_string).or_else(|| {
+                    ["contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"].into_iter().find_map(|key| {
+                        let value = params.get(key)?;
+                        let label = if matches!(key, "contextId" | "executionContextId") { "id" } else if key == "executionContextName" { "name" } else { "unique" };
+                        let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                        self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
+                    })
+                });
+                let scope = if crosses_frames(method, params) { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
+                let state = if self.document_paused(&target) {
+                    if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
+                    self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
+                } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
                     if let Some(value) = params.get(key) {
@@ -556,6 +608,84 @@ impl Cdp {
         }
         if checks.is_empty() { return Err(self.refusal()) }
         Ok(checks)
+    }
+
+    fn document_paused(&self, target: &str) -> bool {
+        self.paused_documents.iter().any(|(session, _)| self.session_target(session).as_deref() == Some(target))
+    }
+
+    fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &[(String, DocumentState)]) -> Result<Option<String>, String> {
+        if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") || checks.is_empty() { return Ok(None) }
+        if method == "Runtime.callFunctionOn" && params.get("objectId").is_some() { return Ok(None) }
+        let session = session.ok_or_else(|| self.refusal())?;
+        let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+        let state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+        let guard = if let Some(guard) = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)) {
+            guard.clone()
+        } else {
+            if state.worker.is_none() { return Err(self.refusal()) }
+            let result = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, DOCUMENT_CHECK)?;
+            let guard = result.get("sessionId").and_then(Value::as_str).ok_or_else(|| self.refusal())?.to_string();
+            self.guard_sessions.insert(guard.clone());
+            self.session_targets.insert(guard.clone(), target.clone());
+            self.runtime_sessions.insert(target.clone(), guard.clone());
+            guard
+        };
+        let choose = |proofs: &BTreeMap<(String, String), ContextProof>| {
+            proofs.iter().find(|((owner, unique), proof)| {
+                owner == &guard && if let Some(id) = params.get("contextId").or_else(|| params.get("executionContextId")).and_then(Value::as_i64) {
+                    proof.id == id
+                } else if let Some(id) = params.get("uniqueContextId").or_else(|| params.get("executionContextUniqueId")).and_then(Value::as_str) {
+                    unique == id
+                } else if let Some(name) = params.get("executionContextName").and_then(Value::as_str) {
+                    proof.name == name
+                } else { proof.default && (state.worker.is_some() || state.frames.get(&proof.frame).is_some_and(|evidence| evidence[4].is_empty())) }
+            }).map(|((_, unique), proof)| (unique.clone(), proof.clone()))
+        };
+        let mut selected = choose(&self.context_proofs);
+        let paused = self.document_paused(&target);
+        let stable_context = selected.as_ref().is_some_and(|(_, proof)| state.worker.is_some()
+            || state.frames.get(&proof.frame).is_some_and(|evidence| proof.loader.as_deref() == Some(evidence[0].as_str())));
+        if !paused && !stable_context {
+            self.context_proofs.retain(|(owner, _), _| owner != &guard);
+            self.raw_call("Runtime.disable", json!({}), Some(&guard), DOCUMENT_CHECK)?;
+            self.raw_call("Runtime.enable", json!({}), Some(&guard), DOCUMENT_CHECK)?;
+            let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.refusal())?;
+            let same = if state.worker.is_some() { state.worker == current.worker } else {
+                state.frames.iter().filter(|(_, evidence)| evidence[4].is_empty()).all(|(id, evidence)| current.frames.get(id).is_some_and(|now| evidence[0] == now[0] && evidence[2] == now[2]))
+            };
+            if !same { return Err(self.refusal()) }
+            selected = choose(&self.context_proofs);
+        }
+        let (unique, proof) = selected.ok_or_else(|| self.refusal())?;
+        let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
+        if unique.is_empty() || proof.origin == "null" || proof.origin.is_empty() && !owned_world || self.guard.url(&proof.origin) { return Err(self.refusal()) }
+        if state.worker.is_none() {
+            let evidence = state.frames.get(&proof.frame).ok_or_else(|| self.refusal())?;
+            if proof.loader.as_deref() != Some(evidence[0].as_str()) { return Err(self.refusal()) }
+        }
+        Ok(Some(unique))
+    }
+
+    fn storage_scope_verified(&self, params: &Value) -> bool {
+        let mut scopes = Vec::new();
+        fn collect(value: &Value, scopes: &mut Vec<String>) -> bool {
+            let Some(items) = value.as_object() else { return false };
+            for (key, value) in items {
+                if matches!(key.as_str(), "origin" | "securityOrigin" | "storageKey" | "cacheId") {
+                    let Some(text) = value.as_str() else { return false };
+                    scopes.push(if key == "cacheId" { text.split('|').next().unwrap_or("").to_string() } else { text.to_string() });
+                } else if value.is_object() && !collect(value, scopes) { return false }
+            }
+            true
+        }
+        collect(params, &mut scopes) && !scopes.is_empty() && scopes.iter().all(|scope| {
+            let mut parts = scope.split('^');
+            let origin = parts.next().unwrap_or("");
+            let valid = |text: &str| url::Url::parse(text).ok().is_some_and(|url| url.origin().ascii_serialization() != "null" && !self.guard.url(text));
+            valid(origin) && !self.guard.storage_key(scope)
+                && parts.filter_map(|part| part.strip_prefix('0')).all(valid)
+        })
     }
 
     fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool) -> Result<(), String> {
@@ -607,6 +737,7 @@ impl Cdp {
         if method == "Page.createIsolatedWorld" {
             self.worlds.created(session_id.unwrap_or(""), &result);
             if let (Some(frame), Some(id)) = (params.get("frameId").and_then(Value::as_str), result.get("executionContextId")) {
+                if let Some(id) = id.as_i64() { self.created_contexts.insert((session_id.unwrap_or("").to_string(), id)); }
                 self.context_frames.insert((session_id.unwrap_or("").to_string(), format!("id:{id}")), frame.to_string());
             }
         }
@@ -1250,12 +1381,14 @@ impl Cdp {
                 self.document_versions.insert((target.to_string(), id.clone()), evidence[0].clone());
             }
         }
-        Some(DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch })
+        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch };
+        if content { self.cached_documents.insert(target.to_string(), state.clone()); }
+        Some(state)
     }
 
     fn scoped_document_tree(node: &Value, id: &str) -> Option<Value> {
         let frame = node.get("frame")?;
-        if frame.get("id").and_then(Value::as_str) == Some(id) { return Some(json!({"frame":frame})) }
+        if id.is_empty() || frame.get("id").and_then(Value::as_str) == Some(id) { return Some(json!({"frame":frame})) }
         node.get("childFrames")?.as_array()?.iter().find_map(|child| Self::scoped_document_tree(child, id))
             .map(|child| json!({"frame":frame,"childFrames":[child]}))
     }
@@ -1268,9 +1401,11 @@ impl Cdp {
             || frame.get("parentId").is_some_and(|id| id.as_str() != parent) { return false }
         let initial_blank = text("url") == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some("")
             && (root || parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2])));
+        let parent_allowed = !root && parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2]));
+        let inherited = parent_allowed && self.guard.inheriting(text("url")) && self.frame_decisions.get(text("id")) != Some(&true);
         let allowed_error = !root && self.guard.error_document(text("url"), text("securityOrigin"))
             && !text("unreachableUrl").is_empty() && self.frame_decisions.get(text("id")) == Some(&false);
-        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || allowed_error;
+        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error;
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
             || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
             || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))) { return false }
@@ -1284,6 +1419,7 @@ impl Cdp {
 
     fn refresh(&mut self, target: &str) -> bool {
         let Some(doc) = self.documents.get(target) else { return true };
+        if self.document_paused(target) { return true }
         if doc.navigating || doc.probed || !(self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) {
             return true;
         }
@@ -1603,6 +1739,15 @@ impl Cdp {
             }
         }
         if method == "Runtime.executionContextCreated" {
+            if let (Some(session), Some(unique), Some(id)) = (session.as_ref(), params.pointer("/context/uniqueId").and_then(Value::as_str), params.pointer("/context/id").and_then(Value::as_i64)) {
+                let frame = params.pointer("/context/auxData/frameId").and_then(Value::as_str).unwrap_or("").to_string();
+                let loader = self.session_target(session).and_then(|target| self.document_versions.get(&(target, frame.clone())).cloned());
+                self.context_proofs.insert((session.clone(), unique.to_string()), ContextProof {
+                    id, frame, loader, origin:params.pointer("/context/origin").and_then(Value::as_str).unwrap_or("").to_string(),
+                    name:params.pointer("/context/name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    default:params.pointer("/context/auxData/isDefault").and_then(Value::as_bool) == Some(true),
+                });
+            }
             if let Some(session) = session.as_ref() {
                 let frame = params.pointer("/context/auxData/frameId").and_then(Value::as_str);
                 for (label, key) in [("id", "id"), ("unique", "uniqueId"), ("name", "name")] {
@@ -1814,6 +1959,7 @@ impl Cdp {
     }
 
     fn settle(&mut self, session_id: &str, request_id: &str) {
+        self.paused_documents.remove(&(session_id.to_string(), request_id.to_string()));
         self.handed
             .remove(&(session_id.to_string(), request_id.to_string()));
     }
@@ -1908,6 +2054,9 @@ impl Cdp {
         let session = value.get("sessionId").and_then(|v| v.as_str());
         if let (true, Some(session), Some(id)) = (method.starts_with("Fetch."), session, &id) {
             let session = session.to_string();
+            if value.pointer("/params/resourceType").and_then(Value::as_str) == Some("Document") {
+                self.paused_documents.insert((session.clone(), id.clone()));
+            }
             self.hand(&session, id);
         }
         if method.ends_with("ExtraInfo") {
@@ -1939,6 +2088,17 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.raw_call_execution(method, params, session_id, timeout, false)
+    }
+
+    fn raw_call_execution(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        pinned: bool,
+    ) -> Result<Value, String> {
         let frame_epoch = self.frame_epoch;
         let id = self.send(method, params, session_id)?;
         let deadline = Instant::now() + timeout;
@@ -1946,7 +2106,7 @@ impl Cdp {
         loop {
             let text = match self.ws.recv_text(deadline)? {
                 Some(text) => text,
-                None => return Err(format!("{method} timed out\n")),
+                None => return Err(if pinned && session_id.is_some_and(|session| self.blocked.contains(session)) { self.refusal() } else { format!("{method} timed out\n") }),
             };
             let value: Value = serde_json::from_str(&text)
                 .map_err(|err| format!("CDP response was not JSON: {err}\n"))?;
@@ -1973,7 +2133,7 @@ impl Cdp {
                 && value.pointer("/params/sessionId").and_then(|v| v.as_str()) == session_id;
             self.absorb(value);
             if let Some(session) = session_id {
-                if detached || (!was_blocked && self.blocked.contains(session)) {
+                if detached || (!pinned && !was_blocked && self.blocked.contains(session)) {
                     return Err(self.refusal());
                 }
             }
@@ -2335,6 +2495,11 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
         | "Debugger.evaluateOnCallFrame" | "Debugger.getScriptSource" | "Debugger.searchInContent" | "Debugger.setScriptSource" | "Debugger.setVariableValue" | "Debugger.restartFrame" | "Debugger.stepInto" | "Debugger.stepOut" | "Debugger.stepOver"
         | "Debugger.getWasmBytecode" | "Debugger.disassembleWasmModule" | "Debugger.nextWasmDisassemblyChunk" | "Debugger.getPossibleBreakpoints" | "Debugger.pause"
         | "HeapProfiler.takeHeapSnapshot" | "HeapProfiler.getHeapObjectId" | "HeapProfiler.getObjectByHeapObjectId" | "HeapProfiler.getSamplingProfile" | "HeapProfiler.stopSampling" | "HeapProfiler.stopTrackingHeapObjects"
+        | "DOMStorage.getDOMStorageItems" | "DOMStorage.setDOMStorageItem" | "DOMStorage.removeDOMStorageItem" | "DOMStorage.clear"
+        | "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota" | "Storage.getStorageKeyForFrame"
+        | "CacheStorage.requestCacheNames" | "CacheStorage.requestEntries" | "CacheStorage.requestCachedResponse" | "CacheStorage.deleteCache" | "CacheStorage.deleteEntry"
+        | "IndexedDB.requestDatabaseNames" | "IndexedDB.requestDatabase" | "IndexedDB.requestData" | "IndexedDB.deleteDatabase" | "IndexedDB.deleteObjectStoreEntries" | "IndexedDB.clearObjectStore" | "IndexedDB.getMetadata"
+        | "FileSystem.getDirectory"
         | "Target.sendMessageToTarget" | "Target.exposeDevToolsProtocol"
         | "Profiler.stop" | "Profiler.takePreciseCoverage" | "Profiler.getBestEffortCoverage" | "CSS.getStyleSheetText" | "CSS.getComputedStyleForNode" | "CSS.getMatchedStylesForNode" | "CSS.getInlineStylesForNode"
         | "CSS.setStyleSheetText" | "CSS.setStyleTexts" | "CSS.setEffectivePropertyValueForNode" | "CSS.getMediaQueries" | "CSS.getPlatformFontsForNode" => Some(true),
@@ -2360,14 +2525,20 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
         | "Profiler.enable" | "Profiler.disable" | "Profiler.start" | "Profiler.startPreciseCoverage" | "Profiler.stopPreciseCoverage" | "Profiler.setSamplingInterval"
         | "HeapProfiler.enable" | "HeapProfiler.disable" | "HeapProfiler.startSampling" | "HeapProfiler.startTrackingHeapObjects" | "HeapProfiler.collectGarbage"
         | "Log.enable" | "Log.disable" | "Log.clear" | "Log.startViolationsReport" | "Log.stopViolationsReport" | "Audits.enable" | "Audits.disable"
-        | "Storage.getCookies" | "Storage.setCookies" | "Storage.clearCookies" | "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota" | "Storage.getStorageKeyForFrame"
-        | "CacheStorage.requestCacheNames" | "CacheStorage.requestEntries" | "CacheStorage.requestCachedResponse" | "CacheStorage.deleteCache" | "CacheStorage.deleteEntry"
-        | "IndexedDB.enable" | "IndexedDB.disable" | "IndexedDB.requestDatabaseNames" | "IndexedDB.requestDatabase" | "IndexedDB.requestData" | "IndexedDB.deleteDatabase" | "IndexedDB.deleteObjectStoreEntries" | "IndexedDB.clearObjectStore" | "IndexedDB.getMetadata" | "IndexedDB.releaseObject"
-        | "FileSystem.getDirectory" | "ServiceWorker.enable" | "ServiceWorker.disable" | "ServiceWorker.unregister" | "ServiceWorker.startWorker" | "ServiceWorker.stopWorker" | "ServiceWorker.stopAllWorkers" | "ServiceWorker.updateRegistration"
+        | "DOMStorage.enable" | "DOMStorage.disable"
+        | "Storage.getCookies" | "Storage.setCookies" | "Storage.clearCookies"
+        | "IndexedDB.enable" | "IndexedDB.disable" | "IndexedDB.releaseObject"
+        | "ServiceWorker.enable" | "ServiceWorker.disable" | "ServiceWorker.unregister" | "ServiceWorker.startWorker" | "ServiceWorker.stopWorker" | "ServiceWorker.stopAllWorkers" | "ServiceWorker.updateRegistration"
         | "PWA.install" | "PWA.launch" | "PWA.uninstall" | "Extensions.loadUnpacked" | "Extensions.uninstall" | "Extensions.getExtensions" | "SystemInfo.getInfo" | "SystemInfo.getProcessInfo"
         | "Tracing.start" | "Tracing.end" | "Tracing.getCategories" | "Tracing.recordClockSyncMarker" | "Tracing.requestMemoryDump" | "Slicc.action" => Some(false),
         _ => None,
     }
+}
+
+fn storage_content(method: &str) -> bool {
+    matches!(method, "Storage.getStorageKeyForFrame" | "FileSystem.getDirectory")
+        || ["DOMStorage.", "IndexedDB.", "CacheStorage."].iter().any(|prefix| method.starts_with(prefix))
+        || matches!(method, "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota")
 }
 
 fn harmless(method: &str, params: &Value) -> bool {
@@ -3365,8 +3536,8 @@ mod tests {
         for url in malformed_urls() {
             let mut cdp = url_backend("about:blank");
             assert!(cdp.notify("Slicc.action", json!({"url":url,"phase":"start"}), None).is_ok(), "{url}");
-            assert!(cdp.call("Storage.getUsageAndQuota", json!({"origin":url}), None).is_ok(), "{url}");
-            assert!(cdp.call("Storage.clearDataForStorageKey", json!({"storageKey":format!("{url}^0{url}")}), None).is_ok(), "{url}");
+            assert!(cdp.call("Storage.getUsageAndQuota", json!({"origin":url}), None).is_err(), "{url}");
+            assert!(cdp.call("Storage.clearDataForStorageKey", json!({"storageKey":format!("{url}^0{url}")}), None).is_err(), "{url}");
         }
     }
 
