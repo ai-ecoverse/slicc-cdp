@@ -135,13 +135,9 @@ fn probe_request(method: &str, url: &str, headers: &str, body: &str) -> Result<P
         return Err(format!("probe URL must be http or https: {url}\n"));
     }
     refuse_real_debug_port(&parts);
-    let addr = resolve(&parts.host, parts.port)?;
-    refuse_real_debug_addr(addr);
+    let addrs = candidates(&parts.host, parts.port)?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    let connect_timeout = Duration::from_secs(3).min(
-        deadline.saturating_duration_since(Instant::now()),
-    );
-    let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
+    let tcp = connect_any(&addrs, Duration::from_secs(3), Some(deadline))
         .map_err(|err| format!("probe connect failed for {url}: {err}\n"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|err| format!("probe timeout setup failed: {err}\n"))?;
@@ -659,11 +655,9 @@ fn connect_error(parts: &Parts, err: &str) -> String {
 
 fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
     refuse_real_debug_port(parts);
-    let addr = resolve(&parts.host, parts.port)?;
-    refuse_real_debug_addr(addr);
-    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|err| {
-        connect_error(parts, &err.to_string())
-    })?;
+    let addrs = candidates(&parts.host, parts.port)?;
+    let tcp = connect_any(&addrs, Duration::from_secs(10), None)
+        .map_err(|err| connect_error(parts, &err.to_string()))?;
     tcp.set_read_timeout(Some(READ_SLICE))
         .map_err(|err| connect_error(parts, &err.to_string()))?;
     tcp.set_nodelay(true).ok();
@@ -688,12 +682,73 @@ fn refuse_real_debug_addr(addr: SocketAddr) {
 
 fn tcp_set_read_deadline(_stream: &mut dyn ReadWrite, _remaining: Duration) {}
 
-fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
-    wasix_net::resolve(host, port)
-        .map_err(|err| format!("could not resolve {host}: {err}\n"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("could not resolve {host}\n"))
+const LOOPBACK_V6: std::net::IpAddr = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+const LOOPBACK_V4: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+const PER_ADDRESS: Duration = Duration::from_secs(2);
+
+fn candidates(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let resolved = wasix_net::resolve(host, port);
+    let addrs = expand_loopback(host, port, resolved.as_deref().unwrap_or(&[]));
+    for addr in &addrs {
+        refuse_real_debug_addr(*addr);
+    }
+    if addrs.is_empty() {
+        let reason = resolved.err().map(|err| format!(": {err}")).unwrap_or_default();
+        return Err(format!("could not resolve {host}{reason}\n"));
+    }
+    Ok(addrs)
+}
+
+fn loopback_alias(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "::")
+}
+
+fn expand_loopback(host: &str, port: u16, resolved: &[SocketAddr]) -> Vec<SocketAddr> {
+    let alias = loopback_alias(host);
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut push = |addr: SocketAddr| {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    };
+    for addr in resolved {
+        let ip = match addr.ip() {
+            std::net::IpAddr::V4(ip) if alias && ip.is_unspecified() => LOOPBACK_V4,
+            std::net::IpAddr::V6(ip) if alias && ip.is_unspecified() => LOOPBACK_V6,
+            ip => ip,
+        };
+        push(SocketAddr::new(ip, addr.port()));
+    }
+    if alias {
+        push(SocketAddr::new(LOOPBACK_V6, port));
+        push(SocketAddr::new(LOOPBACK_V4, port));
+    }
+    out
+}
+
+fn connect_any(
+    addrs: &[SocketAddr],
+    single: Duration,
+    deadline: Option<Instant>,
+) -> std::io::Result<TcpStream> {
+    let mut last = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        let each = if index + 1 < addrs.len() { PER_ADDRESS.min(single) } else { single };
+        let timeout = match deadline {
+            Some(deadline) => each.min(deadline.saturating_duration_since(Instant::now())),
+            None => each,
+        };
+        if timeout.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect deadline exceeded")))
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -1086,6 +1141,62 @@ mod tests {
         assert_eq!(parts.host, "127.0.0.1");
         assert_eq!(parts.port, 9222);
         assert_eq!(parts.path, "/devtools/browser/abc-def?x=1");
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn every_resolved_address_is_tried_in_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let v6: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+        let v4: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let tcp = connect_any(&[v6, v4], Duration::from_secs(10), None).unwrap();
+        assert_eq!(tcp.peer_addr().unwrap(), v4);
+        let late = Instant::now() - Duration::from_secs(1);
+        let err = connect_any(&[v6, v4], Duration::from_secs(10), Some(late)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        drop(listener);
+        assert!(connect_any(&[v4], Duration::from_secs(10), None).is_err());
+    }
+
+    #[test]
+    fn loopback_spellings_fall_back_to_both_families() {
+        let at = |text: &str| -> SocketAddr { text.parse().unwrap() };
+        assert_eq!(
+            expand_loopback("localhost", 9444, &[at("[::1]:9444")]),
+            vec![at("[::1]:9444"), at("127.0.0.1:9444")]
+        );
+        assert_eq!(
+            expand_loopback("127.0.0.1", 9444, &[at("127.0.0.1:9444")]),
+            vec![at("127.0.0.1:9444"), at("[::1]:9444")]
+        );
+        assert_eq!(
+            expand_loopback("[::1]", 9444, &[at("[::1]:9444")]),
+            vec![at("[::1]:9444"), at("127.0.0.1:9444")]
+        );
+        assert_eq!(
+            expand_loopback("0.0.0.0", 9444, &[at("0.0.0.0:9444")]),
+            vec![at("127.0.0.1:9444"), at("[::1]:9444")]
+        );
+        assert_eq!(
+            expand_loopback("::", 9444, &[at("[::]:9444")]),
+            vec![at("[::1]:9444"), at("127.0.0.1:9444")]
+        );
+        assert_eq!(
+            expand_loopback("LocalHost.", 9444, &[]),
+            vec![at("[::1]:9444"), at("127.0.0.1:9444")]
+        );
+        assert_eq!(
+            expand_loopback("example.test", 9444, &[at("[2001:db8::1]:9444"), at("192.0.2.1:9444")]),
+            vec![at("[2001:db8::1]:9444"), at("192.0.2.1:9444")]
+        );
+        assert_eq!(
+            expand_loopback("127.0.0.2", 9444, &[at("127.0.0.2:9444")]),
+            vec![at("127.0.0.2:9444")]
+        );
+        let local = candidates("localhost", 9444).unwrap();
+        assert!(local.contains(&at("127.0.0.1:9444")) && local.contains(&at("[::1]:9444")));
+        assert!(candidates("no-such-host.invalid", 9444).is_err());
     }
 
     #[test]

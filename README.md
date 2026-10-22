@@ -39,7 +39,9 @@ playwright-cli click e3
 curlwright -i https://example.com/
 ```
 
-`open` attaches to a running Chrome or launches one. To pick a browser, pass `--cdp http://127.0.0.1:<port>` or set `SLICC_CDP_URL`. Run `playwright-cli --help` for all commands.
+`open` attaches to a running Chrome or launches one. To pick a browser, pass `--cdp <port>` (for example `--cdp 9333`, which means `localhost:9333`) or `--cdp http://127.0.0.1:<port>`, or set `SLICC_CDP_URL`. Run `playwright-cli --help` for all commands.
+
+`--cdp` and `SLICC_CDP_URL` take a port, `host`, `host:port` (port 9222 when it is left out), an `http://` or `https://` URL, or a `ws://` or `wss://` URL. A `ws://` or `wss://` URL with a path is dialled as it is; every other form reads `/json/version` first. The client tries every address the host resolves to, and `localhost`, `127.0.0.1`, `::1` (`[::1]`) and `0.0.0.0` all mean this machine: both `::1` and `127.0.0.1` are tried. Every address but the last gets two seconds to connect.
 
 Seven's origins, the vault, browser pages, extensions and local files are always off limits.
 
