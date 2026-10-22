@@ -162,7 +162,9 @@ mod tests {
             .unwrap_or("");
         assert!(!pending.contains("console"));
         assert!(!pending.contains("dblclick"));
-        assert!(pending.contains("dialog-accept"));
+        assert!(!pending.contains("dialog-accept"));
+        assert!(!pending.contains("dialog-dismiss"));
+        assert!(pending.contains("resize"));
         assert!(!output.stdout.contains("cdp.slicc.internal"));
         assert!(!output.stdout.contains("cdp.kernel.localhost"));
         assert!(!output.stdout.contains("/devtools/browser/slicc"));
@@ -201,6 +203,8 @@ mod tests {
             "  fill <target> <text>        fill text into editable element",
             "  snapshot [target]           capture page snapshot to obtain element ref",
             "  eval <func> [target]        evaluate javascript expression on page or element",
+            "  dialog-accept [prompt]      accept a dialog",
+            "  dialog-dismiss              dismiss a dialog",
             "  press <key>                 press a key on the keyboard, `a`, `arrowleft`",
             "  screenshot [target]         screenshot of the current page or element",
             "  tab-list                    list all tabs",
@@ -264,7 +268,7 @@ mod tests {
         ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
-        for name in ["dialog-accept", "keydown"] {
+        for name in ["resize", "keydown"] {
             assert!(pending_names.contains(&name), "{name}");
         }
 
@@ -289,6 +293,21 @@ mod tests {
                 "--fg",
                 "--runtime",
             ],
+        );
+        assert_page(
+            "dialog-accept",
+            "playwright-cli dialog-accept [prompt]\n\nAccept a dialog\n",
+            &[
+                "  [prompt]                    the text of the prompt in case of a prompt dialog.",
+                "Accepts the dialog that is open on the tab, or the next one that opens within 5 seconds.",
+            ],
+            &["Not implemented"],
+        );
+        assert_page(
+            "dialog-dismiss",
+            "playwright-cli dialog-dismiss\n\nDismiss a dialog\n",
+            &["Dismisses the dialog that is open on the tab, or the next one that opens within 5 seconds."],
+            &["Not implemented"],
         );
         assert_page(
             "close",

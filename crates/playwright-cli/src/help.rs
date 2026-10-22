@@ -26,6 +26,8 @@ pub fn global_help() -> String {
         row("fill <target> <text>", "fill text into editable element"),
         row("snapshot [target]", "capture page snapshot to obtain element ref"),
         row("eval <func> [target]", "evaluate javascript expression on page or element"),
+        row("dialog-accept [prompt]", "accept a dialog"),
+        row("dialog-dismiss", "dismiss a dialog"),
         String::new(),
         "Keyboard:".to_string(),
         row("press <key>", "press a key on the keyboard, `a`, `arrowleft`"),
@@ -445,6 +447,26 @@ fn implemented_page(name: &str) -> Option<String> {
             ],
             &[],
             &[],
+        ),
+        "dialog-accept" => page(
+            "dialog-accept [prompt]",
+            &[
+                "Accept a dialog",
+                "",
+                "Accepts the dialog that is open on the tab, or the next one that opens within 5 seconds.",
+            ],
+            &[("[prompt]", "the text of the prompt in case of a prompt dialog.")],
+            &[("--tab <targetId>", "tab with the dialog")],
+        ),
+        "dialog-dismiss" => page(
+            "dialog-dismiss",
+            &[
+                "Dismiss a dialog",
+                "",
+                "Dismisses the dialog that is open on the tab, or the next one that opens within 5 seconds.",
+            ],
+            &[],
+            &[("--tab <targetId>", "tab with the dialog")],
         ),
         "pdf" => page(
             "pdf",
