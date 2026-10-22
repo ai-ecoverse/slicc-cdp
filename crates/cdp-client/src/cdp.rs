@@ -1422,7 +1422,7 @@ impl Cdp {
         let initial_blank = text("url") == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some("")
             && (root || parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2])));
         let parent_allowed = !root && parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2]));
-        let inherited = parent_allowed && self.guard.inheriting(text("url")) && self.frame_decisions.get(text("id")) != Some(&true);
+        let inherited = parent_allowed && self.guard.inheriting(text("url")) && !matches!(text("securityOrigin"), "" | "null" | "://") && self.frame_decisions.get(text("id")) != Some(&true);
         let allowed_error = !root && self.guard.error_document(text("url"), text("securityOrigin"))
             && !text("unreachableUrl").is_empty() && self.frame_decisions.get(text("id")) == Some(&false);
         let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error;
@@ -1756,6 +1756,17 @@ impl Cdp {
                 if self.document_versions.remove(&(target.clone(), id)).is_some() {
                     *self.document_epochs.entry(target).or_default() += 1;
                 }
+            }
+        }
+        if matches!(method.as_str(), "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared") {
+            if let Some(session) = session.as_ref() {
+                let target = self.session_target(session);
+                let id = params.get("executionContextId").and_then(Value::as_i64);
+                let unique = params.get("executionContextUniqueId").and_then(Value::as_str);
+                let cleared = method == "Runtime.executionContextsCleared";
+                let owners: BTreeSet<String> = self.context_proofs.keys().map(|(owner, _)| owner.clone()).chain(self.created_contexts.iter().map(|(owner, _)| owner.clone())).filter(|owner| owner == session || target.is_some() && self.session_target(owner) == target).collect();
+                self.context_proofs.retain(|(owner, key), proof| !owners.contains(owner) || !(cleared || id == Some(proof.id) || unique == Some(key.as_str())));
+                self.created_contexts.retain(|(owner, key)| !owners.contains(owner) || !(cleared || id == Some(*key)));
             }
         }
         if method == "Runtime.executionContextCreated" {

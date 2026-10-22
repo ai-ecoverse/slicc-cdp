@@ -49,8 +49,8 @@ for (const transport of ['native', 'wasi']) {
         refuseWhen: (message) => {
           if (
             ['response', 'ordinary-response', 'new-frame'].includes(shape) &&
-            message.method === 'Runtime.evaluate' &&
-            message.params?.expression === 'document.title'
+            message.method === (shape === 'response' ? 'DOM.getDocument' : 'Runtime.evaluate') &&
+            (shape === 'response' || message.params?.expression === 'document.title')
           ) {
             if (shape === 'new-frame') {
               target.childFrames = [
@@ -101,6 +101,7 @@ for (const transport of ['native', 'wasi']) {
             {
               frame: {
                 id: 'CHILD',
+                parentId: 'T',
                 loaderId: 'LC',
                 url: 'https://seven.sliccy.ai/',
                 securityOrigin: 'https://seven.sliccy.ai',
@@ -113,8 +114,20 @@ for (const transport of ['native', 'wasi']) {
           target.frame = frame('L2');
         }
         const from = backend.calls.length;
-        const method = shape === 'stream' ? 'IO.read' : 'Runtime.evaluate';
-        const params = shape === 'stream' ? { handle: 'H' } : { expression: 'document.title' };
+        const method =
+          shape === 'stream'
+            ? 'IO.read'
+            : ['child', 'response'].includes(shape)
+              ? 'DOM.getDocument'
+              : 'Runtime.evaluate';
+        const params =
+          shape === 'stream'
+            ? { handle: 'H' }
+            : shape === 'child'
+              ? { pierce: true }
+              : shape === 'response'
+                ? {}
+                : { expression: 'document.title' };
         if (['ordinary-response', 'new-frame'].includes(shape)) {
           await client.send(method, params, sessionId);
           await client.send(method, params, sessionId);

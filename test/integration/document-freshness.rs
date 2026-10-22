@@ -22,7 +22,7 @@ impl Backend {
     }
 
     fn frame(&self) -> Value {
-        json!({"id":"F","loaderId":"L","url":self.current,"securityOrigin":self.current.split("/document").next().unwrap()})
+        json!({"id":"F","loaderId":if self.current == PROTECTED { "LP" } else { "LO" },"url":self.current,"securityOrigin":url::Url::parse(&self.current).unwrap().origin().ascii_serialization()})
     }
 
     fn commit(&mut self, url: &str, delayed: bool) {
@@ -54,6 +54,11 @@ impl Transport for Fake {
             }
             "Page.getFrameTree" => json!({"frameTree":{"frame":backend.frame()}}),
             "Page.getNavigationHistory" => json!({"currentIndex":if backend.current == PROTECTED { 0 } else { 1 },"entries":[{"id":1,"url":PROTECTED},{"id":2,"url":ORDINARY}]}),
+            "Runtime.enable" => {
+                let event = json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":1,"uniqueId":format!("document:{}", backend.current),"origin":backend.frame()["securityOrigin"],"name":"","auxData":{"frameId":"F","isDefault":true}}}}).to_string();
+                backend.inbox.push_back(event);
+                json!({})
+            }
             "Runtime.evaluate" if call["params"]["expression"] == "history.back()" => {
                 backend.commit(PROTECTED, true);
                 json!({"result":{"type":"undefined"}})

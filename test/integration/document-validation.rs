@@ -13,6 +13,7 @@ struct Backend {
     history: Option<Value>,
     deadlines: Vec<std::time::Duration>,
     block_tree: bool,
+    contexts: bool,
     next_worker_url: Option<String>,
     navigation_event: bool,
     attach_event: Option<Value>,
@@ -51,6 +52,7 @@ impl Transport for Fake {
                 let Some(history) = backend.history.clone() else { return Ok(()) };
                 history
             }
+            "Runtime.enable" if !backend.contexts => json!({}),
             "Runtime.enable" => {
                 let current = if backend.sessions.get(call["sessionId"].as_str().unwrap_or("")).is_some_and(|target| target == "OWNER") { backend.owner_tree.clone().unwrap_or_else(|| backend.tree.clone()) } else { backend.tree.clone() };
                 let main = current.pointer("/frameTree/frame").cloned().unwrap_or(Value::Null);
@@ -93,7 +95,7 @@ impl Transport for Fake {
 
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
-        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, next_worker_url:None, navigation_event:false, attach_event:None,
+        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, next_worker_url:None, navigation_event:false, attach_event:None,
         event_loader:"L2".into(), event_session:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
@@ -224,13 +226,13 @@ fn content_commands_require_verified_child_frames_and_contexts() {
         json!({"id":"CHILD","loaderId":"LC","url":"https://ordinary.example/"}),
         json!({"id":"CHILD","url":"https://ordinary.example/","securityOrigin":"https://ordinary.example"}),
     ] {
-        for params in [json!({"expression":"document.title"}), json!({"expression":"document.title","contextId":7})] {
+        for (method, params) in [("DOM.getDocument", json!({"pierce":true})), ("Runtime.evaluate", json!({"expression":"document.title","contextId":7}))] {
             let (mut cdp, backend) = fixture();
             let session = attach(&mut cdp, "T");
             backend.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":child}]);
             let from = backend.borrow().calls.len();
-            refused(cdp.call("Runtime.evaluate", params, Some(&session)));
-            assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+            refused(cdp.call(method, params, Some(&session)));
+            assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == method));
         }
     }
     let (mut cdp, _) = fixture();
@@ -339,7 +341,7 @@ fn error_children_require_a_known_unprotected_predecessor() {
         let mut next = tree("L1");
         next["frameTree"]["childFrames"] = json!([{"frame":{"id":"CHILD","parentId":"F","loaderId":"ERR","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":"https://vault.sliccy.ai/"}}]);
         backend.borrow_mut().next_tree = Some(next);
-        refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+        refused(cdp.call("DOM.getDocument", json!({"pierce":true}), Some(&session)));
     }
 }
 
@@ -418,10 +420,10 @@ fn inherited_child_documents_require_verified_unprotected_origins() {
                 backend.borrow_mut().tree["frameTree"]["frame"]["securityOrigin"] = json!("https://vault.sliccy.ai");
             }
             let from = backend.borrow().calls.len();
-            let result = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));
-            if shape == "ordinary" || shape == "initial-blank" && url == "about:blank" { result.unwrap(); } else {
+            let result = cdp.call("DOM.getDocument", json!({"pierce":true}), Some(&session));
+            if shape == "ordinary" { result.unwrap(); } else {
                 refused(result);
-                assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+                assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "DOM.getDocument"));
             }
         }
     }
@@ -492,7 +494,23 @@ fn current_policy_is_still_checked_when_a_loader_id_is_unchanged() {
     next["frameTree"]["frame"]["url"] = json!("https://seven.sliccy.ai/document");
     next["frameTree"]["frame"]["securityOrigin"] = json!("https://seven.sliccy.ai");
     backend.borrow_mut().next_tree = Some(next);
-    refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+    refused(cdp.call("DOM.getDocument", json!({}), Some(&session)));
+}
+
+#[test]
+fn destroyed_private_contexts_cannot_be_reused_before_refresh() {
+    for method in ["Runtime.executionContextDestroyed", "Runtime.executionContextsCleared"] {
+        let (mut cdp, backend) = fixture();
+        let session = attach(&mut cdp, "T");
+        cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+        let guard = backend.borrow().sessions.keys().find(|id| **id != session).unwrap().clone();
+        backend.borrow_mut().contexts = false;
+        backend.borrow_mut().inbox.push_back(json!({"method":method,"sessionId":guard,"params":{"executionContextId":1,"executionContextUniqueId":"main:L1"}}).to_string());
+        assert!(cdp.pump(Instant::now()).unwrap());
+        let from = backend.borrow().calls.len();
+        refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+        assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+    }
 }
 
 #[test]
