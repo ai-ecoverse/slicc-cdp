@@ -60,6 +60,7 @@ impl Transport for Backend {
             "Runtime.getProperties" => {
                 json!({"result":[{"name":"child","value":{"type":"object","objectId":"child-object"}},{"name":"getter","get":{"type":"function","objectId":"getter-object"}}]})
             }
+            "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test"}}}),
             "Page.createIsolatedWorld" => json!({"executionContextId":11}),
             "DOM.resolveNode" => json!({"object":{"type":"object","objectId":"node-object"}}),
             "Runtime.compileScript" => json!({"scriptId":"page-script"}),

@@ -86,6 +86,7 @@ impl Transport for RedirectBodyBackend {
         let message: Value = serde_json::from_str(text).unwrap();
         let result = match message["method"].as_str().unwrap() {
             "Network.getResponseBody" | "Fetch.getResponseBody" | "Page.getResourceContent" | "Page.searchInResource" | "CSS.getStyleSheetText" | "Debugger.getScriptSource" => Some(json!({"body":self.body,"text":self.body,"content":self.body,"scriptSource":self.body,"base64Encoded":self.body == base64_encode(REDIRECT_MARKER.as_bytes())})),
+            "Page.getFrameTree" => Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://example.test/source","securityOrigin":"https://example.test"}}})),
             "Network.loadNetworkResource" => Some(json!({"resource":{"success":true,"httpStatusCode":200,"stream":"BODY"}})),
             "IO.read" => Some(json!({"data":self.body,"base64Encoded":false,"eof":true})),
             _ => None,

@@ -164,7 +164,7 @@ fn ordinary_new_tab_settings_and_basics_keep_content_checks() {
     for method in ["Runtime.evaluate", "DOM.getDocument", "DOMSnapshot.captureSnapshot", "Input.dispatchMouseEvent", "Accessibility.getFullAXTree", "Page.captureScreenshot"] {
         let from = backend.borrow().calls.len();
         cdp.call(method, json!({"expression":"document.title"}), Some(&session)).unwrap();
-        assert_eq!(backend.borrow().calls[from..].iter().filter(|call| call["method"] == "Page.getFrameTree").count(), 2);
+        assert_eq!(backend.borrow().calls[from..].iter().filter(|call| call["method"] == "Page.getFrameTree" && call["sessionId"] != session).count(), 2);
     }
 }
 

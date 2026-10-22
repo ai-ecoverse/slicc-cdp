@@ -89,6 +89,8 @@ export async function fakeCdp({
   delayHistoryEvents = false,
   onUpgrade,
   onCommand,
+  childFrames = [],
+  intercept,
 } = {}) {
   const calls = [];
   const jar = cookies.map((cookie) => ({ ...cookie }));
@@ -149,6 +151,7 @@ export async function fakeCdp({
         }
       };
       const target = sessionId ? sessions.get(sessionId) : undefined;
+      if (intercept?.(message, send)) return;
       if (method === 'Slicc.action') clearInterval(noise);
       if (refuse.includes(method) || refuseWhen?.(message, calls)) {
         send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
@@ -183,7 +186,9 @@ export async function fakeCdp({
         case 'Target.getTargets':
           return answer({ targetInfos: targets.map(info) });
         case 'Target.getTargetInfo': {
-          const found = targets.find((item) => item.targetId === params.targetId) ?? target;
+          const found =
+            targets.find((item) => item.targetId === params.targetId) ??
+            (childFrames.some((child) => child.frame.id === params.targetId) ? undefined : target);
           if (!found) return send({ id, error: { code: -32602, message: 'No target' } });
           return answer({ targetInfo: info(found) });
         }
@@ -234,7 +239,7 @@ export async function fakeCdp({
                     ? new URL(target.url).origin
                     : '://',
               },
-              ...(target?.childFrames ? { childFrames: target.childFrames } : {}),
+              childFrames: target?.childFrames ?? childFrames,
             },
           });
         case 'Page.enable':
@@ -265,7 +270,12 @@ export async function fakeCdp({
           }
           answer({ frameId: target?.targetId ?? 'F', loaderId });
           const committed = {
-            frame: { id: target?.targetId ?? 'F', loaderId, url: params.url },
+            frame: {
+              id: target?.targetId ?? 'F',
+              loaderId,
+              url: params.url,
+              securityOrigin: new URL(params.url).origin,
+            },
           };
           for (const [peer, found] of sessions)
             if (target && found === target && peer !== sessionId && paged.has(peer))

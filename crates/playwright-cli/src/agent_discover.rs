@@ -4365,12 +4365,33 @@ mod tests {
 
     struct ScriptedTransport {
         incoming: std::collections::VecDeque<String>,
+        replies: std::collections::VecDeque<Value>,
+        target_info: Option<Value>,
         sent: std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
     }
 
     impl cdp_client::cdp::Transport for ScriptedTransport {
         fn send_text(&mut self, text: &str) -> Result<(), String> {
-            self.sent.borrow_mut().push(serde_json::from_str(text).unwrap());
+            let message: Value = serde_json::from_str(text).unwrap();
+            self.sent.borrow_mut().push(message.clone());
+            let result = if message["method"] == "Page.getFrameTree" {
+                self.target_info.as_ref().map(|info| {
+                    let target = &info["targetInfo"];
+                    let url = target["url"].as_str().unwrap_or("");
+                    let origin = url::Url::parse(url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
+                    json!({ "frameTree": { "frame": { "id": target["targetId"], "url": url, "securityOrigin": origin } } })
+                })
+            } else if message["method"] == "Target.getTargetInfo" && !self.replies.front().is_some_and(|reply| reply.get("targetInfo").is_some()) {
+                self.target_info.clone()
+            } else {
+                self.replies.pop_front()
+            };
+            if let Some(result) = result {
+                if result.get("targetInfo").is_some() {
+                    self.target_info = Some(result.clone());
+                }
+                self.incoming.push_back(json!({ "id": message["id"], "result": result }).to_string());
+            }
             Ok(())
         }
 
@@ -4381,12 +4402,7 @@ mod tests {
 
     fn scripted_cdp(replies: Vec<Value>) -> (Cdp, std::rc::Rc<std::cell::RefCell<Vec<Value>>>) {
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let incoming = replies
-            .into_iter()
-            .enumerate()
-            .map(|(i, result)| json!({ "id": i as i64 + 1, "result": result }).to_string())
-            .collect();
-        let transport = ScriptedTransport { incoming, sent: sent.clone() };
+        let transport = ScriptedTransport { incoming: std::collections::VecDeque::new(), replies: replies.into(), target_info: None, sent: sent.clone() };
         (crate::document_client::client(Box::new(transport), "S1"), sent)
     }
 
@@ -4553,14 +4569,9 @@ mod tests {
             json!({ "executionContextId": 7 }),
             fetched(200, "application/json", &catalog),
         ];
-        let mut incoming: std::collections::VecDeque<String> = replies
-            .iter()
-            .enumerate()
-            .map(|(i, result)| json!({ "id": i as i64 + 1, "result": result }).to_string())
-            .collect();
-        incoming.push_front(link.to_string());
+        let incoming = std::collections::VecDeque::from([link.to_string()]);
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let mut cdp = crate::document_client::client(Box::new(ScriptedTransport { incoming, sent }), "S1");
+        let mut cdp = crate::document_client::client(Box::new(ScriptedTransport { incoming, replies: replies.into(), target_info: None, sent }), "S1");
         cdp.pump(Instant::now()).unwrap();
         let mut state = nlweb_state();
         let output = follow_links(&mut cdp, &mut state, "S1");
@@ -4779,7 +4790,7 @@ mod tests {
         });
         let reply = json!({ "id": 1, "result": { "body": b64(body), "base64Encoded": true } });
         let incoming = [seen.to_string(), reply.to_string()].into_iter().collect();
-        let mut cdp = crate::document_client::client(Box::new(ScriptedTransport { incoming, sent: sent.clone() }), "S1b");
+        let mut cdp = crate::document_client::client(Box::new(ScriptedTransport { incoming, replies: std::collections::VecDeque::new(), target_info: None, sent: sent.clone() }), "S1b");
         let headers = json!({ "content-type": "application/json" });
         assert!(handle_response(&mut cdp, &mut state, "S1", &payment_response("https://example.com/p1", "R1", headers.clone())).is_empty());
         state.sessions.insert(
