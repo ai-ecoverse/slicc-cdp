@@ -131,6 +131,35 @@ test('a matching ordinary navigation does not invalidate fresh frame discovery',
   );
 });
 
+test('verified frame records tolerate additional ordinary runtime origins', async () => {
+  for (const origin of ['https://example.test', '', 'null', 'https://protected.test']) {
+    let inject = false;
+    await fixture(
+      {
+        childFrames: [{ frame: { ...ordinary } }],
+        intercept: (message, send) => {
+          if (inject && message.method === 'Runtime.enable') {
+            send({
+              method: 'Runtime.executionContextCreated',
+              sessionId: message.sessionId,
+              params: {
+                context: { id: 11, origin, auxData: { frameId: 'CHILD', isDefault: true } },
+              },
+            });
+          }
+        },
+      },
+      async (client, sessionId) => {
+        await client.send('Page.getFrameTree', {}, sessionId);
+        inject = true;
+        await client.send('Runtime.enable', {}, sessionId).catch(() => {});
+        if (origin === 'https://example.test') await read(client, sessionId);
+        else await assert.rejects(read(client, sessionId), /slicc: refused:/);
+      }
+    );
+  }
+});
+
 test('ordinary frame-scoped replies are checked against the current tree', async () => {
   await fixture({ childFrames: [{ frame: { ...ordinary } }] }, async (client, sessionId, calls) => {
     await read(client, sessionId);

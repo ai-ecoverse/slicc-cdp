@@ -1167,7 +1167,7 @@ impl Cdp {
 
     fn frame_verified(&self, frame_id: &str) -> bool {
         frame_text_known(frame_id) && !self.protected_targets.contains(frame_id)
-            && self.frames.get(frame_id).is_some_and(|known| known.len() == 2 && known.iter().all(|text| frame_text_known(text) && !self.guard.url(text)))
+            && self.frames.get(frame_id).is_some_and(|known| known.len() >= 2 && known.iter().all(|text| frame_text_known(text) && !self.guard.url(text)))
     }
 
     fn tree_matches_updates(&self, tree: &Value, epoch: u64) -> bool {
