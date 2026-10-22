@@ -47,25 +47,43 @@ function encode(text, opcode = 1) {
   return Buffer.concat([head, payload]);
 }
 
-const tree = {
-  nodes: [
+const defaultAria = {
+  json: [
     {
-      nodeId: '1',
-      role: { type: 'role', value: 'RootWebArea' },
-      name: { type: 'computedString', value: 'Fake' },
-      childIds: ['2'],
-      backendDOMNodeId: 1,
-    },
-    {
-      nodeId: '2',
-      parentId: '1',
-      role: { type: 'role', value: 'button' },
-      name: { type: 'computedString', value: 'Go' },
-      childIds: [],
-      backendDOMNodeId: 2,
+      role: 'generic',
+      ref: 'e1',
+      children: [{ role: 'button', name: 'Go', ref: 'e2', cursor: 'pointer' }],
     },
   ],
+  refs: [
+    { ref: 'e1', selector: ':root > :nth-child(2)' },
+    { ref: 'e2', selector: ':root > :nth-child(2) > :nth-child(1)' },
+  ],
+  base: 'http://example.test/',
+  nodes: [{ backendNodeId: 1 }, { backendNodeId: 2 }],
 };
+
+function ariaOptions(expression) {
+  const match = expression.match(/\nsliccAriaSnapshot\((\{.*\})\)$/);
+  return match ? JSON.parse(match[1]) : undefined;
+}
+
+function ariaAnswer(capture, location, expression) {
+  if (capture?.exception) {
+    return { result: { type: 'object' }, exceptionDetails: { text: capture.exception } };
+  }
+  if (capture) {
+    const { json, refs, base, iframeDepths } = capture;
+    return { result: { type: 'object', value: { json, refs, base, iframeDepths } } };
+  }
+  if (expression.startsWith('globalThis[')) {
+    return { result: { type: 'object', subtype: 'array', objectId: 'ARIA' } };
+  }
+  if (location && expression.startsWith('JSON.stringify({href:location.href')) {
+    return { result: { type: 'string', value: JSON.stringify(location) } };
+  }
+  return undefined;
+}
 
 function cookieDomain(domain) {
   return domain.startsWith('.') ? domain : `.${domain}`;
@@ -91,7 +109,12 @@ export async function fakeCdp({
   onCommand,
   childFrames = [],
   intercept,
+  aria = () => defaultAria,
+  tree = { nodes: [] },
+  location,
+  frameTree,
 } = {}) {
+  let lastAria = defaultAria;
   const calls = [];
   const jar = cookies.map((cookie) => ({ ...cookie }));
   let requests = 0;
@@ -228,6 +251,7 @@ export async function fakeCdp({
         case 'Browser.getVersion':
           return answer({ product: 'Chrome/140.0.0.0', protocolVersion: '1.3' });
         case 'Page.getFrameTree':
+          if (frameTree) return answer({ frameTree });
           return answer({
             frameTree: {
               frame: target?.frame ?? {
@@ -389,9 +413,11 @@ export async function fakeCdp({
           return answer({});
         }
         case 'Page.createIsolatedWorld': {
+          const worlds = target?.worlds ?? [];
+          const previous = worlds.find((world) => world.auxData.frameId === params.frameId);
           const world = {
-            id: 7,
-            uniqueId: `world:${target?.targetId}:${target?.loaderId ?? 'L'}`,
+            id: previous?.id ?? 7 + worlds.length,
+            uniqueId: `world:${params.frameId}:${target?.loaderId ?? 'L'}`,
             origin:
               target?.url && new URL(target.url).origin !== 'null'
                 ? new URL(target.url).origin
@@ -399,18 +425,39 @@ export async function fakeCdp({
             name: params.worldName ?? '',
             auxData: { frameId: params.frameId, isDefault: false },
           };
-          if (target) target.worlds = [world];
-          return answer({ executionContextId: 7 });
+          if (target)
+            target.worlds = [
+              ...worlds.filter((item) => item.auxData.frameId !== params.frameId),
+              world,
+            ];
+          return answer({ executionContextId: world.id });
         }
         case 'Accessibility.getFullAXTree':
           return answer(tree);
+        case 'Runtime.getProperties':
+          return answer({
+            result: lastAria.nodes.flatMap((node, index) =>
+              node
+                ? [
+                    {
+                      name: String(index),
+                      value: { type: 'object', subtype: 'node', objectId: `NODE${index}` },
+                    },
+                  ]
+                : []
+            ),
+          });
+        case 'DOM.describeNode': {
+          const index = Number(String(params.objectId).replace('NODE', ''));
+          return answer({ node: { nodeType: 1, ...lastAria.nodes[index] } });
+        }
         case 'DOM.resolveNode':
           return answer({ object: { type: 'object', subtype: 'node', objectId: 'OBJ' } });
         case 'DOM.getBoxModel':
           return answer({
             model: { content: [0, 0, 10, 0, 10, 10, 0, 10], width: 10, height: 10 },
           });
-        case 'Runtime.evaluate':
+        case 'Runtime.evaluate': {
           if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {
             target.history.currentIndex -= 1;
             target.url = target.history.entries[target.history.currentIndex].url;
@@ -434,9 +481,21 @@ export async function fakeCdp({
             }
             return answer({ result: { type: 'undefined' } });
           }
+          const options = ariaOptions(params.expression ?? '');
+          const capture = options ? aria(options, params) : undefined;
+          if (capture?.error) return send({ id, error: { code: -32000, message: capture.error } });
+          if (!capture && lastAria.handle && params.expression?.startsWith('globalThis[')) {
+            if (lastAria.handle === 'error')
+              return send({ id, error: { code: -32000, message: 'handle refused' } });
+            return answer({ result: { type: 'undefined' } });
+          }
+          if (capture) lastAria = capture;
+          const answered = ariaAnswer(capture, location, params.expression ?? '');
+          if (answered) return answer(answered);
           if (params.expression === 'document.readyState')
             return answer({ result: { type: 'string', value: 'complete' } });
           return answer({ result: { type: 'string', value: 'fake-eval' } });
+        }
         case 'Runtime.callFunctionOn':
           return answer({
             result: { type: 'object', value: { x: 5, y: 5, width: 10, height: 10 } },

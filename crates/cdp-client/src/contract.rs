@@ -27,7 +27,6 @@ pub const SESSION_DOMAINS: &[&str] = &[
     "Input",
     "Network",
     "Fetch",
-    "Accessibility",
 ];
 
 #[cfg(test)]

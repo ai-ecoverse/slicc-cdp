@@ -85,6 +85,9 @@ export async function launchBrowser(extraArgs = [], options = {}) {
     return {
       port,
       wsUrl,
+      died() {
+        return child.exitCode !== null || child.signalCode ? chromeStatus(child, chromeLog) : null;
+      },
       async close() {
         await stop();
         await rm(userDataDir, { recursive: true, force: true });

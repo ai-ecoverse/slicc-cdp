@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
 const documents = new Set(['/', '/one', '/two', '/page', '/other']);
@@ -53,6 +54,7 @@ function answer(req, res, pathname, body) {
   if (pathname === '/code') return text(res, 201, '');
   if (pathname === '/nope') return text(res, 500, 'nope');
   if (pathname === '/child.html') return html(res, childPage());
+  if (/^\/snapshot\/[\w-]+\.html$/.test(pathname)) return html(res, snapshotPage(pathname));
   if (pathname === '/webmcp') return html(res, webmcpPage());
   if (pathname === '/webmcp-empty') return html(res, webmcpEmptyPage());
   if (pathname === '/webmcp-form') return html(res, webmcpFormPage());
@@ -126,6 +128,10 @@ function html(res, body) {
 
 function fixture(title) {
   return `<!doctype html><html><head><title>${title}</title></head><body><button id="go">Go</button><label for="name">Name</label><input id="name"><pre id="out"></pre><label for="color">Color</label><select id="color"><option value="red">Red</option><option value="green">Green</option><option value="blue">Blue</option></select><label for="agree">Agree</label><input type="checkbox" id="agree"><label for="react-cb">React</label><input type="checkbox" id="react-cb"><label for="locked">Locked</label><input type="checkbox" id="locked" disabled><label for="avatar">Avatar</label><input type="file" id="avatar"><iframe src="/child.html"></iframe><script>document.getElementById('go').addEventListener('click',()=>{document.getElementById('out').textContent='clicked'});document.getElementById('name').addEventListener('keydown',(event)=>{if(event.key==='Enter'){document.getElementById('out').textContent='enter:'+event.target.value}});document.getElementById('go').addEventListener('dblclick',()=>{document.getElementById('out').textContent='dblclicked'});document.getElementById('go').addEventListener('mouseover',()=>{document.getElementById('out').textContent='hovered'});document.getElementById('react-cb').addEventListener('click',()=>{document.getElementById('out').textContent='react-cb:'+document.getElementById('react-cb').checked});document.getElementById('avatar').addEventListener('change',()=>{const f=document.getElementById('avatar').files[0];if(!f)return;const r=new FileReader();r.onload=()=>{document.getElementById('out').textContent='upload:'+r.result};r.readAsText(f)});</script></body></html>`;
+}
+
+function snapshotPage(pathname) {
+  return readFileSync(new URL(`./fixtures${pathname}`, import.meta.url), 'utf8');
 }
 
 function childPage() {

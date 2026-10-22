@@ -1,0 +1,96 @@
+[
+  {
+    "role": "generic",
+    "active": true,
+    "ref": "e1",
+    "children": [
+      {
+        "role": "heading",
+        "name": "Where to go",
+        "level": 1,
+        "ref": "e2"
+      },
+      {
+        "role": "list",
+        "ref": "e3",
+        "children": [
+          {
+            "role": "listitem",
+            "ref": "e4",
+            "children": [
+              {
+                "role": "link",
+                "name": "Seven",
+                "ref": "e5",
+                "cursor": "pointer",
+                "url": "https://seven.sliccy.ai/os/?k=SECRET7#inbox"
+              }
+            ]
+          },
+          {
+            "role": "listitem",
+            "ref": "e6",
+            "children": [
+              {
+                "role": "link",
+                "name": "Vault",
+                "ref": "e7",
+                "cursor": "pointer",
+                "url": "//vault.sliccy.ai/v/item?x=SECRET8"
+              }
+            ]
+          },
+          {
+            "role": "listitem",
+            "ref": "e8",
+            "children": [
+              {
+                "role": "link",
+                "name": "Private",
+                "ref": "e9",
+                "cursor": "pointer",
+                "url": "https://user:pass@example.org/private?id_token=SECRET9#access_token=SECRET10"
+              }
+            ]
+          },
+          {
+            "role": "listitem",
+            "ref": "e10",
+            "children": [
+              {
+                "role": "link",
+                "name": "Next",
+                "ref": "e11",
+                "cursor": "pointer",
+                "url": "/next?page=3"
+              }
+            ]
+          },
+          {
+            "role": "listitem",
+            "ref": "e12",
+            "children": [
+              {
+                "role": "link",
+                "name": "Plain",
+                "ref": "e13",
+                "cursor": "pointer",
+                "url": "https://example.org/plain"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "paragraph",
+        "ref": "e14",
+        "text": "Mentions https://example.org/text?k=v inline."
+      },
+      {
+        "role": "button",
+        "name": "Press",
+        "ref": "e15"
+      }
+    ]
+  }
+]

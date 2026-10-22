@@ -1,0 +1,83 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - navigation "Main" [ref=e3]:
+      - link "Home" [ref=e4] [cursor=pointer]:
+        - /url: /
+      - link "Docs" [ref=e5] [cursor=pointer]:
+        - /url: /docs/start?ref=nav&utm=x
+      - link "Pricing" [ref=e6] [cursor=pointer]:
+        - /url: "#pricing"
+      - link "Help" [ref=e7] [cursor=pointer]:
+        - /url: https://example.org/help#faq
+      - link "Contact" [ref=e8] [cursor=pointer]:
+        - /url: mailto:team@example.org
+  - main [ref=e9]:
+    - heading "Create an account" [level=1] [ref=e10]
+    - paragraph [ref=e11]:
+      - text: Already registered?
+      - link "Sign in" [ref=e12] [cursor=pointer]:
+        - /url: /login?next=%2Fdashboard
+      - text: instead.
+    - generic [ref=e13]:
+      - text: Email
+      - textbox "Email" [ref=e14]:
+        - /placeholder: you@example.org
+      - generic [ref=e15]:
+        - text: Password
+        - textbox "Password" [ref=e16]
+      - text: Bio
+      - textbox "Bio" [ref=e17]:
+        - /placeholder: Tell us about yourself
+        - text: Hello
+      - group "Plan" [ref=e18]:
+        - generic [ref=e20]:
+          - radio "Free" [checked] [ref=e21]
+          - text: Free
+        - generic [ref=e22]:
+          - radio "Pro" [ref=e23]
+          - text: Pro
+      - text: Country
+      - combobox "Country" [ref=e24]:
+        - option "Germany"
+        - option "Switzerland" [selected]
+        - option "Norway"
+      - generic [ref=e25]:
+        - checkbox "I accept the terms" [checked] [ref=e26]
+        - text: I accept the
+        - link "terms" [ref=e27] [cursor=pointer]:
+          - /url: /terms
+      - generic [ref=e28]:
+        - checkbox "Newsletter" [disabled] [ref=e29]
+        - text: Newsletter
+      - searchbox "Search docs" [ref=e30]: aria
+      - slider "Volume" [ref=e31]: "3"
+      - button "Avatar" [ref=e32]
+      - button "Create account" [ref=e33]
+      - button "Cancel" [disabled] [ref=e34]
+      - button "Dark mode" [pressed] [ref=e35]
+    - group [ref=e36]:
+      - generic "Why sign up?" [ref=e37]
+      - list [ref=e38]:
+        - listitem [ref=e39]: Free tier
+        - listitem [ref=e40]: No ads
+    - generic [ref=e41] [cursor=pointer]:
+      - img "Logo" [ref=e42]
+      - text: Pro plan
+    - table [ref=e43]:
+      - caption [ref=e44]: Prices
+      - rowgroup [ref=e45]:
+        - row [ref=e46]:
+          - columnheader "Plan" [ref=e47]
+          - columnheader "Price" [ref=e48]
+      - rowgroup [ref=e49]:
+        - row [ref=e50]:
+          - cell "Free" [ref=e51]
+          - cell "0" [ref=e52]
+        - row [ref=e53]:
+          - cell "Pro" [ref=e54]
+          - cell "9" [ref=e55]
+  - contentinfo [ref=e56]:
+    - link "Archive" [ref=e57] [cursor=pointer]:
+      - /url: https://example.org/archive?token=SECRET123&page=2#top
+    - link "Data" [ref=e58] [cursor=pointer]:
+      - /url: data:text/plain,…

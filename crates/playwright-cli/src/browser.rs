@@ -4,7 +4,7 @@ use crate::net::base64_decode;
 use crate::net::base64_encode;
 use crate::route;
 use crate::session::{self, Session};
-use crate::snapshot::{self, AxNode, FrameRec, RefRec};
+use crate::snapshot::{self, FrameRec, RefRec};
 use crate::trace;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -259,20 +259,102 @@ pub fn page_location(cdp: &mut Cdp, session: &str) -> Result<(String, String), S
     Ok((href, title))
 }
 
-pub fn accessibility_tree(cdp: &mut Cdp, session: &str, frame_id: Option<&str>) -> Result<Vec<AxNode>, String> {
-    let _ = cdp.call("Accessibility.enable", json!({}), Some(session));
-    let params = if let Some(frame_id) = frame_id {
-        json!({ "frameId": frame_id })
+pub fn aria_capture(
+    cdp: &mut Cdp,
+    session: &str,
+    frame_id: &str,
+    prefix: &str,
+    options: snapshot::Options,
+    default_context: bool,
+) -> Result<snapshot::Capture, String> {
+    let context_id = if default_context {
+        Value::Null
     } else {
-        json!({})
+        let world = cdp.call(
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+            Some(session),
+        )?;
+        world.get("executionContextId").cloned()
+            .ok_or_else(|| "Page.createIsolatedWorld returned no executionContextId\n".to_string())?
     };
-    let result = cdp.call("Accessibility.getFullAXTree", params, Some(session))?;
-    let nodes = result
-        .get("nodes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(snapshot::ax_from_cdp(&nodes))
+    let mut params = json!({
+        "expression": snapshot::expression(prefix, options),
+        "returnByValue": true,
+    });
+    if !context_id.is_null() {
+        params["contextId"] = context_id.clone();
+    }
+    let result = cdp.call("Runtime.evaluate", params, Some(session))?;
+    if let Some(details) = result.get("exceptionDetails") {
+        return Err(exception_message(details));
+    }
+    let mut capture = snapshot::parse_capture(result.pointer("/result/value").unwrap_or(&Value::Null))?;
+    if capture.refs.is_empty() {
+        return Ok(capture);
+    }
+    let described = describe_elements(cdp, session, &context_id, capture.refs.len());
+    let _ = cdp.call(
+        "Runtime.releaseObjectGroup",
+        json!({ "objectGroup": ARIA_GROUP }),
+        Some(session),
+    );
+    for (rec, (backend, frame)) in capture.refs.iter_mut().zip(described?) {
+        rec.backend_node_id = backend;
+        rec.content_frame = frame;
+    }
+    Ok(capture)
+}
+
+const ARIA_GROUP: &str = "slicc-aria-snapshot";
+
+type Described = (Option<u64>, Option<String>);
+
+fn describe_elements(
+    cdp: &mut Cdp,
+    session: &str,
+    context_id: &Value,
+    count: usize,
+) -> Result<Vec<Described>, String> {
+    let mut params = json!({
+        "expression": format!("globalThis[{}]", Value::from(snapshot::ELEMENTS_KEY)),
+        "objectGroup": ARIA_GROUP,
+    });
+    if !context_id.is_null() {
+        params["contextId"] = context_id.clone();
+    }
+    let handle = cdp.call("Runtime.evaluate", params, Some(session))?;
+    let array = handle
+        .pointer("/result/objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "snapshot: the page returned no elements\n".to_string())?
+        .to_string();
+    let properties = cdp.call(
+        "Runtime.getProperties",
+        json!({ "objectId": array, "ownProperties": true }),
+        Some(session),
+    )?;
+    let mut objects = vec![None; count];
+    for item in properties.get("result").and_then(Value::as_array).into_iter().flatten() {
+        let index = item.get("name").and_then(Value::as_str).and_then(|name| name.parse::<usize>().ok());
+        let object = item.pointer("/value/objectId").and_then(Value::as_str);
+        if let (Some(index), Some(object)) = (index.filter(|index| *index < count), object) {
+            objects[index] = Some(object.to_string());
+        }
+    }
+    let mut out = Vec::with_capacity(count);
+    for object in objects {
+        let Some(object) = object else {
+            out.push((None, None));
+            continue;
+        };
+        let node = cdp.call("DOM.describeNode", json!({ "objectId": object }), Some(session))?;
+        out.push((
+            node.pointer("/node/backendNodeId").and_then(Value::as_u64),
+            node.pointer("/node/frameId").and_then(Value::as_str).map(str::to_string),
+        ));
+    }
+    Ok(out)
 }
 
 const PENDING_FRAME_URL: &str = "(navigating)";

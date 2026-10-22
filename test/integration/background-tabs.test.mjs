@@ -147,7 +147,7 @@ test('open, tab-new, goto, snapshot, click, eval and tab-select never foreground
     for (const method of [
       'Target.createTarget',
       'Page.navigate',
-      'Accessibility.getFullAXTree',
+      'DOM.describeNode',
       'Input.dispatchMouseEvent',
       'Runtime.evaluate',
     ]) {
