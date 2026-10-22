@@ -186,6 +186,19 @@ export async function webmcpBackend({
         });
         return true;
       }
+      if (method === 'DOM.getDocument') {
+        answer({ root: { nodeId: 100 } });
+        return true;
+      }
+      if (method === 'DOM.querySelectorAll') {
+        answer({ nodeIds: children.map((_, index) => index + 1) });
+        return true;
+      }
+      if (method === 'DOM.describeNode') {
+        const child = children[params.nodeId - 1];
+        answer({ node: { backendNodeId: params.nodeId, frameId: child.id } });
+        return true;
+      }
       if (method === 'DOM.getFrameOwner') {
         answer({ backendNodeId: children.findIndex((child) => child.id === params.frameId) + 1 });
         return true;

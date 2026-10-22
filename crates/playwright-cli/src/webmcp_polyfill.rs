@@ -46,11 +46,17 @@ fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str) -> Result<(),
     Ok(())
 }
 
+type Input = Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>;
+
 fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool) -> Result<(), String> {
+    run_with_input(cdp, state, target, session, reload, input)
+}
+
+fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool, make_input: impl FnOnce() -> Result<Input, String>) -> Result<(), String> {
     let owner = cdp.start_webmcp(session)?;
     cdp.webmcp_auto_attach(session)?;
     save(cdp, state, target, &owner)?;
-    let mut input = input()?;
+    let mut input = make_input()?;
     if reload {
         let from = cdp.events().len();
         cdp.call("Page.reload", json!({}), Some(session))?;
@@ -92,20 +98,22 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: 
     }
 }
 
-fn input() -> Result<Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>, String> {
+#[cfg(not(target_os = "wasi"))]
+fn read_input(mut reader: impl io::Read, tx: mpsc::Sender<()>) {
+    let mut bytes = [0; 1024];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => if tx.send(()).is_err() { break; },
+        }
+    }
+}
+
+fn input() -> Result<Input, String> {
     #[cfg(not(target_os = "wasi"))]
     {
-        use std::io::Read;
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bytes = [0; 1024];
-            loop {
-                match io::stdin().read(&mut bytes) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => if tx.send(()).is_err() { break; },
-                }
-            }
-        });
+        std::thread::spawn(move || read_input(io::stdin(), tx));
         Ok(Box::new(move || rx.try_recv()))
     }
     #[cfg(target_os = "wasi")]

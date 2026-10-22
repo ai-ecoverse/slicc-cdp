@@ -365,8 +365,19 @@ fn build_scope(cdp: &mut Cdp, state: &Session, target: &str, session: &str, fram
 fn owner(cdp: &mut Cdp, parent: &Scope, child: &str) -> Result<Value, String> {
     let before = cdp.webmcp_document(&parent.session, &parent.frame)?;
     if before.get("loaderId").and_then(Value::as_str) != Some(&parent.loader) || before.get("origin").and_then(Value::as_str) != Some(&parent.origin) { return Err("webmcp: document changed\n".into()); }
-    let node = cdp.call("DOM.getFrameOwner", json!({"frameId":child}), Some(&parent.session))?;
-    let object = cdp.call("DOM.resolveNode", json!({"backendNodeId":node["backendNodeId"],"executionContextId":parent.isolated}), Some(&parent.session))?;
+    let document = cdp.call("DOM.getDocument", json!({"depth":1,"pierce":false}), Some(&parent.session))?;
+    let nodes = cdp.call("DOM.querySelectorAll", json!({"nodeId":document["root"]["nodeId"],"selector":"iframe,frame"}), Some(&parent.session))?;
+    let ids = nodes.get("nodeIds").and_then(Value::as_array).filter(|ids| ids.len() <= 256).ok_or_else(|| "webmcp: unverified frame owner\n".to_string())?;
+    let mut backend = None;
+    for id in ids {
+        let described = cdp.call("DOM.describeNode", json!({"nodeId":id,"depth":0,"pierce":false}), Some(&parent.session))?;
+        if described.pointer("/node/frameId").and_then(Value::as_str) == Some(child) {
+            if backend.is_some() { return Err("webmcp: unverified frame owner\n".into()); }
+            backend = Some(described.pointer("/node/backendNodeId").and_then(Value::as_i64).ok_or_else(|| "webmcp: unverified frame owner\n".to_string())?);
+        }
+    }
+    let backend = backend.ok_or_else(|| "webmcp: unverified frame owner\n".to_string())?;
+    let object = cdp.call("DOM.resolveNode", json!({"backendNodeId":backend,"executionContextId":parent.isolated}), Some(&parent.session))?;
     let result = cdp.call("Runtime.callFunctionOn", json!({"objectId":object["object"]["objectId"],"functionDeclaration":"function webmcp_owner() { 'use strict'; let index = -1; for (let i = 0; i < window.frames.length; i++) if (window.frames[i] === this.contentWindow) index = i; return {allow:this.getAttribute('allow') || '',srcOrigin:new URL(this.src,document.baseURI).origin,index}; }","returnByValue":true}), Some(&parent.session))?;
     if result.get("exceptionDetails").is_some() { return Err("webmcp: unverified frame owner\n".into()); }
     if cdp.webmcp_document(&parent.session, &parent.frame)? != before { return Err("webmcp: document changed\n".into()); }

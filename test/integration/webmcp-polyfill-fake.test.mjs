@@ -390,6 +390,55 @@ await test('fake: native prototype does not make an absent or null page API avai
   }
 });
 
+await test('fake: frame owners use bounded parent DOM metadata rather than frame-target selectors', async () => {
+  for (const mode of ['verified', 'missing', 'duplicate', 'oversized']) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-owner-'));
+    const backend = await webmcpBackend({
+      native: true,
+      children: [
+        {
+          id: 'CROSS',
+          origin: 'https://cross.test',
+          allow: 'tools *',
+          definitions: [
+            { name: 'child', exposedTo: ['https://ordinary.test'], execute: () => 'child' },
+          ],
+        },
+      ],
+      onCommand(command, _pages, send) {
+        if (command.method === 'DOM.getFrameOwner') {
+          send({ id: command.id, error: { message: 'frame is absent from parent process' } });
+          return true;
+        }
+        if (command.method !== 'DOM.querySelectorAll' || mode === 'verified') return;
+        const nodeIds =
+          mode === 'missing' ? [] : mode === 'duplicate' ? [1, 1] : Array(257).fill(1);
+        send({ id: command.id, result: { nodeIds } });
+        return true;
+      },
+    });
+    try {
+      const result = await run(
+        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://cross.test'],
+        cwd,
+        backend.url
+      );
+      if (mode === 'verified') {
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout)[0].name, 'child');
+        assert.ok(backend.calls.every((command) => command.method !== 'DOM.getFrameOwner'));
+      } else {
+        assert.equal(result.code, 1, result.stderr);
+        assert.match(result.stderr, /unverified frame owner/);
+        assert.equal(result.stdout, '');
+      }
+    } finally {
+      await backend.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+});
+
 await test('fake: native child calls recheck loader, policy and delegation and preserve protected refusals', async () => {
   for (const mode of ['stable', 'loader', 'policy', 'delegation', 'protected', 'during']) {
     const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-native-'));
