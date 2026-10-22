@@ -186,16 +186,7 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
         let origin = url::Url::parse(&frame.url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
         if origin != top && !from.contains(&origin) { continue; }
         if cdp.guard().url(&frame.url) || !matches!(url::Url::parse(&frame.url).map(|url| url.scheme().to_string()).as_deref(), Ok("http" | "https")) { continue; }
-        let mut chain = vec![frame.clone()];
-        let mut current = frame;
-        let mut seen = BTreeSet::new();
-        while let Some(parent) = current.parent_frame_id.as_deref() {
-            if !seen.insert(parent.to_string()) { return Err("webmcp: unverified ancestor chain\n".into()); }
-            if scopes.contains_key(parent) { break; }
-            let Some(next) = frames.iter().find(|frame| frame.frame_id == parent) else { return Err("webmcp: unverified ancestor chain\n".into()); };
-            chain.push(next.clone());
-            current = next;
-        }
+        let chain = ancestor_chain(frame, &frames, &scopes)?;
         for item in chain.iter().rev() {
             if !scopes.contains_key(&item.frame_id) {
                 if build_scope(cdp, state, target, session, item, &mut scopes, opened).is_err() { continue; }
@@ -310,6 +301,20 @@ fn revalidate(cdp: &mut Cdp, scope: &Scope, collected: &Collected, compatibility
     Ok(())
 }
 
+fn ancestor_chain(frame: &FrameRec, frames: &[FrameRec], scopes: &BTreeMap<String, Scope>) -> Result<Vec<FrameRec>, String> {
+    let mut chain = vec![frame.clone()];
+    let mut current = frame;
+    let mut seen = BTreeSet::new();
+    while let Some(parent) = current.parent_frame_id.as_deref() {
+        if !seen.insert(parent.to_string()) { return Err("webmcp: unverified ancestor chain\n".into()); }
+        if scopes.contains_key(parent) { break; }
+        let next = frames.iter().find(|frame| frame.frame_id == parent).ok_or_else(|| "webmcp: unverified ancestor chain\n".to_string())?;
+        chain.push(next.clone());
+        current = next;
+    }
+    Ok(chain)
+}
+
 fn decode_tools(value: &Value) -> Result<Vec<Value>, String> {
     if value.get("__webmcp_error").and_then(Value::as_str) == Some("absent") { return Ok(Vec::new()); }
     if value.get("__webmcp_error").is_some() { return Err("webmcp-list: page result exceeds the limit or listing failed\n".into()); }
@@ -339,6 +344,7 @@ fn build_scope(cdp: &mut Cdp, state: &Session, target: &str, session: &str, fram
         child
     } else { session.to_string() };
     let document = cdp.webmcp_document(&session, &frame.frame_id)?;
+    cdp.call("Runtime.enable", json!({}), Some(&session))?;
     let world = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame.frame_id,"worldName":"slicc-webmcp"}), Some(&session))?;
     let isolated = world.get("executionContextId").and_then(Value::as_i64).ok_or_else(|| "webmcp: unverified isolated context\n".to_string())?;
     let isolated_unique = active_context(cdp.events(), &session, &frame.frame_id, Some(isolated)).ok_or_else(|| "webmcp: unverified isolated context\n".to_string())?;
@@ -467,6 +473,7 @@ fn iframe_allows(allow: &str, parent: &str, child: &str, src: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("webmcp_frames_test.rs");
 
     #[test]
     fn permissions_policy_headers_and_iframe_delegation_fail_closed() {
