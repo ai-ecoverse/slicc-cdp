@@ -16,6 +16,8 @@ struct Backend {
     deadlines: Vec<std::time::Duration>,
     block_tree: bool,
     contexts: bool,
+    clear_after_enable: bool,
+    pending_context_clear: Option<String>,
     context_origin: Option<Value>,
     next_worker_url: Option<String>,
     navigation_event: bool,
@@ -49,6 +51,9 @@ impl Transport for Fake {
                 json!({"sessionId":session})
             }
             "Page.getFrameTree" => {
+                if let Some(session) = backend.pending_context_clear.take() {
+                    backend.inbox.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":session,"params":{}}).to_string());
+                }
                 if backend.block_tree { return Ok(()) }
                 if backend.sessions.get(call["sessionId"].as_str().unwrap_or("")).is_some_and(|target| target == "OWNER") { backend.owner_tree.clone().unwrap_or_else(|| backend.tree.clone()) } else { backend.tree.clone() }
             },
@@ -67,6 +72,10 @@ impl Transport for Fake {
                 let origin = backend.context_origin.clone().unwrap_or_else(|| main["securityOrigin"].clone());
                 backend.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":1,"uniqueId":format!("main:{}",main["loaderId"].as_str().unwrap_or("")),"name":"","origin":origin,"auxData":{"frameId":main["id"],"isDefault":true}}}}).to_string());
                 backend.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":7,"uniqueId":"child-context","name":"child-world","origin":"https://ordinary.example","auxData":{"frameId":"CHILD","isDefault":false}}}}).to_string());
+                if backend.clear_after_enable {
+                    backend.clear_after_enable = false;
+                    backend.pending_context_clear = Some("S1".to_string());
+                }
                 json!({})
             }
             "Target.detachFromTarget" => {
@@ -113,7 +122,7 @@ impl Transport for Fake {
 
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
-        worker:None, tree:tree("L1"), next_tree:None, navigation_tree:None, navigation_reply:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, attach_event:None,
+        worker:None, tree:tree("L1"), next_tree:None, navigation_tree:None, navigation_reply:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, clear_after_enable:false, pending_context_clear:None, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, attach_event:None,
         event_loader:"L2".into(), event_session:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
@@ -519,6 +528,29 @@ fn current_policy_is_still_checked_when_a_loader_id_is_unchanged() {
     next["frameTree"]["frame"]["securityOrigin"] = json!("https://seven.sliccy.ai");
     backend.borrow_mut().next_tree = Some(next);
     refused(cdp.call("DOM.getDocument", json!({}), Some(&session)));
+}
+
+#[test]
+fn delayed_related_context_clears_require_a_new_private_replay_before_execution() {
+    for origin in ["https://ordinary.example", "https://seven.sliccy.ai", "null"] {
+        let (mut cdp, backend) = fixture();
+        let session = attach(&mut cdp, "T");
+        backend.borrow_mut().tree = tree("L2");
+        backend.borrow_mut().clear_after_enable = true;
+        backend.borrow_mut().context_origin = Some(json!(origin));
+        let from = backend.borrow().calls.len();
+        let result = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));
+        let calls = backend.borrow();
+        let calls = &calls.calls[from..];
+        if origin == "https://ordinary.example" {
+            assert_eq!(result.unwrap()["result"]["value"], "document-value");
+            assert_eq!(calls.iter().filter(|call| call["method"] == "Runtime.enable").count(), 2);
+            assert!(calls.iter().any(|call| call["method"] == "Runtime.evaluate" && call["params"]["uniqueContextId"] == "main:L2"));
+        } else {
+            refused(result);
+            assert!(!calls.iter().any(|call| call["method"] == "Runtime.evaluate"));
+        }
+    }
 }
 
 #[test]

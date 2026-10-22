@@ -685,15 +685,23 @@ impl Cdp {
         let stable_context = selected.as_ref().is_some_and(|(_, proof)| state.worker.is_some()
             || state.frames.get(&proof.frame).is_some_and(|evidence| proof.loader.as_deref() == Some(evidence[0].as_str())));
         if !paused && !stable_context {
-            self.context_proofs.retain(|(owner, _), _| owner != &guard);
-            self.raw_call("Runtime.disable", json!({}), Some(&guard), DOCUMENT_CHECK)?;
-            self.raw_call("Runtime.enable", json!({}), Some(&guard), DOCUMENT_CHECK)?;
-            let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.refusal())?;
-            let same = if state.worker.is_some() { state.worker == current.worker } else {
-                state.frames.iter().filter(|(_, evidence)| evidence[4].is_empty()).all(|(id, evidence)| current.frames.get(id).is_some_and(|now| evidence[0] == now[0] && evidence[2] == now[2]))
-            };
-            if !same { return Err(self.refusal()) }
-            selected = choose(&self.context_proofs);
+            let deadline = Instant::now() + DOCUMENT_CHECK;
+            for _ in 0..2 {
+                self.context_proofs.retain(|(owner, _), _| owner != &guard);
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { return Err(self.refusal()) }
+                self.raw_call("Runtime.disable", json!({}), Some(&guard), left)?;
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { return Err(self.refusal()) }
+                self.raw_call("Runtime.enable", json!({}), Some(&guard), left)?;
+                let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.refusal())?;
+                let same = if state.worker.is_some() { state.worker == current.worker } else {
+                    state.frames.iter().filter(|(_, evidence)| evidence[4].is_empty()).all(|(id, evidence)| current.frames.get(id).is_some_and(|now| evidence[0] == now[0] && evidence[2] == now[2]))
+                };
+                if !same || self.blocked.contains(session) { return Err(self.refusal()) }
+                selected = choose(&self.context_proofs);
+                if selected.is_some() { break }
+            }
         }
         let (unique, proof) = selected.ok_or_else(|| self.refusal())?;
         let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
