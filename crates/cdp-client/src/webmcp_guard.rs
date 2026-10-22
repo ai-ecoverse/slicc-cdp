@@ -8,6 +8,17 @@ const SHIM_HASH: &str = "911b9c665b7bf8183de1d4eeebb4a96d72ddcfe7b6b222316998c59
 const GATE: &str = "__slicc_webmcp_gate";
 const PERMIT: &str = "__slicc_webmcp_admitted";
 
+fn vetted_source(source: &str) -> Result<&str, String> {
+    if crate::hash::sha256_hex(source.as_bytes()) != SHIM_HASH { return Err("slicc: refused: WebMCP shim integrity check failed\n".into()); }
+    Ok(source)
+}
+
+fn private_bridge(fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>) -> Result<String, String> {
+    let mut bytes = [0; 16];
+    fill(&mut bytes).map_err(|_| "slicc: refused: WebMCP bridge entropy unavailable\n")?;
+    Ok(format!("__wmcp_{}", bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
+}
+
 struct Arm {
     source: String,
     bridge: String,
@@ -108,13 +119,9 @@ impl Cdp {
     }
 
     fn webmcp_install(&mut self, session: &str, pending: bool, seed: Option<&Value>) -> Result<String, String> {
-        if crate::hash::sha256_hex(SHIM.as_bytes()) != SHIM_HASH {
-            return Err("slicc: refused: WebMCP shim integrity check failed\n".into());
-        }
-        let mut bytes = [0; 16];
-        getrandom::fill(&mut bytes).map_err(|_| "slicc: refused: WebMCP bridge entropy unavailable\n")?;
-        let bridge = format!("__wmcp_{}", bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-        let source = format!("const {bridge} = (function {GATE}() {{ 'use strict'; let {PERMIT} = false; debugger; if (!{PERMIT}) return; return {SHIM}; }})();");
+        let shim = vetted_source(SHIM)?;
+        let bridge = private_bridge(getrandom::fill)?;
+        let source = format!("const {bridge} = (function {GATE}() {{ 'use strict'; let {PERMIT} = false; debugger; if (!{PERMIT}) return; return {shim}; }})();");
         let mut loaders = BTreeMap::new();
         if let Some(tree) = seed { Self::webmcp_loaders(&tree["frameTree"], &mut loaders); }
         self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, pending_contexts: BTreeMap::new(), pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });

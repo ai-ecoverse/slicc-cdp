@@ -47,10 +47,11 @@ function evaluation(value, exception) {
     const expression = params.expression;
     if (
       expression === "'modelContext' in Document.prototype" ||
-      expression === 'document.modelContext != null'
+      expression === 'document.modelContext != null' ||
+      expression.includes('api.__slicc_webmcp_shim')
     ) {
       const present =
-        expression === 'document.modelContext != null' && value?.__webmcp_error !== 'absent';
+        expression !== "'modelContext' in Document.prototype" && value?.__webmcp_error !== 'absent';
       send({ id: message.id, result: { result: { type: 'boolean', value: present } } });
       return true;
     }

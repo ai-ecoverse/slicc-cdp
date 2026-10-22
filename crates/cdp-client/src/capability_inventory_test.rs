@@ -41,7 +41,8 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         if crate::shield::persistent_capability(method) {
             if vetted_shim.contains(method) {
                 let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();
-                assert!(source.contains("sha256_hex(SHIM.as_bytes()) != SHIM_HASH"));
+                assert!(source.contains("vetted_source(SHIM)?"));
+                assert!(source.contains("sha256_hex(source.as_bytes()) != SHIM_HASH"));
                 assert!(source.contains("__slicc_webmcp_admitted"));
                 continue;
             }
