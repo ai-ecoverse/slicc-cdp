@@ -35,6 +35,7 @@ export async function waitExit(exited, timeoutMs = 5000) {
 }
 
 export async function launchBrowser(extraArgs = [], options = {}) {
+  options.signal?.throwIfAborted();
   let port = options.port ?? (await freePort());
   while (port >= 9222 && port <= 9229) port = await freePort();
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
@@ -76,8 +77,13 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       child.stderr.destroy();
     }
   };
+  const abort = () => {
+    void stop().catch(() => {});
+  };
+  options.signal?.addEventListener('abort', abort, { once: true });
   try {
-    const version = await waitVersion(port, () => chromeStatus(child, chromeLog));
+    options.signal?.throwIfAborted();
+    const version = await waitVersion(port, () => chromeStatus(child, chromeLog), options.signal);
     const wsUrl = version.webSocketDebuggerUrl;
     if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || /:922[2-9]\//.test(wsUrl)) {
       throw new Error(`unexpected debugger url ${wsUrl}`);
@@ -86,11 +92,13 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       port,
       wsUrl,
       async close() {
+        options.signal?.removeEventListener('abort', abort);
         await stop();
         await rm(userDataDir, { recursive: true, force: true });
       },
     };
   } catch (error) {
+    options.signal?.removeEventListener('abort', abort);
     await stop();
     await rm(userDataDir, { recursive: true, force: true });
     throw error;
@@ -106,14 +114,17 @@ function chromeStatus(child, log) {
   return tail;
 }
 
-async function waitVersion(port, status) {
+async function waitVersion(port, status, signal) {
   const deadline = Date.now() + 20000;
   let last = 'no response';
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     const early = status();
     if (early.startsWith('chromium exited')) throw new Error(early);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.any([AbortSignal.timeout(1000), ...(signal ? [signal] : [])]),
+      });
       if (response.ok) return await response.json();
       last = `status ${response.status}`;
     } catch (error) {

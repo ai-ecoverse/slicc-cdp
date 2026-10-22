@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { cleanup, deadline, normalizeError } from './cleanup.mjs';
 import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
@@ -72,27 +73,57 @@ const extensionPath = fileURLToPath(
   new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
 );
 
-async function guardBrowser(startup, { privileged, extension, target, slot, siteIsolationOff }) {
-  const browser = await startup.start(
-    [
-      ...browserArgs({ privileged: privileged || extension, siteIsolationOff }),
-      ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
-    ],
-    { target, slot }
+async function guardBrowser(
+  startup,
+  { privileged, extension, target, slot, siteIsolationOff, signal }
+) {
+  const controller = new AbortController();
+  const started = await deadline(
+    () =>
+      startup.start(
+        [
+          ...browserArgs({ privileged: privileged || extension, siteIsolationOff }),
+          ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
+        ],
+        { target, slot, signal: AbortSignal.any([signal, controller.signal]) }
+      ),
+    'browser-startup',
+    45000,
+    (error) => controller.abort(error)
   );
+  const browser = {
+    ...started,
+    close: () =>
+      deadline(
+        () => started.close(),
+        'browser-close',
+        5000,
+        (error) => controller.abort(error)
+      ),
+  };
   if (!extension) return browser;
   let raw;
   try {
-    raw = await rawSocket(browser.wsUrl);
-    const { id } = await raw.send('Extensions.loadUnpacked', {
-      path: extensionPath,
-      enableInIncognito: true,
-    });
+    raw = await deadline(
+      () => rawSocket(browser.wsUrl),
+      'extension-socket-startup',
+      10000,
+      (error) => controller.abort(error)
+    );
+    const { id } = await deadline(
+      () =>
+        raw.send('Extensions.loadUnpacked', {
+          path: extensionPath,
+          enableInIncognito: true,
+        }),
+      'extension-load',
+      35000,
+      (error) => controller.abort(error)
+    );
     assert.equal(id, 'ankmbodmgimjemnojmeddfcdlbocolob');
     return browser;
   } catch (error) {
-    await browser.close();
-    throw error;
+    await cleanup([() => browser.close()], error);
   } finally {
     raw?.close();
   }
@@ -138,6 +169,7 @@ test('published guard set through the Rust guarded client', {
     );
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
   const diagnostics = [];
+  const recordedRows = [];
   const startup = browserStartup(launchBrowser, (retry) => {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
   });
@@ -151,6 +183,7 @@ test('published guard set through the Rust guarded client', {
         .filter((vector) => vector.targets.includes(target))
         .map((vector) => ({ ...vector, targets: [target] })),
     };
+    const failures = [];
     try {
       const execution = await run(selected, {
         fixture,
@@ -189,6 +222,7 @@ test('published guard set through the Rust guarded client', {
                 target,
                 slot,
                 siteIsolationOff,
+                signal: t.signal,
               })
             );
           const browser = await browsers.get(key);
@@ -199,10 +233,11 @@ test('published guard set through the Rust guarded client', {
           try {
             unguarded = await recordedClient((onMessage) => observer(browser.wsUrl, onMessage));
           } catch (error) {
-            await client.close();
-            await browser.close();
-            browsers.delete(key);
-            throw error;
+            try {
+              await cleanup([() => client.close(), () => browser.close()], error);
+            } finally {
+              browsers.delete(key);
+            }
           }
           let diagnostic;
           if (vector.id === 'C5.guessed-id.continue-response') {
@@ -248,8 +283,7 @@ test('published guard set through the Rust guarded client', {
                 diagnostic.afterCleanup = diagnostic.references.map((details) =>
                   structuredClone(details)
                 );
-              await client.close();
-              await unguarded.close();
+              await cleanup([() => client.close(), () => unguarded.close()]);
             },
           };
         },
@@ -263,6 +297,7 @@ test('published guard set through the Rust guarded client', {
           diagnostic.references.push(details);
         },
         log: (row) => {
+          recordedRows.push(structuredClone(row));
           if (process.env.SLICC_GUARD_PROGRESS)
             process.stdout.write(`row ${row.id} ${row.target} ${row.variant}\n`);
           if ([row.control, row.guarded, row.live].includes('fail'))
@@ -270,9 +305,16 @@ test('published guard set through the Rust guarded client', {
         },
       });
       return execution.results;
+    } catch (error) {
+      failures.push(error);
     } finally {
-      await Promise.all([...browsers.values()].map(async (browser) => (await browser).close()));
-      await fixture.close();
+      await cleanup(
+        [
+          ...[...browsers.values()].map((browser) => async () => (await browser).close()),
+          () => fixture.close(),
+        ],
+        ...failures
+      );
     }
   };
   const targetNames = [...new Set(set.vectors.flatMap((vector) => vector.targets))];
@@ -285,13 +327,14 @@ test('published guard set through the Rust guarded client', {
       ))
     );
   }
-  const rejected = settled.filter((value) => value.status === 'rejected');
-  if (rejected.length)
-    throw new AggregateError(
-      rejected.map((value) => value.reason),
-      'target invocations failed'
-    );
-  const results = settled.flatMap((value) => value.value);
+  const completed = settled
+    .filter((value) => value.status === 'fulfilled')
+    .flatMap((value) => value.value);
+  const completedTargets = new Set(completed.map((row) => row.target));
+  const results = [
+    ...completed,
+    ...recordedRows.filter((row) => !completedTargets.has(row.target)),
+  ];
   const report = summary({
     set,
     results,
@@ -336,6 +379,24 @@ test('published guard set through the Rust guarded client', {
   );
   process.stdout.write(output);
   t.diagnostic(`report: ${file}`);
+  const availability = settled.flatMap((result, index) =>
+    result.status === 'rejected'
+      ? [
+          {
+            target: targetNames[index],
+            phase: 'target-execution-or-cleanup',
+            error: normalizeError(result.reason),
+          },
+        ]
+      : []
+  );
+  await writeFile(
+    `${file}.availability.json`,
+    JSON.stringify({ type: 'HARNESS_AVAILABILITY', failures: availability }, null, 2)
+  );
+  for (const error of availability)
+    process.stderr.write(`HARNESS-AVAILABILITY ${JSON.stringify(error)}\n`);
+  assert.deepEqual(availability, [], 'all target invocations and cleanup must succeed');
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
   const expectedParity = set.vectors

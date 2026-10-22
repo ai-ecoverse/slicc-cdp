@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
+import { deadline } from './cleanup.mjs';
+
 const bridge = fileURLToPath(new URL('../../target/debug/examples/guard_bridge', import.meta.url));
 
 function channel(write, onMessage) {
@@ -142,9 +144,17 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage }) {
       close: async () => {
         closing = true;
         terminal.signal('SIGKILL');
-        await terminal.exited.catch(() => {});
         client.stop();
-        kernel.terminate();
+        try {
+          await deadline(
+            () => terminal.exited.catch(() => {}),
+            'wasi-bridge-close',
+            5000,
+            () => kernel.terminate()
+          );
+        } finally {
+          kernel.terminate();
+        }
       },
     };
   } catch (error) {
@@ -168,16 +178,37 @@ export async function guarded(ws, origin, { variant, detachDelay, onMessage }) {
   child.stdin.on('error', client.stop);
   const closed = new Promise((resolve) => child.once('close', resolve));
   child.once('close', client.stop);
+  let closing;
   return {
     events: client.events,
     send: client.send,
     waitEvent: client.waitEvent,
     variant,
     detachDelay,
-    close: async () => {
-      child.stdin.end();
-      await closed;
-    },
+    close: () =>
+      (closing ??= (async () => {
+        client.stop();
+        child.stdin.end();
+        let forced;
+        const timer = setTimeout(() => {
+          forced = Object.assign(new Error('native bridge cleanup deadline; forced SIGKILL'), {
+            code: 'HARNESS_AVAILABILITY',
+            phase: 'native-bridge-close',
+          });
+          process.stderr.write(
+            `HARNESS-AVAILABILITY ${JSON.stringify({ phase: forced.phase, message: forced.message })}\n`
+          );
+          child.kill('SIGKILL');
+          child.stdin.destroy();
+          child.stdout.destroy();
+        }, 5000);
+        try {
+          await closed;
+          if (forced) throw forced;
+        } finally {
+          clearTimeout(timer);
+        }
+      })()),
   };
 }
 
