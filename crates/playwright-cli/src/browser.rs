@@ -541,6 +541,87 @@ pub fn evaluate_in_frame(
     Ok(EvalValue { value, defined })
 }
 
+const EVAL_GROUP: &str = "slicc-eval";
+
+pub fn evaluate_called(
+    cdp: &mut Cdp,
+    session: &str,
+    frame_id: Option<&str>,
+    expression: &str,
+) -> Result<EvalValue, String> {
+    let mut params = json!({
+        "expression": expression,
+        "returnByValue": false,
+        "awaitPromise": true,
+        "objectGroup": EVAL_GROUP,
+    });
+    if let Some(frame_id) = frame_id {
+        let world = cdp.call(
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+            Some(session),
+        )?;
+        params["contextId"] = world
+            .get("executionContextId")
+            .cloned()
+            .ok_or("Page.createIsolatedWorld returned no executionContextId\n".to_string())?;
+    }
+    let source = expression.trim();
+    if source.starts_with("function") || source.starts_with("async function") {
+        let wrapped = format!("({source}\n)");
+        let mut compile = json!({ "expression": wrapped, "sourceURL": "", "persistScript": false });
+        if let Some(context) = params.get("contextId") {
+            compile["executionContextId"] = context.clone();
+        }
+        let parsed = cdp.call("Runtime.compileScript", compile, Some(session))?;
+        if parsed.get("exceptionDetails").is_none() {
+            params["expression"] = json!(wrapped);
+        }
+    }
+    let value = cdp
+        .call("Runtime.evaluate", params, Some(session))
+        .and_then(|result| settle_eval(cdp, session, &result));
+    let _ = cdp.call("Runtime.releaseObjectGroup", json!({ "objectGroup": EVAL_GROUP }), Some(session));
+    value
+}
+
+fn settle_eval(cdp: &mut Cdp, session: &str, result: &Value) -> Result<EvalValue, String> {
+    if let Some(details) = result.get("exceptionDetails") {
+        return Err(exception_message(details));
+    }
+    let remote = result.get("result").cloned().unwrap_or(Value::Null);
+    let declaration = match remote.get("type").and_then(Value::as_str) {
+        Some("function") => "function() { return this(); }",
+        Some("object") => "function() { return this; }",
+        _ => return Ok(by_value(&remote)),
+    };
+    let Some(object) = remote.get("objectId").cloned() else {
+        return Ok(by_value(&remote));
+    };
+    let called = cdp.call(
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object,
+            "functionDeclaration": declaration,
+            "returnByValue": true,
+            "awaitPromise": true,
+            "objectGroup": EVAL_GROUP,
+        }),
+        Some(session),
+    )?;
+    if let Some(details) = called.get("exceptionDetails") {
+        return Err(exception_message(details));
+    }
+    Ok(by_value(called.get("result").unwrap_or(&Value::Null)))
+}
+
+fn by_value(remote: &Value) -> EvalValue {
+    EvalValue {
+        value: remote.get("value").cloned().unwrap_or(Value::Null),
+        defined: remote.get("type").and_then(Value::as_str) != Some("undefined"),
+    }
+}
+
 fn exception_message(details: &Value) -> String {
     let description = details
         .pointer("/exception/description")

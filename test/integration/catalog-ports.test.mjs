@@ -7,10 +7,10 @@ import { createServer as createTls } from 'node:https';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { findBrowser } from '../../src/browser.js';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { killTree } from './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -272,7 +272,12 @@ test('a browser on a catalog debug port is attached and driven without a seven t
     await t.test('the same commands work on an unprotected tab and URL', async () => {
       const before = hits.length;
       const listed = await pw(['webmcp-list', '--tab', personal]);
-      assert.equal(listed.code, 0, listed.stderr);
+      assert.equal(listed.code, 2, listed.stderr);
+      assert.equal(listed.stdout, '');
+      assert.equal(
+        listed.stderr,
+        'webmcp-list: WebMCP is unavailable on this page (document.modelContext is absent)\n'
+      );
       const snapped = await pw(['snapshot', '--tab', personal]);
       assert.equal(snapped.code, 0, snapped.stderr);
       assert.match(snapped.stdout, /personal/);

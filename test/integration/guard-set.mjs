@@ -7,6 +7,7 @@ import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { skipReason } from '@ai-ecoverse/slicc-browsers/guard-driver.mjs';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { requireChrome } from './chrome-policy.mjs';
 import { acquire, cleanup, cleanupGrace, deadline, normalizeError } from './cleanup.mjs';
 import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
@@ -508,6 +509,7 @@ function table(results) {
 }
 
 export async function runPartition(t, id) {
+  requireChrome();
   const selectedTargets = partitions[id];
   assert.ok(selectedTargets, 'guard partition must be declared');
   const set = {
