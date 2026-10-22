@@ -9,6 +9,8 @@ struct Backend {
     worker: Option<Value>,
     tree: Value,
     next_tree: Option<Value>,
+    navigation_tree: Option<Value>,
+    navigation_reply: Option<Value>,
     owner_tree: Option<Value>,
     history: Option<Value>,
     deadlines: Vec<std::time::Duration>,
@@ -50,6 +52,10 @@ impl Transport for Fake {
                 if backend.block_tree { return Ok(()) }
                 if backend.sessions.get(call["sessionId"].as_str().unwrap_or("")).is_some_and(|target| target == "OWNER") { backend.owner_tree.clone().unwrap_or_else(|| backend.tree.clone()) } else { backend.tree.clone() }
             },
+            "Page.navigate" => {
+                if let Some(tree) = backend.navigation_tree.take() { backend.tree = tree; backend.worker = None; }
+                backend.navigation_reply.clone().unwrap_or_else(|| json!({}))
+            }
             "Page.getNavigationHistory" => {
                 let Some(history) = backend.history.clone() else { return Ok(()) };
                 history
@@ -107,7 +113,7 @@ impl Transport for Fake {
 
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
-        worker:None, tree:tree("L1"), next_tree:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, attach_event:None,
+        worker:None, tree:tree("L1"), next_tree:None, navigation_tree:None, navigation_reply:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, attach_event:None,
         event_loader:"L2".into(), event_session:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
@@ -513,6 +519,98 @@ fn current_policy_is_still_checked_when_a_loader_id_is_unchanged() {
     next["frameTree"]["frame"]["securityOrigin"] = json!("https://seven.sliccy.ai");
     backend.borrow_mut().next_tree = Some(next);
     refused(cdp.call("DOM.getDocument", json!({}), Some(&session)));
+}
+
+#[test]
+fn acknowledged_blank_navigation_from_an_allowed_error_document_is_readable() {
+    let (mut cdp, backend) = fixture();
+    let session = attach(&mut cdp, "T");
+    backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LERROR","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":"https://seven.sliccy.ai/path?private#fragment"}}});
+    backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":"https://seven.sliccy.ai/path?private#fragment"}));
+    cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+    {
+        let mut state = backend.borrow_mut();
+        state.navigation_tree = Some(json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}}));
+        state.navigation_reply = Some(json!({"frameId":"F","loaderId":"LBLANK"}));
+        state.context_origin = Some(json!(""));
+    }
+    let from = backend.borrow().calls.len();
+    cdp.call("Page.navigate", json!({"url":"about:blank"}), Some(&session)).unwrap();
+    assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+    cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+    assert!(backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate" && call["params"]["uniqueContextId"] == "main:LBLANK"));
+    assert!(!cdp.session_blocked(&session));
+    backend.borrow_mut().tree["frameTree"]["frame"]["loaderId"] = json!("FOREIGN");
+    let from = backend.borrow().calls.len();
+    refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+    assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+}
+
+#[test]
+fn navigated_blanks_require_successful_root_acknowledgments_and_fresh_ownership() {
+    for (reply, info, frame, params) in [
+        (json!({}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F"}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":""}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"CHILD","loaderId":"LBLANK"}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"WRONG"}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK","errorText":"ERR_FAILED"}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK","isDownload":true}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK","isDownload":"false"}), None, None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), None, None, json!({"url":"about:blank","frameId":"F"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), Some(json!({"targetId":"T","type":"page","url":"about:blank","openerId":"P"})), None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), Some(json!({"targetId":"T","type":"page","url":"about:blank","openerFrameId":"P"})), None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), Some(json!({"targetId":"T","type":"page","url":""})), None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), Some(json!({"targetId":"OTHER","type":"page","url":"about:blank"})), None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), Some(json!({"targetId":"T","type":"iframe","url":"about:blank"})), None, json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), None, Some(json!({"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://","parentId":"P"})), json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), None, Some(json!({"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":""})), json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), None, Some(json!({"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"null"})), json!({"url":"about:blank"})),
+        (json!({"frameId":"F","loaderId":"LBLANK"}), None, Some(json!({"id":"F","loaderId":"LBLANK","url":"data:text/html,unknown","securityOrigin":"://"})), json!({"url":"about:blank"})),
+    ] {
+        let (mut cdp, backend) = fixture();
+        let session = attach(&mut cdp, "T");
+        {
+            let mut state = backend.borrow_mut();
+            state.navigation_tree = Some(json!({"frameTree":{"frame":frame.unwrap_or_else(|| json!({"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}))}}));
+            state.navigation_reply = Some(reply);
+            state.context_origin = Some(json!(""));
+        }
+        let _ = cdp.call("Page.navigate", params, Some(&session));
+        assert!(backend.borrow().calls.iter().any(|call| call["method"] == "Page.navigate"));
+        backend.borrow_mut().worker = info;
+        let from = backend.borrow().calls.len();
+        refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+        assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+    }
+}
+
+#[test]
+fn blank_navigation_receipts_do_not_unlock_a_protected_restore() {
+    let (mut cdp, backend) = fixture();
+    let session = attach(&mut cdp, "T");
+    backend.borrow_mut().navigation_reply = Some(json!({"frameId":"F","loaderId":"LBLANK"}));
+    backend.borrow_mut().navigation_tree = Some(json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}}));
+    cdp.call("Page.navigate", json!({"url":"about:blank"}), Some(&session)).unwrap();
+    let guard = backend.borrow().calls.iter().find(|call| call["method"] == "Runtime.enable").unwrap()["sessionId"].clone();
+    backend.borrow_mut().inbox.push_back(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"type":"BackForwardCacheRestore","frame":{"id":"F","loaderId":"LPROTECTED","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai"}}}).to_string());
+    cdp.pump(Instant::now() + std::time::Duration::from_secs(1)).unwrap();
+    assert!(cdp.session_blocked(&session));
+    let from = backend.borrow().calls.len();
+    refused(cdp.call("Page.navigate", json!({"url":"about:blank"}), Some(&session)));
+    refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+    assert!(!backend.borrow().calls[from..].iter().any(|call| matches!(call["method"].as_str(), Some("Page.navigate" | "Runtime.evaluate"))));
+}
+
+#[test]
+fn blank_navigation_controls_do_not_require_document_probes() {
+    let (mut cdp, backend) = fixture();
+    let session = attach(&mut cdp, "T");
+    backend.borrow_mut().block_tree = true;
+    backend.borrow_mut().navigation_reply = Some(json!({"frameId":"F","loaderId":"LBLANK"}));
+    let from = backend.borrow().calls.len();
+    cdp.call("Page.navigate", json!({"url":"about:blank"}), Some(&session)).unwrap();
+    assert!(!backend.borrow().calls[from..].iter().any(|call| matches!(call["method"].as_str(), Some("Page.getFrameTree" | "Target.getTargetInfo" | "Runtime.evaluate"))));
 }
 
 #[test]
