@@ -192,6 +192,8 @@ impl Cdp {
         struct Fixture {
             inner: Box<dyn Transport>,
             inbox: VecDeque<String>,
+            worlds: BTreeMap<String, Vec<Value>>,
+            pending_worlds: BTreeMap<i64, (String, Value)>,
         }
         impl Transport for Fixture {
             fn send_text(&mut self, text: &str) -> Result<(), String> {
@@ -202,13 +204,31 @@ impl Cdp {
                 } else if call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:")) && matches!(call["method"].as_str(), Some("Runtime.disable" | "Runtime.enable")) {
                     if call["method"] == "Runtime.enable" {
                         self.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":1,"uniqueId":"fixture-context","origin":"https://example.test","name":"","auxData":{"frameId":"F","isDefault":true}}}}).to_string());
+                        let owner = call["sessionId"].as_str().unwrap().strip_prefix("fixture-guard:").unwrap();
+                        for context in self.worlds.get(owner).into_iter().flatten() {
+                            self.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":context}}).to_string());
+                        }
                     }
                     self.inbox.push_back(json!({"id":call["id"],"result":{}}).to_string());
                     Ok(())
-                } else { self.inner.send_text(text) }
+                } else {
+                    if call["method"] == "Page.createIsolatedWorld" {
+                        self.pending_worlds.insert(call["id"].as_i64().unwrap(), (call["sessionId"].as_str().unwrap().to_string(), call["params"].clone()));
+                    }
+                    self.inner.send_text(text)
+                }
             }
             fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
-                match self.inbox.pop_front() { Some(text) => Ok(Some(text)), None => self.inner.recv_text(deadline) }
+                let text = match self.inbox.pop_front() { Some(text) => Some(text), None => self.inner.recv_text(deadline)? };
+                if let Some(text) = &text {
+                    let reply: Value = serde_json::from_str(text).unwrap();
+                    if let Some((owner, params)) = reply["id"].as_i64().and_then(|id| self.pending_worlds.remove(&id)) {
+                        if let Some(id) = reply.pointer("/result/executionContextId").and_then(Value::as_i64) {
+                            self.worlds.entry(owner).or_default().push(json!({"id":id,"uniqueId":format!("fixture-world:{id}"),"origin":"","name":params["worldName"],"auxData":{"frameId":params["frameId"],"isDefault":false}}));
+                        }
+                    }
+                }
+                Ok(text)
             }
         }
         struct Empty;
@@ -224,7 +244,7 @@ impl Cdp {
         self.guard_sessions.insert(guard);
         self.unobserved.insert(target);
         let inner = std::mem::replace(&mut self.ws, Box::new(Empty));
-        self.ws = Box::new(Fixture { inner, inbox:VecDeque::new() });
+        self.ws = Box::new(Fixture { inner, inbox:VecDeque::new(), worlds:BTreeMap::new(), pending_worlds:BTreeMap::new() });
     }
 
     pub fn events(&self) -> &[Value] {
@@ -2940,6 +2960,10 @@ mod tests {
                 let call: Value = serde_json::from_str(text).unwrap();
                 if call["method"] == "Page.getFrameTree" {
                     self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":self.frame}}}).to_string());
+                    Ok(())
+                } else if call["method"] == "Runtime.enable" {
+                    self.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":call["sessionId"],"params":{"context":{"id":1,"uniqueId":"observed-context","origin":self.frame["securityOrigin"],"name":"","auxData":{"frameId":self.frame["id"],"isDefault":true}}}}).to_string());
+                    self.inbox.push_back(json!({"id":call["id"],"result":{}}).to_string());
                     Ok(())
                 } else {
                     self.inner.send_text(text)
