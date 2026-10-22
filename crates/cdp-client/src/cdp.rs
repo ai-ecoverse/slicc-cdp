@@ -28,14 +28,24 @@ pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it 
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
+const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct DocumentState {
     frames: BTreeMap<String, Vec<String>>,
     worker: Option<(String, String)>,
     epoch: u64,
+}
+
+impl PartialEq for DocumentState {
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch && self.worker == other.worker && self.frames.len() == other.frames.len()
+            && self.frames.iter().all(|(id, frame)| other.frames.get(id).is_some_and(|current| {
+                frame[0] == current[0] && frame[2..] == current[2..] && (!frame[0].is_empty() || frame[1] == current[1])
+            }))
+    }
 }
 
 struct MainDocument {
@@ -80,7 +90,8 @@ pub struct Cdp {
     answering: BTreeMap<i64, (String, String)>,
     held: BTreeMap<String, Vec<Value>>,
     streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
-    document_epoch: u64,
+    document_epochs: BTreeMap<String, u64>,
+    document_versions: BTreeMap<(String, String), String>,
     context_frames: BTreeMap<(String, String), String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
@@ -129,7 +140,8 @@ impl Cdp {
             answering: BTreeMap::new(),
             held: BTreeMap::new(),
             streams: BTreeMap::new(),
-            document_epoch: 0,
+            document_epochs: BTreeMap::new(),
+            document_versions: BTreeMap::new(),
             context_frames: BTreeMap::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
@@ -398,23 +410,24 @@ impl Cdp {
             return Err(self.refusal());
         }
         if method == "Page.navigateToHistoryEntry" {
-            let entry = params.get("entryId").and_then(|v| v.as_i64());
+            let entry = params.get("entryId").and_then(|v| v.as_i64()).ok_or_else(|| self.refusal())?;
             let history = self.raw_call(
                 "Page.getNavigationHistory",
                 json!({}),
                 session_id,
-                Duration::from_secs(10),
-            )?;
+                DOCUMENT_CHECK,
+            ).map_err(|_| self.refusal())?;
             let url = history
                 .get("entries")
                 .and_then(|v| v.as_array())
                 .and_then(|entries| {
                     entries
                         .iter()
-                        .find(|item| item.get("id").and_then(|v| v.as_i64()) == entry)
+                        .find(|item| item.get("id").and_then(|v| v.as_i64()) == Some(entry))
                 })
                 .and_then(|item| item.get("url").and_then(|v| v.as_str()))
-                .unwrap_or("")
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| self.refusal())?
                 .to_string();
             if self.guard.url(&url) {
                 return Err(format!("{}\n", self.guard.refusal_for_url(&url)));
@@ -1071,6 +1084,9 @@ impl Cdp {
             return;
         }
         let Some(frame_id) = frame.get("id").and_then(Value::as_str) else { return };
+        if let Some(loader) = frame.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()) {
+            self.document_versions.insert((target.clone(), frame_id.to_string()), loader.to_string());
+        }
         let url = format!("{}{}", frame.get("url").and_then(Value::as_str).unwrap_or(""), frame.get("urlFragment").and_then(Value::as_str).unwrap_or(""));
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
         let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1102,7 +1118,7 @@ impl Cdp {
     fn document_state(&mut self, target: &str, content: bool) -> Option<DocumentState> {
         let Some(guard) = self.guards.get(target).cloned() else {
             if self.protected_targets.contains(target) { return None }
-            let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, OPTIONAL_STEP).ok()?;
+            let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
             let info = result.get("targetInfo")?;
             let text = |key| info.get(key).and_then(Value::as_str).unwrap_or("");
             if text("targetId") != target || !matches!(text("type"), "worker" | "service_worker" | "shared_worker")
@@ -1113,34 +1129,55 @@ impl Cdp {
             state.worker = Some((text("url").to_string(), owner.to_string()));
             return Some(state);
         };
-        let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok()?;
+        let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), DOCUMENT_CHECK).ok()?;
         if self.guards.get(target) != Some(&guard) { return None }
-        let epoch = self.document_epoch;
+        let epoch = self.document_epochs.get(target).copied().unwrap_or(0);
         let node = tree.get("frameTree")?;
         let frame = node.get("frame")?;
         if frame.get("parentId").is_some() { return None }
         let mut frames = BTreeMap::new();
-        if !self.collect_document_frames(node, &mut frames, content, true) { return None }
+        if !self.collect_document_frames(node, &mut frames, content, None) { return None }
+        if content && frames.iter().any(|(id, evidence)| evidence[0].is_empty() && self.document_versions.contains_key(&(target.to_string(), id.clone()))) { return None }
+        if content && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or(""))
+            && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
+        {
+            let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
+            let info = result.get("targetInfo")?;
+            if info.get("targetId").and_then(Value::as_str) != Some(target)
+                || info.get("type").and_then(Value::as_str) != Some("page")
+                || info.get("url").and_then(Value::as_str).is_none_or(|url| !self.guard.inheriting(url)) { return None }
+            if info.get("openerId").is_some() || info.get("openerFrameId").is_some()
+                || frame.get("url").and_then(Value::as_str) != Some("about:blank")
+                || frame.get("loaderId").and_then(Value::as_str) != Some("") { return None }
+        }
         self.main_commit(&guard, frame);
         if self.protected_targets.contains(target) { return None }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
+            if !evidence[0].is_empty() {
+                self.document_versions.insert((target.to_string(), id.clone()), evidence[0].clone());
+            }
         }
         Some(DocumentState { frames, worker:None, epoch })
     }
 
-    fn collect_document_frames(&self, node: &Value, frames: &mut BTreeMap<String, Vec<String>>, content: bool, root: bool) -> bool {
+    fn collect_document_frames(&self, node: &Value, frames: &mut BTreeMap<String, Vec<String>>, content: bool, parent: Option<&str>) -> bool {
         let Some(frame) = node.get("frame") else { return false };
         let text = |key| frame.get(key).and_then(Value::as_str).unwrap_or("");
-        if ["id", "url"].iter().any(|key| matches!(text(*key), "" | "null" | "://")) { return false }
-        if content && (matches!(text("loaderId"), "" | "null") || matches!(text("securityOrigin"), "" | "null")
-            || text("securityOrigin") == "://" && (!root || !matches!(text("url"), "about:blank" | "about:srcdoc" | "chrome-error://chromewebdata/"))
+        let root = parent.is_none();
+        if ["id", "url"].iter().any(|key| matches!(text(*key), "" | "null" | "://"))
+            || frame.get("parentId").is_some_and(|id| id.as_str() != parent) { return false }
+        let initial_blank = text("url") == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some("")
+            && (root || parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2])));
+        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank;
+        if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
+            || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
             || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))) { return false }
-        let evidence = vec![text("loaderId").to_string(), format!("{}{}", text("url"), text("urlFragment")), text("securityOrigin").to_string(), text("unreachableUrl").to_string()];
+        let evidence = vec![text("loaderId").to_string(), format!("{}{}", text("url"), text("urlFragment")), text("securityOrigin").to_string(), text("unreachableUrl").to_string(), parent.unwrap_or("").to_string()];
         if frames.insert(text("id").to_string(), evidence).is_some() { return false }
         match node.get("childFrames") {
             None => true,
-            Some(children) => children.as_array().is_some_and(|children| children.iter().all(|child| self.collect_document_frames(child, frames, content, false))),
+            Some(children) => children.as_array().is_some_and(|children| children.iter().all(|child| self.collect_document_frames(child, frames, content, Some(text("id"))))),
         }
     }
 
@@ -1365,8 +1402,21 @@ impl Cdp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let params = value.get("params").cloned().unwrap_or(Value::Null);
-        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameStartedNavigating" | "Page.navigatedWithinDocument" | "Page.frameDetached" | "Runtime.executionContextsCleared") {
-            self.document_epoch += 1;
+        if let Some(target) = session.as_deref().and_then(|session| self.session_target(session)) {
+            if method == "Page.frameNavigated" {
+                let id = params.pointer("/frame/id").and_then(Value::as_str).unwrap_or("").to_string();
+                let loader = params.pointer("/frame/loaderId").and_then(Value::as_str).unwrap_or("").to_string();
+                let key = (target.clone(), id);
+                if loader.is_empty() || self.document_versions.get(&key) != Some(&loader) {
+                    if !loader.is_empty() { self.document_versions.insert(key, loader); }
+                    *self.document_epochs.entry(target).or_default() += 1;
+                }
+            } else if method == "Page.frameDetached" {
+                let id = params.get("frameId").and_then(Value::as_str).unwrap_or("").to_string();
+                if self.document_versions.remove(&(target.clone(), id)).is_some() {
+                    *self.document_epochs.entry(target).or_default() += 1;
+                }
+            }
         }
         if method == "Runtime.executionContextCreated" {
             if let Some(session) = session.as_ref() {
@@ -2726,7 +2776,7 @@ mod tests {
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test"}}}));
         error_commit(&mut cdp, "https://seven.sliccy.ai/doc#access_token=MARK", "://");
         cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":"https://seven.sliccy.ai/doc#access_token=MARK","title":"MARK"}}}));
-        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"about:blank","securityOrigin":"://"}}}));
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"about:blank","securityOrigin":"https://example.test"}}}));
         observe_document(&mut cdp);
         assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.readyState"}), Some("S")).is_ok());
         assert!(!cdp.session_blocked("S"));

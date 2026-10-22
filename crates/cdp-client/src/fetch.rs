@@ -1391,7 +1391,7 @@ mod tests {
             Vec::new(),
             Box::new(move |message| match message["method"].as_str().unwrap() {
                 "Target.getTargetInfo" => vec![
-                    json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T1", "url": "about:blank" } } }),
+                    json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T1", "type":"page", "url": "about:blank" } } }),
                 ],
                 "Target.attachToTarget" => {
                     *attaches.borrow_mut() += 1;
@@ -1401,7 +1401,7 @@ mod tests {
                 "Fetch.enable" if message["sessionId"] == "S1" => {
                     vec![ok(message), queued.borrow_mut().take().unwrap()]
                 }
-                "Page.getFrameTree" => vec![json!({"id":message["id"],"result":{"frameTree":{"frame":{"id":"F1","loaderId":"L1","url":"about:blank","securityOrigin":"://"}}}})],
+                "Page.getFrameTree" => vec![json!({"id":message["id"],"result":{"frameTree":{"frame":{"id":"F1","loaderId":"L1","url":"about:blank","securityOrigin":"https://idp.example"}}}})],
                 "Fetch.getResponseBody" => vec![
                     json!({ "id": message["id"], "result": { "body": base64_encode(b"<p>hi</p>"), "base64Encoded": true } }),
                 ],

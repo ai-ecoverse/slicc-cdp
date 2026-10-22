@@ -127,6 +127,13 @@ impl Protected {
             && document_url == self.rules.error_page.url
     }
 
+    pub(crate) fn opaque_document(&self, text: &str, root: bool) -> bool {
+        root && (self.inheriting(text) || self.error_page_url(text))
+            || self.unwrap(parse(text)).map(|url| self.rewrite_about(url)).is_some_and(|url| {
+                self.rules.scheme_exceptions.contains(&format!("{}://{}", url.scheme(), host_of(&url)))
+            })
+    }
+
     pub fn error_document(&self, document_url: &str, origin: &str) -> bool {
         self.error_page_url(document_url) && origin == "://"
     }
@@ -215,7 +222,7 @@ impl Protected {
         literal.contains("://") && self.url_read_only(&literal)
     }
 
-    fn inheriting(&self, text: &str) -> bool {
+    pub(crate) fn inheriting(&self, text: &str) -> bool {
         if text.is_empty() {
             return true;
         }

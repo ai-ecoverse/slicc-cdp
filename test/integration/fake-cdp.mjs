@@ -75,6 +75,7 @@ export async function fakeCdp({
   attachEvents = false,
   discoverEvents = false,
   delayHistoryEvents = false,
+  onUpgrade,
 } = {}) {
   const calls = [];
   const targets = [];
@@ -99,6 +100,7 @@ export async function fakeCdp({
   });
   const sockets = new Set();
   server.on('upgrade', (req, socket) => {
+    onUpgrade?.(req.headers);
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
     socket.on('error', () => socket.destroy());
