@@ -6,6 +6,9 @@ mod cdp;
 mod commands;
 mod connect;
 mod discover;
+#[cfg(test)]
+#[path = "../../../test/integration/document-client.rs"]
+mod document_client;
 mod help;
 mod launch;
 mod net;

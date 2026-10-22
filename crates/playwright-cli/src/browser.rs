@@ -1437,7 +1437,7 @@ mod tests {
             incoming: messages.into_iter().map(|m| m.to_string()).collect(),
             sent: sent.clone(),
         };
-        (Cdp::from_transport(Box::new(transport)), sent)
+        (crate::document_client::client(Box::new(transport), "S"), sent)
     }
 
     fn navigated(session: &str, frame: &str, url: &str) -> Value {

@@ -85,7 +85,8 @@ export async function fakeCdp({
   let tabs = 0;
   const info = (target) => ({
     targetId: target.targetId,
-    type: 'page',
+    type: target.type ?? 'page',
+    ...(target.openerId ? { openerId: target.openerId } : {}),
     url: target.url,
     title: target.url,
     attached: false,
@@ -192,7 +193,12 @@ export async function fakeCdp({
                 id: target?.targetId ?? 'F',
                 loaderId: 'L',
                 url: target?.url ?? '',
+                securityOrigin:
+                  target?.url && new URL(target.url).origin !== 'null'
+                    ? new URL(target.url).origin
+                    : '://',
               },
+              ...(target?.childFrames ? { childFrames: target.childFrames } : {}),
             },
           });
         case 'Page.enable':
@@ -231,6 +237,8 @@ export async function fakeCdp({
           event('Page.loadEventFired', { timestamp: 1 });
           return;
         }
+        case 'Page.printToPDF':
+          return answer({ stream: 'H' });
         case 'Page.createIsolatedWorld':
           return answer({ executionContextId: 7 });
         case 'Accessibility.getFullAXTree':
@@ -247,6 +255,7 @@ export async function fakeCdp({
             target.url = target.history.entries[target.history.currentIndex].url;
             target.frame = {
               id: target.targetId,
+              loaderId: 'LHISTORY',
               url: target.url,
               securityOrigin: new URL(target.url).origin,
             };

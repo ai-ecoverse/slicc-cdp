@@ -42,17 +42,22 @@ jobs:
         run: npm run -s browser -- --with-deps
       - name: Verify current document commands
         run: |
-          cargo test --locked -p slicc-cdp-client --test document-freshness
-          node --test test/integration/document-freshness.test.mjs test/integration/current-document.test.mjs
+          cargo test --locked -p slicc-cdp-client --test document-freshness --test document-validation
+          node --test --test-concurrency=1 test/integration/document-freshness.test.mjs test/integration/document-validation.test.mjs test/integration/current-document.test.mjs
       - name: Verify regression sensitivity
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          if git grep -q 'fn verify_document' "$BASE" -- crates/cdp-client/src/cdp.rs; then
+          if git grep -q 'fn document_state\|fn verify_document' "$BASE" -- crates/cdp-client/src/cdp.rs; then
             echo 'baseline already verifies current documents'
             exit 0
           fi
           git show "$BASE:crates/cdp-client/src/cdp.rs" > crates/cdp-client/src/cdp.rs
+          if cargo test --locked -p slicc-cdp-client --test document-validation > /tmp/document-validation.log 2>&1; then
+            echo 'expected the baseline validation tests to fail'
+            exit 1
+          fi
+          grep -q '0 passed; 4 failed' /tmp/document-validation.log
           if cargo test --locked -p slicc-cdp-client --test document-freshness > /tmp/document-rust.log 2>&1; then
             echo 'expected the baseline document test to fail'
             exit 1
@@ -71,6 +76,7 @@ jobs:
           name: document-checks
           path: |
             /tmp/document-rust.log
+            /tmp/document-validation.log
             /tmp/document-browser.tap
           if-no-files-found: ignore
           retention-days: 7

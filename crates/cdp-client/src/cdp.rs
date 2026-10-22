@@ -31,6 +31,13 @@ const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
+#[derive(Clone, Debug, PartialEq)]
+struct DocumentState {
+    frames: BTreeMap<String, Vec<String>>,
+    worker: Option<(String, String)>,
+    epoch: u64,
+}
+
 struct MainDocument {
     frame_id: String,
     url: String,
@@ -72,7 +79,9 @@ pub struct Cdp {
     handed: BTreeSet<(String, String)>,
     answering: BTreeMap<i64, (String, String)>,
     held: BTreeMap<String, Vec<Value>>,
-    streams: BTreeMap<String, Option<String>>,
+    streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
+    document_epoch: u64,
+    context_frames: BTreeMap<(String, String), String>,
     contexts: BTreeSet<String>,
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
@@ -120,6 +129,8 @@ impl Cdp {
             answering: BTreeMap::new(),
             held: BTreeMap::new(),
             streams: BTreeMap::new(),
+            document_epoch: 0,
+            context_frames: BTreeMap::new(),
             contexts: BTreeSet::new(),
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
@@ -129,6 +140,40 @@ impl Cdp {
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_session(&mut self, session: &str) {
+        struct Fixture {
+            inner: Box<dyn Transport>,
+            inbox: VecDeque<String>,
+        }
+        impl Transport for Fixture {
+            fn send_text(&mut self, text: &str) -> Result<(), String> {
+                let call: Value = serde_json::from_str(text).unwrap();
+                if call["method"] == "Page.getFrameTree" && call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:")) {
+                    self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":{"id":"F","loaderId":"L","url":"https://example.test/","securityOrigin":"https://example.test"}}}}).to_string());
+                    Ok(())
+                } else { self.inner.send_text(text) }
+            }
+            fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+                match self.inbox.pop_front() { Some(text) => Ok(Some(text)), None => self.inner.recv_text(deadline) }
+            }
+        }
+        struct Empty;
+        impl Transport for Empty {
+            fn send_text(&mut self, _: &str) -> Result<(), String> { Ok(()) }
+            fn recv_text(&mut self, _: Instant) -> Result<Option<String>, String> { Ok(None) }
+        }
+        let target = format!("fixture:{session}");
+        let guard = format!("fixture-guard:{session}");
+        self.targets.insert(target.clone(), json!({"targetId":target,"type":"page","url":"https://example.test/"}));
+        self.session_targets.insert(session.into(), target.clone());
+        self.guards.insert(target.clone(), guard.clone());
+        self.guard_sessions.insert(guard);
+        self.unobserved.insert(target);
+        let inner = std::mem::replace(&mut self.ws, Box::new(Empty));
+        self.ws = Box::new(Fixture { inner, inbox:VecDeque::new() });
     }
 
     pub fn events(&self) -> &[Value] {
@@ -214,7 +259,11 @@ impl Cdp {
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
         }
+        let checks = self.prepare(method, &params, session_id)?;
         let result = self.raw_call(method, params.clone(), session_id, timeout)?;
+        if stable_command(method) {
+            self.verify_checks(&checks)?;
+        }
         if let (true, Some(session), Some(id)) = (
             shield::answers_interception(method),
             session_id,
@@ -227,7 +276,9 @@ impl Cdp {
                 return Err(self.refusal());
             }
         }
-        self.after(method, &params, session_id, result)
+        let result = self.after(method, &params, session_id, result)?;
+        self.bind_streams(method, session_id, &result, &checks);
+        Ok(result)
     }
 
     pub fn notify(
@@ -241,6 +292,11 @@ impl Cdp {
         if matches!(method, "Target.createTarget" | "Target.attachToTarget") {
             return Err(format!("{method} must be a call, not a notify\n"));
         }
+        if stable_command(method) {
+            self.call(method, params, session_id)?;
+            return Ok(());
+        }
+        self.prepare(method, &params, session_id)?;
         let answered = shield::answers_interception(method)
             .then(|| shield::request_key(&params))
             .flatten()
@@ -411,18 +467,63 @@ impl Cdp {
                 return Err(STREAM.into());
             }
         }
+        Ok(())
+    }
+
+    fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+        let mut checks = Vec::new();
         if matches!(method, "IO.read" | "IO.close") {
-            let target = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned().flatten();
-            if target.is_none_or(|target| !self.verify_document(&target) || self.protected_targets.contains(&target)) {
-                return Err(self.refusal());
+            let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
+            let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
+            let current = self.document_state(&target, true).ok_or_else(|| self.refusal())?;
+            if current != expected { return Err(self.refusal()) }
+            checks.push((target, current));
+        }
+        if let Some(session) = session {
+            if !harmless(method, params) {
+                let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+                if !checks.iter().any(|(known, _)| known == &target) {
+                    let state = self.document_state(&target, stable_command(method)).ok_or_else(|| self.refusal())?;
+                    if self.blocked.contains(session) { return Err(self.refusal()) }
+                    for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
+                        if let Some(value) = params.get(key) {
+                            let frame = if key == "frameId" {
+                                value.as_str().map(str::to_string)
+                            } else {
+                                let label = if matches!(key, "contextId" | "executionContextId") { "id" } else if key == "executionContextName" { "name" } else { "unique" };
+                                let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                                self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
+                            };
+                            if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
+                        }
+                    }
+                    checks.push((target, state));
+                }
             }
         }
-        if let Some(session) = session_id {
-            if !harmless(method, params) && self.session_target(session).is_some_and(|target| !self.verify_document(&target) || self.blocked.contains(session)) {
+        Ok(checks)
+    }
+
+    fn verify_checks(&mut self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+        for (target, expected) in checks {
+            if self.document_state(target, true).as_ref() != Some(expected) {
                 return Err(self.refusal());
             }
         }
         Ok(())
+    }
+
+    fn bind_streams(&mut self, method: &str, session: Option<&str>, result: &Value, checks: &[(String, DocumentState)]) {
+        let target = session.and_then(|session| self.session_target(session));
+        let document = target.as_ref().and_then(|target| checks.iter().find(|(known, _)| known == target)).map(|(_, state)| state.clone());
+        for stream in [result.get("stream"), result.pointer("/resource/stream")].into_iter().flatten().filter_map(Value::as_str) {
+            self.streams.insert(stream.to_string(), (target.clone(), document.clone()));
+        }
+        if method == "IO.resolveBlob" {
+            if let Some(uuid) = result.get("uuid").and_then(Value::as_str) {
+                self.streams.insert(format!("blob:{uuid}"), (target, document));
+            }
+        }
     }
 
     fn request_state(&self, id: &str) -> Option<bool> {
@@ -452,21 +553,12 @@ impl Cdp {
         self.worlds.reply(session_id.unwrap_or(""), method, &result);
         if method == "Page.createIsolatedWorld" {
             self.worlds.created(session_id.unwrap_or(""), &result);
+            if let (Some(frame), Some(id)) = (params.get("frameId").and_then(Value::as_str), result.get("executionContextId")) {
+                self.context_frames.insert((session_id.unwrap_or("").to_string(), format!("id:{id}")), frame.to_string());
+            }
         }
         if method == "Runtime.compileScript" {
             self.worlds.script(session_id.unwrap_or(""), &result);
-        }
-        let stream_target = session_id.and_then(|session| self.session_target(session));
-        if let Some(stream) = result.get("stream").and_then(|v| v.as_str()) {
-            self.streams.insert(stream.to_string(), stream_target.clone());
-        }
-        if let Some(stream) = result.pointer("/resource/stream").and_then(|v| v.as_str()) {
-            self.streams.insert(stream.to_string(), stream_target.clone());
-        }
-        if method == "IO.resolveBlob" {
-            if let Some(uuid) = result.get("uuid").and_then(|v| v.as_str()) {
-                self.streams.insert(format!("blob:{uuid}"), stream_target);
-            }
         }
         match method {
             "Target.attachToTarget" => {
@@ -1007,20 +1099,48 @@ impl Cdp {
         self.documents.get(target_id).is_some_and(|doc| doc.probed && !doc.previous)
     }
 
-    fn verify_document(&mut self, target: &str) -> bool {
+    fn document_state(&mut self, target: &str, content: bool) -> Option<DocumentState> {
         let Some(guard) = self.guards.get(target).cloned() else {
-            return self.targets.get(target).and_then(|info| info.get("type")).and_then(Value::as_str)
-                .is_some_and(|kind| matches!(kind, "worker" | "service_worker" | "shared_worker"));
+            if self.protected_targets.contains(target) { return None }
+            let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, OPTIONAL_STEP).ok()?;
+            let info = result.get("targetInfo")?;
+            let text = |key| info.get(key).and_then(Value::as_str).unwrap_or("");
+            if text("targetId") != target || !matches!(text("type"), "worker" | "service_worker" | "shared_worker")
+                || url::Url::parse(text("url")).is_err() || self.guard.target(text("url"), false, Opener::Unknown) { return None }
+            let owner = text("openerId");
+            if !self.guards.contains_key(owner) { return None }
+            let mut state = self.document_state(owner, true)?;
+            state.worker = Some((text("url").to_string(), owner.to_string()));
+            return Some(state);
         };
-        let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok().and_then(|tree| tree.pointer("/frameTree/frame").cloned());
-        match frame {
-            Some(frame) if self.guards.get(target) == Some(&guard)
-                && frame.get("parentId").is_none()
-                && ["id", "url"].iter().all(|key| frame.get(*key).and_then(Value::as_str).is_some_and(|value| !value.is_empty())) => {
-                self.main_commit(&guard, &frame);
-                true
-            }
-            _ => false,
+        let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok()?;
+        if self.guards.get(target) != Some(&guard) { return None }
+        let epoch = self.document_epoch;
+        let node = tree.get("frameTree")?;
+        let frame = node.get("frame")?;
+        if frame.get("parentId").is_some() { return None }
+        let mut frames = BTreeMap::new();
+        if !self.collect_document_frames(node, &mut frames, content, true) { return None }
+        self.main_commit(&guard, frame);
+        if self.protected_targets.contains(target) { return None }
+        for (id, evidence) in &frames {
+            self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
+        }
+        Some(DocumentState { frames, worker:None, epoch })
+    }
+
+    fn collect_document_frames(&self, node: &Value, frames: &mut BTreeMap<String, Vec<String>>, content: bool, root: bool) -> bool {
+        let Some(frame) = node.get("frame") else { return false };
+        let text = |key| frame.get(key).and_then(Value::as_str).unwrap_or("");
+        if ["id", "url"].iter().any(|key| matches!(text(*key), "" | "null" | "://")) { return false }
+        if content && (matches!(text("loaderId"), "" | "null") || matches!(text("securityOrigin"), "" | "null")
+            || text("securityOrigin") == "://" && (!root || !matches!(text("url"), "about:blank" | "about:srcdoc" | "chrome-error://chromewebdata/"))
+            || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))) { return false }
+        let evidence = vec![text("loaderId").to_string(), format!("{}{}", text("url"), text("urlFragment")), text("securityOrigin").to_string(), text("unreachableUrl").to_string()];
+        if frames.insert(text("id").to_string(), evidence).is_some() { return false }
+        match node.get("childFrames") {
+            None => true,
+            Some(children) => children.as_array().is_some_and(|children| children.iter().all(|child| self.collect_document_frames(child, frames, content, false))),
         }
     }
 
@@ -1245,6 +1365,22 @@ impl Cdp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameStartedNavigating" | "Page.navigatedWithinDocument" | "Page.frameDetached" | "Runtime.executionContextsCleared") {
+            self.document_epoch += 1;
+        }
+        if method == "Runtime.executionContextCreated" {
+            if let Some(session) = session.as_ref() {
+                let frame = params.pointer("/context/auxData/frameId").and_then(Value::as_str);
+                for (label, key) in [("id", "id"), ("unique", "uniqueId"), ("name", "name")] {
+                    if let Some(id) = params.pointer("/context").and_then(|context| context.get(key)) {
+                        let id = id.as_str().map(str::to_string).unwrap_or_else(|| id.to_string());
+                        let key = (session.clone(), format!("{label}:{id}"));
+                        if let Some(frame) = frame { self.context_frames.insert(key, frame.to_string()); }
+                        else { self.context_frames.remove(&key); }
+                    }
+                }
+            }
+        }
         if let Some(id) = params.get("requestId").and_then(|v| v.as_str()) {
             if let Some(url) = shield::request_url(&params) {
                 let resource = (session.clone().unwrap_or_default(), url.clone());
@@ -1880,6 +2016,14 @@ fn recovery(method: &str, params: &Value) -> bool {
     }
 }
 
+fn stable_command(method: &str) -> bool {
+    !method.starts_with("Target.") && !method.starts_with("Browser.") && !method.starts_with("Slicc.")
+        && !matches!(method, "Page.navigate" | "Page.reload" | "Page.stopLoading" | "Page.navigateToHistoryEntry" | "Page.enable" | "Page.disable"
+            | "Page.getFrameTree" | "Page.getNavigationHistory" | "Page.close" | "Runtime.enable" | "Runtime.disable" | "Runtime.runIfWaitingForDebugger"
+            | "Network.enable" | "Network.disable" | "Fetch.enable" | "Fetch.disable" | "Fetch.continueRequest" | "Fetch.fulfillRequest" | "Fetch.failRequest"
+            | "Fetch.continueResponse" | "Fetch.continueWithAuth")
+}
+
 fn harmless(method: &str, params: &Value) -> bool {
     match method {
         "Fetch.disable" => true,
@@ -2210,10 +2354,12 @@ mod tests {
     }
 
     fn pending(answer: fn(&Value) -> Vec<Value>) -> Cdp {
-        Cdp::from_transport(Box::new(Pending {
+        let mut cdp = Cdp::from_transport(Box::new(Pending {
             inbox: VecDeque::new(),
             answer,
-        }))
+        }));
+        cdp.fixture_session("S");
+        cdp
     }
 
     struct Cleanup {
@@ -2290,7 +2436,7 @@ mod tests {
             }
         }
         let doc = &cdp.documents["T"];
-        let frame = json!({"id":doc.frame_id,"url":doc.url,"securityOrigin":doc.origin,"unreachableUrl":doc.unreachable_url});
+        let frame = json!({"id":doc.frame_id,"loaderId":"L","url":doc.url,"securityOrigin":doc.origin,"unreachableUrl":doc.unreachable_url});
         let inner = std::mem::replace(&mut cdp.ws, Box::new(Pending { inbox:VecDeque::new(), answer: |_| Vec::new() }));
         cdp.ws = Box::new(Observed { inner, frame, inbox:VecDeque::new() });
         cdp.guards.insert("T".into(), "G".into());
@@ -2730,7 +2876,9 @@ mod tests {
     }
 
     fn url_backend(url: &str) -> Cdp {
-        Cdp::from_transport(Box::new(UrlBackend { url: url.into(), inbox: VecDeque::new() }))
+        let mut cdp = Cdp::from_transport(Box::new(UrlBackend { url: url.into(), inbox: VecDeque::new() }));
+        cdp.fixture_session("S");
+        cdp
     }
 
     #[test]

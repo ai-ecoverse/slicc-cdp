@@ -71,7 +71,7 @@ for (const transport of ['native', 'wasi']) {
             calls.push(message);
             if (
               message.method === 'Runtime.evaluate' &&
-              message.params?.expression === 'history.back()'
+              message.params?.expression?.includes('history.back()')
             )
               historyId = message.id;
           } else if (
@@ -92,9 +92,24 @@ for (const transport of ['native', 'wasi']) {
       const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
       armed = true;
       timer = setTimeout(releaseHistory, 10000);
-      await client.send('Runtime.evaluate', { expression: 'history.back()' }, sessionId);
+      const historyFrom = calls.length;
+      await client
+        .send('Runtime.evaluate', { expression: 'history.back()' }, sessionId)
+        .catch((error) => {
+          assert.match(error.message, /slicc: refused:/);
+        });
+      await historyComplete;
       clearTimeout(timer);
-      assert.equal(restored?.params?.type, 'BackForwardCacheRestore');
+      assert.equal(
+        restored?.params?.type,
+        'BackForwardCacheRestore',
+        JSON.stringify({
+          commands: calls.slice(historyFrom),
+          events: proxy.heldEvents.filter(
+            (event) => event.method.startsWith('Page.') || event.method.startsWith('Fetch.')
+          ),
+        })
+      );
       assert.ok(proxy.heldEvents.includes(restored));
       const from = calls.length;
       const result = await client
@@ -113,7 +128,7 @@ for (const transport of ['native', 'wasi']) {
       assert.match(result.error?.message ?? '', /slicc: refused:/);
       assert.ok(
         calls
-          .slice(from)
+          .slice(historyFrom)
           .some((call) => call.method === 'Page.getFrameTree' && call.sessionId !== sessionId)
       );
       assert.ok(

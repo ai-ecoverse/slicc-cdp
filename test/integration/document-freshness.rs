@@ -22,7 +22,7 @@ impl Backend {
     }
 
     fn frame(&self) -> Value {
-        json!({"id":"F","url":self.current,"securityOrigin":self.current.split("/document").next().unwrap()})
+        json!({"id":"F","loaderId":"L","url":self.current,"securityOrigin":self.current.split("/document").next().unwrap()})
     }
 
     fn commit(&mut self, url: &str, delayed: bool) {
@@ -118,7 +118,9 @@ fn current_document_is_verified_before_content_commands_after_history_navigation
                     session = attach(&mut cdp);
                 }
                 cdp.call("Page.printToPDF", json!({"transferMode":"ReturnAsStream"}), Some(&session)).unwrap();
-                cdp.call("Runtime.evaluate", json!({"expression":"history.back()"}), Some(&session)).unwrap();
+                let history_from = backend.borrow().calls.len();
+                let history = cdp.call("Runtime.evaluate", json!({"expression":"history.back()"}), Some(&session));
+                assert!(history.is_ok() || history.is_err_and(|message| message.starts_with("slicc: refused:")));
                 assert_eq!(backend.borrow().current, PROTECTED);
                 assert!(!backend.borrow().delayed.is_empty());
                 let from = backend.borrow().calls.len();
@@ -137,7 +139,7 @@ fn current_document_is_verified_before_content_commands_after_history_navigation
                 drain(&mut cdp);
                 assert!(result.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")), "{method}: before_attach={before_attach}, notify={notify}: {result:?}");
                 assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == method && call["sessionId"].as_str() == command_session), "the client command reached the current document");
-                assert!(backend.borrow().calls[from..].iter().any(|call| call["method"] == "Page.getFrameTree" && call["sessionId"] != session), "the current document was not checked on the guard session");
+                assert!(backend.borrow().calls[history_from..].iter().any(|call| call["method"] == "Page.getFrameTree" && call["sessionId"] != session), "the current document was not checked on the guard session");
             }
         }
     }

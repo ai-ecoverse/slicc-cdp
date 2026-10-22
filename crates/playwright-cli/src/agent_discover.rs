@@ -4387,7 +4387,7 @@ mod tests {
             .map(|(i, result)| json!({ "id": i as i64 + 1, "result": result }).to_string())
             .collect();
         let transport = ScriptedTransport { incoming, sent: sent.clone() };
-        (Cdp::from_transport(Box::new(transport)), sent)
+        (crate::document_client::client(Box::new(transport), "S1"), sent)
     }
 
     fn fetched(status: u16, ct: &str, body: &str) -> Value {
@@ -4560,7 +4560,7 @@ mod tests {
             .collect();
         incoming.push_front(link.to_string());
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let mut cdp = Cdp::from_transport(Box::new(ScriptedTransport { incoming, sent }));
+        let mut cdp = crate::document_client::client(Box::new(ScriptedTransport { incoming, sent }), "S1");
         cdp.pump(Instant::now()).unwrap();
         let mut state = nlweb_state();
         let output = follow_links(&mut cdp, &mut state, "S1");
@@ -4779,7 +4779,7 @@ mod tests {
         });
         let reply = json!({ "id": 1, "result": { "body": b64(body), "base64Encoded": true } });
         let incoming = [seen.to_string(), reply.to_string()].into_iter().collect();
-        let mut cdp = Cdp::from_transport(Box::new(ScriptedTransport { incoming, sent: sent.clone() }));
+        let mut cdp = crate::document_client::client(Box::new(ScriptedTransport { incoming, sent: sent.clone() }), "S1b");
         let headers = json!({ "content-type": "application/json" });
         assert!(handle_response(&mut cdp, &mut state, "S1", &payment_response("https://example.com/p1", "R1", headers.clone())).is_empty());
         state.sessions.insert(

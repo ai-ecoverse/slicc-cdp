@@ -362,6 +362,7 @@ mod tests {
                         json!({ "sessionId": "sess" })
                     }
                 }
+                "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"F","loaderId":"L","url":"https://app.example/","securityOrigin":"https://app.example"}}}),
                 "DOM.resolveNode" => json!({ "object": { "objectId": "obj-1" } }),
                 "Runtime.evaluate" => {
                     let expr = params

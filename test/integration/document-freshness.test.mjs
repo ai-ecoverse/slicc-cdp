@@ -40,7 +40,12 @@ for (const transport of ['native', 'wasi']) {
           targetId: 'T',
           flatten: true,
         });
-        await client.send('Runtime.evaluate', { expression: 'history.back()' }, sessionId);
+        const historyFrom = backend.calls.length;
+        await client
+          .send('Runtime.evaluate', { expression: 'history.back()' }, sessionId)
+          .catch((error) => {
+            assert.match(error.message, /slicc: refused:/);
+          });
         assert.equal(backend.targets[0].url, 'https://seven.sliccy.ai/document');
         assert.ok(backend.heldEvents.length > 0);
         const from = backend.calls.length;
@@ -57,7 +62,7 @@ for (const transport of ['native', 'wasi']) {
         );
         assert.ok(
           backend.calls
-            .slice(from)
+            .slice(historyFrom)
             .some((call) => call.method === 'Page.getFrameTree' && call.sessionId !== sessionId)
         );
       } finally {

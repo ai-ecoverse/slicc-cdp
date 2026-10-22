@@ -213,6 +213,13 @@ fn on_message(text: &str, pages: &[PageSpec], shared: &Shared) -> Vec<String> {
             vec![wrap(id, json!({ "sessionId": format!("s-{target}") }))]
         }
         "Target.detachFromTarget" => vec![wrap(id, json!({}))],
+        "Page.getFrameTree" => {
+            let session = session_id.unwrap_or_default();
+            let page = pages.iter().find(|page| session == format!("s-{}", page.target_id) || session.starts_with(&format!("g-{}-", page.target_id)));
+            let Some(page) = page else { return vec![wrap(id, json!({}))] };
+            let frame = |frame_id: &str| json!({"id":frame_id,"loaderId":format!("L-{frame_id}"),"url":page.url,"securityOrigin":"https://app.example"});
+            vec![wrap(id, json!({"frameTree":{"frame":frame("MAIN"),"childFrames":page.frames.iter().filter(|(frame_id, _)| frame_id != "MAIN").map(|(frame_id, _)| json!({"frame":frame(frame_id)})).collect::<Vec<_>>()}}))]
+        }
         "Runtime.enable" => {
             let session = session_id.unwrap_or_default();
             let target = session.strip_prefix("s-").unwrap_or("");

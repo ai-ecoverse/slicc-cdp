@@ -104,9 +104,11 @@ impl Transport for RedirectBodyBackend {
 }
 
 fn redirect_body_backend(body: String) -> Cdp {
-    Cdp::from_transport(Box::new(RedirectBodyBackend {
+    let mut cdp = Cdp::from_transport(Box::new(RedirectBodyBackend {
         inner: UrlBackend { url: "about:blank".into(), inbox: VecDeque::new() }, body,
-    }))
+    }));
+    cdp.fixture_session("S");
+    cdp
 }
 
 #[test]

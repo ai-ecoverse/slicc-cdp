@@ -16,7 +16,7 @@ fn redirect_extra_info_pairing_and_ordinary_controls_remain_visible() {
     let body = cdp.call("Network.getResponseBody", json!({"requestId":"ORDINARY"}), Some("S")).unwrap();
     assert!(body["body"].as_str().unwrap().contains(ordinary_marker));
     assert_eq!(cdp.events().last().unwrap()["params"]["redirectResponse"]["headers"], headers);
-    let content = cdp.call("Page.getResourceContent", json!({"frameId":"FRAME","url":ordinary_url}), Some("S")).unwrap();
+    let content = cdp.call("Page.getResourceContent", json!({"frameId":"F","url":ordinary_url}), Some("S")).unwrap();
     assert!(content["content"].as_str().unwrap().contains(ordinary_marker));
 }
 
