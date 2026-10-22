@@ -81,6 +81,8 @@ export async function fakeCdp({
   const fetchSessions = new Set();
   const targets = [];
   const sessions = new Map();
+  const sessionSends = new Map();
+  const paged = new Set();
   let next = 0;
   let tabs = 0;
   const info = (target) => ({
@@ -99,7 +101,15 @@ export async function fakeCdp({
   const sockets = new Set();
   server.on('upgrade', (req, socket) => {
     sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('close', () => {
+      sockets.delete(socket);
+      for (const [session, owner] of sessionSends) {
+        if (owner !== send) continue;
+        sessions.delete(session);
+        sessionSends.delete(session);
+        paged.delete(session);
+      }
+    });
     socket.on('error', () => socket.destroy());
     const accept = createHash('sha1')
       .update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -108,7 +118,6 @@ export async function fakeCdp({
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     let noise;
-    const paged = new Set();
     socket.on('close', () => clearInterval(noise));
     const send = (message) => {
       if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
@@ -167,6 +176,7 @@ export async function fakeCdp({
           next += 1;
           const session = `S${next}`;
           sessions.set(session, found);
+          sessionSends.set(session, send);
           if (attachEvents)
             event('Target.attachedToTarget', {
               sessionId: session,
@@ -177,6 +187,8 @@ export async function fakeCdp({
         }
         case 'Target.detachFromTarget':
           sessions.delete(params.sessionId);
+          sessionSends.delete(params.sessionId);
+          paged.delete(params.sessionId);
           return answer({});
         case 'Target.closeTarget': {
           const index = targets.findIndex((item) => item.targetId === params.targetId);
@@ -238,7 +250,11 @@ export async function fakeCdp({
             };
             for (const [peer, found] of sessions)
               if (target && found === target && peer !== sessionId && paged.has(peer))
-                send({ method: 'Page.frameNavigated', params: committed, sessionId: peer });
+                sessionSends.get(peer)?.({
+                  method: 'Page.frameNavigated',
+                  params: committed,
+                  sessionId: peer,
+                });
             event('Page.frameNavigated', committed);
             event('Page.domContentEventFired', { timestamp: 1 });
             event('Page.loadEventFired', { timestamp: 1 });

@@ -78,6 +78,7 @@ export async function cdpProxy(
     transform = (message) => message,
     observe = () => {},
     before = [],
+    inbound,
   } = {}
 ) {
   const pending = Object.fromEntries(
@@ -114,7 +115,10 @@ export async function cdpProxy(
       fromClient = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
-        if (message) observe('client', message);
+        if (message) {
+          observe('client', message);
+          inbound?.outbound(message);
+        }
         if (
           delayGuardAttachMs &&
           !delayed &&
@@ -219,10 +223,14 @@ export async function cdpProxy(
           setTimeout(() => toClient(frame.raw), delayGuardAttachMs);
           continue;
         }
-        toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
+        const deliver = () =>
+          toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
+        if (inbound) inbound.inbound(message, deliver);
+        else deliver();
       }
     });
     const end = () => {
+      inbound?.close();
       client.destroy();
       browser.destroy();
     };
@@ -236,6 +244,7 @@ export async function cdpProxy(
     url: `ws://127.0.0.1:${server.address().port}${upstream.pathname}`,
     replies,
     close: async () => {
+      inbound?.close();
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
     },
