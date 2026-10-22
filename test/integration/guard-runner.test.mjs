@@ -9,7 +9,7 @@ import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
 import { guarded, observer } from './guard-client.mjs';
-import { browserArgs, browserStartup, guardConcurrency, origins } from './guard-fixture.mjs';
+import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 
 const published = JSON.parse(
   await readFile(
@@ -135,7 +135,7 @@ test('published guard set through the Rust guarded client', {
       ['build', '-p', 'slicc-cdp-client', '--example', 'guard_bridge', '--target', 'wasm32-wasip1'],
       { stdio: 'inherit' }
     );
-  const { parallel, targetParallel } = guardConcurrency(selectedTargets.length);
+  const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
   const diagnostics = [];
   const startup = browserStartup(launchBrowser, (retry) => {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
@@ -267,6 +267,7 @@ test('published guard set through the Rust guarded client', {
     }
   };
   const targetNames = [...new Set(set.vectors.flatMap((vector) => vector.targets))];
+  const targetParallel = Number(process.env.SLICC_GUARD_TARGET_PARALLEL ?? targetNames.length);
   const settled = [];
   for (let index = 0; index < targetNames.length; index += targetParallel) {
     settled.push(

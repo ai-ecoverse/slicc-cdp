@@ -1,13 +1,3 @@
-export function guardConcurrency(targetCount, env = process.env) {
-  const parallel = Number(env.SLICC_GUARD_PARALLEL ?? 4);
-  const targetParallel = Number(env.SLICC_GUARD_TARGET_PARALLEL ?? Math.min(16, targetCount));
-  if (
-    ![targetCount, parallel, targetParallel].every((value) => Number.isInteger(value) && value > 0)
-  )
-    throw new RangeError('guard concurrency must use positive integers');
-  return { parallel, targetParallel };
-}
-
 export function origins(fixture) {
   const origin = (host) => `http://${host}:${fixture.port}`;
   return {
