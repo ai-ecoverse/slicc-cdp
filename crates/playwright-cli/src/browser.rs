@@ -366,6 +366,79 @@ pub fn frame_tree(cdp: &mut Cdp, session: &str) -> Result<Vec<FrameRec>, String>
     Ok(frames)
 }
 
+pub fn page_frames(cdp: &mut Cdp, session: &str) -> Result<Vec<FrameRec>, String> {
+    let mut frames = frame_tree(cdp, session)?;
+    let listed = cdp.call("Target.getTargets", json!({}), None)?;
+    let remote = listed
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|info| info.get("type").and_then(Value::as_str) == Some("iframe"))
+        .filter_map(|info| {
+            let text = |key: &str| info.get(key).and_then(Value::as_str).filter(|text| !text.is_empty()).map(str::to_string);
+            let id = text("targetId")?;
+            Some(FrameRec { frame_id: id.clone(), parent_frame_id: Some(text("parentFrameId")?), url: text("url").unwrap_or_default(), target: Some(id) })
+        })
+        .collect();
+    link_remote(&mut frames, remote);
+    Ok(frames)
+}
+
+fn link_remote(frames: &mut Vec<FrameRec>, mut remote: Vec<FrameRec>) {
+    loop {
+        let (linked, rest): (Vec<FrameRec>, Vec<FrameRec>) = remote.into_iter().partition(|frame| {
+            frames.iter().any(|known| frame.parent_frame_id.as_ref() == Some(&known.frame_id))
+                && frames.iter().all(|known| known.frame_id != frame.frame_id)
+        });
+        if linked.is_empty() {
+            return;
+        }
+        frames.extend(linked);
+        remote = rest;
+    }
+}
+
+fn remote_url(guard: &cdp_client::protected::Protected, url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) && !guard.url(url)
+}
+
+pub fn open_frame(cdp: &mut Cdp, frame: &FrameRec) -> Result<(String, Vec<FrameRec>), String> {
+    let refusal = format!("{}\n", cdp.guard().refusal());
+    let target = frame.target.as_deref().filter(|target| {
+        *target == frame.frame_id && remote_url(cdp.guard(), &frame.url) && !cdp.is_protected_target(target)
+    });
+    let Some(target) = target else {
+        return Err(refusal);
+    };
+    let session = cdp::attach(cdp, target)?;
+    let frames = frame_tree(cdp, &session);
+    match frames {
+        Ok(frames) if frames.first().is_some_and(|root| root.frame_id == target && remote_url(cdp.guard(), &root.url)) => Ok((session, frames)),
+        other => {
+            cdp::detach(cdp, &session);
+            Err(other.err().unwrap_or(refusal))
+        }
+    }
+}
+
+pub fn frame_session(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<Option<String>, String> {
+    let frames = page_frames(cdp, session)?;
+    match frames.into_iter().find(|frame| frame.frame_id == frame_id && frame.target.is_some()) {
+        Some(frame) => open_frame(cdp, &frame).map(|(child, _)| Some(child)),
+        None => Ok(None),
+    }
+}
+
+pub fn ref_session(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(RefRec, Option<String>), String> {
+    let Some(target) = rec.target.as_deref() else {
+        return Ok((rec.clone(), None));
+    };
+    let child = frame_session(cdp, session, target)?
+        .ok_or_else(|| format!("{}\n", cdp.guard().refusal()))?;
+    Ok((RefRec { page: Some(session.to_string()), ..rec.clone() }, Some(child)))
+}
+
 fn await_child_commits(
     cdp: &mut Cdp,
     session: &str,
@@ -903,7 +976,7 @@ pub fn hover_ref(
 ) -> Result<(), String> {
     if let Some(frame_id) = rec.frame_id.as_deref() {
         let selector = first_selector(&rec.selector);
-        let frame_offset = frame_element_offset(cdp, session, frame_id)?;
+        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let expression = format!(
             "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
@@ -920,7 +993,7 @@ pub fn hover_ref(
                 "x": cx,
                 "y": cy,
             }),
-            Some(session),
+            Some(input_session(session, rec)),
         )?;
         return Ok(());
     }
@@ -1053,7 +1126,7 @@ pub fn check_ref(
         if pre_parsed.get("checked").and_then(|v| v.as_bool()) == Some(checked) {
             return Ok(false);
         }
-        let frame_offset = frame_element_offset(cdp, session, frame_id)?;
+        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let click_expr = format!(
             "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
@@ -1067,7 +1140,7 @@ pub fn check_ref(
             cdp.call(
                 "Input.dispatchMouseEvent",
                 json!({ "type": kind, "x": cx, "y": cy, "button": "left", "clickCount": 1 }),
-                Some(session),
+                Some(input_session(session, rec)),
             )?;
         }
         let post_expr = format!(
@@ -1166,11 +1239,11 @@ fn check_backend(
 pub fn drag_refs(
     cdp: &mut Cdp,
     session: &str,
-    start_rec: &RefRec,
-    end_rec: &RefRec,
+    (start_session, start_rec): (&str, &RefRec),
+    (end_session, end_rec): (&str, &RefRec),
 ) -> Result<(), String> {
-    let start_box = element_center(cdp, session, start_rec)?;
-    let end_box = element_center(cdp, session, end_rec)?;
+    let start_box = element_center(cdp, start_session, start_rec)?;
+    let end_box = element_center(cdp, end_session, end_rec)?;
     cdp.call(
         "Input.dispatchMouseEvent",
         json!({
@@ -1242,7 +1315,8 @@ fn element_center(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f6
     let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
     let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    Ok((x, y))
+    let (ox, oy) = remote_offset(cdp, session, rec)?;
+    Ok((x + ox, y + oy))
 }
 
 fn frame_element_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<(f64, f64), String> {
@@ -1255,6 +1329,38 @@ fn frame_element_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<
         .get("backendNodeId")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "could not find frame owner element\n".to_string())?;
+    owner_offset(cdp, session, backend)
+}
+
+fn ref_frame_offset(cdp: &mut Cdp, session: &str, rec: &RefRec, frame_id: &str) -> Result<(f64, f64), String> {
+    if rec.target.is_none() {
+        return frame_element_offset(cdp, session, frame_id);
+    }
+    remote_offset(cdp, session, rec)
+}
+
+fn remote_offset(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f64), String> {
+    let (Some(target), Some(page)) = (rec.target.as_deref(), rec.page.as_deref()) else {
+        return Ok((0.0, 0.0));
+    };
+    let owner = rec
+        .owner
+        .ok_or_else(|| "could not find frame owner element\n".to_string())?;
+    let (x, y) = owner_offset(cdp, page, owner)?;
+    match rec.frame_id.as_deref().filter(|frame| *frame != target) {
+        Some(frame) => {
+            let (fx, fy) = frame_element_offset(cdp, session, frame)?;
+            Ok((x + fx, y + fy))
+        }
+        None => Ok((x, y)),
+    }
+}
+
+fn input_session<'a>(session: &'a str, rec: &'a RefRec) -> &'a str {
+    rec.page.as_deref().unwrap_or(session)
+}
+
+fn owner_offset(cdp: &mut Cdp, session: &str, backend: u64) -> Result<(f64, f64), String> {
     let _ = cdp.call("Runtime.enable", json!({}), Some(session));
     let resolved = cdp.call(
         "DOM.resolveNode",
@@ -1270,7 +1376,7 @@ fn frame_element_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<
         "Runtime.callFunctionOn",
         json!({
             "objectId": object_id,
-            "functionDeclaration": "function() { var r = this.getBoundingClientRect(); var s = getComputedStyle(this); var bt = parseFloat(s.borderTopWidth)||0; var bl = parseFloat(s.borderLeftWidth)||0; var pt = parseFloat(s.paddingTop)||0; var pl = parseFloat(s.paddingLeft)||0; return {x:r.x+bl+pl,y:r.y+bt+pt}; }",
+            "functionDeclaration": "function() { var x = 0, y = 0, el = this; while (el) { var r = el.getBoundingClientRect(); var s = el.ownerDocument.defaultView.getComputedStyle(el); x += r.x + (parseFloat(s.borderLeftWidth)||0) + (parseFloat(s.paddingLeft)||0); y += r.y + (parseFloat(s.borderTopWidth)||0) + (parseFloat(s.paddingTop)||0); el = el.ownerDocument.defaultView.frameElement; } return {x:x,y:y}; }",
             "returnByValue": true,
         }),
         Some(session),
@@ -1573,8 +1679,8 @@ mod tests {
     fn a_child_that_never_commits_stays_pending() {
         let (mut cdp, _) = scripted(vec![]);
         let mut frames = vec![
-            FrameRec { frame_id: "M".into(), parent_frame_id: None, url: String::new() },
-            FrameRec { frame_id: "C".into(), parent_frame_id: Some("M".into()), url: String::new() },
+            FrameRec { frame_id: "M".into(), parent_frame_id: None, url: String::new(), target: None },
+            FrameRec { frame_id: "C".into(), parent_frame_id: Some("M".into()), url: String::new(), target: None },
         ];
         let started = Instant::now();
         await_child_commits(&mut cdp, "S", 0, &mut frames, Duration::from_millis(50)).unwrap();
