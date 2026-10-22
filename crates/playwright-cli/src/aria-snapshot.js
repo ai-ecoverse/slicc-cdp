@@ -2332,14 +2332,19 @@ function cssPath(element) {
   }
   return [":root", ...steps].join(" > ");
 }
-function collect(node, info, refs, elements) {
+function collect(node, info, refs, elements, requireSelector) {
   if (typeof node === "string") return;
   const element = node.ref ? info.get(node.ref)?.element : void 0;
   if (element) {
-    refs.push({ ref: node.ref, selector: cssPath(element) });
-    elements.push(element);
+    const selector = cssPath(element);
+    if (requireSelector && !selector) {
+      delete node.ref;
+    } else {
+      refs.push({ ref: node.ref, selector });
+      elements.push(element);
+    }
   }
-  for (const child of node.children || []) collect(child, info, refs, elements);
+  for (const child of node.children || []) collect(child, info, refs, elements, requireSelector);
 }
 function sliccAriaSnapshot(options) {
   ariaFocus = options.focused;
@@ -2354,7 +2359,7 @@ function sliccAriaSnapshot(options) {
     const rendered = renderAriaTreeAsJSON(snapshot, aria);
     json = rendered.json;
     iframeDepths = rendered.iframeDepths;
-    for (const node of json) collect(node, snapshot.info, refs, elements);
+    for (const node of json) collect(node, snapshot.info, refs, elements, !!options.prefix);
   }
   globalThis[options.key] = elements;
   return wellFormed({ json, refs, iframeDepths, base: document.baseURI });

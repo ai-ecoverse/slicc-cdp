@@ -258,7 +258,7 @@ fn encode(session: &Session) -> Value {
 }
 
 const REDACTED: &str = "[redacted]";
-const SECRET_HEADERS: &[&str] = &["token", "secret", "key", "auth", "session", "csrf", "cookie"];
+const SECRET_HEADERS: &[&str] = &["token", "secret", "key", "auth", "session", "csrf"];
 const SECRET_QUERY: &[&str] = &["token", "secret", "key", "auth", "code", "sig", "session", "password"];
 
 fn names_secret(name: &str, words: &[&str]) -> bool {
@@ -272,6 +272,8 @@ fn stored_headers(headers: &[(String, String)], base: &str) -> Vec<(String, Stri
         .map(|(name, value)| {
             let lowered = value.trim_start().to_ascii_lowercase();
             if names_secret(name, SECRET_HEADERS) {
+                (name.clone(), REDACTED.to_string())
+            } else if names_secret(name, &["cookie"]) {
                 (name.clone(), REDACTED.to_string())
             } else if url_header(name) {
                 (name.clone(), stored_header_url(name, value, base))
@@ -585,13 +587,14 @@ fn secret_text(text: &str) -> bool {
         || holds_high_entropy(text)
         || holds_credential(&lowered, "bearer ")
         || holds_credential(&lowered, "basic ")
-        || (lowered.contains("cookie") && lowered.contains('='))
         || holds_jwt(text)
         || holds_secret_pair(text)
 }
 
 fn stored_console(entry: &ConsoleEntry) -> Option<Value> {
-    if secret_text(&entry.text) {
+    if secret_text(&entry.text) || entry.cookie_value
+        || entry.text.to_ascii_lowercase().contains("cookie") && entry.text.contains('=')
+    {
         return None;
     }
     let mut text = entry.text.clone();
@@ -992,6 +995,7 @@ mod tests {
             url: "https://example.test/app.js?sig=abc123#L4".to_string(),
             line: 1,
             stamp: String::new(),
+            cookie_value: false,
         };
         let texts = [
             "Authorization: Bearer abcdefgh12345678",
@@ -1034,6 +1038,7 @@ mod tests {
                 url: "https://user:secret@example.test/a?q=1#h".to_string(),
                 line: 4,
                 stamp: "9.5".to_string(),
+                cookie_value: false,
             }],
             vec![NetRequest {
                 method: "GET".to_string(),
@@ -1061,10 +1066,11 @@ mod tests {
                 request_body: Some("body".to_string()),
                 response_body: Some("BODY7SECRET".to_string()),
                 response_base64: true,
+                cookie_scopes: Vec::new(),
             }],
         );
         let written = encode(&session).to_string();
-        for secret in ["session=secret", "Bearer abc", "Basic def", "csrf1", "key1", "a=b", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
+        for secret in ["session=secret", "a=b", "Bearer abc", "Basic def", "csrf1", "key1", "sid1", "tok1", "c2", "s3", "t4", "r5", "l6", "\"body\"", "BODY7SECRET"] {
             assert!(!written.contains(secret), "{secret} was written: {written}");
         }
         assert_eq!(session.requests["T"][0].request_headers[0].1, "session=secret");
@@ -1081,6 +1087,7 @@ mod tests {
                     url: "https://user:secret@example.test/a?q=1#h".to_string(),
                     line: 4,
                     stamp: "9.5".to_string(),
+                    cookie_value: false,
                 },
                 ConsoleEntry {
                     kind: "log".to_string(),
@@ -1088,6 +1095,7 @@ mod tests {
                     url: "https://user:secret@example.test/a?q=1#h".to_string(),
                     line: 4,
                     stamp: "9.75".to_string(),
+                    cookie_value: false,
                 },
             ],
             Vec::new(),
@@ -1103,6 +1111,7 @@ mod tests {
                 url: String::new(),
                 line: 0,
                 stamp: String::new(),
+                cookie_value: false,
             }],
             Vec::new(),
         );

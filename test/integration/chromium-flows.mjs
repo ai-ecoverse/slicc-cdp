@@ -30,6 +30,8 @@ const flows = {
   'kernel navigation guard': ({ kernel, site, browser }) =>
     navigationGuardFlow(kernel, site, browser.wsUrl),
   'kernel upload vfs isolation': ({ kernel, site }) => kernelUploadFlow(kernel, site),
+  'native cookies': ({ native, site, browser }) => cookieFlow(native, site, browser.wsUrl),
+  'kernel cookies': ({ kernel, site, browser }) => cookieFlow(kernel, site, browser.wsUrl),
 };
 
 export function chromiumSuite(title, names) {
@@ -597,29 +599,117 @@ async function protectedFlow(runner, site, wsUrl) {
     assert.equal(opened.code, 0, opened.stderr);
     const tab = targetOf(opened.stdout);
     await runner.playwright(['goto', `${site.origin}/refresh`], cwd);
+    const { sessionId: observer } = await raw.send('Target.attachToTarget', {
+      targetId: tab,
+      flatten: true,
+    });
+    const vaultURL = /^http:\/\/vault\.sliccy\.ai\//;
     const deadline = Date.now() + 15000;
+    let frame;
     for (;;) {
-      const probe = await runner.playwright(['eval', 'location.href'], cwd);
-      if (probe.code !== 0 && refusal.test(probe.stderr)) break;
-      assert.ok(
-        Date.now() < deadline,
-        `the refreshed tab was never refused: ${probe.stdout}${probe.stderr}`
-      );
+      ({ frame } = (await raw.send('Page.getFrameTree', {}, observer)).frameTree);
+      if (vaultURL.test(frame.unreachableUrl ?? '') || vaultURL.test(frame.url)) break;
+      assert.ok(Date.now() < deadline, `the refresh never reached the vault: ${frame.url}`);
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    assert.match(await raw.targetUrl(tab), /^http:\/\/vault\.sliccy\.ai\//);
-    await refused(['eval', 'document.cookie', '--tab', tab], cwd);
-    await refused(['snapshot', '--tab', tab], cwd);
-    await refused(['screenshot', '--tab', tab, '--filename', 'y.png'], cwd);
-    await refused(['press', 'a', '--tab', tab], cwd);
-    await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
-    const afterList = await runner.playwright(['tab-list'], cwd);
-    assert.doesNotMatch(afterList.stdout, new RegExp(escapeReg(tab)));
+    await raw.send('Target.detachFromTarget', { sessionId: observer });
+    assert.match(await raw.targetUrl(tab), vaultURL);
+    if (frame.url === 'chrome-error://chromewebdata/') {
+      await refused(['eval', 'document.documentElement.innerHTML', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
+      const afterList = await runner.playwright(['tab-list'], cwd);
+      assert.doesNotMatch(afterList.stdout, /SECRET|n=refresh/);
+      const recovered = await runner.playwright(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+      assert.equal(recovered.code, 0, recovered.stderr);
+      assert.equal(await raw.targetUrl(tab), `${site.origin}/one`);
+    } else {
+      await refused(['eval', 'document.cookie', '--tab', tab], cwd);
+      await refused(['snapshot', '--tab', tab], cwd);
+      await refused(['screenshot', '--tab', tab, '--filename', 'y.png'], cwd);
+      await refused(['press', 'a', '--tab', tab], cwd);
+      await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
+      const afterList = await runner.playwright(['tab-list'], cwd);
+      assert.doesNotMatch(afterList.stdout, new RegExp(escapeReg(tab)));
+    }
     const requests = await runner.playwright(['requests', '--tab', tab], cwd);
     assert.doesNotMatch(requests.stdout + requests.stderr, /vault|n=refresh/);
     await runner.playwright(['unroute'], cwd);
     for (const id of [seven, vault, tab]) await raw.send('Target.closeTarget', { targetId: id });
   } finally {
+    raw.close();
+  }
+}
+
+async function cookieFlow(runner, site, wsUrl) {
+  const raw = await rawSocket(wsUrl);
+  const refusal = "slicc: refused: cookies on seven's origin\n";
+  const canaries = [
+    { name: 'sevencanary', value: 'SEVENCOOKIESECRET', domain: '.sliccy.ai', path: '/' },
+    { name: 'vaultcanary', value: 'VAULTCOOKIESECRET', domain: 'vault.sliccy.ai', path: '/' },
+  ];
+  const host = new URL(site.origin).hostname;
+  const cwd = await runner.fresh();
+  const run = async (args, code = 0) => {
+    const result = await runner.playwright(args, cwd);
+    assert.equal(result.code, code, `${args.join(' ')}\n${result.stdout}${result.stderr}`);
+    assert.doesNotMatch(result.stdout + result.stderr, /COOKIESECRET/, args.join(' '));
+    return code === 0 ? result.stdout : result.stderr;
+  };
+  const seeded = async () => {
+    const { cookies } = await raw.send('Storage.getCookies');
+    return canaries.every((canary) =>
+      cookies.some((cookie) => cookie.name === canary.name && cookie.value === canary.value)
+    );
+  };
+  try {
+    await raw.send('Storage.setCookies', { cookies: canaries });
+    assert.ok(await seeded());
+    await run(['open', `${site.origin}/page`]);
+    assert.match(
+      await run(['cookie-list']),
+      new RegExp(`^session=from-tab \\(domain: ${escapeReg(host)}, path: /\\)$`, 'm')
+    );
+    assert.match(
+      await run(['cookie-get', 'session']),
+      new RegExp(
+        `^session=from-tab \\(domain: ${escapeReg(host)}, path: /, httpOnly: true, secure: false, sameSite: (Lax|Strict|None)\\)\n$`
+      )
+    );
+    for (const { name } of canaries) {
+      assert.equal(await run(['cookie-get', name]), `Cookie '${name}' not found\n`);
+    }
+    assert.equal(
+      await run(['cookie-set', 'flavor', 'fixture-flavor']),
+      `### Ran Playwright code\n\`\`\`js\nawait page.context().addCookies([{"name":"flavor","value":"fixture-flavor","domain":"${host}","path":"/"}]);\n\`\`\`\n`
+    );
+    assert.match(await run(['cookie-get', 'flavor']), /^flavor=fixture-flavor /);
+    assert.match(
+      await run(['eval', "fetch('/api/me').then((r) => r.text())"]),
+      /flavor=fixture-flavor/
+    );
+    const listed = await run(['requests', '--filter', '/api/me']);
+    const index = listed.match(/^(\d+)\. \[GET\] \S+\/api\/me/m)?.[1];
+    assert.ok(index, listed);
+    const headers = await run(['request-headers', index]);
+    assert.match(headers, /^cookie: .*session=from-tab/m, headers);
+    assert.match(headers, /^cookie: .*flavor=fixture-flavor/m, headers);
+    assert.doesNotMatch(headers, /\[redacted\]/, headers);
+    for (const domain of ['sliccy.ai', 'vault.sliccy.ai', '.sliccy.ai']) {
+      assert.equal(await run(['cookie-list', '--domain', domain], 1), refusal);
+      assert.equal(
+        await run(['cookie-set', 'sevencanary', 'forged', '--domain', domain], 1),
+        refusal
+      );
+    }
+    await run(['cookie-delete', 'flavor']);
+    assert.equal(await run(['cookie-get', 'flavor']), "Cookie 'flavor' not found\n");
+    for (const { name } of canaries) await run(['cookie-delete', name]);
+    assert.ok(await seeded());
+    await run(['cookie-clear']);
+    assert.equal(await run(['cookie-list']), 'No cookies found\n');
+    assert.ok(await seeded());
+  } finally {
+    for (const canary of canaries) await settle(raw.send('Network.deleteCookies', canary));
     raw.close();
   }
 }

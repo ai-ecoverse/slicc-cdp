@@ -43,6 +43,7 @@ for (const noisyRefusal of [false, true]) {
       assert.equal(result.stderr, "slicc: refused: target is on seven's origin\n");
       assert.ok(backend.calls.some((call) => call.method === 'Slicc.action'));
       assert.ok(backend.calls.every((call) => call.method !== 'Target.attachToTarget'));
+      assert.ok(backend.calls.every((call) => call.method !== 'Network.getAllCookies'));
     } finally {
       clearTimeout(timer);
       await runner?.close();

@@ -121,11 +121,35 @@ impl Protected {
         self.rules.target_types.iter().any(|item| item == kind)
     }
 
+    pub fn error_page_url(&self, document_url: &str) -> bool {
+        self.rules.error_page.target == "previous"
+            && !self.rules.error_page.url.is_empty()
+            && document_url == self.rules.error_page.url
+    }
+
+    pub fn error_document(&self, document_url: &str, origin: &str) -> bool {
+        self.error_page_url(document_url) && origin == "://"
+    }
+
+    pub fn error_redaction(&self) -> bool {
+        self.rules.error_page.redact == "origin"
+    }
+
     pub fn target(&self, text: &str, previous: bool, opener: Opener) -> bool {
         if self.inheriting(text) {
             return previous || matches!(opener, Opener::Protected | Opener::Unknown);
         }
         self.url(text)
+    }
+
+    pub fn target_with_document(&self, text: &str, previous: bool, opener: Opener, document_url: Option<&str>, unreachable_url: Option<&str>, navigating: bool) -> bool {
+        if document_url.is_some_and(|url| self.error_page_url(url))
+            && unreachable_url == Some(text)
+            && !navigating
+        {
+            return previous;
+        }
+        self.target(text, previous, opener)
     }
 
     pub fn cookie_domain(&self, domain: &str) -> bool {
@@ -148,6 +172,25 @@ impl Protected {
             .chain(self.rules.hosts.iter())
             .chain(self.extra_hosts.iter())
             .any(|host| under(host, &domain))
+    }
+
+    pub fn cookie_scope(&self, domain: &str) -> bool {
+        canonical_cookie_domain(domain).is_none_or(|host| self.cookie_domain(&host))
+    }
+
+    pub fn cookie_url(&self, text: &str) -> bool {
+        let Some(url) = self.unwrap(parse(text)) else {
+            return true;
+        };
+        let host = host_of(&url);
+        if host.is_empty() || self.url(text) {
+            return true;
+        }
+        if !matches!(url.host(), Some(url::Host::Domain(_))) {
+            return self.cookie_domain(&host);
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        (0..labels.len()).any(|at| self.cookie_scope(&labels[at..].join(".")))
     }
 
     pub fn storage_key(&self, key: &str) -> bool {
@@ -329,6 +372,23 @@ fn host_glob(glob: &[u8], text: &[u8]) -> bool {
     }
 }
 
+pub fn canonical_cookie_domain(domain: &str) -> Option<String> {
+    if domain.is_empty() || domain.chars().any(|ch| ch.is_whitespace() || matches!(ch, '/' | '\\' | '@' | '?' | '#')) {
+        return None;
+    }
+    let normalized = domain.replace(['。', '．', '｡'], ".");
+    let normalized = normalized.trim_start_matches('.');
+    let url = parse(&format!("http://{normalized}/"))?;
+    let host = host_of(&url).trim_matches('.').to_string();
+    if matches!(url.host(), Some(url::Host::Domain(_))) && host.split('.').any(|label| {
+        label.is_empty() || label.starts_with('-') || label.ends_with('-')
+            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return None;
+    }
+    Some(host)
+}
+
 fn parse(text: &str) -> Option<Url> {
     Url::parse(text).ok()
 }
@@ -441,7 +501,7 @@ mod tests {
             };
             assert_eq!(
                 guard.target_type(vector.kind.as_deref().unwrap_or(""))
-                    || guard.target(&vector.url, vector.previous, opener),
+                    || guard.target_with_document(&vector.url, vector.previous, opener, vector.document_url.as_deref(), vector.unreachable_url.as_deref(), vector.navigating),
                 vector.protected,
                 "{vector:?}"
             );

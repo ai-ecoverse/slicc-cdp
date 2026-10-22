@@ -85,16 +85,35 @@ function ariaAnswer(capture, location, expression) {
   return undefined;
 }
 
+function cookieDomain(domain) {
+  return domain.startsWith('.') ? domain : `.${domain}`;
+}
+
+function sameCookie(a, b) {
+  return a.name === b.name && a.domain === b.domain && a.path === b.path;
+}
+
 export async function fakeCdp({
   refuse = [],
+  refuseWhen,
   refusalMessage,
   noisyRefusal = false,
+  cookies = [],
+  traffic = [],
+  consoleLines = [],
+  answers = {},
+  attachEvents = false,
+  discoverEvents = false,
+  childFrames = [],
+  intercept,
   aria = () => defaultAria,
   location,
   frameTree,
 } = {}) {
   let lastAria = defaultAria;
   const calls = [];
+  const jar = cookies.map((cookie) => ({ ...cookie }));
+  let requests = 0;
   const targets = [];
   const sessions = new Map();
   let next = 0;
@@ -124,6 +143,7 @@ export async function fakeCdp({
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     let noise;
+    const paged = new Set();
     socket.on('close', () => clearInterval(noise));
     const send = (message) => {
       if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
@@ -133,9 +153,21 @@ export async function fakeCdp({
       const answer = (result) => send({ id, result, ...(sessionId ? { sessionId } : {}) });
       const event = (name, eventParams) =>
         send({ method: name, params: eventParams, ...(sessionId ? { sessionId } : {}) });
+      const emitConsole = (url) => {
+        for (const [index, entry] of consoleLines.entries()) {
+          event('Runtime.consoleAPICalled', {
+            type: 'log',
+            executionContextId: 1,
+            timestamp: index + 1,
+            args: [{ type: 'string', value: entry.text }],
+            stackTrace: { callFrames: [{ url: entry.url ?? url, lineNumber: 0 }] },
+          });
+        }
+      };
       const target = sessionId ? sessions.get(sessionId) : undefined;
+      if (intercept?.(message, send)) return;
       if (method === 'Slicc.action') clearInterval(noise);
-      if (refuse.includes(method)) {
+      if (refuse.includes(method) || refuseWhen?.(message, calls)) {
         send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
         if (noisyRefusal) {
           noise = setInterval(
@@ -156,11 +188,20 @@ export async function fakeCdp({
         }
         return;
       }
+      if (answers[method]) return answer(answers[method]);
       switch (method) {
+        case 'Target.setDiscoverTargets':
+          answer({});
+          if (discoverEvents && params.discover)
+            for (const item of targets)
+              send({ method: 'Target.targetCreated', params: { targetInfo: info(item) } });
+          return;
         case 'Target.getTargets':
           return answer({ targetInfos: targets.map(info) });
         case 'Target.getTargetInfo': {
-          const found = targets.find((item) => item.targetId === params.targetId) ?? target;
+          const found =
+            targets.find((item) => item.targetId === params.targetId) ??
+            (childFrames.some((child) => child.frame.id === params.targetId) ? undefined : target);
           if (!found) return send({ id, error: { code: -32602, message: 'No target' } });
           return answer({ targetInfo: info(found) });
         }
@@ -176,6 +217,12 @@ export async function fakeCdp({
           next += 1;
           const session = `S${next}`;
           sessions.set(session, found);
+          if (attachEvents)
+            event('Target.attachedToTarget', {
+              sessionId: session,
+              targetInfo: info(found),
+              waitingForDebugger: false,
+            });
           return answer({ sessionId: session });
         }
         case 'Target.detachFromTarget':
@@ -192,18 +239,136 @@ export async function fakeCdp({
           if (frameTree) return answer({ frameTree });
           return answer({
             frameTree: {
-              frame: { id: target?.targetId ?? 'F', loaderId: 'L', url: target?.url ?? '' },
+              frame: target?.frame ?? {
+                id: target?.targetId ?? 'F',
+                loaderId: 'L',
+                url: target?.url ?? '',
+                securityOrigin: new URL(target?.url ?? 'about:blank').origin,
+              },
+              childFrames,
             },
           });
+        case 'Page.enable':
+          paged.add(sessionId);
+          return answer({});
+        case 'Page.getNavigationHistory':
+          return answer(
+            target?.history ?? {
+              currentIndex: 0,
+              entries: [
+                {
+                  id: 1,
+                  url: target?.url ?? '',
+                  userTypedURL: '',
+                  title: '',
+                  transitionType: 'typed',
+                },
+              ],
+            }
+          );
         case 'Page.navigate': {
-          if (target) target.url = params.url;
+          if (target) {
+            target.url = params.url;
+            delete target.frame;
+            delete target.history;
+          }
           answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
-          event('Page.frameNavigated', {
-            frame: { id: target?.targetId ?? 'F', loaderId: `L${next}`, url: params.url },
-          });
+          const committed = {
+            frame: {
+              id: target?.targetId ?? 'F',
+              loaderId: `L${next}`,
+              url: params.url,
+              securityOrigin: new URL(params.url).origin,
+            },
+          };
+          for (const [peer, found] of sessions)
+            if (target && found === target && peer !== sessionId && paged.has(peer))
+              send({ method: 'Page.frameNavigated', params: committed, sessionId: peer });
+          event('Page.frameNavigated', committed);
+          emitConsole(params.url);
+          for (const item of traffic) {
+            requests += 1;
+            const requestId = `R${requests}`;
+            event('Network.requestWillBeSent', {
+              requestId,
+              loaderId: `L${next}`,
+              documentURL: params.url,
+              request: { url: item.url, method: 'GET', headers: {} },
+              timestamp: 1,
+              wallTime: 1,
+              initiator: { type: 'other' },
+              type: 'Fetch',
+            });
+            event('Network.requestWillBeSentExtraInfo', {
+              requestId,
+              associatedCookies: item.associatedCookies ?? [],
+              headers: item.requestHeaders,
+            });
+            event('Network.responseReceived', {
+              requestId,
+              loaderId: `L${next}`,
+              timestamp: 1,
+              type: 'Fetch',
+              response: {
+                url: item.url,
+                status: 200,
+                statusText: 'OK',
+                headers: { 'content-type': 'text/plain' },
+                mimeType: 'text/plain',
+              },
+            });
+            event('Network.responseReceivedExtraInfo', {
+              requestId,
+              blockedCookies: [],
+              statusCode: 200,
+              headers: item.responseHeaders,
+            });
+            event('Network.loadingFinished', { requestId, timestamp: 1, encodedDataLength: 0 });
+          }
           event('Page.domContentEventFired', { timestamp: 1 });
           event('Page.loadEventFired', { timestamp: 1 });
           return;
+        }
+        case 'Runtime.enable':
+          answer({});
+          if (target?.url && target.url !== 'about:blank') emitConsole(target.url);
+          return;
+        case 'Network.getAllCookies':
+          return answer({ cookies: jar.map((cookie) => ({ ...cookie })) });
+        case 'Network.setCookie': {
+          const cookie = {
+            name: params.name,
+            value: params.value,
+            domain: cookieDomain(params.domain),
+            path: params.path ?? '/',
+            expires: params.expires ?? -1,
+            size: params.name.length + params.value.length,
+            httpOnly: params.httpOnly ?? false,
+            secure: params.secure ?? false,
+            session: params.expires === undefined,
+            ...(params.sameSite ? { sameSite: params.sameSite } : {}),
+            priority: 'Medium',
+            sameParty: false,
+            sourceScheme: 'Secure',
+            sourcePort: 443,
+          };
+          const index = jar.findIndex((item) => sameCookie(item, cookie));
+          if (index >= 0) jar.splice(index, 1, cookie);
+          else jar.push(cookie);
+          return answer({ success: true });
+        }
+        case 'Network.deleteCookies': {
+          for (let index = jar.length - 1; index >= 0; index -= 1) {
+            const item = jar[index];
+            if (
+              item.name === params.name &&
+              item.domain === params.domain &&
+              (!params.path || item.path === params.path) &&
+              JSON.stringify(item.partitionKey) === JSON.stringify(params.partitionKey)
+            )
+              jar.splice(index, 1);
+          }
+          return answer({});
         }
         case 'Page.createIsolatedWorld':
           return answer({ executionContextId: 7 });
@@ -275,6 +440,8 @@ export async function fakeCdp({
   return {
     url: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`,
     calls,
+    jar,
+    targets,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));

@@ -39,7 +39,7 @@ pub fn list_pages(cdp: &mut Cdp) -> Result<Vec<PageInfo>, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if is_internal(&url, &title) || target_id.is_empty() || cdp.is_protected_target(&target_id) {
+        if is_internal(&url, &title) && !cdp.recovering(&target_id) || target_id.is_empty() || cdp.is_protected_target(&target_id) {
             continue;
         }
         pages.push(PageInfo {
@@ -1559,14 +1559,13 @@ mod tests {
     }
 
     #[test]
-    fn frame_tree_takes_a_commit_seen_before_the_tree_reply() {
+    fn frame_tree_refuses_a_tree_racing_with_a_commit() {
         let (mut cdp, _) = scripted(vec![
             json!({ "id": 1, "result": {} }),
             navigated("S", "C", "http://a/child.html"),
             json!({ "id": 2, "result": tree("") }),
         ]);
-        let frames = frame_tree(&mut cdp, "S").unwrap();
-        assert_eq!(frames[1].url, "http://a/child.html");
+        assert!(frame_tree(&mut cdp, "S").unwrap_err().starts_with("slicc: refused:"));
     }
 
     #[test]

@@ -23,6 +23,10 @@
       ]
     },
     {
+      "files": ["cert-stdout-order.test.mjs"],
+      "classification": "Large-plan output regressions route the actual planner's GitHub API reads to a case-owned loopback HTTP server with empty fixture credentials. The http://fixture URL is only a local URL-parser base; embedded and partial verdict cases use local Node stdout, not network requests. No remote host is dialed."
+    },
+    {
       "files": ["cert-bios-shards.test.mjs"],
       "classification": "The raw URL is asserted against an injected fetcher returning local Response bytes; unavailable, HTTP and oversized cases use injected responses, not remote requests. Artifact URLs are provenance data."
     },

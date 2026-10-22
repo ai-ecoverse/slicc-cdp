@@ -67,8 +67,17 @@ function page(name) {
         ? capture(inner, 'http://127.0.0.1:9/snapshot/frame-child.html')
         : capture(outer, base, { e3: 'CHILD' }),
     frameTree: {
-      frame: { id: 'TAB1', loaderId: 'L', url: base },
-      childFrames: [{ frame: { id: 'CHILD', loaderId: 'L', url: `${base}#child` } }],
+      frame: { id: 'TAB1', loaderId: 'L', url: base, securityOrigin: new URL(base).origin },
+      childFrames: [
+        {
+          frame: {
+            id: 'CHILD',
+            loaderId: 'L',
+            url: `${base}#child`,
+            securityOrigin: new URL(base).origin,
+          },
+        },
+      ],
     },
   };
 }

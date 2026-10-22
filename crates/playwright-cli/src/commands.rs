@@ -3,6 +3,7 @@ use crate::args::{Invocation, Output};
 use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::connect;
+use crate::cookies;
 use crate::launch::{self, Started};
 use crate::sanitize;
 use crate::session::{self, Session};
@@ -16,6 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let command = invocation.command.as_deref().unwrap_or("");
     if let Some(message) = trace::precheck(command, &invocation.positionals) {
+        return Output::err(message);
+    }
+    if let Some(message) = cookies::precheck(command, invocation) {
         return Output::err(message);
     }
     if let Some(message) = launch::reject_wasm_flags(command, &invocation.flags) {
@@ -154,6 +158,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
+        _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
         "go-forward" => cmd_go_forward(&mut cdp, &mut state, invocation, &mut report),
@@ -521,7 +526,7 @@ fn build_snapshot(cdp: &mut Cdp, session: &str, invocation: &Invocation) -> Resu
         boxes: flag_true(&invocation.flags, "boxes"),
     };
     let mut refs = BTreeMap::new();
-    let nodes = walk.frame(cdp, &root.frame_id, options, chosen.is_some(), &mut refs)?;
+    let nodes = walk.frame(cdp, &root.frame_id, options, root.parent_frame_id.is_some(), &mut refs)?;
     Ok((header, sanitize::terminal(&snapshot::render(&nodes)), refs))
 }
 
@@ -569,6 +574,9 @@ impl Walk<'_> {
             let Some(content) = rec.content_frame.as_deref() else {
                 continue;
             };
+            if self.frames.iter().find(|frame| frame.frame_id == content).is_some_and(|frame| self.guard.url(&frame.url)) {
+                continue;
+            }
             let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) else {
                 continue;
             };
@@ -945,7 +953,7 @@ fn with_ref(
     }
 }
 
-fn resolve_target(
+pub(crate) fn resolve_target(
     cdp: &mut Cdp,
     invocation: &Invocation,
     state: &mut Session,
@@ -1009,6 +1017,17 @@ fn cmd_console(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> O
         .first()
         .map(String::as_str)
         .unwrap_or("info");
+    let session = match browser::watch_attach(cdp, state, &target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    if cdp.content_blocked(&session) {
+        cdp::detach(cdp, &session);
+        return Output::err(format!("{}\n", cdp.guard().refusal()));
+    }
+    if let Err(message) = browser::watch_detach(cdp, state, &target, &session) {
+        return Output::err(message);
+    }
     let entries = state.console.get(&target).cloned().unwrap_or_default();
     match trace::render_console(&entries, level) {
         Ok(text) => Output::ok(format!("{text}\n")),
@@ -1050,14 +1069,24 @@ fn cmd_request(
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
-    let items = state.requests.get(&target).cloned().unwrap_or_default();
+    let mut items = state.requests.get(&target).cloned().unwrap_or_default();
+    let current_values = match items.get_mut(index - 1) {
+        Some(request) => match crate::cookie_headers::hydrate(cdp, &target, request, command) {
+            Ok(restored) => restored,
+            Err(message) => return Output::err(message),
+        },
+        None => false,
+    };
     let filename = invocation.flags.get("filename").map(String::as_str);
     let title = part_title(command);
     if command == "request" {
-        let text = match trace::render_request(&items, index) {
+        let mut text = match trace::render_request(&items, index) {
             Ok(text) => text,
             Err(message) => return Output::err(message),
         };
+        if current_values {
+            text.push_str(&format!("\n\n{}", crate::cookie_headers::CURRENT_VALUES));
+        }
         if filename.is_some() {
             let body = text.strip_prefix("### Result\n").unwrap_or(&text);
             return finish_text(false, title, body, filename);
@@ -1065,7 +1094,12 @@ fn cmd_request(
         return finish_text(true, title, &text, None);
     }
     match trace::render_part(&items, index, command) {
-        Ok(Piece::Text(body)) => finish_text(true, title, &body, filename),
+        Ok(Piece::Text(mut body)) => {
+            if current_values {
+                body.push_str(&format!("\n{}", crate::cookie_headers::CURRENT_VALUES));
+            }
+            finish_text(true, title, &body, filename)
+        },
         Ok(Piece::Empty) => finish_text(true, title, "", filename),
         Ok(Piece::File { bytes, extension }) => finish_file(title, &bytes, &extension, filename),
         Err(message) => Output::err(message),

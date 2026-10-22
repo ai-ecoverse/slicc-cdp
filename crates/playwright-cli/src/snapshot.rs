@@ -172,7 +172,7 @@ pub fn link(raw: &str, base: &str, guard: &Protected) -> String {
             .filter(|origin| origin != "null")
             .unwrap_or_else(|| "about:blank".to_string());
     }
-    crate::sanitize::href(raw)
+    crate::sanitize::href(if raw.starts_with("//") { &resolved } else { raw })
 }
 
 pub fn render(nodes: &[Value]) -> String {
@@ -373,7 +373,9 @@ fn needs_quotes(text: &str) -> bool {
     if "&*],?!>|@\"'#%[".contains(first) {
         return true;
     }
-    js_number(text)
+    text == "~"
+        || [".inf", ".nan"].contains(&text.strip_prefix(['+', '-']).unwrap_or(text).to_ascii_lowercase().as_str())
+        || js_number(text)
         || ["y", "n", "yes", "no", "true", "false", "on", "off", "null"]
             .contains(&text.to_lowercase().as_str())
 }
