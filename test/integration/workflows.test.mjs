@@ -112,6 +112,11 @@ test('the crates, binaries and release assets follow only a release on main', ()
   assert.match(job('crates'), /run: cargo fetch --locked\n[\s\S]*scripts\/publish-crates\.sh/);
   assert.match(job('binaries'), /scripts\/sign-macos\.sh/);
   assert.match(job('binaries'), /source=Notarized Developer ID/);
+  assert.doesNotMatch(
+    job('binaries'),
+    /\| *(tee|grep -q)\b/,
+    'grep -q and tee in a pipe can kill its writer with SIGPIPE under pipefail'
+  );
   for (const label of [
     'darwin-amd64',
     'darwin-arm64',

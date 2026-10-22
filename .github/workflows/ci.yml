@@ -159,8 +159,11 @@ jobs:
         run: |
           scripts/sign-macos.sh "ai.sliccy.playwright-cli:dist/playwright-cli-$LABEL" "ai.sliccy.curlwright:dist/curlwright-$LABEL"
           for bin in "dist/playwright-cli-$LABEL" "dist/curlwright-$LABEL"; do
-            codesign -dv --verbose=2 "$bin" 2>&1 | grep -q 'Authority=Developer ID Application'
-            spctl -a -vv -t install "$bin" 2>&1 | tee /dev/stderr | grep -q 'source=Notarized Developer ID'
+            signed=$(codesign -dv --verbose=2 "$bin" 2>&1)
+            printf '%s\n' "$signed" | grep 'Authority=Developer ID Application'
+            gatekeeper=$(spctl -a -vv -t install "$bin" 2>&1)
+            printf '%s\n' "$gatekeeper"
+            printf '%s\n' "$gatekeeper" | grep -x 'source=Notarized Developer ID'
           done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
