@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Sign up</title>
+    <style>
+    body {
+      font: 16px sans-serif;
+      margin: 2em;
+    }
+    .card {
+      cursor: pointer;
+      border: 1px solid #ccc;
+      padding: 8px;
+    }
+    .gone {
+      display: none;
+    }
+    </style>
+  </head>
+  <body>
+    <header>
+      <nav aria-label="Main">
+        <a href="/">Home</a>
+        <a href="/docs/start?ref=nav&amp;utm=x">Docs</a>
+        <a href="#pricing">Pricing</a>
+        <a href="https://example.org/help#faq">Help</a>
+        <a href="mailto:team@example.org">Contact</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Create an account</h1>
+      <p>Already registered? <a href="/login?next=%2Fdashboard">Sign in</a> instead.</p>
+      <form action="/signup" method="post">
+        <label for="email">Email</label>
+        <input id="email" type="email" placeholder="you@example.org" required>
+        <label>Password <input type="password" name="password"></label>
+        <label for="bio">Bio</label>
+        <textarea id="bio" placeholder="Tell us about yourself">Hello</textarea>
+        <fieldset>
+          <legend>Plan</legend>
+          <label><input type="radio" name="plan" value="free" checked> Free</label>
+          <label><input type="radio" name="plan" value="pro"> Pro</label>
+        </fieldset>
+        <label for="country">Country</label>
+        <select id="country">
+          <option>Germany</option>
+          <option selected>Switzerland</option>
+          <option>Norway</option>
+        </select>
+        <label
+          ><input type="checkbox" name="terms" checked>
+          I accept the <a href="/terms">terms</a></label
+        >
+        <label><input type="checkbox" name="news" disabled> Newsletter</label>
+        <input type="search" aria-label="Search docs" value="aria">
+        <input type="range" aria-label="Volume" min="0" max="10" value="3">
+        <input type="file" aria-label="Avatar">
+        <button type="submit">Create account</button>
+        <button type="button" disabled>Cancel</button>
+        <button type="button" aria-pressed="true">Dark mode</button>
+      </form>
+      <details open>
+        <summary>Why sign up?</summary>
+        <ul>
+          <li>Free tier</li>
+          <li>No ads</li>
+        </ul>
+      </details>
+      <div class="card">
+        <img
+          alt="Logo"
+          width="16"
+          height="16"
+          src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        >
+        <span>Pro plan</span>
+      </div>
+      <table>
+        <caption>
+          Prices
+        </caption>
+        <thead>
+          <tr>
+            <th>Plan</th>
+            <th>Price</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Free</td>
+            <td>0</td>
+          </tr>
+          <tr>
+            <td>Pro</td>
+            <td>9</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="gone">Invisible</p>
+    </main>
+    <footer>
+      <a href="https://example.org/archive?token=SECRET123&amp;page=2#top">Archive</a>
+      <a href="data:text/plain,hello">Data</a>
+    </footer>
+  </body>
+</html>

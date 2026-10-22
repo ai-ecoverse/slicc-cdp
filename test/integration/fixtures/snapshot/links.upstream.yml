@@ -1,0 +1,20 @@
+- generic [active] [ref=e1]:
+  - heading "Where to go" [level=1] [ref=e2]
+  - list [ref=e3]:
+    - listitem [ref=e4]:
+      - link "Seven" [ref=e5] [cursor=pointer]:
+        - /url: https://seven.sliccy.ai/os/?k=SECRET7#inbox
+    - listitem [ref=e6]:
+      - link "Vault" [ref=e7] [cursor=pointer]:
+        - /url: //vault.sliccy.ai/v/item?x=SECRET8
+    - listitem [ref=e8]:
+      - link "Private" [ref=e9] [cursor=pointer]:
+        - /url: https://user:pass@example.org/private?id_token=SECRET9#access_token=SECRET10
+    - listitem [ref=e10]:
+      - link "Next" [ref=e11] [cursor=pointer]:
+        - /url: /next?page=3
+    - listitem [ref=e12]:
+      - link "Plain" [ref=e13] [cursor=pointer]:
+        - /url: https://example.org/plain
+  - paragraph [ref=e14]: Mentions https://example.org/text?k=v inline.
+  - button "Press" [ref=e15]

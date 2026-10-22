@@ -35,7 +35,7 @@ static SPECS: &[Spec] = &[
     spec("click", &["target", "button"], false, &[("tab", S), ("modifiers", S)], true, RefMode::Element),
     spec("fill", &["target", "text"], true, &[("tab", S), ("submit", B)], true, RefMode::Element),
     spec("press", &["key"], false, &[("tab", S)], true, RefMode::None),
-    spec("snapshot", &[], false, &[("tab", S), ("frame", S), ("filename", S), ("no-iframes", B)], true, RefMode::None),
+    spec("snapshot", &[], false, &[("tab", S), ("frame", S), ("filename", S), ("depth", S), ("boxes", B), ("no-iframes", B)], true, RefMode::None),
     spec("eval", &["func"], true, &[("tab", S), ("frame", S), ("output", S), ("filename", S)], true, RefMode::None),
     spec("screenshot", &["target"], false, &[("tab", S), ("filename", S), ("fullPage", B), ("full-page", B), ("max-width", S)], true, RefMode::Main),
     spec("tab-list", &[], false, &[], true, RefMode::None),

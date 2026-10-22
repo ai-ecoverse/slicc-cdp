@@ -1,0 +1,368 @@
+[
+  {
+    "role": "generic",
+    "active": true,
+    "ref": "e1",
+    "children": [
+      {
+        "role": "banner",
+        "ref": "e2",
+        "children": [
+          {
+            "role": "navigation",
+            "name": "Main",
+            "ref": "e3",
+            "children": [
+              {
+                "role": "link",
+                "name": "Home",
+                "ref": "e4",
+                "cursor": "pointer",
+                "url": "/"
+              },
+              {
+                "role": "link",
+                "name": "Docs",
+                "ref": "e5",
+                "cursor": "pointer",
+                "url": "/docs/start?ref=nav&utm=x"
+              },
+              {
+                "role": "link",
+                "name": "Pricing",
+                "ref": "e6",
+                "cursor": "pointer",
+                "url": "#pricing"
+              },
+              {
+                "role": "link",
+                "name": "Help",
+                "ref": "e7",
+                "cursor": "pointer",
+                "url": "https://example.org/help#faq"
+              },
+              {
+                "role": "link",
+                "name": "Contact",
+                "ref": "e8",
+                "cursor": "pointer",
+                "url": "mailto:team@example.org"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "main",
+        "ref": "e9",
+        "children": [
+          {
+            "role": "heading",
+            "name": "Create an account",
+            "level": 1,
+            "ref": "e10"
+          },
+          {
+            "role": "paragraph",
+            "ref": "e11",
+            "children": [
+              "Already registered?",
+              {
+                "role": "link",
+                "name": "Sign in",
+                "ref": "e12",
+                "cursor": "pointer",
+                "url": "/login?next=%2Fdashboard"
+              },
+              "instead."
+            ]
+          },
+          {
+            "role": "generic",
+            "ref": "e13",
+            "children": [
+              "Email",
+              {
+                "role": "textbox",
+                "name": "Email",
+                "ref": "e14",
+                "placeholder": "you@example.org"
+              },
+              {
+                "role": "generic",
+                "ref": "e15",
+                "children": [
+                  "Password",
+                  {
+                    "role": "textbox",
+                    "name": "Password",
+                    "ref": "e16"
+                  }
+                ]
+              },
+              "Bio",
+              {
+                "role": "textbox",
+                "name": "Bio",
+                "ref": "e17",
+                "placeholder": "Tell us about yourself",
+                "text": "Hello"
+              },
+              {
+                "role": "group",
+                "name": "Plan",
+                "ref": "e18",
+                "children": [
+                  {
+                    "role": "generic",
+                    "ref": "e20",
+                    "children": [
+                      {
+                        "role": "radio",
+                        "name": "Free",
+                        "checked": true,
+                        "ref": "e21"
+                      },
+                      "Free"
+                    ]
+                  },
+                  {
+                    "role": "generic",
+                    "ref": "e22",
+                    "children": [
+                      {
+                        "role": "radio",
+                        "name": "Pro",
+                        "ref": "e23"
+                      },
+                      "Pro"
+                    ]
+                  }
+                ]
+              },
+              "Country",
+              {
+                "role": "combobox",
+                "name": "Country",
+                "ref": "e24",
+                "children": [
+                  {
+                    "role": "option",
+                    "name": "Germany"
+                  },
+                  {
+                    "role": "option",
+                    "name": "Switzerland",
+                    "selected": true
+                  },
+                  {
+                    "role": "option",
+                    "name": "Norway"
+                  }
+                ]
+              },
+              {
+                "role": "generic",
+                "ref": "e25",
+                "children": [
+                  {
+                    "role": "checkbox",
+                    "name": "I accept the terms",
+                    "checked": true,
+                    "ref": "e26"
+                  },
+                  "I accept the",
+                  {
+                    "role": "link",
+                    "name": "terms",
+                    "ref": "e27",
+                    "cursor": "pointer",
+                    "url": "/terms"
+                  }
+                ]
+              },
+              {
+                "role": "generic",
+                "ref": "e28",
+                "children": [
+                  {
+                    "role": "checkbox",
+                    "name": "Newsletter",
+                    "disabled": true,
+                    "ref": "e29"
+                  },
+                  "Newsletter"
+                ]
+              },
+              {
+                "role": "searchbox",
+                "name": "Search docs",
+                "ref": "e30",
+                "text": "aria"
+              },
+              {
+                "role": "slider",
+                "name": "Volume",
+                "ref": "e31",
+                "text": "3"
+              },
+              {
+                "role": "button",
+                "name": "Avatar",
+                "ref": "e32"
+              },
+              {
+                "role": "button",
+                "name": "Create account",
+                "ref": "e33"
+              },
+              {
+                "role": "button",
+                "name": "Cancel",
+                "disabled": true,
+                "ref": "e34"
+              },
+              {
+                "role": "button",
+                "name": "Dark mode",
+                "pressed": true,
+                "ref": "e35"
+              }
+            ]
+          },
+          {
+            "role": "group",
+            "ref": "e36",
+            "children": [
+              {
+                "role": "generic",
+                "name": "Why sign up?",
+                "ref": "e37"
+              },
+              {
+                "role": "list",
+                "ref": "e38",
+                "children": [
+                  {
+                    "role": "listitem",
+                    "ref": "e39",
+                    "text": "Free tier"
+                  },
+                  {
+                    "role": "listitem",
+                    "ref": "e40",
+                    "text": "No ads"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "role": "generic",
+            "ref": "e41",
+            "cursor": "pointer",
+            "children": [
+              {
+                "role": "img",
+                "name": "Logo",
+                "ref": "e42"
+              },
+              "Pro plan"
+            ]
+          },
+          {
+            "role": "table",
+            "ref": "e43",
+            "children": [
+              {
+                "role": "caption",
+                "ref": "e44",
+                "text": "Prices"
+              },
+              {
+                "role": "rowgroup",
+                "ref": "e45",
+                "children": [
+                  {
+                    "role": "row",
+                    "ref": "e46",
+                    "children": [
+                      {
+                        "role": "columnheader",
+                        "name": "Plan",
+                        "ref": "e47"
+                      },
+                      {
+                        "role": "columnheader",
+                        "name": "Price",
+                        "ref": "e48"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "role": "rowgroup",
+                "ref": "e49",
+                "children": [
+                  {
+                    "role": "row",
+                    "ref": "e50",
+                    "children": [
+                      {
+                        "role": "cell",
+                        "name": "Free",
+                        "ref": "e51"
+                      },
+                      {
+                        "role": "cell",
+                        "name": "0",
+                        "ref": "e52"
+                      }
+                    ]
+                  },
+                  {
+                    "role": "row",
+                    "ref": "e53",
+                    "children": [
+                      {
+                        "role": "cell",
+                        "name": "Pro",
+                        "ref": "e54"
+                      },
+                      {
+                        "role": "cell",
+                        "name": "9",
+                        "ref": "e55"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "contentinfo",
+        "ref": "e56",
+        "children": [
+          {
+            "role": "link",
+            "name": "Archive",
+            "ref": "e57",
+            "cursor": "pointer",
+            "url": "https://example.org/archive?token=SECRET123&page=2#top"
+          },
+          {
+            "role": "link",
+            "name": "Data",
+            "ref": "e58",
+            "cursor": "pointer",
+            "url": "data:text/plain,…"
+          }
+        ]
+      }
+    ]
+  }
+]
