@@ -511,6 +511,7 @@ fn build_snapshot(cdp: &mut Cdp, session: &str, invocation: &Invocation) -> Resu
         frames: &frames,
         guard: cdp.guard().clone(),
         iframes: !flag_true(&invocation.flags, "no-iframes"),
+        default_root: (chosen.is_none() && cdp.guard().error_page_url(&root.url) && !cdp.content_blocked(session)).then_some(root.frame_id.as_str()),
         extra: std::cell::Cell::new(0),
         seen: std::cell::RefCell::new([root.frame_id.clone()].into()),
     };
@@ -535,6 +536,7 @@ struct Walk<'a> {
     frames: &'a [snapshot::FrameRec],
     guard: cdp_client::protected::Protected,
     iframes: bool,
+    default_root: Option<&'a str>,
     extra: std::cell::Cell<usize>,
     seen: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
@@ -552,7 +554,7 @@ impl Walk<'_> {
             self.extra.set(self.extra.get() + 1);
             self.frames.len() + self.extra.get()
         });
-        let capture = browser::aria_capture(cdp, self.session, frame_id, &prefix, options)?;
+        let capture = browser::aria_capture(cdp, self.session, frame_id, &prefix, options, self.default_root == Some(frame_id))?;
         let mut nodes = capture.json;
         snapshot::redact_links(&mut nodes, &capture.base, &self.guard);
         let labels = snapshot::labels(&nodes);

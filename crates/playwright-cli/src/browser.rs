@@ -261,25 +261,27 @@ pub fn aria_capture(
     frame_id: &str,
     prefix: &str,
     options: snapshot::Options,
+    default_context: bool,
 ) -> Result<snapshot::Capture, String> {
-    let world = cdp.call(
-        "Page.createIsolatedWorld",
-        json!({ "frameId": frame_id, "grantUniveralAccess": true }),
-        Some(session),
-    )?;
-    let context_id = world
-        .get("executionContextId")
-        .cloned()
-        .ok_or_else(|| "Page.createIsolatedWorld returned no executionContextId\n".to_string())?;
-    let result = cdp.call(
-        "Runtime.evaluate",
-        json!({
-            "expression": snapshot::expression(prefix, options),
-            "contextId": context_id,
-            "returnByValue": true,
-        }),
-        Some(session),
-    )?;
+    let context_id = if default_context {
+        Value::Null
+    } else {
+        let world = cdp.call(
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame_id, "grantUniveralAccess": true }),
+            Some(session),
+        )?;
+        world.get("executionContextId").cloned()
+            .ok_or_else(|| "Page.createIsolatedWorld returned no executionContextId\n".to_string())?
+    };
+    let mut params = json!({
+        "expression": snapshot::expression(prefix, options),
+        "returnByValue": true,
+    });
+    if !context_id.is_null() {
+        params["contextId"] = context_id.clone();
+    }
+    let result = cdp.call("Runtime.evaluate", params, Some(session))?;
     if let Some(details) = result.get("exceptionDetails") {
         return Err(exception_message(details));
     }
@@ -310,15 +312,14 @@ fn describe_elements(
     context_id: &Value,
     count: usize,
 ) -> Result<Vec<Described>, String> {
-    let handle = cdp.call(
-        "Runtime.evaluate",
-        json!({
-            "expression": format!("globalThis[{}]", Value::from(snapshot::ELEMENTS_KEY)),
-            "contextId": context_id,
-            "objectGroup": ARIA_GROUP,
-        }),
-        Some(session),
-    )?;
+    let mut params = json!({
+        "expression": format!("globalThis[{}]", Value::from(snapshot::ELEMENTS_KEY)),
+        "objectGroup": ARIA_GROUP,
+    });
+    if !context_id.is_null() {
+        params["contextId"] = context_id.clone();
+    }
+    let handle = cdp.call("Runtime.evaluate", params, Some(session))?;
     let array = handle
         .pointer("/result/objectId")
         .and_then(Value::as_str)
