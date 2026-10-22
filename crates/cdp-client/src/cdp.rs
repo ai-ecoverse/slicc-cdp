@@ -587,6 +587,9 @@ impl Cdp {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
         }
+        if matches!(method, "Fetch.getResponseBody" | "Network.getResponseBody" | "Network.getRequestPostData")
+            && session.and_then(|session| self.session_target(session)).is_some_and(|target| self.document_paused(&target))
+            && shield::request_key(params).is_some_and(|id| self.request_state(&id) == Some(false)) { return Ok(checks) }
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
@@ -679,7 +682,9 @@ impl Cdp {
         }
         let (unique, proof) = selected.ok_or_else(|| self.refusal())?;
         let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
-        if unique.is_empty() || proof.origin == "null" || proof.origin.is_empty() && !owned_world || self.guard.url(&proof.origin) { return Err(self.refusal()) }
+        let owned_blank = proof.default && state.frames.get(&proof.frame).is_some_and(|evidence| evidence[1] == "about:blank"
+            && self.created_blanks.get(&target).is_some_and(|(frame, loader, _)| frame == &proof.frame && loader == &evidence[0]));
+        if unique.is_empty() || proof.origin == "null" || proof.origin.is_empty() && !owned_world && !owned_blank || self.guard.url(&proof.origin) { return Err(self.refusal()) }
         if state.worker.is_none() {
             let evidence = state.frames.get(&proof.frame).ok_or_else(|| self.refusal())?;
             if proof.loader.as_deref() != Some(evidence[0].as_str()) { return Err(self.refusal()) }
@@ -1044,6 +1049,7 @@ impl Cdp {
     fn record_initial_blank(&mut self, target: &str) {
         if let Some(recorded) = self.initial_blank_evidence(target, true) {
             self.created_blanks.insert(target.to_string(), recorded);
+            let _ = self.document_state_for(target, true, Some(""));
         }
     }
 
@@ -1194,6 +1200,10 @@ impl Cdp {
             ("Runtime.enable", json!({})),
         ];
         for (method, params) in setup {
+            if method == "Runtime.enable" {
+                let _ = self.document_state_for(target_id, false, Some(""));
+                let _ = self.document_state_for(target_id, true, Some(""));
+            }
             let optional = matches!(method, "Page.enable" | "Runtime.enable");
             let left = budget.saturating_duration_since(Instant::now());
             let span = if optional { left.min(OPTIONAL_STEP) } else { left };
@@ -2375,6 +2385,9 @@ impl Cdp {
             if self.redirects.contains(&paused.request_id) && !redirect && !protected {
                 self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
+            }
+            if paused.resource_type == "Document" {
+                self.paused_documents.insert((paused.session_id.clone(), paused.request_id.clone()));
             }
             self.hand(&paused.session_id, &paused.request_id);
             if self.deciders.contains_key(&paused.session_id) {

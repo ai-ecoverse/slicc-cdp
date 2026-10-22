@@ -1056,9 +1056,9 @@ mod tests {
         assert!(refused(cdp.call("Fetch.fulfillRequest", good, Some("S"))));
         let bad = json!({ "requestId": "R2", "responseCode": 0 });
         cdp.notify("Fetch.fulfillRequest", bad, Some("S")).unwrap();
-        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        cdp.call("Runtime.evaluate", json!({"expression":"0","returnByValue":true}), Some("S")).unwrap();
         cdp.notify("Fetch.continueRequest", json!({ "requestId": "R2" }), Some("S")).unwrap();
-        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        cdp.call("Runtime.evaluate", json!({"expression":"0","returnByValue":true}), Some("S")).unwrap();
         assert!(refused(cdp.call("Fetch.continueRequest", json!({ "requestId": "R2" }), Some("S"))));
         assert_eq!(
             methods(&log),
@@ -1437,12 +1437,11 @@ mod tests {
                 "Network.enable",
                 "Network.setBypassServiceWorker",
                 "Page.enable",
+                "Page.getFrameTree",
+                "Page.getFrameTree",
                 "Runtime.enable",
-                "Page.getFrameTree",
                 "Fetch.enable",
-                "Page.getFrameTree",
                 "Fetch.getResponseBody",
-                "Page.getFrameTree",
                 "Fetch.fulfillRequest",
                 "Fetch.disable",
                 "Target.detachFromTarget"
