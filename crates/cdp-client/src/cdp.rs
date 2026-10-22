@@ -659,7 +659,7 @@ impl Cdp {
                     unique == id
                 } else if let Some(name) = params.get("executionContextName").and_then(Value::as_str) {
                     proof.name == name
-                } else { proof.default && (state.worker.is_some() || state.frames.get(&proof.frame).is_some_and(|evidence| evidence[4].is_empty())) }
+                } else { proof.default && (state.worker.is_some() || state.scope.as_deref() == Some(proof.frame.as_str()) || state.frames.get(&proof.frame).is_some_and(|evidence| evidence[4].is_empty())) }
             }).map(|((_, unique), proof)| (unique.clone(), proof.clone()))
         };
         let mut selected = choose(&self.context_proofs);
@@ -1379,9 +1379,22 @@ impl Cdp {
             &scoped
         } else { node };
         let frame = node.get("frame")?;
-        if frame.get("parentId").is_some() { return None }
+        let parent = frame.get("parentId").and_then(Value::as_str);
         let mut frames = BTreeMap::new();
-        if !self.collect_document_frames(node, &mut frames, content, None) { return None }
+        if let Some(parent) = parent {
+            let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
+            let info = info.get("targetInfo")?;
+            if info.get("targetId").and_then(Value::as_str) != Some(target) || info.get("type").and_then(Value::as_str) != Some("iframe")
+                || info.get("parentFrameId").and_then(Value::as_str) != Some(parent) { return None }
+            let owner = self.guards.keys().find(|owner| owner.as_str() != target && self.targets.get(*owner).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("page")
+                && self.documents.get(*owner).is_some_and(|doc| doc.frame_id == parent)).cloned()?;
+            let parent_guard = self.guards.get(&owner)?.clone();
+            let parent_tree = self.raw_call("Page.getFrameTree", json!({}), Some(&parent_guard), DOCUMENT_CHECK).ok()?;
+            let parent_frame = parent_tree.pointer("/frameTree/frame")?;
+            if parent_frame.get("id").and_then(Value::as_str) != Some(parent) || parent_frame.get("parentId").is_some() { return None }
+            frames = self.document_state_for(&owner, true, Some(parent))?.frames;
+        }
+        if !self.collect_document_frames(node, &mut frames, content, parent) { return None }
         if content && frames.iter().any(|(id, evidence)| evidence[0].is_empty() && self.document_versions.contains_key(&(target.to_string(), id.clone()))) { return None }
         if content && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or(""))
             && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
@@ -1401,6 +1414,7 @@ impl Cdp {
                 self.document_versions.insert((target.to_string(), id.clone()), evidence[0].clone());
             }
         }
+        let scope = if parent.is_some() && scope == Some("") { frame.get("id").and_then(Value::as_str) } else { scope };
         let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch };
         if content { self.cached_documents.insert(target.to_string(), state.clone()); }
         Some(state)

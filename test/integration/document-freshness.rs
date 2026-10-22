@@ -18,11 +18,11 @@ struct Backend {
 
 impl Backend {
     fn info(&self) -> Value {
-        json!({"targetId":"T","type":"page","url":ORDINARY})
+        json!({"targetId":"T","type":"page","url":if self.current.is_empty() { "" } else { ORDINARY }})
     }
 
     fn frame(&self) -> Value {
-        json!({"id":"F","loaderId":if self.current == PROTECTED { "LP" } else { "LO" },"url":self.current,"securityOrigin":url::Url::parse(&self.current).unwrap().origin().ascii_serialization()})
+        json!({"id":"F","loaderId":if self.current == PROTECTED { "LP" } else { "LO" },"url":self.current,"securityOrigin":url::Url::parse(&self.current).map(|url| url.origin().ascii_serialization()).unwrap_or_default()})
     }
 
     fn commit(&mut self, url: &str, delayed: bool) {
@@ -100,6 +100,21 @@ fn commands() -> Vec<(&'static str, Value)> {
         ("IO.read", json!({"handle":"H"})),
         ("IO.close", json!({"handle":"H"})),
     ]
+}
+
+#[test]
+fn empty_target_and_document_origins_are_unknown_before_runtime_execution() {
+    let backend = Rc::new(RefCell::new(Backend {
+        current:String::new(), sessions:Vec::new(), calls:Vec::new(), inbox:VecDeque::new(), delayed:VecDeque::new(),
+    }));
+    let mut cdp = Cdp::from_transport(Box::new(Fake(backend.clone())));
+    let session = attach(&mut cdp);
+    assert_eq!(backend.borrow().info()["url"], "");
+    assert_eq!(backend.borrow().frame()["securityOrigin"], "");
+    let from = backend.borrow().calls.len();
+    let result = cdp.call("Runtime.evaluate", json!({"expression":"navigator.modelContext && document.title","returnByValue":true}), Some(&session));
+    assert!(result.is_err_and(|message| message.starts_with("slicc: refused:")));
+    assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
 }
 
 #[test]

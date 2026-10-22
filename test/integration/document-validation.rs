@@ -498,6 +498,33 @@ fn current_policy_is_still_checked_when_a_loader_id_is_unchanged() {
 }
 
 #[test]
+fn out_of_process_frame_documents_require_fresh_verified_parent_ownership() {
+    for shape in ["ordinary", "missing-owner", "wrong-parent", "protected-parent", "unknown-parent"] {
+        let (mut cdp, backend) = fixture();
+        if shape != "missing-owner" {
+            let owner = attach(&mut cdp, "OWNER");
+            cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&owner)).unwrap();
+            let mut parent = tree("LPARENT");
+            if shape == "protected-parent" {
+                parent["frameTree"]["frame"]["url"] = json!("https://seven.sliccy.ai/");
+                parent["frameTree"]["frame"]["securityOrigin"] = json!("https://seven.sliccy.ai");
+            }
+            if shape == "unknown-parent" { parent["frameTree"]["frame"]["securityOrigin"] = json!(""); }
+            backend.borrow_mut().owner_tree = Some(parent);
+        }
+        backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"iframe","url":"https://ordinary.example/","parentFrameId":if shape == "wrong-parent" { "OTHER" } else { "F" }}));
+        backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"CHILD","parentId":"F","loaderId":"LCHILD","url":"https://ordinary.example/","securityOrigin":"https://ordinary.example"}}});
+        let session = attach(&mut cdp, "T");
+        let from = backend.borrow().calls.len();
+        let result = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));
+        if shape == "ordinary" { result.unwrap(); } else {
+            refused(result);
+            assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == "Runtime.evaluate"));
+        }
+    }
+}
+
+#[test]
 fn destroyed_private_contexts_cannot_be_reused_before_refresh() {
     for method in ["Runtime.executionContextDestroyed", "Runtime.executionContextsCleared"] {
         let (mut cdp, backend) = fixture();
