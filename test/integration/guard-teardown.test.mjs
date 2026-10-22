@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 const root = path.resolve(import.meta.dirname, '../..');
 
@@ -20,11 +21,18 @@ for (const mode of [
     const folder = await mkdtemp(path.join(tmpdir(), 'guard-disposal-regression-'));
     const vectors = path.join(folder, 'vectors.json');
     const report = path.join(folder, 'guard-report');
+    const entry = path.join(folder, 'worker.test.mjs');
+    await writeFile(
+      entry,
+      `import test from 'node:test';import {runPartition} from ${JSON.stringify(pathToFileURL(path.join(root, 'test/integration/guard-set.mjs')).href)};test('owned worker',(t)=>runPartition(t,'a'));`
+    );
     await writeFile(
       vectors,
       JSON.stringify({
+        setVersion: 'synthetic',
+        schemaVersion: 1,
         variants: { prompt: 0 },
-        vectors: [{ id: 'E4.teardown', targets: ['ordinary'] }],
+        vectors: [{ id: 'E4.teardown', scope: 'any', kind: 'cdp', targets: ['ordinary'] }],
       })
     );
     const environment = {
@@ -44,7 +52,7 @@ for (const mode of [
         './test/integration/guard-teardown-fixture.mjs',
         '--test',
         '--test-reporter=tap',
-        './test/integration/guard-runner.test.mjs',
+        entry,
       ],
       { cwd: root, env: environment }
     );

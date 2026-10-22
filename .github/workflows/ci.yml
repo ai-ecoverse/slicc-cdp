@@ -3,460 +3,238 @@ name: CI
 on:
   pull_request:
   merge_group:
-  workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
-  contents: read
-
-env:
-  SLICC_CDP_PORTS: 9300-9309
+  contents: write
+  actions: read
+  attestations: write
+  issues: write
+  pull-requests: write
+  statuses: write
+  id-token: write
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  runner:
+  ci:
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.8.2
+    secrets: inherit
+    with:
+      test-glob: test/integration/*.test.mjs
+      shards: 4
+      timeout-minutes: 30
+      review-timeout-minutes: 90
+      review-prompt: |
+        SLICC-CDP
+
+        This repository is slicc-cdp: the npm package `@ai-ecoverse/slicc-cdp` (the Node `CDPClient`, `connect`, `slicc-cdp install-browser` and `find-browser`, and the kernel wasm builds `bin/playwright-cli.wasm` and `bin/curlwright.wasm`), the Rust crates `slicc-cdp-client`, `slicc-discovery`, `slicc-cdp` (`playwright-cli`) and `curlwright` on crates.io, the native binaries and `install.sh` on the GitHub release, and `@ai-ecoverse/sliccy-browser` in `packages/sliccy-browser`. AGENTS.md and the README are the contract: read the sections the change touches first. `git diff origin/main...HEAD`, or `$RUNNER_TEMP/review/context/pr.diff`, is the change.
+
+        There is no certification after you: once this pull request passes the merge queue, semantic-release publishes it to npm from `main`, then the crates and the signed binaries follow. Seven ships `playwright-cli` and `curlwright` in its base set, and every repository's CI on slicc-shared-web's pipeline installs Chrome with the latest `slicc-cdp install-browser`. Review it as the last check before it ships.
+
+        Look for real defects, in this order:
+        1. The guard: seven's origins, the vault, browser pages, extensions and local files stay out of reach in every path (tabs, frames, redirects, popups, `Fetch`, cookies, headers, console, saved sessions, WebMCP), protected cookies and their values never leak, and a refusal fails closed. Check the Rust guard in `crates/cdp-client` and the Node client in `src/` both.
+        2. Connecting: `--cdp`, then `SLICC_CDP_URL`, then a seven-profiles port, then a loopback session in the user config dir; a cwd session file is ignored, saved state never dials a remote host, probes and launch stay on 9222 to 9229, `ws`/`wss` dial and `http` discovers, a non-2xx exits non-zero, and the wasm builds use 9222 and have no TLS.
+        3. Compatibility for consumers: Microsoft playwright-cli's commands, flags and output for what we claim to match, curl's for curlwright, the public Node entry and its types, the crates' public API, `install.sh` and the release asset names, and `slicc.commands` in `package.json`.
+        4. Correctness of CDP use: flat sessions with a top-level `sessionId`, no `/devtools/page/<id>` socket, races between targets, sessions and events, and promises or reads that never end.
+        5. Tests: every behaviour change has an integration test in `test/integration/` or a `#[cfg(test)]` test, and a fix's test fails without the fix. Confirm that for a fix: copy the changed test files into `$RUNNER_TEMP/base`, build it and run them there.
+        6. Repo rules: no comments anywhere (YAML too, except `# renovate:` annotations), no unit tests in git (`test/unit/` is ignored), and a conventional-commit title (`fix`, `feat` and `perf` release, the rest don't).
+
+        Build a tree before you run its tests: `cargo build --locked -p slicc-cdp -p curlwright` and `cargo build --locked --target wasm32-wasip1 -p slicc-cdp -p curlwright`, then run one file with `node --import ./test/integration/ports.mjs --test --test-timeout=600000 test/integration/<file>.test.mjs`. Don't report style preferences, or anything you haven't confirmed in the code or by a run.
+
+        Severity: deny for a confirmed P1 or P2: a guard bypass or a leak of a protected cookie or secret, a dial to a remote host from saved state, a crash or a command that no longer runs in seven's kernel, a regression in a common command without a workaround, a behaviour change without its test, or a fix whose test passes without it. A narrow problem with a workaround is P3: comment with a repro and approve. A problem in seven's pins belongs to ai-ecoverse/slicc-bios, one in the guard vectors to ai-ecoverse/slicc-browsers: open it there as an issue.
+
+  released:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
-      pull-requests: read
     outputs:
-      runner: ${{ steps.pick.outputs.runner }}
-    steps:
-      - id: pick
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
-        env:
-          FORCED: ${{ vars.CI_RUNNER }}
-          POOL: ${{ vars.CERT_RUNNER }}
-        with:
-          script: |
-            const hosted = 'ubuntu-latest';
-            const pick = async (runner, why) => {
-              core.setOutput('runner', runner);
-              await core.summary.addRaw(`runner: ${runner} (${why})\n`).write();
-            };
-            if (process.env.FORCED) return await pick(process.env.FORCED, 'vars.CI_RUNNER');
-            const pool = process.env.POOL;
-            const { owner, repo } = context.repo;
-            if (context.eventName === 'pull_request') {
-              const head = context.payload.pull_request.head.repo;
-              const same = head && head.full_name === `${owner}/${repo}`;
-              return same ? await pick(pool, 'same-repo PR') : await pick(hosted, 'fork PR');
-            }
-            if (context.eventName === 'merge_group') {
-              const base = context.payload.merge_group.base_ref.replace('refs/heads/', '');
-              const q = await github.graphql(
-                `query($o:String!,$n:String!,$b:String!){repository(owner:$o,name:$n){mergeQueue(branch:$b){entries(first:100){nodes{pullRequest{number isCrossRepository}}}}}}`,
-                { o: owner, n: repo, b: base }
-              );
-              const entries = q.repository.mergeQueue?.entries?.nodes ?? [];
-              const forks = entries.filter((e) => e.pullRequest?.isCrossRepository !== false);
-              return forks.length === 0
-                ? await pick(pool, `merge group, ${entries.length} same-repo entries`)
-                : await pick(hosted, `merge group with a fork or unknown PR: ${forks.map((e) => e.pullRequest?.number).join(', ')}`);
-            }
-            if (context.eventName === 'push' && context.ref === 'refs/heads/main') return await pick(pool, 'push to main');
-            await pick(hosted, context.eventName);
-
-  ci:
-    needs: runner
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/node-ci.yml@v1.27.0
-    with:
-      chromium: false
-      runs-on: ${{ needs.runner.outputs.runner }}
-  integration:
-    needs: [integration-suite, guard-partitions, guard-union, redirect-regressions]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Require every complete integration owner
-        env:
-          SUITE_RESULT: ${{ needs.integration-suite.result }}
-          REDIRECT_RESULT: ${{ needs.redirect-regressions.result }}
-          GUARD_RESULT: ${{ needs.guard-partitions.result }}
-          UNION_RESULT: ${{ needs.guard-union.result }}
-        run: test "$SUITE_RESULT" = success && test "$REDIRECT_RESULT" = success && test "$GUARD_RESULT" = success && test "$UNION_RESULT" = success
-
-  integration-suite:
-    needs: runner
-    runs-on: ${{ needs.runner.outputs.runner }}
-    timeout-minutes: 50
-    env:
-      LEFTHOOK: '0'
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Chrome for Testing (pinned in package.json config.chrome)
-        run: |
-          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
-          npm run -s browser -- $deps
-      - run: node scripts/gate.mjs integration -- npm run test:integration
-        env:
-          SLICC_INTEGRATION_JOB: integration
-          SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
-          SLICC_REDIRECT_EVIDENCE: ${{ runner.temp }}/slicc-cdp-redirect-report
-      - name: Guard regression report
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: guard-regression-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/slicc-cdp-guard-runner-report.md*
-            ${{ runner.temp }}/slicc-cdp-redirect-report/
-          if-no-files-found: ignore
-          retention-days: 7
+          persist-credentials: false
 
-  guard-partitions:
-    name: guard-${{ matrix.shard }}
-    needs: runner
-    runs-on: ${{ needs.runner.outputs.runner }}
-    timeout-minutes: 50
+      - id: version
+        run: |
+          git fetch --tags --force --quiet origin
+          version=$(git tag --points-at HEAD --list 'v*' | sed 's/^v//' | sort -V | tail -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release: ${version:-none} at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  crates:
+    needs: released
+    if: needs.released.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --profile minimal
+
+      - run: cargo fetch --locked
+
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9
+        id: auth
+
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.released.outputs.version }}
+        run: sh scripts/publish-crates.sh "$VERSION"
+
+  binaries:
+    needs: released
+    if: needs.released.outputs.version != ''
     strategy:
       fail-fast: false
       matrix:
-        shard: [a, b, c, d]
-    env:
-      LEFTHOOK: '0'
+        include:
+          - { os: macos-latest, target: x86_64-apple-darwin, label: darwin-amd64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, label: darwin-arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, label: linux-amd64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, label: linux-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: windows-amd64 }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, label: windows-arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Install Rust
+          persist-credentials: false
+
+      - name: Stamp version
+        env:
+          VERSION: ${{ needs.released.outputs.version }}
+        run: node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.VERSION;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+
+      - env:
+          TARGET: ${{ matrix.target }}
+        run: rustup toolchain install "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --profile minimal --target "$TARGET"
+
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.label }}
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '\"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Chrome for Testing (pinned in package.json config.chrome)
+          build=cargo
+          [ "$TARGET" = aarch64-unknown-linux-musl ] && build=cross
+          "$build" build --locked --release --target "$TARGET" -p slicc-cdp -p curlwright
+          ext=
+          [ "$RUNNER_OS" = Windows ] && ext=.exe
+          mkdir -p dist
+          cp "target/$TARGET/release/playwright-cli$ext" "dist/playwright-cli-$LABEL$ext"
+          cp "target/$TARGET/release/curlwright$ext" "dist/curlwright-$LABEL$ext"
+
+      - name: Sign, notarise and check Gatekeeper
+        if: runner.os == 'macOS'
+        env:
+          LABEL: ${{ matrix.label }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_ISSUER_ID: ${{ secrets.APPLE_API_KEY_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
         run: |
-          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
-          npm run -s browser -- $deps
-      - name: Execute every assigned published guard row
-        run: node scripts/gate.mjs guard-ci -- node scripts/guard-ci.mjs run "${{ matrix.shard }}" "${{ runner.temp }}/guard-ci"
-      - name: Owned guard partition report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          scripts/sign-macos.sh "ai.sliccy.playwright-cli:dist/playwright-cli-$LABEL" "ai.sliccy.curlwright:dist/curlwright-$LABEL"
+          for bin in "dist/playwright-cli-$LABEL" "dist/curlwright-$LABEL"; do
+            codesign -dv --verbose=2 "$bin" 2>&1 | grep -q 'Authority=Developer ID Application'
+            spctl -a -vv -t install "$bin" 2>&1 | tee /dev/stderr | grep -q 'source=Notarized Developer ID'
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: guard-ci-${{ github.run_attempt }}-${{ matrix.shard }}
-          path: ${{ runner.temp }}/guard-ci/
+          name: binaries-${{ matrix.label }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
-  guard-union:
-    needs: [guard-partitions]
-    if: always()
+  assets:
+    needs: [released, binaries]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Notices, licence, installer and checksums
+        run: |
+          rustup toolchain install "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --profile minimal
+          bash scripts/generate-notices.sh artifacts/THIRD-PARTY-NOTICES
+          cp LICENSE install.sh artifacts/
+          node scripts/release-checksums.mjs artifacts
+
+      - name: Upload every asset, then publish the draft release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.released.outputs.version }}
+        run: |
+          expected="SHA256SUMS install.sh LICENSE THIRD-PARTY-NOTICES"
+          for bin in playwright-cli curlwright; do
+            for label in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64; do expected="$expected $bin-$label"; done
+            expected="$expected $bin-windows-amd64.exe $bin-windows-arm64.exe"
+          done
+          for name in $expected; do test -f "artifacts/$name" || { echo "::error::missing asset $name"; exit 1; }; done
+          gh release upload "$TAG" artifacts/* --clobber --repo "$GITHUB_REPOSITORY"
+          uploaded=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          for name in $expected; do printf '%s\n' "$uploaded" | grep -qx "$name" || { echo "::error::$name is not on $TAG"; exit 1; }; done
+          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+
+  sliccy-browser:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 24
-          cache: npm
-      - run: npm ci
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: guard-ci-${{ github.run_attempt }}-a
-          path: ${{ runner.temp }}/guard-union/a
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: guard-ci-${{ github.run_attempt }}-b
-          path: ${{ runner.temp }}/guard-union/b
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: guard-ci-${{ github.run_attempt }}-c
-          path: ${{ runner.temp }}/guard-union/c
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: guard-ci-${{ github.run_attempt }}-d
-          path: ${{ runner.temp }}/guard-union/d
-      - name: Require the exact complete row universe
-        run: node scripts/gate.mjs guard-ci -- node scripts/guard-ci.mjs union "${{ runner.temp }}/guard-union"
+          registry-url: https://registry.npmjs.org
 
-  redirect-regressions:
-    needs: runner
-    runs-on: ${{ needs.runner.outputs.runner }}
-    timeout-minutes: 30
-    env:
-      LEFTHOOK: '0'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Install Rust
+      - name: Publish sliccy-browser when its version is not on npm yet
+        working-directory: packages/sliccy-browser
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Chrome for Testing (pinned in package.json config.chrome)
-        run: |
-          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
-          npm run -s browser -- $deps
-      - name: Every focused redirect regression from the shared manifest
-        run: node scripts/gate.mjs redirect-regressions -- node scripts/redirect-ci.mjs
-        env:
-          SLICC_GUARD_REPORT: ${{ runner.temp }}/slicc-cdp-guard-runner-report.md
-      - name: Guard regression report
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: redirect-regression-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/slicc-cdp-guard-runner-report.md*
-            ${{ runner.temp }}/slicc-cdp-redirect-report/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  integration-chrome-latest:
-    needs: runner
-    runs-on: ${{ needs.runner.outputs.runner }}
-    timeout-minutes: 30
-    env:
-      LEFTHOOK: '0'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --target wasm32-wasip1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Chrome for Testing (latest)
-        run: |
-          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then deps=--with-deps; else deps=; fi
-          echo "CHROMIUM_EXECUTABLE=$(node src/cli.js install-browser --channel stable $deps)" >> "$GITHUB_ENV"
-      - name: Run WebMCP integration tests
-        run: |
-          cargo build -p slicc-cdp -p curlwright
-          node scripts/gate.mjs webmcp --tap -- node --test --test-reporter=tap --test-timeout=600000 test/integration/webmcp.test.mjs
-
-  shellcheck:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: shellcheck -s sh install.sh
-
-  build-binaries:
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      version: "99.0.0"
-
-  installer-ubuntu:
-    needs: [runner, build-binaries]
-    runs-on: ${{ needs.runner.outputs.runner }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          path: /tmp/serve
-          pattern: binaries-linux-amd64
-          merge-multiple: true
-
-      - name: Prepare assets
-        run: cd /tmp/serve && sha256sum * > SHA256SUMS
-
-      - name: Start server
-        run: |
-          python3 -m http.server 8399 --directory /tmp/serve &
-          sleep 1
-
-      - name: Install with curl
-        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Verify version output
-        run: |
-          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
-          /tmp/test-bin/curlwright --version | grep "99.0.0"
-
-      - name: TLS verified HTTPS exchange
-        run: |
-          output=$(/tmp/test-bin/playwright-cli --cdp https://example.com/ list 2>&1) || true
-          echo "$output"
-          echo "$output" | grep -q "HTTP 404"
-
-      - name: TLS rejects invalid certificate
-        run: |
-          output=$(/tmp/test-bin/playwright-cli --cdp https://self-signed.badssl.com/ tab-list 2>&1) || true
-          echo "$output"
-          echo "$output" | grep -q "TLS handshake with self-signed.badssl.com failed"
-
-      - name: Tampered asset refusal
-        run: |
-          cp /tmp/serve/curlwright-linux-amd64 /tmp/serve/curlwright-linux-amd64.bak
-          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
-          printf "tampered" > /tmp/serve/curlwright-linux-amd64
-          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
-            echo "should have failed on tampered asset"
-            exit 1
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already on npm"
+            exit 0
           fi
-          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
-          cp /tmp/serve/curlwright-linux-amd64.bak /tmp/serve/curlwright-linux-amd64
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Custom INSTALL_DIR
-        run: |
-          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
-          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
-          /tmp/custom-dir/curlwright --version | grep "99.0.0"
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Idempotent re-run
-        run: |
-          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
-          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
-          /tmp/custom-dir/curlwright --version | grep "99.0.0"
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-  installer-macos:
-    needs: build-binaries
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          path: /tmp/serve
-          pattern: binaries-darwin-arm64
-          merge-multiple: true
-
-      - name: Prepare assets
-        run: cd /tmp/serve && shasum -a 256 * > SHA256SUMS
-
-      - name: Start server
-        run: |
-          python3 -m http.server 8399 --directory /tmp/serve &
-          sleep 1
-
-      - name: Install with curl
-        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Verify version output
-        run: |
-          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
-          /tmp/test-bin/curlwright --version | grep "99.0.0"
-
-      - name: Tampered asset refusal
-        run: |
-          cp /tmp/serve/curlwright-darwin-arm64 /tmp/serve/curlwright-darwin-arm64.bak
-          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
-          printf "tampered" > /tmp/serve/curlwright-darwin-arm64
-          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
-            echo "should have failed on tampered asset"
-            exit 1
-          fi
-          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
-          cp /tmp/serve/curlwright-darwin-arm64.bak /tmp/serve/curlwright-darwin-arm64
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Custom INSTALL_DIR
-        run: |
-          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
-          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Idempotent re-run
-        run: |
-          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
-          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-  installer-alpine:
-    needs: build-binaries
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    container:
-      image: alpine:latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - name: Setup
-        run: apk add --no-cache wget python3 ca-certificates
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          path: /tmp/serve
-          pattern: binaries-linux-amd64
-          merge-multiple: true
-
-      - name: Prepare assets
-        run: cd /tmp/serve && sha256sum * > SHA256SUMS
-
-      - name: Start server
-        run: |
-          python3 -m http.server 8399 --directory /tmp/serve &
-          sleep 1
-
-      - name: Install with wget
-        run: sh install.sh --version 99.0.0 --dir /tmp/test-bin
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Verify version output
-        run: |
-          /tmp/test-bin/playwright-cli --version | grep "99.0.0"
-          /tmp/test-bin/curlwright --version | grep "99.0.0"
-
-      - name: TLS verified HTTPS exchange
-        run: |
-          output=$(/tmp/test-bin/playwright-cli --cdp https://example.com/ list 2>&1) || true
-          echo "$output"
-          echo "$output" | grep -q "HTTP 404"
-
-      - name: Tampered asset refusal
-        run: |
-          cp /tmp/serve/curlwright-linux-amd64 /tmp/serve/curlwright-linux-amd64.bak
-          cp /tmp/serve/SHA256SUMS /tmp/serve/SHA256SUMS.good
-          printf "tampered" > /tmp/serve/curlwright-linux-amd64
-          if sh install.sh --version 99.0.0 --dir /tmp/test-bin-tamper 2>/dev/null; then
-            echo "should have failed on tampered asset"
-            exit 1
-          fi
-          cp /tmp/serve/SHA256SUMS.good /tmp/serve/SHA256SUMS
-          cp /tmp/serve/curlwright-linux-amd64.bak /tmp/serve/curlwright-linux-amd64
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Custom INSTALL_DIR
-        run: |
-          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
-          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
-
-      - name: Idempotent re-run
-        run: |
-          sh install.sh --version 99.0.0 --dir /tmp/custom-dir
-          /tmp/custom-dir/playwright-cli --version | grep "99.0.0"
-        env:
-          SLICC_INSTALL_BASE_URL: http://127.0.0.1:8399
+          npm publish --access public --ignore-scripts
+          git push origin "$GITHUB_SHA:refs/tags/sliccy-browser-v$version"
+          echo "published $name@$version and tagged sliccy-browser-v$version" >> "$GITHUB_STEP_SUMMARY"

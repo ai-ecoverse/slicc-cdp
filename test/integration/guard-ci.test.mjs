@@ -1,115 +1,84 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { guardShardPlan } from '../../scripts/cert/guard-shards.mjs';
-import { assertPartitionUnion, planPartitions } from '../../scripts/guard-ci.mjs';
-import { integrationArguments } from '../../scripts/integration-selection.mjs';
-import { fixture } from './cert-fixture.mjs';
+import { assertGuardReport, canonicalSkip, partitions, published } from './guard-set.mjs';
+import { syntheticReport } from './guard-test-evidence.mjs';
 
-const vectors = JSON.parse(
-  await readFile(
-    new URL(import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-vectors.json')),
-    'utf8'
-  )
-);
-const plan = planPartitions(vectors);
-const head = 'pure-ci-subject';
-const run = 'pure-ci-run';
-const documents = () => {
-  const original = fixture().guard.executions.positive.report;
-  return plan.shards.map((shard) => ({
-    id: shard.id,
-    head,
-    run,
-    report: {
-      ...original,
-      sha: head,
-      selection: { targets: shard.targets },
-      results: original.results.filter((row) => shard.targets.includes(row.target)),
-    },
-  }));
-};
+function document(id = 'a') {
+  const targets = partitions[id];
+  const set = {
+    ...published,
+    vectors: published.vectors
+      .map((vector) => ({
+        ...vector,
+        targets: vector.targets.filter((target) => targets.includes(target)),
+      }))
+      .filter((vector) => vector.targets.length),
+  };
+  return { ...syntheticReport(set, 'pure-pipeline-head'), selection: { targets } };
+}
 
-test('normal CI reuses the cert partition library with an exact disjoint full row universe', async () => {
-  assert.deepEqual(plan, guardShardPlan(vectors));
-  assert.equal(assertPartitionUnion(vectors, documents(), head, run), plan.keys.length);
-  const all = await integrationArguments('all');
-  const general = await integrationArguments('integration');
-  const focused = await integrationArguments('redirects');
-  const guarded = await integrationArguments('guard');
-  assert.deepEqual([...general, ...focused, ...guarded].sort(), all);
-  assert.equal(new Set([...general, ...focused, ...guarded]).size, all.length);
-  assert.deepEqual(guarded, ['test/integration/guard-runner.test.mjs']);
+test('ordinary pipeline guard files retain strict complete-key behavioural and subject validation', () => {
+  for (const id of Object.keys(partitions))
+    assertGuardReport(document(id), id, 'pure-pipeline-head');
 });
 
 for (const defect of [
-  'failed leg',
-  'incomplete leg',
+  'failed control',
+  'failed guarded',
+  'incomplete live',
   'unsupported skip',
   'eligible applicability forgery',
   'C2 skip',
   'shared iframe skip',
+  'BFCache skip',
   'false producer pass',
   'wrong corpus',
+  'wrong scope',
+  'wrong head',
+  'wrong selection',
+  'missing row',
+  'duplicate row',
+  'extra row',
 ]) {
-  test(`guard union rejects behavioural defect ${defect} even with complete keys`, () => {
-    const input = documents();
-    const row = input
-      .flatMap((document) => document.report.results)
-      .find((row) =>
-        defect === 'shared iframe skip'
-          ? row.id === 'C4.iframe-preattach.blank.shared'
+  test(`guard report rejects ${defect} rather than accepting a complete count`, () => {
+    const doc = document();
+    const id =
+      defect === 'shared iframe skip'
+        ? 'C4.iframe-preattach.blank.shared'
+        : defect === 'BFCache skip'
+          ? 'C8.protected-bfcache-restore'
           : defect === 'unsupported skip'
-            ? row.id === 'C1.href'
-            : row.id === 'C2.redirect-body'
-      );
-    if (defect === 'failed leg') row.guarded = 'fail';
-    if (defect === 'incomplete leg') row.live = 'incomplete';
-    if (
-      [
-        'unsupported skip',
-        'eligible applicability forgery',
-        'C2 skip',
-        'shared iframe skip',
-      ].includes(defect)
-    ) {
+            ? 'C1.href'
+            : 'C2.redirect-body';
+    const row = doc.results.find((row) => row.id === id);
+    if (defect === 'failed control') row.control = 'fail';
+    if (defect === 'failed guarded') row.guarded = 'fail';
+    if (defect === 'incomplete live') row.live = 'incomplete';
+    if (defect.includes('skip') || defect === 'eligible applicability forgery') {
       row.control = row.guarded = row.live = 'skip';
       row.reason =
         defect === 'eligible applicability forgery'
           ? 'not-applicable'
           : 'not-supported:browserSession';
     }
-    if (defect === 'false producer pass') input[0].report.pass = false;
-    if (defect === 'wrong corpus') input[0].report.set = 'unverified corpus';
-    assert.throws(() => assertPartitionUnion(vectors, input, head, run));
+    if (defect === 'false producer pass') doc.pass = false;
+    if (defect === 'wrong corpus') doc.set = 'other corpus';
+    if (defect === 'wrong scope') doc.guard = 'other guard';
+    if (defect === 'wrong head') doc.sha = 'other head';
+    if (defect === 'wrong selection') doc.selection.targets = [];
+    if (defect === 'missing row') doc.results.pop();
+    if (defect === 'duplicate row') doc.results.push(doc.results[0]);
+    if (defect === 'extra row') doc.results.push({ ...doc.results[0], id: 'invented' });
+    assert.throws(() => assertGuardReport(doc, 'a', 'pure-pipeline-head'));
   });
 }
 
-for (const defect of [
-  'missing partition',
-  'duplicate partition',
-  'unknown partition',
-  'wrong head',
-  'wrong run',
-  'wrong report head',
-  'wrong selection',
-  'missing row',
-  'duplicate row',
-  'extra row',
-]) {
-  test(`guard union rejects ${defect}`, () => {
-    const input = documents();
-    if (defect === 'missing partition') input.pop();
-    if (defect === 'duplicate partition') input[3] = input[0];
-    if (defect === 'unknown partition') input[0].id = 'invented';
-    if (defect === 'wrong head') input[0].head = 'other';
-    if (defect === 'wrong run') input[0].run = 'other';
-    if (defect === 'wrong report head') input[0].report.sha = 'other';
-    if (defect === 'wrong selection') input[0].report.selection.targets = [];
-    if (defect === 'missing row') input[0].report.results.pop();
-    if (defect === 'duplicate row') input[0].report.results.push(input[0].report.results[0]);
-    if (defect === 'extra row')
-      input[0].report.results.push({ id: 'invented', target: 'ordinary', variant: 'prompt' });
-    assert.throws(() => assertPartitionUnion(vectors, input, head, run));
-  });
-}
+test('observable applicability keeps its canonical published reason without serialized rewrites', () => {
+  const vector = published.vectors.find((vector) =>
+    Object.values(vector.observable ?? {}).includes(false)
+  );
+  const target = Object.keys(vector.observable).find(
+    (target) => vector.observable[target] === false
+  );
+  assert.equal(canonicalSkip(vector, target), 'not-applicable');
+});

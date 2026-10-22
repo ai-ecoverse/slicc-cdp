@@ -3,7 +3,7 @@ import { createServer } from 'node:net';
 import { mock } from 'node:test';
 import { setTimeout as wallTimer } from 'node:timers';
 import { pathToFileURL } from 'node:url';
-import { fixture as syntheticEvidence } from './cert-fixture.mjs';
+import { syntheticReport } from './guard-test-evidence.mjs';
 
 const simulated = process.env.TEARDOWN_MODE !== 'roundtrip';
 if (simulated) mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
@@ -43,12 +43,7 @@ const state = {
     return { events: [], send: async () => ({}), close: async () => {} };
   },
   async run(set, options) {
-    if (process.env.TEARDOWN_MODE === 'roundtrip')
-      return {
-        results: syntheticEvidence().guard.executions.positive.report.results.filter((row) =>
-          set.vectors.some((vector) => vector.id === row.id && vector.targets.includes(row.target))
-        ),
-      };
+    if (process.env.TEARDOWN_MODE === 'roundtrip') return { results: syntheticReport(set).results };
     const pair = await options.clientFactory({
       slot: 0,
       variant: 'prompt',
@@ -71,10 +66,7 @@ const state = {
 };
 globalThis.__guardTeardownFixture = state;
 const publishedRunner = import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-runner');
-const runnerExports =
-  process.env.TEARDOWN_MODE === 'roundtrip'
-    ? `export {summary} from ${JSON.stringify(publishedRunner)};export const run=(...args)=>globalThis.__guardTeardownFixture.run(...args);`
-    : 'export const run=(...args)=>globalThis.__guardTeardownFixture.run(...args);export const summary=({results})=>({results,line:results.length?"GUARD-PASS fake-owned-worker":"GUARD-FAIL fake-owned-worker",pass:results.length>0,missing:results.length?[]:[{id:"E4.teardown",target:"ordinary",variant:"prompt"}],observerSkipped:0});';
+const runnerExports = `export {summary} from ${JSON.stringify(publishedRunner)};export const run=(...args)=>globalThis.__guardTeardownFixture.run(...args);`;
 
 const modules = new Map([
   ['node:child_process', 'export function execFileSync(){return "fake-owned-worker";}'],
@@ -99,7 +91,7 @@ const modules = new Map([
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (context.parentURL?.endsWith('/guard-runner.test.mjs')) {
+    if (context.parentURL?.endsWith('/guard-set.mjs')) {
       if (specifier === '@ai-ecoverse/slicc-browsers/guard-vectors.json')
         return { url: pathToFileURL(process.env.TEARDOWN_VECTORS).href, shortCircuit: true };
       if (modules.has(specifier)) return { url: `guard-teardown:${specifier}`, shortCircuit: true };
