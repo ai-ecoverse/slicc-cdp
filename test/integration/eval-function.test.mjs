@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
+import { chromeTest as it } from './chrome-policy.mjs';
 import { fakeCdp } from './fake-cdp.mjs';
 import { HARNESS_PORTS } from './ports.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
@@ -231,7 +232,7 @@ test('eval --frame calls a function expression in the frame world', async () => 
 });
 
 for (const kind of ['native', 'kernel']) {
-  test(`${kind} eval calls arrow, async arrow and function expressions in Chrome`, async (t) => {
+  it(`${kind} eval calls arrow, async arrow and function expressions in Chrome`, async (t) => {
     const site = await startServer();
     let browser;
     let runner;

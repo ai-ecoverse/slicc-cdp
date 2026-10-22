@@ -21,6 +21,7 @@ for (const transport of ['native', 'wasi']) {
   for (const mode of [
     'resolve',
     'navigation',
+    'quiet-navigation',
     'poll-navigation',
     'poll-refusal',
     'original-refusal',
@@ -71,14 +72,15 @@ for (const transport of ['native', 'wasi']) {
           if (message.params.expression.includes('Promise.resolve((0, eval)')) {
             started = true;
             reply(message, send, true);
-            if (mode === 'navigation') {
+            if (['navigation', 'quiet-navigation'].includes(mode)) {
               changed = true;
               backend.targets[0].frame = frame('L2');
-              send({
-                method: 'Page.frameNavigated',
-                sessionId: session,
-                params: { frame: backend.targets[0].frame },
-              });
+              if (mode === 'navigation')
+                send({
+                  method: 'Page.frameNavigated',
+                  sessionId: session,
+                  params: { frame: backend.targets[0].frame },
+                });
             }
             return true;
           }
@@ -117,7 +119,7 @@ for (const transport of ['native', 'wasi']) {
           assert.equal(polls, 2);
           const evaluations = backend.calls.filter((call) => call.method === 'Runtime.evaluate');
           assert(evaluations.every((call) => call.params.uniqueContextId === 'default:TAB:L1'));
-        } else if (['navigation', 'poll-navigation'].includes(mode)) {
+        } else if (['navigation', 'quiet-navigation', 'poll-navigation'].includes(mode)) {
           await assert.rejects(outcome, (error) => {
             assert.equal(error.message, 'bridge evaluation navigated or superseded');
             assert(!/refused|session.*closed|target.*closed|no session/i.test(error.message));
@@ -154,7 +156,7 @@ test('C5 diagnostics hash values but preserve commands, error classes and physic
     result: { value: secret },
   });
   assert(!JSON.stringify(sanitized).includes(secret));
-  assert.equal(sanitized.method, 'Runtime.evaluate');
+  assert.equal(sanitized.method.sha256.length, 64);
   assert.equal(sanitized.params.expression.sha256, sanitized.result.value.sha256);
   const backend = await fakeCdp({
     attachEvents: true,

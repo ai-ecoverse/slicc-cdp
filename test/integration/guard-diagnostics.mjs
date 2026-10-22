@@ -12,7 +12,6 @@ const safeErrors = new Set([
 
 export function diagnosticValue(value, key = '') {
   if (typeof value === 'string') {
-    if (key === 'method' && /^[A-Z][A-Za-z]*\.[A-Za-z]+$/.test(value)) return value;
     if (key === 'phase' && ['original', 'poll', 'superseded'].includes(value)) return value;
     if (key === 'side' && ['control', 'guarded'].includes(value)) return value;
     if (key === 'message') {
@@ -55,7 +54,10 @@ export async function guardDiagnostics(wsUrl, metadata) {
         ...(direction === 'browser' && message.id !== undefined
           ? { responseTo: methods.get(message.id) }
           : {}),
-        message: diagnosticValue(message),
+        message: {
+          ...diagnosticValue(message),
+          ...(message.method ? { method: message.method } : {}),
+        },
       });
     },
   });
@@ -64,7 +66,10 @@ export async function guardDiagnostics(wsUrl, metadata) {
     url: proxy.url,
     onMessage: (message) => {
       if (message.event)
-        record.events.push({ at: Date.now(), event: diagnosticValue(message.event) });
+        record.events.push({
+          at: Date.now(),
+          event: { ...diagnosticValue(message.event), method: message.event.method },
+        });
       if (message.diagnostic)
         record.bridge.push({ at: Date.now(), ...diagnosticValue(message.diagnostic) });
     },

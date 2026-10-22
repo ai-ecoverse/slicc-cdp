@@ -65,6 +65,8 @@ npm test
 
 `npm test` builds the native and wasm CLIs and the guard bridge, installs the pinned Chrome for Testing (`config.chrome`) and runs `test/integration/*.test.mjs`, the Rust workspace tests included. The published guard set from `@ai-ecoverse/slicc-browsers` runs in four files, `guard-a.test.mjs` to `guard-d.test.mjs`, one per partition of its targets; `guard-union.test.mjs` checks the partitions add up to the whole set. Every row must pass, or skip with the reason its vector declares, and the `C2.redirect-*` and `C4.iframe-preattach` `.shared` rows must pass. Each partition writes its report to `artifacts/guard-<partition>.md`.
 
+Real-Chrome integration cases run only on CI by default; set `SLICC_LOCAL_CHROME=1` to opt in locally. Fake-backend cases still run without it.
+
 ## CI and releases
 
 `.github/workflows/ci.yml` calls [slicc-shared-web's pipeline](https://github.com/ai-ecoverse/slicc-shared-web#pipeline): lint, the integration tests split over four shards on the pool, and the Claude and Codex reviews on pull requests. The ruleset requires `ci / integration` and `ci / review`.

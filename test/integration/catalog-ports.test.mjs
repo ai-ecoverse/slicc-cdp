@@ -7,10 +7,10 @@ import { createServer as createTls } from 'node:https';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { findBrowser } from '../../src/browser.js';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { killTree } from './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');

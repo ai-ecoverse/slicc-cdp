@@ -37,7 +37,7 @@ fn frame_identity(tree: &Value, frame_id: Option<&str>) -> Option<(String, Strin
     }
     let frame = find(tree.get("frameTree")?, frame_id)?;
     let id = frame.get("id")?.as_str().filter(|id| !matches!(*id, "" | "null" | "://"))?;
-    let loader = frame.get("loaderId")?.as_str().filter(|loader| !matches!(*loader, "" | "null" | "://"))?;
+    let loader = frame.get("loaderId")?.as_str().filter(|loader| !matches!(*loader, "null" | "://"))?;
     Some((id.to_string(), loader.to_string()))
 }
 

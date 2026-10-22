@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { launchBrowser } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, origins } from './guard-fixture.mjs';
 
