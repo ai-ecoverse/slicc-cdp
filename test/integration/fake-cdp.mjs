@@ -109,6 +109,8 @@ export async function fakeCdp({
   aria = () => defaultAria,
   location,
   frameTree,
+  listen = '127.0.0.1',
+  version = false,
 } = {}) {
   let lastAria = defaultAria;
   const calls = [];
@@ -129,6 +131,17 @@ export async function fakeCdp({
     ...(target.parentFrameId ? { parentFrameId: target.parentFrameId } : {}),
   });
   const server = createServer((req, res) => {
+    if (version && req.url === '/json/version') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          Browser: 'Chrome/140.0.0.0',
+          'Protocol-Version': '1.3',
+          webSocketDebuggerUrl: `ws://${req.headers.host}/devtools/browser/fake`,
+        })
+      );
+      return;
+    }
     res.writeHead(404);
     res.end();
   });
@@ -438,9 +451,14 @@ export async function fakeCdp({
       }
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, listen, resolve);
+  });
+  const host = listen.includes(':') ? `[${listen}]` : listen;
   return {
-    url: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`,
+    url: `ws://${host}:${server.address().port}/devtools/browser/fake`,
+    port: server.address().port,
     calls,
     jar,
     targets,
