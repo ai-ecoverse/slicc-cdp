@@ -284,13 +284,12 @@ fn describe(name: &str, modifiers: &[String]) -> Result<Key, String> {
     Ok(key)
 }
 
-fn mac(cdp: &mut Cdp) -> Result<bool, String> {
-    let version = cdp.call("Browser.getVersion", json!({}), None)?;
-    Ok(version.get("userAgent").and_then(Value::as_str).is_some_and(|agent| agent.contains("Macintosh")))
+fn mac(cdp: &mut Cdp) -> bool {
+    cdp.call("Browser.getVersion", json!({}), None).ok().and_then(|version| version.get("userAgent").and_then(Value::as_str).map(|agent| agent.contains("Macintosh"))).unwrap_or(false)
 }
 
 fn key_down(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> Result<String, String> {
-    let mac = mac(cdp)?;
+    let mac = mac(cdp);
     let key = describe(keys::smart(raw, mac), &pointer.modifiers)?;
     let mut next = pointer.clone();
     let repeat = next.keys.iter().any(|known| known == &key.code);
@@ -321,7 +320,7 @@ fn key_down(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> R
 }
 
 fn key_up(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> Result<String, String> {
-    let mac = raw == "ControlOrMeta" && mac(cdp)?;
+    let mac = raw == "ControlOrMeta" && mac(cdp);
     let key = describe(keys::smart(raw, mac), &pointer.modifiers)?;
     let mut next = pointer.clone();
     if keys::MODIFIERS.contains(&key.key.as_str()) {
