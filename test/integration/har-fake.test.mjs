@@ -11,6 +11,7 @@ export async function harFixture(body, options = {}) {
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-har-'));
   const emitters = new Map();
   const backend = await fakeCdp({
+    refuseWhen: options.refuseWhen,
     onCommand(message, emit) {
       if (message.sessionId) emitters.set(message.sessionId, emit);
     },
