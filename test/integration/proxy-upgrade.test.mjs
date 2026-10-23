@@ -43,7 +43,7 @@ async function backend(split) {
       {
         method: 'Page.frameNavigated',
         sessionId: 'OBS',
-        params: { frame: { url: 'https://private.test/bfcache?n=upgrade-proof' } },
+        params: { frame: { url: 'https://private.test/bfcache?n=upgrade-proof-p' } },
       },
       {
         method: 'Page.frameNavigated',

@@ -77,6 +77,8 @@ Only the hash-pinned shim can use the dedicated installer. Its inert pre-executi
 
 `webmcp-list` succeeds with an empty list (`--json`: `[]`) or “No WebMCP tools on this page” when WebMCP is available but has no registered tools. If `document.modelContext` is absent or null, both `webmcp-list` and `webmcp-call` print “WebMCP is unavailable on this page” to stderr, leave stdout empty and exit 2. Evaluation and connection failures exit 1.
 
+`dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
+
 ## Develop
 
 ```sh

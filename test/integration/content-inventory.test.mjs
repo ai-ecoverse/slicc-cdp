@@ -29,6 +29,8 @@ const events = new Set([
   'Page.frameNavigated',
   'Page.frameRequestedNavigation',
   'Page.frameStartedNavigating',
+  'Page.javascriptDialogClosed',
+  'Page.javascriptDialogOpening',
   'Page.lifecycleEvent',
   'Page.loadEventFired',
   'Page.navigatedWithinDocument',

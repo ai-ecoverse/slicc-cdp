@@ -970,6 +970,23 @@ const CLEAR_FOCUSABLE: &str = "function() { const emit = () => this.dispatchEven
 const READ_INPUT: &str = "function() { if (this.isContentEditable) return this.textContent || ''; if ('value' in this) return this.value; return ''; }";
 const REACT_FILL: &str = "function(value) { const proto = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const desc = Object.getOwnPropertyDescriptor(proto, 'value'); if (desc && desc.set) desc.set.call(this, value); else this.value = value; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }";
 
+const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub fn handle_dialog(
+    cdp: &mut Cdp,
+    session: &str,
+    accept: bool,
+    prompt: Option<&str>,
+) -> Result<String, String> {
+    cdp.wait_dialog(session, DIALOG_WAIT)?;
+    let mut params = json!({ "accept": accept });
+    if let Some(text) = prompt {
+        params["promptText"] = json!(text);
+    }
+    cdp.call_for("Page.handleJavaScriptDialog", params, Some(session), DIALOG_WAIT)?;
+    Ok(if accept { "Accepted the dialog\n" } else { "Dismissed the dialog\n" }.to_string())
+}
+
 pub fn format_eval(result: &EvalValue) -> String {
     if !result.defined {
         return "undefined".to_string();
