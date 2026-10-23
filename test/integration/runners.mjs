@@ -126,6 +126,9 @@ export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
     curl(args, cwd) {
       return kernelRun(kernel, ['curlwright', ...args], cwd);
     },
+    run(argv, cwd, options = {}) {
+      return kernelRun(kernel, argv, cwd, options);
+    },
     addUser(name) {
       return kernel.users.add({ name });
     },

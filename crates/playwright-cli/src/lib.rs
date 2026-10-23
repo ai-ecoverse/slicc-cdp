@@ -31,6 +31,7 @@ mod upgrade;
 mod webmcp;
 mod webmcp_frames;
 mod webmcp_polyfill;
+mod webmcp_watch;
 
 pub use args::Output;
 
