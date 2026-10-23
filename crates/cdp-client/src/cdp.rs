@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 #[path = "webmcp_guard.rs"]
 mod webmcp_guard;
+#[path = "issued.rs"]
+mod issued;
+pub(crate) use issued::target_refusal;
 
 pub trait Transport {
     fn send_text(&mut self, text: &str) -> Result<(), String>;
@@ -152,6 +155,7 @@ pub struct Cdp {
     webmcp: webmcp_guard::Webmcp,
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
+    issued: issued::Issued,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
@@ -228,6 +232,7 @@ impl Cdp {
             webmcp: webmcp_guard::Webmcp::default(),
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
+            issued: issued::Issued::default(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -406,11 +411,12 @@ impl Cdp {
                 sent["executionContextId"] = json!(proof.id);
             } else { sent["uniqueContextId"] = json!(unique); }
         }
+        let (forwarded, sent) = self.fetch_command(method, sent, session_id);
         let compile_session = if method == "Runtime.compileScript" {
             session_id.and_then(|session| self.session_target(session)).and_then(|target| self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target))).cloned()
         } else { None };
         let frame_epoch = self.frame_epoch;
-        let result = match self.raw_call_execution(method, sent, compile_session.as_deref().or(session_id), timeout, executed) {
+        let result = match self.raw_call_execution(&forwarded, sent, compile_session.as_deref().or(session_id), timeout, executed) {
             Ok(result) => result,
             Err(message) => {
                 if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false)?; }
@@ -499,7 +505,8 @@ impl Cdp {
             .then(|| shield::request_key(&params))
             .flatten()
             .zip(session_id.map(str::to_string));
-        let sent = self.send(method, params, session_id)?;
+        let (forwarded, params) = self.fetch_command(method, params, session_id);
+        let sent = self.send(&forwarded, params, session_id)?;
         if let Some((id, session)) = answered {
             self.answering.insert(sent, (session, id));
         }
@@ -651,9 +658,7 @@ impl Cdp {
                 }
             }
         }
-        if matches!(method, "Fetch.continueRequest" | "Network.continueInterceptedRequest") && params.get("url").and_then(Value::as_str).is_some_and(|url| self.redirector_protected(url)) {
-            return Err(self.refusal());
-        }
+        let issued = self.client_issued(method, params, session_id)?;
         if shield::interception_method(method) {
             let id = shield::request_key(params).unwrap_or_default();
             let handed = session_id
@@ -662,6 +667,7 @@ impl Cdp {
                 return Err(UNSEEN.into());
             }
         }
+        if issued { self.issue(method, params, session_id, true)?; }
         if shield::body_method(method) {
             let id = shield::request_key(params);
             match id.as_deref().and_then(|id| self.request_state(id)) {
@@ -683,6 +689,10 @@ impl Cdp {
                     }
                 }
             }
+        }
+        if method == "Network.replayXHR" {
+            if session_id.is_none_or(|session| self.replay_url(params, session).is_none()) { return Err(self.refusal()) }
+            self.issue(method, params, session_id, true)?;
         }
         if method == "IO.read" {
             let handle = params.get("handle").and_then(|v| v.as_str()).unwrap_or("");
@@ -2058,6 +2068,7 @@ impl Cdp {
                 self.protected_request_pages.insert((session.clone().unwrap_or_default(), id.to_string()));
             }
         }
+        self.remember_xhr(&method, session.as_deref().unwrap_or(""), &params);
         if let Some(id) = params.get("requestId").and_then(|v| v.as_str()) {
             if let Some(url) = shield::request_url(&params) {
                 let resource = (session.clone().unwrap_or_default(), url.clone());
@@ -2444,15 +2455,7 @@ impl Cdp {
     }
 
     pub fn ordinary_redirect_target(&self, source: &str, target: &str) -> Result<String, String> {
-        let targets = Self::carrier_targets(&self.guard, target, source).ok_or_else(|| self.refusal())?;
-        if target.trim().is_empty() || targets.iter().any(|target| target.protected) {
-            return Err(self.refusal());
-        }
-        let url = &targets[0].url;
-        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
-            return Err(self.refusal());
-        }
-        Ok(url.to_string())
+        target_refusal(&self.guard, source, target).map_err(|_| self.refusal())
     }
 
     fn carrier_targets(guard: &Protected, target: &str, source: &str) -> Option<Vec<CarrierTarget>> {
@@ -2901,6 +2904,9 @@ impl Cdp {
             );
             return;
         }
+        if value.get("method").and_then(Value::as_str) == Some("Fetch.authRequired") && self.guard_auth(&value) {
+            return;
+        }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
             let Some(mut paused) = Paused::from_event(&value) else {
                 return;
@@ -2913,6 +2919,8 @@ impl Cdp {
                 }
                 if self.protected_body_requests.contains(network) { self.protect_body_request(network); }
             }
+            if self.issued_hop(&value, &paused) { return; }
+            let guard_only = self.guard_only(&paused);
             let authority_protected = shield::scheme_less_protected(&self.guard, &value["params"]["request"]);
             let redirect = self.actual_redirect_carrier(&value);
             if self.protected_carrier(&value, false) {
@@ -2993,6 +3001,10 @@ impl Cdp {
                 self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
             }
+            if guard_only {
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
             if paused.resource_type == "Document" {
                 self.paused_documents.insert((paused.session_id.clone(), paused.request_id.clone()));
             }
@@ -3019,14 +3031,21 @@ impl Cdp {
             return;
         };
         let decision = decider(&paused);
-        let (method, params) = match fetch::command(&self.guard, &paused, &decision) {
+        let session = Some(paused.session_id.as_str());
+        let (method, params, issued) = match fetch::command(&self.guard, &paused, &decision)
+            .and_then(|(method, params)| self.client_issued(method, &params, session).map(|issued| (method, params, issued))) {
             Ok(command) => command,
             Err(message) => {
                 self.fetch_errors.push(message);
-                fetch::command(&self.guard, &paused, &Decision::default())
-                    .expect("a plain continue is always allowed")
+                let (method, params) = fetch::command(&self.guard, &paused, &Decision::default())
+                    .expect("a plain continue is always allowed");
+                (method, params, false)
             }
         };
+        if issued && self.issue(method, &params, session, false).is_err() {
+            self.continue_plain(&paused.session_id, &paused.request_id);
+            return;
+        }
         self.settle(&paused.session_id, &paused.request_id);
         if let Ok(id) = self.send(method, params, Some(&paused.session_id)) {
             self.decided
