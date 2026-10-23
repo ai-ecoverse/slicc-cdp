@@ -77,6 +77,7 @@ export async function cdpProxy(
     early = [],
     transform = (message) => message,
     observe = () => {},
+    forwarded = () => {},
     before = [],
     holdEvents = () => false,
     responseBarrier = () => null,
@@ -196,6 +197,7 @@ export async function cdpProxy(
           continue;
         }
         browser.write(frame.raw);
+        if (message) forwarded(message);
       }
     });
     browser.on('data', (chunk) => {
