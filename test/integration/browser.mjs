@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { headlessByDefault, modeFlags, screenFor } from '@ai-ecoverse/slicc-shared-web/harness';
 import { requireChrome } from './chrome-policy.mjs';
 import { chromeLaunched } from './chrome-report.mjs';
 
@@ -44,18 +45,27 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   options.signal?.throwIfAborted();
   let port = options.port ?? 0;
   if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
+  const headless = headlessByDefault(process.env);
+  const executable = process.env.CHROMIUM_EXECUTABLE || (await findBrowser())?.executable;
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
+  let screen;
+  try {
+    screen = await screenFor(!headless, process.env);
+  } catch (error) {
+    await rm(userDataDir, { recursive: true, force: true });
+    throw error;
+  }
   let chromeLog = '';
   const child = spawn(
-    process.env.CHROMIUM_EXECUTABLE || (await findBrowser())?.executable,
+    executable,
     [
       `--remote-debugging-port=${port}`,
       '--remote-debugging-address=127.0.0.1',
       `--user-data-dir=${userDataDir}`,
-      '--headless=new',
+      ...modeFlags(headless),
       '--no-first-run',
       '--no-default-browser-check',
-      '--disable-gpu',
+      ...(headless ? ['--disable-gpu'] : ['--window-size=1280,800']),
       '--disable-dev-shm-usage',
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -63,7 +73,11 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       ...extraArgs,
       'about:blank',
     ],
-    { stdio: ['ignore', 'ignore', 'pipe'], detached: process.platform !== 'win32' }
+    {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      detached: process.platform !== 'win32',
+      env: screen.env,
+    }
   );
   const exited = new Promise((resolve) => child.once('exit', resolve));
   child.stderr.on('data', (chunk) => {
@@ -130,16 +144,25 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       died() {
         return child.exitCode !== null || child.signalCode ? chromeStatus(child, chromeLog) : null;
       },
+      headless,
       async close() {
         options.signal?.removeEventListener('abort', abort);
-        await stop();
-        await rm(userDataDir, { recursive: true, force: true });
+        try {
+          await stop();
+        } finally {
+          await screen.close();
+          await rm(userDataDir, { recursive: true, force: true });
+        }
       },
     };
   } catch (error) {
     options.signal?.removeEventListener('abort', abort);
-    await stop();
-    await rm(userDataDir, { recursive: true, force: true });
+    try {
+      await stop();
+    } finally {
+      await screen.close();
+      await rm(userDataDir, { recursive: true, force: true });
+    }
     throw error;
   }
 }
