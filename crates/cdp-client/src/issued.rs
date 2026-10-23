@@ -265,9 +265,8 @@ impl Cdp {
 
     pub(super) fn remember_xhr(&mut self, method: &str, session: &str, params: &Value) {
         if method != "Network.requestWillBeSent" || params.get("type").and_then(Value::as_str) != Some("XHR") || params.get("redirectResponse").is_some() { return }
-        if let (Some(id), Some(url)) = (params.get("requestId").and_then(Value::as_str), params.pointer("/request/url").and_then(Value::as_str)) {
-            self.issued.xhr.entry((session.to_string(), id.to_string())).or_insert_with(|| url.to_string());
-        }
+        let (Some(id), Some(url)) = (params.get("requestId").and_then(Value::as_str), params.pointer("/request/url").and_then(Value::as_str)) else { return };
+        self.issued.xhr.entry((session.to_string(), id.to_string())).or_insert_with(|| url.to_string());
     }
 
     pub(super) fn fetch_command(&mut self, method: &str, params: Value, session: Option<&str>) -> (String, Value) {

@@ -1,22 +1,28 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
+import path from 'node:path';
 import { before } from 'node:test';
 import { launchBrowser } from './browser.mjs';
 import { chromeSkipReason, chromeTest as test } from './chrome-policy.mjs';
 import { guarded } from './guard-client.mjs';
+import { kernelRunner, nativeRunner } from './runners.mjs';
 
 const CHAINS = [[301], [302], [303], [307], [308], [301, 302, 303, 307, 308]];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 before(() => {
   if (chromeSkipReason()) return;
-  for (const target of [[], ['--target', 'wasm32-wasip1']])
+  for (const target of [[], ['--target', 'wasm32-wasip1']]) {
     execFileSync(
       'cargo',
       ['build', '--locked', '-p', 'slicc-cdp-client', '--example', 'guard_bridge', ...target],
       { stdio: 'inherit' }
     );
+    execFileSync('cargo', ['build', '--locked', '-p', 'slicc-cdp', '-p', 'curlwright', ...target], {
+      stdio: 'inherit',
+    });
+  }
 });
 
 for (const transport of ['native', 'wasi']) {
@@ -44,6 +50,7 @@ for (const transport of ['native', 'wasi']) {
         return res.end('<!doctype html><title>page</title><p>page</p>');
       }
       if (url.pathname === '/landing') return res.end('landing');
+      if (url.pathname.startsWith('/direct')) return res.end('unrouted');
       if (url.pathname.endsWith('/auth') && !req.headers.authorization) {
         res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="client-issued"' });
         return res.end('auth');
@@ -277,6 +284,83 @@ for (const transport of ['native', 'wasi']) {
           assert.deepEqual(hits, []);
         }
       );
+      await t.test('playwright-cli route redirects follow the client-issued rule', async () => {
+        const runner =
+          transport === 'native'
+            ? nativeRunner(
+                path.resolve('target/debug/playwright-cli'),
+                path.resolve('target/debug/curlwright'),
+                browser.wsUrl
+              )
+            : await kernelRunner(
+                path.resolve('target/wasm32-wasip1/debug/playwright-cli.wasm'),
+                path.resolve('target/wasm32-wasip1/debug/curlwright.wasm'),
+                browser.wsUrl
+              );
+        try {
+          const cwd = await runner.fresh();
+          const ok = (result) => {
+            assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+            return result.stdout;
+          };
+          const fetched = async (path) =>
+            ok(
+              await runner.playwright(
+                [
+                  'eval',
+                  `fetch(${JSON.stringify(path)}, { cache: 'no-store' }).then((r) => r.text(), (e) => 'failed:' + e.message)`,
+                ],
+                cwd
+              )
+            );
+          ok(await runner.playwright(['open', `${base}/page`], cwd));
+          for (const host of ['seven', 'vault']) {
+            ok(
+              await runner.playwright(
+                [
+                  'route',
+                  `**/routed-${host}*`,
+                  '--status=302',
+                  '--header',
+                  `Location: /hop?statuses=307,308&host=${host}.sliccy.ai`,
+                ],
+                cwd
+              )
+            );
+            ok(
+              await runner.playwright(
+                [
+                  'route',
+                  `**/direct-${host}*`,
+                  '--status=302',
+                  '--header',
+                  `Location: http://${host}.sliccy.ai:${protectedPort}/protected`,
+                ],
+                cwd
+              )
+            );
+            assert.match(await fetched(`/routed-${host}`), /^failed:/);
+            assert.equal(await fetched(`/direct-${host}`), 'unrouted\n');
+            noHits(`route into ${host}`);
+          }
+          ok(
+            await runner.playwright(
+              [
+                'route',
+                '**/routed-ordinary*',
+                '--status=302',
+                '--header',
+                'Location: /hop?statuses=301,302,303,307,308&host=ordinary',
+              ],
+              cwd
+            )
+          );
+          assert.equal(await fetched('/routed-ordinary'), 'landing\n');
+          ok(await runner.playwright(['unroute'], cwd));
+        } finally {
+          await runner.close?.();
+        }
+      });
     } finally {
       if (previousTransport === undefined) delete process.env.SLICC_GUARD_TRANSPORT;
       else process.env.SLICC_GUARD_TRANSPORT = previousTransport;

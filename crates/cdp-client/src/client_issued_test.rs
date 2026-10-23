@@ -313,6 +313,13 @@ fn route_style_deciders_follow_the_client_issued_rule() {
 }
 
 #[test]
+fn the_shared_classifier_keeps_its_curlwright_contract() {
+    let (cdp, _log) = wire(Box::new(answer));
+    assert_eq!(cdp.ordinary_redirect_target("https://app.example/a", "b?c#d").unwrap(), "https://app.example/b?c#d");
+    assert_eq!(cdp.ordinary_redirect_target("https://app.example/a", "https://seven.sliccy.ai/").unwrap_err(), format!("{}\n", cdp.guard.refusal()));
+}
+
+#[test]
 fn fetch_commands_refuse_unclassifiable_redirect_locations() {
     let guard = Protected::default();
     let paused = Paused { request_id: "R".into(), url: "https://app.example/".into(), status: Some(200), ..Paused::default() };
