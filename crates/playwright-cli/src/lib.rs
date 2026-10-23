@@ -14,6 +14,7 @@ mod document_client;
 mod help;
 mod launch;
 mod net;
+mod page_tools;
 mod recording;
 mod route;
 mod sanitize;
@@ -101,6 +102,9 @@ pub fn execute_in(
     }
     if route::is_route_command(&command) {
         return route::run(&invocation);
+    }
+    if command == "network-state-set" {
+        return page_tools::network_state_set(&invocation);
     }
     if recording::is_stop(&command) {
         return recording::stop(&invocation);

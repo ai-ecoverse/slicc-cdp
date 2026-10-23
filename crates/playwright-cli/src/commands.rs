@@ -22,6 +22,9 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = cookies::precheck(command, invocation) {
         return Output::err(message);
     }
+    if let Some(output) = crate::page_tools::precheck(command, invocation) {
+        return output;
+    }
     if let Some(message) = crate::storage::precheck(command, invocation) {
         return Output::err(message);
     }
@@ -181,6 +184,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         "pdf" => cmd_pdf(&mut cdp, &mut state, invocation, &mut report),
         "dialog-accept" => cmd_dialog(&mut cdp, &mut state, invocation, true),
         "dialog-dismiss" => cmd_dialog(&mut cdp, &mut state, invocation, false),
+        _ if crate::page_tools::is_command(command) => crate::page_tools::run(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
@@ -882,26 +886,41 @@ fn cmd_eval(
         return Output::err("eval requires an expression\n");
     }
     let expression = invocation.positionals.join(" ");
-    let pages = match browser::list_pages(cdp) {
-        Ok(pages) => pages,
+    let text = match evaluate_source(cdp, state, invocation, report, &expression) {
+        Ok(text) => text,
         Err(message) => return Output::err(message),
     };
-    let target = match resolve_target(cdp, invocation, state, &pages, false) {
-        Ok(target) => target,
-        Err(message) => return Output::err(message),
-    };
+    if let Some(path) = invocation
+        .flags
+        .get("filename")
+        .or_else(|| invocation.flags.get("output"))
+    {
+        return match write_text(path, &text) {
+            Ok(()) => Output::ok(format!("Result saved to {path}\n")),
+            Err(message) => Output::err(message),
+        };
+    }
+    Output::ok(format!("{}\n", sanitize::browser_message(&text)))
+}
+
+pub(crate) fn evaluate_source(
+    cdp: &mut Cdp,
+    state: &mut Session,
+    invocation: &Invocation,
+    report: &mut Report,
+    expression: &str,
+) -> Result<String, String> {
+    let pages = browser::list_pages(cdp)?;
+    let target = resolve_target(cdp, invocation, state, &pages, false)?;
     report.tab(&target);
     report.begin(cdp);
-    let session = match browser::watch_attach(cdp, state, &target) {
-        Ok(session) => session,
-        Err(message) => return Output::err(message),
-    };
+    let session = browser::watch_attach(cdp, state, &target)?;
     let result: Result<String, String> = (|| {
         let value = if let Some(frame_id) = invocation.flags.get("frame") {
             let child = browser::frame_session(cdp, &session, frame_id)?;
             let scope = child.as_deref().unwrap_or(&session);
-            let value = browser::evaluate_called(cdp, scope, Some(frame_id), &expression).or_else(|err| {
-                retry_await(err, &expression, |source| {
+            let value = browser::evaluate_called(cdp, scope, Some(frame_id), expression).or_else(|err| {
+                retry_await(err, expression, |source| {
                     browser::evaluate_called(cdp, scope, Some(frame_id), source)
                 })
             });
@@ -910,8 +929,8 @@ fn cmd_eval(
             }
             value?
         } else {
-            browser::evaluate_called(cdp, &session, None, &expression).or_else(|err| {
-                retry_await(err, &expression, |source| {
+            browser::evaluate_called(cdp, &session, None, expression).or_else(|err| {
+                retry_await(err, expression, |source| {
                     browser::evaluate_called(cdp, &session, None, source)
                 })
             })?
@@ -919,26 +938,10 @@ fn cmd_eval(
         Ok(browser::format_eval(&value))
     })();
     let watched = browser::watch_detach(cdp, state, &target, &session);
-    match result {
-        Ok(text) => {
-            if let Err(message) = watched {
-                return Output::err(message);
-            }
-            state.current = Some(target);
-            if let Some(path) = invocation
-                .flags
-                .get("filename")
-                .or_else(|| invocation.flags.get("output"))
-            {
-                return match write_text(path, &text) {
-                    Ok(()) => Output::ok(format!("Result saved to {path}\n")),
-                    Err(message) => Output::err(message),
-                };
-            }
-            Output::ok(format!("{}\n", sanitize::browser_message(&text)))
-        }
-        Err(message) => Output::err(message),
-    }
+    let text = result?;
+    watched?;
+    state.current = Some(target);
+    Ok(text)
 }
 
 fn retry_await(
@@ -1264,7 +1267,7 @@ fn modifiers_of(flag: Option<&str>) -> i64 {
     })
 }
 
-fn write_text(path: &str, text: &str) -> Result<(), String> {
+pub(crate) fn write_text(path: &str, text: &str) -> Result<(), String> {
     if let Some(parent) = PathBuf::from(path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|err| format!("{path}: {err}\n"))?;
