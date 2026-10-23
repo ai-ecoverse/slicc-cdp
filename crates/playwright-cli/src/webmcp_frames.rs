@@ -347,9 +347,10 @@ fn build_scope(cdp: &mut Cdp, state: &Session, target: &str, session: &str, fram
     let loader = document.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
     let origin = document.get("origin").and_then(Value::as_str).unwrap_or("").to_string();
     let latest = crate::session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
-    let remembered = latest.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).and_then(|entry| entry.get("sessions")).and_then(Value::as_array).and_then(|entries| entries.iter().find(|entry| entry.get("target").and_then(Value::as_str) == Some(&frame_target)));
+    let entries = latest.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).and_then(|entry| entry.get("sessions")).and_then(Value::as_array);
+    let remembered = entries.and_then(|entries| entries.iter().find(|entry| entry.get("target").and_then(Value::as_str) == Some(&frame_target)));
     let bridge = remembered.and_then(|entry| entry.get("bridge")).and_then(Value::as_str).filter(|name| bridge_name(name)).map(str::to_string);
-    let policy = remembered.and_then(|entry| entry.get("documents")).and_then(|documents| documents.get(format!("{}:{}", frame.frame_id, loader))).filter(|entry| entry.get("origin").and_then(Value::as_str) == Some(&origin)).and_then(|entry| entry.get("policy")).and_then(Value::as_str).map(str::to_string);
+    let policy = entries.into_iter().flatten().filter_map(|entry| entry.get("documents").and_then(|documents| documents.get(format!("{}:{}", frame.frame_id, loader)))).filter(|entry| entry.get("origin").and_then(Value::as_str) == Some(&origin)).map(|entry| entry.get("policy").and_then(Value::as_str).unwrap_or("tools=()").to_string()).reduce(|first, next| if first == next { first } else { "tools=()".to_string() });
     let mut scope = Scope { session, frame: frame.frame_id.clone(), origin, loader, isolated, isolated_unique, main, bridge, policy, path: Vec::new(), page_defined: false };
     scope.page_defined = evaluate(cdp, &scope, PAGE_DEFINED, false)?.as_bool() == Some(true);
     scopes.insert(frame.frame_id.clone(), scope);

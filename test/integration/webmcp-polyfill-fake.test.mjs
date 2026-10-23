@@ -225,6 +225,33 @@ await test('fake: collection refreshes holder policy metadata after its initial 
   );
 });
 
+await test('fake: verified response policy can be observed on the parent holder channel', async () => {
+  await fixture('', async (backend, cwd) => {
+    const config =
+      process.platform === 'darwin' ? path.join(cwd, 'Library', 'Application Support') : cwd;
+    const dir = path.join(config, 'slicc', 'playwright-cli', 'sessions');
+    const file = path.join(dir, (await readdir(dir))[0]);
+    const state = JSON.parse(await readFile(file, 'utf8'));
+    const own = state.webmcp.TAB.sessions[0];
+    const parent = structuredClone(own);
+    parent.target = 'PARENT_OBSERVER';
+    own.documents = {};
+    state.webmcp.TAB.sessions.push(parent);
+    await writeFile(file, JSON.stringify(state));
+    const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.equal(JSON.parse(listed.stdout).length, 3);
+    const conflicting = structuredClone(parent);
+    conflicting.target = 'CONFLICT';
+    for (const record of Object.values(conflicting.documents)) record.policy = 'tools=()';
+    state.webmcp.TAB.sessions.push(conflicting);
+    await writeFile(file, JSON.stringify(state));
+    const denied = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+    assert.equal(denied.code, 0, denied.stderr);
+    assert.deepEqual(JSON.parse(denied.stdout), []);
+  });
+});
+
 await test('fake: same-origin aggregation and explicit foreign exposure/delegation with ambiguous tool selection', async () => {
   await fixture(
     '',
