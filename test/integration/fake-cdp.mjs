@@ -89,6 +89,10 @@ function cookieDomain(domain) {
   return domain.startsWith('.') ? domain : `.${domain}`;
 }
 
+function samePartition(a, b) {
+  return a?.topLevelSite === b?.topLevelSite && a?.hasCrossSiteAncestor === b?.hasCrossSiteAncestor;
+}
+
 function sameCookie(a, b) {
   return a.name === b.name && a.domain === b.domain && a.path === b.path;
 }
@@ -302,6 +306,7 @@ export async function fakeCdp({
         case 'Fetch.disable':
           fetchSessions.delete(sessionId);
           return answer({});
+        case 'Fetch.fulfillRequest':
         case 'Fetch.continueRequest': {
           const complete = navigationPauses.get(params.requestId);
           navigationPauses.delete(params.requestId);
@@ -465,7 +470,7 @@ export async function fakeCdp({
               item.name === params.name &&
               item.domain === params.domain &&
               (!params.path || item.path === params.path) &&
-              JSON.stringify(item.partitionKey) === JSON.stringify(params.partitionKey)
+              samePartition(item.partitionKey, params.partitionKey)
             )
               jar.splice(index, 1);
           }

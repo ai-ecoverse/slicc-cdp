@@ -126,7 +126,7 @@ fn get(jar: &[Value], name: &str) -> String {
     )
 }
 
-fn delete(cdp: &mut Cdp, session: &str, cookie: &Value) -> Result<(), String> {
+pub(crate) fn delete(cdp: &mut Cdp, session: &str, cookie: &Value) -> Result<(), String> {
     let mut params = json!({
         "name": field(cookie, "name"),
         "domain": field(cookie, "domain"),
@@ -211,7 +211,7 @@ pub(crate) fn js_number(text: &str) -> Option<f64> {
     text.parse::<f64>().ok()
 }
 
-fn js_value(value: &Value) -> String {
+pub(crate) fn js_value(value: &Value) -> String {
     match value.as_f64().filter(|_| value.is_number()) {
         Some(number) if number.fract() == 0.0 => format!("{}", number as i64),
         Some(number) => format!("{number}"),
@@ -219,17 +219,17 @@ fn js_value(value: &Value) -> String {
     }
 }
 
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     let json = Value::String(text.to_string()).to_string();
     let inner = json[1..json.len() - 1].replace("\\\"", "\"").replace('\'', "\\'");
     format!("'{inner}'")
 }
 
-fn code(line: &str) -> String {
+pub(crate) fn code(line: &str) -> String {
     format!("### Ran Playwright code\n```js\n{line}\n```\n")
 }
 
-fn target(cdp: &mut Cdp, invocation: &Invocation, state: &mut Session) -> Result<PageInfo, String> {
+pub(crate) fn target(cdp: &mut Cdp, invocation: &Invocation, state: &mut Session) -> Result<PageInfo, String> {
     let pages = browser::list_pages(cdp)?;
     let id = match pages.first() {
         Some(page) if !invocation.flags.contains_key("tab") && state.current.is_none() => page.target_id.clone(),

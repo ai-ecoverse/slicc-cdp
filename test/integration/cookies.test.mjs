@@ -713,7 +713,7 @@ for (const kind of ['native', 'wasi']) {
       const global = await ok(['--help']);
       assert.ok(
         global.includes(
-          'Storage:\n  cookie-list                 list all cookies (optionally filtered by domain/path)\n  cookie-get <name>           get a specific cookie by name\n  cookie-set <name> <value>   set a cookie with optional flags\n  cookie-delete <name>        delete a specific cookie\n  cookie-clear                clear all cookies\n'
+          'Storage:\n  state-load <filename>       loads browser storage (authentication) state from a file\n  state-save [filename]       saves the current storage (authentication) state to a file\n  cookie-list                 list all cookies (optionally filtered by domain/path)\n  cookie-get <name>           get a specific cookie by name\n  cookie-set <name> <value>   set a cookie with optional flags\n  cookie-delete <name>        delete a specific cookie\n  cookie-clear                clear all cookies\n'
         ),
         global
       );

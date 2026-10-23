@@ -21,6 +21,7 @@ mod sanitize;
 mod session;
 mod snapshot;
 mod spec;
+mod storage;
 mod trace;
 mod upgrade;
 mod webmcp;
