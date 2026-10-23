@@ -87,6 +87,21 @@ Only the hash-pinned shim can use the dedicated installer. Its inert pre-executi
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
 
+## Foreground dialog holder
+
+Start `playwright-cli --cdp "$CDP" -s "$SESSION" dialog-hold --tab "$TAB"` before triggering dialogs, keep its stdin open, and wait for its newline JSON `ready` event. This uses the same selected session and user config directory as other commands; there is no daemon or mailbox relay, and no prompt text is saved. Standalone `dialog-accept` and `dialog-dismiss` remain unchanged and do not relay into the holder.
+
+The holder retains its observing CDP session. A `dialog-opened` event supplies `dialogId`; answer that observed dialog by writing one JSON line to the holder's stdin:
+
+```json
+{"id":1,"dialogId":7,"command":"dialog-accept","promptText":"Lars"}
+{"id":2,"dialogId":8,"command":"dialog-dismiss"}
+```
+
+`id` and `dialogId` are unsigned integers. Each request gets a reply event correlated by `id`: `handled`, `no-dialog`, `stale-dialog`, `dialog-refused` or `invalid-request`. A request with no observed open dialog gets `no-dialog`; dialogs opened before this holder attached are still unanswerable. `dialog-closed` revokes the observed ID. Only current verified ordinary main-frame ownership can be answered; protected, unknown, opaque, stale or subframe ownership stays refused. Closing stdin emits `stopped` and detaches.
+
+`ready` contains `target`, `loaderId`, `loaderIdSource` and `status`. The initial `loaderId` can be null (`unavailable`, `observing`): the holder never invents one or queries a frozen renderer. A verified ordinary main-frame `frameNavigated` event supplies the loader ID in `document-ready` (`frame-navigated`, `document-verified`). Dialog ownership is independently reverified before every answer; a loader ID is not permission to handle a dialog. No dialog message, URL or prompt answer is echoed in events.
+
 `resize`, `keydown`, `keyup`, `mousemove`, `mousedown`, `mouseup`, `mousewheel` and `drop` take Microsoft's arguments, print its `### Ran Playwright code` lines and send Playwright's key definitions, buttons, coordinates and modifier masks. The deliberate differences:
 
 - Every command is its own process, so the pointer position, held buttons and held keys are saved per tab in the session, and the next command continues from them as Playwright's `page.mouse` and `page.keyboard` do. Modifiers held with `keydown` apply to later key and mouse events. On a macOS browser `keydown` sends Playwright's editing commands; `ControlOrMeta` follows the browser's platform rather than the CLI's.

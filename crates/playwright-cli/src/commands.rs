@@ -188,6 +188,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         "pdf" => cmd_pdf(&mut cdp, &mut state, invocation, &mut report),
         "dialog-accept" => cmd_dialog(&mut cdp, &mut state, invocation, true),
         "dialog-dismiss" => cmd_dialog(&mut cdp, &mut state, invocation, false),
+        "dialog-hold" => crate::dialog_holder::hold(&mut cdp, &mut state, invocation),
         _ if crate::page_tools::is_command(command) => crate::page_tools::run(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };

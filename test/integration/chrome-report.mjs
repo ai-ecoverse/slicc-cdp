@@ -24,6 +24,7 @@ export const CHROME_FILES = new Set(
     'current-document',
     'data-document',
     'dialog',
+    'dialog-holder-chrome',
     'discover-payments',
     'discover-sinks',
     'discover-ucp',
