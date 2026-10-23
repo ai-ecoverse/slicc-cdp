@@ -47,7 +47,7 @@ fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str) -> Result<(),
     Ok(())
 }
 
-type Input = Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>;
+pub(crate) type Input = Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>;
 
 fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool) -> Result<(), String> {
     run_with_input(cdp, state, target, session, reload, input)
@@ -132,7 +132,7 @@ fn read_input(mut reader: impl io::Read, tx: mpsc::Sender<()>) {
     }
 }
 
-fn input() -> Result<Input, String> {
+pub(crate) fn input() -> Result<Input, String> {
     #[cfg(not(target_os = "wasi"))]
     {
         let (tx, rx) = mpsc::channel();

@@ -20,6 +20,7 @@ pub struct Session {
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
     pub routes: Vec<Route>,
+    pub offline: bool,
     pub webmcp: BTreeMap<String, Value>,
     pub webmcp_connection: String,
     pub cwd: Option<PathBuf>,
@@ -80,7 +81,7 @@ fn config_root() -> Option<String> {
     }
 }
 
-fn path_named(session_name: Option<&str>, cwd: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn path_named(session_name: Option<&str>, cwd: Option<&Path>) -> Option<PathBuf> {
     if let Some(cwd) = cwd {
         return storage_path_named(cwd, session_name);
     }
@@ -200,6 +201,7 @@ fn decode(text: &str) -> Session {
             .and_then(|item| item.as_array())
             .map(|items| items.iter().filter_map(route::decode).collect())
             .unwrap_or_default(),
+        offline: value.get("networkOffline").and_then(Value::as_bool).unwrap_or(false),
         webmcp: value.get("webmcp").and_then(Value::as_object).map(|entries| entries.iter().map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
         webmcp_connection: String::new(),
         cwd: None,
@@ -255,7 +257,7 @@ fn encode(session: &Session) -> Value {
         }
         snapshots.insert(target.clone(), Value::Object(object));
     }
-    json!({
+    let mut value = json!({
         "current": session.current,
         "endpoint": session.endpoint,
         "provenance": session.provenance,
@@ -267,7 +269,11 @@ fn encode(session: &Session) -> Value {
         "requests": encode_lists(&session.requests, |request| Some(stored_request(request))),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
         "webmcp": session.webmcp,
-    })
+    });
+    if session.offline {
+        value["networkOffline"] = json!(true);
+    }
+    value
 }
 
 const REDACTED: &str = "[redacted]";
@@ -738,10 +744,15 @@ pub fn without_state(mut output: crate::args::Output, message: &str) -> crate::a
 }
 
 pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(&encode(session)).unwrap_or_else(|_| "{}".into());
+    write_private(path, &body)
+}
+
+pub fn write_private(path: &Path, body: &str) -> Result<(), String> {
     #[cfg(target_os = "wasi")]
     {
         let old = wasi_mode::set_umask(0o077);
-        let written = wasi_write(path, session);
+        let written = wasi_write(path, body);
         if let Some(old) = old {
             wasi_mode::set_umask(old);
         }
@@ -749,12 +760,12 @@ pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
     }
     #[cfg(not(target_os = "wasi"))]
     {
-        host_write(path, session)
+        host_write(path, body)
     }
 }
 
 #[cfg(target_os = "wasi")]
-fn wasi_write(path: &Path, session: &Session) -> Result<(), String> {
+fn wasi_write(path: &Path, body: &str) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
@@ -764,7 +775,6 @@ fn wasi_write(path: &Path, session: &Session) -> Result<(), String> {
             }
         }
     }
-    let body = serde_json::to_string_pretty(&encode(session)).unwrap_or_else(|_| "{}".into());
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -804,7 +814,7 @@ mod wasi_mode {
 }
 
 #[cfg(not(target_os = "wasi"))]
-fn host_write(path: &Path, session: &Session) -> Result<(), String> {
+fn host_write(path: &Path, body: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
         #[cfg(unix)]
@@ -817,7 +827,6 @@ fn host_write(path: &Path, session: &Session) -> Result<(), String> {
             }
         }
     }
-    let body = serde_json::to_string_pretty(&encode(session)).unwrap_or_else(|_| "{}".into());
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

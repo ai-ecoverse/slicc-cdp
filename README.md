@@ -87,6 +87,55 @@ Only the hash-pinned shim can use the dedicated installer. Its inert pre-executi
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
 
+## Page tools
+
+`generate-locator`, `highlight` and `network-state-set` take Microsoft's arguments and options and print its output and exit codes. `eval-file` and `fetch` are SLICC-only. Where they differ from Microsoft's, or from SLICC's own handlers:
+
+- `generate-locator <ref>` runs Playwright's own selector generator and `asLocator` from the `playwright-core` 1.64 injected script (Apache-2.0, Copyright Microsoft Corporation), vendored in `crates/playwright-cli/vendor/playwright-injected.js.txt` with upstream's license header and its `LICENSE` and `NOTICE` beside it, in an isolated world of the element's frame, so it prints the same `getByRole(…)`, `getByTestId(…)` or `.nth(…)` locator. A ref in an iframe gets the iframe's locator and `.contentFrame()` in front. A frame nested inside an out-of-process iframe is refused instead.
+- `highlight <ref>` prints `Highlighted locator('aria-ref=e5')` like upstream. The overlay is SLICC's: an `x-slicc-highlight` element in the top layer, with an open shadow root and one box per element, that follows the element while its isolated world lives. It shows no locator tooltip. `--style` is appended to the box's inline style. `--hide <ref>` removes that element's box, and `--hide` alone removes every overlay in the tab's frames that the guard admits.
+- `network-state-set offline|online` is saved with the session, like routes, because each command runs in its own process. While offline, every later command that attaches to a tab first sends Playwright's `Network.emulateNetworkConditions` with `offline: true`, latency 0 and unlimited throughput, and the setting ends when that command detaches. Out-of-process iframes and workers keep their network. The guard admits only that exact shape, only on an ordinary page session, and never on seven's, the vault's or an unknown target. It does not change guard interception. Upstream's `--tab` is not accepted, as upstream has none.
+- The vendored script is `injectedScriptSource` from `playwright-core@1.64.0-alpha-1790635538000` (`lib/coreBundle.js`), minified with `esbuild@0.25.10`. `node scripts/vendor-playwright-injected.mjs [version]` downloads that package with `npm pack`, extracts and minifies the source the same way, and rewrites the file, `LICENSE` and `NOTICE`; with the default version it reproduces the committed bytes. The `.txt` extension keeps the license header out of the no-comment lint, and the file is only embedded with `include_str!`.
+- These ref commands take snapshot refs only, not selectors, like `click`. Errors go to stderr; upstream prints them on stdout under `### Error`, except for `highlight` with neither a ref nor `--hide`, which prints upstream's error.
+- `eval-file <path> [--tab] [--frame] [--output|--filename <file>]` reads only the file you name, up to 16 MiB of UTF-8, and evaluates it through `eval`'s guarded path: a function expression is called, and top-level `await` and `return` work. `--output` prints `Result saved to <file> (<n> KB)`.
+- `fetch <url> [--method <method>] [--tab]` runs `fetch()` in the tab, so the tab's cookies, origin and CORS rules apply. It is not SLICC's proxied fetch and has no `--discover`. A relative URL is resolved against the document. Only http and https are fetched. A protected destination is refused before connecting and again after it is resolved. Every request uses `redirect: 'manual'`: ordinary redirect Locations must be unambiguously correlated to that request in admitted CDP Network events and pass the guard before the next hop is sent. Missing or ambiguous redirect metadata fails closed, and at most 20 redirects are followed. POST becomes GET on 301/302, and 303 becomes GET except for HEAD; 307/308 preserve the method. The body is never read. It prints JSON with `url`, `status`, `redirected`, the `links` from the final `Link` header (one entry per `rel`, protected targets dropped) and the SLICC `upskill` link as `handoff`, and exits 1 on non-2xx responses or with an `error` when the request fails. The guard redacts SLICC's `handoff` relation, which names seven's origin, so it is listed only as that origin and never reported as a handoff.
+
+## Regenerating the Playwright injected script
+
+From the repository root, run:
+
+```sh
+node scripts/vendor-playwright-injected.mjs 1.64.0-alpha-1790635538000
+git diff -- crates/playwright-cli/vendor
+npm run lint
+```
+
+The pinned package and `esbuild@0.25.10` produce the committed bytes. Keep the upstream copyright and Apache-2.0 header, `LICENSE` and `NOTICE` together when updating. If changing the source version, update the script's default version and this README, then run the native and kernel `page-tools.test.mjs` locator regressions in CI.
+
+## Recording
+
+`recording-start` and `recording-stop` are Microsoft's commands of the same names; `record` and `stop-recording` are aliases. Microsoft keeps the browser in a daemon, so its `recording-start` returns at once. There is no daemon here: `recording-start` is a foreground holder, like `webmcp-polyfill`. It records until its stdin closes or `recording-stop` runs in another terminal with the same session.
+
+```sh
+playwright-cli recording-start --tab <targetId>
+playwright-cli recording-stop
+```
+
+The holder prints one JSON event per line: `ready` with the tab and `loaderId`, `paused` and `resumed` around documents it may not record, and `stopped` with a `reason` (`stdin`, `stop`, `closed` or `refused`) and the recorded `actions`. `recording-stop` prints Microsoft's result: `### Result`, `Recording stopped. Recorded actions:` and the actions in a `js` code block, or `Recording stopped. No actions were recorded.` Without a running holder it prints Microsoft's `Error: No recording in progress, use browser_start_recording to start one.` on stderr and exits 1. A second `recording-start` while one runs prints `Error: Recording is already in progress.` and exits 1.
+
+The recorder writes Playwright code for trusted clicks, double clicks, right and middle clicks, fills, key presses, checks, selects and file choices in the main frame. A new document is recorded as `page.goto` unless a click, press or fill came less than five seconds before it. Locators prefer a test id, then role and accessible name (from Playwright's aria code in `aria-snapshot.js`), placeholder, label, text, role alone, a stable id, and finally `nth` or a CSS path.
+
+The recorder runs in an isolated world that the guarded client installs only after the guard has verified the current main-frame document, and its events are read through guarded `Runtime.evaluate` calls pinned to that context. It uses no binding, init script, screencast or tracing. When the holder stops it removes the recorder's listeners, each start replaces any earlier recorder on that document, and a recorder that nobody drains for five seconds drops what it sees, so input between recordings is never captured. Nothing is installed in or read from seven's, the vault's, protected, unverified or unknown documents: capture pauses on an unverified document, and recording stops with `reason: "refused"` and exit 1 when the tab turns protected. Actions recorded before that stay available to `recording-stop`. Frames are not recorded, so a protected iframe is never read. A `goto` URL is redacted like every other URL unless `--full-urls` is given. The holder keeps the actions in memory; when it stops for `recording-stop`, a closed tab or a refusal, the result waits in a 0600 file next to the saved session until `recording-stop` reads and deletes it.
+
+Deliberate differences from Microsoft's recorder:
+
+- `recording-start` holds the terminal and prints JSON events instead of `### Result` and returning.
+- `recording-stop` prints no `### Page` or `### Snapshot` section, like the other commands here.
+- Only the selected tab's main frame is recorded: no iframes, popups (`page1`), dialog, download or popup signals, and no assertions.
+- Events are observed, not intercepted: there is no recorder overlay, and the locator generator is a smaller version of Playwright's.
+- The code is always JavaScript; the `codegen` language setting does not exist here.
+- `--tab <targetId>` picks the tab. The old SLICC placeholders `record [url] --filter` and `stop-recording <recordingId>` (HAR recording) are gone; the names remain as argument-free aliases.
+- Microsoft's `video-*` and `tracing-*` commands are not offered: `Page.startScreencast` and `Tracing.start` keep capturing across navigations, including into protected documents, and the guard refuses both.
+
 ## Develop
 
 ```sh
@@ -145,7 +194,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Network.setRequestInterception`
 - `Fetch.*`
 
-The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including generic init scripts, bindings, page overrides and automatic debugger-waiting attachment. The dedicated WebMCP installer is the sole vetted-shim exception: it accepts a session, never client-provided source, and gates the pinned bytes on guard-owned document verification. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
+The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including generic init scripts, bindings, page overrides and automatic debugger-waiting attachment. `Network.emulateNetworkConditions` is the one network override admitted, and only as Playwright's offline toggle on an ordinary page session. The dedicated WebMCP installer is the sole vetted-shim exception: it accepts a session, never client-provided source, and gates the pinned bytes on guard-owned document verification. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
 
 ### Session-level domains
 

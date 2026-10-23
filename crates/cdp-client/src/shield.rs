@@ -113,6 +113,17 @@ pub fn browser_wide(
     Some(format!("slicc: refused: {reason}\n"))
 }
 
+pub fn network_state(method: &str, params: &Value) -> bool {
+    method == "Network.emulateNetworkConditions"
+        && params.as_object().is_some_and(|object| {
+            object.len() == 4
+                && object.get("offline").is_some_and(Value::is_boolean)
+                && object.get("latency").and_then(Value::as_i64) == Some(0)
+                && object.get("downloadThroughput").and_then(Value::as_i64) == Some(-1)
+                && object.get("uploadThroughput").and_then(Value::as_i64) == Some(-1)
+        })
+}
+
 pub fn persistent_capability(method: &str) -> bool {
     match method.split_once('.') {
         Some(("Emulation", command)) => !matches!(command, "canEmulate" | "getScreenInfos"),

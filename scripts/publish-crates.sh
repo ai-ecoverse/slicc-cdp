@@ -15,9 +15,13 @@ publish_one() {
       return 0
     fi
     cat "$log"
-    if grep -q 'already uploaded' "$log"; then
+    if grep 'already uploaded' "$log" >/dev/null; then
       rm -f "$log"
       return 0
+    fi
+    if grep -i -E 'status 429|too many requests|too many versions|rate.?limit' "$log" >/dev/null; then
+      rm -f "$log"
+      return 2
     fi
     rm -f "$log"
     n=$((n + 1))
@@ -25,8 +29,14 @@ publish_one() {
   done
   return 1
 }
-publish_one slicc-cdp-client
-publish_one slicc-discovery
-publish_one slicc-cdp
-publish_one curlwright
+for name in slicc-cdp-client slicc-discovery slicc-cdp curlwright; do
+  status=0
+  publish_one "$name" || status=$?
+  if [ "$status" -eq 2 ]; then
+    echo "::warning::crates.io rate-limited $name $version; skipped it and the crates after it, the next release publishes the newest version"
+    echo "publish-crates: SKIP $name $version rate-limited by crates.io"
+    exit 0
+  fi
+  [ "$status" -eq 0 ] || exit "$status"
+done
 echo "publish-crates: PASS 4 crates $version"

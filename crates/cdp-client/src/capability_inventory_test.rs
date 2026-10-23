@@ -22,7 +22,8 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     ]);
     let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker"]);
     let vetted_shim = set(&["Debugger.enable", "Debugger.getScriptSource", "Debugger.evaluateOnCallFrame", "Page.addScriptToEvaluateOnNewDocument", "Page.removeScriptToEvaluateOnNewDocument", "Runtime.runIfWaitingForDebugger", "Target.setAutoAttach"]);
-    let inventory = [&document, &observation, &request, &origin, &target, &internal, &vetted_shim];
+    let network_state = set(&["Network.emulateNetworkConditions"]);
+    let inventory = [&document, &observation, &request, &origin, &target, &internal, &vetted_shim, &network_state];
     let mut methods: BTreeSet<String> = sent().into_iter()
         .filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs"))
         .map(|(method, _, _)| method)
@@ -44,6 +45,20 @@ fn production_cdp_methods_have_a_lifetime_classification() {
                 assert!(source.contains("vetted_source(SHIM)?"));
                 assert!(source.contains("sha256_hex(source.as_bytes()) != SHIM_HASH"));
                 assert!(source.contains("__slicc_webmcp_admitted"));
+                continue;
+            }
+            if network_state.contains(method) {
+                let shield = fs::read_to_string(root().join("crates/cdp-client/src/shield.rs")).unwrap();
+                let shape = shield.split("pub fn network_state(").nth(1).unwrap().split("pub fn persistent_capability(").next().unwrap();
+                for part in ["object.len() == 4", "\"offline\").is_some_and(Value::is_boolean)", "\"latency\").and_then(Value::as_i64) == Some(0)", "\"downloadThroughput\").and_then(Value::as_i64) == Some(-1)", "\"uploadThroughput\").and_then(Value::as_i64) == Some(-1)"] {
+                    assert!(shape.contains(part), "{part}");
+                }
+                let source = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
+                assert!(source.contains("shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id)"));
+                let admitted = source.split("fn network_state_admitted(").nth(1).unwrap().split("fn prepare(").next().unwrap();
+                for part in ["!self.guard_sessions.contains(session)", "!self.blocked.contains(session)", "Some(\"page\")", "!self.info_protected(info, &[])"] {
+                    assert!(admitted.contains(part), "{part}");
+                }
                 continue;
             }
             assert_eq!(method, "Network.setBypassServiceWorker", "CLI sends an unsafe persistent method: {method}");
