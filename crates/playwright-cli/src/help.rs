@@ -92,6 +92,12 @@ pub fn global_help() -> String {
         row("generate-locator <target>", "generate a playwright locator for the given element"),
         row("highlight [target]", "show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."),
         String::new(),
+        "Recording:".to_string(),
+        row("recording-start", "start recording user actions"),
+        row("recording-stop", "stop recording user actions and print them as playwright code"),
+        row("record", "alias of recording-start"),
+        row("stop-recording", "alias of recording-stop"),
+        String::new(),
         "Browsers:".to_string(),
         row(
             "list",
@@ -215,6 +221,26 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--tab <targetId>", "tab to run in"),
                 ("--method <method>", "request method, defaults to GET"),
             ],
+        ),
+        "recording-start" | "record" => page(
+            &format!("{name} "),
+            &[
+                "Start recording user actions",
+                "A foreground holder: it records until stdin closes or recording-stop runs in another terminal.",
+                "Stdout is JSON events: ready, paused, resumed, and stopped with the recorded actions.",
+                "Only verified ordinary main-frame documents are recorded. Capture pauses on unverified documents and stops when the tab turns protected.",
+            ],
+            &[],
+            &[("--tab <targetId>", "tab to record")],
+        ),
+        "recording-stop" | "stop-recording" => page(
+            &format!("{name} "),
+            &[
+                "Stop recording user actions and print them as Playwright code",
+                "Stops the recording-start holder of this session and prints the actions it recorded.",
+            ],
+            &[],
+            &[],
         ),
         "open" => page(
             "open [url]",
@@ -825,7 +851,6 @@ fn arg_optional(spec: &Spec, index: usize) -> bool {
             | ("console", 0)
             | ("dialog-accept", 0)
             | ("unroute", 0)
-            | ("record", 0)
             | ("highlight", 0)
     )
 }

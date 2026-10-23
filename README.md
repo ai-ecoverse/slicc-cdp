@@ -111,6 +111,31 @@ npm run lint
 
 The pinned package and `esbuild@0.25.10` produce the committed bytes. Keep the upstream copyright and Apache-2.0 header, `LICENSE` and `NOTICE` together when updating. If changing the source version, update the script's default version and this README, then run the native and kernel `page-tools.test.mjs` locator regressions in CI.
 
+## Recording
+
+`recording-start` and `recording-stop` are Microsoft's commands of the same names; `record` and `stop-recording` are aliases. Microsoft keeps the browser in a daemon, so its `recording-start` returns at once. There is no daemon here: `recording-start` is a foreground holder, like `webmcp-polyfill`. It records until its stdin closes or `recording-stop` runs in another terminal with the same session.
+
+```sh
+playwright-cli recording-start --tab <targetId>
+playwright-cli recording-stop
+```
+
+The holder prints one JSON event per line: `ready` with the tab and `loaderId`, `paused` and `resumed` around documents it may not record, and `stopped` with a `reason` (`stdin`, `stop`, `closed` or `refused`) and the recorded `actions`. `recording-stop` prints Microsoft's result: `### Result`, `Recording stopped. Recorded actions:` and the actions in a `js` code block, or `Recording stopped. No actions were recorded.` Without a running holder it prints Microsoft's `Error: No recording in progress, use browser_start_recording to start one.` on stderr and exits 1. A second `recording-start` while one runs prints `Error: Recording is already in progress.` and exits 1.
+
+The recorder writes Playwright code for trusted clicks, double clicks, right and middle clicks, fills, key presses, checks, selects and file choices in the main frame. A new document is recorded as `page.goto` unless a click, press or fill came less than five seconds before it. Locators prefer a test id, then role and accessible name (from Playwright's aria code in `aria-snapshot.js`), placeholder, label, text, role alone, a stable id, and finally `nth` or a CSS path.
+
+The recorder runs in an isolated world that the guarded client installs only after the guard has verified the current main-frame document, and its events are read through guarded `Runtime.evaluate` calls pinned to that context. It uses no binding, init script, screencast or tracing. When the holder stops it removes the recorder's listeners, each start replaces any earlier recorder on that document, and a recorder that nobody drains for five seconds drops what it sees, so input between recordings is never captured. Nothing is installed in or read from seven's, the vault's, protected, unverified or unknown documents: capture pauses on an unverified document, and recording stops with `reason: "refused"` and exit 1 when the tab turns protected. Actions recorded before that stay available to `recording-stop`. Frames are not recorded, so a protected iframe is never read. A `goto` URL is redacted like every other URL unless `--full-urls` is given. The holder keeps the actions in memory; when it stops for `recording-stop`, a closed tab or a refusal, the result waits in a 0600 file next to the saved session until `recording-stop` reads and deletes it.
+
+Deliberate differences from Microsoft's recorder:
+
+- `recording-start` holds the terminal and prints JSON events instead of `### Result` and returning.
+- `recording-stop` prints no `### Page` or `### Snapshot` section, like the other commands here.
+- Only the selected tab's main frame is recorded: no iframes, popups (`page1`), dialog, download or popup signals, and no assertions.
+- Events are observed, not intercepted: there is no recorder overlay, and the locator generator is a smaller version of Playwright's.
+- The code is always JavaScript; the `codegen` language setting does not exist here.
+- `--tab <targetId>` picks the tab. The old SLICC placeholders `record [url] --filter` and `stop-recording <recordingId>` (HAR recording) are gone; the names remain as argument-free aliases.
+- Microsoft's `video-*` and `tracing-*` commands are not offered: `Page.startScreencast` and `Tracing.start` keep capturing across navigations, including into protected documents, and the guard refuses both.
+
 ## Develop
 
 ```sh
