@@ -20,6 +20,7 @@ export const CHROME_FILES = new Set(
     'chromium-kernel-basics',
     'chromium-kernel-guards',
     'chromium',
+    'client-issued-chrome',
     'curlwright-redirect-chrome',
     'current-document',
     'data-document',

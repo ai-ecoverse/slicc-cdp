@@ -416,6 +416,16 @@ fn redirect_refusal<'a>(guard: &'a Protected, base: &str, headers: &[(String, St
     })
 }
 
+fn location_refusal(guard: &Protected, base: &str, status: Option<u16>, headers: &[(String, String)]) -> Result<(), String> {
+    if !status.is_some_and(|status| (300..400).contains(&status)) {
+        return Ok(());
+    }
+    for (_, value) in headers.iter().filter(|(name, _)| name.trim().eq_ignore_ascii_case("location")) {
+        cdp::target_refusal(guard, base, value)?;
+    }
+    Ok(())
+}
+
 pub fn command(
     guard: &Protected,
     paused: &Paused,
@@ -429,6 +439,7 @@ pub fn command(
                 if guard.url(url) {
                     return Err(format!("{}\n", guard.refusal_for_url(url)));
                 }
+                cdp::target_refusal(guard, url, url)?;
                 params["url"] = json!(url);
             }
             if let Some(method) = &overrides.method {
@@ -459,6 +470,7 @@ pub fn command(
                 if let Some(reason) = redirect_refusal(guard, &paused.url, headers) {
                     return Err(format!("{reason}\n"));
                 }
+                location_refusal(guard, &paused.url, overrides.status.or(paused.status), headers)?;
                 params["responseHeaders"] = header_list(headers);
             }
             Ok(("Fetch.continueResponse", params))
@@ -467,6 +479,7 @@ pub fn command(
             if let Some(reason) = redirect_refusal(guard, &paused.url, &fulfill.headers) {
                 return Err(format!("{reason}\n"));
             }
+            location_refusal(guard, &paused.url, Some(fulfill.status), &fulfill.headers)?;
             let mut params = json!({
                 "requestId": id,
                 "responseCode": fulfill.status,
@@ -1134,7 +1147,7 @@ mod tests {
         assert!(refused(cdp.call("Fetch.continueWithAuth", json!({ "requestId": "A1", "authChallengeResponse": answer }), Some("S"))));
         cdp.call("Fetch.continueWithAuth", json!({ "requestId": "A2", "authChallengeResponse": answer }), Some("S")).unwrap();
         assert!(refused(cdp.call("Fetch.continueWithAuth", json!({ "requestId": "A2", "authChallengeResponse": answer }), Some("S"))));
-        assert_eq!(methods(&log), ["Fetch.continueWithAuth", "Fetch.continueWithAuth"]);
+        assert_eq!(methods(&log), ["Fetch.continueWithAuth", "Fetch.enable", "Fetch.continueWithAuth"]);
     }
 
     fn panic_decider() -> Option<crate::cdp::Decider> {
