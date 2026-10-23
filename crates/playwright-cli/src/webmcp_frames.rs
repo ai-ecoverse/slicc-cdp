@@ -98,6 +98,17 @@ pub fn list(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &
     with_tools(cdp, state, target, session, from, |_, collected| if collected.available { Ok(Value::Array(collected.tools.into_iter().map(|tool| tool.value).collect())) } else { Ok(Value::Null) })
 }
 
+pub fn frames(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String]) -> Result<Value, String> {
+    with_tools(cdp, state, target, session, from, |_, collected| {
+        let mut frames = serde_json::Map::new();
+        for scope in collected.scopes.values() { frames.insert(scope.frame.clone(), json!({"loaderId":scope.loader,"tools":[]})); }
+        for tool in collected.tools {
+            if let Some(Value::Array(tools)) = frames.get_mut(&tool.scope.frame).and_then(|frame| frame.get_mut("tools")) { tools.push(tool.value); }
+        }
+        Ok(Value::Object(frames))
+    })
+}
+
 pub fn call(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], frame: Option<&str>, name: &str, input: &Value, allow: bool) -> Result<Value, String> {
     with_tools(cdp, state, target, session, from, |cdp, collected| {
         if !collected.available { return Ok(json!({"__webmcp_error":"absent"})); }

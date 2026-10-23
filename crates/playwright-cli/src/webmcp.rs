@@ -463,7 +463,7 @@ fn parse_value(value: Value) -> Result<CallOutcome, String> {
     Err("webmcp-call: unexpected evaluation result\n".into())
 }
 
-fn redact_output(value: &mut Value) {
+pub(crate) fn redact_output(value: &mut Value) {
     match value {
         Value::String(text) => *text = sanitize::browser_message(text),
         Value::Array(values) => values.iter_mut().for_each(redact_output),

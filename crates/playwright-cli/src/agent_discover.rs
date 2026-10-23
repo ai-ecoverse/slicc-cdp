@@ -184,6 +184,7 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         Ok(start) => start,
         Err(message) => return Output::err(message),
     };
+    let mut feed = HolderFeed::new(&start, invocation);
     let mut cdp = match cdp::open(start, invocation.runtime.as_deref()) {
         Ok(cdp) => cdp,
         Err(message) => return Output::err(message),
@@ -403,7 +404,8 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                     continue;
                 }
             }
-            let events_out = process_events(&mut cdp, &mut state);
+            let mut events_out = process_events(&mut cdp, &mut state);
+            events_out.push_str(&feed.poll(&mut cdp, &mut state));
             if !events_out.is_empty() {
                 eprint_flush(&events_out);
             }
@@ -481,7 +483,8 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
                 continue;
             }
         }
-        let events_out = process_events(&mut cdp, &mut state);
+        let mut events_out = process_events(&mut cdp, &mut state);
+        events_out.push_str(&feed.poll(&mut cdp, &mut state));
         if !events_out.is_empty() {
             eprint_flush(&events_out);
         }
@@ -541,6 +544,72 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
             }
         attach_new_targets(&mut cdp, &mut state);
     }
+}
+
+struct HolderFeed {
+    connection: String,
+    session: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+    seen: BTreeMap<(String, String, String), u64>,
+    primed: bool,
+    next: Instant,
+}
+
+impl HolderFeed {
+    fn new(start: &crate::connect::Start, invocation: &Invocation) -> Self {
+        let (crate::connect::Start::Direct(endpoint) | crate::connect::Start::Discover(endpoint)) = start;
+        HolderFeed { connection: cdp_client::hash::sha256_hex(endpoint.as_bytes()), session: invocation.session.clone(), cwd: invocation.cwd.clone(), seen: BTreeMap::new(), primed: false, next: Instant::now() }
+    }
+
+    fn poll(&mut self, cdp: &mut Cdp, state: &mut WatcherState) -> String {
+        if Instant::now() < self.next { return String::new(); }
+        self.next = Instant::now() + Duration::from_millis(250);
+        let latest = session::load_in(self.session.as_deref(), self.cwd.as_deref());
+        let watched = state.sessions.iter().map(|(session, watched)| (session.clone(), watched.target_id.clone())).collect::<Vec<_>>();
+        let mut output = String::new();
+        for (session, target) in watched {
+            let Some(entry) = latest.webmcp.get(&target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&self.connection)) else { continue };
+            let owner = entry.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
+            for (frame, record) in entry.get("changes").and_then(Value::as_object).into_iter().flatten() {
+                let sequence = record.get("sequence").and_then(Value::as_u64).unwrap_or(0);
+                let previous = self.seen.insert((target.clone(), owner.clone(), frame.clone()), sequence);
+                if self.primed && previous.is_none_or(|previous| previous < sequence) {
+                    output.push_str(&holder_change(cdp, state, &session, &target, record));
+                }
+            }
+        }
+        self.primed = true;
+        output
+    }
+}
+
+fn holder_change(cdp: &mut Cdp, state: &mut WatcherState, session: &str, target: &str, record: &Value) -> String {
+    let change = &record["event"];
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let Ok(tree) = cdp.call("Page.getFrameTree", json!({}), Some(session)) else { return String::new() };
+    let top = &tree["frameTree"]["frame"];
+    let page = text(top, "url");
+    let current = !text(top, "loaderId").is_empty() && top.get("loaderId") == record.get("topLoaderId") && text(change, "tab") == target;
+    let origin = extract_origin(&page).unwrap_or_default();
+    if !current || origin.is_empty() || cdp.guard().url(&page) || cdp.guard().url(&text(change, "origin")) || cdp.is_protected_target(target) || cdp.is_protected_target(&text(change, "target")) {
+        return String::new();
+    }
+    let mut tools = change.get("tools").filter(|tools| tools.is_array()).cloned().unwrap_or_else(|| json!([]));
+    crate::webmcp::redact_output(&mut tools);
+    let event = DiscoveryEvent {
+        v: EVENT_VERSION,
+        standard: "webmcp".to_string(),
+        aliases: None,
+        origin,
+        url: page.clone(),
+        via: Via::PageApi,
+        page,
+        target_id: target.to_string(),
+        status: Validity::Valid,
+        summary: json!({"event":"tools-changed","target":change["target"],"frameId":change["frameId"],"loaderId":change["loaderId"],"origin":change["origin"],"tools":tools}),
+        reason: None,
+    };
+    emit_event(state, &event)
 }
 
 fn eprint_flush(text: &str) {
