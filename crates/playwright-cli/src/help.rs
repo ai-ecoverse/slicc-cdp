@@ -195,7 +195,7 @@ fn implemented_page(name: &str) -> Option<String> {
             "fetch <url>",
             &[
                 "Fetch a URL in the tab and list its Link headers",
-                "Runs fetch() in the tab with its cookies and origin, like curlwright, and prints JSON with the status, the Link header entries and any SLICC handoff link. The body is not read.",
+                "Runs fetch() in the tab with its cookies and origin, like curlwright, and prints JSON with the status, the Link header entries and any SLICC upskill link. The body is not read.",
                 "Seven's origins and the vault are refused, and a redirect to them fails the request.",
             ],
             &[("<url>", "http(s) URL, absolute or relative to the tab")],

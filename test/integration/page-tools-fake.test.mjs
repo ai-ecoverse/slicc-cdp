@@ -11,11 +11,13 @@ import { kernelRunner } from './runners.mjs';
 import './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const exe = path.join(
-  root,
-  'target/debug',
-  process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
-);
+const exe =
+  process.env.SLICC_PAGE_TOOLS_BIN ||
+  path.join(
+    root,
+    'target/debug',
+    process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+  );
 const wasm = (name) => path.join(root, 'target/wasm32-wasip1/debug', `${name}.wasm`);
 const conditions = (offline) => ({
   offline,
