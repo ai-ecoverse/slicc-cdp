@@ -80,7 +80,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 ### Browser-level methods
 
 - `Target.getTargets` (`crates/playwright-cli/src/browser.rs` `list_pages`)
-- `Target.getTargetInfo` (`crates/cdp-client/src/cdp.rs` `target_protected`)
+- `Target.getTargetInfo` (`crates/cdp-client/src/cdp.rs` `judge_target`)
 - `Target.setDiscoverTargets` (`crates/playwright-cli/src/agent_discover.rs` `run`)
 - `Target.createTarget` (`crates/cdp-client/src/cdp.rs` `create_target`)
 - `Target.attachToTarget` (`crates/cdp-client/src/cdp.rs` `attach`)
