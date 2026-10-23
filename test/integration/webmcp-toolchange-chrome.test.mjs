@@ -248,7 +248,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     const protectedSession = (
       await raw.send('Target.attachToTarget', { targetId: sealed.targetId, flatten: true })
     ).sessionId;
-    await evaluate(raw, protectedSession, 'addProtected()');
+    assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
     const crossSession = (
       await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
     ).sessionId;
