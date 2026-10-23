@@ -587,12 +587,12 @@ fn delayed_related_context_clears_require_a_new_private_replay_before_execution(
 }
 
 #[test]
-fn acknowledged_blank_navigation_from_an_allowed_error_document_is_readable() {
+fn acknowledged_blank_navigation_from_a_sealed_error_document_is_readable() {
     let (mut cdp, backend) = fixture();
     let session = attach(&mut cdp, "T");
     backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LERROR","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":"https://seven.sliccy.ai/path?private#fragment"}}});
     backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":"https://seven.sliccy.ai/path?private#fragment"}));
-    cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+    refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
     {
         let mut state = backend.borrow_mut();
         state.navigation_tree = Some(json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}}));
@@ -806,5 +806,51 @@ fn stream_commands_require_the_document_generation_that_opened_the_handle() {
         let from = backend.borrow().calls.len();
         refused(cdp.call(method, json!({"handle":"H"}), None));
         assert!(!backend.borrow().calls[from..].iter().any(|call| call["method"] == method));
+    }
+}
+
+fn error_tree(unreachable: &str) -> Value {
+    json!({"frameTree":{"frame":{"id":"F","loaderId":"LERROR","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":unreachable}}})
+}
+
+const ERROR_TARGETS: [(&str, bool); 5] = [
+    ("https://seven.sliccy.ai/path-secret?q=QSECRET", false),
+    ("https://vault.sliccy.ai/path-secret?q=QSECRET", false),
+    ("", false),
+    ("not a url", false),
+    ("https://ordinary.example/missing?q=visible", true),
+];
+
+#[test]
+fn root_error_documents_admit_content_only_for_a_verified_ordinary_unreachable_url() {
+    for (unreachable, ordinary) in ERROR_TARGETS {
+        for (method, params) in [("Runtime.evaluate", json!({"expression":"document.documentElement.outerHTML"})), ("DOM.getDocument", json!({}))] {
+            let (mut cdp, backend) = fixture();
+            let session = attach(&mut cdp, "T");
+            cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+            backend.borrow_mut().tree = error_tree(unreachable);
+            let from = backend.borrow().calls.len();
+            let result = cdp.call(method, params.clone(), Some(&session));
+            let sent = backend.borrow().calls[from..].iter().any(|call| call["method"] == method);
+            if ordinary { result.unwrap(); assert!(sent); } else { refused(result); assert!(!sent, "{unreachable} {method}"); }
+        }
+    }
+}
+
+#[test]
+fn evaluation_replies_are_refused_when_a_protected_error_document_commits_in_flight() {
+    for (unreachable, ordinary) in ERROR_TARGETS {
+        let (mut cdp, backend) = fixture();
+        let session = attach(&mut cdp, "T");
+        let guard = backend.borrow().sessions.iter().find(|(id, _)| *id != &session).unwrap().0.clone();
+        cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
+        let error = error_tree(unreachable);
+        backend.borrow_mut().attach_event = Some(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":error["frameTree"]["frame"]}}));
+        backend.borrow_mut().next_tree = Some(error);
+        backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":unreachable}));
+        let result = cdp.call("Runtime.evaluate", json!({"expression":"location.href"}), Some(&session));
+        assert!(backend.borrow().calls.iter().any(|call| call["method"] == "Runtime.evaluate" && call["params"]["expression"] == "location.href"));
+        let next = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));
+        if ordinary { result.unwrap(); next.unwrap(); } else { refused(result); refused(next); }
     }
 }

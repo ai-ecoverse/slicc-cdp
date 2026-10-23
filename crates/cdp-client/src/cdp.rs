@@ -406,6 +406,7 @@ impl Cdp {
         if content_command(method, &params) == Some(true) && !executed {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"))?;
         }
+        if executed { self.verify_execution(&checks)?; }
         if let (true, Some(session), Some(id)) = (
             shield::answers_interception(method),
             session_id,
@@ -817,6 +818,20 @@ impl Cdp {
             if same_document && &current != expected { return Err(self.refusal()) }
         }
         Ok(())
+    }
+
+    fn verify_execution(&self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+        let sealed = checks.iter().any(|(target, state)| {
+            let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
+            self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
+        });
+        if sealed { Err(self.refusal()) } else { Ok(()) }
+    }
+
+    fn unverified_error(&self, url: &str, unreachable: &str) -> bool {
+        let error = self.guard.error_page_url(url) || !unreachable.is_empty()
+            || url.get(..13).is_some_and(|scheme| scheme.eq_ignore_ascii_case("chrome-error:"));
+        error && (url::Url::parse(unreachable).is_err() || self.guard.url(unreachable))
     }
 
     fn bind_streams(&mut self, method: &str, session: Option<&str>, result: &Value, checks: &[(String, DocumentState)]) {
@@ -1596,7 +1611,8 @@ impl Cdp {
         let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error;
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
             || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
-            || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))) { return false }
+            || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))
+            || self.unverified_error(text("url"), text("unreachableUrl"))) { return false }
         let evidence = vec![text("loaderId").to_string(), format!("{}{}", text("url"), text("urlFragment")), text("securityOrigin").to_string(), text("unreachableUrl").to_string(), parent.unwrap_or("").to_string()];
         if frames.insert(text("id").to_string(), evidence).is_some() { return false }
         match node.get("childFrames") {

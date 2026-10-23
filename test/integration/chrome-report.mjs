@@ -25,6 +25,7 @@ export const CHROME_FILES = new Set(
     'discover-sinks',
     'discover-ucp',
     'discover',
+    'error-document-race',
     'eval-function',
     'fetch',
     'guard-a',
