@@ -44,6 +44,7 @@ export const CHROME_FILES = new Set(
     'guard-persistent',
     'guard-setup-budget',
     'har-chrome',
+    'headed-input',
     'input',
     'kernel-session',
     'launch',

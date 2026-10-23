@@ -160,13 +160,3 @@ fn window_bounds_are_refused_when_the_page_is_not_listed_as_an_ordinary_page() {
     assert_eq!(window_resized(&browser), 0);
 }
 
-#[test]
-fn foreground_activation_is_admitted_only_for_an_ordinary_page_alone_in_its_profile() {
-    let (mut cdp, session, _) = window_client(vec![window_page("OTHER", "https://other.test/", "CTX")], vec![]);
-    assert_eq!(cdp.admit_foreground(&session).unwrap(), "T");
-    let (mut cdp, session, _) = window_client(vec![window_page("SEVEN", "https://seven.sliccy.ai/", "CTX")], vec![]);
-    assert!(cdp.admit_foreground(&session).unwrap_err().starts_with("slicc: refused:"));
-    let (mut cdp, _, _) = window_client(vec![], vec![]);
-    assert!(cdp.admit_foreground("G").is_err());
-    assert!(cdp.admit_foreground("NOBODY").is_err());
-}

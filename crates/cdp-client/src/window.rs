@@ -18,10 +18,6 @@ impl Cdp {
         Ok(())
     }
 
-    pub fn admit_foreground(&mut self, session: &str) -> Result<String, String> {
-        self.exclusive_profile(session)
-    }
-
     fn exclusive_profile(&mut self, session: &str) -> Result<String, String> {
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         if self.guard_sessions.contains(session) || self.blocked.contains(session) || self.protected_targets.contains(&target) {

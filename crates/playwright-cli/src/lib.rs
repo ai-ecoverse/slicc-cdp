@@ -16,6 +16,7 @@ mod har;
 mod help;
 mod input;
 mod keys;
+mod landing;
 mod launch;
 mod net;
 mod page_tools;
