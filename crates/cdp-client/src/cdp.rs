@@ -2428,6 +2428,18 @@ impl Cdp {
         Some((delay, (!target.is_empty()).then_some(target)))
     }
 
+    pub fn ordinary_redirect_target(&self, source: &str, target: &str) -> Result<String, String> {
+        let targets = Self::carrier_targets(&self.guard, target, source).ok_or_else(|| self.refusal())?;
+        if target.trim().is_empty() || targets.iter().any(|target| target.protected) {
+            return Err(self.refusal());
+        }
+        let url = &targets[0].url;
+        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+            return Err(self.refusal());
+        }
+        Ok(url.to_string())
+    }
+
     fn carrier_targets(guard: &Protected, target: &str, source: &str) -> Option<Vec<CarrierTarget>> {
         let base = url::Url::parse(source).ok()?;
         let mut target = target.trim().to_string();
