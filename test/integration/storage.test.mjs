@@ -186,7 +186,7 @@ const runners = {
   },
 };
 
-async function withBrowser(kind, body, options = {}) {
+async function withBrowser(kind, body, { hook, ...options } = {}) {
   const model = storageModel();
   let fake;
   fake = await fakeCdp({
@@ -194,6 +194,13 @@ async function withBrowser(kind, body, options = {}) {
     pauseNavigation: true,
     ...options,
     intercept: (message, send) => {
+      const reply = (answer) =>
+        send({
+          id: message.id,
+          ...answer,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        });
+      if (hook?.(message, reply, fake)) return true;
       const expression = message.params?.expression ?? '';
       if (
         message.method !== 'Runtime.evaluate' ||
@@ -557,6 +564,8 @@ for (const kind of ['native', 'wasi']) {
     await withBrowser(kind, async ({ fake, model, runner, ok }) => {
       await ok(['open', `${shop}/app`]);
       await ok(['tab-new', `${docs}/guide`]);
+      await ok(['tab-new', `${shop}/second`]);
+      await ok(['tab-new', 'https://empty.example.test/']);
       const docsTab = fake.targets.find((item) => item.url.startsWith(docs)).targetId;
       await ok(['localstorage-set', 'note', 'fixture "quoted"\n', '--tab', docsTab]);
       await ok(['localstorage-set', 'emoji', 'π', '--tab', docsTab]);
@@ -838,5 +847,127 @@ for (const kind of ['native', 'wasi']) {
         'loaded=fixture-loaded (domain: .shop.example.test, path: /, httpOnly: false, secure: true, sameSite: Lax)\n'
       );
     });
+  });
+
+  test(`${kind}: storage failures report errors and still close the blank tab`, {
+    timeout: 120_000,
+  }, async () => {
+    let refuseAttach = false;
+    const hook = (message, reply, fake) => {
+      const expression = message.params?.expression ?? '';
+      if (message.method === 'Runtime.evaluate' && expression.includes('"key":"fixture-throw"')) {
+        reply({
+          result: {
+            result: { type: 'object' },
+            exceptionDetails: {
+              text: 'Uncaught',
+              exception: { description: 'SecurityError: denied' },
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method === 'Runtime.evaluate' && expression.includes('"key":"fixture-gone"')) {
+        reply({ error: { code: -32000, message: 'Execution context was destroyed.' } });
+        return true;
+      }
+      if (message.method === 'Runtime.evaluate' && expression.includes('"key":"fixture-swap"')) {
+        reply({
+          result: { result: { type: 'object', value: { origin: 'https://vault.sliccy.ai' } } },
+        });
+        return true;
+      }
+      if (message.method === 'Network.setCookie' && message.params.name === 'fixture-reject') {
+        reply({ result: { success: false } });
+        return true;
+      }
+      if (
+        message.method === 'Page.navigate' &&
+        message.params.url.includes('broken.example.test')
+      ) {
+        reply({
+          result: { frameId: 'F', loaderId: 'LB', errorText: 'net::ERR_NAME_NOT_RESOLVED' },
+        });
+        return true;
+      }
+      if (
+        refuseAttach &&
+        message.method === 'Target.attachToTarget' &&
+        message.params.targetId === fake.targets.at(-1)?.targetId &&
+        fake.calls.filter(
+          (call) =>
+            call.method === 'Target.attachToTarget' &&
+            call.params.targetId === message.params.targetId
+        ).length > 1
+      ) {
+        reply({ error: { code: -32000, message: 'attach refused' } });
+        return true;
+      }
+      return false;
+    };
+    await withBrowser(
+      kind,
+      async ({ fake, run, ok, refused, runner }) => {
+        const empty = await run(['localstorage-list']);
+        assert.equal(empty.code, 1);
+        assert.match(empty.stderr, /--tab <targetId> is required|Error:/);
+        await ok(['open', `${shop}/app`]);
+        assert.equal(
+          await refused(['localstorage-get', 'fixture-throw']),
+          'Error: SecurityError: denied\n'
+        );
+        assert.match(
+          await refused(['sessionstorage-get', 'fixture-gone']),
+          /Execution context was destroyed/
+        );
+        assert.match(await refused(['localstorage-get', 'fixture-swap']), /^slicc: refused/);
+        const closes = () => count(fake, 'Target.closeTarget');
+        const states = [
+          [
+            {
+              cookies: [
+                { name: 'fixture-reject', value: 'v', domain: 'shop.example.test', path: '/' },
+              ],
+            },
+            'Error: Error setting storage state:\nInvalid cookie fields\n',
+          ],
+          [
+            { origins: [{ origin: 'https://broken.example.test', localStorage: [] }] },
+            'Error: Error setting storage state:\nnet::ERR_NAME_NOT_RESOLVED\n',
+          ],
+          [
+            {
+              cookies: [
+                { name: 'x', value: 'y', domain: 'shop.example.test', path: '/', httpOnly: 'yes' },
+              ],
+            },
+            'Error: Error setting storage state:\nstorageState.cookies[0].httpOnly: expected boolean\n',
+          ],
+        ];
+        for (const [index, [state, expected]] of states.entries()) {
+          await runner.write(`fail${index}.json`, JSON.stringify(state));
+          const before = closes();
+          assert.equal(await refused(['state-load', `fail${index}.json`]), expected);
+          if (!state.cookies?.[0]?.httpOnly) assert.equal(closes(), before + 1);
+        }
+        await runner.write('cookies.json', JSON.stringify({ cookies: [] }));
+        const tabs = fake.targets.length;
+        assert.match(
+          await ok(['state-load', 'cookies.json']),
+          /^### Result\nStorage state restored/
+        );
+        assert.equal(fake.targets.length, tabs);
+        refuseAttach = true;
+        const before = closes();
+        assert.match(
+          await refused(['state-load', 'cookies.json']),
+          /^slicc: refused|attach refused/
+        );
+        refuseAttach = false;
+        assert.equal(closes(), before + 1);
+        assert.equal(fake.targets.length, tabs);
+      },
+      { hook }
+    );
   });
 }
