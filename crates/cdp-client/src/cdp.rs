@@ -578,7 +578,7 @@ impl Cdp {
         }
         if method == "Browser.setWindowBounds" {
             self.admit_window(params, session_id)?;
-        } else if shield::persistent_capability(method) {
+        } else if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
             return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
@@ -693,6 +693,21 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    fn network_state_admitted(&self, method: &str, params: &Value, session_id: Option<&str>) -> bool {
+        let Some(session) = session_id else { return false };
+        shield::network_state(method, params)
+            && !self.guard_sessions.contains(session)
+            && !self.dialog_sessions.contains(session)
+            && !self.blocked.contains(session)
+            && self.session_target(session).is_some_and(|target| {
+                !self.protected_targets.contains(&target)
+                    && !self.abandoned.contains(&target)
+                    && self.targets.get(&target).is_some_and(|info| {
+                        info.get("type").and_then(Value::as_str) == Some("page") && !self.info_protected(info, &[])
+                    })
+            })
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
@@ -2428,6 +2443,18 @@ impl Cdp {
         }
         target = target.trim_matches(|ch: char| ch.is_ascii_whitespace());
         Some((delay, (!target.is_empty()).then_some(target)))
+    }
+
+    pub fn ordinary_redirect_target(&self, source: &str, target: &str) -> Result<String, String> {
+        let targets = Self::carrier_targets(&self.guard, target, source).ok_or_else(|| self.refusal())?;
+        if target.trim().is_empty() || targets.iter().any(|target| target.protected) {
+            return Err(self.refusal());
+        }
+        let url = &targets[0].url;
+        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+            return Err(self.refusal());
+        }
+        Ok(url.to_string())
     }
 
     fn carrier_targets(guard: &Protected, target: &str, source: &str) -> Option<Vec<CarrierTarget>> {

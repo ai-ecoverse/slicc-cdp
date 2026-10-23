@@ -93,6 +93,11 @@ pub fn create_target(
         cdp::detach(cdp, &session);
         return Err(message);
     }
+    if let Err(message) = crate::page_tools::arm_network(cdp, &session, state) {
+        route::disarm(cdp, &session);
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
     let mut abandon = false;
     let loaded = if blank {
         cdp.wait_load(&session)
@@ -146,6 +151,11 @@ pub fn watch_attach(cdp: &mut Cdp, state: &Session, target_id: &str) -> Result<S
         return Err(message);
     }
     if let Err(message) = route::arm(cdp, target_id, &session, &state.routes) {
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
+    if let Err(message) = crate::page_tools::arm_network(cdp, &session, state) {
+        route::disarm(cdp, &session);
         cdp::detach(cdp, &session);
         return Err(message);
     }
@@ -213,6 +223,7 @@ pub fn navigate(
         cdp.call("Page.enable", json!({}), Some(&session))?;
         trace::enable(cdp, &session)?;
         route::arm(cdp, target_id, &session, &state.routes)?;
+        crate::page_tools::arm_network(cdp, &session, state)?;
         let result = cdp.call("Page.navigate", json!({ "url": url }), Some(&session))?;
         if let Some(error) = result.get("errorText").and_then(|v| v.as_str()) {
             return Err(format!("navigate: {error}\n"));
