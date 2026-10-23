@@ -863,7 +863,7 @@ mod tests {
                 }
                 last_ready = Some(ready);
             }
-            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} subject_blocked={} target_protected={} content_blocked={}", cdp.session_blocked(session), cdp.is_protected_target(target), cdp.content_blocked(session));
+            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} subject_blocked={} target_protected={} content_blocked={} guard_document={}", cdp.session_blocked(session), cdp.is_protected_target(target), cdp.content_blocked(session), cdp.document_evidence(target));
         }
         raw.call("Target.detachFromTarget", json!({ "sessionId": observer }), None).unwrap();
     }
