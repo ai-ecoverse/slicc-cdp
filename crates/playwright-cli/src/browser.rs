@@ -1653,8 +1653,7 @@ pub fn validate_upload_path(path: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
-fn mime_from_name(name: &str) -> String {
+pub(crate) fn mime_from_name(name: &str) -> String {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "html" | "htm" => "text/html",

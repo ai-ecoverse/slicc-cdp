@@ -23,6 +23,7 @@ pub struct Session {
     pub webmcp: BTreeMap<String, Value>,
     pub webmcp_connection: String,
     pub cwd: Option<PathBuf>,
+    pub input: BTreeMap<String, Value>,
 }
 
 #[allow(dead_code)]
@@ -203,6 +204,7 @@ fn decode(text: &str) -> Session {
         webmcp: value.get("webmcp").and_then(Value::as_object).map(|entries| entries.iter().map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
         webmcp_connection: String::new(),
         cwd: None,
+        input: value.get("input").and_then(Value::as_object).map(|entries| entries.iter().filter(|(_, value)| value.is_object()).map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
     }
 }
 
@@ -267,6 +269,7 @@ fn encode(session: &Session) -> Value {
         "requests": encode_lists(&session.requests, |request| Some(stored_request(request))),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
         "webmcp": session.webmcp,
+        "input": session.input,
     })
 }
 
