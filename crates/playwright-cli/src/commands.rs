@@ -119,6 +119,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
+    state.webmcp_connection = cdp_client::hash::sha256_hex(endpoint.as_bytes());
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
@@ -157,6 +158,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if trace::is_request_command(command) => {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
+        "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
@@ -1287,7 +1289,11 @@ fn cmd_webmcp_list(
 ) -> Output {
     let tab = invocation.flags.get("tab").map(String::as_str);
     let json = flag_true(&invocation.flags, "json");
-    crate::webmcp::list(cdp, state, tab, json)
+    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
+        Ok(from) => from,
+        Err(message) => return Output::err(message),
+    };
+    crate::webmcp::list_from(cdp, state, tab, json, &from)
 }
 
 fn cmd_webmcp_call(
@@ -1311,7 +1317,12 @@ fn cmd_webmcp_call(
     };
     let tab = invocation.flags.get("tab").map(String::as_str);
     let allow_consequential = flag_true(&invocation.flags, "allow-consequential");
-    crate::webmcp::call(cdp, state, name, &input_json, tab, allow_consequential)
+    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
+        Ok(from) => from,
+        Err(message) => return Output::err(message),
+    };
+    let frame = invocation.flags.get("frame").map(String::as_str);
+    crate::webmcp::call_from(cdp, state, name, &input_json, tab, allow_consequential, &from, frame)
 }
 
 
