@@ -22,6 +22,7 @@ export const CHROME_FILES = new Set(
     'chromium',
     'current-document',
     'dialog',
+    'dialog-holder-chrome',
     'discover-payments',
     'discover-sinks',
     'discover-ucp',

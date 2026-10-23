@@ -93,6 +93,7 @@ pub struct Cdp {
     events: Vec<Value>,
     dialog_sessions: BTreeSet<String>,
     dialogs: BTreeMap<String, Dialog>,
+    dialog_documents: BTreeMap<String, DialogDocument>,
     dialog_epoch: u64,
     trace_cookies: Vec<Value>,
     guard: Protected,
@@ -168,6 +169,7 @@ impl Cdp {
             events: Vec::new(),
             dialog_sessions: BTreeSet::new(),
             dialogs: BTreeMap::new(),
+            dialog_documents: BTreeMap::new(),
             dialog_epoch: 0,
             trace_cookies: Vec::new(),
             guard: Protected::default(),
@@ -3243,6 +3245,7 @@ pub fn detach(cdp: &mut Cdp, session_id: &str) {
     cdp.session_targets.remove(session_id);
     cdp.dialog_sessions.remove(session_id);
     cdp.dialogs.remove(session_id);
+    cdp.dialog_documents.remove(session_id);
     let _ = cdp.call(
         "Target.detachFromTarget",
         json!({ "sessionId": session_id }),

@@ -51,6 +51,7 @@ static SPECS: &[Spec] = &[
     spec("uncheck", &["ref"], false, &[("tab", S)], true, RefMode::Element),
     spec("dialog-accept", &["prompt"], true, &[("tab", S)], true, RefMode::None),
     spec("dialog-dismiss", &[], false, &[("tab", S)], true, RefMode::None),
+    spec("dialog-hold", &[], false, &[("tab", S)], true, RefMode::None),
     spec("resize", &["w", "h"], false, &[("tab", S)], false, RefMode::None),
     spec("go-back", &[], false, &[("tab", S)], true, RefMode::None),
     spec("go-forward", &[], false, &[("tab", S)], true, RefMode::None),

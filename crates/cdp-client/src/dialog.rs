@@ -5,6 +5,12 @@ struct Dialog {
     epoch: u64,
 }
 
+#[derive(Clone, PartialEq)]
+struct DialogDocument {
+    url: String,
+    loader: String,
+}
+
 pub const DIALOG_UNOBSERVED: &str = "Error: No dialog visible to this session. Dialogs already open before attachment require the foreground dialog holder (follow-up #529); arm dialog-accept or dialog-dismiss before triggering a dialog.\n";
 
 impl Cdp {
@@ -35,10 +41,29 @@ impl Cdp {
             let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":session}), None, DOCUMENT_CHECK);
             self.dialog_sessions.remove(&session);
             self.dialogs.remove(&session);
+            self.dialog_documents.remove(&session);
             self.session_targets.remove(&session);
             return Err(message);
         }
         Ok(session)
+    }
+
+    pub fn dialog_ready(&mut self, session: &str) -> Result<Value, String> {
+        if !self.dialog_sessions.contains(session) || self.blocked.contains(session) { return Err(self.refusal()) }
+        let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+        let url = self.dialog_target(&target)?;
+        if self.dialog_history(session)? != url { return Err(self.refusal()) }
+        let loader = self.dialog_documents.get(session).filter(|document| document.url == url).map(|document| document.loader.as_str());
+        Ok(json!({"target":target,"loaderId":loader,"loaderIdSource":if loader.is_some() {"frame-navigated"} else {"unavailable"},"status":if loader.is_some() {"document-verified"} else {"observing"}}))
+    }
+
+    pub fn dialog_id(&self, session: &str) -> Option<u64> {
+        self.dialogs.get(session).map(|dialog| dialog.epoch)
+    }
+
+    pub fn verify_dialog(&mut self, session: &str, epoch: u64) -> Result<(), String> {
+        if self.dialog_id(session) != Some(epoch) { return Err(DIALOG_UNOBSERVED.into()) }
+        self.check_dialog(session)
     }
 
     pub fn wait_dialog(&mut self, session: &str, timeout: Duration) -> Result<(), String> {
@@ -88,7 +113,7 @@ impl Cdp {
         Ok(url.to_string())
     }
 
-    fn admit_dialog(&mut self, session: &str) -> Result<(), String> {
+    fn check_dialog(&mut self, session: &str) -> Result<(), String> {
         if self.blocked.contains(session) || self.guard_sessions.contains(session) { return Err(self.refusal()) }
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         let dialog = self.dialogs.get(session).cloned().ok_or(DIALOG_UNOBSERVED.to_string())?;
@@ -97,6 +122,11 @@ impl Cdp {
         let current = self.dialog_history(session)?;
         if current != dialog.url || url != current || self.dialogs.get(session) != Some(&dialog)
             || self.blocked.contains(session) || self.protected_targets.contains(&target) { return Err(self.refusal()) }
+        Ok(())
+    }
+
+    fn admit_dialog(&mut self, session: &str) -> Result<(), String> {
+        self.check_dialog(session)?;
         self.dialogs.remove(session);
         Ok(())
     }
@@ -107,6 +137,7 @@ impl Cdp {
             if let Some(session) = event.pointer("/params/sessionId").and_then(Value::as_str) {
                 self.dialog_sessions.remove(session);
                 self.dialogs.remove(session);
+                self.dialog_documents.remove(session);
             }
             return;
         }
@@ -120,7 +151,24 @@ impl Cdp {
                     epoch: self.dialog_epoch,
                 });
             }
-            "Page.javascriptDialogClosed" | "Page.frameStartedNavigating" | "Page.frameNavigated" => { self.dialogs.remove(session); }
+            "Page.frameNavigated" => {
+                self.dialogs.remove(session);
+                self.dialog_documents.remove(session);
+                let frame = &event["params"]["frame"];
+                let text = |key| frame.get(key).and_then(Value::as_str).unwrap_or("");
+                let url = format!("{}{}", text("url"), text("urlFragment"));
+                let origin = url::Url::parse(&url).ok().map(|url| url.origin().ascii_serialization());
+                if self.session_target(session).as_deref() == Some(text("id")) && frame.get("parentId").is_none()
+                    && self.dialog_url(&url) && text("unreachableUrl").is_empty() && frame_text_known(text("loaderId"))
+                    && origin.as_deref() == Some(text("securityOrigin")) {
+                    self.dialog_documents.insert(session.to_string(), DialogDocument {url, loader:text("loaderId").to_string()});
+                }
+            }
+            "Page.frameStartedNavigating" => {
+                self.dialogs.remove(session);
+                self.dialog_documents.remove(session);
+            }
+            "Page.javascriptDialogClosed" => { self.dialogs.remove(session); }
             _ => {}
         }
     }
