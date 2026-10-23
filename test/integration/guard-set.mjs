@@ -706,7 +706,7 @@ export async function runPartition(t, id) {
   const problems = verdictProblems(report.results);
   const load = stopLoad();
   const deaths = launched
-    .map(({ target, slot, browser }) => ({ target, slot, died: browser.died() }))
+    .map(({ target, slot, browser }) => ({ target, slot, died: browser.died?.() ?? null }))
     .filter(({ died }) => died);
   const pressure = `${launched.length} guard browsers; ${describeLoad(load)}\nChrome deaths: ${deaths.length}${deaths.map(({ target, slot, died }) => `\n- ${target} slot ${slot}: ${died}`).join('')}`;
   const ms = Date.now() - started;
