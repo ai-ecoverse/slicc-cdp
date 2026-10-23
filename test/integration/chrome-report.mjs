@@ -45,6 +45,7 @@ export const CHROME_FILES = new Set(
     'sliccy-browser',
     'snapshot-golden',
     'snapshot-oopif-chrome',
+    'webmcp-polyfill-chrome',
     'webmcp-unavailable',
     'webmcp',
   ].map((name) => path.join(directory, `${name}.test.mjs`))

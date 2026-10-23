@@ -20,6 +20,8 @@ pub struct Session {
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
     pub routes: Vec<Route>,
+    pub webmcp: BTreeMap<String, Value>,
+    pub webmcp_connection: String,
     pub cwd: Option<PathBuf>,
 }
 
@@ -198,6 +200,8 @@ fn decode(text: &str) -> Session {
             .and_then(|item| item.as_array())
             .map(|items| items.iter().filter_map(route::decode).collect())
             .unwrap_or_default(),
+        webmcp: value.get("webmcp").and_then(Value::as_object).map(|entries| entries.iter().map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
+        webmcp_connection: String::new(),
         cwd: None,
     }
 }
@@ -262,6 +266,7 @@ fn encode(session: &Session) -> Value {
         "console": encode_lists(&session.console, stored_console),
         "requests": encode_lists(&session.requests, |request| Some(stored_request(request))),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
+        "webmcp": session.webmcp,
     })
 }
 
@@ -699,6 +704,14 @@ pub fn stored_label<'a>(session: &'a Session, target: &str, id: &str) -> Option<
 }
 
 pub fn save(session: &Session) -> Result<(), String> {
+    store(session, false)
+}
+
+pub fn save_webmcp(session: &Session) -> Result<(), String> {
+    store(session, true)
+}
+
+fn store(session: &Session, webmcp_writer: bool) -> Result<(), String> {
     let mut stored = session.clone();
     if usable_endpoint(stored.endpoint.as_deref(), stored.provenance.as_deref()).is_none() {
         stored.endpoint = None;
@@ -710,6 +723,9 @@ pub fn save(session: &Session) -> Result<(), String> {
         }
         return Err("session: user config dir is not absolute\n".into());
     };
+    if !webmcp_writer && file.exists() {
+        stored.webmcp = load_at(&file).webmcp;
+    }
     write_at(&file, &stored)
 }
 
