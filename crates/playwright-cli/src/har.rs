@@ -311,6 +311,7 @@ impl Holder {
             if fs::read_to_string(&self.files.stop).is_ok_and(|id| id == self.id) { return Ok("stop".into()) }
             if beat.elapsed() >= Duration::from_secs(1) { self.beat()?; beat = Instant::now(); }
             if self.session.as_deref().is_some_and(|session| cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) {
+                cdp.trail(|| format!("holder detach blocked={} protected={}", self.session.as_deref().is_some_and(|session| cdp.content_blocked(session)), cdp.is_protected_target(&self.target)));
                 if self.absorb(cdp)? { return Ok("closed".into()) }
                 if let Some(session) = self.session.take() { cdp.set_decider(&session, None); cdp::detach(cdp, &session); }
                 self.pending.clear();
@@ -323,8 +324,12 @@ impl Holder {
                 if self.session.is_none() {
                     let mut fresh = Cdp::connect(endpoint)?;
                     let pages = browser::list_pages(&mut fresh)?;
-                    if pages.iter().any(|page| page.target_id == self.target && ordinary(fresh.guard(), &page.url)) {
-                        if let Ok(session) = attach(&mut fresh, state, &self.target) {
+                    let found = pages.iter().any(|page| page.target_id == self.target && ordinary(fresh.guard(), &page.url));
+                    fresh.trail(|| format!("holder fresh ordinary={found}"));
+                    if found {
+                        let attached = attach(&mut fresh, state, &self.target);
+                        fresh.trail(|| format!("holder fresh attached={}", attached.is_ok()));
+                        if let Ok(session) = attached {
                             *cdp = fresh;
                             self.session = Some(session);
                             self.seen = cdp.events().len();
@@ -332,6 +337,7 @@ impl Holder {
                     }
                 }
                 let verified = self.verify(cdp);
+                cdp.trail(|| format!("holder verify attached={} verified={} paused={}", self.session.is_some(), verified.is_some(), self.paused));
                 if verified.is_some() {
                     if self.paused { self.paused = false; emit(self.status("resumed"))?; }
                 } else {
