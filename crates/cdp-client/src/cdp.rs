@@ -85,6 +85,9 @@ pub struct Cdp {
     next_id: i64,
     navigations: BTreeMap<i64, Navigation>,
     events: Vec<Value>,
+    dialog_sessions: BTreeSet<String>,
+    dialogs: BTreeMap<String, Dialog>,
+    dialog_epoch: u64,
     trace_cookies: Vec<Value>,
     guard: Protected,
     paused: VecDeque<Paused>,
@@ -157,6 +160,9 @@ impl Cdp {
             next_id: 0,
             navigations: BTreeMap::new(),
             events: Vec::new(),
+            dialog_sessions: BTreeSet::new(),
+            dialogs: BTreeMap::new(),
+            dialog_epoch: 0,
             trace_cookies: Vec::new(),
             guard: Protected::default(),
             paused: VecDeque::new(),
@@ -497,6 +503,15 @@ impl Cdp {
     }
 
     fn admit(&mut self, method: &str, params: &Value, session_id: Option<&str>) -> Result<(), String> {
+        if method == "Page.handleJavaScriptDialog" {
+            if params.get("accept").and_then(Value::as_bool).is_none()
+                || params.get("promptText").is_some_and(|text| !text.is_string())
+                || !params.as_object().is_some_and(|object| object.keys().all(|key| matches!(key.as_str(), "accept" | "promptText"))) {
+                return Err(self.refusal());
+            }
+            return self.admit_dialog(session_id.ok_or_else(|| self.refusal())?);
+        }
+        if session_id.is_some_and(|session| self.dialog_sessions.contains(session)) { return Err(self.refusal()) }
         if let Some(session) = session_id {
             if self.blocked.contains(session) && !harmless(method, params) {
                 return Err(self.refusal());
@@ -2796,6 +2811,7 @@ impl Cdp {
             }
             return;
         }
+        self.observe_dialog(&value);
         if value.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget") {
             let session = value.pointer("/params/sessionId").and_then(Value::as_str);
             for navigation in self.navigations.values_mut() {
@@ -3091,7 +3107,7 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
         | "Profiler.stop" | "Profiler.takePreciseCoverage" | "Profiler.getBestEffortCoverage" | "CSS.getStyleSheetText" | "CSS.getComputedStyleForNode" | "CSS.getMatchedStylesForNode" | "CSS.getInlineStylesForNode"
         | "CSS.setStyleSheetText" | "CSS.setStyleTexts" | "CSS.setEffectivePropertyValueForNode" | "CSS.getMediaQueries" | "CSS.getPlatformFontsForNode" => Some(true),
         "Page.enable" | "Page.disable" | "Page.navigate" | "Page.reload" | "Page.stopLoading" | "Page.navigateToHistoryEntry" | "Page.close" | "Page.bringToFront"
-        | "Page.getFrameTree" | "Page.getResourceTree" | "Page.getNavigationHistory" | "Page.createIsolatedWorld" | "Page.setLifecycleEventsEnabled" | "Page.removeScriptToEvaluateOnNewDocument"
+        | "Page.getFrameTree" | "Page.getResourceTree" | "Page.getNavigationHistory" | "Page.handleJavaScriptDialog" | "Page.createIsolatedWorld" | "Page.setLifecycleEventsEnabled" | "Page.removeScriptToEvaluateOnNewDocument"
         | "Page.setBypassCSP" | "Page.setWebLifecycleState" | "Page.setInterceptFileChooserDialog" | "Page.stopScreencast" | "Page.screencastFrameAck" | "Page.setDownloadBehavior" | "Page.getCookies" | "Page.deleteCookie"
         | "Runtime.enable" | "Runtime.disable" | "Runtime.runIfWaitingForDebugger" | "Runtime.addBinding" | "Runtime.removeBinding" | "Runtime.releaseObject" | "Runtime.releaseObjectGroup" | "Runtime.getIsolateId"
         | "Runtime.setAsyncCallStackDepth" | "Runtime.setCustomObjectFormatterEnabled" | "Runtime.setMaxCallStackSizeToCapture" | "Runtime.terminateExecution"
@@ -3210,6 +3226,8 @@ pub fn detach(cdp: &mut Cdp, session_id: &str) {
     cdp.forget_paused(session_id);
     cdp.blocked.remove(session_id);
     cdp.session_targets.remove(session_id);
+    cdp.dialog_sessions.remove(session_id);
+    cdp.dialogs.remove(session_id);
     let _ = cdp.call(
         "Target.detachFromTarget",
         json!({ "sessionId": session_id }),
@@ -3423,6 +3441,8 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
     let socket = crate::connect::append_runtime(&socket, runtime);
     Cdp::connect(&socket)
 }
+
+include!("dialog.rs");
 
 #[cfg(test)]
 mod tests {

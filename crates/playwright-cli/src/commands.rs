@@ -174,6 +174,8 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         "drag" => cmd_drag(&mut cdp, &mut state, invocation, &mut report),
         "frames" => cmd_frames(&mut cdp, &mut state, invocation, &mut report),
         "pdf" => cmd_pdf(&mut cdp, &mut state, invocation, &mut report),
+        "dialog-accept" => cmd_dialog(&mut cdp, &mut state, invocation, true),
+        "dialog-dismiss" => cmd_dialog(&mut cdp, &mut state, invocation, false),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
@@ -1339,6 +1341,31 @@ fn default_pdf_path() -> PathBuf {
     #[cfg(target_os = "wasi")]
     {
         PathBuf::from(".playwright-cli").join(name)
+    }
+}
+
+fn cmd_dialog(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, accept: bool) -> Output {
+    let prompt = (accept && !invocation.positionals.is_empty()).then(|| invocation.positionals.join(" "));
+    let target = match invocation.flags.get("tab").cloned().or_else(|| state.current.clone()) {
+        Some(target) => target,
+        None => match cdp.dialog_targets() {
+            Ok(targets) if targets.len() == 1 => targets[0].clone(),
+            Ok(_) => return Output::err("Error: --tab <targetId> is required. Run 'playwright-cli tab-list' to get tab IDs.\n"),
+            Err(message) => return Output::err(message),
+        },
+    };
+    let session = match cdp.attach_dialog(&target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::handle_dialog(cdp, &session, accept, prompt.as_deref());
+    cdp::detach(cdp, &session);
+    match result {
+        Ok(text) => {
+            state.current = Some(target);
+            Output::ok(text)
+        }
+        Err(message) => Output::err(message),
     }
 }
 

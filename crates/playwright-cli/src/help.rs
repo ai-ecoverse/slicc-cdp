@@ -26,6 +26,8 @@ pub fn global_help() -> String {
         row("fill <target> <text>", "fill text into editable element"),
         row("snapshot [target]", "capture page snapshot to obtain element ref"),
         row("eval <func> [target]", "evaluate javascript expression on page or element"),
+        row("dialog-accept [prompt]", "accept a dialog"),
+        row("dialog-dismiss", "dismiss a dialog"),
         String::new(),
         "Keyboard:".to_string(),
         row("press <key>", "press a key on the keyboard, `a`, `arrowleft`"),
@@ -446,6 +448,28 @@ fn implemented_page(name: &str) -> Option<String> {
             ],
             &[],
             &[],
+        ),
+        "dialog-accept" => page(
+            "dialog-accept [prompt]",
+            &[
+                "Accept a dialog",
+                "",
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
+            ],
+            &[("[prompt]", "the text of the prompt in case of a prompt dialog.")],
+            &[("--tab <targetId>", "tab with the dialog")],
+        ),
+        "dialog-dismiss" => page(
+            "dialog-dismiss",
+            &[
+                "Dismiss a dialog",
+                "",
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
+            ],
+            &[],
+            &[("--tab <targetId>", "tab with the dialog")],
         ),
         "pdf" => page(
             "pdf",
