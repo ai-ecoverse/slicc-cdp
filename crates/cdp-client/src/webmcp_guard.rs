@@ -103,6 +103,14 @@ impl Cdp {
         self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked) && !self.content_blocked(session)
     }
 
+    pub fn webmcp_settled(&self) -> bool {
+        self.webmcp.arms.iter().all(|(session, arm)| {
+            let quarantined = self.webmcp.quarantined.contains(session);
+            arm.revoked || self.blocked.contains(session) || !quarantined && (self.content_blocked(session)
+                || arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty())
+        })
+    }
+
     pub(super) fn webmcp_sweep(&mut self) {
         let now = Instant::now();
         let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
