@@ -7,7 +7,7 @@ import { acquire, cleanupGrace, deadline } from './cleanup.mjs';
 
 const bridge = fileURLToPath(new URL('../../target/debug/examples/guard_bridge', import.meta.url));
 
-function channel(write, onMessage) {
+function channel(write, onMessage, onCommand) {
   const events = [];
   const pending = new Map();
   let id = 0;
@@ -44,6 +44,7 @@ function channel(write, onMessage) {
           reject(new Error(`CDP timeout ${method}`));
         }, 35000);
         pending.set(seq, { resolve, reject, timer });
+        onCommand?.({ id: seq, method, params: structuredClone(params), sessionId });
         write(JSON.stringify({ id: seq, method, params, sessionId }));
       }),
     waitEvent: (pred, ms) =>
@@ -61,7 +62,11 @@ function channel(write, onMessage) {
   };
 }
 
-async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage, signal, deadlineAt }) {
+async function wasiGuarded(
+  ws,
+  origin,
+  { variant, detachDelay, onMessage, onCommand, signal, deadlineAt }
+) {
   const { createNodeKernel } = await import('@ai-ecoverse/slicc-kernel/node');
   const { bridge: browserBridge } = await import('./browser.mjs');
   const kernel = await acquire(
@@ -104,7 +109,7 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage, signal
       return (await child.wait()).status;
     }`
     );
-    client = channel((message) => terminal.write(`${message}\n`), onMessage);
+    client = channel((message) => terminal.write(`${message}\n`), onMessage, onCommand);
     let buffered = '';
     let ready;
     const started = new Promise((resolve) => {
@@ -186,6 +191,7 @@ export async function guarded(
     variant,
     detachDelay,
     onMessage,
+    onCommand,
     transport = process.env.SLICC_GUARD_TRANSPORT,
     signal,
     deadlineAt = Date.now() + 35000,
@@ -201,6 +207,7 @@ export async function guarded(
           variant,
           detachDelay,
           onMessage,
+          onCommand,
           deadlineAt,
           signal: AbortSignal.any([ownedSignal, ...(signal ? [signal] : [])]),
         }),
@@ -209,7 +216,7 @@ export async function guarded(
       Math.max(1, deadlineAt - Date.now())
     );
   const child = spawn(bridge, [ws, origin], { stdio: ['pipe', 'pipe', 'inherit'] });
-  const client = channel((message) => child.stdin.write(`${message}\n`), onMessage);
+  const client = channel((message) => child.stdin.write(`${message}\n`), onMessage, onCommand);
   const abort = () => {
     child.kill('SIGKILL');
     child.stdin.destroy();
@@ -278,7 +285,11 @@ export function observerSend(send) {
   };
 }
 
-export async function observer(wsUrl, onMessage, { signal, deadlineAt = Date.now() + 35000 } = {}) {
+export async function observer(
+  wsUrl,
+  onMessage,
+  { signal, onCommand, deadlineAt = Date.now() + 35000 } = {}
+) {
   signal?.throwIfAborted();
   const ws = new WebSocket(wsUrl);
   const abort = () => ws.close();
@@ -299,7 +310,7 @@ export async function observer(wsUrl, onMessage, { signal, deadlineAt = Date.now
     abort();
     throw error;
   }
-  const client = channel((message) => ws.send(message), onMessage);
+  const client = channel((message) => ws.send(message), onMessage, onCommand);
   ws.addEventListener('message', (event) => client.receive(JSON.parse(event.data)));
   ws.addEventListener('close', client.stop);
   return {
