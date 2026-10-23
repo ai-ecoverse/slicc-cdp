@@ -75,6 +75,17 @@ impl Protected {
         self.judge_url(text, false)
     }
 
+    pub fn resource_key(&self, text: &str) -> Option<String> {
+        let mut url = self.unwrap(parse(text)).map(|url| self.rewrite_about(url))?;
+        url.set_username("").ok()?;
+        url.set_password(None).ok()?;
+        url.set_query(None);
+        url.set_fragment(None);
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(if path.is_empty() { "/" } else { &path });
+        Some(url.to_string())
+    }
+
     pub fn redaction_schemes(&self) -> impl Iterator<Item = &str> {
         self.rules.schemes.iter()
             .chain(&self.rules.protected_schemes)
@@ -125,6 +136,17 @@ impl Protected {
         self.rules.error_page.target == "previous"
             && !self.rules.error_page.url.is_empty()
             && document_url == self.rules.error_page.url
+    }
+
+    pub(crate) fn opaque_document(&self, text: &str, root: bool) -> bool {
+        root && (self.inheriting(text) || self.error_page_url(text))
+            || self.unwrap(parse(text)).map(|url| self.rewrite_about(url)).is_some_and(|url| {
+                self.rules.scheme_exceptions.contains(&format!("{}://{}", url.scheme(), host_of(&url)))
+            })
+    }
+
+    pub(crate) fn data_document(&self, text: &str) -> bool {
+        parse(text).is_some_and(|url| url.scheme() == "data")
     }
 
     pub fn error_document(&self, document_url: &str, origin: &str) -> bool {
@@ -234,7 +256,7 @@ impl Protected {
         literal.contains("://") && self.url_read_only(&literal)
     }
 
-    fn inheriting(&self, text: &str) -> bool {
+    pub(crate) fn inheriting(&self, text: &str) -> bool {
         if text.is_empty() {
             return true;
         }

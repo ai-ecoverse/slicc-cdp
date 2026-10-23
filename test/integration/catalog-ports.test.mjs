@@ -7,10 +7,10 @@ import { createServer as createTls } from 'node:https';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { findBrowser } from '../../src/browser.js';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { killTree } from './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -272,7 +272,12 @@ test('a browser on a catalog debug port is attached and driven without a seven t
     await t.test('the same commands work on an unprotected tab and URL', async () => {
       const before = hits.length;
       const listed = await pw(['webmcp-list', '--tab', personal]);
-      assert.equal(listed.code, 0, listed.stderr);
+      assert.equal(listed.code, 2, listed.stderr);
+      assert.equal(listed.stdout, '');
+      assert.equal(
+        listed.stderr,
+        'webmcp-list: WebMCP is unavailable on this page (document.modelContext is absent)\n'
+      );
       const snapped = await pw(['snapshot', '--tab', personal]);
       assert.equal(snapped.code, 0, snapped.stderr);
       assert.match(snapped.stdout, /personal/);
@@ -382,7 +387,8 @@ test('list --json lists a real seven tab in sevenTabs only, and an http stand-in
     const ids = (tabs) => tabs.map((tab) => tab.id);
     assert.equal(entry.endpoint.sevenOpen, true);
     assert.deepEqual(ids(entry.endpoint.sevenTabs), [real]);
-    assert.equal(entry.endpoint.sevenTabs[0].url, 'https://seven.sliccy.ai/');
+    assert.equal(entry.endpoint.sevenTabs[0].url, 'https://seven.sliccy.ai');
+    assert.equal(entry.endpoint.sevenTabs[0].title, 'https://seven.sliccy.ai');
     assert.ok(!ids(entry.endpoint.tabs).includes(real), listed.stdout);
     assert.ok(!ids(entry.endpoint.tabs).includes(stand), listed.stdout);
     assert.ok(!listed.stdout.includes(`seven.sliccy.ai:${server.port}`), listed.stdout);

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { nativeRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
 import './watchdog.mjs';

@@ -113,6 +113,30 @@ pub fn browser_wide(
     Some(format!("slicc: refused: {reason}\n"))
 }
 
+pub fn persistent_capability(method: &str) -> bool {
+    match method.split_once('.') {
+        Some(("Emulation", command)) => !matches!(command, "canEmulate" | "getScreenInfos"),
+        Some(("Network", command)) => {
+            command.starts_with("set") && !matches!(command, "setCookie" | "setCookies")
+                || command.starts_with("emulate")
+                || matches!(command, "overrideNetworkState" | "clearAcceptedEncodings")
+        }
+        Some(("Page", command)) => {
+            command.starts_with("addScriptToEvaluateOn")
+                || command.starts_with("set") && !matches!(command, "setDocumentContent" | "setLifecycleEventsEnabled")
+                || command == "startScreencast"
+        }
+        Some(("Runtime", command)) => command == "addBinding" || command.starts_with("set"),
+        Some(("Debugger", command)) => command.starts_with("set"),
+        Some(("Input" | "Security", command)) => command.starts_with("set"),
+        Some(("Overlay", command)) => !matches!(command, "enable" | "disable" | "hideHighlight" | "getHighlightObjectForTest" | "getGridHighlightObjectsForTest" | "getSourceOrderHighlightObjectForTest"),
+        Some(("Browser", command)) => matches!(command, "setDownloadBehavior" | "setWindowBounds" | "setContentsSize"),
+        Some(("Profiler", command)) => matches!(command, "start" | "startPreciseCoverage"),
+        Some(("HeapProfiler", command)) => matches!(command, "startSampling" | "startTrackingHeapObjects" | "takeHeapSnapshot"),
+        _ => false,
+    }
+}
+
 pub fn body_method(method: &str) -> bool {
     BODY_METHODS.contains(&method)
 }
@@ -174,7 +198,7 @@ pub fn mentions(guard: &Protected, value: &Value) -> bool {
     }
 }
 
-fn decode_percent(text: &str) -> String {
+pub(crate) fn decode_percent(text: &str) -> String {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -262,15 +286,18 @@ fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool)
             (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') || encoded && ch == '&').then_some(start + at)
         }).unwrap_or(text.len());
         let raw = &text[start..end];
-        let mut decoded = raw.replace("\\/", "/");
+        let mut levels = vec![raw.replace("\\/", "/")];
         for _ in 0..8 {
-            let next = decode_percent(&decoded);
-            if next == decoded { break; }
-            decoded = next;
+            let next = decode_percent(&levels[levels.len() - 1]);
+            if next == levels[levels.len() - 1] { break; }
+            levels.push(next);
         }
+        let decoded = levels.pop().unwrap_or_default();
+        let found = levels.into_iter().find(|level| url_protected(guard, level)).or_else(|| (url_protected(guard, &decoded) || guard.unparseable(&decoded) && guard.url(&decoded)).then(|| decoded.clone()));
         let overflow = encoded && decode_percent(&decoded) != decoded;
-        if overflow || url_protected(guard, &decoded) || guard.unparseable(&decoded) && guard.url(&decoded) {
+        if overflow || found.is_some() {
             protected = true;
+            let decoded = found.unwrap_or(decoded);
             let origin = if overflow { "about:blank".to_string() } else {
                 url::Url::parse(&web_socket_as_http(&decoded)).ok().and_then(|url| {
                     let origin = url.origin().ascii_serialization();
@@ -437,7 +464,7 @@ fn site_protected(guard: &Protected, site: &str) -> bool {
     url_protected(guard, site) || host_of(site).is_some_and(|host| guard.cookie_domain(&host))
 }
 
-fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
+pub fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
     if let Some(domain) = cookie.get("domain").and_then(|v| v.as_str()) {
         if guard.cookie_scope(domain) {
             return true;
@@ -815,6 +842,7 @@ mod tests {
         }
         let observer = raw.session(target);
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_ready = None;
         loop {
             let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
             let tree = raw.call("Page.getFrameTree", json!({}), Some(&observer));
@@ -833,8 +861,9 @@ mod tests {
                     assert!(!cdp.target_protected(target, false).unwrap());
                     break;
                 }
+                last_ready = Some(ready);
             }
-            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?}");
+            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} subject_blocked={} target_protected={} content_blocked={} guard_document={}", cdp.session_blocked(session), cdp.is_protected_target(target), cdp.content_blocked(session), cdp.document_evidence(target));
         }
         raw.call("Target.detachFromTarget", json!({ "sessionId": observer }), None).unwrap();
     }
@@ -1412,13 +1441,14 @@ mod tests {
                     Decision::default()
                 })),
             );
+            let navigation = cdp.events().len();
             cdp.call(
                 "Page.navigate",
                 json!({ "url": format!("{app}/?n=next") }),
                 Some(&session),
             )
             .unwrap();
-            cdp.wait_load(&session).unwrap();
+            cdp.wait_load_since(&session, navigation).unwrap();
             cdp.call(
                 "Runtime.evaluate",
                 json!({ "expression": format!("setTimeout(() => {{ location.href = {}; }}, 50); true", json!(format!("{seven}/nowhere?n=away"))) }),

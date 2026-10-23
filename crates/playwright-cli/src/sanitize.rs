@@ -32,6 +32,30 @@ pub fn url(raw: &str) -> String {
     cdp_client::sanitize::redact_url(raw)
 }
 
+pub fn href(raw: &str) -> String {
+    if full_urls_enabled() {
+        return raw.to_string();
+    }
+    if cdp_client::sanitize::is_absolute_url(raw) {
+        return url(raw);
+    }
+    let (rest, fragment) = raw.split_once('#').unwrap_or((raw, ""));
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut out = path.to_string();
+    if !query.is_empty() {
+        out.push('?');
+        out.push_str(&cdp_client::sanitize::redact_query_string(query));
+    } else if rest.contains('?') {
+        out.push('?');
+    }
+    if !fragment.is_empty() {
+        out.push_str("#\u{2026}");
+    } else if raw.contains('#') {
+        out.push('#');
+    }
+    out
+}
+
 pub fn terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -138,6 +162,19 @@ mod tests {
         let input = "\x1b[A\x1b[K";
         let output = terminal(input);
         assert_eq!(output, "\\x1b[A\\x1b[K");
+    }
+
+    #[test]
+    fn href_redacts_relative_and_absolute_links() {
+        set_full_urls(false);
+        assert_eq!(href("/a?x=1&flag#top"), "/a?x=\u{2026}&\u{2026}#\u{2026}");
+        assert_eq!(href("/a?#"), "/a?#");
+        assert_eq!(href("#"), "#");
+        assert_eq!(href("plain"), "plain");
+        assert_eq!(href("https://h/p?q=SECRET"), "https://h/p?q=\u{2026}");
+        set_full_urls(true);
+        assert_eq!(href("/a?x=1#top"), "/a?x=1#top");
+        set_full_urls(false);
     }
 
     #[test]

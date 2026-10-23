@@ -47,28 +47,50 @@ function encode(text, opcode = 1) {
   return Buffer.concat([head, payload]);
 }
 
-const tree = {
-  nodes: [
+const defaultAria = {
+  json: [
     {
-      nodeId: '1',
-      role: { type: 'role', value: 'RootWebArea' },
-      name: { type: 'computedString', value: 'Fake' },
-      childIds: ['2'],
-      backendDOMNodeId: 1,
-    },
-    {
-      nodeId: '2',
-      parentId: '1',
-      role: { type: 'role', value: 'button' },
-      name: { type: 'computedString', value: 'Go' },
-      childIds: [],
-      backendDOMNodeId: 2,
+      role: 'generic',
+      ref: 'e1',
+      children: [{ role: 'button', name: 'Go', ref: 'e2', cursor: 'pointer' }],
     },
   ],
+  refs: [
+    { ref: 'e1', selector: ':root > :nth-child(2)' },
+    { ref: 'e2', selector: ':root > :nth-child(2) > :nth-child(1)' },
+  ],
+  base: 'http://example.test/',
+  nodes: [{ backendNodeId: 1 }, { backendNodeId: 2 }],
 };
+
+function ariaOptions(expression) {
+  const match = expression.match(/\nsliccAriaSnapshot\((\{.*\})\)$/);
+  return match ? JSON.parse(match[1]) : undefined;
+}
+
+function ariaAnswer(capture, location, expression) {
+  if (capture?.exception) {
+    return { result: { type: 'object' }, exceptionDetails: { text: capture.exception } };
+  }
+  if (capture) {
+    const { json, refs, base, iframeDepths } = capture;
+    return { result: { type: 'object', value: { json, refs, base, iframeDepths } } };
+  }
+  if (expression.startsWith('globalThis[')) {
+    return { result: { type: 'object', subtype: 'array', objectId: 'ARIA' } };
+  }
+  if (location && expression.startsWith('JSON.stringify({href:location.href')) {
+    return { result: { type: 'string', value: JSON.stringify(location) } };
+  }
+  return undefined;
+}
 
 function cookieDomain(domain) {
   return domain.startsWith('.') ? domain : `.${domain}`;
+}
+
+function samePartition(a, b) {
+  return a?.topLevelSite === b?.topLevelSite && a?.hasCrossSiteAncestor === b?.hasCrossSiteAncestor;
 }
 
 function sameCookie(a, b) {
@@ -86,33 +108,73 @@ export async function fakeCdp({
   answers = {},
   attachEvents = false,
   discoverEvents = false,
+  delayHistoryEvents = false,
+  onUpgrade,
+  onCommand,
+  pauseNavigation = false,
   childFrames = [],
   intercept,
+  aria = () => defaultAria,
+  tree = { nodes: [] },
+  location,
+  frameTree,
+  listen = '127.0.0.1',
+  version = false,
 } = {}) {
+  let lastAria = defaultAria;
   const calls = [];
+  const navigationPauses = new Map();
+  const fetchSessions = new Set();
   const jar = cookies.map((cookie) => ({ ...cookie }));
   let requests = 0;
   const targets = [];
   const sessions = new Map();
+  const heldEvents = [];
+  const releaseEvents = [];
+  const sessionSends = new Map();
+  const paged = new Set();
   let next = 0;
   let tabs = 0;
+  let loaders = 0;
   const info = (target) => ({
     targetId: target.targetId,
-    type: 'page',
+    type: target.type ?? 'page',
+    ...(target.openerId ? { openerId: target.openerId } : {}),
     url: target.url,
     title: target.url,
     attached: false,
     canAccessOpener: false,
     browserContextId: 'CTX',
+    ...(target.parentFrameId ? { parentFrameId: target.parentFrameId } : {}),
   });
   const server = createServer((req, res) => {
+    if (version && req.url === '/json/version') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          Browser: 'Chrome/140.0.0.0',
+          'Protocol-Version': '1.3',
+          webSocketDebuggerUrl: `ws://${req.headers.host}/devtools/browser/fake`,
+        })
+      );
+      return;
+    }
     res.writeHead(404);
     res.end();
   });
   const sockets = new Set();
   server.on('upgrade', (req, socket) => {
+    onUpgrade?.(req.headers);
     sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('close', () => {
+      sockets.delete(socket);
+      for (const [session, owner] of sessionSends) {
+        if (owner !== send) continue;
+        sessions.delete(session);
+        sessionSends.delete(session);
+        paged.delete(session);
+      }
+    });
     socket.on('error', () => socket.destroy());
     const accept = createHash('sha1')
       .update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -121,7 +183,6 @@ export async function fakeCdp({
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     let noise;
-    const paged = new Set();
     socket.on('close', () => clearInterval(noise));
     const send = (message) => {
       if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
@@ -166,6 +227,7 @@ export async function fakeCdp({
         }
         return;
       }
+      onCommand?.(message, event);
       if (answers[method]) return answer(answers[method]);
       switch (method) {
         case 'Target.setDiscoverTargets':
@@ -185,7 +247,12 @@ export async function fakeCdp({
         }
         case 'Target.createTarget': {
           tabs += 1;
-          const created = { targetId: `TAB${tabs}`, url: params.url ?? 'about:blank' };
+          const url = params.url ?? 'about:blank';
+          const created = {
+            targetId: `TAB${tabs}`,
+            url,
+            loaderId: `L${++loaders}`,
+          };
           targets.push(created);
           return answer({ targetId: created.targetId });
         }
@@ -195,6 +262,7 @@ export async function fakeCdp({
           next += 1;
           const session = `S${next}`;
           sessions.set(session, found);
+          sessionSends.set(session, send);
           if (attachEvents)
             event('Target.attachedToTarget', {
               sessionId: session,
@@ -205,6 +273,8 @@ export async function fakeCdp({
         }
         case 'Target.detachFromTarget':
           sessions.delete(params.sessionId);
+          sessionSends.delete(params.sessionId);
+          paged.delete(params.sessionId);
           return answer({});
         case 'Target.closeTarget': {
           const index = targets.findIndex((item) => item.targetId === params.targetId);
@@ -214,17 +284,35 @@ export async function fakeCdp({
         case 'Browser.getVersion':
           return answer({ product: 'Chrome/140.0.0.0', protocolVersion: '1.3' });
         case 'Page.getFrameTree':
+          if (target?.tree) return answer({ frameTree: target.tree });
+          if (frameTree) return answer({ frameTree });
           return answer({
             frameTree: {
               frame: target?.frame ?? {
                 id: target?.targetId ?? 'F',
-                loaderId: 'L',
+                loaderId: target?.loaderId ?? 'L',
                 url: target?.url ?? '',
-                securityOrigin: new URL(target?.url ?? 'about:blank').origin,
+                securityOrigin:
+                  target?.url && new URL(target.url).origin !== 'null'
+                    ? new URL(target.url).origin
+                    : '://',
               },
-              childFrames,
+              childFrames: target?.childFrames ?? childFrames,
             },
           });
+        case 'Fetch.enable':
+          fetchSessions.add(sessionId);
+          return answer({});
+        case 'Fetch.disable':
+          fetchSessions.delete(sessionId);
+          return answer({});
+        case 'Fetch.fulfillRequest':
+        case 'Fetch.continueRequest': {
+          const complete = navigationPauses.get(params.requestId);
+          navigationPauses.delete(params.requestId);
+          complete?.();
+          return answer({});
+        }
         case 'Page.enable':
           paged.add(sessionId);
           return answer({});
@@ -244,72 +332,113 @@ export async function fakeCdp({
             }
           );
         case 'Page.navigate': {
-          if (target) {
-            target.url = params.url;
-            delete target.frame;
-            delete target.history;
-          }
-          answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
-          const committed = {
-            frame: {
-              id: target?.targetId ?? 'F',
-              loaderId: `L${next}`,
-              url: params.url,
-              securityOrigin: new URL(params.url).origin,
-            },
-          };
-          for (const [peer, found] of sessions)
-            if (target && found === target && peer !== sessionId && paged.has(peer))
-              send({ method: 'Page.frameNavigated', params: committed, sessionId: peer });
-          event('Page.frameNavigated', committed);
-          emitConsole(params.url);
-          for (const item of traffic) {
-            requests += 1;
-            const requestId = `R${requests}`;
-            event('Network.requestWillBeSent', {
-              requestId,
-              loaderId: `L${next}`,
-              documentURL: params.url,
-              request: { url: item.url, method: 'GET', headers: {} },
-              timestamp: 1,
-              wallTime: 1,
-              initiator: { type: 'other' },
-              type: 'Fetch',
-            });
-            event('Network.requestWillBeSentExtraInfo', {
-              requestId,
-              associatedCookies: item.associatedCookies ?? [],
-              headers: item.requestHeaders,
-            });
-            event('Network.responseReceived', {
-              requestId,
-              loaderId: `L${next}`,
-              timestamp: 1,
-              type: 'Fetch',
-              response: {
-                url: item.url,
-                status: 200,
-                statusText: 'OK',
-                headers: { 'content-type': 'text/plain' },
-                mimeType: 'text/plain',
+          const complete = () => {
+            const loaderId = `L${++loaders}`;
+            if (target) {
+              target.url = params.url;
+              target.loaderId = loaderId;
+              delete target.frame;
+              delete target.history;
+            }
+            answer({ frameId: target?.targetId ?? 'F', loaderId });
+            const committed = {
+              frame: {
+                id: target?.targetId ?? 'F',
+                loaderId: `L${next}`,
+                url: params.url,
+                securityOrigin: new URL(params.url).origin,
               },
-            });
-            event('Network.responseReceivedExtraInfo', {
+            };
+            for (const [peer, found] of sessions)
+              if (target && found === target && peer !== sessionId && paged.has(peer))
+                sessionSends.get(peer)?.({
+                  method: 'Page.frameNavigated',
+                  params: committed,
+                  sessionId: peer,
+                });
+            event('Page.frameNavigated', committed);
+            emitConsole(params.url);
+            for (const item of traffic) {
+              requests += 1;
+              const requestId = `R${requests}`;
+              event('Network.requestWillBeSent', {
+                requestId,
+                loaderId: `L${next}`,
+                documentURL: params.url,
+                request: { url: item.url, method: 'GET', headers: {} },
+                timestamp: 1,
+                wallTime: 1,
+                initiator: { type: 'other' },
+                type: 'Fetch',
+              });
+              event('Network.requestWillBeSentExtraInfo', {
+                requestId,
+                associatedCookies: item.associatedCookies ?? [],
+                headers: item.requestHeaders,
+              });
+              event('Network.responseReceived', {
+                requestId,
+                loaderId: `L${next}`,
+                timestamp: 1,
+                type: 'Fetch',
+                response: {
+                  url: item.url,
+                  status: 200,
+                  statusText: 'OK',
+                  headers: { 'content-type': 'text/plain' },
+                  mimeType: 'text/plain',
+                },
+              });
+              event('Network.responseReceivedExtraInfo', {
+                requestId,
+                blockedCookies: [],
+                statusCode: 200,
+                headers: item.responseHeaders,
+              });
+              event('Network.loadingFinished', { requestId, timestamp: 1, encodedDataLength: 0 });
+            }
+            event('Page.domContentEventFired', { timestamp: 1 });
+            event('Page.loadEventFired', { timestamp: 1 });
+          };
+          if (pauseNavigation && fetchSessions.has(sessionId)) {
+            const requestId = `NAV-${sessionId}`;
+            navigationPauses.set(requestId, complete);
+            event('Fetch.requestPaused', {
               requestId,
-              blockedCookies: [],
-              statusCode: 200,
-              headers: item.responseHeaders,
+              networkId: `NET-${sessionId}`,
+              frameId: target?.targetId ?? 'F',
+              resourceType: 'Document',
+              request: { url: params.url, method: 'GET', headers: {} },
             });
-            event('Network.loadingFinished', { requestId, timestamp: 1, encodedDataLength: 0 });
-          }
-          event('Page.domContentEventFired', { timestamp: 1 });
-          event('Page.loadEventFired', { timestamp: 1 });
+          } else complete();
           return;
         }
-        case 'Runtime.enable':
+        case 'Page.printToPDF':
+          return answer({ stream: 'H' });
+        case 'Runtime.enable': {
+          const frame = target?.frame ?? {
+            id: target?.targetId ?? 'F',
+            loaderId: target?.loaderId ?? 'L',
+            securityOrigin:
+              target?.url && new URL(target.url).origin !== 'null'
+                ? new URL(target.url).origin
+                : '://',
+          };
+          event('Runtime.executionContextCreated', {
+            context: {
+              id: 1,
+              uniqueId: `default:${target?.targetId}:${frame.loaderId}`,
+              origin: frame.securityOrigin,
+              name: '',
+              auxData: { frameId: frame.id, isDefault: true },
+            },
+          });
+          for (const world of target?.worlds ?? [])
+            event('Runtime.executionContextCreated', { context: world });
           answer({});
           if (target?.url && target.url !== 'about:blank') emitConsole(target.url);
           return;
+        }
         case 'Network.getAllCookies':
           return answer({ cookies: jar.map((cookie) => ({ ...cookie })) });
         case 'Network.setCookie': {
@@ -341,26 +470,96 @@ export async function fakeCdp({
               item.name === params.name &&
               item.domain === params.domain &&
               (!params.path || item.path === params.path) &&
-              JSON.stringify(item.partitionKey) === JSON.stringify(params.partitionKey)
+              samePartition(item.partitionKey, params.partitionKey)
             )
               jar.splice(index, 1);
           }
           return answer({});
         }
-        case 'Page.createIsolatedWorld':
-          return answer({ executionContextId: 7 });
+        case 'Page.createIsolatedWorld': {
+          const worlds = target?.worlds ?? [];
+          const previous = worlds.find((world) => world.auxData.frameId === params.frameId);
+          const world = {
+            id: previous?.id ?? 7 + worlds.length,
+            uniqueId: `world:${params.frameId}:${target?.loaderId ?? 'L'}`,
+            origin:
+              target?.url && new URL(target.url).origin !== 'null'
+                ? new URL(target.url).origin
+                : '://',
+            name: params.worldName ?? '',
+            auxData: { frameId: params.frameId, isDefault: false },
+          };
+          if (target)
+            target.worlds = [
+              ...worlds.filter((item) => item.auxData.frameId !== params.frameId),
+              world,
+            ];
+          return answer({ executionContextId: world.id });
+        }
         case 'Accessibility.getFullAXTree':
           return answer(tree);
+        case 'Runtime.getProperties':
+          return answer({
+            result: lastAria.nodes.flatMap((node, index) =>
+              node
+                ? [
+                    {
+                      name: String(index),
+                      value: { type: 'object', subtype: 'node', objectId: `NODE${index}` },
+                    },
+                  ]
+                : []
+            ),
+          });
+        case 'DOM.describeNode': {
+          const index = Number(String(params.objectId).replace('NODE', ''));
+          return answer({ node: { nodeType: 1, ...lastAria.nodes[index] } });
+        }
         case 'DOM.resolveNode':
           return answer({ object: { type: 'object', subtype: 'node', objectId: 'OBJ' } });
         case 'DOM.getBoxModel':
           return answer({
             model: { content: [0, 0, 10, 0, 10, 10, 0, 10], width: 10, height: 10 },
           });
-        case 'Runtime.evaluate':
+        case 'Runtime.evaluate': {
+          if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {
+            target.history.currentIndex -= 1;
+            target.url = target.history.entries[target.history.currentIndex].url;
+            target.frame = {
+              id: target.targetId,
+              loaderId: 'LHISTORY',
+              url: target.url,
+              securityOrigin: new URL(target.url).origin,
+            };
+            for (const [peer, found] of sessions) {
+              if (found !== target || !paged.has(peer)) continue;
+              const restored = {
+                method: 'Page.frameNavigated',
+                sessionId: peer,
+                params: { type: 'BackForwardCacheRestore', frame: target.frame },
+              };
+              if (delayHistoryEvents) {
+                heldEvents.push(restored);
+                releaseEvents.push(() => send(restored));
+              } else send(restored);
+            }
+            return answer({ result: { type: 'undefined' } });
+          }
+          const options = ariaOptions(params.expression ?? '');
+          const capture = options ? aria(options, params, target) : undefined;
+          if (capture?.error) return send({ id, error: { code: -32000, message: capture.error } });
+          if (!capture && lastAria.handle && params.expression?.startsWith('globalThis[')) {
+            if (lastAria.handle === 'error')
+              return send({ id, error: { code: -32000, message: 'handle refused' } });
+            return answer({ result: { type: 'undefined' } });
+          }
+          if (capture) lastAria = capture;
+          const answered = ariaAnswer(capture, location, params.expression ?? '');
+          if (answered) return answer(answered);
           if (params.expression === 'document.readyState')
             return answer({ result: { type: 'string', value: 'complete' } });
           return answer({ result: { type: 'string', value: 'fake-eval' } });
+        }
         case 'Runtime.callFunctionOn':
           return answer({
             result: { type: 'object', value: { x: 5, y: 5, width: 10, height: 10 } },
@@ -386,12 +585,21 @@ export async function fakeCdp({
       }
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, listen, resolve);
+  });
+  const host = listen.includes(':') ? `[${listen}]` : listen;
   return {
-    url: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`,
+    url: `ws://${host}:${server.address().port}/devtools/browser/fake`,
+    port: server.address().port,
     calls,
     jar,
     targets,
+    heldEvents,
+    releaseEvents: () => {
+      for (const release of releaseEvents.splice(0)) release();
+    },
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));

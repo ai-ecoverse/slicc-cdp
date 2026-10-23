@@ -100,7 +100,7 @@ test('frame-scoped reads of a protected child frame committed before attach are 
     assert.equal(plain.code, 0, plain.stderr);
     assert.deepEqual(
       fake.calls.filter((call) => call.params?.frameId === 'PLAIN').map((call) => call.method),
-      ['Accessibility.getFullAXTree']
+      ['Page.createIsolatedWorld']
     );
   } finally {
     await fake.close();

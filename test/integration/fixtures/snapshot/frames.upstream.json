@@ -1,0 +1,51 @@
+[
+  {
+    "role": "generic",
+    "active": true,
+    "ref": "e1",
+    "children": [
+      {
+        "role": "heading",
+        "name": "Outer",
+        "level": 1,
+        "ref": "e2"
+      },
+      {
+        "role": "iframe",
+        "ref": "e3",
+        "children": [
+          {
+            "role": "generic",
+            "ref": "f1e1",
+            "children": [
+              {
+                "role": "paragraph",
+                "ref": "f1e2",
+                "text": "Inside the frame"
+              },
+              {
+                "role": "button",
+                "name": "Inner button",
+                "ref": "f1e3"
+              },
+              {
+                "role": "link",
+                "name": "Inner link",
+                "ref": "f1e4",
+                "cursor": "pointer",
+                "url": "/inner?q=1"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "link",
+        "name": "After",
+        "ref": "e4",
+        "cursor": "pointer",
+        "url": "/after"
+      }
+    ]
+  }
+]

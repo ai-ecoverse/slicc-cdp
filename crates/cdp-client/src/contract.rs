@@ -27,7 +27,6 @@ pub const SESSION_DOMAINS: &[&str] = &[
     "Input",
     "Network",
     "Fetch",
-    "Accessibility",
 ];
 
 #[cfg(test)]
@@ -36,6 +35,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    include!("capability_inventory_test.rs");
 
     const CALLS: &[&str] = &["call(", "call_for(", "raw_call(", "send(", "notify("];
     const BROWSER_DOMAINS: &[&str] = &["Target", "Browser", "Slicc"];

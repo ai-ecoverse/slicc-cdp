@@ -4,11 +4,11 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { findBrowser, launchBrowser } from '../../src/index.js';
-import { freePort } from './browser.mjs';
+import { findBrowser } from '../../src/index.js';
+import { freePort, launchManagedBrowser as launchBrowser } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');

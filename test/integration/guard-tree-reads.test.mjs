@@ -16,7 +16,7 @@ const reads = [
 ];
 
 function child(url = 'https://example.test/child', securityOrigin = 'https://example.test') {
-  return { frame: { id: 'CHILD', parentId: 'TAB1', url, securityOrigin } };
+  return { frame: { id: 'CHILD', parentId: 'TAB1', loaderId: 'LCHILD', url, securityOrigin } };
 }
 
 async function fixture(options, run) {
@@ -94,7 +94,11 @@ test('a frame tree change during a read prevents returning the reply', async () 
 });
 
 test('verified ordinary frame trees remain readable', async () => {
-  for (const childFrames of [[], [child()], [{ ...child(), childFrames: [child()] }]]) {
+  const deep = child();
+  deep.frame.id = 'DEEP';
+  deep.frame.parentId = 'CHILD';
+  deep.frame.loaderId = 'LDEEP';
+  for (const childFrames of [[], [child()], [{ ...child(), childFrames: [deep] }]]) {
     await fixture({ childFrames }, async (client, sessionId, calls) => {
       for (const [method, params] of reads) {
         const before = calls.length;

@@ -8,6 +8,9 @@ mod connect;
 mod cookie_headers;
 mod cookies;
 mod discover;
+#[cfg(test)]
+#[path = "../../../test/integration/document-client.rs"]
+mod document_client;
 mod help;
 mod launch;
 mod net;
@@ -16,10 +19,19 @@ mod sanitize;
 mod session;
 mod snapshot;
 mod spec;
+mod storage;
 mod trace;
+mod upgrade;
 mod webmcp;
+mod webmcp_frames;
+mod webmcp_polyfill;
 
 pub use args::Output;
+
+#[cfg(windows)]
+pub fn remove_parked_binary() {
+    upgrade::remove_parked();
+}
 
 pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     execute_with_session(argv, cdp_env, None)
@@ -73,6 +85,9 @@ pub fn execute_in(
     }
     if let Err(output) = args::validate(&invocation, spec) {
         return output;
+    }
+    if command == "upgrade" || command == "update" {
+        return upgrade::run(&invocation);
     }
     if command == "list" {
         return discover::run(&invocation, cdp_env);
@@ -162,7 +177,9 @@ mod tests {
             .unwrap_or("");
         assert!(!pending.contains("console"));
         assert!(!pending.contains("dblclick"));
-        assert!(pending.contains("dialog-accept"));
+        assert!(!pending.contains("dialog-accept"));
+        assert!(!pending.contains("dialog-dismiss"));
+        assert!(pending.contains("resize"));
         assert!(!output.stdout.contains("cdp.slicc.internal"));
         assert!(!output.stdout.contains("cdp.kernel.localhost"));
         assert!(!output.stdout.contains("/devtools/browser/slicc"));
@@ -183,7 +200,7 @@ mod tests {
             "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when that port is absent or unreachable, attaches to the first of those ports whose /json/version answers, with or without a seven tab. A probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy. The wasm build still uses port 9222.\n"
         ));
         assert!(stdout.contains(
-            "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.\n"
+            "A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque.\n"
         ));
         assert!(stdout.contains(
             "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.\n"
@@ -201,6 +218,8 @@ mod tests {
             "  fill <target> <text>        fill text into editable element",
             "  snapshot [target]           capture page snapshot to obtain element ref",
             "  eval <func> [target]        evaluate javascript expression on page or element",
+            "  dialog-accept [prompt]      accept a dialog",
+            "  dialog-dismiss              dismiss a dialog",
             "  press <key>                 press a key on the keyboard, `a`, `arrowleft`",
             "  screenshot [target]         screenshot of the current page or element",
             "  tab-list                    list all tabs",
@@ -264,7 +283,7 @@ mod tests {
         ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
-        for name in ["dialog-accept", "keydown"] {
+        for name in ["resize", "keydown"] {
             assert!(pending_names.contains(&name), "{name}");
         }
 
@@ -289,6 +308,25 @@ mod tests {
                 "--fg",
                 "--runtime",
             ],
+        );
+        assert_page(
+            "dialog-accept",
+            "playwright-cli dialog-accept [prompt]\n\nAccept a dialog\n",
+            &[
+                "  [prompt]                    the text of the prompt in case of a prompt dialog.",
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
+            ],
+            &["Not implemented"],
+        );
+        assert_page(
+            "dialog-dismiss",
+            "playwright-cli dialog-dismiss\n\nDismiss a dialog\n",
+            &[
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
+            ],
+            &["Not implemented"],
         );
         assert_page(
             "close",
@@ -452,8 +490,6 @@ mod tests {
 
         for args in [
             vec!["open", "--persistent"],
-            vec!["snapshot", "--depth", "1"],
-            vec!["snapshot", "--boxes"],
             vec!["screenshot", "--hires"],
             vec!["screenshot", "--type", "jpeg"],
         ] {

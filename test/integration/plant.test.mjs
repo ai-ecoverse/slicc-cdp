@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import test from 'node:test';
 import { launchBrowser, rawSocket } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { plantOrigins } from './plant.mjs';
 import './watchdog.mjs';
 

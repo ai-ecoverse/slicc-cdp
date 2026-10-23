@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { frameId, launchBrowser, rawSocket } from './browser.mjs';
+import { chromeTest as test } from './chrome-policy.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
 import './watchdog.mjs';
@@ -498,7 +498,10 @@ async function basicsBatchFlow(runner, site) {
   assert.ok(childFrameId, childFrameLine);
   const frameSnap = await runner.playwright(['snapshot', `--frame=${childFrameId}`], cwd);
   assert.equal(frameSnap.code, 0, `${frameSnap.stderr}\n${frameSnap.stdout}`);
-  const hoverTarget = frameSnap.stdout.match(/statictext "hover me" \[ref=(f\d+e\d+)\]/)?.[1];
+  const hoverMatch = frameSnap.stdout.match(
+    /generic "hover me" \[ref=(f\d+e\d+)\]|generic \[ref=(f\d+e\d+)\]: hover me/
+  );
+  const hoverTarget = hoverMatch?.[1] ?? hoverMatch?.[2];
   assert.ok(hoverTarget, `hover-target not found in frame snapshot:\n${frameSnap.stdout}`);
   const hoverFrame = await runner.playwright(['hover', hoverTarget], cwd);
   assert.equal(hoverFrame.code, 0, hoverFrame.stderr);
@@ -722,7 +725,9 @@ function targetOf(stdout) {
 }
 
 function refOf(stdout, role, name) {
-  const match = stdout.match(new RegExp(`(?<![A-Za-z])${role} "${name}" \\[ref=(e\\d+)\\]`));
+  const match = stdout.match(
+    new RegExp(`(?<![A-Za-z])${role} "${name}"(?: \\[[^\\]]+\\])*? \\[ref=(e\\d+)\\]`)
+  );
   if (!match) throw new Error(`missing ${role} ${name}\n${stdout}`);
   return match[1];
 }

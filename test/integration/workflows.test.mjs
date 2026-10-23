@@ -59,15 +59,27 @@ test('the pipeline picks its runners, reviews no Renovate pull request and runs 
     assert.equal(input(name), undefined, name);
   }
   assert.doesNotMatch(ci, /vars\.|CERT_|cert-review/);
-  assert.equal(input('shards'), '4');
+  assert.equal(input('shards'), '8');
   assert.equal(input('timeout-minutes'), '30');
   assert.match(input('review-prompt'), /^\|$/);
 });
 
-test('the shards split exactly the files npm test runs, on the Node the package asks for', () => {
+test('the shards split exactly the files npm test runs, on the Node the package asks for', async () => {
   assert.equal(input('test'), undefined);
   assert.equal(input('test-glob'), 'test/integration/*.test.mjs');
-  assert.ok(pkg.scripts.test.endsWith(` '${input('test-glob')}'`), pkg.scripts.test);
+  assert.ok(pkg.scripts.test.endsWith(' node scripts/test-integration.mjs'), pkg.scripts.test);
+  const entrypoint = await read('scripts/test-integration.mjs');
+  assert.ok(entrypoint.includes(`'${input('test-glob')}'`), entrypoint);
+  assert.match(
+    entrypoint,
+    /import \{ testArguments \} from '\.\.\/test\/integration\/test-arguments\.mjs'/
+  );
+  assert.match(entrypoint, /spawnSync\(process\.execPath, \[\.\.\.testArguments, \.\.\.files\]/);
+  const argumentsSource = await read('test/integration/test-arguments.mjs');
+  assert.match(argumentsSource, /'--import'/);
+  assert.match(argumentsSource, /'\.\/ports\.mjs'/);
+  assert.match(argumentsSource, /'--test'/);
+  assert.match(argumentsSource, /'--test-timeout=600000'/);
   assert.doesNotMatch(pkg.scripts.test, /NODE_OPTIONS/);
   assert.equal(input('node-version'), undefined);
   assert.equal(pkg.engines.node, '>=24');
@@ -112,6 +124,11 @@ test('the crates, binaries and release assets follow only a release on main', ()
   assert.match(job('crates'), /run: cargo fetch --locked\n[\s\S]*scripts\/publish-crates\.sh/);
   assert.match(job('binaries'), /scripts\/sign-macos\.sh/);
   assert.match(job('binaries'), /source=Notarized Developer ID/);
+  assert.doesNotMatch(
+    job('binaries'),
+    /\| *(tee|grep -q)\b/,
+    'grep -q and tee in a pipe can kill its writer with SIGPIPE under pipefail'
+  );
   for (const label of [
     'darwin-amd64',
     'darwin-arm64',
@@ -122,7 +139,14 @@ test('the crates, binaries and release assets follow only a release on main', ()
   ])
     assert.match(job('binaries'), new RegExp(`label: ${label} `), label);
   assert.match(job('assets'), /release-checksums\.mjs/);
-  assert.match(job('assets'), /--draft=false --latest/);
+  assert.match(job('assets'), /--draft=false --latest="\$latest"/);
+  assert.match(job('assets'), /\[ "\$TAG" = "\$highest" \] && latest=true/);
+  assert.match(job('assets'), /git ls-remote --tags --refs origin 'refs\/tags\/v\*'/);
+  assert.doesNotMatch(
+    ci,
+    /grep -q/,
+    'grep -q in a pipe can kill its writer with SIGPIPE under pipefail'
+  );
   for (const name of ['released', 'crates', 'binaries', 'assets', 'sliccy-browser'])
     assert.match(job(name), /\n {4}permissions:\n/, name);
 });

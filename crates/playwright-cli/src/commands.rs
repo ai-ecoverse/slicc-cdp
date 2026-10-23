@@ -22,6 +22,9 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = cookies::precheck(command, invocation) {
         return Output::err(message);
     }
+    if let Some(message) = crate::storage::precheck(command, invocation) {
+        return Output::err(message);
+    }
     if let Some(message) = launch::reject_wasm_flags(command, &invocation.flags) {
         return Output::err(message);
     }
@@ -119,6 +122,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
+    state.webmcp_connection = cdp_client::hash::sha256_hex(endpoint.as_bytes());
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
@@ -157,8 +161,10 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if trace::is_request_command(command) => {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
+        "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
+        _ if crate::storage::is_command(command) => crate::storage::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
         "go-forward" => cmd_go_forward(&mut cdp, &mut state, invocation, &mut report),
@@ -172,6 +178,8 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         "drag" => cmd_drag(&mut cdp, &mut state, invocation, &mut report),
         "frames" => cmd_frames(&mut cdp, &mut state, invocation, &mut report),
         "pdf" => cmd_pdf(&mut cdp, &mut state, invocation, &mut report),
+        "dialog-accept" => cmd_dialog(&mut cdp, &mut state, invocation, true),
+        "dialog-dismiss" => cmd_dialog(&mut cdp, &mut state, invocation, false),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
     let result = match session::save(&state) {
@@ -462,7 +470,7 @@ fn cmd_snapshot(
     };
     let built = build_snapshot(cdp, &session, invocation);
     let watched = browser::watch_detach(cdp, state, &target, &session);
-    let (text, refs) = match built {
+    let (header, body, refs) = match built {
         Ok(value) => value,
         Err(message) => return Output::err(message),
     };
@@ -471,75 +479,174 @@ fn cmd_snapshot(
     }
     state.current = Some(target.clone());
     state.snapshots.insert(target, refs);
+    let mut lines = header;
+    lines.push("### Snapshot".to_string());
     if let Some(filename) = invocation.flags.get("filename") {
-        return match write_text(filename, &text) {
-            Ok(()) => Output::ok(format!("Snapshot saved to {filename}\n")),
-            Err(message) => Output::err(message),
-        };
-    }
-    Output::ok(format!("{text}\n"))
-}
-
-fn build_snapshot(
-    cdp: &mut Cdp,
-    session: &str,
-    invocation: &Invocation,
-) -> Result<(String, BTreeMap<String, RefRec>), String> {
-    let (url, title) = browser::page_location(cdp, session)?;
-    let url = sanitize::display_url(&url);
-    let title = sanitize::browser_message(&title);
-    if let Some(frame_id) = invocation.flags.get("frame") {
-        let frames = browser::frame_tree(cdp, session)?;
-        if !frames.iter().any(|frame| frame.frame_id == *frame_id) {
-            return Err(format!(
-                "Unknown frame ID \"{frame_id}\" for tab {}. Run 'playwright-cli frames --tab={}' to list frame IDs.\n",
-                invocation.flags.get("tab").map(String::as_str).unwrap_or("<targetId>"),
-                invocation.flags.get("tab").map(String::as_str).unwrap_or("<targetId>")
-            ));
+        if let Err(message) = write_text(filename, &body) {
+            return Output::err(message);
         }
-        let nodes = browser::accessibility_tree(cdp, session, Some(frame_id))?;
-        let root = single_root(nodes);
-        let (body, mut refs) = snapshot::render_tree(&root, "f1");
-        snapshot::tag_frame_refs(&mut refs, frame_id, "f1");
-        let text = format!("Page URL: {url}\nPage Title: {title}\n\n{body}");
-        return Ok((text, refs));
-    }
-    let nodes = browser::accessibility_tree(cdp, session, None)?;
-    let root = single_root(nodes);
-    let (body, mut refs) = snapshot::render_tree(&root, "");
-    let body = if flag_true(&invocation.flags, "no-iframes") {
-        body
+        lines.push(format!("- [Snapshot]({})", sanitize::terminal(filename)));
     } else {
-        let frames = browser::frame_tree(cdp, session).unwrap_or_default();
-        let (stitched, assigned) =
-            snapshot::stitch_iframes(&body, &url, &frames, |frame, prefix| {
-                let nodes =
-                    browser::accessibility_tree(cdp, session, Some(&frame.frame_id)).ok()?;
-                let root = single_root(nodes);
-                let (text, frame_refs) = snapshot::render_tree(&root, prefix);
-                for (id, mut rec) in frame_refs {
-                    rec.frame_id = Some(frame.frame_id.clone());
-                    refs.insert(id, rec);
-                }
-                Some(text)
-            });
-        let _ = assigned;
-        stitched
-    };
-    let text = format!("Page URL: {url}\nPage Title: {title}\n\n{body}");
-    Ok((text, refs))
+        lines.extend(["```yaml".to_string(), body, "```".to_string()]);
+    }
+    Output::ok(format!("{}\n", lines.join("\n")))
 }
 
-fn single_root(mut nodes: Vec<crate::snapshot::AxNode>) -> crate::snapshot::AxNode {
-    if nodes.len() == 1 {
-        return nodes.pop().unwrap();
+type Built = (Vec<String>, String, BTreeMap<String, RefRec>);
+
+fn build_snapshot(cdp: &mut Cdp, session: &str, invocation: &Invocation) -> Result<Built, String> {
+    let (url, title) = browser::page_location(cdp, session)?;
+    let mut header = vec!["### Page".to_string(), format!("- Page URL: {}", sanitize::display_url(&url))];
+    if !title.is_empty() {
+        header.push(format!("- Page Title: {}", sanitize::browser_message(&title)));
     }
-    crate::snapshot::AxNode {
-        role: "RootWebArea".to_string(),
-        name: String::new(),
-        value: String::new(),
-        backend_node_id: None,
-        children: nodes,
+    let frames = browser::page_frames(cdp, session)?;
+    let chosen = invocation.flags.get("frame");
+    let root = match chosen {
+        Some(frame_id) => frames.iter().find(|frame| frame.frame_id == *frame_id).ok_or_else(|| {
+            let tab = invocation.flags.get("tab").map(String::as_str).unwrap_or("<targetId>");
+            format!(
+                "Unknown frame ID \"{frame_id}\" for tab {tab}. Run 'playwright-cli frames --tab={tab}' to list frame IDs.\n"
+            )
+        })?,
+        None => frames
+            .iter()
+            .find(|frame| frame.parent_frame_id.is_none())
+            .ok_or_else(|| "snapshot: the tab has no main frame\n".to_string())?,
+    };
+    let walk = Walk {
+        frames: &frames,
+        guard: cdp.guard().clone(),
+        iframes: !flag_true(&invocation.flags, "no-iframes"),
+        default_root: (chosen.is_none() && cdp.guard().error_page_url(&root.url) && !cdp.content_blocked(session)).then_some(root.frame_id.as_str()),
+        extra: std::cell::Cell::new(0),
+        seen: std::cell::RefCell::new([root.frame_id.clone()].into()),
+    };
+    let depth = match invocation.flags.get("depth") {
+        Some(text) => Some(text.parse::<i64>().map_err(|_| {
+            format!("snapshot: --depth must be a number, not \"{}\"\n", sanitize::terminal(text))
+        })?),
+        None => None,
+    };
+    let options = snapshot::Options {
+        focused: if chosen.is_some() { None } else { Some(true) },
+        depth,
+        boxes: flag_true(&invocation.flags, "boxes"),
+    };
+    let mut refs = BTreeMap::new();
+    let scope = Scope { session, frames: &frames, target: None, owner: None };
+    let nodes = match root.target {
+        Some(_) => walk.remote(cdp, &scope, &root.frame_id, None, options, &mut refs)?,
+        None => walk.frame(cdp, &scope, &root.frame_id, options, root.parent_frame_id.is_some(), &mut refs)?,
+    };
+    Ok((header, sanitize::terminal(&snapshot::render(&nodes)), refs))
+}
+
+struct Scope<'a> {
+    session: &'a str,
+    frames: &'a [snapshot::FrameRec],
+    target: Option<&'a str>,
+    owner: Option<u64>,
+}
+
+struct Walk<'a> {
+    frames: &'a [snapshot::FrameRec],
+    guard: cdp_client::protected::Protected,
+    iframes: bool,
+    default_root: Option<&'a str>,
+    extra: std::cell::Cell<usize>,
+    seen: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+impl Walk<'_> {
+    fn frame(
+        &self,
+        cdp: &mut Cdp,
+        scope: &Scope,
+        frame_id: &str,
+        options: snapshot::Options,
+        child: bool,
+        refs: &mut BTreeMap<String, RefRec>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let prefix = snapshot::frame_prefix(self.frames, frame_id, || {
+            self.extra.set(self.extra.get() + 1);
+            self.frames.len() + self.extra.get()
+        });
+        let capture = browser::aria_capture(cdp, scope.session, frame_id, &prefix, options, self.default_root == Some(frame_id))?;
+        let mut nodes = capture.json;
+        snapshot::redact_links(&mut nodes, &capture.base, &self.guard);
+        let labels = snapshot::labels(&nodes);
+        for rec in &capture.refs {
+            refs.insert(
+                rec.id.clone(),
+                RefRec {
+                    backend_node_id: rec.backend_node_id,
+                    selector: rec.selector.clone(),
+                    frame_id: child.then(|| frame_id.to_string()),
+                    label: labels.get(&rec.id).cloned().flatten(),
+                    target: scope.target.map(str::to_string),
+                    owner: scope.owner,
+                    page: None,
+                },
+            );
+        }
+        if !self.iframes {
+            return Ok(nodes);
+        }
+        for rec in &capture.refs {
+            let Some(content) = rec.content_frame.as_deref() else {
+                continue;
+            };
+            let local = scope.frames.iter().find(|frame| frame.frame_id == content && frame.target.is_none());
+            let remote = local.is_none() && self.frames.iter().any(|frame| frame.frame_id == content && frame.target.is_some());
+            if local.is_some_and(|frame| self.guard.url(&frame.url)) {
+                continue;
+            }
+            let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) else {
+                continue;
+            };
+            if node.get("role").and_then(serde_json::Value::as_str) != Some("iframe")
+                || !self.seen.borrow_mut().insert(content.to_string())
+            {
+                continue;
+            }
+            let active = node.get("active").and_then(serde_json::Value::as_bool) == Some(true);
+            let inner_options =
+                snapshot::child_options(options, active, capture.iframe_depths.get(&rec.id).copied());
+            let inner = if remote {
+                self.remote(cdp, scope, content, rec.backend_node_id, inner_options, refs)
+            } else {
+                self.frame(cdp, scope, content, inner_options, true, refs)
+            };
+            if let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) {
+                if let Some(inner) = inner.ok().filter(|inner| !inner.is_empty()) {
+                    node["children"] = serde_json::Value::Array(inner);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    fn remote(
+        &self,
+        cdp: &mut Cdp,
+        scope: &Scope,
+        frame_id: &str,
+        owner: Option<u64>,
+        options: snapshot::Options,
+        refs: &mut BTreeMap<String, RefRec>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let frame = self.frames.iter().find(|frame| frame.frame_id == frame_id && frame.target.is_some()).cloned().unwrap_or_default();
+        let (session, frames) = browser::open_frame(cdp, &frame)?;
+        let inner = Scope {
+            session: &session,
+            frames: &frames,
+            target: Some(frame_id),
+            owner: owner.filter(|_| scope.target.is_none()),
+        };
+        let nodes = self.frame(cdp, &inner, frame_id, options, true, refs);
+        cdp::detach(cdp, &session);
+        nodes
     }
 }
 
@@ -790,15 +897,21 @@ fn cmd_eval(
     };
     let result: Result<String, String> = (|| {
         let value = if let Some(frame_id) = invocation.flags.get("frame") {
-            browser::evaluate_in_frame(cdp, &session, frame_id, &expression).or_else(|err| {
+            let child = browser::frame_session(cdp, &session, frame_id)?;
+            let scope = child.as_deref().unwrap_or(&session);
+            let value = browser::evaluate_called(cdp, scope, Some(frame_id), &expression).or_else(|err| {
                 retry_await(err, &expression, |source| {
-                    browser::evaluate_in_frame(cdp, &session, frame_id, source)
+                    browser::evaluate_called(cdp, scope, Some(frame_id), source)
                 })
-            })?
+            });
+            if let Some(child) = child.as_deref() {
+                cdp::detach(cdp, child);
+            }
+            value?
         } else {
-            browser::evaluate(cdp, &session, &expression, true).or_else(|err| {
+            browser::evaluate_called(cdp, &session, None, &expression).or_else(|err| {
                 retry_await(err, &expression, |source| {
-                    browser::evaluate(cdp, &session, source, true)
+                    browser::evaluate_called(cdp, &session, None, source)
                 })
             })?
         };
@@ -883,7 +996,13 @@ fn with_ref(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = body(cdp, &session, &rec);
+    let result = browser::ref_session(cdp, &session, &rec).and_then(|(rec, child)| {
+        let result = body(cdp, child.as_deref().unwrap_or(&session), &rec);
+        if let Some(child) = child {
+            cdp::detach(cdp, &child);
+        }
+        result
+    });
     let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(text) => {
@@ -1176,7 +1295,11 @@ fn cmd_webmcp_list(
 ) -> Output {
     let tab = invocation.flags.get("tab").map(String::as_str);
     let json = flag_true(&invocation.flags, "json");
-    crate::webmcp::list(cdp, state, tab, json)
+    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
+        Ok(from) => from,
+        Err(message) => return Output::err(message),
+    };
+    crate::webmcp::list_from(cdp, state, tab, json, &from)
 }
 
 fn cmd_webmcp_call(
@@ -1200,7 +1323,12 @@ fn cmd_webmcp_call(
     };
     let tab = invocation.flags.get("tab").map(String::as_str);
     let allow_consequential = flag_true(&invocation.flags, "allow-consequential");
-    crate::webmcp::call(cdp, state, name, &input_json, tab, allow_consequential)
+    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
+        Ok(from) => from,
+        Err(message) => return Output::err(message),
+    };
+    let frame = invocation.flags.get("frame").map(String::as_str);
+    crate::webmcp::call_from(cdp, state, name, &input_json, tab, allow_consequential, &from, frame)
 }
 
 
@@ -1217,6 +1345,31 @@ fn default_pdf_path() -> PathBuf {
     #[cfg(target_os = "wasi")]
     {
         PathBuf::from(".playwright-cli").join(name)
+    }
+}
+
+fn cmd_dialog(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, accept: bool) -> Output {
+    let prompt = (accept && !invocation.positionals.is_empty()).then(|| invocation.positionals.join(" "));
+    let target = match invocation.flags.get("tab").cloned().or_else(|| state.current.clone()) {
+        Some(target) => target,
+        None => match cdp.dialog_targets() {
+            Ok(targets) if targets.len() == 1 => targets[0].clone(),
+            Ok(_) => return Output::err("Error: --tab <targetId> is required. Run 'playwright-cli tab-list' to get tab IDs.\n"),
+            Err(message) => return Output::err(message),
+        },
+    };
+    let session = match cdp.attach_dialog(&target) {
+        Ok(session) => session,
+        Err(message) => return Output::err(message),
+    };
+    let result = browser::handle_dialog(cdp, &session, accept, prompt.as_deref());
+    cdp::detach(cdp, &session);
+    match result {
+        Ok(text) => {
+            state.current = Some(target);
+            Output::ok(text)
+        }
+        Err(message) => Output::err(message),
     }
 }
 
@@ -1495,7 +1648,7 @@ fn cmd_drag(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = browser::drag_refs(cdp, &session, &start_rec, &end_rec);
+    let result = drag_between(cdp, &session, &start_rec, &end_rec);
     let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(()) => {
@@ -1507,6 +1660,26 @@ fn cmd_drag(
         }
         Err(message) => Output::err(message),
     }
+}
+
+fn drag_between(cdp: &mut Cdp, session: &str, start: &RefRec, end: &RefRec) -> Result<(), String> {
+    let mut children = Vec::new();
+    let result = (|| {
+        let (start, start_child) = browser::ref_session(cdp, session, start)?;
+        children.extend(start_child.clone());
+        let (end, end_child) = browser::ref_session(cdp, session, end)?;
+        children.extend(end_child.clone());
+        browser::drag_refs(
+            cdp,
+            session,
+            (start_child.as_deref().unwrap_or(session), &start),
+            (end_child.as_deref().unwrap_or(session), &end),
+        )
+    })();
+    for child in children {
+        cdp::detach(cdp, &child);
+    }
+    result
 }
 
 fn cmd_frames(
@@ -1529,7 +1702,7 @@ fn cmd_frames(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = browser::frame_tree(cdp, &session);
+    let result = browser::page_frames(cdp, &session);
     let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(frames) => {

@@ -1,0 +1,307 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { verdictProblems } from './guard-set.mjs';
+import { finalizeX1Privacy, protectedX1Exposure, recordX1Client, x1Privacy } from './x1-audit.mjs';
+
+const ordinary = 'http://plain.guard.test:18100';
+const protectedOrigin = 'http://seven.sliccy.ai:18100';
+function evidence() {
+  const actors = [ordinary, protectedOrigin].map((destination, index) => {
+    const sessionId = `S${index}`;
+    const loaderId = `N${index}`;
+    const url = `${ordinary}/page?k=href&tag=public-${index}&to=${destination}/canary/public-${index}`;
+    return {
+      closed: true,
+      calls: [
+        {
+          method: 'Page.addScriptToEvaluateOnNewDocument',
+          error: 'slicc: refused: persistent page capabilities are not supported by slicc-cdp\n',
+        },
+        {
+          method: 'Network.setExtraHTTPHeaders',
+          error: 'slicc: refused: persistent page capabilities are not supported by slicc-cdp\n',
+        },
+        { method: 'Page.navigate', params: { url }, sessionId, result: { loaderId } },
+      ],
+      messages: [
+        JSON.stringify({
+          method: 'Network.requestWillBeSent',
+          sessionId,
+          params: { requestId: loaderId, request: { url } },
+        }),
+        JSON.stringify({
+          method: 'Fetch.requestPaused',
+          sessionId,
+          params: { requestId: `F${index}`, networkId: loaderId, request: { url } },
+        }),
+      ],
+    };
+  });
+  const observed = {
+    instrumented: false,
+    headed: false,
+    intercepted: true,
+    served: true,
+    document: true,
+    forged: false,
+    scripted: false,
+    probed: false,
+    paused: false,
+  };
+  const row = {
+    id: 'X1.after-exit',
+    target: 'seven',
+    variant: 'prompt',
+    control: 'fail',
+    guarded: 'fail',
+    live: 'pass',
+    observations: { control: { ...observed }, guarded: { ...observed } },
+    errors: [
+      `settle: no beacon from ${ordinary} within 1500ms`,
+      `settle: no beacon from ${ordinary} within 1500ms`,
+    ],
+  };
+  return { actors, row };
+}
+
+test('X1 raw failures never qualify for a disposition even with clean privacy evidence', () => {
+  const { actors, row } = evidence();
+  row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+  assert(row.x1Privacy.measured && !row.x1Privacy.markerExposed && !row.x1Privacy.protectedExposed);
+  assert.equal(verdictProblems([row]).length, 1);
+  for (const target of ['seven', 'vault'])
+    for (const variant of ['prompt', 'lagging'])
+      assert.equal(verdictProblems([{ ...row, target, variant }]).length, 1);
+});
+
+test('X1 audit never excludes a private marker, a differing request or a URL in any other field', () => {
+  const mutate = [
+    (message) => {
+      message.params.requestId = 'OTHER';
+      delete message.params.networkId;
+    },
+    (message) => {
+      message.sessionId = 'OTHER';
+    },
+    (message) => {
+      message.params.request.url += '&new=1';
+    },
+    (message) => {
+      message.params.headers = { Location: `${protectedOrigin}/canary/private` };
+    },
+    (message) => {
+      message.params.frame = { url: `${protectedOrigin}/canary/private` };
+    },
+    (message) => {
+      message.params.title = `${protectedOrigin}/canary/private`;
+    },
+    (message) => {
+      message.params.body = `canary-marker ${new URL(protectedOrigin).host}`;
+    },
+    (message) => {
+      message.params.body = Buffer.from(`${protectedOrigin}/canary/private`).toString('base64');
+    },
+    (message) => {
+      message.params.other = JSON.stringify({ url: `${protectedOrigin}/canary/private` });
+    },
+    (message) => {
+      message.method = 'Network.responseReceived';
+    },
+  ];
+  for (const change of mutate) {
+    const { actors, row } = evidence();
+    const message = JSON.parse(actors[1].messages[1]);
+    change(message);
+    actors[1].messages[1] = JSON.stringify(message);
+    row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+    assert(verdictProblems([row]).length > 0);
+    assert.ok(verdictProblems([row]).length > 0);
+    assert.ok(verdictProblems([{ ...row, control: 'pass', guarded: 'pass' }]).length > 0);
+  }
+  const { actors, row } = evidence();
+  const url =
+    actors[1].calls[2].params.url +
+    `&marker=${encodeURIComponent(`canary-marker ${new URL(protectedOrigin).host}`)}`;
+  actors[1].calls[2].params.url = url;
+  const event = JSON.parse(actors[1].messages[1]);
+  event.params.request.url = url;
+  actors[1].messages[1] = JSON.stringify(event);
+  row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+  assert.equal(row.x1Privacy.markerExposed, true);
+  assert(verdictProblems([row]).length > 0);
+});
+
+test('X1 screenshots or missing audit cannot qualify as PASS', () => {
+  for (const mutate of [
+    (actors) => {
+      actors[1].closed = false;
+    },
+    (actors) => {
+      actors[1].messages = [];
+    },
+    (actors) => {
+      actors[1].calls.push({
+        method: 'Page.captureScreenshot',
+        result: { data: 'PRIVATE_SCREENSHOT' },
+      });
+    },
+  ]) {
+    const { actors, row } = evidence();
+    mutate(actors);
+    row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+    assert(verdictProblems([row]).length > 0);
+  }
+});
+
+test('ordinary absolute canary URLs are not mistaken for protected relative paths', () => {
+  for (const value of [
+    `${ordinary}/canary/control`,
+    `${ordinary}/page?to=${ordinary}/canary/control`,
+    JSON.stringify({ url: `${ordinary}/canary/control` }),
+  ])
+    assert.equal(protectedX1Exposure(value), false);
+  assert.equal(protectedX1Exposure('/canary/private'), true);
+  assert.equal(protectedX1Exposure(`${protectedOrigin}/canary/private`), true);
+});
+
+test('origin-only references in any field are public but protected URL components remain secret', () => {
+  const { actors, row } = evidence();
+  const message = JSON.parse(actors[1].messages[1]);
+  message.params.headers = { Reference: `${protectedOrigin}/` };
+  message.params.frame = { url: `${ordinary}/page?tag=public-1&to=${protectedOrigin}` };
+  actors[1].messages[1] = JSON.stringify(message);
+  row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+  assert(
+    row.x1Privacy.measured &&
+      !row.x1Privacy.markerExposed &&
+      !row.x1Privacy.protectedExposed &&
+      !row.x1Privacy.screenshotExposed
+  );
+  assert(row.x1Privacy.diagnostics.some((entry) => entry.valueClass === 'protected-origin-only'));
+  for (const entry of row.x1Privacy.diagnostics) {
+    assert.match(entry.valueHash, /^[a-f0-9]{64}$/);
+    assert.equal(Object.hasOwn(entry, 'value'), false);
+    assert.equal(Object.hasOwn(entry, 'raw'), false);
+  }
+  for (const suffix of [
+    '/canary/secret',
+    '/private',
+    '?code=secret',
+    '/?code=secret',
+    '#secret',
+    '/#secret',
+  ]) {
+    assert.equal(protectedX1Exposure(`${protectedOrigin}${suffix}`), true);
+  }
+  for (const value of [
+    protectedOrigin,
+    `${protectedOrigin}/`,
+    protectedOrigin.toUpperCase(),
+    encodeURIComponent(`${protectedOrigin}/`),
+  ])
+    assert.equal(protectedX1Exposure(value), false);
+  const leaked = evidence();
+  const bad = JSON.parse(leaked.actors[1].messages[1]);
+  bad.params.title = 'public-1';
+  leaked.actors[1].messages[1] = JSON.stringify(bad);
+  leaked.row.x1Privacy = x1Privacy(leaked.actors, { ordinary, protectedOrigin });
+  assert(verdictProblems([leaked.row]).length > 0);
+  assert(
+    leaked.row.x1Privacy.diagnostics.some(
+      (entry) => entry.field === '$.params.title' && entry.valueClass === 'protected-canary-tag'
+    )
+  );
+});
+
+test('ordinary scheme-less auto-titles are parsed in their own realm without exempting private titles', () => {
+  const { actors, row } = evidence();
+  const message = JSON.parse(actors[1].messages[1]);
+  actors[1].messages.push(
+    JSON.stringify({
+      method: 'Target.targetInfoChanged',
+      params: { targetInfo: { title: 'plain.guard.test:18100/doc?n=exit-public-1' } },
+    })
+  );
+  actors[1].messages.push(
+    JSON.stringify({
+      method: 'Target.targetInfoChanged',
+      params: {
+        targetInfo: { title: `plain.guard.test:18100/page?tag=public-1&to=${protectedOrigin}` },
+      },
+    })
+  );
+  row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
+  assert(
+    row.x1Privacy.measured &&
+      !row.x1Privacy.markerExposed &&
+      !row.x1Privacy.protectedExposed &&
+      !row.x1Privacy.screenshotExposed
+  );
+  for (const title of [
+    'seven.sliccy.ai:18100/canary/public-1',
+    'public-1',
+    'canary-marker seven.sliccy.ai:18100',
+  ]) {
+    const bad = evidence();
+    bad.actors[1].messages.push(
+      JSON.stringify({ method: 'Target.targetInfoChanged', params: { targetInfo: { title } } })
+    );
+    bad.row.x1Privacy = x1Privacy(bad.actors, { ordinary, protectedOrigin });
+    assert(verdictProblems([bad.row]).length > 0);
+  }
+  assert.equal(message.method, 'Fetch.requestPaused');
+});
+
+test('private URL audit decodes nested carriers and case variants', () => {
+  for (const encode of [
+    (s) => s,
+    encodeURIComponent,
+    (s) => Buffer.from(s).toString('base64'),
+    (s) => [...s].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`).join(''),
+  ])
+    assert.equal(protectedX1Exposure(encode('HTTPS://SEVEN.SLICCY.AI:18100/canary/secret')), true);
+  assert.equal(protectedX1Exposure({ value: 'ordinary public bytes' }), false);
+});
+
+test('X1 recorder captures actual outgoing results, refusals and completed close', async () => {
+  const client = {
+    messages: ['{}'],
+    async send(method) {
+      if (method === 'denied') throw new Error('actual refusal');
+      return { loaderId: 'actual-loader' };
+    },
+    async close() {},
+  };
+  const actor = recordX1Client(client);
+  await client.send('Page.navigate', { url: `${ordinary}/page` }, 'S');
+  await assert.rejects(client.send('denied'), /actual refusal/);
+  assert.equal(actor.calls[0].result.loaderId, 'actual-loader');
+  assert.equal(actor.calls[1].error, 'actual refusal');
+  assert.equal(actor.closed, false);
+  await client.close();
+  assert.equal(actor.closed, true);
+});
+
+test('final X1 privacy uses actual completed resource closes, not the earlier row-log snapshot', async () => {
+  const { actors, row } = evidence();
+  const clones = actors.map((actor) => ({
+    messages: actor.messages,
+    send: async () => ({}),
+    close: async () => {},
+  }));
+  const captured = clones.map(recordX1Client);
+  for (const [i, actor] of captured.entries()) actor.calls.push(...actors[i].calls);
+  const records = new Map([
+    ['X1.after-exit/seven/prompt', { actors: captured, ordinary, protectedOrigin }],
+  ]);
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, false);
+  const legs = [row.control, row.guarded, row.live];
+  await Promise.all(clones.map((client) => client.close()));
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, true);
+  assert.deepEqual([row.control, row.guarded, row.live], legs);
+  captured[1].closed = false;
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, false);
+});

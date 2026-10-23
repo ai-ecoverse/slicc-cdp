@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { attachKernel, createNodeKernel } from '@ai-ecoverse/slicc-kernel/node';
 import { bridge } from './browser.mjs';
+import { requireChrome } from './chrome-policy.mjs';
 import { deadline, killTree } from './watchdog.mjs';
 
 const manifest = JSON.stringify({
@@ -45,6 +46,9 @@ async function hostSessionFile(cwd) {
 }
 
 export function runProcess(file, args, cwd, timeoutMs = 45000) {
+  const explicitCdp = args.some((arg) => arg === '--cdp' || arg?.startsWith('--cdp='));
+  if (/chrome|chromium/i.test(path.basename(file)) || (args.includes('open') && !explicitCdp))
+    requireChrome();
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     delete env.SLICC_CDP_URL;
@@ -73,6 +77,7 @@ export function runProcess(file, args, cwd, timeoutMs = 45000) {
 }
 
 export function nativeRunner(playwright, curlwright, wsUrl) {
+  if (!wsUrl) requireChrome();
   return {
     async fresh() {
       return mkdtemp(path.join(tmpdir(), 'slicc-cdp-cli-'));
@@ -101,6 +106,7 @@ export function nativeRunner(playwright, curlwright, wsUrl) {
 }
 
 export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
+  if (!wsUrl) requireChrome();
   const kernel = await createNodeKernel({ cdp: bridge(wsUrl) });
   const pkg = '/node_modules/@ai-ecoverse/slicc-cdp';
   await kernel.writeFile(`${pkg}/package.json`, manifest);

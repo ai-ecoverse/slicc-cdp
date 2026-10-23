@@ -15,10 +15,13 @@ pub struct Session {
     pub provenance: Option<String>,
     pub session_name: Option<String>,
     pub owned: Vec<String>,
+    pub created_blanks: BTreeMap<String, Value>,
     pub snapshots: BTreeMap<String, BTreeMap<String, RefRec>>,
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
     pub routes: Vec<Route>,
+    pub webmcp: BTreeMap<String, Value>,
+    pub webmcp_connection: String,
     pub cwd: Option<PathBuf>,
 }
 
@@ -172,6 +175,9 @@ fn decode(text: &str) -> Session {
                                 .and_then(|v| v.as_str())
                                 .filter(|label| !label.is_empty())
                                 .map(str::to_string),
+                            target: rec.get("targetId").and_then(|v| v.as_str()).map(str::to_string),
+                            owner: rec.get("ownerNodeId").and_then(|v| v.as_u64()),
+                            page: None,
                         },
                     );
                 }
@@ -185,6 +191,7 @@ fn decode(text: &str) -> Session {
         provenance,
         session_name,
         owned,
+        created_blanks: value.get("createdBlanks").and_then(Value::as_object).map(|items| items.iter().map(|(target, proof)| (target.clone(), proof.clone())).collect()).unwrap_or_default(),
         snapshots,
         console: decode_console(&value),
         requests: decode_requests(&value),
@@ -193,6 +200,8 @@ fn decode(text: &str) -> Session {
             .and_then(|item| item.as_array())
             .map(|items| items.iter().filter_map(route::decode).collect())
             .unwrap_or_default(),
+        webmcp: value.get("webmcp").and_then(Value::as_object).map(|entries| entries.iter().map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
+        webmcp_connection: String::new(),
         cwd: None,
     }
 }
@@ -239,6 +248,8 @@ fn encode(session: &Session) -> Value {
                     "selector": rec.selector,
                     "frameId": rec.frame_id,
                     "label": rec.label,
+                    "targetId": rec.target,
+                    "ownerNodeId": rec.owner,
                 }),
             );
         }
@@ -250,10 +261,12 @@ fn encode(session: &Session) -> Value {
         "provenance": session.provenance,
         "sessionName": session.session_name,
         "owned": session.owned,
+        "createdBlanks": session.created_blanks,
         "snapshots": snapshots,
         "console": encode_lists(&session.console, stored_console),
         "requests": encode_lists(&session.requests, |request| Some(stored_request(request))),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
+        "webmcp": session.webmcp,
     })
 }
 
@@ -691,6 +704,14 @@ pub fn stored_label<'a>(session: &'a Session, target: &str, id: &str) -> Option<
 }
 
 pub fn save(session: &Session) -> Result<(), String> {
+    store(session, false)
+}
+
+pub fn save_webmcp(session: &Session) -> Result<(), String> {
+    store(session, true)
+}
+
+fn store(session: &Session, webmcp_writer: bool) -> Result<(), String> {
     let mut stored = session.clone();
     if usable_endpoint(stored.endpoint.as_deref(), stored.provenance.as_deref()).is_none() {
         stored.endpoint = None;
@@ -702,6 +723,9 @@ pub fn save(session: &Session) -> Result<(), String> {
         }
         return Err("session: user config dir is not absolute\n".into());
     };
+    if !webmcp_writer && file.exists() {
+        stored.webmcp = load_at(&file).webmcp;
+    }
     write_at(&file, &stored)
 }
 
@@ -965,6 +989,7 @@ mod tests {
                 selector: "button".to_string(),
                 frame_id: None,
                 label: Some("button \"Sign in\"".to_string()),
+                ..RefRec::default()
             },
         );
         refs.insert(
@@ -974,6 +999,9 @@ mod tests {
                 selector: "input".to_string(),
                 frame_id: Some("F".to_string()),
                 label: Some(String::new()),
+                target: Some("F".to_string()),
+                owner: Some(9),
+                page: Some("S".to_string()),
             },
         );
         let session = Session {
@@ -985,6 +1013,10 @@ mod tests {
         assert_eq!(stored_label(&again, "T", "e1"), Some("button \"Sign in\""));
         assert!(stored_label(&again, "T", "e2").is_none());
         assert_eq!(again.snapshots["T"]["e2"].frame_id.as_deref(), Some("F"));
+        assert_eq!(again.snapshots["T"]["e2"].target.as_deref(), Some("F"));
+        assert_eq!(again.snapshots["T"]["e2"].owner, Some(9));
+        assert_eq!(again.snapshots["T"]["e2"].page, None);
+        assert_eq!(again.snapshots["T"]["e1"].target, None);
     }
 
     #[test]

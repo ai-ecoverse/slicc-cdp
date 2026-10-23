@@ -97,7 +97,7 @@ pub fn redact_url(raw: &str) -> String {
     parsed.to_string().replace("%E2%80%A6", "\u{2026}")
 }
 
-fn redact_query_string(query: &str) -> String {
+pub fn redact_query_string(query: &str) -> String {
     query
         .split('&')
         .map(|component| {
