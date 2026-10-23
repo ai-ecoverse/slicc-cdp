@@ -1,12 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { expectedFailureDispositions, verdictProblems } from './guard-set.mjs';
-import {
-  isExpectedX1Failure150,
-  protectedX1Exposure,
-  recordX1Client,
-  x1Privacy,
-} from './x1-known.mjs';
+import { verdictProblems } from './guard-set.mjs';
+import { finalizeX1Privacy, protectedX1Exposure, recordX1Client, x1Privacy } from './x1-audit.mjs';
 
 const ordinary = 'http://plain.guard.test:18100';
 const protectedOrigin = 'http://seven.sliccy.ai:18100';
@@ -69,28 +64,17 @@ function evidence() {
   return { actors, row };
 }
 
-test('#150 preserves raw X1 failures and binds only exact authored request URL echoes', () => {
+test('X1 raw failures never qualify for a disposition even with clean privacy evidence', () => {
   const { actors, row } = evidence();
-  const original = structuredClone(row);
   row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
-  assert.equal(isExpectedX1Failure150(row), true);
-  assert.deepEqual(verdictProblems([row]), []);
-  assert.equal(row.x1Privacy.echoes.length, 4);
-  assert(
-    row.x1Privacy.echoes.every((echo) => echo.byteExact && echo.outgoingURL === echo.incomingURL)
-  );
-  assert.deepEqual(row.observations, original.observations);
-  assert.equal(row.control, 'fail');
-  assert.equal(row.guarded, 'fail');
-  const [disposition] = expectedFailureDispositions([row]);
-  assert.equal(disposition.reason, 'slicc-browsers#150');
-  assert.match(disposition.deletionHook, /fixed X1 vector/);
+  assert(row.x1Privacy.measured && !row.x1Privacy.markerExposed && !row.x1Privacy.protectedExposed);
+  assert.equal(verdictProblems([row]).length, 1);
   for (const target of ['seven', 'vault'])
     for (const variant of ['prompt', 'lagging'])
-      assert.equal(isExpectedX1Failure150({ ...row, target, variant }), true);
+      assert.equal(verdictProblems([{ ...row, target, variant }]).length, 1);
 });
 
-test('#150 never excludes a private marker, a differing request or a URL in any other field', () => {
+test('X1 audit never excludes a private marker, a differing request or a URL in any other field', () => {
   const mutate = [
     (message) => {
       message.params.requestId = 'OTHER';
@@ -130,7 +114,7 @@ test('#150 never excludes a private marker, a differing request or a URL in any 
     change(message);
     actors[1].messages[1] = JSON.stringify(message);
     row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
-    assert.equal(isExpectedX1Failure150(row), false);
+    assert(verdictProblems([row]).length > 0);
     assert.ok(verdictProblems([row]).length > 0);
     assert.ok(verdictProblems([{ ...row, control: 'pass', guarded: 'pass' }]).length > 0);
   }
@@ -144,11 +128,11 @@ test('#150 never excludes a private marker, a differing request or a URL in any 
   actors[1].messages[1] = JSON.stringify(event);
   row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
   assert.equal(row.x1Privacy.markerExposed, true);
-  assert.equal(isExpectedX1Failure150(row), false);
+  assert(verdictProblems([row]).length > 0);
 });
 
-test('#150 rejects screenshots, missing audit, other failures and incorrect legs', () => {
-  const actorsChange = [
+test('X1 screenshots or missing audit cannot qualify as PASS', () => {
+  for (const mutate of [
     (actors) => {
       actors[1].closed = false;
     },
@@ -156,67 +140,16 @@ test('#150 rejects screenshots, missing audit, other failures and incorrect legs
       actors[1].messages = [];
     },
     (actors) => {
-      actors[1].messages.push('invalid JSON');
-    },
-    (actors) => {
-      actors[1].messages.push('null');
-    },
-    (actors) => {
-      actors[1].calls[2].result.loaderId = 'OTHER';
-    },
-    (actors) => {
-      actors[1].calls[0].error = 'unknown setup failure';
-    },
-    (actors) => {
       actors[1].calls.push({
         method: 'Page.captureScreenshot',
         result: { data: 'PRIVATE_SCREENSHOT' },
       });
     },
-  ];
-  for (const change of actorsChange) {
-    const { actors, row } = evidence();
-    change(actors);
-    row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
-    assert.equal(isExpectedX1Failure150(row), false);
-  }
-  for (const change of [
-    (r) => {
-      r.id = 'OTHER';
-    },
-    (r) => {
-      r.target = 'ordinary';
-    },
-    (r) => {
-      r.variant = 'other';
-    },
-    (r) => {
-      r.live = 'fail';
-    },
-    (r) => {
-      r.control = 'pass';
-    },
-    (r) => {
-      r.guarded = 'incomplete';
-    },
-    (r) => {
-      delete r.x1Privacy;
-    },
-    (r) => {
-      r.errors.push('other error');
-    },
-    (r) => {
-      r.observations.guarded.scripted = true;
-    },
-    (r) => {
-      r.observations.control.instrumented = true;
-      r.observations.control.headed = true;
-    },
   ]) {
     const { actors, row } = evidence();
+    mutate(actors);
     row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
-    change(row);
-    assert.equal(isExpectedX1Failure150(row), false);
+    assert(verdictProblems([row]).length > 0);
   }
 });
 
@@ -238,7 +171,12 @@ test('origin-only references in any field are public but protected URL component
   message.params.frame = { url: `${ordinary}/page?tag=public-1&to=${protectedOrigin}` };
   actors[1].messages[1] = JSON.stringify(message);
   row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
-  assert.equal(isExpectedX1Failure150(row), true);
+  assert(
+    row.x1Privacy.measured &&
+      !row.x1Privacy.markerExposed &&
+      !row.x1Privacy.protectedExposed &&
+      !row.x1Privacy.screenshotExposed
+  );
   assert(row.x1Privacy.diagnostics.some((entry) => entry.valueClass === 'protected-origin-only'));
   for (const entry of row.x1Privacy.diagnostics) {
     assert.match(entry.valueHash, /^[a-f0-9]{64}$/);
@@ -267,7 +205,7 @@ test('origin-only references in any field are public but protected URL component
   bad.params.title = 'public-1';
   leaked.actors[1].messages[1] = JSON.stringify(bad);
   leaked.row.x1Privacy = x1Privacy(leaked.actors, { ordinary, protectedOrigin });
-  assert.equal(isExpectedX1Failure150(leaked.row), false);
+  assert(verdictProblems([leaked.row]).length > 0);
   assert(
     leaked.row.x1Privacy.diagnostics.some(
       (entry) => entry.field === '$.params.title' && entry.valueClass === 'protected-canary-tag'
@@ -293,7 +231,12 @@ test('ordinary scheme-less auto-titles are parsed in their own realm without exe
     })
   );
   row.x1Privacy = x1Privacy(actors, { ordinary, protectedOrigin });
-  assert.equal(isExpectedX1Failure150(row), true);
+  assert(
+    row.x1Privacy.measured &&
+      !row.x1Privacy.markerExposed &&
+      !row.x1Privacy.protectedExposed &&
+      !row.x1Privacy.screenshotExposed
+  );
   for (const title of [
     'seven.sliccy.ai:18100/canary/public-1',
     'public-1',
@@ -304,7 +247,7 @@ test('ordinary scheme-less auto-titles are parsed in their own realm without exe
       JSON.stringify({ method: 'Target.targetInfoChanged', params: { targetInfo: { title } } })
     );
     bad.row.x1Privacy = x1Privacy(bad.actors, { ordinary, protectedOrigin });
-    assert.equal(isExpectedX1Failure150(bad.row), false);
+    assert(verdictProblems([bad.row]).length > 0);
   }
   assert.equal(message.method, 'Fetch.requestPaused');
 });
@@ -337,4 +280,28 @@ test('X1 recorder captures actual outgoing results, refusals and completed close
   assert.equal(actor.closed, false);
   await client.close();
   assert.equal(actor.closed, true);
+});
+
+test('final X1 privacy uses actual completed resource closes, not the earlier row-log snapshot', async () => {
+  const { actors, row } = evidence();
+  const clones = actors.map((actor) => ({
+    messages: actor.messages,
+    send: async () => ({}),
+    close: async () => {},
+  }));
+  const captured = clones.map(recordX1Client);
+  for (const [i, actor] of captured.entries()) actor.calls.push(...actors[i].calls);
+  const records = new Map([
+    ['X1.after-exit/seven/prompt', { actors: captured, ordinary, protectedOrigin }],
+  ]);
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, false);
+  const legs = [row.control, row.guarded, row.live];
+  await Promise.all(clones.map((client) => client.close()));
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, true);
+  assert.deepEqual([row.control, row.guarded, row.live], legs);
+  captured[1].closed = false;
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, false);
 });

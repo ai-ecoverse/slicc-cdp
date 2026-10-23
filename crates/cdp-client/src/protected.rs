@@ -145,6 +145,10 @@ impl Protected {
             })
     }
 
+    pub(crate) fn data_document(&self, text: &str) -> bool {
+        parse(text).is_some_and(|url| url.scheme() == "data")
+    }
+
     pub fn error_document(&self, document_url: &str, origin: &str) -> bool {
         self.error_page_url(document_url) && origin == "://"
     }
