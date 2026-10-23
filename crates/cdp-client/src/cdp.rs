@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+#[path = "webmcp_guard.rs"]
+mod webmcp_guard;
+
 pub trait Transport {
     fn send_text(&mut self, text: &str) -> Result<(), String>;
     fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String>;
@@ -83,6 +86,9 @@ pub struct Cdp {
     frame_versions: BTreeMap<String, u64>,
     documents: BTreeMap<String, MainDocument>,
     unobserved: BTreeSet<String>,
+    webmcp: webmcp_guard::Webmcp,
+    waiting_calls: BTreeSet<i64>,
+    call_replies: BTreeMap<i64, Value>,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
@@ -134,6 +140,9 @@ impl Cdp {
             frame_versions: BTreeMap::new(),
             documents: BTreeMap::new(),
             unobserved: BTreeSet::new(),
+            webmcp: webmcp_guard::Webmcp::default(),
+            waiting_calls: BTreeSet::new(),
+            call_replies: BTreeMap::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -965,9 +974,16 @@ impl Cdp {
     }
 
     fn block(&mut self, session_id: &str) {
-        if !self.blocked.insert(session_id.to_string()) {
+        let newly_blocked = self.blocked.insert(session_id.to_string());
+        if self.webmcp_is_paused(session_id) {
+            self.webmcp.deferred.insert(session_id.to_string());
+            self.webmcp_revoke(session_id);
             return;
         }
+        if !newly_blocked && !self.webmcp.deferred.remove(session_id) {
+            return;
+        }
+        self.webmcp_revoke(session_id);
         if let Some(target) = self.session_targets.get(session_id) {
             self.protected_targets.insert(target.clone());
         }
@@ -1652,15 +1668,28 @@ impl Cdp {
     ) -> Result<Value, String> {
         let frame_epoch = self.frame_epoch;
         let id = self.send(method, params, session_id)?;
+        self.waiting_calls.insert(id);
+        let result = self.raw_reply(method, id, session_id, timeout, frame_epoch);
+        self.waiting_calls.remove(&id);
+        self.call_replies.remove(&id);
+        result
+    }
+
+    fn raw_reply(&mut self, method: &str, id: i64, session_id: Option<&str>, timeout: Duration, frame_epoch: u64) -> Result<Value, String> {
         let deadline = Instant::now() + timeout;
         let was_blocked = session_id.is_some_and(|session| self.blocked.contains(session));
         loop {
-            let text = match self.ws.recv_text(deadline)? {
-                Some(text) => text,
-                None => return Err(format!("{method} timed out\n")),
+            let value = match self.call_replies.remove(&id) {
+                Some(value) => value,
+                None => {
+                    let text = match self.ws.recv_text(deadline)? {
+                        Some(text) => text,
+                        None => return Err(format!("{method} timed out\n")),
+                    };
+                    serde_json::from_str::<Value>(&text)
+                        .map_err(|err| format!("CDP response was not JSON: {err}\n"))?
+                }
             };
-            let value: Value = serde_json::from_str(&text)
-                .map_err(|err| format!("CDP response was not JSON: {err}\n"))?;
             if value.get("id").and_then(|item| item.as_i64()) == Some(id) {
                 if let Some(error) = value.get("error") {
                     let text = error
@@ -1707,7 +1736,8 @@ impl Cdp {
     }
 
     pub fn pump(&mut self, deadline: Instant) -> Result<bool, String> {
-        match self.ws.recv_text(deadline)? {
+        self.webmcp_sweep();
+        let result = match self.ws.recv_text(deadline)? {
             Some(text) => {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                     self.absorb(value);
@@ -1715,7 +1745,9 @@ impl Cdp {
                 Ok(true)
             }
             None => Ok(false),
-        }
+        };
+        self.webmcp_sweep();
+        result
     }
 
     pub fn next_paused(
@@ -1771,6 +1803,9 @@ impl Cdp {
 
     fn absorb(&mut self, mut value: Value) {
         if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
+            if self.waiting_calls.contains(&id) {
+                self.call_replies.insert(id, value.clone());
+            }
             if let Some((session, request)) = self.answering.remove(&id) {
                 if value.get("error").is_none() {
                     self.settle(&session, &request);
@@ -1787,6 +1822,9 @@ impl Cdp {
                     self.continue_plain(&session, &request);
                 }
             }
+            return;
+        }
+        if self.webmcp_event(&value) {
             return;
         }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.authRequired")

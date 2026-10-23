@@ -21,8 +21,40 @@ const runnerFor = (kind, url) =>
 
 function evaluation(value, exception) {
   return (message, send) => {
-    if (message.method !== 'Runtime.evaluate') return false;
-    const expression = message.params.expression;
+    const { method, params = {}, sessionId } = message;
+    if (method === 'Runtime.enable' || method === 'Page.createIsolatedWorld') {
+      const isolated = method === 'Page.createIsolatedWorld';
+      send({
+        method: 'Runtime.executionContextCreated',
+        sessionId,
+        params: {
+          context: {
+            id: isolated ? 2 : 1,
+            uniqueId: `${sessionId}-${isolated ? 'isolated' : 'main'}`,
+            origin: 'https://example.test',
+            auxData: { frameId: params.frameId || 'TAB', isDefault: !isolated },
+          },
+        },
+      });
+      send({ id: message.id, result: isolated ? { executionContextId: 2 } : {} });
+      return true;
+    }
+    if (method === 'Page.getPermissionsPolicyState') {
+      send({ id: message.id, result: { states: [{ feature: 'tools', allowed: true }] } });
+      return true;
+    }
+    if (method !== 'Runtime.evaluate') return false;
+    const expression = params.expression;
+    if (
+      expression === "'modelContext' in Document.prototype" ||
+      expression === 'document.modelContext != null' ||
+      expression.includes('api.__slicc_webmcp_shim')
+    ) {
+      const present =
+        expression !== "'modelContext' in Document.prototype" && value?.__webmcp_error !== 'absent';
+      send({ id: message.id, result: { result: { type: 'boolean', value: present } } });
+      return true;
+    }
     if (!expression.includes('const tools = []') && !expression.includes('__webmcp_error')) {
       return false;
     }
@@ -31,7 +63,14 @@ function evaluation(value, exception) {
       sessionId: message.sessionId,
       result: exception
         ? { exceptionDetails: { text: exception } }
-        : { result: { type: 'object', value } },
+        : {
+            result: {
+              type: 'object',
+              value: Array.isArray(value)
+                ? { kind: 'page', toolsJson: JSON.stringify(value) }
+                : value,
+            },
+          },
     });
     return true;
   };
