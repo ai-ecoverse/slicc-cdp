@@ -104,10 +104,14 @@ export async function fakeCdp({
   answers = {},
   attachEvents = false,
   discoverEvents = false,
+  delayHistoryEvents = false,
+  onUpgrade,
+  onCommand,
   pauseNavigation = false,
   childFrames = [],
   intercept,
   aria = () => defaultAria,
+  tree = { nodes: [] },
   location,
   frameTree,
   listen = '127.0.0.1',
@@ -121,13 +125,17 @@ export async function fakeCdp({
   let requests = 0;
   const targets = [];
   const sessions = new Map();
+  const heldEvents = [];
+  const releaseEvents = [];
   const sessionSends = new Map();
   const paged = new Set();
   let next = 0;
   let tabs = 0;
+  let loaders = 0;
   const info = (target) => ({
     targetId: target.targetId,
     type: target.type ?? 'page',
+    ...(target.openerId ? { openerId: target.openerId } : {}),
     url: target.url,
     title: target.url,
     attached: false,
@@ -152,6 +160,7 @@ export async function fakeCdp({
   });
   const sockets = new Set();
   server.on('upgrade', (req, socket) => {
+    onUpgrade?.(req.headers);
     sockets.add(socket);
     socket.on('close', () => {
       sockets.delete(socket);
@@ -214,6 +223,7 @@ export async function fakeCdp({
         }
         return;
       }
+      onCommand?.(message, event);
       if (answers[method]) return answer(answers[method]);
       switch (method) {
         case 'Target.setDiscoverTargets':
@@ -233,7 +243,12 @@ export async function fakeCdp({
         }
         case 'Target.createTarget': {
           tabs += 1;
-          const created = { targetId: `TAB${tabs}`, url: params.url ?? 'about:blank' };
+          const url = params.url ?? 'about:blank';
+          const created = {
+            targetId: `TAB${tabs}`,
+            url,
+            loaderId: `L${++loaders}`,
+          };
           targets.push(created);
           return answer({ targetId: created.targetId });
         }
@@ -271,11 +286,14 @@ export async function fakeCdp({
             frameTree: {
               frame: target?.frame ?? {
                 id: target?.targetId ?? 'F',
-                loaderId: 'L',
+                loaderId: target?.loaderId ?? 'L',
                 url: target?.url ?? '',
-                securityOrigin: new URL(target?.url ?? 'about:blank').origin,
+                securityOrigin:
+                  target?.url && new URL(target.url).origin !== 'null'
+                    ? new URL(target.url).origin
+                    : '://',
               },
-              childFrames,
+              childFrames: target?.childFrames ?? childFrames,
             },
           });
         case 'Fetch.enable':
@@ -310,12 +328,14 @@ export async function fakeCdp({
           );
         case 'Page.navigate': {
           const complete = () => {
+            const loaderId = `L${++loaders}`;
             if (target) {
               target.url = params.url;
+              target.loaderId = loaderId;
               delete target.frame;
               delete target.history;
             }
-            answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
+            answer({ frameId: target?.targetId ?? 'F', loaderId });
             const committed = {
               frame: {
                 id: target?.targetId ?? 'F',
@@ -388,10 +408,32 @@ export async function fakeCdp({
           } else complete();
           return;
         }
-        case 'Runtime.enable':
+        case 'Page.printToPDF':
+          return answer({ stream: 'H' });
+        case 'Runtime.enable': {
+          const frame = target?.frame ?? {
+            id: target?.targetId ?? 'F',
+            loaderId: target?.loaderId ?? 'L',
+            securityOrigin:
+              target?.url && new URL(target.url).origin !== 'null'
+                ? new URL(target.url).origin
+                : '://',
+          };
+          event('Runtime.executionContextCreated', {
+            context: {
+              id: 1,
+              uniqueId: `default:${target?.targetId}:${frame.loaderId}`,
+              origin: frame.securityOrigin,
+              name: '',
+              auxData: { frameId: frame.id, isDefault: true },
+            },
+          });
+          for (const world of target?.worlds ?? [])
+            event('Runtime.executionContextCreated', { context: world });
           answer({});
           if (target?.url && target.url !== 'about:blank') emitConsole(target.url);
           return;
+        }
         case 'Network.getAllCookies':
           return answer({ cookies: jar.map((cookie) => ({ ...cookie })) });
         case 'Network.setCookie': {
@@ -429,8 +471,28 @@ export async function fakeCdp({
           }
           return answer({});
         }
-        case 'Page.createIsolatedWorld':
-          return answer({ executionContextId: 7 });
+        case 'Page.createIsolatedWorld': {
+          const worlds = target?.worlds ?? [];
+          const previous = worlds.find((world) => world.auxData.frameId === params.frameId);
+          const world = {
+            id: previous?.id ?? 7 + worlds.length,
+            uniqueId: `world:${params.frameId}:${target?.loaderId ?? 'L'}`,
+            origin:
+              target?.url && new URL(target.url).origin !== 'null'
+                ? new URL(target.url).origin
+                : '://',
+            name: params.worldName ?? '',
+            auxData: { frameId: params.frameId, isDefault: false },
+          };
+          if (target)
+            target.worlds = [
+              ...worlds.filter((item) => item.auxData.frameId !== params.frameId),
+              world,
+            ];
+          return answer({ executionContextId: world.id });
+        }
+        case 'Accessibility.getFullAXTree':
+          return answer(tree);
         case 'Runtime.getProperties':
           return answer({
             result: lastAria.nodes.flatMap((node, index) =>
@@ -455,6 +517,29 @@ export async function fakeCdp({
             model: { content: [0, 0, 10, 0, 10, 10, 0, 10], width: 10, height: 10 },
           });
         case 'Runtime.evaluate': {
+          if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {
+            target.history.currentIndex -= 1;
+            target.url = target.history.entries[target.history.currentIndex].url;
+            target.frame = {
+              id: target.targetId,
+              loaderId: 'LHISTORY',
+              url: target.url,
+              securityOrigin: new URL(target.url).origin,
+            };
+            for (const [peer, found] of sessions) {
+              if (found !== target || !paged.has(peer)) continue;
+              const restored = {
+                method: 'Page.frameNavigated',
+                sessionId: peer,
+                params: { type: 'BackForwardCacheRestore', frame: target.frame },
+              };
+              if (delayHistoryEvents) {
+                heldEvents.push(restored);
+                releaseEvents.push(() => send(restored));
+              } else send(restored);
+            }
+            return answer({ result: { type: 'undefined' } });
+          }
           const options = ariaOptions(params.expression ?? '');
           const capture = options ? aria(options, params, target) : undefined;
           if (capture?.error) return send({ id, error: { code: -32000, message: capture.error } });
@@ -506,6 +591,10 @@ export async function fakeCdp({
     calls,
     jar,
     targets,
+    heldEvents,
+    releaseEvents: () => {
+      for (const release of releaseEvents.splice(0)) release();
+    },
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));

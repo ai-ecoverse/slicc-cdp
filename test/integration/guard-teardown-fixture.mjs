@@ -69,6 +69,7 @@ const publishedRunner = import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-r
 const runnerExports = `export {summary} from ${JSON.stringify(publishedRunner)};export const run=(...args)=>globalThis.__guardTeardownFixture.run(...args);`;
 
 const modules = new Map([
+  ['./chrome-policy.mjs', 'export function requireChrome() {}'],
   ['node:child_process', 'export function execFileSync(){return "fake-owned-worker";}'],
   [
     '@ai-ecoverse/slicc-browsers/fixture',

@@ -75,6 +75,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
     println!("{status}");
     io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
     let mut saved = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
+    let mut readiness = Readiness { seen: cdp.events().len(), waiting: false };
     loop {
         match input() {
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -83,7 +84,6 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         if !cdp.webmcp_alive(session) {
             return Err("webmcp-polyfill: target closed, changed or was refused by the guard\n".into());
         }
-        let from = cdp.events().len();
         cdp.pump(Instant::now() + Duration::from_millis(50))?;
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
@@ -94,8 +94,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         for (_target, child, _bridge) in cdp.take_webmcp_children() {
             cdp.webmcp_auto_attach(&child)?;
         }
-        let loaded = cdp.events()[from..].iter().any(|event| event["method"] == "Page.loadEventFired" && event["sessionId"] == session);
-        if loaded && cdp.webmcp_alive(session) {
+        if readiness.due(cdp.events(), session, cdp.webmcp_settled()) && cdp.webmcp_alive(session) {
             let document = cdp.webmcp_document(session, frame)?;
             save(cdp, state, target, &owner)?;
             println!("{}", json!({"event":"document-ready","tab":target,"loaderId":document["loaderId"]}));
@@ -104,6 +103,21 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         if cdp.events().iter().rev().any(|event| event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed") && event.pointer("/params/targetId").and_then(Value::as_str) == Some(target)) {
             return Ok(());
         }
+    }
+}
+
+struct Readiness {
+    seen: usize,
+    waiting: bool,
+}
+
+impl Readiness {
+    fn due(&mut self, events: &[Value], session: &str, settled: bool) -> bool {
+        self.waiting |= events[self.seen..].iter().any(|event| event["method"] == "Page.loadEventFired" && event["sessionId"] == session);
+        self.seen = events.len();
+        let due = self.waiting && settled;
+        self.waiting &= !due;
+        due
     }
 }
 
@@ -144,5 +158,31 @@ fn input() -> Result<Input, String> {
                 Err(_) => Err(mpsc::TryRecvError::Disconnected),
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(session: &str) -> Value {
+        json!({"method":"Page.loadEventFired","sessionId":session,"params":{"timestamp":1}})
+    }
+
+    #[test]
+    fn document_readiness_waits_for_frames_admitted_after_the_top_load() {
+        let mut events = vec![load("TOP")];
+        let mut readiness = Readiness { seen: 1, waiting: false };
+        assert!(!readiness.due(&events, "TOP", true));
+        events.push(load("CHILD"));
+        assert!(!readiness.due(&events, "TOP", true));
+        events.push(load("TOP"));
+        assert!(!readiness.due(&events, "TOP", false));
+        assert!(!readiness.due(&events, "TOP", false));
+        assert!(readiness.due(&events, "TOP", true));
+        assert!(!readiness.due(&events, "TOP", true));
+        events.extend([load("TOP"), load("TOP")]);
+        assert!(readiness.due(&events, "TOP", true));
+        assert!(!readiness.due(&events, "TOP", true));
     }
 }

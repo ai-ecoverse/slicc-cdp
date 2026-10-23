@@ -149,7 +149,7 @@ test('eval normalizes function expressions without turning scripts into expressi
       assert.equal(result.stdout, 'undefined\n');
       const [compiled] = sent(fake, 'Runtime.compileScript');
       assert.equal(compiled.params.persistScript, false);
-      assert.equal(compiled.params.executionContextId, framed ? 7 : undefined);
+      assert.equal(compiled.params.executionContextId, framed ? 7 : 1);
       const [evaluated] = sent(fake, 'Runtime.evaluate').filter(
         (call) => call.params.objectGroup === 'slicc-eval'
       );
@@ -225,7 +225,8 @@ test('eval --frame calls a function expression in the frame world', async () => 
     const [evaluated] = sent(fake, 'Runtime.evaluate').filter(
       (call) => call.params.objectGroup === 'slicc-eval'
     );
-    assert.equal(evaluated.params.contextId, 7);
+    assert.equal(evaluated.params.contextId, undefined);
+    assert.equal(evaluated.params.uniqueContextId, 'world:TAB:L');
     assert.equal(sent(fake, 'Runtime.callFunctionOn').length, 1);
   });
 });

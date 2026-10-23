@@ -2,6 +2,7 @@ struct AttachBrowser {
     url: String,
     main: Value,
     during_read: Option<Value>,
+    attaching: bool,
 }
 
 struct AttachTree {
@@ -22,7 +23,8 @@ impl Transport for AttachTree {
             }
             "Target.getTargetInfo" => json!({ "targetInfo": { "targetId": "T", "type": "page", "url": browser.url, "title": "" } }),
             "Page.getFrameTree" => {
-                if let Some(event) = browser.during_read.take() {
+                let event = if browser.attaching { browser.during_read.clone() } else { browser.during_read.take() };
+                if let Some(event) = event {
                     self.inbox.push_back(event.to_string());
                 }
                 json!({ "frameTree": { "frame": browser.main } })
@@ -47,9 +49,12 @@ fn attach_during(during_read: Option<Value>) -> (Cdp, String, std::rc::Rc<std::c
         url: ATTACH_LANDING.into(),
         main: json!({ "id": "T", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
         during_read,
+        attaching: true,
     }));
     let mut cdp = Cdp::from_transport(Box::new(AttachTree { inbox: VecDeque::new(), browser: browser.clone(), guard: false }));
     let session = super::attach(&mut cdp, "T").unwrap();
+    browser.borrow_mut().attaching = false;
+    browser.borrow_mut().during_read = None;
     assert_eq!(cdp.guards["T"], "G");
     (cdp, session, browser)
 }

@@ -509,7 +509,7 @@ mod tests {
     }
 
     fn fake_cdp(responses: Vec<Value>) -> Cdp {
-        Cdp::from_transport(Box::new(FakeTransport::with_responses(responses)))
+        crate::document_client::client(Box::new(FakeTransport::with_responses(responses)), "S1")
     }
 
     fn eval_result(value: Value) -> Value {

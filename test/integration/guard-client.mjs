@@ -182,12 +182,19 @@ async function wasiGuarded(ws, origin, { variant, detachDelay, onMessage, signal
 export async function guarded(
   ws,
   origin,
-  { variant, detachDelay, onMessage, signal, deadlineAt = Date.now() + 35000 }
+  {
+    variant,
+    detachDelay,
+    onMessage,
+    transport = process.env.SLICC_GUARD_TRANSPORT,
+    signal,
+    deadlineAt = Date.now() + 35000,
+  }
 ) {
   signal?.throwIfAborted();
   if (!['prompt', 'lagging'].includes(variant) || !Number.isInteger(detachDelay))
     throw new Error('invalid guard variant');
-  if (process.env.SLICC_GUARD_TRANSPORT === 'wasi')
+  if (transport === 'wasi')
     return acquire(
       (ownedSignal) =>
         wasiGuarded(ws, origin, {

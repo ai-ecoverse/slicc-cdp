@@ -3,7 +3,7 @@ fn known_redirector_taint_survives_a_fresh_target_and_session() {
     for method in ["Fetch.continueRequest", "Network.continueInterceptedRequest"] {
         let mut cdp = redirect_body_backend("NEW_TARGET_ORDINARY_CONTROL".into());
         cdp.session_targets.insert("A".into(), "OLD-TARGET".into());
-        cdp.session_targets.insert("B".into(), "NEW-TARGET".into());
+        fixture_target(&mut cdp, "B", "NEW-TARGET");
         cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"A","params":{"requestId":"OLD-REDIRECT","request":{"url":"https://ordinary.invalid/redirector?original=1"}}}));
         cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"A","params":{"requestId":"OLD-REDIRECT","statusCode":302,"headers":{"Location":"https://seven.sliccy.ai/private"}}}));
         cdp.absorb(json!({"method":"Fetch.requestPaused","sessionId":"B","params":{"requestId":"NEW-HOLD","networkId":"NEW-NET","resourceType":"XHR","request":{"url":"https://ordinary.invalid/ordinary","method":"GET","headers":{}}}}));

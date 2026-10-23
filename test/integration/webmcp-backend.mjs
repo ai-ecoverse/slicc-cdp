@@ -12,11 +12,15 @@ export async function webmcpBackend({
   let reloads = 0;
   let pages;
   const sessions = new Map();
+  const runtimeEnabled = new Set();
   const writers = new Map();
   const scripts = new Map();
   const permitted = new Map();
   const paused = new Map();
   const queues = new Map();
+  const lateFrames = new Set();
+  let held = null;
+  let loadFired = false;
   const configs = [
     { id: 'TAB', origin: 'https://ordinary.test', policy, definitions },
     ...children,
@@ -54,6 +58,7 @@ export async function webmcpBackend({
             window,
             main: index * 2 + 1,
             isolated: index * 2 + 2,
+            isolatedCreated: false,
           },
         ];
       })
@@ -103,7 +108,7 @@ export async function webmcpBackend({
       const event = (method, params, peer = sessionId) =>
         (writers.get(peer) || send)({ method, params, sessionId: peer });
       const created = (peer) => {
-        for (const page of pages.values())
+        for (const page of pages.values()) {
           event(
             'Runtime.executionContextCreated',
             {
@@ -116,6 +121,21 @@ export async function webmcpBackend({
             },
             peer
           );
+          if (page.isolatedCreated)
+            event(
+              'Runtime.executionContextCreated',
+              {
+                context: {
+                  id: page.isolated,
+                  uniqueId: `isolated-${page.loader}`,
+                  origin: page.origin,
+                  name: 'slicc-webmcp',
+                  auxData: { frameId: page.id, isDefault: false },
+                },
+              },
+              peer
+            );
+        }
       };
       const pause = (peer) => {
         const frameId = queues.get(peer)?.shift();
@@ -152,9 +172,15 @@ export async function webmcpBackend({
       }
       if (method === 'Target.detachFromTarget') {
         sessions.delete(params.sessionId);
+        runtimeEnabled.delete(params.sessionId);
         writers.delete(params.sessionId);
         scripts.delete(params.sessionId);
         answer({});
+        if (params.sessionId === 'LATE_MARKER') {
+          const release = held;
+          held = null;
+          release?.();
+        }
         return true;
       }
       if (method === 'Page.getFrameTree') {
@@ -166,21 +192,33 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Runtime.enable') {
+        runtimeEnabled.add(sessionId);
         created(sessionId);
+        answer({});
+        return true;
+      }
+      if (method === 'Runtime.disable') {
+        runtimeEnabled.delete(sessionId);
         answer({});
         return true;
       }
       if (method === 'Page.createIsolatedWorld') {
         const page = pages.get(params.frameId);
-        event('Runtime.executionContextCreated', {
-          context: {
-            id: page.isolated,
-            uniqueId: `isolated-${page.loader}`,
-            origin: page.origin,
-            name: 'slicc-webmcp',
-            auxData: { frameId: page.id, isDefault: false },
-          },
-        });
+        page.isolatedCreated = true;
+        for (const peer of runtimeEnabled)
+          event(
+            'Runtime.executionContextCreated',
+            {
+              context: {
+                id: page.isolated,
+                uniqueId: `isolated-${page.loader}`,
+                origin: page.origin,
+                name: 'slicc-webmcp',
+                auxData: { frameId: page.id, isDefault: false },
+              },
+            },
+            peer
+          );
         answer({ executionContextId: page.isolated });
         return true;
       }
@@ -244,6 +282,10 @@ export async function webmcpBackend({
         answer({ result: { type: 'boolean', value } });
         return true;
       }
+      const loadEverywhere = () => {
+        loadFired = true;
+        for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
+      };
       if (method === 'Debugger.resume') {
         const page = pages.get(paused.get(sessionId));
         if (page && permitted.get(sessionId) && scripts.has(sessionId)) {
@@ -261,12 +303,26 @@ export async function webmcpBackend({
           }
         }
         answer({});
-        if (!pause(sessionId) && page?.loaded)
-          for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
+        if (page?.loaded && lateFrames.delete(queues.get(sessionId)?.[0])) {
+          held = () => pause(sessionId);
+          loadEverywhere();
+          event('Target.attachedToTarget', {
+            sessionId: 'LATE_MARKER',
+            targetInfo: {
+              targetId: 'LATE_MARKER',
+              type: 'iframe',
+              url: 'https://seven.sliccy.ai/',
+            },
+            waitingForDebugger: true,
+          });
+          return true;
+        }
+        if (!pause(sessionId) && page?.loaded && !loadFired) loadEverywhere();
         return true;
       }
       if (method === 'Page.reload') {
         reset(`RELOAD${++reloads}`);
+        loadFired = false;
         answer({});
         for (const peer of sessions.keys()) {
           for (const page of pages.values())
@@ -341,5 +397,8 @@ export async function webmcpBackend({
     },
     sessions,
     scripts,
+    admitLate(frameId) {
+      lateFrames.add(frameId);
+    },
   };
 }

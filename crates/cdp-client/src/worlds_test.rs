@@ -25,7 +25,7 @@ impl Transport for Backend {
                 (1, "https://example.test", true),
                 (7, "chrome-extension://fixture", false),
             ] {
-                self.incoming.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":id,"uniqueId":format!("world-{id}"),"name":format!("world-{id}"),"origin":origin,"auxData":{"isDefault":default,"type":if default { "default" } else { "isolated" }}}}}));
+                self.incoming.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":id,"uniqueId":format!("world-{id}"),"name":format!("world-{id}"),"origin":origin,"auxData":{"isDefault":default,"frameId":"F","type":if default { "default" } else { "isolated" }}}}}));
             }
             for method in [
                 "Runtime.consoleAPICalled",
@@ -78,10 +78,12 @@ impl Transport for Backend {
 
 fn client() -> (Cdp, Rc<RefCell<Vec<Value>>>) {
     let sent = Rc::new(RefCell::new(Vec::new()));
-    let cdp = Cdp::from_transport(Box::new(Backend {
+    let mut cdp = Cdp::from_transport(Box::new(Backend {
         sent: sent.clone(),
         incoming: VecDeque::new(),
     }));
+    cdp.fixture_session("S");
+    cdp.fixture_session("OTHER");
     (cdp, sent)
 }
 
@@ -292,7 +294,7 @@ fn all_visible_remote_handles_remain_usable() {
     }
     cdp.call(
         "Runtime.compileScript",
-        json!({"expression":"1","executionContextId":1}),
+        json!({"expression":"1","executionContextId":1,"persistScript":false}),
         Some("S"),
     )
     .unwrap();

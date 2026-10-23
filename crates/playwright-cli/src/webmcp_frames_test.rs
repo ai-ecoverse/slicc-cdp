@@ -23,7 +23,7 @@ impl Transport for FrameInspector {
             "Page.getFrameTree" => json!({"frameTree":{"frame":frame}}),
             "Runtime.enable" | "Page.createIsolatedWorld" => {
                 let isolated = command["method"] == "Page.createIsolatedWorld";
-                self.queue.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":if isolated {9} else {7},"uniqueId":format!("{}-{session}",if isolated {"isolated"} else {"main"}),"origin":"https://ordinary.test","auxData":{"frameId":"FRAME_TARGET","isDefault":!isolated}}}}).to_string());
+                self.queue.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":if isolated {9} else {7},"uniqueId":format!("{}-FRAME_TARGET-LOADER",if isolated {"isolated"} else {"main"}),"origin":"https://ordinary.test","auxData":{"frameId":"FRAME_TARGET","isDefault":!isolated}}}}).to_string());
                 if isolated { json!({"executionContextId":9}) } else { json!({}) }
             }
             "Runtime.evaluate" => json!({"result":{"type":"boolean","value":true}}),

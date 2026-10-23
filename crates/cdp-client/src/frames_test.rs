@@ -14,14 +14,14 @@ struct Backend {
 
 fn frame_tree() -> Value {
     json!({ "frameTree": {
-        "frame": { "id": "MAIN", "url": "https://example.test/", "securityOrigin": "https://example.test" },
+        "frame": { "id": "MAIN", "loaderId": "LMAIN", "url": "https://example.test/", "securityOrigin": "https://example.test" },
         "childFrames": [
-            { "frame": { "id": "SEVEN", "parentId": "MAIN", "url": "https://seven.sliccy.ai/missing", "securityOrigin": "https://seven.sliccy.ai" } },
-            { "frame": { "id": "INHERITED", "parentId": "MAIN", "url": "about:blank", "securityOrigin": "https://vault.sliccy.ai" },
+            { "frame": { "id": "SEVEN", "loaderId": "LSEVEN", "parentId": "MAIN", "url": "https://seven.sliccy.ai/missing", "securityOrigin": "https://seven.sliccy.ai" } },
+            { "frame": { "id": "INHERITED", "loaderId": "LINHERITED", "parentId": "MAIN", "url": "about:blank", "securityOrigin": "https://vault.sliccy.ai" },
               "childFrames": [
-                { "frame": { "id": "DEEP", "parentId": "INHERITED", "url": "about:srcdoc", "securityOrigin": "https://vault.sliccy.ai" } }
+                { "frame": { "id": "DEEP", "loaderId": "LDEEP", "parentId": "INHERITED", "url": "about:srcdoc", "securityOrigin": "https://vault.sliccy.ai" } }
               ] },
-            { "frame": { "id": "PLAIN", "parentId": "MAIN", "url": "https://example.test/plain", "urlFragment": "#top", "securityOrigin": "https://example.test" } }
+            { "frame": { "id": "PLAIN", "loaderId": "LPLAIN", "parentId": "MAIN", "url": "https://example.test/plain", "urlFragment": "#top", "securityOrigin": "https://example.test" } }
         ]
     }})
 }
@@ -42,6 +42,11 @@ impl Transport for Backend {
                 "targetInfo": { "targetId": "MAIN", "type": "page", "url": "https://example.test/", "title": "t" }
             }}),
             "Target.getTargetInfo" => json!({ "id": id, "error": { "message": "No target with given id found" } }),
+            "Target.attachToTarget" => {
+                let attached = self.sent.borrow().iter().filter(|call| call["method"] == "Target.attachToTarget").count();
+                json!({"id":id,"result":{"sessionId":if attached == 1 {"S"} else {"G"}}})
+            }
+            "Target.getTargets" => json!({"id":id,"result":{"targetInfos":[{"targetId":"MAIN","type":"page","url":"https://example.test/"}]}}),
             "Page.createIsolatedWorld" => json!({ "id": id, "sessionId": session, "result": { "executionContextId": 5 } }),
             _ => json!({ "id": id, "sessionId": session, "result": { "nodes": [{ "name": { "value": "PROTECTED-TEXT" } }] } }),
         };
@@ -72,7 +77,8 @@ fn sent_with_frame(sent: &Rc<RefCell<Vec<Value>>>, frame: &str) -> Vec<String> {
         .collect()
 }
 
-const FRAME_READS: [(&str, fn(&str) -> Value); 5] = [
+const FRAME_READS: [(&str, fn(&str) -> Value); 6] = [
+    ("Page.getPermissionsPolicyState", |frame| json!({ "frameId": frame })),
     ("Accessibility.getFullAXTree", |frame| json!({ "frameId": frame })),
     ("Accessibility.getRootAXNode", |frame| json!({ "frameId": frame })),
     ("DOM.getFrameOwner", |frame| json!({ "frameId": frame })),
@@ -119,8 +125,9 @@ fn unknown_frames_fail_closed() {
 #[test]
 fn ordinary_frames_stay_readable() {
     let (mut cdp, sent) = client(true);
+    cdp.call("Target.attachToTarget", json!({"targetId":"MAIN","flatten":true}), None).unwrap();
     for frame in ["MAIN", "PLAIN"] {
-        let tree = cdp.call("Accessibility.getFullAXTree", json!({ "frameId": frame }), Some("S")).unwrap();
+        let tree = cdp.call("Accessibility.getFullAXTree", json!({ "frameId": frame }), Some("S")).unwrap_or_else(|error| panic!("{frame}: {error}; {:?}", sent.borrow()));
         assert_eq!(tree["nodes"][0]["name"]["value"], "PROTECTED-TEXT");
         assert_eq!(sent_with_frame(&sent, frame), ["Accessibility.getFullAXTree"]);
     }
@@ -178,13 +185,13 @@ const MAIN_FRAME: &str = "A1B2C3D4E5F60718293A4B5C6D7E8F90";
 
 fn extension_tree(main: &str) -> Value {
     json!({ "frameTree": {
-        "frame": { "id": main, "url": "http://localhost:43117/driven.html", "securityOrigin": "http://localhost:43117" },
+        "frame": { "id": main, "loaderId": "LMAIN", "url": "http://localhost:43117/driven.html", "securityOrigin": "http://localhost:43117" },
         "childFrames": [
-            { "frame": { "id": "PLAIN", "parentId": main, "url": "http://localhost:43118/child.html", "securityOrigin": "http://localhost:43118" } },
-            { "frame": { "id": "SEVENPORT", "parentId": main, "url": "http://localhost:5710/", "securityOrigin": "http://localhost:5710" } },
-            { "frame": { "id": "SEVEN", "parentId": main, "url": "https://seven.sliccy.ai/", "securityOrigin": "https://seven.sliccy.ai" } },
-            { "frame": { "id": "VAULT", "parentId": main, "url": "about:blank", "securityOrigin": "https://vault.sliccy.ai" } },
-            { "frame": { "id": "OPAQUE", "parentId": main, "url": "about:blank", "securityOrigin": "null" } }
+            { "frame": { "id": "PLAIN", "loaderId": "LPLAIN", "parentId": main, "url": "http://localhost:43118/child.html", "securityOrigin": "http://localhost:43118" } },
+            { "frame": { "id": "SEVENPORT", "loaderId": "LSEVENPORT", "parentId": main, "url": "http://localhost:5710/", "securityOrigin": "http://localhost:5710" } },
+            { "frame": { "id": "SEVEN", "loaderId": "LSEVEN", "parentId": main, "url": "https://seven.sliccy.ai/", "securityOrigin": "https://seven.sliccy.ai" } },
+            { "frame": { "id": "VAULT", "loaderId": "LVAULT", "parentId": main, "url": "about:blank", "securityOrigin": "https://vault.sliccy.ai" } },
+            { "frame": { "id": "OPAQUE", "loaderId": "LOPAQUE", "parentId": main, "url": "about:blank", "securityOrigin": "null" } }
         ]
     }})
 }
