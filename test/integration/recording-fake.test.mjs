@@ -271,6 +271,18 @@ test('the holder records verified ordinary actions and recording-stop prints Pla
     assert.deepEqual(last.actions, CODE);
     assert.deepEqual(await recordingFiles(home), []);
     assert.ok(cdp.calls.some((call) => call.method === 'Target.activateTarget'));
+    const disposed = cdp.calls.filter(
+      (call) =>
+        call.method === 'Runtime.evaluate' &&
+        call.params.expression.includes('__sliccRecording?.dispose?.()') &&
+        !call.params.expression.includes('sliccRecorder(')
+    );
+    assert.equal(disposed.length, 1);
+    assert.ok(
+      fake.installs.every((call) =>
+        call.params.expression.startsWith('(() => { globalThis.__sliccRecording?.dispose?.();')
+      )
+    );
     assert.ok(
       cdp.calls.some(
         (call) =>

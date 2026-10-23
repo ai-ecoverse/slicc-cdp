@@ -72,34 +72,39 @@ test('recording-start records trusted Chrome actions and nothing from protected 
     });
     await raw.send('Page.enable', {}, sessionId);
     const runner = nativeRunner(exe('playwright-cli'), exe('curlwright'), browser.wsUrl);
-    const cwd = await runner.fresh();
+    let cwd = await runner.fresh();
+    const start = async () => {
+      for (const held of holders) held.child.kill('SIGKILL');
+      cwd = await runner.fresh();
+      const held = holder(browser.wsUrl, ['recording-start', '--tab', target], cwd);
+      holders.push(held);
+      return held;
+    };
     const cli = async (args) => {
       const result = await runner.playwright([...args, '--tab', target], cwd);
       assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
       return result.stdout;
     };
-    const refs = async () => {
+    const patterns = {
+      go: /button "Go".*\[ref=(e\d+)\]/,
+      name: /textbox "Name".*\[ref=(e\d+)\]/,
+      agree: /checkbox "Agree".*\[ref=(e\d+)\]/,
+    };
+    const act = async (command, element, ...rest) => {
       const snapshot = await cli(['snapshot']);
-      const ref = (pattern) => snapshot.match(pattern)?.[1];
-      return {
-        go: ref(/button "Go".*\[ref=(e\d+)\]/),
-        name: ref(/textbox "Name".*\[ref=(e\d+)\]/),
-        agree: ref(/checkbox "Agree".*\[ref=(e\d+)\]/),
-        snapshot,
-      };
+      const ref = snapshot.match(patterns[element])?.[1];
+      assert.ok(ref, snapshot);
+      return cli([command, ref, ...rest]);
     };
 
     await t.test('trusted clicks, fills, presses and checks become Playwright code', async () => {
-      const held = holder(browser.wsUrl, ['recording-start', '--tab', target], cwd);
-      holders.push(held);
+      const held = await start();
       const ready = await held.event('ready');
       assert.equal(ready.tab, target);
-      const found = await refs();
-      assert.ok(found.go && found.name && found.agree, found.snapshot);
-      await cli(['click', found.go]);
-      await cli(['fill', found.name, 'hello']);
+      await act('click', 'go');
+      await act('fill', 'name', 'hello');
       await cli(['press', 'Enter']);
-      await cli(['check', found.agree]);
+      await act('check', 'agree');
       await raw.send(
         'Runtime.evaluate',
         { expression: "document.getElementById('go').click()" },
@@ -125,14 +130,31 @@ test('recording-start records trusted Chrome actions and nothing from protected 
       assert.equal(held.events().at(-1).reason, 'stop');
     });
 
+    await t.test('input between two recordings on one document is never recorded', async () => {
+      const first = await start();
+      await first.event('ready');
+      await settle();
+      const empty = await runner.playwright(['recording-stop'], cwd);
+      assert.equal(empty.code, 0, empty.stderr);
+      assert.equal((await first.ended).code, 0);
+      await act('fill', 'name', 'private-between-recordings');
+      await settle();
+      const second = await start();
+      await second.event('ready');
+      await settle();
+      const stopped = await runner.playwright(['recording-stop'], cwd);
+      assert.equal(stopped.code, 0, stopped.stderr);
+      assert.equal(stopped.stdout, '### Result\nRecording stopped. No actions were recorded.\n');
+      const ended = await second.ended;
+      assert.ok(!ended.stdout.includes('private-between-recordings'), ended.stdout);
+    });
+
     await t.test(
       'a protected navigation never records anything from the protected document',
       async () => {
-        const held = holder(browser.wsUrl, ['recording-start', '--tab', target], cwd);
-        holders.push(held);
+        const held = await start();
         await held.event('ready');
-        const found = await refs();
-        await cli(['click', found.go]);
+        await act('click', 'go');
         await settle();
         await raw
           .send(

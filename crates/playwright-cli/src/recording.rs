@@ -16,6 +16,7 @@ const RECORDER: &str = include_str!("recorder.js");
 const ARIA_HEAD: &str = "globalThis.sliccAriaSnapshot = (() => {";
 const ARIA_TAIL: &str = "return sliccAriaSnapshot;\n})();";
 const DRAIN: &str = "globalThis.__sliccRecording ? globalThis.__sliccRecording.next(500) : null";
+const DISPOSE: &str = "(() => { globalThis.__sliccRecording?.dispose?.(); delete globalThis.__sliccRecording; return true; })()";
 const ALREADY: &str = "Error: Recording is already in progress.\n";
 const NONE: &str = "Error: No recording in progress, use browser_start_recording to start one.\n";
 const SILENT: &str = "Error: The recording holder did not answer.\n";
@@ -200,6 +201,7 @@ impl Holder {
         if matches!(end, Ok(End::Input | End::Stop)) {
             if let Some(id) = context.filter(|_| !cdp.content_blocked(&self.session)) {
                 let _ = self.drain(cdp, id);
+                let _ = cdp.call("Runtime.evaluate", json!({"expression":DISPOSE,"contextId":id,"returnByValue":true}), Some(&self.session));
             }
         }
         let codes: Vec<String> = self.actions.iter().map(|action| action.code.clone()).collect();
@@ -362,7 +364,7 @@ fn install_expression() -> Result<String, String> {
         .and_then(|rest| rest.trim_end().strip_suffix(ARIA_TAIL))
         .ok_or_else(|| "recording-start: the recorder script is unavailable\n".to_string())?;
     Ok(format!(
-        "(() => {{ if (!globalThis.__sliccRecording) {{ globalThis.__sliccRecording = (() => {{\n{body}\n{RECORDER}\nreturn globalThis.sliccRecorder({{ getAriaRole, getElementAccessibleName, isElementHiddenForAria, beginAriaCaches, endAriaCaches, cssPath }});\n}})(); }} return globalThis.__sliccRecording.href(); }})()"
+        "(() => {{ globalThis.__sliccRecording?.dispose?.(); globalThis.__sliccRecording = (() => {{\n{body}\n{RECORDER}\nreturn globalThis.sliccRecorder({{ getAriaRole, getElementAccessibleName, isElementHiddenForAria, beginAriaCaches, endAriaCaches, cssPath }});\n}})(); return globalThis.__sliccRecording.href(); }})()"
     ))
 }
 

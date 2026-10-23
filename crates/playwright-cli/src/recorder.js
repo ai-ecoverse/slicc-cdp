@@ -264,7 +264,13 @@ function sliccInputAction(target) {
 globalThis.sliccRecorder = (api) => {
   const queue = [];
   const waiters = [];
+  const listeners = [];
+  let polled = Date.now();
   const record = (action, element) => {
+    if (Date.now() - polled > 5000) {
+      queue.length = 0;
+      return;
+    }
     if (queue.length >= 200) return;
     try {
       api.beginAriaCaches();
@@ -303,19 +309,26 @@ globalThis.sliccRecorder = (api) => {
     if (!event.isTrusted || !target || !sliccPressed(event, target)) return;
     record({ name: 'press', key: event.key, modifiers: sliccModifiers(event) }, target);
   };
-  document.addEventListener('click', (event) => click(event), true);
-  document.addEventListener(
-    'auxclick',
-    (event) => {
-      if (event.button === 1) click(event, 'middle');
-    },
-    true
-  );
-  document.addEventListener('contextmenu', (event) => click(event, 'right'), true);
-  document.addEventListener('input', input, true);
-  document.addEventListener('keydown', keydown, true);
+  const listen = (type, listener) => {
+    document.addEventListener(type, listener, true);
+    listeners.push([type, listener]);
+  };
+  listen('click', (event) => click(event));
+  listen('auxclick', (event) => {
+    if (event.button === 1) click(event, 'middle');
+  });
+  listen('contextmenu', (event) => click(event, 'right'));
+  listen('input', input);
+  listen('keydown', keydown);
+  const dispose = () => {
+    for (const [type, listener] of listeners.splice(0))
+      document.removeEventListener(type, listener, true);
+    queue.length = 0;
+    for (const wake of waiters.splice(0)) wake();
+  };
   const next = (wait) =>
     new Promise((resolve) => {
+      polled = Date.now();
       if (queue.length) {
         resolve(queue.splice(0));
         return;
@@ -331,5 +344,5 @@ globalThis.sliccRecorder = (api) => {
       }, wait);
       waiters.push(wake);
     });
-  return { href: () => location.href, next };
+  return { href: () => location.href, next, dispose };
 };
