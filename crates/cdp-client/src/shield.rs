@@ -286,15 +286,18 @@ fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool)
             (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') || encoded && ch == '&').then_some(start + at)
         }).unwrap_or(text.len());
         let raw = &text[start..end];
-        let mut decoded = raw.replace("\\/", "/");
+        let mut levels = vec![raw.replace("\\/", "/")];
         for _ in 0..8 {
-            let next = decode_percent(&decoded);
-            if next == decoded { break; }
-            decoded = next;
+            let next = decode_percent(&levels[levels.len() - 1]);
+            if next == levels[levels.len() - 1] { break; }
+            levels.push(next);
         }
+        let decoded = levels.pop().unwrap_or_default();
+        let found = levels.into_iter().find(|level| url_protected(guard, level)).or_else(|| (url_protected(guard, &decoded) || guard.unparseable(&decoded) && guard.url(&decoded)).then(|| decoded.clone()));
         let overflow = encoded && decode_percent(&decoded) != decoded;
-        if overflow || url_protected(guard, &decoded) || guard.unparseable(&decoded) && guard.url(&decoded) {
+        if overflow || found.is_some() {
             protected = true;
+            let decoded = found.unwrap_or(decoded);
             let origin = if overflow { "about:blank".to_string() } else {
                 url::Url::parse(&web_socket_as_http(&decoded)).ok().and_then(|url| {
                     let origin = url.origin().ascii_serialization();

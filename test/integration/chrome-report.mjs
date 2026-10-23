@@ -42,6 +42,7 @@ export const CHROME_FILES = new Set(
     'privileged-ui',
     'redirect-navigation',
     'redirect-protected',
+    'redirect-userinfo',
     'session',
     'sliccy-browser',
     'snapshot-golden',
