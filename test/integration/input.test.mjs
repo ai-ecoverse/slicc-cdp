@@ -105,7 +105,7 @@ async function flow(runner, raw, port) {
     return !targetInfos.some((info) => info.url.includes('seven.sliccy.ai'));
   };
 
-  await run(['open', `http://127.0.0.1:${port}/input`]);
+  await run(['open', '--foreground', `http://127.0.0.1:${port}/input`]);
   await drain();
   for (const [command, key] of [
     ['keydown', 'Shift'],
@@ -168,6 +168,16 @@ async function flow(runner, raw, port) {
     'the wheel scrolled the element under the pointer'
   );
   assert.ok((await drain()).some((event) => event.type === 'wheel' && event.dy === 200));
+  const background = await raw.open(`http://127.0.0.1:${port}/input`);
+  try {
+    const started = Date.now();
+    const hidden = await pw(['mousewheel', '0', '200', '--tab', background]);
+    assert.equal(hidden.code, 1);
+    assert.match(hidden.stderr, /^Error: mousewheel needs the tab in the foreground/);
+    assert.ok(Date.now() - started < 9000, 'a background wheel fails fast');
+  } finally {
+    await raw.send('Target.closeTarget', { targetId: background });
+  }
 
   await runner.write(cwd, 'note.txt', 'dropped bytes');
   const shot = (await run(['snapshot'])).stdout;

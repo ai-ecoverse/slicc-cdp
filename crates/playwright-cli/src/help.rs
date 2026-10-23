@@ -504,7 +504,7 @@ fn implemented_page(name: &str) -> Option<String> {
         ),
         "mousewheel" => page(
             "mousewheel <dx> <dy>",
-            &["Scroll mouse wheel", "", "Scrolls at the position from the last mousemove on this tab. Refused over an iframe or other embedded frame."],
+            &["Scroll mouse wheel", "", "Scrolls at the position from the last mousemove on this tab. Refused over an iframe or other embedded frame, and in a background tab, where Chrome never answers wheel events."],
             &[("<dx>", "x delta"), ("<dy>", "y delta")],
             &[],
         ),

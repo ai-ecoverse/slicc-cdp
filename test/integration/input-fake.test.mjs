@@ -84,6 +84,10 @@ function page(script) {
       reply({ result: { type: 'object', subtype: 'array', value: script.inner ?? [800, 600] } });
       return true;
     }
+    if (method === 'Runtime.evaluate' && params.expression === 'document.visibilityState') {
+      reply({ result: { type: 'string', value: script.visibility ?? 'visible' } });
+      return true;
+    }
     if (method === 'Page.getLayoutMetrics') {
       reply(
         script.metrics ?? {
@@ -404,6 +408,18 @@ test('pointer input over an embedded frame or outside the main document is refus
     const result = await pw(['mousemove', '5000', '5000']);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 1);
+  });
+});
+
+test('mousewheel is refused in a background tab instead of waiting for an answer Chrome never sends', async () => {
+  await withFake({ visibility: 'hidden' }, async (fake, pw) => {
+    const result = await pw(['mousewheel', '0', '100']);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      'Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab. Run "playwright-cli tab-select <index> --foreground" first.\n'
+    );
+    assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
   });
 });
 

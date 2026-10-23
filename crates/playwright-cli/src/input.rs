@@ -22,6 +22,8 @@ const FOCUS: &str = "(() => { let e = document.activeElement; while (e && e.shad
 const INNER: &str = "[innerWidth, innerHeight]";
 const DROP: &str = "function(payloads, data) { if (!this.isConnected || this.nodeType !== 1) return 'error:notconnected'; this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); const point = {x:r.x+r.width/2,y:r.y+r.height/2}; const dt = new DataTransfer(); for (const p of payloads) { const bytes = Uint8Array.from(atob(p.buffer), (c) => c.charCodeAt(0)); dt.items.add(new File([bytes], p.name, { type: p.mimeType, lastModified: p.lastModifiedMs })); } for (const entry of data) dt.setData(entry.mimeType, entry.value); const make = (type) => new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y, dataTransfer: dt }); this.dispatchEvent(make('dragenter')); const over = make('dragover'); this.dispatchEvent(over); if (!over.defaultPrevented) { this.dispatchEvent(make('dragleave')); return 'not-accepted'; } this.dispatchEvent(make('drop')); return 'accepted'; }";
 const NOT_ACCEPTED: &str = "Error: Drop target did not accept the drop \u{2014} its dragover handler did not call preventDefault()\n";
+const BACKGROUND: &str = "Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const WHEEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const NO_PAYLOAD: &str = "Error: At least one of \"paths\" or \"data\" must be provided.\n";
 
 pub fn is_command(command: &str) -> bool {
@@ -247,7 +249,12 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
         "mousewheel" => {
             let (dx, dy) = numbers(invocation, ["dx", "dy"])?;
             admit_point(cdp, session, pointer.x, pointer.y)?;
-            cdp.call("Input.dispatchMouseEvent", json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy }), Some(session))?;
+            let frame = main_frame(cdp, session)?;
+            if browser::evaluate_in_frame(cdp, session, &frame, "document.visibilityState")?.value != json!("visible") {
+                return Err(BACKGROUND.to_string());
+            }
+            let wheel = json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy });
+            cdp.call_for("Input.dispatchMouseEvent", wheel, Some(session), WHEEL_WAIT).map_err(|message| if message == "Input.dispatchMouseEvent timed out\n" { BACKGROUND.to_string() } else { message })?;
             Ok(code(&format!("// Scroll mouse wheel\nawait page.mouse.wheel({}, {});", js(dx), js(dy))))
         }
         _ => {
