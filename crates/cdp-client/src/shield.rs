@@ -839,6 +839,7 @@ mod tests {
         }
         let observer = raw.session(target);
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_ready = None;
         loop {
             let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
             let tree = raw.call("Page.getFrameTree", json!({}), Some(&observer));
@@ -857,8 +858,16 @@ mod tests {
                     assert!(!cdp.target_protected(target, false).unwrap());
                     break;
                 }
+                last_ready = Some(ready);
             }
-            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?}");
+            assert!(
+                Instant::now() < deadline,
+                "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} session_blocked={} content_blocked={} guard_document={} target_protected={:?}",
+                cdp.session_blocked(session),
+                cdp.content_blocked(session),
+                cdp.document_evidence(target),
+                cdp.target_protected(target, false)
+            );
         }
         raw.call("Target.detachFromTarget", json!({ "sessionId": observer }), None).unwrap();
     }
