@@ -27,7 +27,7 @@ fn tainted_unseen_and_non_redirect_carriers_never_deliver_partial_headers() {
 fn redirector_override_aliases_are_refused_in_both_interception_apis() {
     for method in ["Fetch.continueRequest", "Network.continueInterceptedRequest"] {
         let mut cdp = redirect_body_backend("GROK_ORDINARY_CONTROL_27".into());
-        cdp.session_targets.insert("S".into(), "T".into());
+        fixture_target(&mut cdp, "S", "T");
         cdp.session_targets.insert("G".into(), "T".into());
         cdp.guard_sessions.insert("G".into());
         cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"G","params":{"requestId":"TAINT","request":{"url":"https://ordinary.invalid/redirector?seed=private#seed"}}}));

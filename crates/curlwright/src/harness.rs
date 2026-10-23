@@ -213,18 +213,28 @@ fn on_message(text: &str, pages: &[PageSpec], shared: &Shared) -> Vec<String> {
             vec![wrap(id, json!({ "sessionId": format!("s-{target}") }))]
         }
         "Target.detachFromTarget" => vec![wrap(id, json!({}))],
+        "Page.getFrameTree" => {
+            let session = session_id.unwrap_or_default();
+            let page = pages.iter().find(|page| session == format!("s-{}", page.target_id) || session.starts_with(&format!("g-{}-", page.target_id)));
+            let Some(page) = page else { return vec![wrap(id, json!({}))] };
+            let frame = |frame_id: &str| json!({"id":frame_id,"loaderId":format!("L-{frame_id}"),"url":page.url,"securityOrigin":"https://app.example"});
+            vec![wrap(id, json!({"frameTree":{"frame":frame("MAIN"),"childFrames":page.frames.iter().filter(|(frame_id, _)| frame_id != "MAIN").map(|(frame_id, _)| json!({"frame":frame(frame_id)})).collect::<Vec<_>>()}}))]
+        }
         "Runtime.enable" => {
             let session = session_id.unwrap_or_default();
-            let target = session.strip_prefix("s-").unwrap_or("");
+            let page = pages.iter().find(|page| session == format!("s-{}", page.target_id) || session.starts_with(&format!("g-{}-", page.target_id)));
             let mut messages = Vec::new();
-            if let Some(page) = pages.iter().find(|page| page.target_id == target) {
-                for (frame_id, context_id) in &page.frames {
+            if let Some(page) = page {
+                let mut frames = page.frames.clone();
+                if !frames.iter().any(|(id, _)| id == "MAIN") { frames.push(("MAIN".into(), 1)); }
+                for (frame_id, context_id) in &frames {
                     messages.push(json!({
                         "method": "Runtime.executionContextCreated",
                         "sessionId": session,
                         "params": {
                             "context": {
                                 "id": context_id,
+                                "uniqueId": format!("ctx:{context_id}"),
                                 "origin": "https://app.example",
                                 "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}
                             }
@@ -240,7 +250,7 @@ fn on_message(text: &str, pages: &[PageSpec], shared: &Shared) -> Vec<String> {
                 return vec![json!({"id": id, "error": {"message": "missing sessionId"}}).to_string()];
             }
             let expr = params.get("expression").and_then(|item| item.as_str()).unwrap_or("");
-            let context = params.get("contextId").and_then(|item| item.as_i64());
+            let context = params.get("contextId").and_then(|item| item.as_i64()).or_else(|| params.get("uniqueContextId").and_then(Value::as_str).and_then(|id| id.strip_prefix("ctx:")).and_then(|id| id.parse().ok()));
             vec![wrap(id, interpret(expr, context))]
         }
         _ => vec![wrap(id, json!({}))],
@@ -489,7 +499,7 @@ fn tab_and_frame_selection() {
     assert_eq!(framed.code, 0, "{}", framed.stderr);
     assert_eq!(framed.as_text(), "frame-ok");
     let eval = running.shared.log.lock().unwrap().iter().rev().find(|call| call.method == "Runtime.evaluate").unwrap().params.clone();
-    assert_eq!(eval.get("contextId").and_then(|value| value.as_i64()), Some(9));
+    assert_eq!(eval.get("uniqueContextId").and_then(Value::as_str), Some("ctx:9"));
 }
 
 #[test]

@@ -19,7 +19,7 @@ fn ordinary_source_reads_remain_readable() {
     for (method, params) in [
         ("CSS.getStyleSheetText", json!({"styleSheetId":"CSS"})),
         ("Debugger.getScriptSource", json!({"scriptId":"JS"})),
-        ("Page.getResourceContent", json!({"frameId":"FRAME","url":"https://example.test/source"})),
+        ("Page.getResourceContent", json!({"frameId":"F","url":"https://example.test/source"})),
     ] {
         let result = cdp.call(method, params, Some("S")).unwrap();
         assert_eq!(result["text"], "ordinary source");

@@ -53,7 +53,7 @@ function capture(json, refs = [], nodes = []) {
 }
 
 function frame(id, url, securityOrigin) {
-  return { frame: { id, url, securityOrigin } };
+  return { frame: { id, loaderId: `L${id}`, url, securityOrigin } };
 }
 
 for (const metadata of [

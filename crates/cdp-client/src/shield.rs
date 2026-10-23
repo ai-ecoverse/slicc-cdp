@@ -1438,13 +1438,14 @@ mod tests {
                     Decision::default()
                 })),
             );
+            let navigation = cdp.events().len();
             cdp.call(
                 "Page.navigate",
                 json!({ "url": format!("{app}/?n=next") }),
                 Some(&session),
             )
             .unwrap();
-            cdp.wait_load(&session).unwrap();
+            cdp.wait_load_since(&session, navigation).unwrap();
             cdp.call(
                 "Runtime.evaluate",
                 json!({ "expression": format!("setTimeout(() => {{ location.href = {}; }}, 50); true", json!(format!("{seven}/nowhere?n=away"))) }),

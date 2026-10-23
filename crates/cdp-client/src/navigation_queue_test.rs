@@ -55,6 +55,7 @@ fn navigation_playwright_route_decider_cannot_queue_a_dependent_pause() {
 #[test]
 fn navigation_curlwright_guard_pause_is_answered_inside_synchronous_evaluation() {
     let mut cdp = navigation_queue_backend(true);
+    cdp.fixture_session("S");
     cdp.guard_sessions.insert("G".into());
     let result = cdp.call_for("Runtime.evaluate", json!({"expression":"void 0","returnByValue":true}), Some("S"), Duration::from_millis(100)).unwrap();
     assert_eq!(result["result"]["value"], "completed-fetch");

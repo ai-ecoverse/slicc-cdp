@@ -12,6 +12,7 @@ export async function webmcpBackend({
   let reloads = 0;
   let pages;
   const sessions = new Map();
+  const runtimeEnabled = new Set();
   const writers = new Map();
   const scripts = new Map();
   const permitted = new Map();
@@ -57,6 +58,7 @@ export async function webmcpBackend({
             window,
             main: index * 2 + 1,
             isolated: index * 2 + 2,
+            isolatedCreated: false,
           },
         ];
       })
@@ -106,7 +108,7 @@ export async function webmcpBackend({
       const event = (method, params, peer = sessionId) =>
         (writers.get(peer) || send)({ method, params, sessionId: peer });
       const created = (peer) => {
-        for (const page of pages.values())
+        for (const page of pages.values()) {
           event(
             'Runtime.executionContextCreated',
             {
@@ -119,6 +121,21 @@ export async function webmcpBackend({
             },
             peer
           );
+          if (page.isolatedCreated)
+            event(
+              'Runtime.executionContextCreated',
+              {
+                context: {
+                  id: page.isolated,
+                  uniqueId: `isolated-${page.loader}`,
+                  origin: page.origin,
+                  name: 'slicc-webmcp',
+                  auxData: { frameId: page.id, isDefault: false },
+                },
+              },
+              peer
+            );
+        }
       };
       const pause = (peer) => {
         const frameId = queues.get(peer)?.shift();
@@ -155,6 +172,7 @@ export async function webmcpBackend({
       }
       if (method === 'Target.detachFromTarget') {
         sessions.delete(params.sessionId);
+        runtimeEnabled.delete(params.sessionId);
         writers.delete(params.sessionId);
         scripts.delete(params.sessionId);
         answer({});
@@ -174,21 +192,33 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Runtime.enable') {
+        runtimeEnabled.add(sessionId);
         created(sessionId);
+        answer({});
+        return true;
+      }
+      if (method === 'Runtime.disable') {
+        runtimeEnabled.delete(sessionId);
         answer({});
         return true;
       }
       if (method === 'Page.createIsolatedWorld') {
         const page = pages.get(params.frameId);
-        event('Runtime.executionContextCreated', {
-          context: {
-            id: page.isolated,
-            uniqueId: `isolated-${page.loader}`,
-            origin: page.origin,
-            name: 'slicc-webmcp',
-            auxData: { frameId: page.id, isDefault: false },
-          },
-        });
+        page.isolatedCreated = true;
+        for (const peer of runtimeEnabled)
+          event(
+            'Runtime.executionContextCreated',
+            {
+              context: {
+                id: page.isolated,
+                uniqueId: `isolated-${page.loader}`,
+                origin: page.origin,
+                name: 'slicc-webmcp',
+                auxData: { frameId: page.id, isDefault: false },
+              },
+            },
+            peer
+          );
         answer({ executionContextId: page.isolated });
         return true;
       }

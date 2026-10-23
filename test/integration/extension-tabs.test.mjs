@@ -117,7 +117,7 @@ function extensionTabs(state, children) {
         frameTree: {
           frame: {
             id: main,
-            loaderId: `L${tab.targetId}`,
+            loaderId: tab.loaderId ?? `L${tab.targetId}`,
             url: tab.url,
             securityOrigin: tab.origin ?? originOf(tab.url),
           },
@@ -128,6 +128,7 @@ function extensionTabs(state, children) {
     }
     if (method === 'Page.navigate') {
       tab.url = params.url;
+      tab.loaderId = `L${tab.targetId}-2`;
       answer({ frameId: main, loaderId: `L${tab.targetId}-2` });
       event('Page.frameNavigated', {
         frame: {
@@ -139,6 +140,21 @@ function extensionTabs(state, children) {
       });
       event('Page.domContentEventFired', { timestamp: 1 });
       event('Page.loadEventFired', { timestamp: 1 });
+      return true;
+    }
+    if (method === 'Runtime.enable') {
+      event('Runtime.executionContextCreated', {
+        context: {
+          id: 1,
+          uniqueId: `main:${tab.targetId}:${tab.loaderId ?? `L${tab.targetId}`}`,
+          origin: tab.origin ?? originOf(tab.url),
+          name: '',
+          auxData: { frameId: main, isDefault: true },
+        },
+      });
+      for (const world of tab.worlds ?? [])
+        event('Runtime.executionContextCreated', { context: world });
+      answer({});
       return true;
     }
     if (

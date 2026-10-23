@@ -20,6 +20,7 @@ export const CHROME_FILES = new Set(
     'chromium-kernel-basics',
     'chromium-kernel-guards',
     'chromium',
+    'current-document',
     'discover-payments',
     'discover-sinks',
     'discover-ucp',

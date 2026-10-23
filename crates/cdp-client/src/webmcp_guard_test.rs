@@ -60,6 +60,10 @@ impl Transport for Backend {
                 state.inbox.push_back(context(&frame, "https://ordinary.test").to_string());
                 json!({})
             }
+            "Runtime.enable" => {
+                state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":command["sessionId"],"params":{"context":{"id":1,"uniqueId":"PRIVATE_CONTEXT","origin":"https://ordinary.test","name":"","auxData":{"frameId":"F","isDefault":true}}}}).to_string());
+                json!({})
+            }
             "Page.addScriptToEvaluateOnNewDocument" => {
                 state.source = params["source"].as_str().unwrap().to_string();
                 state.installed = true;

@@ -58,7 +58,7 @@ fn c2_every_redirect_response_carrier_retains_four_redacted_headers() {
 #[test]
 fn c2_override_to_a_known_redirector_is_refused_without_blocking_plain_reads() {
     let mut cdp = redirect_body_backend("C2_ORDINARY_FAKE_CONTROL".into());
-    cdp.session_targets.insert("S".into(), "T".into());
+    fixture_target(&mut cdp, "S", "T");
     cdp.session_targets.insert("G".into(), "T".into());
     cdp.guard_sessions.insert("G".into());
     let redirector = "https://ordinary.invalid/redirect";

@@ -11,6 +11,7 @@ import { requireChrome } from './chrome-policy.mjs';
 import { acquire, cleanup, cleanupGrace, deadline, normalizeError } from './cleanup.mjs';
 import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
+import { guardDiagnostics } from './guard-diagnostics.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 import { inboundClients } from './inbound-clients.mjs';
 import { isExpectedX1Failure150, recordX1Client, x1Disposition, x1Privacy } from './x1-known.mjs';
@@ -548,6 +549,8 @@ export async function runPartition(t, id) {
     );
   const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 4);
   const diagnostics = [];
+  const tracedClients = new WeakMap();
+  const activeTraceEvents = new Set();
   const recordedRows = [];
   const restoreClients = new Map();
   const exitClients = new Map();
@@ -635,21 +638,38 @@ export async function runPartition(t, id) {
             startup.markRowStarted();
             return made;
           }
-          const client = await acquire(
-            (signal) =>
-              recordedClient((onMessage) =>
-                guarded(browser.wsUrl, targets.client, {
-                  variant,
-                  detachDelay,
-                  onMessage,
-                  signal,
-                  deadlineAt: setupDeadline,
-                })
-              ),
-            'guarded-client-startup',
-            (resource) => resource.close(),
-            remaining()
-          );
+          const trace = ['C5.document', 'C5.continue-request'].includes(vector.id)
+            ? await guardDiagnostics(browser.wsUrl, { id: vector.id, target, variant, slot })
+            : null;
+          let client;
+          try {
+            client = await acquire(
+              (signal) =>
+                recordedClient((onMessage) =>
+                  guarded(trace?.url ?? browser.wsUrl, targets.client, {
+                    variant,
+                    detachDelay,
+                    onMessage: (message) => {
+                      onMessage(message);
+                      trace?.onMessage(message);
+                    },
+                    signal,
+                    deadlineAt: setupDeadline,
+                  })
+                ),
+              'guarded-client-startup',
+              (resource) => resource.close(),
+              remaining()
+            );
+          } catch (error) {
+            await cleanup([() => trace?.close()], error);
+          }
+          if (trace) {
+            trace.wrap(client);
+            tracedClients.set(client.events, trace);
+            activeTraceEvents.add(client.events);
+            diagnostics.push(trace.record);
+          }
           if (vector.id === 'X1.after-exit') {
             const key = `${vector.id}/${target}/${variant}`;
             if (!exitClients.has(key))
@@ -673,7 +693,10 @@ export async function runPartition(t, id) {
             );
           } catch (error) {
             try {
-              await cleanup([() => client.close(), () => browser.close()], error);
+              await cleanup(
+                [() => client.close(), () => trace?.close(), () => browser.close()],
+                error
+              );
             } finally {
               browsers.delete(key);
             }
@@ -722,12 +745,20 @@ export async function runPartition(t, id) {
                 diagnostic.afterCleanup = diagnostic.references.map((details) =>
                   structuredClone(details)
                 );
-              await cleanup([() => client.close(), () => unguarded.close()]);
+              try {
+                await cleanup([() => client.close(), () => unguarded.close()]);
+              } finally {
+                activeTraceEvents.delete(client.events);
+                await trace?.close();
+              }
             },
           };
         },
         debug: (details) => {
           if (!details.events?.length) return;
+          for (const events of activeTraceEvents) {
+            if (events.includes(details.events[0])) tracedClients.get(events)?.snapshot(details);
+          }
           const diagnostic = diagnostics.find((record) =>
             record.events.includes(details.events[0])
           );
