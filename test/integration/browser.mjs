@@ -40,6 +40,57 @@ export async function waitExit(exited, timeoutMs = cleanupGrace()) {
   }
 }
 
+const QUIET = [
+  '--disable-background-networking',
+  '--disable-component-update',
+  '--disable-sync',
+  '--disable-domain-reliability',
+  '--disable-client-side-phishing-detection',
+  '--disable-breakpad',
+  '--disable-search-engine-choice-screen',
+  '--metrics-recording-only',
+  '--no-pings',
+  '--no-service-autorun',
+];
+const QUIET_FEATURES = [
+  'Translate',
+  'MediaRouter',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'OptimizationHints',
+  'OptimizationHintsFetching',
+  'OptimizationGuideModelDownloading',
+  'OptimizationTargetPrediction',
+  'LensOverlay',
+  'AutofillServerCommunication',
+  'CertificateTransparencyComponentUpdater',
+  'InterestFeedContentSuggestions',
+  'ZeroSuggestPrefetching',
+];
+const OFFLINE = ['google.com', '*.google.com', '*.googleapis.com', '*.gstatic.com', '*.gvt1.com'];
+
+function quiet(extraArgs) {
+  const merged = (prefix, own, separator) =>
+    prefix +
+    [
+      ...extraArgs.filter((arg) => arg.startsWith(prefix)).map((arg) => arg.slice(prefix.length)),
+      ...own,
+    ]
+      .filter(Boolean)
+      .join(separator);
+  const features = '--disable-features=';
+  const rules = '--host-resolver-rules=';
+  return [
+    ...extraArgs.filter((arg) => !arg.startsWith(features) && !arg.startsWith(rules)),
+    merged(features, QUIET_FEATURES, ','),
+    merged(
+      rules,
+      OFFLINE.map((host) => `MAP ${host} ~NOTFOUND`),
+      ', '
+    ),
+  ];
+}
+
 export async function launchBrowser(extraArgs = [], options = {}) {
   requireChrome();
   options.signal?.throwIfAborted();
@@ -65,15 +116,13 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       ...modeFlags(headless),
       '--no-first-run',
       '--no-default-browser-check',
-      '--disable-background-networking',
-      '--disable-component-update',
-      '--disable-sync',
+      ...QUIET,
       ...(headless ? ['--disable-gpu'] : ['--window-size=1280,800']),
       '--disable-dev-shm-usage',
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--remote-allow-origins=*',
-      ...extraArgs,
+      ...quiet(extraArgs),
       'about:blank',
     ],
     {
