@@ -150,7 +150,9 @@ fn flush(cdp: &mut Cdp, session: &str) -> Result<(), String> {
 }
 
 fn fetch_bodies(cdp: &mut Cdp, session: &str, raws: &mut [RawRequest]) -> Result<(), String> {
+    let failed: std::collections::BTreeSet<String> = raws.iter().filter(|raw| raw.item.failed.is_some()).map(|raw| raw.request_id.clone()).collect();
     for raw in raws {
+        if failed.contains(&raw.request_id) { continue; }
         if raw.item.request_body.is_none() && raw.has_post_data {
             match cdp.call_for(
                 "Network.getRequestPostData",
@@ -1032,6 +1034,30 @@ fn pairs_from(value: Option<&Value>) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_redirects_do_not_trigger_body_reads_during_trace_cleanup() {
+        struct Unused;
+        impl cdp_client::cdp::Transport for Unused {
+            fn send_text(&mut self, _: &str) -> Result<(), String> { panic!("failed requests must not be read") }
+            fn recv_text(&mut self, _: std::time::Instant) -> Result<Option<String>, String> { panic!("failed requests must not be read") }
+        }
+        let mut cdp = Cdp::from_transport(Box::new(Unused));
+        let events = vec![
+            json!({ "method": "Network.requestWillBeSent", "sessionId": "S", "params": { "requestId": "R", "type": "Fetch", "request": { "url": "https://app.example/start", "method": "POST", "hasPostData": true, "headers": {} } } }),
+            json!({ "method": "Network.responseReceived", "sessionId": "S", "params": { "requestId": "R", "response": { "status": 302, "headers": { "Location": "/next" } } } }),
+            json!({ "method": "Network.requestWillBeSent", "sessionId": "S", "params": { "requestId": "R", "type": "Fetch", "request": { "url": "https://app.example/next", "method": "GET", "headers": {} }, "redirectResponse": { "status": 302, "headers": { "Location": "/next" } } } }),
+            json!({ "method": "Network.loadingFailed", "sessionId": "S", "params": { "requestId": "R", "errorText": "net::ERR_BLOCKED_BY_CLIENT" } }),
+        ];
+        let (_, mut raws) = from_events(&events, "S");
+        assert!(raws[0].done);
+        assert!(raws[0].has_post_data);
+        assert_eq!(raws[0].item.status, Some(302));
+        assert!(raws[0].item.failed.is_none());
+        assert_eq!(raws[1].item.failed.as_deref(), Some("net::ERR_BLOCKED_BY_CLIENT"));
+        fetch_bodies(&mut cdp, "S", &mut raws).unwrap();
+        assert!(raws.iter().all(|raw| raw.item.response_body.is_none() && raw.item.request_body.is_none()));
+    }
 
     #[test]
     fn console_stamp_comes_from_the_event_timestamp() {
