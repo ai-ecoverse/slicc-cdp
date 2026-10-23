@@ -1,4 +1,8 @@
 use cdp_client::cdp::Cdp;
+#[path = "support/forward_ledger.rs"]
+mod forward_ledger;
+use std::cell::Cell;
+use std::rc::Rc;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -124,6 +128,7 @@ fn emit(value: Value) {
 }
 
 fn answer(id: Value, result: Result<Value, String>) {
+    emit(json!({"audit":{"id":id,"stage":"complete"}}));
     match result {
         Ok(value) => emit(json!({"id":id,"result":value})),
         Err(message) => emit(json!({"id":id,"error":{"message":message}})),
@@ -190,13 +195,16 @@ fn main() {
     let url = std::env::var("SLICC_CDP_URL").unwrap();
     #[cfg(not(target_os = "wasi"))]
     let url = std::env::args().nth(1).unwrap();
-    let mut cdp = Cdp::connect(&url).unwrap();
+    let command = Rc::new(Cell::new(None));
+    let transport = forward_ledger::Audited::new(cdp_client::net::ws_connect(&url).unwrap(), command.clone());
+    let mut cdp = Cdp::from_transport(Box::new(transport));
     let origin = std::env::args().nth(2).unwrap();
     cdp.protect_origins(&[&origin]);
     let mut input = input();
     let mut seen = 0;
     let mut pending = BTreeMap::<u64, Pending>::new();
-        let mut navigations = BTreeMap::<u64, (i64, Instant)>::new();
+    let mut navigations = BTreeMap::<u64, (i64, Instant)>::new();
+    emit(json!({"audit":{"stage":"ready","version":1}}));
     let mut wait = BUSY;
     loop {
         let mut busy = !pending.is_empty() || !navigations.is_empty();
@@ -205,6 +213,8 @@ fn main() {
                 busy = true;
                 let message: Value = serde_json::from_str(&line).unwrap();
                 let method = message["method"].as_str().unwrap();
+                command.set(message["id"].as_u64());
+                emit(json!({"audit":{"id":message["id"],"stage":"received","method":method}}));
                 let mut params = message["params"].clone();
                 let notify = params.as_object_mut().and_then(|params| params.remove("__guardBridgeNotify")).and_then(|value| value.as_bool()).unwrap_or(false);
                 let session = message["sessionId"].as_str();
@@ -259,6 +269,7 @@ fn main() {
                     seen = cdp.events().len();
                     answer(message["id"].clone(), result);
                 }
+                command.set(None);
             }
             Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}
@@ -280,12 +291,14 @@ fn main() {
         wait = if busy { BUSY } else { (wait * 2).min(IDLE) };
         let mut done = Vec::new();
         for (id, evaluation) in &pending {
+            command.set(Some(*id));
             if let Some(result) = poll(&mut cdp, evaluation) {
                 let message = result.as_ref().err().map(String::as_str);
                 diagnostic(*id, if message == Some(SUPERSEDED) { "superseded" } else { "poll" }, Some(&evaluation.document), message);
                 answer(json!(id), result);
                 done.push(*id);
             }
+            command.set(None);
         }
         for id in done {
             pending.remove(&id);

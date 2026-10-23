@@ -1,12 +1,20 @@
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class InboundGate {
-  constructor({ protectedOrigin, ordinaryOrigin, now = Date.now, wait = sleep, seedSource }) {
+  constructor({
+    protectedOrigin,
+    ordinaryOrigin,
+    now = Date.now,
+    wait = sleep,
+    seedSource,
+    auditFactory,
+  }) {
     this.protectedOrigin = new URL(protectedOrigin).origin;
     this.ordinaryOrigin = new URL(ordinaryOrigin).origin;
     this.now = now;
     this.wait = wait;
     this.seedSource = seedSource;
+    this.auditFactory = auditFactory;
     this.requests = new Map();
     this.sessions = new Map();
     this.seeds = new Map();
@@ -132,6 +140,7 @@ export class InboundGate {
       gate: true,
       protectedObserved: seed?.protectedObserved === true,
       ordinaryObserved: seed?.ordinaryObserved === true,
+      ...(this.auditFactory ? { audit: this.auditFactory(sessionId) } : {}),
       release,
     };
   }

@@ -14,18 +14,17 @@ import { guarded, observer } from './guard-client.mjs';
 import { guardDiagnostics } from './guard-diagnostics.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 import { inboundClients } from './inbound-clients.mjs';
-import { isExpectedX1Failure150, recordX1Client, x1Disposition, x1Privacy } from './x1-known.mjs';
+import { recordX1Client, x1Privacy } from './x1-audit.mjs';
 
 const { containsSecret } = await import(
   new URL('./redirect-secret.mjs', import.meta.resolve('@ai-ecoverse/slicc-browsers/package.json'))
     .href
 );
 
-export const expectedBfcacheFailure477 = new Set([
+export const protectedBfcacheRows = new Set([
   'C8.protected-bfcache-restore',
   'C8.protected-bfcache-restore.history',
 ]);
-export const expectedBfcacheFailureReason = 'slicc-cdp#477';
 
 export function containsMarkerToken(value, marker) {
   const pattern = new RegExp(
@@ -115,154 +114,6 @@ export function bfcacheScreenshotExposed(row) {
   );
 }
 
-export function historyRepliesProvenOrdinaryB(restore) {
-  const url = restore?.seed?.ordinaryAnswer?.result?.frameTree?.frame?.url;
-  const protectedURL = restore?.seed?.protectedURL;
-  if (typeof url !== 'string' || typeof protectedURL !== 'string') return false;
-  let ordinary;
-  let protectedPage;
-  try {
-    ordinary = new URL(url);
-    protectedPage = new URL(protectedURL);
-  } catch {
-    return false;
-  }
-  const tag = protectedPage.searchParams.get('n');
-  if (
-    !tag ||
-    ordinary.origin === protectedPage.origin ||
-    ordinary.pathname !== '/bfcache' ||
-    ordinary.searchParams.get('n') !== `${tag}-b`
-  )
-    return false;
-  const marker = `bfcache-marker-${tag}-b`;
-  const isB = (state) =>
-    state?.origin === ordinary.origin &&
-    state.marker === marker &&
-    state.stored === marker &&
-    state.persisted === false;
-  if (!isB(restore.beforeRelease) || !isB(restore.sideEffect)) return false;
-  if (
-    !Array.isArray(restore.probes) ||
-    !restore.probes.length ||
-    restore.probes.some((probe) => probe.protectedCurrent !== false)
-  )
-    return false;
-  const answered = restore.probes.filter((probe) => probe.outcome === 'answered');
-  const required = [
-    'Runtime.evaluate',
-    'Runtime.callFunctionOn',
-    'DOM.getDocument',
-    'Accessibility.getFullAXTree',
-    'Page.captureScreenshot',
-  ];
-  if (required.some((method) => !answered.some((probe) => probe.method === method))) return false;
-  return answered.every((probe) => {
-    if (!probe.reply?.ok) return false;
-    const result = probe.reply.result;
-    if (probe.method === 'Page.captureScreenshot')
-      return (
-        typeof result?.data === 'string' &&
-        result.data.length > 0 &&
-        restore.screenshotProof?.url === url &&
-        restore.screenshotProof.reply?.ok === true &&
-        result.data === restore.screenshotProof.reply.result?.data
-      );
-    if (probe.method === 'DOM.getDocument') return result?.root?.documentURL === url;
-    if (probe.method === 'Accessibility.getFullAXTree')
-      return (
-        Array.isArray(result?.nodes) && result.nodes.some((node) => node.name?.value === marker)
-      );
-    if (['Runtime.evaluate', 'Runtime.callFunctionOn'].includes(probe.method)) {
-      let state;
-      try {
-        state = JSON.parse(result?.result?.value);
-      } catch {
-        return false;
-      }
-      return state?.origin === ordinary.origin && state.marker === marker;
-    }
-    return probe.method === 'Input.dispatchKeyEvent';
-  });
-}
-
-export function isExpectedBfcacheHistoryFailure477(row) {
-  const restore = row.evidence?.guarded?.restore;
-  const observation = row.observations?.guarded;
-  const audit = row.guardedPrivacy;
-  return (
-    row.id === 'C8.protected-bfcache-restore.history' &&
-    ['seven', 'vault'].includes(row.target) &&
-    ['prompt', 'lagging'].includes(row.variant) &&
-    row.control === 'pass' &&
-    row.guarded === 'fail' &&
-    row.live === 'pass' &&
-    observation?.markerHidden === false &&
-    observation.originHidden === true &&
-    observation.restoredObserved === 'incomplete' &&
-    observation.sideEffectAbsent === 'incomplete' &&
-    observation.probesRefusedOrUnforwarded === false &&
-    observation.sessionLive === true &&
-    restore?.trigger?.ok === false &&
-    restore.trigger.error?.message === 'no answer' &&
-    restore.delay?.acknowledged === true &&
-    restore.delay.seeding?.protectedObserved === true &&
-    restore.delay.seeding?.ordinaryObserved === true &&
-    restore.delay.release?.ok === true &&
-    restore.delay.release.result?.delayedEvents === 0 &&
-    restore.restoreAt === undefined &&
-    audit?.measured === true &&
-    audit.markerIdentity === 'whole-token' &&
-    audit.markerExposed === false &&
-    audit.protectedPathExposed === false &&
-    audit.upstreamMarkerSubstring === true &&
-    audit.ordinaryBMarkerObserved === true &&
-    typeof audit.auditDifference === 'string' &&
-    audit.auditDifference.length > 0 &&
-    historyRepliesProvenOrdinaryB(restore)
-  );
-}
-
-export function isExpectedBfcacheFailure477(row) {
-  if (isExpectedBfcacheHistoryFailure477(row)) return true;
-  const observation = row.observations?.guarded;
-  const audit = row.guardedPrivacy;
-  return (
-    expectedBfcacheFailure477.has(row.id) &&
-    row.control === 'pass' &&
-    row.guarded === 'fail' &&
-    row.live === 'pass' &&
-    observation?.markerHidden === true &&
-    observation?.originHidden === true &&
-    observation.restoredObserved === true &&
-    observation.sessionLive === true &&
-    audit?.measured === true &&
-    audit.markerExposed === false &&
-    audit.protectedPathExposed === false &&
-    (observation.sideEffectAbsent === false || observation.probesRefusedOrUnforwarded === false) &&
-    !bfcacheScreenshotExposed(row)
-  );
-}
-
-export function expectedFailureDispositions(results) {
-  return results
-    .filter(isExpectedBfcacheFailure477)
-    .map((row) => ({
-      id: row.id,
-      target: row.target,
-      variant: row.variant,
-      reason: expectedBfcacheFailureReason,
-      ...(isExpectedBfcacheHistoryFailure477(row)
-        ? {
-            class: 'history-no-answer-ordinary-B',
-            auditDifference: row.guardedPrivacy.auditDifference,
-            deletionHook: 'slicc-cdp#478 or fixed slicc-browsers vectors',
-          }
-        : {}),
-    }))
-    .concat(results.filter(isExpectedX1Failure150).map(x1Disposition));
-}
-
 export const published = JSON.parse(
   await readFile(
     fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/guard-vectors.json')),
@@ -290,7 +141,10 @@ export function rowsFor(targets) {
 }
 
 export const mandatory = (id) =>
-  id.startsWith('C2.redirect-') || /^C4\.iframe-preattach\..*\.shared$/.test(id);
+  protectedBfcacheRows.has(id) ||
+  id === 'X1.after-exit' ||
+  id.startsWith('C2.redirect-') ||
+  /^C4\.iframe-preattach\..*\.shared$/.test(id);
 
 export function canonicalSkip(vector, target) {
   if (!vector) return null;
@@ -345,12 +199,11 @@ export function verdictProblems(results) {
     const legs = [row.control, row.guarded, row.live];
     const where = `${row.id} ${row.target} ${row.variant}`;
     if (
-      expectedBfcacheFailure477.has(row.id) &&
+      protectedBfcacheRows.has(row.id) &&
       (row.guardedPrivacy?.measured !== true ||
         row.guardedPrivacy.markerExposed !== false ||
         row.guardedPrivacy.protectedPathExposed !== false ||
-        (row.observations?.guarded?.markerHidden === false &&
-          !isExpectedBfcacheHistoryFailure477(row)) ||
+        row.observations?.guarded?.markerHidden === false ||
         row.observations?.guarded?.originHidden === false ||
         bfcacheScreenshotExposed(row))
     ) {
@@ -359,8 +212,7 @@ export function verdictProblems(results) {
     }
     if (
       row.id === 'X1.after-exit' &&
-      row.x1Privacy &&
-      (row.x1Privacy.measured !== true ||
+      (row.x1Privacy?.measured !== true ||
         row.x1Privacy.markerExposed !== false ||
         row.x1Privacy.protectedExposed !== false ||
         row.x1Privacy.screenshotExposed !== false)
@@ -368,14 +220,16 @@ export function verdictProblems(results) {
       problems.push(`${where} lacks measured X1 non-exposure or discloses protected content`);
       continue;
     }
-    if (isExpectedBfcacheFailure477(row) || isExpectedX1Failure150(row)) continue;
-    if (legs.every((leg) => leg === 'pass')) continue;
-    if (expectedBfcacheFailure477.has(row.id)) {
-      problems.push(
-        `${where} is not PASS or the exact ${expectedBfcacheFailureReason} expected failure`
-      );
+    if (
+      row.id === 'C8.protected-bfcache-restore.history' &&
+      (row.guardedForwardingAudit?.id !== 'history-trigger' ||
+        row.guardedForwardingAudit?.complete !== true ||
+        row.guardedForwardingAudit.forwarded !== false)
+    ) {
+      problems.push(where + ' lacks terminal upstream non-forwarding proof');
       continue;
     }
+    if (legs.every((leg) => leg === 'pass')) continue;
     if (mandatory(row.id)) {
       problems.push(
         `${where} must pass and is never skipped: ${legs.join('/')} ${row.reason ?? ''}`
@@ -426,11 +280,7 @@ export function assertGuardReport(report, id, head) {
   assert.equal(report.pass, checked.pass, 'guard producer and recomputed raw verdicts must agree');
   assert.deepEqual(checked.missing, [], 'guard rows must not be missing');
   assert.deepEqual(checked.forged, [], 'guard rows must not be forged');
-  assert.ok(
-    checked.pass ||
-      report.results.some((row) => isExpectedBfcacheFailure477(row) || isExpectedX1Failure150(row)),
-    'raw failures require the exact expected class'
-  );
+  assert.equal(checked.pass, true, 'all raw guard verdicts must pass');
   assert.deepEqual(
     verdictProblems(report.results),
     [],
@@ -553,6 +403,7 @@ export async function runPartition(t, id) {
   const activeTraceEvents = new Set();
   const recordedRows = [];
   const restoreClients = new Map();
+  const restoreLedgers = new Map();
   const exitClients = new Map();
   const startup = browserStartup(launchBrowser, (retry) => {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
@@ -590,6 +441,7 @@ export async function runPartition(t, id) {
           clientExit: true,
           siteIsolationOff: true,
           inboundDelay: true,
+          forwardAudit: true,
         },
         variant: Object.keys(set.variants),
         parallel,
@@ -635,6 +487,7 @@ export async function runPartition(t, id) {
               remaining()
             );
             restoreClients.set(`${vector.id}/${target}/${variant}`, made.client.messages);
+            restoreLedgers.set(`${vector.id}/${target}/${variant}`, made.forwardLedger);
             startup.markRowStarted();
             return made;
           }
@@ -771,11 +624,15 @@ export async function runPartition(t, id) {
             const exit = exitClients.get(`${row.id}/${row.target}/${row.variant}`);
             row.x1Privacy = x1Privacy(exit?.actors, exit ?? {});
           }
-          if (expectedBfcacheFailure477.has(row.id))
+          if (protectedBfcacheRows.has(row.id))
             row.guardedPrivacy = bfcachePrivacy(
               row,
               restoreClients.get(`${row.id}/${row.target}/${row.variant}`)
             );
+          if (row.id === 'C8.protected-bfcache-restore.history')
+            row.guardedForwardingAudit = restoreLedgers
+              .get(`${row.id}/${row.target}/${row.variant}`)
+              ?.historyAudit();
           recordedRows.push(structuredClone(row));
           if (process.env.SLICC_GUARD_PROGRESS)
             process.stdout.write(`row ${row.id} ${row.target} ${row.variant}\n`);
@@ -834,10 +691,9 @@ export async function runPartition(t, id) {
   report.selection = { targets: selectedTargets };
   report.transport =
     process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
-  report.expectedFailures = expectedFailureDispositions(report.results);
   const problems = verdictProblems(report.results);
   const ms = Date.now() - started;
-  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS, its declared skip, or an exact recorded expected failure'}\n\n${table(report.results)}\n`;
+  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every mandatory row PASS or its declared applicability skip'}\n\n${table(report.results)}\n`;
   const file =
     process.env.SLICC_GUARD_REPORT ??
     path.join(fileURLToPath(new URL('../../artifacts/', import.meta.url)), `guard-${id}.md`);
@@ -885,10 +741,6 @@ export async function runPartition(t, id) {
   assertGuardReport(report, id, report.sha);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  assert.deepEqual(
-    problems,
-    [],
-    'every row is PASS, its declared not-applicable skip, or an exact expected failure'
-  );
-  assert.ok(report.pass || report.expectedFailures.length > 0, report.line);
+  assert.deepEqual(problems, [], 'every row is PASS or its declared not-applicable skip');
+  assert.equal(report.pass, true, report.line);
 }
