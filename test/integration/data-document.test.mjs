@@ -190,6 +190,11 @@ for (const [label, start] of [
       const went = await run(['goto', 'data:text/html,<title>start</title>']);
       assert.equal(went.code, 0, went.stderr);
       assert.equal((await run(['eval', 'location.href'])).code, 0);
+      const seven = await run(['goto', SEVEN]);
+      assert.notEqual(seven.code, 0, seven.stdout);
+      assert.match(seven.stderr, REFUSED);
+      assert.equal(tab.url, 'data:text/html,<title>start</title>');
+      assert.equal((await run(['eval', 'location.href'])).code, 0);
       const closed = await run(['close']);
       assert.equal(closed.code, 0, closed.stderr);
       assert.equal(fake.targets.length, 0);
@@ -286,16 +291,8 @@ for (const [label, start] of [
   });
 }
 
-function sandboxSite() {
-  const server = createServer((req, res) => {
-    if (req.url === '/sandboxed') {
-      res.writeHead(200, {
-        'content-type': 'text/html',
-        'content-security-policy': 'sandbox allow-scripts',
-      });
-      res.end('<!doctype html><title>sandboxed</title><p>sandboxed</p>');
-      return;
-    }
+function framedSite() {
+  const server = createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(
       `<!doctype html><title>framed</title><iframe src="${linked.replace('linked-browser', 'framed-data')}"></iframe>`
@@ -317,10 +314,10 @@ function sandboxSite() {
 
 for (const kind of ['native', 'kernel']) {
   chromeTest(
-    `${kind}: in Chrome, a data: page opens, evals, snapshots and goes on, while a sandboxed page stays refused`,
+    `${kind}: in Chrome, a data: page opens, evals, snapshots and goes on, while seven stays refused`,
     async () => {
       const site = await startServer();
-      const sandbox = await sandboxSite();
+      const framedPage = await framedSite();
       let browser;
       let runner;
       try {
@@ -346,24 +343,24 @@ for (const kind of ['native', 'kernel']) {
         const href = await runner.playwright(['eval', 'location.href'], cwd);
         assert.equal(href.code, 0, href.stderr);
         assert.equal(href.stdout, 'data:text/html,<title>start</title>\n');
+        const seven = await runner.playwright(['goto', SEVEN], cwd);
+        assert.notEqual(seven.code, 0, seven.stdout);
+        assert.match(seven.stderr, REFUSED);
+        const stayed = await runner.playwright(['eval', 'location.href'], cwd);
+        assert.equal(stayed.code, 0, stayed.stderr);
+        assert.equal(stayed.stdout, 'data:text/html,<title>start</title>\n');
         const ordinaryPage = await runner.playwright(['goto', `${site.origin}/cb`], cwd);
         assert.equal(ordinaryPage.code, 0, ordinaryPage.stderr);
-        const framed = await runner.playwright(['goto', `${sandbox.origin}/framed`], cwd);
+        const framed = await runner.playwright(['goto', `${framedPage.origin}/framed`], cwd);
         assert.equal(framed.code, 0, framed.stderr);
         const frames = await runner.playwright(['snapshot'], cwd);
         assert.equal(frames.code, 0, frames.stderr);
         const closed = await runner.playwright(['close'], cwd);
         assert.equal(closed.code, 0, closed.stderr);
-        const sandboxed = await runner.playwright(['open', `${sandbox.origin}/sandboxed`], cwd);
-        if (sandboxed.code === 0) {
-          const refused = await runner.playwright(['eval', 'document.title'], cwd);
-          assert.notEqual(refused.code, 0, refused.stdout);
-          assert.match(refused.stderr, REFUSED);
-        } else assert.match(sandboxed.stderr, REFUSED);
       } finally {
         await Promise.resolve(runner?.close()).catch(() => {});
         await browser?.close().catch(() => {});
-        await sandbox.close().catch(() => {});
+        await framedPage.close().catch(() => {});
         await site.close().catch(() => {});
       }
     }
