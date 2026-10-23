@@ -196,7 +196,7 @@ fn continue_with_auth_classifies_the_redirect_that_follows() {
 }
 
 #[test]
-fn replay_xhr_needs_a_verified_ordinary_original_and_classifies_every_hop() {
+fn replay_xhr_is_refused_without_a_correlated_interception_identity() {
     let (mut cdp, log) = wire(Box::new(answer));
     let sent = |id: &str, kind: &str, url: &str| json!({ "method": "Network.requestWillBeSent", "sessionId": "S", "params": { "requestId": id, "type": kind, "request": { "url": url, "method": "GET", "headers": {} } } });
     let redirected = |id: &str, url: &str, from: &str| { let mut event = sent(id, "XHR", url); event["params"]["redirectResponse"] = json!({ "url": from, "status": 302, "headers": { "Location": url } }); event };
@@ -210,12 +210,16 @@ fn replay_xhr_needs_a_verified_ordinary_original_and_classifies_every_hop() {
         assert!(cdp.call("Network.replayXHR", json!({ "requestId": id }), Some("S")).unwrap_err().starts_with("slicc: refused:"), "{id}");
     }
     assert!(cdp.call("Network.replayXHR", json!({ "requestId": "X1" }), Some("")).unwrap_err().starts_with("slicc: refused:"));
-    cdp.call("Network.replayXHR", json!({ "requestId": "X1" }), Some("S")).unwrap();
+    assert!(refused(cdp.call("Network.replayXHR", json!({ "requestId": "X1" }), Some("S"))));
+    cdp.call("Fetch.enable", json!({ "patterns": [{ "urlPattern": "https://app.example/start*" }] }), Some("S")).unwrap();
+    cdp.absorb(pause("R1", "N1", "https://app.example/start", "XHR"));
+    cdp.next_paused(Some("S"), Duration::ZERO).unwrap().unwrap();
+    cdp.call("Fetch.continueRequest", json!({ "requestId": "R1", "url": "https://app.example/ordinary" }), Some("S")).unwrap();
+    fetch_calls(&log);
+    assert!(refused(cdp.call("Network.replayXHR", json!({ "requestId": "X1" }), Some("S"))));
     cdp.absorb(pause("P1", "Y1", "https://app.example/flip", "XHR"));
     cdp.absorb(hop("P2", "Y1", "https://seven.sliccy.ai/private", "P1"));
-    cdp.absorb(pause("P3", "Y3", "https://app.example/other", "XHR"));
-    assert!(cdp.next_paused(Some("S"), Duration::ZERO).unwrap().is_none());
-    assert_eq!(fetch_calls(&log), [armed(json!([]), false), call("Network.replayXHR", json!({ "requestId": "X1" })), plain("P1"), failed("P2"), plain("P3")]);
+    assert_eq!(fetch_calls(&log), [plain("P1"), plain("P2")]);
 }
 
 #[test]
@@ -310,6 +314,52 @@ fn route_style_deciders_follow_the_client_issued_rule() {
     assert_eq!(calls[1].1["requestId"], "D1");
     assert_eq!(calls[2..], [failed("D2"), plain("D3"), plain("D4")]);
     assert_eq!(cdp.take_fetch_errors().len(), 2);
+}
+
+#[test]
+fn response_rewrites_classify_locations_with_the_effective_status_and_headers() {
+    let (mut cdp, log) = wire(Box::new(answer));
+    cdp.call("Fetch.enable", json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Response" }] }), Some("S")).unwrap();
+    cdp.absorb(respond("R1", "N1", "https://app.example/start", 302, "/fine"));
+    cdp.next_paused(Some("S"), Duration::ZERO).unwrap().unwrap();
+    assert!(refused(cdp.call("Fetch.continueResponse", json!({ "requestId": "R1", "responseHeaders": [{ "name": "Location", "value": "//seven.sliccy.ai/" }] }), Some("S"))));
+    assert!(refused(cdp.call("Fetch.continueResponse", json!({ "requestId": "R1", "binaryResponseHeaders": crate::net::base64_encode(b"Location: //vault.sliccy.ai/") }), Some("S"))));
+    cdp.call("Fetch.continueResponse", json!({ "requestId": "R1", "responseCode": 307 }), Some("S")).unwrap();
+    cdp.absorb(hop("R2", "N1", "https://vault.sliccy.ai/", "R1"));
+    assert_eq!(fetch_calls(&log).last().unwrap(), &failed("R2"));
+    cdp.absorb(respond("R3", "N3", "https://app.example/start", 302, "/fine"));
+    cdp.next_paused(Some("S"), Duration::ZERO).unwrap().unwrap();
+    cdp.call("Fetch.continueResponse", json!({ "requestId": "R3" }), Some("S")).unwrap();
+    assert!(!cdp.issued.chains.contains(&("S".to_string(), "N3".to_string())));
+    cdp.absorb(hop("R4", "N3", "https://seven.sliccy.ai/", "R3"));
+    assert_eq!(fetch_calls(&log).last().unwrap(), &plain("R4"));
+}
+
+#[test]
+fn inline_routes_wait_for_a_successful_arm_before_issuing_a_redirect() {
+    for success in [true, false] {
+        let (mut cdp, log) = wire(Box::new(move |message| {
+            if message["method"] == "Fetch.enable" && message["params"]["handleAuthRequests"] == false {
+                let reply = if success { json!({ "id": message["id"], "result": {} }) } else { json!({ "id": message["id"], "error": { "message": "no" } }) };
+                vec![pause("D2", "N2", "https://app.example/start", "Fetch"), reply]
+            } else { answer(message) }
+        }));
+        cdp.call("Fetch.enable", json!({ "patterns": [{ "urlPattern": "https://app.example/*" }] }), Some("S")).unwrap();
+        cdp.set_decider("S", Some(Box::new(|_: &Paused| crate::fetch::Decision::Fulfill(crate::fetch::Fulfill::new(302).header("Location", "/next")))));
+        fetch_calls(&log);
+        cdp.absorb(pause("D1", "N1", "https://app.example/start", "Fetch"));
+        let calls = fetch_calls(&log);
+        assert_eq!(calls[0].0, "Fetch.enable");
+        if success {
+            assert_eq!(calls[1].0, "Fetch.fulfillRequest");
+            assert_eq!(calls[2].0, "Fetch.fulfillRequest");
+            assert!(cdp.take_fetch_errors().is_empty());
+        } else {
+            assert_eq!(calls[1..], [plain("D2"), plain("D1")]);
+            assert_eq!(cdp.take_fetch_errors().len(), 1);
+            assert!(cdp.issued.chains.is_empty());
+        }
+    }
 }
 
 #[test]

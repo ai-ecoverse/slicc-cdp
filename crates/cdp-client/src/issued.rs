@@ -4,9 +4,8 @@ use crate::net::base64_decode;
 use crate::protected::Protected;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const REPLAY_WINDOW: Duration = Duration::from_secs(30);
 const ARM: Duration = Duration::from_secs(10);
 const FETCH_LIKE: [&str; 3] = ["XHR", "Fetch", "EventSource"];
 const NAMED: [&str; 12] = ["Document", "Stylesheet", "Image", "Media", "Font", "Script", "XHR", "Fetch", "EventSource", "Prefetch", "Ping", "CSPViolationReport"];
@@ -18,8 +17,9 @@ pub(super) struct Issued {
     chains: BTreeSet<(String, String)>,
     urls: BTreeMap<(String, String), String>,
     auth: BTreeSet<(String, String)>,
-    xhr: BTreeMap<(String, String), String>,
-    replays: Vec<(String, String, Instant)>,
+    responses: BTreeMap<(String, String), (u64, Vec<String>)>,
+    arming: BTreeSet<String>,
+    deferred: BTreeMap<String, Vec<Paused>>,
 }
 
 enum Token {
@@ -125,7 +125,8 @@ impl Cdp {
 
     pub(super) fn client_issued(&self, method: &str, params: &Value, session: Option<&str>) -> Result<bool, String> {
         let id = crate::shield::request_key(params).unwrap_or_default();
-        let source = session.and_then(|session| self.issued.urls.get(&(session.to_string(), id))).cloned();
+        let key = session.map(|session| (session.to_string(), id));
+        let source = key.as_ref().and_then(|key| self.issued.urls.get(key)).cloned();
         match method {
             "Fetch.continueRequest" | "Network.continueInterceptedRequest" if params.get("url").is_some_and(|url| !url.is_null()) => {
                 let url = params["url"].as_str().ok_or_else(|| self.refusal())?;
@@ -136,7 +137,13 @@ impl Cdp {
             }
             "Fetch.continueWithAuth" => Ok(true),
             "Fetch.fulfillRequest" | "Fetch.continueResponse" | "Network.continueInterceptedRequest" => {
-                let (status, locations) = redirect_answer(method, params);
+                let (mut status, mut locations) = redirect_answer(method, params);
+                if method == "Fetch.continueResponse" {
+                    if !["responseCode", "responseHeaders", "binaryResponseHeaders"].iter().any(|name| params.get(name).is_some()) { return Ok(false) }
+                    let original = key.as_ref().and_then(|key| self.issued.responses.get(key)).ok_or_else(|| self.refusal())?;
+                    if params.get("responseCode").is_none() { status = original.0; }
+                    if params.get("responseHeaders").is_none() && params.get("binaryResponseHeaders").is_none() { locations = original.1.clone(); }
+                }
                 if !(300..400).contains(&status) || locations.is_empty() { return Ok(false) }
                 let source = source.ok_or_else(|| self.refusal())?;
                 match locations.iter().find_map(|location| self.hop_refusal(&source, location)) {
@@ -160,16 +167,25 @@ impl Cdp {
         json!({ "patterns": patterns, "handleAuthRequests": auth })
     }
 
-    pub(super) fn arm_fetch(&mut self, session: &str, wait: bool) -> Result<(), String> {
+    fn arm_fetch(&mut self, session: &str) -> Result<(), String> {
         if self.issued.armed.contains(session) { return Ok(()) }
         let params = self.armed_params(session);
-        if wait {
-            self.raw_call("Fetch.enable", params, Some(session), ARM).map_err(|_| self.refusal())?;
-        } else {
-            self.send("Fetch.enable", params, Some(session))?;
+        self.issued.arming.insert(session.to_string());
+        let result = self.raw_call("Fetch.enable", params, Some(session), ARM).map_err(|_| self.refusal());
+        self.issued.arming.remove(session);
+        if result.is_ok() { self.issued.armed.insert(session.to_string()); }
+        let deferred = self.issued.deferred.remove(session).unwrap_or_default();
+        for paused in deferred {
+            if result.is_ok() { self.decide_inline(paused); }
+            else { self.continue_plain(&paused.session_id, &paused.request_id); }
         }
-        self.issued.armed.insert(session.to_string());
-        Ok(())
+        result.map(|_| ())
+    }
+
+    pub(super) fn defer_issued(&mut self, paused: &Paused) -> bool {
+        if !self.issued.arming.contains(&paused.session_id) { return false }
+        self.issued.deferred.entry(paused.session_id.clone()).or_default().push(paused.clone());
+        true
     }
 
     pub(super) fn track_issued(&mut self, session: &str, id: &str) {
@@ -178,27 +194,10 @@ impl Cdp {
         for id in ids { self.issued.chains.insert((session.to_string(), id)); }
     }
 
-    pub(super) fn issue(&mut self, params: &Value, session: &str, wait: bool) -> Result<(), String> {
-        self.arm_fetch(session, wait)?;
+    pub(super) fn issue(&mut self, params: &Value, session: &str) -> Result<(), String> {
+        self.arm_fetch(session)?;
         self.track_issued(session, &crate::shield::request_key(params).unwrap_or_default());
         Ok(())
-    }
-
-    pub(super) fn replay(&mut self, params: &Value, session: Option<&str>) -> Result<(), String> {
-        let session = session.ok_or_else(|| self.refusal())?;
-        let url = self.replay_url(params, session).ok_or_else(|| self.refusal())?;
-        self.arm_fetch(session, true)?;
-        self.issued.replays.push((session.to_string(), url, Instant::now() + REPLAY_WINDOW));
-        Ok(())
-    }
-
-    pub(super) fn replay_url(&self, params: &Value, session: &str) -> Option<String> {
-        let id = crate::shield::request_key(params)?;
-        let url = self.issued.xhr.get(&(session.to_string(), id.clone()))?;
-        let hops = self.request_resources.get(&id)?;
-        let ordinary = !self.redirects.contains(&id) && !self.protected_body_requests.contains(&id)
-            && self.hop_refusal(url, url).is_none() && hops.iter().all(|(_, hop)| self.hop_refusal(hop, hop).is_none());
-        ordinary.then(|| url.clone())
     }
 
     fn client_matches(&self, session: &str, url: &str, kind: &str) -> bool {
@@ -238,12 +237,12 @@ impl Cdp {
         let key = |id: &str| (session.clone(), id.to_string());
         self.issued.urls.insert(key(&paused.request_id), paused.url.clone());
         self.issued.auth.remove(&key(&paused.request_id));
-        let now = Instant::now();
-        self.issued.replays.retain(|(_, _, deadline)| *deadline > now);
+        if let Some(status) = paused.status {
+            let locations = paused.response_headers.iter().flatten().filter(|(name, _)| name.trim().eq_ignore_ascii_case("location")).map(|(_, value)| value.clone()).collect();
+            self.issued.responses.insert(key(&paused.request_id), (u64::from(status), locations));
+        }
         let redirected = value.pointer("/params/redirectedRequestId").and_then(Value::as_str);
-        let replay = !paused.is_response() && redirected.is_none() && paused.resource_type == "XHR"
-            && self.issued.replays.iter().any(|(peer, url, _)| peer == &session && url == &paused.url);
-        let tracked = replay || [Some(paused.request_id.as_str()), paused.network_id.as_deref(), redirected].into_iter().flatten().any(|id| self.issued.chains.contains(&key(id)));
+        let tracked = [Some(paused.request_id.as_str()), paused.network_id.as_deref(), redirected].into_iter().flatten().any(|id| self.issued.chains.contains(&key(id)));
         if !tracked { return false }
         let refusal = if paused.is_response() {
             let locations: Vec<String> = paused.response_headers.iter().flatten().filter(|(name, _)| name.trim().eq_ignore_ascii_case("location")).map(|(_, value)| value.clone()).collect();
@@ -261,12 +260,6 @@ impl Cdp {
         self.settle(&session, &paused.request_id);
         let _ = self.send("Fetch.failRequest", json!({ "requestId": paused.request_id, "errorReason": "BlockedByClient" }), Some(&session));
         true
-    }
-
-    pub(super) fn remember_xhr(&mut self, method: &str, session: &str, params: &Value) {
-        if method != "Network.requestWillBeSent" || params.get("type").and_then(Value::as_str) != Some("XHR") || params.get("redirectResponse").is_some() { return }
-        let (Some(id), Some(url)) = (params.get("requestId").and_then(Value::as_str), params.pointer("/request/url").and_then(Value::as_str)) else { return };
-        self.issued.xhr.entry((session.to_string(), id.to_string())).or_insert_with(|| url.to_string());
     }
 
     pub(super) fn fetch_command(&mut self, method: &str, params: Value, session: Option<&str>) -> (String, Value) {
@@ -307,6 +300,7 @@ impl Cdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     include!("client_issued_test.rs");
 

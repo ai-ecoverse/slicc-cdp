@@ -470,7 +470,7 @@ pub fn command(
                 if let Some(reason) = redirect_refusal(guard, &paused.url, headers) {
                     return Err(format!("{reason}\n"));
                 }
-                location_refusal(guard, &paused.url, overrides.status, headers)?;
+                location_refusal(guard, &paused.url, overrides.status.or(paused.status), headers)?;
                 params["responseHeaders"] = header_list(headers);
             }
             Ok(("Fetch.continueResponse", params))

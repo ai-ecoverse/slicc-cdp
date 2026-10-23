@@ -9,7 +9,6 @@ import { guarded } from './guard-client.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 
 const CHAINS = [[301], [302], [303], [307], [308], [301, 302, 303, 307, 308]];
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 before(() => {
   if (chromeSkipReason()) return;
@@ -32,6 +31,7 @@ for (const transport of ['native', 'wasi']) {
     const hits = [];
     const protectedServer = createServer((req, res) => {
       hits.push({ host: req.headers.host, url: req.url });
+      res.setHeader('Access-Control-Allow-Origin', '*');
       res.end('protected');
     });
     const ordinaryHits = [];
@@ -40,6 +40,7 @@ for (const transport of ['native', 'wasi']) {
     let protectedPort;
     const ordinary = createServer((req, res) => {
       ordinaryHits.push(req.url);
+      res.setHeader('Access-Control-Allow-Origin', '*');
       const url = new URL(req.url, base);
       const host = url.searchParams.get('host') ?? 'ordinary';
       const path = url.searchParams.get('path') ?? 'protected';
@@ -63,10 +64,14 @@ for (const transport of ['native', 'wasi']) {
         return res.end();
       }
       const statuses = (url.searchParams.get('statuses') ?? '302').split(',').map(Number);
+      const peers = url.searchParams.get('peers') === '1';
+      const nextBase = peers
+        ? `http://hop-${statuses.length % 2}.ordinary.invalid:${ordinary.address().port}`
+        : base;
       res.writeHead(statuses[0], {
         Location:
           statuses.length > 1
-            ? `${base}/hop?statuses=${statuses.slice(1).join(',')}&host=${host}&path=${path}`
+            ? `${nextBase}/hop?statuses=${statuses.slice(1).join(',')}&host=${host}&path=${path}&peers=${peers ? 1 : 0}`
             : end,
       });
       res.end();
@@ -80,7 +85,7 @@ for (const transport of ['native', 'wasi']) {
       protectedPort = protectedServer.address().port;
       base = `http://127.0.0.1:${ordinary.address().port}`;
       browser = await launchBrowser([
-        '--host-resolver-rules=MAP *.sliccy.ai 127.0.0.1',
+        '--host-resolver-rules=MAP *.sliccy.ai 127.0.0.1, MAP *.ordinary.invalid 127.0.0.1',
         '--no-proxy-server',
       ]);
       process.env.SLICC_GUARD_TRANSPORT = transport;
@@ -139,7 +144,7 @@ for (const transport of ['native', 'wasi']) {
             const before = ordinaryHits.length;
             await page.send('Fetch.continueRequest', {
               requestId,
-              url: `${base}/hop?statuses=${chain.join(',')}&host=${host}`,
+              url: `${base}/hop?statuses=${chain.join(',')}&host=${host}&peers=1`,
             });
             assert.match(await done, /^failed:/);
             noHits(`${chain.join(' → ')} into ${host}`);
@@ -152,16 +157,21 @@ for (const transport of ['native', 'wasi']) {
         await t.test(`fulfilled redirects into ${host}`, async () => {
           const page = await tab(pattern);
           const direct = await intercept(page, `/start?fulfil=direct&host=${host}`);
-          await assert.rejects(
-            page.send('Fetch.fulfillRequest', {
-              requestId: direct.requestId,
-              responseCode: 302,
-              responseHeaders: [
-                { name: 'Location', value: `http://${host}:${protectedPort}/protected` },
-              ],
-            }),
-            /slicc: refused:/
-          );
+          for (const value of [
+            `http://${host}:${protectedPort}/protected`,
+            'http://[::1',
+            '',
+            '/a\u0001b',
+          ]) {
+            await assert.rejects(
+              page.send('Fetch.fulfillRequest', {
+                requestId: direct.requestId,
+                responseCode: 302,
+                responseHeaders: [{ name: 'Location', value }],
+              }),
+              /slicc: refused:/
+            );
+          }
           await page.send('Fetch.failRequest', {
             requestId: direct.requestId,
             errorReason: 'Failed',
@@ -171,10 +181,51 @@ for (const transport of ['native', 'wasi']) {
           await page.send('Fetch.fulfillRequest', {
             requestId: hop.requestId,
             responseCode: 302,
-            responseHeaders: [{ name: 'Location', value: `/hop?statuses=307,308&host=${host}` }],
+            responseHeaders: [
+              { name: 'Location', value: `/hop?statuses=307,308&host=${host}&peers=1` },
+            ],
           });
           assert.match(await hop.done, /^failed:/);
           noHits(`fulfilled 302 into ${host}`);
+        });
+        await t.test(`rewritten response redirects into ${host}`, async () => {
+          const page = await tab({
+            patterns: [
+              ...pattern.patterns,
+              { urlPattern: `${base}/start*`, requestStage: 'Response' },
+            ],
+          });
+          const path = `/start?response=${host}&host=ordinary`;
+          const response = client.waitEvent(
+            (event) =>
+              event.sessionId === page.sessionId &&
+              event.method === 'Fetch.requestPaused' &&
+              event.params.responseStatusCode === 302 &&
+              event.params.request.url === `${base}${path}`,
+            20000
+          );
+          const first = await intercept(page, path);
+          await page.send('Fetch.continueRequest', { requestId: first.requestId });
+          const { requestId } = (await response).params;
+          await assert.rejects(
+            page.send('Fetch.continueResponse', {
+              requestId,
+              responseCode: 302,
+              responseHeaders: [
+                { name: 'Location', value: `http://${host}:${protectedPort}/protected` },
+              ],
+            }),
+            /slicc: refused:/
+          );
+          await page.send('Fetch.continueResponse', {
+            requestId,
+            responseCode: 302,
+            responseHeaders: [
+              { name: 'Location', value: `/hop?statuses=307,308&host=${host}&peers=1` },
+            ],
+          });
+          assert.match(await first.done, /^failed:/);
+          noHits(`rewritten response into ${host}`);
         });
         await t.test(`continueWithAuth then a redirect into ${host}`, async () => {
           const page = await tab({ ...pattern, handleAuthRequests: true });
@@ -209,11 +260,11 @@ for (const transport of ['native', 'wasi']) {
               event.params.request.url === url
           );
           assert.ok(sent, 'the XHR must be observed');
-          await page.send('Network.replayXHR', { requestId: sent.params.requestId });
-          const deadline = Date.now() + 10000;
-          while ((flips.get(key) ?? 0) < 2 && Date.now() < deadline) await delay(50);
-          await delay(1500);
-          assert.equal(flips.get(key), 2, 'the replay must send its ordinary first hop');
+          await assert.rejects(
+            page.send('Network.replayXHR', { requestId: sent.params.requestId }),
+            /slicc: refused:/
+          );
+          assert.equal(flips.get(key), 1, 'an uncorrelated replay must not be sent');
           noHits(`replayXHR into ${host}`);
         });
       }
@@ -270,15 +321,12 @@ for (const transport of ['native', 'wasi']) {
               event.params.request.url === url
           );
           const landings = ordinaryHits.filter((hit) => hit === '/landing').length;
-          await page.send('Network.replayXHR', { requestId: sent.params.requestId });
-          const deadline = Date.now() + 10000;
-          while (
-            ordinaryHits.filter((hit) => hit === '/landing').length === landings &&
-            Date.now() < deadline
-          )
-            await delay(50);
-          assert.equal(flips.get(key), 2);
-          assert.equal(ordinaryHits.filter((hit) => hit === '/landing').length, landings + 1);
+          await assert.rejects(
+            page.send('Network.replayXHR', { requestId: sent.params.requestId }),
+            /slicc: refused:/
+          );
+          assert.equal(flips.get(key), 1);
+          assert.equal(ordinaryHits.filter((hit) => hit === '/landing').length, landings);
           await page.send('Fetch.disable', {});
           assert.equal(await page.load('/start/hop?statuses=302&host=ordinary'), 'landing');
           assert.deepEqual(hits, []);
@@ -322,7 +370,7 @@ for (const transport of ['native', 'wasi']) {
                   `**/routed-${host}*`,
                   '--status=302',
                   '--header',
-                  `Location: /hop?statuses=307,308&host=${host}.sliccy.ai`,
+                  `Location: /hop?statuses=307,308&host=${host}.sliccy.ai&peers=1`,
                 ],
                 cwd
               )

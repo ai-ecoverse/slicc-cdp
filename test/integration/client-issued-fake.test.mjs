@@ -368,14 +368,14 @@ for (const host of PROTECTED) {
     assert.deepEqual(page.hits, []);
   });
 
-  test(`fake: replayXHR of a request that now redirects into ${host} is refused at the hop`, async (t) => {
+  test(`fake: replayXHR of a request that now redirects into ${host} is refused before sending`, async (t) => {
     const page = await world(t);
     await page.send('Network.enable', {});
     const url = `${page.base}/flip?host=${host}`;
     const replayed = await page.replay(url, [url, `${page.base}/landing`]);
-    assert.deepEqual(replayed, { result: [{ failed: 'BlockedByClient' }] });
+    assert.match(replayed.error, /slicc: refused:/);
     assert.deepEqual(page.hits, []);
-    assert.deepEqual(page.ordinaryHits, ['/flip?host=' + host]);
+    assert.deepEqual(page.ordinaryHits, []);
     const tainted = await page.replay(`${page.base}/flip?host=ordinary`, [
       `${page.base}/flip?host=ordinary`,
       `http://${host}/protected`,
@@ -411,7 +411,7 @@ test('fake: ordinary client-issued requests and unmodified page traffic stay liv
     `${page.base}/flip?host=ordinary`,
     `${page.base}/landing`,
   ]);
-  assert.equal(replayed.result[0].body, 'landing');
+  assert.match(replayed.error, /slicc: refused:/);
   await page.send('Fetch.disable', {});
   const after = await page.load(`${page.base}/start/hop?statuses=302&host=ordinary`);
   assert.equal(after.body, 'landing');

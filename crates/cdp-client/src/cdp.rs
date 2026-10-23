@@ -669,7 +669,7 @@ impl Cdp {
                 return Err(UNSEEN.into());
             }
         }
-        if let Some(session) = session_id.filter(|_| issued) { self.issue(params, session, true)?; }
+        if let Some(session) = session_id.filter(|_| issued) { self.issue(params, session)?; }
         if shield::body_method(method) {
             let id = shield::request_key(params);
             match id.as_deref().and_then(|id| self.request_state(id)) {
@@ -692,7 +692,7 @@ impl Cdp {
                 }
             }
         }
-        if method == "Network.replayXHR" { self.replay(params, session_id)?; }
+        if method == "Network.replayXHR" { return Err(self.refusal()) }
         if method == "IO.read" {
             let handle = params.get("handle").and_then(|v| v.as_str()).unwrap_or("");
             if !self.streams.contains_key(handle) {
@@ -2067,7 +2067,6 @@ impl Cdp {
                 self.protected_request_pages.insert((session.clone().unwrap_or_default(), id.to_string()));
             }
         }
-        self.remember_xhr(&method, session.as_deref().unwrap_or(""), &params);
         if let Some(id) = params.get("requestId").and_then(|v| v.as_str()) {
             if let Some(url) = shield::request_url(&params) {
                 let resource = (session.clone().unwrap_or_default(), url.clone());
@@ -3025,6 +3024,7 @@ impl Cdp {
             self.answer_protected(&paused);
             return;
         }
+        if self.defer_issued(&paused) { return }
         let Some(decider) = self.deciders.get_mut(&paused.session_id) else {
             self.paused.push_back(paused);
             return;
@@ -3040,7 +3040,13 @@ impl Cdp {
                 (method, params, false)
             }
         };
-        if issued { let _ = self.issue(&params, &paused.session_id, false); }
+        if issued {
+            if let Err(message) = self.issue(&params, &paused.session_id) {
+                self.fetch_errors.push(message);
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
+        }
         self.settle(&paused.session_id, &paused.request_id);
         if let Ok(id) = self.send(method, params, Some(&paused.session_id)) {
             self.decided
