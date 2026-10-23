@@ -214,6 +214,7 @@ fn redirect_hop(events: &[Value], session: &str, current: &str, method: &str) ->
     let events: Vec<_> = events.iter().filter(|event| event["sessionId"].as_str() == Some(session)).collect();
     let ids: std::collections::BTreeSet<_> = events.iter().filter(|event| {
         event["method"] == "Network.requestWillBeSent"
+            && event.pointer("/params/redirectResponse").is_none()
             && event["params"]["type"] == "Fetch"
             && event.pointer("/params/request/url").and_then(Value::as_str) == Some(base.as_str())
             && event.pointer("/params/request/method").and_then(Value::as_str).is_some_and(|sent| sent.eq_ignore_ascii_case(method))
@@ -223,7 +224,8 @@ fn redirect_hop(events: &[Value], session: &str, current: &str, method: &str) ->
     let mut hops = std::collections::BTreeSet::new();
     for event in events.iter().filter(|event| event.pointer("/params/requestId").and_then(Value::as_str) == Some(id)) {
         let (status, headers) = match event["method"].as_str() {
-            Some("Network.responseReceived") => (event.pointer("/params/response/status"), event.pointer("/params/response/headers")),
+            Some("Network.responseReceived") if event.pointer("/params/response/url").and_then(Value::as_str) == Some(base.as_str()) => (event.pointer("/params/response/status"), event.pointer("/params/response/headers")),
+            Some("Network.requestWillBeSent") if event.pointer("/params/redirectResponse/url").and_then(Value::as_str) == Some(base.as_str()) => (event.pointer("/params/redirectResponse/status"), event.pointer("/params/redirectResponse/headers")),
             Some("Network.responseReceivedExtraInfo") => (event.pointer("/params/statusCode"), event.pointer("/params/headers")),
             _ => continue,
         };

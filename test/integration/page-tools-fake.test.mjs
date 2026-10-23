@@ -391,7 +391,10 @@ test('fetch runs in the tab, lists ordinary Link entries and drops protected one
   });
 });
 
-function redirectBackend(destinations, { status = 302, missing = false, ambiguous = false } = {}) {
+function redirectBackend(
+  destinations,
+  { status = 302, missing = false, ambiguous = false, redirectEvent = false } = {}
+) {
   const seen = [];
   const resolving = fetchBackend(() => ({})).intercept;
   const intercept = (message, send, answer) => {
@@ -420,11 +423,20 @@ function redirectBackend(destinations, { status = 302, missing = false, ambiguou
           type: 'Fetch',
           request: { url, method, headers: {} },
         });
-        event('Network.responseReceived', {
-          requestId,
-          type: 'Fetch',
-          response: { url, status, headers: { Location: location } },
-        });
+        if (redirectEvent) {
+          event('Network.requestWillBeSent', {
+            requestId,
+            type: 'Fetch',
+            request: { url: new URL(location, url).href, method, headers: {} },
+            redirectResponse: { url, status, headers: { Location: location } },
+          });
+        } else {
+          event('Network.responseReceived', {
+            requestId,
+            type: 'Fetch',
+            response: { url, status, headers: { Location: location } },
+          });
+        }
       }
     }
     if (expression.includes("redirect: 'manual'")) {
@@ -467,23 +479,28 @@ for (const kind of ['native', 'kernel']) {
       });
     }
   });
-  test(`${kind} fetch follows an ordinary redirect and uses the final Link base`, async () => {
-    const { seen, intercept } = redirectBackend({ 'https://example.test/start': '/dir/final' });
-    await fixture(intercept, async (_fake, pw) => {
-      const result = await pw(['fetch', 'https://example.test/start', '--method', 'POST']);
-      assert.equal(result.code, 0, result.stdout + result.stderr);
-      const payload = JSON.parse(result.stdout);
-      assert.equal(payload.redirected, true);
-      assert.equal(payload.links[0].href, 'https://example.test/dir/child');
-      assert.deepEqual(
-        seen.map(({ url, method }) => [url, method]),
-        [
-          ['https://example.test/start', 'POST'],
-          ['https://example.test/dir/final', 'GET'],
-        ]
+  for (const redirectEvent of [false, true]) {
+    test(`${kind} fetch follows an ordinary redirect and uses the final Link base (${redirectEvent ? 'redirectResponse' : 'responseReceived'})`, async () => {
+      const { seen, intercept } = redirectBackend(
+        { 'https://example.test/start': '/dir/final' },
+        { redirectEvent }
       );
+      await fixture(intercept, async (_fake, pw) => {
+        const result = await pw(['fetch', 'https://example.test/start', '--method', 'POST']);
+        assert.equal(result.code, 0, result.stdout + result.stderr);
+        const payload = JSON.parse(result.stdout);
+        assert.equal(payload.redirected, true);
+        assert.equal(payload.links[0].href, 'https://example.test/dir/child');
+        assert.deepEqual(
+          seen.map(({ url, method }) => [url, method]),
+          [
+            ['https://example.test/start', 'POST'],
+            ['https://example.test/dir/final', 'GET'],
+          ]
+        );
+      });
     });
-  });
+  }
 }
 
 test('fetch fails closed when redirect metadata is missing or ambiguous', async () => {
