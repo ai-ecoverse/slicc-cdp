@@ -202,14 +202,12 @@ test('help pages and global help list the recording commands like Microsoft', as
     for (const line of [
       '  recording-start             start recording user actions',
       '  recording-stop              stop recording user actions and print them as playwright code',
-      '  record                      alias of recording-start',
-      '  stop-recording              alias of recording-stop',
     ])
       assert.ok(global.stdout.includes(`${line}\n`), line);
     const pending = global.stdout.split('Not implemented yet:')[1].split('\n')[1];
-    for (const name of ['record', 'stop-recording', 'recording-start', 'recording-stop'])
+    for (const name of ['recording-start', 'recording-stop'])
       assert.ok(!pending.split(', ').includes(name), name);
-    for (const name of ['recording-start', 'record']) {
+    for (const name of ['recording-start']) {
       const page = await run([name, '--help'], home);
       assert.equal(page.code, 0);
       assert.ok(
@@ -218,7 +216,7 @@ test('help pages and global help list the recording commands like Microsoft', as
       assert.match(page.stdout, /--tab <targetId> +tab to record/);
       assert.ok(!page.stdout.includes('Not implemented'));
     }
-    for (const name of ['recording-stop', 'stop-recording']) {
+    for (const name of ['recording-stop']) {
       const page = await run([name, '--help'], home);
       assert.equal(page.code, 0);
       assert.ok(
@@ -227,7 +225,7 @@ test('help pages and global help list the recording commands like Microsoft', as
         )
       );
     }
-    const extra = await run(['record', 'https://example.test/'], home);
+    const extra = await run(['recording-start', 'https://example.test/'], home);
     assert.equal(extra.code, 1);
     assert.equal(extra.stderr, 'error: too many arguments: expected 0, received 1\n');
     const flag = await run(['recording-stop', '--tab', 'TAB'], home);
@@ -240,7 +238,7 @@ test('help pages and global help list the recording commands like Microsoft', as
 
 test('recording-stop without a holder fails like Microsoft and never dials the browser', async () => {
   await withFake({}, async (fake, home, cli) => {
-    for (const name of ['recording-stop', 'stop-recording']) {
+    for (const name of ['recording-stop']) {
       const result = await run(cli([name]), home);
       assert.equal(result.code, 1);
       assert.equal(result.stdout, '');
@@ -256,7 +254,7 @@ test('the holder records verified ordinary actions and recording-stop prints Pla
     const holder = launch(cli(['recording-start', '--tab', 'TAB']), home);
     const ready = await holder.event('ready');
     assert.equal(ready.tab, 'TAB');
-    const again = await run(cli(['record', '--tab', 'TAB']), home);
+    const again = await run(cli(['recording-start', '--tab', 'TAB']), home);
     assert.equal(again.code, 1);
     assert.equal(again.stderr, 'Error: Recording is already in progress.\n');
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -307,7 +305,7 @@ test('the holder records verified ordinary actions and recording-stop prints Pla
 test('closing stdin ends the holder with its actions and an empty recording prints nothing', async () => {
   const fake = recorder({ actions: ACTIONS.slice(0, 1) });
   await withFake({ intercept: fake.intercept }, async (cdp, home, cli) => {
-    const holder = launch(cli(['record', '--tab', 'TAB']), home);
+    const holder = launch(cli(['recording-start', '--tab', 'TAB']), home);
     await holder.event('ready');
     await new Promise((resolve) => setTimeout(resolve, 200));
     holder.child.stdin.end();
@@ -320,14 +318,14 @@ test('closing stdin ends the holder with its actions and an empty recording prin
       actions: ["await page.getByRole('button', { name: 'Go' }).click();"],
     });
     assert.deepEqual(await recordingFiles(home), []);
-    const none = await run(cli(['stop-recording']), home);
+    const none = await run(cli(['recording-stop']), home);
     assert.equal(none.stderr, NONE);
   });
   const empty = recorder();
   await withFake({ intercept: empty.intercept }, async (cdp, home, cli) => {
     const holder = launch(cli(['recording-start']), home);
     await holder.event('ready');
-    const stopped = await run(cli(['stop-recording']), home);
+    const stopped = await run(cli(['recording-stop']), home);
     assert.equal(stopped.code, 0, stopped.stderr);
     assert.equal(stopped.stdout, '### Result\nRecording stopped. No actions were recorded.\n');
     assert.equal((await holder.ended).code, 0);
@@ -464,7 +462,7 @@ test('recording-stop prints a kept result and drops a stale holder without diali
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, JSON.stringify(KEPT));
     const printed = await run(
-      ['--cdp', 'ws://127.0.0.1:1/devtools/browser/x', 'stop-recording'],
+      ['--cdp', 'ws://127.0.0.1:1/devtools/browser/x', 'recording-stop'],
       home
     );
     assert.equal(printed.code, 0, printed.stderr);
@@ -530,7 +528,7 @@ test('kernel holder records the same actions and stops at EOF', async () => {
     assert.equal(none.stderr, NONE);
     const kept = kernelSessionFile('/root', cwd).replace(/\.json$/, '.recording.json');
     await runner.writeFile(kept, JSON.stringify(KEPT));
-    const printed = await runner.playwright(['stop-recording'], cwd);
+    const printed = await runner.playwright(['recording-stop'], cwd);
     assert.equal(printed.code, 0, printed.stderr);
     assert.equal(printed.stdout, KEPT_TEXT);
     await runner.writeFile(kept, JSON.stringify({ owner: 'dead', state: 'recording', beat: 1 }));

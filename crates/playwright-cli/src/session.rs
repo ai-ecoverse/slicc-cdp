@@ -752,10 +752,18 @@ pub fn write_at(path: &Path, session: &Session) -> Result<(), String> {
 }
 
 pub fn write_private(path: &Path, body: &str) -> Result<(), String> {
+    write_with_dirs(path, body, true)
+}
+
+pub fn write_private_file(path: &Path, body: &str) -> Result<(), String> {
+    write_with_dirs(path, body, false)
+}
+
+fn write_with_dirs(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
     #[cfg(target_os = "wasi")]
     {
         let old = wasi_mode::set_umask(0o077);
-        let written = wasi_write(path, body);
+        let written = wasi_write(path, body, private_dirs);
         if let Some(old) = old {
             wasi_mode::set_umask(old);
         }
@@ -763,18 +771,20 @@ pub fn write_private(path: &Path, body: &str) -> Result<(), String> {
     }
     #[cfg(not(target_os = "wasi"))]
     {
-        host_write(path, body)
+        host_write(path, body, private_dirs)
     }
 }
 
 #[cfg(target_os = "wasi")]
-fn wasi_write(path: &Path, body: &str) -> Result<(), String> {
+fn wasi_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
-        for item in [Some(dir), dir.parent()].into_iter().flatten() {
-            if let Ok(handle) = fs::File::open(item) {
-                let _ = wasi_mode::chmod(handle.as_raw_fd(), 0o700);
+        if private_dirs {
+            for item in [Some(dir), dir.parent()].into_iter().flatten() {
+                if let Ok(handle) = fs::File::open(item) {
+                    let _ = wasi_mode::chmod(handle.as_raw_fd(), 0o700);
+                }
             }
         }
     }
@@ -817,11 +827,11 @@ mod wasi_mode {
 }
 
 #[cfg(not(target_os = "wasi"))]
-fn host_write(path: &Path, body: &str) -> Result<(), String> {
+fn host_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
         #[cfg(unix)]
-        {
+        if private_dirs {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::Permissions::from_mode(0o700);
             let _ = fs::set_permissions(dir, mode.clone());
