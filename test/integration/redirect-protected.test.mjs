@@ -5,8 +5,9 @@ import { createServer } from 'node:http';
 import { createServer as createTlsServer } from 'node:https';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test, { before } from 'node:test';
+import { before } from 'node:test';
 import { launchBrowser } from './browser.mjs';
+import { chromeSkipReason, chromeTest as test } from './chrome-policy.mjs';
 import { guarded } from './guard-client.mjs';
 
 const marker = 'P0_REDIRECT_SECRET_7F9A';
@@ -43,6 +44,7 @@ function containsMarker(value) {
 }
 
 before(() => {
+  if (chromeSkipReason()) return;
   for (const target of [[], ['--target', 'wasm32-wasip1']])
     execFileSync(
       'cargo',

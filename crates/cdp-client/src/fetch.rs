@@ -732,7 +732,10 @@ mod tests {
             reply,
             closed: None,
         };
-        (Cdp::from_transport(Box::new(transport)), log)
+        let mut cdp = Cdp::from_transport(Box::new(transport));
+        cdp.fixture_session("S");
+        cdp.fixture_session("OTHER");
+        (cdp, log)
     }
 
     fn ok(message: &Value) -> Value {
@@ -1053,9 +1056,9 @@ mod tests {
         assert!(refused(cdp.call("Fetch.fulfillRequest", good, Some("S"))));
         let bad = json!({ "requestId": "R2", "responseCode": 0 });
         cdp.notify("Fetch.fulfillRequest", bad, Some("S")).unwrap();
-        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        cdp.call("Runtime.evaluate", json!({"expression":"0","returnByValue":true}), Some("S")).unwrap();
         cdp.notify("Fetch.continueRequest", json!({ "requestId": "R2" }), Some("S")).unwrap();
-        cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
+        cdp.call("Runtime.evaluate", json!({"expression":"0","returnByValue":true}), Some("S")).unwrap();
         assert!(refused(cdp.call("Fetch.continueRequest", json!({ "requestId": "R2" }), Some("S"))));
         assert_eq!(
             methods(&log),
@@ -1207,10 +1210,7 @@ mod tests {
             }),
         );
         assert_eq!(crate::cdp::attach(&mut cdp, "T").unwrap_err(), close);
-        assert_eq!(
-            cdp.call("Runtime.evaluate", json!({ "expression": "1" }), Some("S")).unwrap_err(),
-            close
-        );
+        assert!(cdp.call("Runtime.evaluate", json!({ "expression": "1" }), Some("S")).unwrap_err().starts_with("slicc: refused:"));
         let (mut live, _log) = fake(
             Vec::new(),
             Box::new(|message| match message["method"].as_str().unwrap() {
@@ -1391,7 +1391,7 @@ mod tests {
             Vec::new(),
             Box::new(move |message| match message["method"].as_str().unwrap() {
                 "Target.getTargetInfo" => vec![
-                    json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T1", "url": "about:blank" } } }),
+                    json!({ "id": message["id"], "result": { "targetInfo": { "targetId": "T1", "type":"page", "url": "about:blank" } } }),
                 ],
                 "Target.attachToTarget" => {
                     *attaches.borrow_mut() += 1;
@@ -1401,6 +1401,7 @@ mod tests {
                 "Fetch.enable" if message["sessionId"] == "S1" => {
                     vec![ok(message), queued.borrow_mut().take().unwrap()]
                 }
+                "Page.getFrameTree" => vec![json!({"id":message["id"],"result":{"frameTree":{"frame":{"id":"F1","loaderId":"L1","url":"about:blank","securityOrigin":"https://idp.example"}}}})],
                 "Fetch.getResponseBody" => vec![
                     json!({ "id": message["id"], "result": { "body": base64_encode(b"<p>hi</p>"), "base64Encoded": true } }),
                 ],
@@ -1436,8 +1437,9 @@ mod tests {
                 "Network.enable",
                 "Network.setBypassServiceWorker",
                 "Page.enable",
-                "Runtime.enable",
                 "Page.getFrameTree",
+                "Page.getFrameTree",
+                "Runtime.enable",
                 "Fetch.enable",
                 "Fetch.getResponseBody",
                 "Fetch.fulfillRequest",

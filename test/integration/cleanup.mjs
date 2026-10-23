@@ -1,0 +1,107 @@
+const workerDeadline =
+  Date.now() +
+  Number(process.env.SLICC_GUARD_TIMEOUT ?? process.env.SLICC_ROW_TIMEOUT_MS ?? 605000);
+
+export const cleanupGrace = (deadlineAt = workerDeadline - 5000) =>
+  Math.max(30000, deadlineAt - Date.now());
+
+export async function deadline(task, phase, ms = cleanupGrace(), abort = () => {}) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(task),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = Object.assign(new Error(`${phase} deadline exceeded`), {
+            code: 'HARNESS_AVAILABILITY',
+            phase,
+          });
+          reject(error);
+          Promise.resolve()
+            .then(() => abort(error))
+            .catch((cause) => {
+              error.cause = cause;
+            });
+        }, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function acquire(task, phase, dispose, ms = 10000) {
+  const controller = new AbortController();
+  let abandoned = false;
+  const work = Promise.resolve()
+    .then(() => task(controller.signal))
+    .then(async (resource) => {
+      if (abandoned) {
+        try {
+          await deadline(() => dispose(resource), `${phase}-late-cleanup`);
+        } catch (error) {
+          process.stderr.write(
+            `HARNESS-AVAILABILITY ${JSON.stringify({ phase: `${phase}-late-cleanup`, error: normalizeError(error) })}\n`
+          );
+        }
+      }
+      return resource;
+    });
+  try {
+    return await deadline(
+      () => work,
+      phase,
+      ms,
+      (error) => controller.abort(error)
+    );
+  } catch (error) {
+    abandoned = true;
+    controller.abort(error);
+    throw error;
+  }
+}
+
+export async function cleanup(tasks, ...failures) {
+  const results = await Promise.allSettled(
+    tasks.map((task, index) => deadline(task, `cleanup-${index}`))
+  );
+  const errors = [
+    ...failures,
+    ...results.filter((result) => result.status === 'rejected').map((result) => result.reason),
+  ];
+  if (errors.length) throw new AggregateError(errors, 'harness execution or cleanup failed');
+}
+
+export function normalizeError(value, seen = new Set()) {
+  let message;
+  try {
+    message = String(value);
+  } catch {
+    message = 'unprintable rejection';
+  }
+  const result = { type: value === null ? 'null' : typeof value, message };
+  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') return result;
+  if (seen.has(value) || seen.size >= 32) return { ...result, recursive: true };
+  seen.add(value);
+  const read = (key) => {
+    try {
+      return value[key];
+    } catch {
+      return undefined;
+    }
+  };
+  for (const key of ['name', 'message', 'stack', 'code', 'phase']) {
+    const field = read(key);
+    if (typeof field === 'string') result[key] = field;
+  }
+  const errors = read('errors');
+  try {
+    if (Array.isArray(errors))
+      result.errors = Array.from(errors, (error) => normalizeError(error, seen));
+  } catch {
+    result.errorsUnavailable = true;
+  }
+  const cause = read('cause');
+  if (cause !== undefined) result.cause = normalizeError(cause, seen);
+  return result;
+}

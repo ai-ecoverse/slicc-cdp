@@ -113,6 +113,30 @@ pub fn browser_wide(
     Some(format!("slicc: refused: {reason}\n"))
 }
 
+pub fn persistent_capability(method: &str) -> bool {
+    match method.split_once('.') {
+        Some(("Emulation", command)) => !matches!(command, "canEmulate" | "getScreenInfos"),
+        Some(("Network", command)) => {
+            command.starts_with("set") && !matches!(command, "setCookie" | "setCookies")
+                || command.starts_with("emulate")
+                || matches!(command, "overrideNetworkState" | "clearAcceptedEncodings")
+        }
+        Some(("Page", command)) => {
+            command.starts_with("addScriptToEvaluateOn")
+                || command.starts_with("set") && !matches!(command, "setDocumentContent" | "setLifecycleEventsEnabled")
+                || command == "startScreencast"
+        }
+        Some(("Runtime", command)) => command == "addBinding" || command.starts_with("set"),
+        Some(("Debugger", command)) => command.starts_with("set"),
+        Some(("Input" | "Security", command)) => command.starts_with("set"),
+        Some(("Overlay", command)) => !matches!(command, "enable" | "disable" | "hideHighlight" | "getHighlightObjectForTest" | "getGridHighlightObjectsForTest" | "getSourceOrderHighlightObjectForTest"),
+        Some(("Browser", command)) => matches!(command, "setDownloadBehavior" | "setWindowBounds" | "setContentsSize"),
+        Some(("Profiler", command)) => matches!(command, "start" | "startPreciseCoverage"),
+        Some(("HeapProfiler", command)) => matches!(command, "startSampling" | "startTrackingHeapObjects" | "takeHeapSnapshot"),
+        _ => false,
+    }
+}
+
 pub fn body_method(method: &str) -> bool {
     BODY_METHODS.contains(&method)
 }
@@ -174,7 +198,7 @@ pub fn mentions(guard: &Protected, value: &Value) -> bool {
     }
 }
 
-fn decode_percent(text: &str) -> String {
+pub(crate) fn decode_percent(text: &str) -> String {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -815,6 +839,7 @@ mod tests {
         }
         let observer = raw.session(target);
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_ready = None;
         loop {
             let _ = cdp.pump(Instant::now() + Duration::from_millis(100));
             let tree = raw.call("Page.getFrameTree", json!({}), Some(&observer));
@@ -833,8 +858,9 @@ mod tests {
                     assert!(!cdp.target_protected(target, false).unwrap());
                     break;
                 }
+                last_ready = Some(ready);
             }
-            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?}");
+            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} subject_blocked={} target_protected={} content_blocked={} guard_document={}", cdp.session_blocked(session), cdp.is_protected_target(target), cdp.content_blocked(session), cdp.document_evidence(target));
         }
         raw.call("Target.detachFromTarget", json!({ "sessionId": observer }), None).unwrap();
     }
@@ -1412,13 +1438,14 @@ mod tests {
                     Decision::default()
                 })),
             );
+            let navigation = cdp.events().len();
             cdp.call(
                 "Page.navigate",
                 json!({ "url": format!("{app}/?n=next") }),
                 Some(&session),
             )
             .unwrap();
-            cdp.wait_load(&session).unwrap();
+            cdp.wait_load_since(&session, navigation).unwrap();
             cdp.call(
                 "Runtime.evaluate",
                 json!({ "expression": format!("setTimeout(() => {{ location.href = {}; }}, 50); true", json!(format!("{seven}/nowhere?n=away"))) }),

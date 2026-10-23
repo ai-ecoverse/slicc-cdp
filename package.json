@@ -57,7 +57,7 @@
     "typecheck": "node --check src/index.js && node --check src/cdp-client.js && node --check src/connect.js && node --check src/page.js && node --check src/browser.js && node --check src/cli.js && node --check packages/sliccy-browser/src/browser.js && node --check packages/sliccy-browser/src/fetch-script.js",
     "format": "biome check --write .",
     "pretest": "export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo build --locked -p slicc-cdp -p curlwright && cargo build --locked -p slicc-cdp-client --examples && cargo build --locked --target wasm32-wasip1 -p slicc-cdp -p curlwright && cargo build --locked --target wasm32-wasip1 -p slicc-cdp-client --example guard_bridge && npm run -s browser >/dev/null",
-    "test": "PATH=\"$HOME/.cargo/bin:$PATH\" SLICC_CDP_PORTS=\"${SLICC_CDP_PORTS:-9300-9309}\" node --import ./test/integration/ports.mjs --test --test-timeout=600000 'test/integration/*.test.mjs'",
+    "test": "PATH=\"$HOME/.cargo/bin:$PATH\" SLICC_CDP_PORTS=\"${SLICC_CDP_PORTS:-9300-9309}\" node scripts/test-integration.mjs",
     "test:unit": "SLICC_CDP_PORTS=\"${SLICC_CDP_PORTS:-9300-9309}\" mcr -c node_modules/@ai-ecoverse/slicc-shared-web/mcr.config.mjs node scripts/test-unit.mjs",
     "trust": "npx fledgling sync -y --skip-publish",
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish",
@@ -68,9 +68,9 @@
     "chrome": "156.0.8078.4"
   },
   "devDependencies": {
-    "@ai-ecoverse/slicc-browsers": "1.12.0",
-    "@ai-ecoverse/slicc-kernel": "1.146.3",
-    "@ai-ecoverse/slicc-shared-web": "2.10.2",
+    "@ai-ecoverse/slicc-browsers": "1.18.5",
+    "@ai-ecoverse/slicc-kernel": "1.147.8",
+    "@ai-ecoverse/slicc-shared-web": "2.10.4",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.2.2",
     "semantic-release": "25.0.9"

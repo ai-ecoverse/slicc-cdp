@@ -21,11 +21,11 @@ concurrency:
 
 jobs:
   ci:
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.10.2
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.10.4
     secrets: inherit
     with:
       test-glob: test/integration/*.test.mjs
-      shards: 4
+      shards: 8
       timeout-minutes: 30
       review-timeout-minutes: 90
       review-prompt: |

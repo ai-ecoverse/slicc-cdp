@@ -12,7 +12,7 @@ pub fn global_help() -> String {
         "Usage: playwright-cli -s=<session> <command> [args] [options]".to_string(),
         String::new(),
         "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else a seven-profiles DevToolsActivePort; else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when that port is absent or unreachable, attaches to the first of those ports whose /json/version answers, with or without a seven tab. A probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy. The wasm build still uses port 9222.".to_string(),
-        "ws:// and wss:// are dialed directly. An http:// URL is /json/version discovery. The debugger path is opaque.".to_string(),
+        "A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque.".to_string(),
         "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.".to_string(),
         "The host build launches a browser when no debugger is already connected, and the wasm build only opens a tab.".to_string(),
         String::new(),
@@ -86,6 +86,7 @@ pub fn global_help() -> String {
         ),
         String::new(),
         "WebMCP (SLICC):".to_string(),
+        row("webmcp-polyfill", "hold a guarded WebMCP shim on a tab"),
         row("webmcp-list", "list WebMCP tools on the page"),
         row("webmcp-call <name> <json|->", "call a WebMCP tool on the page"),
         String::new(),
@@ -104,7 +105,7 @@ pub fn global_help() -> String {
     lines.push("Options:".to_string());
     lines.push(row(
         "--cdp <url>",
-        "WebSocket URL, or an http URL used for /json/version",
+        "a port or host[:port] (localhost, default 9222), a ws:// URL with a path, or an http URL (or path-less ws://) used for /json/version; loopback names try ::1 and 127.0.0.1",
     ));
     lines.push(row(
         "-s, --session <name>",
@@ -594,19 +595,37 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--off", "exit immediately without watching"),
             ],
         ),
+        "webmcp-polyfill" => page(
+            "webmcp-polyfill --tab <targetId>",
+            &[
+                "Hold the guarded WebMCP polyfill session until stdin or the tab closes.",
+                "Native and page-defined modelContext APIs are not replaced.",
+                "Protected and unverified documents never receive the shim.",
+                "An already-open page may only register tools at load; --reload is opt-in.",
+                "Prints one JSON status line without bridge identifiers.",
+            ],
+            &[],
+            &[("--tab <targetId>", "required tab to hold"), ("--reload", "reload the tab once after arming the shim")],
+        ),
         "webmcp-list" => page(
             "webmcp-list",
             &[
                 "List WebMCP tools registered on the page",
                 "",
-                "Evaluates document.modelContext.getTools() in the page's main world.",
+                "Lists document.modelContext.getTools() from verified provider frames.",
+                "Prefers native WebMCP; otherwise uses the guarded private bridge or page API.",
+                "Same-origin frames are included. Cross-origin tools require --from-origin.",
+                "The tools Permissions Policy and exposedTo are enforced before listing.",
                 "Chrome includes declarative form[toolname] tools in getTools().",
-                "If modelContext is absent, returns an empty list.",
+                "An empty tool list succeeds (exit 0).",
+                "If document.modelContext is absent, reports WebMCP unavailable (exit 2).",
+                "Evaluation or connection failures exit 1.",
             ],
             &[],
             &[
                 ("--tab <targetId>", "tab to query"),
                 ("--json", "print the tool list as a JSON array"),
+                ("--from-origin <origin>", "opt in to a cross-origin provider (repeatable)"),
             ],
         ),
         "webmcp-call" => page(
@@ -614,7 +633,8 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 "Call a WebMCP tool on the page",
                 "",
-                "Runs document.modelContext.executeTool in the page's main world.",
+                "Runs document.modelContext.executeTool or the private guarded bridge.",
+                "Only policy-admitted tools from the current verified document can be called.",
                 "The result string is printed to stdout.",
                 "",
                 "Pass - as <json-input> to read the JSON from stdin (avoids exposing",
@@ -637,6 +657,8 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 ("--tab <targetId>", "tab to run in"),
                 ("--allow-consequential", "permit calling tools with consequentialHint"),
+                ("--from-origin <origin>", "opt in to a cross-origin provider (repeatable)"),
+                ("--frame <frameId>", "select a provider when tool names are ambiguous"),
             ],
         ),
         _ => return None,

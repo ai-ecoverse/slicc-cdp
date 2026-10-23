@@ -104,10 +104,25 @@ impl Transport for RedirectBodyBackend {
     }
 }
 
+fn fixture_target(cdp: &mut Cdp, session: &str, target: &str) {
+    cdp.fixture_session(session);
+    let old = cdp.session_targets[session].clone();
+    let guard = cdp.guards.remove(&old).unwrap();
+    let mut info = cdp.targets.remove(&old).unwrap();
+    info["targetId"] = json!(target);
+    cdp.targets.insert(target.into(), info);
+    cdp.guards.insert(target.into(), guard);
+    cdp.session_targets.insert(session.into(), target.into());
+    cdp.unobserved.remove(&old);
+    cdp.unobserved.insert(target.into());
+}
+
 fn redirect_body_backend(body: String) -> Cdp {
-    Cdp::from_transport(Box::new(RedirectBodyBackend {
+    let mut cdp = Cdp::from_transport(Box::new(RedirectBodyBackend {
         inner: UrlBackend { url: "about:blank".into(), inbox: VecDeque::new() }, body,
-    }))
+    }));
+    cdp.fixture_session("S");
+    cdp
 }
 
 #[test]

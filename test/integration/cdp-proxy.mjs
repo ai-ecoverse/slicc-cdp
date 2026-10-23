@@ -78,6 +78,9 @@ export async function cdpProxy(
     transform = (message) => message,
     observe = () => {},
     before = [],
+    holdEvents = () => false,
+    responseBarrier = () => null,
+    inbound,
   } = {}
 ) {
   const pending = Object.fromEntries(
@@ -85,6 +88,8 @@ export async function cdpProxy(
   );
   const upstream = new URL(wsUrl);
   const replies = [];
+  const heldEvents = [];
+  const releases = [];
   const sockets = new Set();
   let delayed = false;
   const server = net.createServer((client) => {
@@ -104,17 +109,26 @@ export async function cdpProxy(
       if (!client.destroyed) client.write(bytes);
     };
     client.on('data', (chunk) => {
-      if (!upgraded.up) {
-        upgraded.up = true;
-        browser.write(chunk);
-        return;
-      }
       fromClient = Buffer.concat([fromClient, chunk]);
+      if (!upgraded.up) {
+        const end = fromClient.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const head = fromClient
+          .subarray(0, end + 4)
+          .toString('latin1')
+          .replace(/^sec-websocket-extensions:.*\r\n/gim, '');
+        browser.write(Buffer.from(head, 'latin1'));
+        fromClient = Buffer.from(fromClient.subarray(end + 4));
+        upgraded.up = true;
+      }
       const { out, rest } = frames(fromClient);
       fromClient = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
-        if (message) observe('client', message);
+        if (message) {
+          observe('client', message);
+          inbound?.outbound(message);
+        }
         if (
           delayGuardAttachMs &&
           !delayed &&
@@ -185,17 +199,32 @@ export async function cdpProxy(
       }
     });
     browser.on('data', (chunk) => {
-      if (!upgraded.down) {
-        upgraded.down = true;
-        toClient(chunk);
-        return;
-      }
       fromBrowser = Buffer.concat([fromBrowser, chunk]);
+      if (!upgraded.down) {
+        const end = fromBrowser.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        toClient(fromBrowser.subarray(0, end + 4));
+        fromBrowser = Buffer.from(fromBrowser.subarray(end + 4));
+        upgraded.down = true;
+      }
       const { out, rest } = frames(fromBrowser);
       fromBrowser = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
         if (message) observe('browser', message);
+        if (message?.method && holdEvents(message)) {
+          heldEvents.push(message);
+          releases.push(() => toClient(frame.raw));
+          continue;
+        }
+        const barrier = message?.id !== undefined ? responseBarrier(message) : null;
+        if (barrier) {
+          Promise.resolve(barrier).then(
+            () => toClient(frame.raw),
+            () => client.destroy()
+          );
+          continue;
+        }
         if (!browserEvents && message?.method && !message.sessionId) continue;
         if (message?.id !== undefined && acked.delete(message.id)) continue;
         if (message?.id !== undefined && injected.delete(message.id)) {
@@ -219,10 +248,14 @@ export async function cdpProxy(
           setTimeout(() => toClient(frame.raw), delayGuardAttachMs);
           continue;
         }
-        toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
+        const deliver = () =>
+          toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
+        if (inbound) inbound.inbound(message, deliver);
+        else deliver();
       }
     });
     const end = () => {
+      inbound?.close();
       client.destroy();
       browser.destroy();
     };
@@ -235,7 +268,12 @@ export async function cdpProxy(
   return {
     url: `ws://127.0.0.1:${server.address().port}${upstream.pathname}`,
     replies,
+    heldEvents,
+    releaseEvents: () => {
+      for (const release of releases.splice(0)) release();
+    },
     close: async () => {
+      inbound?.close();
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
     },

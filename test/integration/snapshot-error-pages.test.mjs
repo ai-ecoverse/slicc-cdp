@@ -37,6 +37,7 @@ for (const failed of ['http://ordinary.invalid/', 'https://seven.sliccy.ai']) {
       target.url = failed;
       target.frame = {
         id: target.targetId,
+        loaderId: 'LERROR',
         url: 'chrome-error://chromewebdata/',
         securityOrigin: '://',
         unreachableUrl: failed,

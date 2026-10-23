@@ -5,7 +5,7 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
-pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -> Output {
+pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool, from: &[String]) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -18,18 +18,31 @@ pub fn list(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool) -
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = evaluate_list(cdp, &session);
+    let result = crate::webmcp_frames::list(cdp, state, &target, &session, from);
     let _ = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(tools) => {
             state.current = Some(target);
+            if tools.is_null() || tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent") {
+                return unavailable("webmcp-list");
+            }
             if json {
+                let mut tools = tools;
+                redact_output(&mut tools);
                 Output::ok(format!("{}\n", crate::sanitize::json_c1(&tools.to_string())))
             } else {
                 Output::ok(format_list(&tools))
             }
         }
         Err(message) => Output::err(message),
+    }
+}
+
+fn unavailable(command: &str) -> Output {
+    Output {
+        stdout: String::new(),
+        stderr: format!("{command}: WebMCP is unavailable on this page (document.modelContext is absent)\n"),
+        code: 2,
     }
 }
 
@@ -49,6 +62,7 @@ fn format_list(tools: &Value) -> String {
                 .unwrap_or(""),
         );
         let mut flags = Vec::new();
+        if tool.get("policy").and_then(Value::as_str) == Some("unknown") { flags.push("policy: unknown, top-level page-defined"); }
         if let Some(ann) = tool.get("annotations") {
             if ann.get("consequentialHint").and_then(|v| v.as_bool()) == Some(true) {
                 flags.push("consequential");
@@ -74,6 +88,7 @@ fn format_list(tools: &Value) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
+#[cfg(test)]
 pub fn call(
     cdp: &mut Cdp,
     state: &mut Session,
@@ -82,6 +97,10 @@ pub fn call(
     tab: Option<&str>,
     allow_consequential: bool,
 ) -> Output {
+    call_from(cdp, state, name, input_json, tab, allow_consequential, &[], None)
+}
+
+pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &str, tab: Option<&str>, allow_consequential: bool, from: &[String], frame: Option<&str>) -> Output {
     let parsed: Value = match serde_json::from_str(input_json) {
         Ok(value) => value,
         Err(err) => {
@@ -111,25 +130,14 @@ pub fn call(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let native = native_webmcp_object_input(cdp, &session);
-    let result = evaluate_call(cdp, &session, name, &parsed, native);
-    let outcome = match result {
-        Ok(CallOutcome::Consequential(_)) if allow_consequential => {
-            evaluate_call_force(cdp, &session, name, &parsed, native)
-        }
-        other => other,
-    };
+    let outcome = crate::webmcp_frames::call(cdp, state, &target, &session, from, frame, name, &parsed, allow_consequential).and_then(parse_value);
     let _ = browser::watch_detach(cdp, state, &target, &session);
     match outcome {
         Ok(outcome) => {
             state.current = Some(target);
             match outcome {
                 CallOutcome::Result(text) => Output::ok(format!("{}\n", sanitize::browser_message(&text))),
-                CallOutcome::Absent => Output {
-                    stdout: String::new(),
-                    stderr: "webmcp-call: page does not support WebMCP (document.modelContext is absent)\n".into(),
-                    code: 2,
-                },
+                CallOutcome::Absent => unavailable("webmcp-call"),
                 CallOutcome::Unknown(available) => {
                     let list = if available.is_empty() {
                         String::new()
@@ -222,10 +230,14 @@ fn resolve(
     )
 }
 
+#[cfg(test)]
 fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     let expression = r#"(async () => {
+  if (!('modelContext' in document) || !document.modelContext) {
+    return { __webmcp_error: 'absent' };
+  }
   const tools = [];
-  if ('modelContext' in document && document.modelContext) {
+  {
     const list = await document.modelContext.getTools();
     for (const t of list) {
       let schema = t.inputSchema || null;
@@ -263,11 +275,14 @@ fn evaluate_list(cdp: &mut Cdp, session: &str) -> Result<Value, String> {
     let value = result
         .pointer("/result/value")
         .cloned()
-        .unwrap_or(json!([]));
+        .unwrap_or(Value::Null);
+    if !value.is_array() && value.get("__webmcp_error").and_then(Value::as_str) != Some("absent") {
+        return Err("webmcp-list: unexpected evaluation result\n".into());
+    }
     Ok(value)
 }
 
-fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
+pub fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     let result = cdp.call("Browser.getVersion", json!({}), None).ok()?;
     let product = result.pointer("/product").and_then(|v| v.as_str()).unwrap_or("");
     let version_part = product
@@ -276,6 +291,7 @@ fn chrome_major_version(cdp: &mut Cdp) -> Option<u32> {
     version_part.split('.').next()?.parse().ok()
 }
 
+#[cfg(test)]
 fn native_webmcp_object_input(cdp: &mut Cdp, session: &str) -> bool {
     let chrome = chrome_major_version(cdp);
     if chrome.is_some_and(|v| v < 155) {
@@ -296,6 +312,7 @@ fn native_webmcp_object_input(cdp: &mut Cdp, session: &str) -> bool {
     native && chrome.is_some_and(|v| v >= 155)
 }
 
+#[cfg(test)]
 fn input_expression(input: &Value, native: bool) -> String {
     if native {
         format!("JSON.parse({})", json!(input.to_string()))
@@ -312,6 +329,7 @@ enum CallOutcome {
     Threw(String),
 }
 
+#[cfg(test)]
 fn evaluate_call(
     cdp: &mut Cdp,
     session: &str,
@@ -345,6 +363,7 @@ fn evaluate_call(
     parse_call_result(cdp, session, &expression)
 }
 
+#[cfg(test)]
 fn evaluate_call_force(
     cdp: &mut Cdp,
     session: &str,
@@ -372,6 +391,7 @@ fn evaluate_call_force(
     parse_call_result(cdp, session, &expression)
 }
 
+#[cfg(test)]
 fn parse_call_result(
     cdp: &mut Cdp,
     session: &str,
@@ -399,6 +419,10 @@ fn parse_call_result(
         .pointer("/result/value")
         .cloned()
         .unwrap_or(Value::Null);
+    parse_value(value)
+}
+
+fn parse_value(value: Value) -> Result<CallOutcome, String> {
     if let Some(error) = value.get("__webmcp_error").and_then(|v| v.as_str()) {
         return match error {
             "absent" => Ok(CallOutcome::Absent),
@@ -439,6 +463,15 @@ fn parse_call_result(
     Err("webmcp-call: unexpected evaluation result\n".into())
 }
 
+fn redact_output(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = sanitize::browser_message(text),
+        Value::Array(values) => values.iter_mut().for_each(redact_output),
+        Value::Object(values) => values.values_mut().for_each(redact_output),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,7 +509,7 @@ mod tests {
     }
 
     fn fake_cdp(responses: Vec<Value>) -> Cdp {
-        Cdp::from_transport(Box::new(FakeTransport::with_responses(responses)))
+        crate::document_client::client(Box::new(FakeTransport::with_responses(responses)), "S1")
     }
 
     fn eval_result(value: Value) -> Value {

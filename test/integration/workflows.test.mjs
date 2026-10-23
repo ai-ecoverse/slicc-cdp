@@ -59,15 +59,27 @@ test('the pipeline picks its runners, reviews no Renovate pull request and runs 
     assert.equal(input(name), undefined, name);
   }
   assert.doesNotMatch(ci, /vars\.|CERT_|cert-review/);
-  assert.equal(input('shards'), '4');
+  assert.equal(input('shards'), '8');
   assert.equal(input('timeout-minutes'), '30');
   assert.match(input('review-prompt'), /^\|$/);
 });
 
-test('the shards split exactly the files npm test runs, on the Node the package asks for', () => {
+test('the shards split exactly the files npm test runs, on the Node the package asks for', async () => {
   assert.equal(input('test'), undefined);
   assert.equal(input('test-glob'), 'test/integration/*.test.mjs');
-  assert.ok(pkg.scripts.test.endsWith(` '${input('test-glob')}'`), pkg.scripts.test);
+  assert.ok(pkg.scripts.test.endsWith(' node scripts/test-integration.mjs'), pkg.scripts.test);
+  const entrypoint = await read('scripts/test-integration.mjs');
+  assert.ok(entrypoint.includes(`'${input('test-glob')}'`), entrypoint);
+  assert.match(
+    entrypoint,
+    /import \{ testArguments \} from '\.\.\/test\/integration\/test-arguments\.mjs'/
+  );
+  assert.match(entrypoint, /spawnSync\(process\.execPath, \[\.\.\.testArguments, \.\.\.files\]/);
+  const argumentsSource = await read('test/integration/test-arguments.mjs');
+  assert.match(argumentsSource, /'--import'/);
+  assert.match(argumentsSource, /'\.\/ports\.mjs'/);
+  assert.match(argumentsSource, /'--test'/);
+  assert.match(argumentsSource, /'--test-timeout=600000'/);
   assert.doesNotMatch(pkg.scripts.test, /NODE_OPTIONS/);
   assert.equal(input('node-version'), undefined);
   assert.equal(pkg.engines.node, '>=24');
