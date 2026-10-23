@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -67,7 +67,7 @@ export async function harFixture(body, options = {}) {
     send('Page.frameNavigated', {
       frame: { id: 'TAB', loaderId: 'L', url: tab.url, securityOrigin: new URL(tab.url).origin },
     });
-    await held.event('checkpoint', (event) => event.entries === count);
+    await held.event('checkpoint', (event) => count === undefined || event.entries === count);
     return JSON.parse(await readFile(file, 'utf8'));
   };
   try {
@@ -232,6 +232,102 @@ test('HAR rejects protected and unknown URLs and bodies, redacts redirect carrie
     const stopped = await harCommand(backend.url, ['har-stop'], home);
     assert.equal(stopped.code, 0, stopped.stderr);
     assert.equal((await held.ended).code, 0);
+  });
+});
+
+test('HAR retains ordinary redirect sources delivered through Network extra-info before a guarded failure', async () => {
+  await harFixture(async ({ home, backend, start, request, send, checkpoint }) => {
+    const held = await start(['--content=embed']);
+    request('REDIRECT_EXTRA', 'https://example.test/extra-redirect', {
+      Cookie: 'ordinary-credential',
+    });
+    send('Network.responseReceivedExtraInfo', {
+      requestId: 'REDIRECT_EXTRA',
+      statusCode: 302,
+      headers: {
+        Location: 'https://seven.sliccy.ai/private?extra-secret=1',
+        'Set-Cookie': 'ordinary-response-credential',
+      },
+    });
+    send('Network.loadingFailed', {
+      requestId: 'REDIRECT_EXTRA',
+      timestamp: 1.1,
+      errorText: 'net::ERR_BLOCKED_BY_CLIENT',
+      blockedReason: 'inspector',
+    });
+    request('REDIRECT_FETCH_LATE', 'https://example.test/late-fetch');
+    send('Network.loadingFailed', {
+      requestId: 'REDIRECT_FETCH_LATE',
+      timestamp: 1.1,
+      errorText: 'net::ERR_BLOCKED_BY_CLIENT',
+      blockedReason: 'inspector',
+    });
+    send('Fetch.requestPaused', {
+      requestId: 'FETCH_LATE',
+      networkId: 'REDIRECT_FETCH_LATE',
+      frameId: 'TAB',
+      resourceType: 'Fetch',
+      request: { url: 'https://example.test/late-fetch', method: 'GET', headers: {} },
+      responseStatusCode: 302,
+      responseHeaders: [
+        { name: 'Location', value: 'https://seven.sliccy.ai/private?late-secret=1' },
+      ],
+    });
+    const har = await checkpoint();
+    assert.equal(har.log.entries.length, 2, JSON.stringify(har));
+    assert.ok(
+      har.log.entries.some((entry) => entry.request.url === 'https://example.test/late-fetch')
+    );
+    assert.ok(!JSON.stringify(har).includes('late-secret'));
+    assert.ok(
+      backend.calls.some(
+        (call) =>
+          call.method === 'Fetch.enable' &&
+          call.params.patterns?.some((pattern) => pattern.requestStage === 'Response')
+      )
+    );
+    const entry = har.log.entries[0];
+    assert.equal(entry.request.url, 'https://example.test/extra-redirect');
+    assert.equal(entry.response.status, 302);
+    assert.equal(entry.response.redirectURL, 'https://seven.sliccy.ai');
+    assert.ok(!JSON.stringify(har).includes('extra-secret'));
+    assert.ok(!JSON.stringify(har).includes('ordinary-credential'));
+    assert.ok(!JSON.stringify(har).includes('ordinary-response-credential'));
+    assert.ok(!backend.calls.some((call) => call.method === 'Network.getResponseBody'));
+    const result = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal((await held.ended).code, 0);
+  });
+});
+
+test('HAR output preserves shared directory permissions and makes only the archive private', async () => {
+  await harFixture(async ({ home, backend }) => {
+    const parent = path.join(home, 'shared');
+    const directory = path.join(parent, 'public');
+    await mkdir(directory, { recursive: true });
+    await chmod(parent, 0o755);
+    await chmod(directory, 0o755);
+    const file = path.join(directory, 'traffic.har');
+    const result = await harCommand(backend.url, ['har-start', '--tab', 'TAB', file], home);
+    assert.equal(result.code, 0, result.stderr);
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(parent)).mode & 0o777, 0o755);
+      assert.equal((await stat(directory)).mode & 0o777, 0o755);
+      assert.equal((await stat(file)).mode & 0o777, 0o600);
+    }
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).log.version, '1.2');
+  });
+});
+
+test('a stale killed HAR holder is reclaimed automatically', async () => {
+  await harFixture(async ({ start, home, backend, file }) => {
+    const first = await start();
+    first.child.kill('SIGKILL');
+    await first.ended;
+    await new Promise((resolve) => setTimeout(resolve, 5200));
+    const next = await harCommand(backend.url, ['har-start', '--tab', 'TAB', file], home);
+    assert.equal(next.code, 0, next.stderr);
+    assert.equal(JSON.parse(next.stdout.trim().split('\n').at(-1)).reason, 'stdin');
   });
 });
 

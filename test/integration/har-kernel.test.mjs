@@ -15,7 +15,10 @@ test('slicc6 HAR aliases open a new tab and persist HAR 1.2 in the kernel record
       backend.url
     );
     await runner.writeFile('/recordings/.keep', '');
+    const recordingsMode = (await runner.stat('/recordings')).mode;
     const cwd = await runner.fresh();
+    const cwdMode = (await runner.stat(cwd)).mode;
+    const homeMode = (await runner.stat('/home')).mode;
     const held = await runner.playwright(
       ['record', 'https://example.test/page', '--filter=**/api/**'],
       cwd,
@@ -31,6 +34,8 @@ test('slicc6 HAR aliases open a new tab and persist HAR 1.2 in the kernel record
       JSON.parse(new TextDecoder().decode(await runner.readFile(ready.path))).log.version,
       '1.2'
     );
+    assert.equal((await runner.stat(ready.path)).mode & 0o777, 0o600);
+    assert.equal((await runner.stat('/recordings')).mode, recordingsMode);
     assert.ok(backend.calls.some((call) => call.method === 'Target.createTarget'));
     assert.ok(
       backend.calls.some(
@@ -51,6 +56,9 @@ test('slicc6 HAR aliases open a new tab and persist HAR 1.2 in the kernel record
       JSON.parse(new TextDecoder().decode(await runner.read(cwd, 'capture.har'))).log.version,
       '1.2'
     );
+    assert.equal((await runner.stat(`${cwd}/capture.har`)).mode & 0o777, 0o600);
+    assert.equal((await runner.stat(cwd)).mode, cwdMode);
+    assert.equal((await runner.stat('/home')).mode, homeMode);
   } finally {
     await runner?.close();
     await backend.close();

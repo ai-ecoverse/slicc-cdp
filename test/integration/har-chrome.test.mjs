@@ -76,7 +76,14 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
     const barrierLoad = raw.event('Page.loadEventFired', sessionId);
     await raw.send('Page.navigate', { url: `${origin}/before-protected` }, sessionId);
     await barrierLoad.seen;
-    await held.event('checkpoint', (event) => event.entries >= 2);
+    await held.event('checkpoint');
+    const checkpoint = JSON.parse(await readFile(file, 'utf8'));
+    for (const pathname of ['/ordinary-api', '/redirect']) {
+      assert.ok(
+        checkpoint.log.entries.some((entry) => entry.request.url === `${origin}${pathname}`),
+        JSON.stringify(checkpoint)
+      );
+    }
     for (const host of ['seven', 'vault']) {
       const before = held.events().filter((event) => event.event === 'paused').length;
       const commit = raw.event(
