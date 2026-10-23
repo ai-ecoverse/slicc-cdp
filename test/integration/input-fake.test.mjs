@@ -84,6 +84,14 @@ function page(script) {
       reply({ result: { type: 'object', subtype: 'array', value: script.inner ?? [800, 600] } });
       return true;
     }
+    if (method === 'Page.getLayoutMetrics') {
+      reply(
+        script.metrics ?? {
+          cssLayoutViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 },
+        }
+      );
+      return true;
+    }
     if (method === 'Browser.getWindowForTarget') {
       reply({
         windowId: 3,
@@ -369,6 +377,29 @@ test('pointer input over an embedded frame or outside the main document is refus
       'slicc: refused: mouse input at (3, 4) would reach an embedded frame\n'
     );
   });
+  await withFake(
+    { metrics: { cssLayoutViewport: { pageX: 100.5, pageY: 40 } } },
+    async (fake, pw) => {
+      const result = await pw(['mousemove', '10', '20']);
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(
+        params(fake, 'DOM.getNodeForLocation').map((hit) => [hit.x, hit.y]),
+        [
+          [110, 60],
+          [111, 60],
+        ]
+      );
+      assert.deepEqual(params(fake, 'Input.dispatchMouseEvent')[0].x, 10);
+    }
+  );
+  for (const metrics of [{}, { cssLayoutViewport: { pageX: 0 } }]) {
+    await withFake({ metrics }, async (fake, pw) => {
+      const result = await pw(['mousemove', '10', '20']);
+      assert.equal(result.code, 1);
+      assert.equal(params(fake, 'DOM.getNodeForLocation').length, 0);
+      assert.equal(params(fake, 'Input.dispatchMouseEvent').length, 0);
+    });
+  }
   await withFake({ miss: true }, async (fake, pw) => {
     const result = await pw(['mousemove', '5000', '5000']);
     assert.equal(result.code, 0, result.stderr);
@@ -390,6 +421,7 @@ test('keyboard input is refused while focus is inside a frame or a closed shadow
     },
     { focus: { type: 'string', value: 'fake-eval' } },
     { focus: { type: 'object', subtype: 'node' } },
+    { focusNode: { nodeType: 1, nodeName: 'X-ODD', shadowRoots: [{ nodeType: 11 }] } },
   ]) {
     await withFake(script, async (fake, pw) => {
       for (const command of ['keydown', 'keyup']) {
@@ -410,6 +442,14 @@ test('keyboard input is refused while focus is inside a frame or a closed shadow
         nodeType: 1,
         nodeName: 'X-OPEN',
         shadowRoots: [{ nodeType: 11, shadowRootType: 'open' }],
+      },
+    },
+    {
+      focusNode: {
+        nodeType: 1,
+        nodeName: 'INPUT',
+        localName: 'input',
+        shadowRoots: [{ nodeType: 11, shadowRootType: 'user-agent' }],
       },
     },
   ]) {

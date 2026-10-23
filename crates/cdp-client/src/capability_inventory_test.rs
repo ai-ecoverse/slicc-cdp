@@ -3,7 +3,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     let document = set(&[
         "DOM.describeNode", "DOM.getDocument", "DOM.getFrameOwner", "DOM.getNodeForLocation", "DOM.querySelectorAll", "DOM.resolveNode", "DOM.setFileInputFiles",
         "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.insertText",
-        "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree",
+        "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree", "Page.getLayoutMetrics",
         "Page.getNavigationHistory", "Page.handleJavaScriptDialog", "Page.getPermissionsPolicyState", "Page.navigate", "Page.printToPDF", "Page.reload",
         "Runtime.callFunctionOn", "Runtime.compileScript", "Runtime.evaluate", "Runtime.getProperties", "Runtime.releaseObjectGroup",
         "Debugger.resume",

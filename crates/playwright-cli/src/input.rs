@@ -355,9 +355,14 @@ fn frame_owner(node: &Value) -> bool {
 fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<(), String> {
     let refused = || format!("slicc: refused: mouse input at ({}, {}) would reach an embedded frame\n", js(x), js(y));
     let frame = main_frame(cdp, session)?;
+    let metrics = cdp.call("Page.getLayoutMetrics", json!({}), Some(session))?;
+    let scroll = |key: &str| metrics.pointer(&format!("/cssLayoutViewport/{key}")).and_then(Value::as_f64).filter(|value| value.is_finite());
+    let (Some(left), Some(top)) = (scroll("pageX"), scroll("pageY")) else {
+        return Err(refused());
+    };
     let mut points: Vec<(i64, i64)> = Vec::new();
-    for px in [x.floor(), x.ceil()] {
-        for py in [y.floor(), y.ceil()] {
+    for px in [(x + left).floor(), (x + left).ceil()] {
+        for py in [(y + top).floor(), (y + top).ceil()] {
             if px.abs() <= i32::MAX as f64 && py.abs() <= i32::MAX as f64 && !points.contains(&(px as i64, py as i64)) {
                 points.push((px as i64, py as i64));
             }
@@ -397,7 +402,7 @@ fn admit_focus(cdp: &mut Cdp, session: &str) -> Result<(), String> {
     let object = remote.get("objectId").cloned().filter(|_| remote.get("subtype").and_then(Value::as_str) == Some("node")).ok_or_else(refused)?;
     let node = cdp.call("DOM.describeNode", json!({ "objectId": object }), Some(session))?;
     let node = node.get("node").ok_or_else(refused)?;
-    let closed = node.get("shadowRoots").and_then(Value::as_array).is_some_and(|roots| roots.iter().any(|root| root.get("shadowRootType").and_then(Value::as_str) != Some("open")));
+    let closed = node.get("shadowRoots").and_then(Value::as_array).is_some_and(|roots| roots.iter().any(|root| root.get("shadowRootType").and_then(Value::as_str).is_none_or(|kind| !matches!(kind, "open" | "user-agent"))));
     if frame_owner(node) || closed {
         return Err(refused());
     }

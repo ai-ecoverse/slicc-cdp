@@ -41,8 +41,9 @@ zone.addEventListener('drop', async (e) => {
 document.getElementById('field').focus();
 </script>`,
   '/framed': () => `<title>Framed</title>
-<style>body{margin:0}iframe{position:absolute;left:500px;top:0;width:200px;height:200px;border:0}</style>
+<style>body{margin:0}iframe{position:absolute;left:500px;top:300px;width:200px;height:200px;border:0}#spacer{height:3000px}</style>
 <p>Outside</p>
+<div id="spacer"></div>
 <iframe src="http://seven.sliccy.ai/frame?k=FRAME_SECRET" onload="this.dataset.loaded = 'yes'"></iframe>
 <script>${listen}</script>`,
   '/frame': () => '<title>Seven</title><input aria-label="Seven field">',
@@ -197,6 +198,7 @@ async function flow(runner, raw, port) {
     'protected frame loaded'
   );
   await until(sevenGone, (gone) => !gone, 'protected frame target listed');
+  assert.equal(await value('(scrollTo(0, 250), scrollY)'), 250);
   const over = await pw(['mousemove', '600', '100']);
   assert.equal(over.code, 1);
   assert.equal(
