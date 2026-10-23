@@ -142,6 +142,7 @@ pub struct Cdp {
     targets: BTreeMap<String, Value>,
     worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
+    frame_parents: BTreeMap<String, String>,
     frame_decisions: BTreeMap<String, bool>,
     frame_sessions: BTreeMap<String, BTreeSet<String>>,
     frame_epoch: u64,
@@ -217,6 +218,7 @@ impl Cdp {
             targets: BTreeMap::new(),
             worlds: Worlds::default(),
             frames: BTreeMap::new(),
+            frame_parents: BTreeMap::new(),
             frame_decisions: BTreeMap::new(),
             frame_sessions: BTreeMap::new(),
             frame_epoch: 0,
@@ -1599,6 +1601,7 @@ impl Cdp {
         if self.protected_targets.contains(target) { return None }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
+            self.note_parent(id, &evidence[4]);
             if content { self.frame_decisions.insert(id.clone(), false); }
             if !evidence[0].is_empty() {
                 self.document_versions.insert((target.to_string(), id.clone()), evidence[0].clone());
@@ -1629,7 +1632,8 @@ impl Cdp {
         let inherited = parent_allowed && self.guard.inheriting(text("url")) && !matches!(text("securityOrigin"), "" | "null" | "://") && self.frame_decisions.get(text("id")) != Some(&true);
         let allowed_error = !root && self.guard.error_document(text("url"), text("securityOrigin"))
             && !text("unreachableUrl").is_empty() && self.frame_decisions.get(text("id")) == Some(&false);
-        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error;
+        let data = (root || parent_allowed) && self.guard.data_document(text("url"));
+        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error || data;
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
             || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
             || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))
@@ -1788,8 +1792,16 @@ impl Cdp {
     }
 
     fn frame_verified(&self, frame_id: &str) -> bool {
-        frame_text_known(frame_id) && !self.protected_targets.contains(frame_id)
-            && self.frames.get(frame_id).is_some_and(|known| known.len() >= 2 && known.iter().all(|text| frame_text_known(text) && !self.guard.url(text)))
+        self.frame_chain_verified(frame_id, 0)
+    }
+
+    fn frame_chain_verified(&self, frame_id: &str, depth: usize) -> bool {
+        let Some(known) = self.frames.get(frame_id) else { return false };
+        if depth > self.frames.len() || !frame_text_known(frame_id) || self.protected_targets.contains(frame_id)
+            || known.len() < 2 || known.iter().any(|text| self.guard.url(text)) { return false }
+        if known.iter().all(|text| frame_text_known(text)) { return true }
+        frame_text_known(&known[0]) && self.guard.data_document(&known[0]) && known[1..].iter().all(|text| text == "://" || frame_text_known(text))
+            && self.frame_parents.get(frame_id).is_none_or(|parent| self.frame_chain_verified(parent, depth + 1))
     }
 
     fn tree_current(&self, tree: &Value, epoch: u64) -> bool {
@@ -1820,8 +1832,17 @@ impl Cdp {
         let ids = frames.keys().cloned().collect::<BTreeSet<_>>();
         for id in self.frame_sessions.insert(session.to_string(), ids.clone()).unwrap_or_default().difference(&ids) {
             self.frames.remove(id);
+            self.frame_parents.remove(id);
         }
-        self.frames.extend(frames);
+        for (id, mut evidence) in frames {
+            let parent = evidence.pop().unwrap_or_default();
+            self.note_parent(&id, &parent);
+            self.frames.insert(id, evidence);
+        }
+    }
+
+    fn note_parent(&mut self, frame_id: &str, parent: &str) {
+        if parent.is_empty() { self.frame_parents.remove(frame_id); } else { self.frame_parents.insert(frame_id.to_string(), parent.to_string()); }
     }
 
     fn collect_frames(node: &Value, frames: &mut BTreeMap<String, Vec<String>>) {
@@ -1829,7 +1850,7 @@ impl Cdp {
         let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
         if !text("id").is_empty() {
             let url = format!("{}{}", text("url"), text("urlFragment"));
-            frames.insert(text("id").to_string(), vec![url, text("securityOrigin").to_string()]);
+            frames.insert(text("id").to_string(), vec![url, text("securityOrigin").to_string(), text("parentId").to_string()]);
         }
         for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() {
             Self::collect_frames(child, frames);
@@ -2075,6 +2096,7 @@ impl Cdp {
                 }
                 if let Some(id) = params.get("frameId").and_then(Value::as_str) {
                     self.frames.remove(id);
+                    self.frame_parents.remove(id);
                     self.frame_versions.insert(id.to_string(), self.frame_epoch);
                     for frames in self.frame_sessions.values_mut() {
                         frames.remove(id);
@@ -2104,6 +2126,7 @@ impl Cdp {
                     .to_string();
                 if let Some(id) = frame.get("id").and_then(|v| v.as_str()) {
                     self.frames.insert(id.to_string(), vec![url.clone(), origin.clone()]);
+                    self.note_parent(id, frame.get("parentId").and_then(Value::as_str).unwrap_or(""));
                     if self.guard.url(&url) || self.guard.url(&origin) {
                         self.frame_decisions.insert(id.to_string(), true);
                     } else if !self.guard.error_page_url(&url) && !matches!(origin.as_str(), "" | "null" | "://") {

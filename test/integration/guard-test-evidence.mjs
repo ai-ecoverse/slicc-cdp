@@ -25,6 +25,21 @@ export function syntheticReport(set, sha = 'synthetic-report') {
                 },
               }
             : {}),
+          ...(vector.id === 'C8.protected-bfcache-restore.history'
+            ? {
+                guardedForwardingAudit: { id: 'history-trigger', complete: true, forwarded: false },
+              }
+            : {}),
+          ...(vector.id === 'X1.after-exit'
+            ? {
+                x1Privacy: {
+                  measured: true,
+                  markerExposed: false,
+                  protectedExposed: false,
+                  screenshotExposed: false,
+                },
+              }
+            : {}),
         };
       })
     )
