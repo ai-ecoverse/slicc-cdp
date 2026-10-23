@@ -168,39 +168,37 @@ async function flow(runner, raw, port) {
     'the wheel scrolled the element under the pointer'
   );
   assert.ok((await drain()).some((event) => event.type === 'wheel' && event.dy === 200));
+  const sevenTab = await raw.open('http://seven.sliccy.ai/frame?k=WHEEL_SECRET');
   const background = await raw.open(`http://127.0.0.1:${port}/input`);
   try {
+    const on = async (expression) =>
+      JSON.parse(
+        (await run(['eval', `JSON.stringify(${expression})`, '--tab', background])).stdout
+      );
+    assert.equal(await on('document.visibilityState'), 'hidden');
     await run(['mousemove', '100', '100', '--tab', background]);
-    await run(['mousewheel', '0', '200', '--tab', background]);
-    await until(
-      async () =>
-        JSON.parse(
-          (
-            await run([
-              'eval',
-              "JSON.stringify(document.getElementById('pad').scrollTop)",
-              '--tab',
-              background,
-            ])
-          ).stdout
-        ),
-      (top) => top > 0,
-      'a background tab was brought forward and scrolled'
+    const started = Date.now();
+    await run(
+      ['mousewheel', '0', '200', '--tab', background],
+      '// Scroll mouse wheel\nawait page.mouse.wheel(0, 200);'
     );
+    assert.ok(Date.now() - started < 9000, 'a background wheel does not wait for Chrome');
+    assert.ok(
+      (await on("document.getElementById('pad').scrollTop")) > 0,
+      'the element under the pointer scrolled'
+    );
+    assert.equal(await on('window.scrollY'), 0);
+    assert.equal(await on('document.visibilityState'), 'hidden');
+    assert.ok(
+      (await on('window.events.splice(0)')).some(
+        (event) => event.type === 'wheel' && event.dy === 200
+      ),
+      'the page saw the wheel event'
+    );
+    const { targetInfos } = await raw.send('Target.getTargets');
+    assert.ok(targetInfos.some((info) => info.targetId === sevenTab));
   } finally {
     await raw.send('Target.closeTarget', { targetId: background });
-  }
-  const sevenTab = await raw.open('http://seven.sliccy.ai/frame?k=WHEEL_SECRET');
-  const hiddenTab = await raw.open(`http://127.0.0.1:${port}/input`);
-  try {
-    const started = Date.now();
-    const hidden = await pw(['mousewheel', '0', '200', '--tab', hiddenTab]);
-    assert.equal(hidden.code, 1);
-    assert.match(hidden.stderr, /^Error: mousewheel needs the tab in the foreground/);
-    assert.doesNotMatch(hidden.stderr, /WHEEL_SECRET/);
-    assert.ok(Date.now() - started < 9000, 'a refused background wheel fails fast');
-  } finally {
-    await raw.send('Target.closeTarget', { targetId: hiddenTab });
     await raw.send('Target.closeTarget', { targetId: sevenTab });
   }
   await until(sevenGone, Boolean, 'protected tab gone after the wheel check');

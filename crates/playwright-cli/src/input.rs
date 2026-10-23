@@ -22,7 +22,8 @@ const FOCUS: &str = "(() => { let e = document.activeElement; while (e && e.shad
 const INNER: &str = "[innerWidth, innerHeight]";
 const DROP: &str = "function(payloads, data) { if (!this.isConnected || this.nodeType !== 1) return 'error:notconnected'; this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); const point = {x:r.x+r.width/2,y:r.y+r.height/2}; const dt = new DataTransfer(); for (const p of payloads) { const bytes = Uint8Array.from(atob(p.buffer), (c) => c.charCodeAt(0)); dt.items.add(new File([bytes], p.name, { type: p.mimeType, lastModified: p.lastModifiedMs })); } for (const entry of data) dt.setData(entry.mimeType, entry.value); const make = (type) => new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y, dataTransfer: dt }); this.dispatchEvent(make('dragenter')); const over = make('dragover'); this.dispatchEvent(over); if (!over.defaultPrevented) { this.dispatchEvent(make('dragleave')); return 'not-accepted'; } this.dispatchEvent(make('drop')); return 'accepted'; }";
 const NOT_ACCEPTED: &str = "Error: Drop target did not accept the drop \u{2014} its dragover handler did not call preventDefault()\n";
-const BACKGROUND: &str = "Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const BACKGROUND: &str = "Error: mousewheel could not scroll the background tab in place, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const SYNTHETIC_WHEEL: &str = "function(x, y, dx, dy, alt, ctrl, meta, shift, buttons) { let target = document.elementFromPoint(x, y); while (target && target.shadowRoot) { const inner = target.shadowRoot.elementFromPoint(x, y); if (!inner || inner === target) break; target = inner; } const root = document.scrollingElement || document.documentElement; if (!target) target = root; if (/^(iframe|frame|object|embed|fencedframe|portal)$/i.test(target.localName)) return 'frame'; const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, screenX: x, screenY: y, deltaX: dx, deltaY: dy, deltaMode: 0, altKey: alt, ctrlKey: ctrl, metaKey: meta, shiftKey: shift, buttons }); if (!target.dispatchEvent(event)) return 'prevented'; const parent = (node) => node.assignedSlot || node.parentElement || (node.getRootNode() instanceof ShadowRoot ? node.getRootNode().host : null); const room = (node, axis, delta) => { const style = getComputedStyle(node); if (!/(auto|scroll|overlay)/.test(axis === 'x' ? style.overflowX : style.overflowY)) return false; const at = axis === 'x' ? node.scrollLeft : node.scrollTop; const end = axis === 'x' ? node.scrollWidth - node.clientWidth : node.scrollHeight - node.clientHeight; return delta > 0 ? at < end - 0.5 : at > 0.5; }; const scroller = (axis, delta) => { if (!delta) return root; for (let node = target; node && node !== root; node = parent(node)) if (room(node, axis, delta)) return node; return root; }; const sx = scroller('x', dx); const sy = scroller('y', dy); if (sx === sy) sx.scrollBy({ left: dx, top: dy, behavior: 'instant' }); else { sx.scrollBy({ left: dx, top: 0, behavior: 'instant' }); sy.scrollBy({ left: 0, top: dy, behavior: 'instant' }); } return 'scrolled'; }";
 const FOREGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const WHEEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const NO_PAYLOAD: &str = "Error: At least one of \"paths\" or \"data\" must be provided.\n";
@@ -250,9 +251,10 @@ fn act(cdp: &mut Cdp, session: &str, target: &str, invocation: &Invocation, comm
         "mousewheel" => {
             let (dx, dy) = numbers(invocation, ["dx", "dy"])?;
             admit_point(cdp, session, pointer.x, pointer.y)?;
-            foreground(cdp, session, target)?;
-            let wheel = json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy });
-            cdp.call_for("Input.dispatchMouseEvent", wheel, Some(session), WHEEL_WAIT).map_err(|message| if message == "Input.dispatchMouseEvent timed out\n" { BACKGROUND.to_string() } else { message })?;
+            if foreground(cdp, session, target, pointer, (dx, dy))? {
+                let wheel = json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy });
+                cdp.call_for("Input.dispatchMouseEvent", wheel, Some(session), WHEEL_WAIT).map_err(|message| if message == "Input.dispatchMouseEvent timed out\n" { BACKGROUND.to_string() } else { message })?;
+            }
             Ok(code(&format!("// Scroll mouse wheel\nawait page.mouse.wheel({}, {});", js(dx), js(dy))))
         }
         _ => {
@@ -280,9 +282,27 @@ fn visible(cdp: &mut Cdp, session: &str, waited: std::time::Duration) -> Result<
     }
 }
 
-fn foreground(cdp: &mut Cdp, session: &str, target: &str) -> Result<(), String> {
+fn synthetic_wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, (dx, dy): (f64, f64)) -> Result<bool, String> {
+    let frame = main_frame(cdp, session)?;
+    let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
+    let Some(context) = world.get("executionContextId").cloned() else { return Ok(false) };
+    let held = |name: &str| pointer.modifiers.iter().any(|known| known == name);
+    let arguments = json!([pointer.x, pointer.y, dx, dy, held("Alt"), held("Control"), held("Meta"), held("Shift"), pointer.buttons_mask()]);
+    let expression = format!("({SYNTHETIC_WHEEL})(...{arguments})");
+    let scrolled = cdp.call("Runtime.evaluate", json!({ "expression": expression, "contextId": context, "returnByValue": true }), Some(session))?;
+    match scrolled.pointer("/result/value").and_then(Value::as_str).filter(|_| scrolled.get("exceptionDetails").is_none()) {
+        Some("scrolled" | "prevented") => Ok(true),
+        Some("frame") => Err(format!("slicc: refused: mouse input at ({}, {}) would reach an embedded frame\n", js(pointer.x), js(pointer.y))),
+        _ => Ok(false),
+    }
+}
+
+fn foreground(cdp: &mut Cdp, session: &str, target: &str, pointer: &Pointer, delta: (f64, f64)) -> Result<bool, String> {
     if visible(cdp, session, std::time::Duration::ZERO)? {
-        return Ok(());
+        return Ok(true);
+    }
+    if synthetic_wheel(cdp, session, pointer, delta)? {
+        return Ok(false);
     }
     if cdp.admit_foreground(session).ok().as_deref() != Some(target) {
         return Err(BACKGROUND.to_string());
@@ -291,7 +311,7 @@ fn foreground(cdp: &mut Cdp, session: &str, target: &str) -> Result<(), String> 
     if !visible(cdp, session, FOREGROUND_WAIT)? {
         return Err(BACKGROUND.to_string());
     }
-    Ok(())
+    Ok(true)
 }
 
 fn mouse(cdp: &mut Cdp, session: &str, kind: &str, pointer: &Pointer, button: &str, clicks: Option<i64>) -> Result<(), String> {

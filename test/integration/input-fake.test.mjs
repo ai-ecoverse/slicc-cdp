@@ -88,6 +88,12 @@ function page(script) {
       reply({ result: { type: 'string', value: script.hidden ? 'hidden' : 'visible' } });
       return true;
     }
+    if (method === 'Runtime.evaluate' && params.expression?.startsWith('(function(x, y, dx, dy')) {
+      if (script.synthetic === 'throw')
+        reply({ result: { type: 'object' }, exceptionDetails: { text: 'scroll failed' } });
+      else reply({ result: { type: 'string', value: script.synthetic ?? 'scrolled' } });
+      return true;
+    }
     if (method === 'Target.activateTarget') {
       if (script.wakes) script.hidden = false;
       reply({});
@@ -416,16 +422,51 @@ test('pointer input over an embedded frame or outside the main document is refus
   });
 });
 
-test('mousewheel brings a background tab forward only while no protected tab is open', async () => {
+test('mousewheel scrolls a background tab in place and only falls back to bringing it forward', async () => {
   const background =
-    'Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run "playwright-cli tab-select <index> --foreground" first.\n';
-  await withFake({ hidden: true, wakes: true }, async (fake, pw) => {
+    'Error: mousewheel could not scroll the background tab in place, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run "playwright-cli tab-select <index> --foreground" first.\n';
+  const synthetic = (fake) =>
+    params(fake, 'Runtime.evaluate').filter((call) =>
+      call.expression.startsWith('(function(x, y, dx, dy')
+    );
+  for (const seven of [false, true]) {
+    await withFake({ hidden: true, wakes: true }, async (fake, pw) => {
+      if (seven) fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+      assert.equal((await pw(['keydown', 'Shift', '--tab', 'TAB'])).code, 0);
+      assert.equal((await pw(['mousemove', '30', '40', '--tab', 'TAB'])).code, 0);
+      const result = await pw(['mousewheel', '0', '100', '--tab', 'TAB']);
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stdout, code('// Scroll mouse wheel\nawait page.mouse.wheel(0, 100);'));
+      const [call] = synthetic(fake);
+      assert.ok(
+        call.expression.endsWith('(...[30.0,40.0,0.0,100.0,false,false,false,true,0])'),
+        call.expression
+      );
+      assert.match(call.uniqueContextId, /^world:/);
+      assert.equal(sent(fake, 'Target.activateTarget').length, 0);
+      assert.equal(
+        params(fake, 'Input.dispatchMouseEvent').filter((event) => event.type === 'mouseWheel')
+          .length,
+        0
+      );
+    });
+  }
+  await withFake({ hidden: true, synthetic: 'frame' }, async (fake, pw) => {
+    const result = await pw(['mousewheel', '0', '100']);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      'slicc: refused: mouse input at (0, 0) would reach an embedded frame\n'
+    );
+    assert.equal(sent(fake, 'Target.activateTarget').length, 0);
+  });
+  await withFake({ hidden: true, wakes: true, synthetic: 'throw' }, async (fake, pw) => {
     const result = await pw(['mousewheel', '0', '100']);
     assert.equal(result.code, 0, result.stderr);
     assert.deepEqual(params(fake, 'Target.activateTarget'), [{ targetId: 'TAB' }]);
     assert.equal(params(fake, 'Input.dispatchMouseEvent').length, 1);
   });
-  await withFake({ hidden: true, wakes: true }, async (fake, pw) => {
+  await withFake({ hidden: true, wakes: true, synthetic: 'nothing' }, async (fake, pw) => {
     fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
     const result = await pw(['mousewheel', '0', '100', '--tab', 'TAB']);
     assert.equal(result.code, 1);
@@ -433,7 +474,7 @@ test('mousewheel brings a background tab forward only while no protected tab is 
     assert.equal(sent(fake, 'Target.activateTarget').length, 0);
     assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
   });
-  await withFake({ hidden: true }, async (fake, pw) => {
+  await withFake({ hidden: true, synthetic: 'throw' }, async (fake, pw) => {
     const result = await pw(['mousewheel', '0', '100']);
     assert.equal(result.code, 1);
     assert.equal(result.stderr, background);
