@@ -5,7 +5,13 @@ const { containsSecret } = await import(
     .href
 );
 
-export const x1KnownReason = 'slicc-browsers#150';
+export function finalizeX1Privacy(rows, records) {
+  for (const row of rows) {
+    if (row.id !== 'X1.after-exit') continue;
+    const record = records.get(`${row.id}/${row.target}/${row.variant}`);
+    if (record) row.x1Privacy = x1Privacy(record.actors, record);
+  }
+}
 
 export function recordX1Client(client) {
   const calls = [];
@@ -307,59 +313,5 @@ export function x1Privacy(actors, { ordinary, protectedOrigin }) {
     echoes,
     exposures,
     diagnostics,
-  };
-}
-
-export function isExpectedX1Failure150(row) {
-  const audit = row.x1Privacy;
-  const states = ['control', 'guarded'].map((side) => row.observations?.[side]);
-  return (
-    row.id === 'X1.after-exit' &&
-    ['seven', 'vault'].includes(row.target) &&
-    ['prompt', 'lagging'].includes(row.variant) &&
-    row.control === 'fail' &&
-    row.guarded === 'fail' &&
-    row.live === 'pass' &&
-    audit?.measured === true &&
-    audit.persistentRefusals === true &&
-    audit.markerExposed === false &&
-    audit.protectedExposed === false &&
-    audit.screenshotExposed === false &&
-    Array.isArray(audit.echoes) &&
-    [0, 1].every((actorIndex) =>
-      audit.echoes.some((echo) => echo.actorIndex === actorIndex && echo.byteExact === true)
-    ) &&
-    states.every(
-      (state) =>
-        state &&
-        (state.instrumented === false || state.headed === false) &&
-        state.intercepted === true &&
-        state.served === true &&
-        state.document === true &&
-        state.forged === false &&
-        state.scripted === false &&
-        state.probed === false &&
-        state.paused === false
-    ) &&
-    Array.isArray(row.errors) &&
-    row.errors.length === 2 &&
-    row.errors.every(
-      (error) =>
-        typeof error === 'string' &&
-        error.startsWith(`settle: no beacon from ${audit.ordinary} within `) &&
-        /^\d+ms$/.test(error.slice(`settle: no beacon from ${audit.ordinary} within `.length))
-    )
-  );
-}
-
-export function x1Disposition(row) {
-  return {
-    id: row.id,
-    target: row.target,
-    variant: row.variant,
-    reason: x1KnownReason,
-    class: 'persistent-capabilities-refused',
-    deletionHook: 'fixed X1 vector version for slicc-browsers#150',
-    excludedEchoes: row.x1Privacy.echoes,
   };
 }

@@ -29,7 +29,7 @@ for (const side of ['guarded', 'control']) {
       () => {}
     );
     for (const url of [
-      'https://private.test/bfcache?n=gate-proof',
+      'https://private.test/bfcache?n=gate-proof-p',
       'https://public.test/bfcache?n=gate-proof-b',
     ])
       observerGate.inbound(
@@ -50,7 +50,7 @@ for (const side of ['guarded', 'control']) {
         sessionId: 'SUBJECT',
         params: {
           type: 'BackForwardCacheRestore',
-          frame: { url: 'https://private.test/bfcache?n=gate-proof' },
+          frame: { url: 'https://private.test/bfcache?n=gate-proof-p' },
         },
       },
       () => received.push('restore')
@@ -72,3 +72,48 @@ for (const side of ['guarded', 'control']) {
     gate.close();
   });
 }
+
+test('published protected and ordinary seeds require exact base identity and target ownership', () => {
+  for (const ordinaryTag of ['gate-proof-p-b', 'other-b', 'gate-proof-b-extra']) {
+    const gate = new InboundGate({
+      protectedOrigin: 'https://private.test',
+      ordinaryOrigin: 'https://public.test',
+    });
+    gate.inbound(
+      {
+        method: 'Target.attachedToTarget',
+        params: { sessionId: 'S', targetInfo: { targetId: 'T' } },
+      },
+      () => {}
+    );
+    for (const url of [
+      'https://private.test/bfcache?n=gate-proof-p',
+      'https://public.test/bfcache?n=' + ordinaryTag,
+    ])
+      gate.inbound(
+        { method: 'Page.frameNavigated', sessionId: 'S', params: { frame: { url } } },
+        () => {}
+      );
+    assert.equal(gate.observedSeed('T').protectedObserved, true);
+    assert.equal(gate.observedSeed('T').ordinaryObserved, false);
+    gate.inbound(
+      {
+        method: 'Page.frameNavigated',
+        sessionId: 'FOREIGN',
+        params: { frame: { url: 'https://public.test/bfcache?n=gate-proof-b' } },
+      },
+      () => {}
+    );
+    assert.equal(gate.observedSeed('T').ordinaryObserved, false);
+    gate.inbound(
+      {
+        method: 'Page.frameNavigated',
+        sessionId: 'S',
+        params: { frame: { url: 'https://public.test/bfcache?n=gate-proof-b' } },
+      },
+      () => {}
+    );
+    assert.equal(gate.observedSeed('T').ordinaryObserved, true);
+    gate.close();
+  }
+});
