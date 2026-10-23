@@ -35,6 +35,12 @@ const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
+struct CarrierTarget {
+    origin: Option<String>,
+    protected: bool,
+    url: url::Url,
+}
+
 #[derive(Clone, Debug)]
 struct DocumentState {
     frames: BTreeMap<String, Vec<String>>,
@@ -2332,18 +2338,16 @@ impl Cdp {
         };
         let source = source.as_deref().unwrap_or("https://ordinary.invalid/");
         let redirect = status.and_then(Value::as_u64).is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308));
-        let sensitive = |target: &str| {
-            if Self::redirect_header_value(&self.guard, "location", target, source).is_none_or(|url| !self.guard.url(&url)) { return false }
-            let mut target = target.to_string();
-            for _ in 0..8 { let decoded = shield::decode_percent(&target); if decoded == target { break } target = decoded; }
-            url::Url::parse(source).ok().and_then(|base| base.join(&target).ok()).is_some_and(|url| !url.path().trim_matches('/').is_empty() || url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() || url.password().is_some())
-        };
+        let sensitive = |target: &str| Self::carrier_targets(&self.guard, target, source).is_none_or(|targets| targets.iter().any(|target| target.protected && {
+            let url = &target.url;
+            !url.path().trim_matches('/').is_empty() || url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() || url.password().is_some()
+        }));
         let protected = |name: &str, text: &str| {
             match name.to_ascii_lowercase().as_str() {
-                "location" if navigation && redirect => Self::redirect_header_value(&self.guard, name, text, source).is_some_and(|url| self.guard.url(&url)),
+                "location" if navigation && redirect => Self::carrier_targets(&self.guard, text, source).is_none_or(|targets| targets.iter().any(|target| target.protected)),
                 "location" | "content-location" if !navigation => sensitive(text),
                 "refresh" => Self::redirect_header_value(&self.guard, name, text, source).is_none_or(|text| text.split_once(";url=").is_none_or(|(_, url)| self.guard.url(url))),
-                "link" => text.split(',').any(|part| part.trim().strip_prefix('<').and_then(|part| part.split_once('>')).is_some_and(|(target, _)| sensitive(target))),
+                "link" => text.split([',', '\n']).any(|part| part.trim().strip_prefix('<').and_then(|part| part.split_once('>')).is_some_and(|(target, _)| sensitive(target))),
                 _ => false,
             }
         };
@@ -2401,19 +2405,30 @@ impl Cdp {
         Some((delay, (!target.is_empty()).then_some(target)))
     }
 
+    fn carrier_targets(guard: &Protected, target: &str, source: &str) -> Option<Vec<CarrierTarget>> {
+        let base = url::Url::parse(source).ok()?;
+        let mut target = target.trim().to_string();
+        if target.chars().any(char::is_control) { return None }
+        let mut targets = Vec::new();
+        for _ in 0..9 {
+            let url = base.join(&target).ok()?;
+            let keyed = guard.resource_key(&target).and_then(|key| url::Url::parse(&key).ok()).unwrap_or_else(|| url.clone());
+            let origin = keyed.origin().ascii_serialization();
+            let web = origin.starts_with("http://") || origin.starts_with("https://");
+            let protected = if web { guard.url(&origin) } else { guard.url(keyed.as_str()) };
+            targets.push(CarrierTarget { origin: web.then_some(origin), protected, url });
+            let decoded = shield::decode_percent(&target);
+            if decoded == target { return Some(targets) }
+            target = decoded;
+        }
+        None
+    }
+
     fn redirect_header_value(guard: &Protected, name: &str, text: &str, source: &str) -> Option<String> {
         if text.is_empty() || text.chars().any(|ch| ch.is_control() && !(name.eq_ignore_ascii_case("refresh") && ch == '\t')) { return None }
         let origin = |target: &str| {
-            let mut target = target.trim().to_string();
-            for _ in 0..8 {
-                let decoded = shield::decode_percent(&target);
-                if decoded == target { break }
-                target = decoded;
-            }
-            let base = url::Url::parse(source).ok()?;
-            let url = guard.resource_key(&target).and_then(|key| url::Url::parse(&key).ok()).or_else(|| base.join(&target).ok())?;
-            let origin = url.origin().ascii_serialization();
-            (origin.starts_with("http://") || origin.starts_with("https://")).then_some(origin)
+            let targets = Self::carrier_targets(guard, target, source)?;
+            targets.iter().find(|target| target.protected).unwrap_or(&targets[0]).origin.clone()
         };
         match name.to_ascii_lowercase().as_str() {
             "location" | "content-location" => origin(text),
@@ -3471,6 +3486,7 @@ mod tests {
     include!("redirect_fragment_test.rs");
     include!("redirect_review_test.rs");
     include!("redirect_relation_test.rs");
+    include!("redirect_userinfo_test.rs");
     include!("guard_attach_tree_test.rs");
 
     #[test]
