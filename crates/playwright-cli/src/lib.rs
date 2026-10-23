@@ -12,6 +12,7 @@ mod discover;
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
 mod help;
+mod landing;
 mod launch;
 mod net;
 mod page_tools;

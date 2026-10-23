@@ -85,6 +85,21 @@ function ariaAnswer(capture, location, expression) {
   return undefined;
 }
 
+const LANDING = "Symbol.for('slicc-landing')";
+
+function landed(mode) {
+  return { arm: 'armed', read: ['landed'], visible: 'visible', focus: 'editable' }[mode] ?? 'done';
+}
+
+function landingCall(params) {
+  if (params.functionDeclaration?.includes(LANDING))
+    return [params.arguments?.[0]?.value, params.arguments?.[1]?.value];
+  const match = params.expression?.includes(LANDING)
+    ? params.expression.match(/\}\)\("(\w+)", (.*)\)$/s)
+    : null;
+  return match ? [match[1], JSON.parse(match[2])] : undefined;
+}
+
 function cookieDomain(domain) {
   return domain.startsWith('.') ? domain : `.${domain}`;
 }
@@ -115,6 +130,7 @@ export async function fakeCdp({
   childFrames = [],
   intercept,
   aria = () => defaultAria,
+  landing = landed,
   tree = { nodes: [] },
   location,
   frameTree,
@@ -522,6 +538,8 @@ export async function fakeCdp({
             model: { content: [0, 0, 10, 0, 10, 10, 0, 10], width: 10, height: 10 },
           });
         case 'Runtime.evaluate': {
+          const call = landingCall(params);
+          if (call) return answer({ result: { type: 'string', value: landing(...call, target) } });
           if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {
             target.history.currentIndex -= 1;
             target.url = target.history.entries[target.history.currentIndex].url;
@@ -561,6 +579,10 @@ export async function fakeCdp({
           return answer({ result: { type: 'string', value: 'fake-eval' } });
         }
         case 'Runtime.callFunctionOn':
+          if (landingCall(params))
+            return answer({
+              result: { type: 'string', value: landing(...landingCall(params), target) },
+            });
           return answer({
             result: { type: 'object', value: { x: 5, y: 5, width: 10, height: 10 } },
           });

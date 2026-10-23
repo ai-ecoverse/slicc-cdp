@@ -3508,6 +3508,7 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
 }
 
 include!("dialog.rs");
+include!("front.rs");
 
 #[cfg(test)]
 mod tests {
