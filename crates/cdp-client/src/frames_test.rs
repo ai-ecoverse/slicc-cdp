@@ -189,7 +189,9 @@ fn extension_tree(main: &str) -> Value {
     }})
 }
 
-fn over_extension(main: &str) -> (Cdp, Rc<RefCell<Vec<Value>>>, Rc<Cell<bool>>) {
+type OverExtension = (Cdp, Rc<RefCell<Vec<Value>>>, Rc<Cell<bool>>);
+
+fn over_extension(main: &str) -> OverExtension {
     let sent = Rc::new(RefCell::new(Vec::new()));
     let tab_refused = Rc::new(Cell::new(false));
     let mut cdp = Cdp::from_transport(Box::new(Extension { sent: sent.clone(), incoming: VecDeque::new(), tree: extension_tree(main), tab_refused: tab_refused.clone(), attached: 0 }));
