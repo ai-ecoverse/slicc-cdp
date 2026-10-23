@@ -70,28 +70,22 @@ for (const transport of ['native', 'wasi']) {
       armed = true;
       const read = client.send('DOM.getDocument', { depth: -1, pierce: true }, session);
       await entered;
-      const params = { source: 'persistent capability' };
+      const params = { url: 'https://private.example.invalid/' };
       const sentAt = Date.now();
-      const denied = assert.rejects(
-        client.send('Page.addScriptToEvaluateOnNewDocument', params),
-        /slicc: refused: persistent page capabilities/
-      );
+      const denied = assert.rejects(client.send('Page.navigate', params), /slicc: refused: /);
       const restore = new Restore({ forwardAudit: true, tag: 'audit-contract' });
-      restore.result.probes = [
-        { id: 1, method: 'Page.addScriptToEvaluateOnNewDocument', params, sentAt },
-      ];
+      restore.result.probes = [{ id: 1, method: 'Page.navigate', params, sentAt }];
       restore.gate = { audit: ledger.auditor(undefined) };
       await restore.audit(false);
       assert.equal(restore.result.delay.audit.result.complete, false);
       assert.equal(restore.result.delay.audit.result.probes[0].complete, false);
       assert.equal(restore.result.commandsUnforwarded, 'incomplete');
       assert.deepEqual(restore.missing, []);
-      assert(
-        !backend.calls.some((message) => message.method === 'Page.addScriptToEvaluateOnNewDocument')
-      );
+      assert(!backend.calls.some((message) => message.method === 'Page.navigate'));
       release();
       await read;
       await denied;
+      assert(!backend.calls.some((message) => message.method === 'Page.navigate'));
       await restore.audit(true);
       assert.equal(restore.result.delay.finalAudit.result.complete, true);
       assert.equal(restore.result.delay.finalAudit.result.probes[0].complete, true);

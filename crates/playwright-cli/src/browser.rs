@@ -1,4 +1,5 @@
 use crate::cdp::{self, Cdp};
+use crate::landing::{self, Anchor, Gesture, Scope};
 use crate::net::base64_decode;
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::net::base64_encode;
@@ -93,6 +94,11 @@ pub fn create_target(
         cdp::detach(cdp, &session);
         return Err(message);
     }
+    if let Err(message) = crate::page_tools::arm_network(cdp, &session, state) {
+        route::disarm(cdp, &session);
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
     let mut abandon = false;
     let loaded = if blank {
         cdp.wait_load(&session)
@@ -146,6 +152,11 @@ pub fn watch_attach(cdp: &mut Cdp, state: &Session, target_id: &str) -> Result<S
         return Err(message);
     }
     if let Err(message) = route::arm(cdp, target_id, &session, &state.routes) {
+        cdp::detach(cdp, &session);
+        return Err(message);
+    }
+    if let Err(message) = crate::page_tools::arm_network(cdp, &session, state) {
+        route::disarm(cdp, &session);
         cdp::detach(cdp, &session);
         return Err(message);
     }
@@ -213,6 +224,7 @@ pub fn navigate(
         cdp.call("Page.enable", json!({}), Some(&session))?;
         trace::enable(cdp, &session)?;
         route::arm(cdp, target_id, &session, &state.routes)?;
+        crate::page_tools::arm_network(cdp, &session, state)?;
         let result = cdp.call("Page.navigate", json!({ "url": url }), Some(&session))?;
         if let Some(error) = result.get("errorText").and_then(|v| v.as_str()) {
             return Err(format!("navigate: {error}\n"));
@@ -661,8 +673,9 @@ pub fn click_ref(
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
         let value = evaluate(cdp, session, &expression, false)?;
-        dispatch_click(cdp, session, &value.value, button, modifiers)?;
-        return Ok(());
+        let point = center(&value.value);
+        let gesture = Gesture::Click { button, modifiers };
+        return landing::pointer(cdp, &Scope::page(session), &Anchor::Selector(selector), point, gesture, &mut |cdp| dispatch_click(cdp, session, point, button, modifiers));
     }
     Err("element has no backend node\n".to_string())
 }
@@ -709,24 +722,30 @@ fn click_backend(
         )?;
         return Ok(());
     }
-    dispatch_click(cdp, session, &value, button, modifiers)
+    let point = center(&value);
+    let gesture = Gesture::Click { button, modifiers };
+    landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), point, gesture, &mut |cdp| dispatch_click(cdp, session, point, button, modifiers))
 }
 
-fn dispatch_click(
-    cdp: &mut Cdp,
-    session: &str,
-    value: &Value,
-    button: &str,
-    modifiers: i64,
-) -> Result<(), String> {
+fn center(value: &Value) -> (f64, f64) {
     let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let cx = if width > 0.0 { x + width / 2.0 } else { x };
     let cy = if height > 0.0 { y + height / 2.0 } else { y };
+    (cx, cy)
+}
+
+fn dispatch_click(
+    cdp: &mut Cdp,
+    session: &str,
+    (cx, cy): (f64, f64),
+    button: &str,
+    modifiers: i64,
+) -> Result<(), String> {
     for kind in ["mousePressed", "mouseReleased"] {
-        cdp.call(
+        cdp.call_for(
             "Input.dispatchMouseEvent",
             json!({
                 "type": kind,
@@ -737,6 +756,7 @@ fn dispatch_click(
                 "modifiers": modifiers,
             }),
             Some(session),
+            landing::INPUT_WAIT,
         )?;
     }
     Ok(())
@@ -806,11 +826,21 @@ pub fn fill_ref(cdp: &mut Cdp, session: &str, rec: &RefRec, text: &str) -> Resul
 }
 
 pub fn insert_text(cdp: &mut Cdp, session: &str, text: &str) -> Result<(), String> {
-    cdp.call("Input.insertText", json!({ "text": text }), Some(session))?;
+    cdp.call_for("Input.insertText", json!({ "text": text }), Some(session), landing::INPUT_WAIT)?;
     Ok(())
 }
 
+pub fn type_text(cdp: &mut Cdp, session: &str, text: &str) -> Result<(), String> {
+    landing::text(cdp, session, text, &mut |cdp| insert_text(cdp, session, text))
+}
+
 pub fn press_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> {
+    let (key_name, code, _, text, modifiers) = key_info(key);
+    let keyed = landing::Keyed { key: &key_name, code: &code, text: text.as_deref(), modifiers };
+    landing::key(cdp, session, &keyed, &mut |cdp| dispatch_key(cdp, session, key))
+}
+
+fn dispatch_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> {
     let (key_name, code, vk, text, modifiers) = key_info(key);
     let mut down = json!({
         "type": "keyDown",
@@ -822,8 +852,8 @@ pub fn press_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> 
     if let Some(text) = text {
         down["text"] = json!(text);
     }
-    cdp.call("Input.dispatchKeyEvent", down, Some(session))?;
-    cdp.call(
+    cdp.call_for("Input.dispatchKeyEvent", down, Some(session), landing::INPUT_WAIT)?;
+    cdp.call_for(
         "Input.dispatchKeyEvent",
         json!({
             "type": "keyUp",
@@ -833,6 +863,7 @@ pub fn press_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> 
             "modifiers": modifiers,
         }),
         Some(session),
+        landing::INPUT_WAIT,
     )?;
     Ok(())
 }
@@ -1048,27 +1079,26 @@ fn dblclick_backend(
         Some(session),
     )?;
     let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
-    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cx = if width > 0.0 { x + width / 2.0 } else { x };
-    let cy = if height > 0.0 { y + height / 2.0 } else { y };
-    for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
-        cdp.call(
-            "Input.dispatchMouseEvent",
-            json!({
-                "type": kind,
-                "x": cx,
-                "y": cy,
-                "button": button,
-                "clickCount": count,
-                "modifiers": modifiers,
-            }),
-            Some(session),
-        )?;
-    }
-    Ok(())
+    let (cx, cy) = center(&value);
+    let gesture = Gesture::Double { button, modifiers };
+    landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), (cx, cy), gesture, &mut |cdp| {
+        for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
+            cdp.call_for(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": kind,
+                    "x": cx,
+                    "y": cy,
+                    "button": button,
+                    "clickCount": count,
+                    "modifiers": modifiers,
+                }),
+                Some(session),
+                landing::INPUT_WAIT,
+            )?;
+        }
+        Ok(())
+    })
 }
 
 pub fn hover_ref(
@@ -1088,16 +1118,9 @@ pub fn hover_ref(
         let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let cx = frame_offset.0 + fx;
         let cy = frame_offset.1 + fy;
-        cdp.call(
-            "Input.dispatchMouseEvent",
-            json!({
-                "type": "mouseMoved",
-                "x": cx,
-                "y": cy,
-            }),
-            Some(input_session(session, rec)),
-        )?;
-        return Ok(());
+        let input = input_session(session, rec);
+        let scope = Scope { session, frame: Some(frame_id), input };
+        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), Gesture::Hover, &mut |cdp| move_mouse(cdp, input, (cx, cy)));
     }
     if let Some(backend) = rec.backend_node_id {
         hover_backend(cdp, session, backend)?;
@@ -1133,21 +1156,12 @@ fn hover_backend(
         Some(session),
     )?;
     let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
-    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let width = value.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let height = value.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cx = if width > 0.0 { x + width / 2.0 } else { x };
-    let cy = if height > 0.0 { y + height / 2.0 } else { y };
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mouseMoved",
-            "x": cx,
-            "y": cy,
-        }),
-        Some(session),
-    )?;
+    let point = center(&value);
+    landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), point, Gesture::Hover, &mut |cdp| move_mouse(cdp, session, point))
+}
+
+fn move_mouse(cdp: &mut Cdp, session: &str, (x, y): (f64, f64)) -> Result<(), String> {
+    cdp.call_for("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }), Some(session), landing::INPUT_WAIT)?;
     Ok(())
 }
 
@@ -1653,8 +1667,7 @@ pub fn validate_upload_path(path: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
-fn mime_from_name(name: &str) -> String {
+pub(crate) fn mime_from_name(name: &str) -> String {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "html" | "htm" => "text/html",

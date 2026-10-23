@@ -8,6 +8,7 @@ pub const BROWSER_METHODS: &[&str] = &[
     "Target.closeTarget",
     "Target.activateTarget",
     "Browser.getVersion",
+    "Browser.getWindowForTarget",
     "Slicc.action",
 ];
 

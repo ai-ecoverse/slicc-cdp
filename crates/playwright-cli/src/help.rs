@@ -28,9 +28,19 @@ pub fn global_help() -> String {
         row("eval <func> [target]", "evaluate javascript expression on page or element"),
         row("dialog-accept [prompt]", "accept a dialog"),
         row("dialog-dismiss", "dismiss a dialog"),
+        row("dialog-hold", "hold a foreground guarded dialog session"),
+        row("resize <w> <h>", "resize the browser window"),
         String::new(),
         "Keyboard:".to_string(),
         row("press <key>", "press a key on the keyboard, `a`, `arrowleft`"),
+        row("keydown <key>", "press a key down on the keyboard"),
+        row("keyup <key>", "press a key up on the keyboard"),
+        String::new(),
+        "Mouse:".to_string(),
+        row("mousemove <x> <y>", "move mouse to a given position"),
+        row("mousedown [button]", "press mouse down"),
+        row("mouseup [button]", "press mouse up"),
+        row("mousewheel <dx> <dy>", "scroll mouse wheel"),
         String::new(),
         "Pointer and form:".to_string(),
         row("hover <ref>", "hover over an element"),
@@ -40,6 +50,7 @@ pub fn global_help() -> String {
         row("uncheck <ref>", "uncheck a checkbox"),
         row("upload <ref> <file...>", "upload files to a file input"),
         row("drag <startRef> <endRef>", "drag one element to another"),
+        row("drop <target>", "drop files or data onto an element"),
         String::new(),
         "Navigation:".to_string(),
         row("go-back", "navigate to the previous page in history"),
@@ -86,6 +97,17 @@ pub fn global_help() -> String {
         row("route <pattern>", "mock network requests matching a url pattern"),
         row("route-list", "list all active network routes"),
         row("unroute [pattern]", "remove routes matching a pattern (or all routes)"),
+        row("network-state-set <state>", "set the browser network state to online or offline"),
+        String::new(),
+        "DevTools:".to_string(),
+        row("generate-locator <target>", "generate a playwright locator for the given element"),
+        row("highlight [target]", "show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."),
+        String::new(),
+        "Recording:".to_string(),
+        row("recording-start", "start recording user actions"),
+        row("recording-stop", "stop recording user actions and print them as playwright code"),
+        row("record", "alias of recording-start"),
+        row("stop-recording", "alias of recording-stop"),
         String::new(),
         "Browsers:".to_string(),
         row(
@@ -104,6 +126,8 @@ pub fn global_help() -> String {
         String::new(),
         "SLICC-only:".to_string(),
         row("frames", "list frame IDs for the current page"),
+        row("eval-file <path>", "evaluate javascript from a local file on page"),
+        row("fetch <url>", "fetch a url in the tab and list its link headers"),
         String::new(),
         "Install:".to_string(),
         row("upgrade [--check]", "replace this binary with the latest release (alias: update)"),
@@ -159,6 +183,76 @@ pub fn command_help(spec: &Spec) -> String {
 fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
         "upgrade" | "update" => crate::upgrade::usage(name),
+        "generate-locator" => page(
+            "generate-locator <target>",
+            &["Generate a Playwright locator for the given element"],
+            &[("<target>", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[],
+        ),
+        "highlight" => page(
+            "highlight [target]",
+            &["Show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."],
+            &[("[target]", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[
+                ("--hide", "hide a previously added highlight for this element, or all page highlights when no element is given"),
+                ("--style", "additional inline css applied to the highlight overlay, e.g. \"outline: 2px dashed red\""),
+            ],
+        ),
+        "network-state-set" => page(
+            "network-state-set <state>",
+            &[
+                "Set the browser network state to online or offline",
+                "The state is saved with the session. Offline applies to each tab while a later command is attached to it.",
+            ],
+            &[("<state>", "set to \"offline\" to simulate offline mode, \"online\" to restore network connectivity")],
+            &[],
+        ),
+        "eval-file" => page(
+            "eval-file <path>",
+            &[
+                "Evaluate JavaScript from a local file on page",
+                "Reads only the file you name and evaluates it like eval: a function expression is called, and top-level await and return work.",
+            ],
+            &[("<path>", "file with the JavaScript to evaluate")],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+                ("--frame <frameId>", "frame to run in, in an isolated world"),
+                ("--output <path>", "save the result to a file (alias: --filename)"),
+            ],
+        ),
+        "fetch" => page(
+            "fetch <url>",
+            &[
+                "Fetch a URL in the tab and list its Link headers",
+                "Runs fetch() in the tab with its cookies and origin and prints JSON with the status, the Link header entries and any SLICC upskill link. The body is not read. Redirects are manual: every hop must pass the guard, and missing or ambiguous redirect metadata is refused.",
+                "Seven's origins and the vault are refused, and a redirect to them fails the request.",
+            ],
+            &[("<url>", "http(s) URL, absolute or relative to the tab")],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+                ("--method <method>", "request method, defaults to GET"),
+            ],
+        ),
+        "recording-start" | "record" => page(
+            &format!("{name} "),
+            &[
+                "Start recording user actions",
+                "A foreground holder: it records until stdin closes or recording-stop runs in another terminal.",
+                "Stdout is JSON events: ready, paused, resumed, and stopped with the recorded actions.",
+                "Only verified ordinary main-frame documents are recorded. Capture pauses on unverified documents and stops when the tab turns protected.",
+            ],
+            &[],
+            &[("--tab <targetId>", "tab to record")],
+        ),
+        "recording-stop" | "stop-recording" => page(
+            &format!("{name} "),
+            &[
+                "Stop recording user actions and print them as Playwright code",
+                "Stops the recording-start holder of this session and prints the actions it recorded.",
+            ],
+            &[],
+            &[],
+        ),
         "open" => page(
             "open [url]",
             &[
@@ -455,6 +549,58 @@ fn implemented_page(name: &str) -> Option<String> {
             ],
             &[],
         ),
+        "resize" => page(
+            "resize <w> <h>",
+            &[
+                "Resize the browser window",
+                "",
+                "Sets the window bounds so the viewport becomes <w> by <h> CSS pixels and stays that size after the command exits.",
+                "Refused while a protected or unverified tab or frame is open in the same browser profile.",
+            ],
+            &[("<w>", "width of the browser window"), ("<h>", "height of the browser window")],
+            &[],
+        ),
+        "keydown" | "keyup" => page(
+            &format!("{name} <key>"),
+            &[
+                if name == "keydown" { "Press a key down on the keyboard" } else { "Press a key up on the keyboard" },
+                "",
+                "Held keys and modifiers are kept per tab in the saved session. Refused while focus is inside an iframe or a closed shadow root.",
+            ],
+            &[("<key>", "name of the key to press or a character to generate, such as `arrowleft` or `a`")],
+            &[],
+        ),
+        "mousemove" => page(
+            "mousemove <x> <y>",
+            &["Move mouse to a given position", "", "The pointer position and held buttons are kept per tab in the saved session. Refused over an iframe or other embedded frame."],
+            &[("<x>", "x coordinate"), ("<y>", "y coordinate")],
+            &[],
+        ),
+        "mousedown" | "mouseup" => page(
+            &format!("{name} [button]"),
+            &[
+                if name == "mousedown" { "Press mouse down" } else { "Press mouse up" },
+                "",
+                "Uses the position from the last mousemove on this tab. Refused over an iframe or other embedded frame.",
+            ],
+            &[("[button]", "button to press, defaults to left")],
+            &[],
+        ),
+        "mousewheel" => page(
+            "mousewheel <dx> <dy>",
+            &["Scroll mouse wheel", "", "Scrolls at the position from the last mousemove on this tab. Refused over an iframe or other embedded frame. A background tab is scrolled in place with an untrusted wheel event, because Chrome never answers trusted wheel events there."],
+            &[("<dx>", "x delta"), ("<dy>", "y delta")],
+            &[],
+        ),
+        "drop" => page(
+            "drop <target>",
+            &["Drop files or data onto an element", "", "Only the regular files named by --path are read, up to 25 MiB in total."],
+            &[("<target>", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[
+                ("--path", "absolute path to a file to drop onto the element (repeatable)"),
+                ("--data", "data to drop in \"mime/type=value\" format, e.g. --data \"text/plain=hello\" (repeatable)"),
+            ],
+        ),
         "frames" => page(
             "frames",
             &[
@@ -475,6 +621,24 @@ fn implemented_page(name: &str) -> Option<String> {
             ],
             &[("[prompt]", "the text of the prompt in case of a prompt dialog.")],
             &[("--tab <targetId>", "tab with the dialog")],
+        ),
+        "dialog-hold" => page(
+            "dialog-hold --tab <targetId>",
+            &[
+                "Hold a foreground guarded dialog session",
+                "",
+                "Emits newline JSON ready, dialog-opened, handled, refused and stopped events.",
+                "Keep stdin open; EOF ends the holder. No daemon or mailbox relay.",
+                "Requests are JSON lines with unsigned id and dialogId, command dialog-accept",
+                "or dialog-dismiss, and optional promptText for acceptance.",
+                "Replies echo id. No open observed dialog gives a no-dialog event.",
+                "Dialogs opened before holder attachment are still unanswerable.",
+                "ready loaderId may be null (source unavailable); document-ready supplies a",
+                "loaderId only after a verified main-frame frameNavigated event.",
+                "Dialog answers require verified ordinary ownership independently of loaderId.",
+            ],
+            &[],
+            &[("--tab <targetId>", "ordinary tab to observe")],
         ),
         "dialog-dismiss" => page(
             "dialog-dismiss",
@@ -626,6 +790,9 @@ fn implemented_page(name: &str) -> Option<String> {
                 "  --lick: write each event to ~/.slicc/discoveries/<hash>.json.",
                 "    Default when SLICC_CDP_URL is set and no other sink is given.",
                 "",
+                "WebMCP tool changes after load are reported only while a webmcp-polyfill",
+                "holder runs for the tab with the same CDP endpoint and saved session.",
+                "",
                 "Opt-out: --off exits immediately. A file named discover.disabled in",
                 "the user config dir (e.g. ~/.config/slicc/ or ~/Library/Application Support/slicc/)",
                 "also disables the watcher; checked at start and on SIGHUP.",
@@ -653,6 +820,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "Protected and unverified documents never receive the shim.",
                 "An already-open page may only register tools at load; --reload is opt-in.",
                 "Prints one JSON status line without bridge identifiers.",
+                "Prints a tools-changed JSON line when tools change after load.",
             ],
             &[],
             &[("--tab <targetId>", "required tab to hold"), ("--reload", "reload the tab once after arming the shim")],
@@ -768,7 +936,6 @@ fn arg_optional(spec: &Spec, index: usize) -> bool {
             | ("console", 0)
             | ("dialog-accept", 0)
             | ("unroute", 0)
-            | ("record", 0)
             | ("highlight", 0)
     )
 }

@@ -71,6 +71,16 @@ playwright-cli --cdp 9333 webmcp-polyfill --tab <targetId> --reload
 
 The holder is a foreground process: keep stdin open, and close stdin to stop it. Its first stdout line is JSON with `event: "ready"`, `loaderId`, `mode`, `tab`, `late`, `reloaded` and measured `pauseMicros`. After later navigations, a `document-ready` JSON event identifies the current `loaderId` once the top document has loaded, every frame document the holder is waiting on, including cross-origin iframes in their own processes, has passed or failed the gate, and the holder has persisted its verified metadata; consumers should await this event before listing load-time tools. Ordinary CLI saves preserve holder-owned metadata, and listing refreshes it after verifying the current document. `--reload` is opt-in: it reloads only the selected tab so registration during page load sees the API. Without it, the shim installs into the already-loaded document and `late: true` warns that load-time registrations may have been missed. An existing native or page-provided API is not replaced. The shim's document and navigator aliases remain replaceable; the holder retains its registered tools through a private, random lexical bridge, not a page-callable binding.
 
+While the holder runs, a page that registers or unregisters tools after load, including in an admitted cross-origin iframe, produces a `tools-changed` JSON line:
+
+```json
+{"event":"tools-changed","tab":"<targetId>","target":"<targetId>","frameId":"<frameId>","loaderId":"<loaderId>","origin":"https://shop.example","tools":[]}
+```
+
+`target` is the CDP target that hosts the frame: the tab, or a cross-origin iframe's own target. `tools` is that frame's list with the same fields, policy checks, escaping and URL redaction as `webmcp-list --json`, or `webmcp-list --json --from-origin <origin>` for a cross-origin frame. The holder adds no binding and no init script for this. About every 250 ms it reads the change counter of each admitted frame document's private bridge, or with native WebMCP that document's `getTools()` from an isolated world. It reports once no change has been seen for 250 ms, and at most a second after the first change. An event is printed only when the frame's list differs from the one it had at `ready` or `document-ready`, or from the last event; a frame document admitted later starts from `[]`. Events belong to one document generation: a change still pending when its frame or the top document navigates is dropped, and after a top-level navigation reporting resumes at the next `document-ready`. Protected, refused and unverified documents never produce events. A page-defined API that replaces `document.modelContext` is not watched.
+
+`discover` reports these changes too, but only from a running holder. In watch mode it reads the changes the holder publishes to the saved session, so the holder must use the same CDP endpoint and saved session (the same working directory, or the same `--session`). Each change becomes one `webmcp` event with `"via":"page-api"` and `"summary":{"event":"tools-changed","target":…,"frameId":…,"loaderId":…,"origin":…,"tools":[…]}`, and only while the tab's top document is still the one the holder reported. Changes published before `discover` started are not replayed. Without a holder, `discover` reports a page's WebMCP tools only when it loads.
+
 From another terminal, using the same CDP endpoint and saved session:
 
 ```sh
@@ -86,6 +96,87 @@ Only the hash-pinned shim can use the dedicated installer. Its inert pre-executi
 `webmcp-list` succeeds with an empty list (`--json`: `[]`) or “No WebMCP tools on this page” when WebMCP is available but has no registered tools. If `document.modelContext` is absent or null, both `webmcp-list` and `webmcp-call` print “WebMCP is unavailable on this page” to stderr, leave stdout empty and exit 2. Evaluation and connection failures exit 1.
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
+
+## Foreground dialog holder
+
+Start `playwright-cli --cdp "$CDP" -s "$SESSION" dialog-hold --tab "$TAB"` before triggering dialogs, keep its stdin open, and wait for its newline JSON `ready` event. This uses the same selected session and user config directory as other commands; there is no daemon or mailbox relay, and no prompt text is saved. Standalone `dialog-accept` and `dialog-dismiss` remain unchanged and do not relay into the holder.
+
+The holder retains its observing CDP session. A `dialog-opened` event supplies `dialogId`; answer that observed dialog by writing one JSON line to the holder's stdin:
+
+```json
+{"id":1,"dialogId":7,"command":"dialog-accept","promptText":"Lars"}
+{"id":2,"dialogId":8,"command":"dialog-dismiss"}
+```
+
+`id` and `dialogId` are unsigned integers. Each request gets a reply event correlated by `id`: `handled`, `no-dialog`, `stale-dialog`, `dialog-refused` or `invalid-request`. A request with no observed open dialog gets `no-dialog`; dialogs opened before this holder attached are still unanswerable. `dialog-closed` revokes the observed ID. Only current verified ordinary main-frame ownership can be answered; protected, unknown, opaque, stale or subframe ownership stays refused. Closing stdin emits `stopped` and detaches.
+
+`ready` contains `target`, `loaderId`, `loaderIdSource` and `status`. The initial `loaderId` can be null (`unavailable`, `observing`): the holder never invents one or queries a frozen renderer. A verified ordinary main-frame `frameNavigated` event supplies the loader ID in `document-ready` (`frame-navigated`, `document-verified`). Dialog ownership is independently reverified before every answer; a loader ID is not permission to handle a dialog. No dialog message, URL or prompt answer is echoed in events.
+
+`resize`, `keydown`, `keyup`, `mousemove`, `mousedown`, `mouseup`, `mousewheel` and `drop` take Microsoft's arguments, print its `### Ran Playwright code` lines and send Playwright's key definitions, buttons, coordinates and modifier masks. The deliberate differences:
+
+- Every command is its own process, so the pointer position, held buttons and held keys are saved per tab in the session, and the next command continues from them as Playwright's `page.mouse` and `page.keyboard` do. Modifiers held with `keydown` apply to later key and mouse events. On a macOS browser `keydown` sends Playwright's editing commands; `ControlOrMeta` follows the browser's platform rather than the CLI's.
+- Mouse commands first hit-test the whole pixels around the point with `DOM.getNodeForLocation` and refuse a point over an iframe, frame, object, embed or fenced frame, or inside a child frame. `keydown` and `keyup` refuse while focus is inside one of those or inside a closed shadow root. This keeps raw input out of protected and unverified frames.
+- A native HTML drag that `mousedown` and `mousemove` start is not intercepted. `Input.setInterceptDrags` is a persistent capability the guard refuses, and an intercepted drag could not span separate commands. `drag` and `drop` cover element-to-element and external drops.
+- `resize` sets the window with `Browser.setWindowBounds`, adding the measured difference between the window and the viewport, so the viewport becomes `<w>` by `<h>` and stays that size after the command exits. `Emulation.setDeviceMetricsOverride` is not used because Chrome clears it when the command's session detaches. Sizes must be whole numbers from 1 to 10000000. The guard admits the change only for the session's own window, with an ordinary current document and frame tree, and refuses it while any protected or unverifiable tab, frame or other window-capable target is open in the same browser profile, since a window resize reaches every tab in the window. Chrome's own `browser_ui` targets on `chrome://*.top-chrome/`, such as the omnibox popup of a headed window, are not tabs and are not counted.
+- `drop` dispatches synthetic `dragenter`, `dragover` and `drop` events in the page, as Microsoft's does, rather than `Input.dispatchDragEvent`, whose file list makes the browser read paths itself. The CLI reads only the regular files named with `--path`, resolved against the working directory, refuses directories and other non-regular files, and caps them at 25 MiB in total. The wasm build reads the kernel's files with the same code. The printed locator is `locator('aria-ref=<ref>')`, not Playwright's generated one, only snapshot refs are accepted as targets, and MIME types come from a short built-in table.
+- Chrome never acknowledges `Input.dispatchMouseEvent` `mouseWheel` in a background tab, and Playwright's pages are always visible. In a visible tab `mousewheel` sends the trusted wheel event. In a background tab it scrolls in place, without bringing the tab forward: from an isolated world it dispatches a cancelable, untrusted `WheelEvent` at the point to the element under it, and unless the page cancels that event, it scrolls the nearest ancestor that can scroll in each axis, or the page. Browser-level wheel effects such as Ctrl zoom, smooth scrolling and overscroll do not happen there. Only if that cannot run does `mousewheel` bring the tab to the front, send the trusted wheel and switch back, the same way as the other input commands (see [Input on background tabs](#input-on-background-tabs)). Otherwise it is refused and names `tab-select <index> --foreground`. `Input.synthesizeScrollGesture` is driven by the begin-frames a background tab does not get, and `Emulation.setFocusEmulationEnabled` and `Page.setWebLifecycleState` do not make a tab visible and are persistent capabilities the guard refuses, so none of them is used.
+- Errors go to stderr without the `### Error` heading, as for the other commands.
+- `--` ends the options, so `mousewheel -- 0 -100` scrolls up.
+
+### Input on background tabs
+
+Headed Chrome doesn't deliver trusted input to a tab it isn't showing, and playwright-cli's tabs usually stay in the background next to seven's. So `click`, `dblclick`, `hover`, `type` and `press` check from an isolated world which events reached the page. If Chrome dropped them, the same events are dispatched in place to the element under the point, or to the focused element, without bringing the tab forward. The page then sees them with `isTrusted: false`: there is no user activation, `:hover` doesn't change, and `click` is dispatched just after the command returns, so a dialog it opens doesn't block it. `type` needs a focused editable element. `press` handles printable keys, `Enter`, `Escape`, `Backspace` and `Delete` in place.
+
+Only when that can't work (another key, focus inside a frame, or nothing at the point) does it bring the tab to the front, send the input again, check that it arrived and switch back to the tab that was in front. The guard does the switching. It reads which tab is visible from isolated worlds of the ordinary tabs in the window, and switches back to seven's tab only when no ordinary tab there was visible and seven's is the one protected tab in that window. A tab alone in its window is brought forward with nothing to switch back. It refuses, so that no tab is activated, when the vault, another protected or unknown tab could have been in front, when a protected tab is in another window, or when the window is minimized. The error names `tab-select --foreground`. Input that still doesn't arrive fails with an error rather than reporting success.
+
+## Page tools
+
+`generate-locator`, `highlight` and `network-state-set` take Microsoft's arguments and options and print its output and exit codes. `eval-file` and `fetch` are SLICC-only. Where they differ from Microsoft's, or from SLICC's own handlers:
+
+- `generate-locator <ref>` runs Playwright's own selector generator and `asLocator` from the `playwright-core` 1.64 injected script (Apache-2.0, Copyright Microsoft Corporation), vendored in `crates/playwright-cli/vendor/playwright-injected.js.txt` with upstream's license header and its `LICENSE` and `NOTICE` beside it, in an isolated world of the element's frame, so it prints the same `getByRole(…)`, `getByTestId(…)` or `.nth(…)` locator. A ref in an iframe gets the iframe's locator and `.contentFrame()` in front. A frame nested inside an out-of-process iframe is refused instead.
+- `highlight <ref>` prints `Highlighted locator('aria-ref=e5')` like upstream. The overlay is SLICC's: an `x-slicc-highlight` element in the top layer, with an open shadow root and one box per element, that follows the element while its isolated world lives. It shows no locator tooltip. `--style` is appended to the box's inline style. `--hide <ref>` removes that element's box, and `--hide` alone removes every overlay in the tab's frames that the guard admits.
+- `network-state-set offline|online` is saved with the session, like routes, because each command runs in its own process. While offline, every later command that attaches to a tab first sends Playwright's `Network.emulateNetworkConditions` with `offline: true`, latency 0 and unlimited throughput, and the setting ends when that command detaches. Out-of-process iframes and workers keep their network. The guard admits only that exact shape, only on an ordinary page session, and never on seven's, the vault's or an unknown target. It does not change guard interception. Upstream's `--tab` is not accepted, as upstream has none.
+- The vendored script is `injectedScriptSource` from `playwright-core@1.64.0-alpha-1790635538000` (`lib/coreBundle.js`), minified with `esbuild@0.25.10`. `node scripts/vendor-playwright-injected.mjs [version]` downloads that package with `npm pack`, extracts and minifies the source the same way, and rewrites the file, `LICENSE` and `NOTICE`; with the default version it reproduces the committed bytes. The `.txt` extension keeps the license header out of the no-comment lint, and the file is only embedded with `include_str!`.
+- These ref commands take snapshot refs only, not selectors, like `click`. Errors go to stderr; upstream prints them on stdout under `### Error`, except for `highlight` with neither a ref nor `--hide`, which prints upstream's error.
+- `eval-file <path> [--tab] [--frame] [--output|--filename <file>]` reads only the file you name, up to 16 MiB of UTF-8, and evaluates it through `eval`'s guarded path: a function expression is called, and top-level `await` and `return` work. `--output` prints `Result saved to <file> (<n> KB)`.
+- `fetch <url> [--method <method>] [--tab]` runs `fetch()` in the tab, so the tab's cookies, origin and CORS rules apply. It is not SLICC's proxied fetch and has no `--discover`. A relative URL is resolved against the document. Only http and https are fetched. A protected destination is refused before connecting and again after it is resolved. Every request uses `redirect: 'manual'`: ordinary redirect Locations must be unambiguously correlated to that request in admitted CDP Network events and pass the guard before the next hop is sent. Missing or ambiguous redirect metadata fails closed, and at most 20 redirects are followed. POST becomes GET on 301/302, and 303 becomes GET except for HEAD; 307/308 preserve the method. The body is never read. It prints JSON with `url`, `status`, `redirected`, the `links` from the final `Link` header (one entry per `rel`, protected targets dropped) and the SLICC `upskill` link as `handoff`, and exits 1 on non-2xx responses or with an `error` when the request fails. The guard redacts SLICC's `handoff` relation, which names seven's origin, so it is listed only as that origin and never reported as a handoff.
+
+## Regenerating the Playwright injected script
+
+From the repository root, run:
+
+```sh
+node scripts/vendor-playwright-injected.mjs 1.64.0-alpha-1790635538000
+git diff -- crates/playwright-cli/vendor
+npm run lint
+```
+
+The pinned package and `esbuild@0.25.10` produce the committed bytes. Keep the upstream copyright and Apache-2.0 header, `LICENSE` and `NOTICE` together when updating. If changing the source version, update the script's default version and this README, then run the native and kernel `page-tools.test.mjs` locator regressions in CI.
+
+## Recording
+
+`recording-start` and `recording-stop` are Microsoft's commands of the same names; `record` and `stop-recording` are aliases. Microsoft keeps the browser in a daemon, so its `recording-start` returns at once. There is no daemon here: `recording-start` is a foreground holder, like `webmcp-polyfill`. It records until its stdin closes or `recording-stop` runs in another terminal with the same session.
+
+```sh
+playwright-cli recording-start --tab <targetId>
+playwright-cli recording-stop
+```
+
+The holder prints one JSON event per line: `ready` with the tab and `loaderId`, `paused` and `resumed` around documents it may not record, and `stopped` with a `reason` (`stdin`, `stop`, `closed` or `refused`) and the recorded `actions`. `recording-stop` prints Microsoft's result: `### Result`, `Recording stopped. Recorded actions:` and the actions in a `js` code block, or `Recording stopped. No actions were recorded.` Without a running holder it prints Microsoft's `Error: No recording in progress, use browser_start_recording to start one.` on stderr and exits 1. A second `recording-start` while one runs prints `Error: Recording is already in progress.` and exits 1.
+
+The recorder writes Playwright code for trusted clicks, double clicks, right and middle clicks, fills, key presses, checks, selects and file choices in the main frame. A new document is recorded as `page.goto` unless a click, press or fill came less than five seconds before it. Locators prefer a test id, then role and accessible name (from Playwright's aria code in `aria-snapshot.js`), placeholder, label, text, role alone, a stable id, and finally `nth` or a CSS path.
+
+The recorder runs in an isolated world that the guarded client installs only after the guard has verified the current main-frame document, and its events are read through guarded `Runtime.evaluate` calls pinned to that context. It uses no binding, init script, screencast or tracing. When the holder stops it removes the recorder's listeners, each start replaces any earlier recorder on that document, and a recorder that nobody drains for five seconds drops what it sees, so input between recordings is never captured. Nothing is installed in or read from seven's, the vault's, protected, unverified or unknown documents: capture pauses on an unverified document, and recording stops with `reason: "refused"` and exit 1 when the tab turns protected. Actions recorded before that stay available to `recording-stop`. Frames are not recorded, so a protected iframe is never read. A `goto` URL is redacted like every other URL unless `--full-urls` is given. The holder keeps the actions in memory; when it stops for `recording-stop`, a closed tab or a refusal, the result waits in a 0600 file next to the saved session until `recording-stop` reads and deletes it.
+
+Deliberate differences from Microsoft's recorder:
+
+- `recording-start` holds the terminal and prints JSON events instead of `### Result` and returning.
+- `recording-stop` prints no `### Page` or `### Snapshot` section, like the other commands here.
+- Only the selected tab's main frame is recorded: no iframes, popups (`page1`), dialog, download or popup signals, and no assertions.
+- Events are observed, not intercepted: there is no recorder overlay, and the locator generator is a smaller version of Playwright's.
+- The code is always JavaScript; the `codegen` language setting does not exist here.
+- `--tab <targetId>` picks the tab. The old SLICC placeholders `record [url] --filter` and `stop-recording <recordingId>` (HAR recording) are gone; the names remain as argument-free aliases.
+- Microsoft's `video-*` and `tracing-*` commands are not offered: `Page.startScreencast` and `Tracing.start` keep capturing across navigations, including into protected documents, and the guard refuses both.
 
 ## Develop
 
@@ -120,6 +211,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Target.closeTarget` (`crates/playwright-cli/src/browser.rs` `close_target`)
 - `Target.activateTarget` (`crates/playwright-cli/src/browser.rs` `activate`)
 - `Browser.getVersion` (`crates/playwright-cli/src/webmcp.rs` `chrome_major_version`)
+- `Browser.getWindowForTarget` (`crates/cdp-client/src/front.rs` `front_window`)
 - `Slicc.action` (`crates/playwright-cli/src/action.rs` `begin`)
 
 ### Browser-level events
@@ -145,7 +237,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Network.setRequestInterception`
 - `Fetch.*`
 
-The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including generic init scripts, bindings, page overrides and automatic debugger-waiting attachment. The dedicated WebMCP installer is the sole vetted-shim exception: it accepts a session, never client-provided source, and gates the pinned bytes on guard-owned document verification. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
+The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including generic init scripts, bindings, page overrides and automatic debugger-waiting attachment. `Network.emulateNetworkConditions` is the one network override admitted, and only as Playwright's offline toggle on an ordinary page session. The dedicated WebMCP installer is the sole vetted-shim exception: it accepts a session, never client-provided source, and gates the pinned bytes on guard-owned document verification. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
 
 ### Session-level domains
 

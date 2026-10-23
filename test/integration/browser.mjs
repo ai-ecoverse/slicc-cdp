@@ -45,7 +45,7 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   options.signal?.throwIfAborted();
   let port = options.port ?? 0;
   if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
-  const headless = headlessByDefault(process.env);
+  const headless = options.headless ?? headlessByDefault(process.env);
   const executable = process.env.CHROMIUM_EXECUTABLE || (await findBrowser())?.executable;
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let screen;
@@ -84,9 +84,11 @@ export async function launchBrowser(extraArgs = [], options = {}) {
     chromeLog = (chromeLog + chunk.toString('utf8')).slice(-4000);
   });
   let stopping;
+  let diedFirst = null;
   const stop = () =>
     (stopping ??= (async () => {
       const running = child.exitCode === null && !child.signalCode;
+      if (!running) diedFirst = chromeStatus(child, chromeLog);
       const sendSignal = (signal) => {
         try {
           if (process.platform === 'win32') child.kill(signal);
@@ -142,6 +144,7 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       port,
       wsUrl,
       died() {
+        if (stopping) return diedFirst;
         return child.exitCode !== null || child.signalCode ? chromeStatus(child, chromeLog) : null;
       },
       headless,

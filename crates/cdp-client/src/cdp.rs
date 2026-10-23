@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 #[path = "webmcp_guard.rs"]
 mod webmcp_guard;
+#[path = "issued.rs"]
+mod issued;
+pub(crate) use issued::target_refusal;
 
 pub trait Transport {
     fn send_text(&mut self, text: &str) -> Result<(), String>;
@@ -32,6 +35,10 @@ pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
+const WAITER_SLICE: Duration = Duration::from_millis(5);
+const AUTO_ATTACH: &str = "slicc: refused: auto-attach is not supported by slicc-cdp\n";
+const FLATTEN: &str = "slicc: refused: attach with flatten: true\n";
+const PERSISTENT: &str = "slicc: refused: persistent page capabilities are not supported by slicc-cdp\n";
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
@@ -86,6 +93,8 @@ struct MainDocument {
     probed: bool,
 }
 
+pub type Waiter = Box<dyn FnMut(&Cdp)>;
+
 pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: i64,
@@ -93,6 +102,7 @@ pub struct Cdp {
     events: Vec<Value>,
     dialog_sessions: BTreeSet<String>,
     dialogs: BTreeMap<String, Dialog>,
+    dialog_documents: BTreeMap<String, DialogDocument>,
     dialog_epoch: u64,
     trace_cookies: Vec<Value>,
     guard: Protected,
@@ -152,6 +162,9 @@ pub struct Cdp {
     webmcp: webmcp_guard::Webmcp,
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
+    issued: issued::Issued,
+    waiter: Option<Waiter>,
+    waiter_due: Instant,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
@@ -169,6 +182,7 @@ impl Cdp {
             events: Vec::new(),
             dialog_sessions: BTreeSet::new(),
             dialogs: BTreeMap::new(),
+            dialog_documents: BTreeMap::new(),
             dialog_epoch: 0,
             trace_cookies: Vec::new(),
             guard: Protected::default(),
@@ -228,6 +242,9 @@ impl Cdp {
             webmcp: webmcp_guard::Webmcp::default(),
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
+            issued: issued::Issued::default(),
+            waiter: None,
+            waiter_due: Instant::now(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -406,11 +423,12 @@ impl Cdp {
                 sent["executionContextId"] = json!(proof.id);
             } else { sent["uniqueContextId"] = json!(unique); }
         }
+        let (forwarded, sent) = self.fetch_command(method, sent, session_id);
         let compile_session = if method == "Runtime.compileScript" {
             session_id.and_then(|session| self.session_target(session)).and_then(|target| self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target))).cloned()
         } else { None };
         let frame_epoch = self.frame_epoch;
-        let result = match self.raw_call_execution(method, sent, compile_session.as_deref().or(session_id), timeout, executed) {
+        let result = match self.raw_call_execution(&forwarded, sent, compile_session.as_deref().or(session_id), timeout, executed) {
             Ok(result) => result,
             Err(message) => {
                 if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false)?; }
@@ -499,7 +517,8 @@ impl Cdp {
             .then(|| shield::request_key(&params))
             .flatten()
             .zip(session_id.map(str::to_string));
-        let sent = self.send(method, params, session_id)?;
+        let (forwarded, params) = self.fetch_command(method, params, session_id);
+        let sent = self.send(&forwarded, params, session_id)?;
         if let Some((id, session)) = answered {
             self.answering.insert(sent, (session, id));
         }
@@ -576,18 +595,20 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
-        if shield::persistent_capability(method) {
-            return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
+        if method == "Browser.setWindowBounds" {
+            self.admit_window(params, session_id)?;
+        } else if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
+            return Err(PERSISTENT.into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
         {
-            return Err("slicc: refused: auto-attach is not supported by slicc-cdp\n".into());
+            return Err(AUTO_ATTACH.into());
         }
         if matches!(method, "Target.attachToTarget" | "Target.setAutoAttach")
             && params.get("flatten").and_then(|v| v.as_bool()) != Some(true)
         {
-            return Err("slicc: refused: attach with flatten: true\n".into());
+            return Err(FLATTEN.into());
         }
         if let Some(reason) = shield::command_url_refusal(&self.guard, params, method) {
             if reason == self.guard.refusal() && shield::cookie_method(method) {
@@ -651,9 +672,7 @@ impl Cdp {
                 }
             }
         }
-        if matches!(method, "Fetch.continueRequest" | "Network.continueInterceptedRequest") && params.get("url").and_then(Value::as_str).is_some_and(|url| self.redirector_protected(url)) {
-            return Err(self.refusal());
-        }
+        let issued = self.client_issued(method, params, session_id)?;
         if shield::interception_method(method) {
             let id = shield::request_key(params).unwrap_or_default();
             let handed = session_id
@@ -662,6 +681,7 @@ impl Cdp {
                 return Err(UNSEEN.into());
             }
         }
+        if let Some(session) = session_id.filter(|_| issued) { self.issue(params, session)?; }
         if shield::body_method(method) {
             let id = shield::request_key(params);
             match id.as_deref().and_then(|id| self.request_state(id)) {
@@ -684,6 +704,7 @@ impl Cdp {
                 }
             }
         }
+        if method == "Network.replayXHR" { return Err(self.refusal()) }
         if method == "IO.read" {
             let handle = params.get("handle").and_then(|v| v.as_str()).unwrap_or("");
             if !self.streams.contains_key(handle) {
@@ -691,6 +712,46 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    pub fn settled_refusal(&self, method: &str, params: &Value, session_id: Option<&str>) -> Option<String> {
+        let session_id = session_id.filter(|id| !id.is_empty());
+        if method == "Page.handleJavaScriptDialog" || harmless(method, params) { return None }
+        if session_id.is_some_and(|session| self.blocked.contains(session)) { return Some(self.refusal()) }
+        let reason = if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
+            self.refusal()
+        } else if shield::persistent_capability(method) && method != "Browser.setWindowBounds" && (session_id.is_none() || !shield::network_state(method, params)) {
+            PERSISTENT.to_string()
+        } else if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach" && params.get("autoAttach").and_then(Value::as_bool) == Some(true) {
+            AUTO_ATTACH.to_string()
+        } else if matches!(method, "Target.attachToTarget" | "Target.setAutoAttach") && params.get("flatten").and_then(Value::as_bool) != Some(true) {
+            FLATTEN.to_string()
+        } else {
+            return None;
+        };
+        if session_id.is_some_and(|session| self.dialog_sessions.contains(session) || self.guard_sessions.contains(session))
+            || self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Some(self.refusal());
+        }
+        if reason == self.refusal() { return Some(reason) }
+        if Worlds::selectors(params) || Worlds::sensitive(method) { return None }
+        if params.get("targetId").and_then(Value::as_str).is_some_and(|target| self.abandoned.contains(target)) { return Some(UNGUARDED.to_string()) }
+        Some(shield::browser_wide(method, params, session_id, &self.contexts).unwrap_or(reason))
+    }
+
+    fn network_state_admitted(&self, method: &str, params: &Value, session_id: Option<&str>) -> bool {
+        let Some(session) = session_id else { return false };
+        shield::network_state(method, params)
+            && !self.guard_sessions.contains(session)
+            && !self.dialog_sessions.contains(session)
+            && !self.blocked.contains(session)
+            && self.session_target(session).is_some_and(|target| {
+                !self.protected_targets.contains(&target)
+                    && !self.abandoned.contains(&target)
+                    && self.targets.get(&target).is_some_and(|info| {
+                        info.get("type").and_then(Value::as_str) == Some("page") && !self.info_protected(info, &[])
+                    })
+            })
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
@@ -2428,6 +2489,10 @@ impl Cdp {
         Some((delay, (!target.is_empty()).then_some(target)))
     }
 
+    pub fn ordinary_redirect_target(&self, source: &str, target: &str) -> Result<String, String> {
+        target_refusal(&self.guard, source, target).map_err(|_| self.refusal())
+    }
+
     fn carrier_targets(guard: &Protected, target: &str, source: &str) -> Option<Vec<CarrierTarget>> {
         let base = url::Url::parse(source).ok()?;
         let mut target = target.trim().to_string();
@@ -2709,7 +2774,7 @@ impl Cdp {
             let value = match self.call_replies.remove(&id) {
                 Some(value) => value,
                 None => {
-                    let text = match self.ws.recv_text(deadline)? {
+                    let text = match self.recv(deadline)? {
                         Some(text) => text,
                         None => return Err(if pinned && session_id.is_some_and(|session| self.blocked.contains(session)) { self.refusal() } else { format!("{method} timed out\n") }),
                     };
@@ -2756,9 +2821,28 @@ impl Cdp {
         Ok(id)
     }
 
+    pub fn set_waiter(&mut self, waiter: Option<Waiter>) {
+        self.waiter = waiter;
+    }
+
+    fn recv(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        loop {
+            let Some(mut waiter) = self.waiter.take() else { return self.ws.recv_text(deadline) };
+            let now = Instant::now();
+            if now >= self.waiter_due {
+                waiter(self);
+                self.waiter_due = now + WAITER_SLICE;
+            }
+            self.waiter = Some(waiter);
+            let until = deadline.min(self.waiter_due);
+            if let Some(text) = self.ws.recv_text(until)? { return Ok(Some(text)) }
+            if until == deadline { return Ok(None) }
+        }
+    }
+
     pub fn pump(&mut self, deadline: Instant) -> Result<bool, String> {
         self.webmcp_sweep();
-        let result = match self.ws.recv_text(deadline)? {
+        let result = match self.recv(deadline)? {
             Some(text) => {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                     self.absorb(value);
@@ -2874,6 +2958,9 @@ impl Cdp {
             );
             return;
         }
+        if value.get("method").and_then(Value::as_str) == Some("Fetch.authRequired") && self.guard_auth(&value) {
+            return;
+        }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
             let Some(mut paused) = Paused::from_event(&value) else {
                 return;
@@ -2886,6 +2973,8 @@ impl Cdp {
                 }
                 if self.protected_body_requests.contains(network) { self.protect_body_request(network); }
             }
+            if self.issued_hop(&value, &paused) { return; }
+            let guard_only = self.guard_only(&paused);
             let authority_protected = shield::scheme_less_protected(&self.guard, &value["params"]["request"]);
             let redirect = self.actual_redirect_carrier(&value);
             if self.protected_carrier(&value, false) {
@@ -2966,6 +3055,10 @@ impl Cdp {
                 self.continue_plain(&paused.session_id, &paused.request_id);
                 return;
             }
+            if guard_only {
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
             if paused.resource_type == "Document" {
                 self.paused_documents.insert((paused.session_id.clone(), paused.request_id.clone()));
             }
@@ -2987,19 +3080,29 @@ impl Cdp {
             self.answer_protected(&paused);
             return;
         }
+        if self.defer_issued(&paused) { return }
         let Some(decider) = self.deciders.get_mut(&paused.session_id) else {
             self.paused.push_back(paused);
             return;
         };
         let decision = decider(&paused);
-        let (method, params) = match fetch::command(&self.guard, &paused, &decision) {
+        let (method, params, issued) = match fetch::command(&self.guard, &paused, &decision)
+            .and_then(|(method, params)| self.client_issued(method, &params, Some(&paused.session_id)).map(|issued| (method, params, issued))) {
             Ok(command) => command,
             Err(message) => {
                 self.fetch_errors.push(message);
-                fetch::command(&self.guard, &paused, &Decision::default())
-                    .expect("a plain continue is always allowed")
+                let (method, params) = fetch::command(&self.guard, &paused, &Decision::default())
+                    .expect("a plain continue is always allowed");
+                (method, params, false)
             }
         };
+        if issued {
+            if let Err(message) = self.issue(&params, &paused.session_id) {
+                self.fetch_errors.push(message);
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
+        }
         self.settle(&paused.session_id, &paused.request_id);
         if let Ok(id) = self.send(method, params, Some(&paused.session_id)) {
             self.decided
@@ -3266,6 +3369,7 @@ pub fn detach(cdp: &mut Cdp, session_id: &str) {
     cdp.session_targets.remove(session_id);
     cdp.dialog_sessions.remove(session_id);
     cdp.dialogs.remove(session_id);
+    cdp.dialog_documents.remove(session_id);
     let _ = cdp.call(
         "Target.detachFromTarget",
         json!({ "sessionId": session_id }),
@@ -3481,6 +3585,8 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
 }
 
 include!("dialog.rs");
+include!("front.rs");
+include!("window.rs");
 
 #[cfg(test)]
 mod tests {
@@ -3511,6 +3617,9 @@ mod tests {
     include!("redirect_relation_test.rs");
     include!("redirect_userinfo_test.rs");
     include!("guard_attach_tree_test.rs");
+    include!("front_test.rs");
+    include!("window_test.rs");
+    include!("settled_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

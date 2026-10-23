@@ -20,6 +20,7 @@ export async function webmcpBackend({
   const queues = new Map();
   const lateFrames = new Set();
   let held = null;
+  let navigateLatest = () => {};
   let loadFired = false;
   const configs = [
     { id: 'TAB', origin: 'https://ordinary.test', policy, definitions },
@@ -163,6 +164,33 @@ export async function webmcpBackend({
         queues.set(peer, [...pages.keys()]);
         pause(peer);
       };
+      const navigate = () => {
+        reset(`RELOAD${++reloads}`);
+        loadFired = false;
+        for (const peer of sessions.keys()) {
+          for (const page of pages.values())
+            event('Page.frameNavigated', { frame: frame(page) }, peer);
+          event('Runtime.executionContextsCleared', {}, peer);
+          created(peer);
+          for (const page of pages.values())
+            event(
+              'Network.responseReceived',
+              {
+                frameId: page.id,
+                loaderId: page.loader,
+                type: 'Document',
+                response: {
+                  url: `${page.origin}/`,
+                  status: 200,
+                  headers: { 'permissions-policy': page.policy || '' },
+                },
+              },
+              peer
+            );
+          if (scripts.has(peer)) begin(peer);
+        }
+      };
+      navigateLatest = navigate;
       if (method === 'Target.attachToTarget') {
         const peer = `PEER${++next}`;
         sessions.set(peer, params.targetId);
@@ -321,31 +349,8 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.reload') {
-        reset(`RELOAD${++reloads}`);
-        loadFired = false;
         answer({});
-        for (const peer of sessions.keys()) {
-          for (const page of pages.values())
-            event('Page.frameNavigated', { frame: frame(page) }, peer);
-          event('Runtime.executionContextsCleared', {}, peer);
-          created(peer);
-          for (const page of pages.values())
-            event(
-              'Network.responseReceived',
-              {
-                frameId: page.id,
-                loaderId: page.loader,
-                type: 'Document',
-                response: {
-                  url: `${page.origin}/`,
-                  status: 200,
-                  headers: { 'permissions-policy': page.policy || '' },
-                },
-              },
-              peer
-            );
-          if (scripts.has(peer)) begin(peer);
-        }
+        navigate();
         return true;
       }
       if (method === 'Runtime.evaluate') {
@@ -399,6 +404,12 @@ export async function webmcpBackend({
     scripts,
     admitLate(frameId) {
       lateFrames.add(frameId);
+    },
+    reload() {
+      navigateLatest();
+    },
+    inject(message) {
+      writers.get(message.sessionId)(message);
     },
   };
 }

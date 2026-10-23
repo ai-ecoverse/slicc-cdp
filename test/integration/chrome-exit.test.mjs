@@ -89,7 +89,13 @@ it('the suite browser reports how Chrome died after it started, and nothing whil
     while (!browser.died() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
     socket.close();
     assert.match(browser.died() ?? 'still running', /^chromium exited (signal [A-Z]+|code -?\d+)/);
+    const died = browser.died();
+    await browser.close();
+    assert.equal(browser.died(), died, 'closing keeps how it died');
   } finally {
     await browser.close();
   }
+  const closed = await launchSuiteBrowser();
+  await closed.close();
+  assert.equal(closed.died(), null, 'a browser the suite closed did not die');
 });
