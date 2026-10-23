@@ -26,6 +26,8 @@ const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch];
 const asset = `playwright-cli-${os}-${arch}`;
 const built = path.join(root, 'target/debug/playwright-cli');
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
+const refusal =
+  'releases are fetched over https, or plain http only from 127.0.0.1, ::1 or localhost';
 const script = (reported) => Buffer.from(`#!/bin/sh\necho "playwright-cli ${reported}"\n`);
 
 function fakeGitHub() {
@@ -33,6 +35,8 @@ function fakeGitHub() {
     tag: 'v9.9.9',
     payload: script('9.9.9'),
     sums: null,
+    assetUrl: null,
+    sumsUrl: null,
     status: 200,
     downloads: 0,
     requests: [],
@@ -51,8 +55,11 @@ function fakeGitHub() {
           tag_name: state.tag,
           assets: [
             { name: `curlwright-${os}-${arch}`, browser_download_url: `${base}/dl/curlwright` },
-            { name: asset, browser_download_url: `${base}/dl/${asset}` },
-            { name: 'SHA256SUMS', browser_download_url: `${base}/dl/SHA256SUMS` },
+            { name: asset, browser_download_url: state.assetUrl ?? `${base}/dl/${asset}` },
+            {
+              name: 'SHA256SUMS',
+              browser_download_url: state.sumsUrl ?? `${base}/dl/SHA256SUMS`,
+            },
           ],
         })
       );
@@ -85,10 +92,12 @@ function fakeGitHub() {
   });
 }
 
-function run(bin, args, base) {
+function run(bin, args, base, extra = {}) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, SLICC_UPDATE_API_BASE: base };
     delete env.CARGO_HOME;
+    if (base === null) delete env.SLICC_UPDATE_API_BASE;
+    Object.assign(env, extra);
     const child = spawn(bin, args, { env });
     let stdout = '';
     let stderr = '';
@@ -126,10 +135,18 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       tag: 'v9.9.9',
       payload: script('9.9.9'),
       sums: null,
+      assetUrl: null,
+      sumsUrl: null,
       status: 200,
       downloads: 0,
       requests: [],
     });
+  };
+  const notice = (command = 'upgrade', base = fake.base) =>
+    `playwright-cli ${command}: SLICC_UPDATE_API_BASE overrides the GitHub API with ${base}\n`;
+  const after = (result, command = 'upgrade', base = fake.base) => {
+    assert.ok(result.stderr.startsWith(notice(command, base)), result.stderr);
+    return result.stderr.slice(notice(command, base).length);
   };
   const untouched = (bin) => {
     assert.equal(sha256(readFileSync(bin)), sha256(readFileSync(built)));
@@ -141,6 +158,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     const bin = install();
     const result = await run(bin, ['upgrade', '--check'], fake.base);
     assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr, notice());
     assert.equal(
       result.stdout,
       development
@@ -163,7 +181,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       const result = await run(bin, ['upgrade'], fake.base);
       assert.equal(result.code, 1);
       assert.equal(
-        result.stderr,
+        after(result),
         `playwright-cli upgrade: refusing to replace a development build (${version}) with release 9.9.9; pass --force to replace it\n`
       );
       assert.equal(fake.state.downloads, 0);
@@ -178,6 +196,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       const bin = install();
       const result = await run(bin, ['update', '--force'], fake.base);
       assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stderr, notice('update'));
       assert.equal(
         result.stdout,
         `upgrading playwright-cli ${version} to 9.9.9\nupgraded ${realpathSync(bin)} to playwright-cli 9.9.9 (SHA256SUMS verified)\n`
@@ -186,8 +205,9 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       assert.equal(readFileSync(bin, 'utf8'), script('9.9.9').toString());
       assert.ok(statSync(bin).mode & 0o100);
       assert.deepEqual(readdirSync(path.dirname(bin)), ['playwright-cli']);
-      const after = await run(bin, ['--version'], fake.base);
-      assert.equal(after.stdout, 'playwright-cli 9.9.9\n');
+      const swapped = await run(bin, ['--version'], fake.base);
+      assert.equal(swapped.stdout, 'playwright-cli 9.9.9\n');
+      assert.equal(swapped.stderr, '');
     }
   );
 
@@ -211,7 +231,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     const result = await run(bin, ['upgrade', '--force'], fake.base);
     assert.equal(result.code, 1);
     assert.equal(
-      result.stderr,
+      after(result),
       `playwright-cli upgrade: ${asset} does not match its SHA-256 in SHA256SUMS\n`
     );
     untouched(bin);
@@ -223,7 +243,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     const bin = install();
     const result = await run(bin, ['upgrade', '--force'], fake.base);
     assert.equal(result.code, 1);
-    assert.equal(result.stderr, `playwright-cli upgrade: SHA256SUMS has no entry for ${asset}\n`);
+    assert.equal(after(result), `playwright-cli upgrade: SHA256SUMS has no entry for ${asset}\n`);
     assert.equal(fake.state.downloads, 0);
     untouched(bin);
   });
@@ -235,7 +255,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     const result = await run(bin, ['upgrade', '--force'], fake.base);
     assert.equal(result.code, 1);
     assert.equal(
-      result.stderr,
+      after(result),
       'playwright-cli upgrade: the downloaded binary reports "playwright-cli 9.9.8", expected "playwright-cli 9.9.9"\n'
     );
     untouched(bin);
@@ -248,7 +268,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     const result = await run(bin, ['upgrade', '--force'], fake.base);
     assert.equal(result.code, 1);
     assert.match(
-      result.stderr,
+      after(result),
       /^playwright-cli upgrade: the downloaded binary failed to run --version/
     );
     untouched(bin);
@@ -266,7 +286,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       const file = await run(bin, ['upgrade', '--force'], fake.base);
       assert.equal(file.code, 1);
       assert.match(
-        file.stderr,
+        after(file),
         /^playwright-cli upgrade: .*playwright-cli is not writable; rerun with permission to write it, or reinstall with install\.sh\n$/
       );
       chmodSync(bin, 0o755);
@@ -274,7 +294,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       try {
         const dir = await run(bin, ['upgrade', '--force'], fake.base);
         assert.equal(dir.code, 1);
-        assert.match(dir.stderr, /is not writable, so .*playwright-cli can't be replaced/);
+        assert.match(after(dir), /is not writable, so .*playwright-cli can't be replaced/);
       } finally {
         chmodSync(path.dirname(bin), 0o755);
       }
@@ -291,23 +311,52 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     mkdirSync(path.join(home, 'bin'), { recursive: true });
     const bin = path.join(home, 'bin', 'playwright-cli');
     copyFileSync(built, bin);
-    const result = await new Promise((resolve, reject) => {
-      const child = spawn(bin, ['upgrade'], {
-        env: { ...process.env, SLICC_UPDATE_API_BASE: fake.base, CARGO_HOME: home },
-      });
-      let stderr = '';
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk;
-      });
-      child.on('error', reject);
-      child.on('close', (code) => resolve({ code, stderr }));
-    });
+    const advice =
+      'playwright-cli upgrade: playwright-cli was installed with cargo; upgrade it with `cargo install slicc-cdp`\n';
+    const overridden = await run(bin, ['upgrade'], fake.base, { CARGO_HOME: home });
+    assert.equal(overridden.code, 1);
+    assert.equal(overridden.stderr, notice() + advice);
+    const plain = await run(bin, ['upgrade'], null, { CARGO_HOME: home });
+    assert.equal(plain.code, 1);
+    assert.equal(plain.stderr, advice);
+    assert.equal(fake.state.requests.length, 0);
+  });
+
+  await t.test('a non-loopback http API base is refused before it is dialled', async () => {
+    reset();
+    const bin = install();
+    const base = 'http://api.example.com';
+    const result = await run(bin, ['upgrade', '--check'], base);
     assert.equal(result.code, 1);
     assert.equal(
-      result.stderr,
-      'playwright-cli upgrade: playwright-cli was installed with cargo; upgrade it with `cargo install slicc-cdp`\n'
+      after(result, 'upgrade', base),
+      `playwright-cli upgrade: asking GitHub for the latest release: refusing http://api.example.com: ${refusal}\n`
     );
-    assert.equal(fake.state.requests.length, 0);
+    untouched(bin);
+  });
+
+  await t.test('http download URLs on another host are refused', async () => {
+    reset();
+    fake.state.assetUrl = `http://downloads.example.com/dl/${asset}`;
+    const bin = install();
+    const result = await run(bin, ['upgrade', '--force'], fake.base);
+    assert.equal(result.code, 1);
+    assert.equal(
+      after(result),
+      `playwright-cli upgrade: downloading ${asset}: refusing http://downloads.example.com: ${refusal}\n`
+    );
+    assert.equal(fake.state.downloads, 0);
+    untouched(bin);
+    reset();
+    fake.state.sumsUrl = 'http://downloads.example.com/dl/SHA256SUMS';
+    const sums = await run(bin, ['update', '--force'], fake.base);
+    assert.equal(sums.code, 1);
+    assert.equal(
+      after(sums, 'update'),
+      `playwright-cli update: downloading SHA256SUMS: refusing http://downloads.example.com: ${refusal}\n`
+    );
+    assert.equal(fake.state.downloads, 0);
+    untouched(bin);
   });
 
   await t.test('a GitHub API failure is reported', async () => {
@@ -317,7 +366,7 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     const result = await run(bin, ['upgrade', '--check'], fake.base);
     assert.equal(result.code, 1);
     assert.equal(
-      result.stderr,
+      after(result),
       'playwright-cli upgrade: asking GitHub for the latest release: HTTP 403\n'
     );
     untouched(bin);

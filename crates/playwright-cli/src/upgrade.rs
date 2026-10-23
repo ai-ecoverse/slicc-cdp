@@ -4,7 +4,7 @@ use crate::args::{Invocation, Output};
 
 pub fn usage(command: &str) -> String {
     format!(
-        "playwright-cli {command} [--check] [--force]\n\nReplace this binary with the latest release of ai-ecoverse/slicc-cdp from GitHub\nThe release binary must match the release's SHA256SUMS and report the release version before it replaces this one.\nThe binary is only replaced when it is writable. A copy installed with cargo or inside an app bundle is not replaced.\n\nOptions:\n  --check                     only report whether a newer release exists\n  --force                     replace a development build, or reinstall the current release\n"
+        "playwright-cli {command} [--check] [--force]\n\nReplace this binary with the latest release of ai-ecoverse/slicc-cdp from GitHub, over https only\nThe release binary must match the release's SHA256SUMS and report the release version before it replaces this one.\nThe binary is only replaced when it is writable. A copy installed with cargo or inside an app bundle is not replaced.\n\nOptions:\n  --check                     only report whether a newer release exists\n  --force                     replace a development build, or reinstall the current release\n"
     )
 }
 
@@ -21,16 +21,39 @@ pub fn run(invocation: &Invocation) -> Output {
     let command = invocation.command.as_deref().unwrap_or("upgrade");
     let check = native::flag(invocation, "check");
     let force = native::flag(invocation, "force");
-    match native::upgrade(check, force) {
+    let notice = native::api_override()
+        .map(|base| format!("playwright-cli {command}: {} overrides the GitHub API with {base}\n", native::API_ENV))
+        .unwrap_or_default();
+    let mut output = match native::upgrade(check, force) {
         Ok(stdout) => Output::ok(stdout),
         Err(message) => Output::err(format!("playwright-cli {command}: {message}\n")),
-    }
+    };
+    output.stderr.insert_str(0, &notice);
+    output
 }
 
 #[cfg(windows)]
 pub fn remove_parked() {
     if let Ok(exe) = native::executable() {
         let _ = std::fs::remove_file(native::parked_path(&exe));
+    }
+}
+
+fn allowed_url(text: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(text).map_err(|err| format!("bad URL {text:?}: {err}"))?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    };
+    match parsed.scheme() {
+        "https" if parsed.host().is_some() => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(format!(
+            "refusing {}: releases are fetched over https, or plain http only from 127.0.0.1, ::1 or localhost",
+            parsed.origin().ascii_serialization()
+        )),
     }
 }
 
@@ -161,7 +184,7 @@ mod native {
 
     const REPO: &str = "ai-ecoverse/slicc-cdp";
     const DEFAULT_API: &str = "https://api.github.com";
-    const API_ENV: &str = "SLICC_UPDATE_API_BASE";
+    pub const API_ENV: &str = "SLICC_UPDATE_API_BASE";
     const SUMS: &str = "SHA256SUMS";
     const MAX_JSON: usize = 4 << 20;
     const MAX_SUMS: usize = 1 << 20;
@@ -246,10 +269,12 @@ mod native {
             .collect()
     }
 
+    pub fn api_override() -> Option<String> {
+        std::env::var(API_ENV).ok().filter(|base| !base.is_empty())
+    }
+
     fn api_base() -> String {
-        std::env::var(API_ENV)
-            .ok()
-            .filter(|base| !base.is_empty())
+        api_override()
             .unwrap_or_else(|| DEFAULT_API.to_string())
             .trim_end_matches('/')
             .to_string()
@@ -263,6 +288,7 @@ mod native {
             if !accept.is_empty() {
                 headers.push(("Accept", accept));
             }
+            allowed_url(&current)?;
             let response = cdp_client::net::http_fetch(&current, &headers, cap, total)
                 .map_err(|err| err.trim_end().to_string())?;
             match response.status {
@@ -552,6 +578,37 @@ mod tests {
             Plan::Refuse("refusing to replace a development build (0.0.0) with release 1.1.0; pass --force to replace it".to_string())
         );
         assert_eq!(plan("0.0.0", "1.1.0", false, true), Plan::Replace);
+    }
+
+    #[test]
+    fn only_https_or_loopback_http_is_fetched() {
+        for ok in [
+            "https://api.github.com/repos/ai-ecoverse/slicc-cdp/releases/latest",
+            "https://release-assets.githubusercontent.com/x",
+            "http://127.0.0.1:4000/dl/SHA256SUMS",
+            "http://[::1]:4000/dl/x",
+            "http://localhost:4000/dl/x",
+            "http://LOCALHOST/dl/x",
+        ] {
+            assert_eq!(allowed_url(ok), Ok(()), "{ok}");
+        }
+        for bad in [
+            "http://api.github.com/repos/ai-ecoverse/slicc-cdp/releases/latest",
+            "http://example.com/playwright-cli-linux-amd64",
+            "http://127.0.0.2/dl/x",
+            "http://10.0.0.1/dl/x",
+            "http://localhost.example.com/dl/x",
+            "http://0.0.0.0/dl/x",
+            "ftp://127.0.0.1/dl/x",
+            "file:///tmp/playwright-cli",
+            "not a url",
+        ] {
+            assert!(allowed_url(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            allowed_url("http://user:secret@example.com/path?token=1"),
+            Err("refusing http://example.com: releases are fetched over https, or plain http only from 127.0.0.1, ::1 or localhost".to_string())
+        );
     }
 
     #[test]
