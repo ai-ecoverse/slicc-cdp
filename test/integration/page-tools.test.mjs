@@ -23,6 +23,7 @@ const toolsPage = `<!doctype html><title>Tools</title>
 
 function site() {
   const protectedHits = [];
+  const ordinaryHits = [];
   const server = createServer((req, res) => {
     const host = req.headers.host ?? '';
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -32,6 +33,7 @@ function site() {
       res.end(`<html><body>${marker}</body></html>`);
       return;
     }
+    ordinaryHits.push({ path: url.pathname, method: req.method });
     const send = (status, type, body, headers = {}) => {
       res.writeHead(status, { 'content-type': type, ...headers });
       res.end(body);
@@ -48,6 +50,24 @@ function site() {
           '</skills/demo>; rel="https://www.sliccy.ai/rel/upskill"; title="Install the demo"',
         ].join(', '),
       });
+    if (url.pathname === '/ordinary-redirect')
+      return send(
+        Number(url.searchParams.get('status') ?? 302),
+        'text/plain',
+        'ordinary redirect',
+        {
+          location: '/links',
+        }
+      );
+    if (url.pathname === '/via-protected')
+      return send(
+        Number(url.searchParams.get('status') ?? 302),
+        'text/plain',
+        'ordinary first hop',
+        {
+          location: url.searchParams.get('hop'),
+        }
+      );
     if (url.pathname === '/to-seven')
       return send(302, 'text/plain', `Redirect ${marker}`, {
         location: `http://seven.sliccy.ai/auth/callback?code=${marker}#access_token=${marker}`,
@@ -65,6 +85,7 @@ function site() {
         port,
         origin: `http://127.0.0.1:${port}`,
         protectedHits,
+        ordinaryHits,
         close: () =>
           new Promise((done) => {
             server.closeAllConnections();
@@ -191,11 +212,42 @@ async function fetchFlow(runner, server) {
   const head = await pw(['fetch', `${server.origin}/ping`, '--method', 'HEAD']);
   ok(head, 'fetch HEAD');
   assert.equal(JSON.parse(head.stdout).status, 200);
+  const missing = await pw(['fetch', '/missing']);
+  assert.equal(missing.code, 1);
+  assert.equal(JSON.parse(missing.stdout).status, 404);
+  for (const status of [301, 302, 303, 307, 308]) {
+    const ordinary = await pw(['fetch', `/ordinary-redirect?status=${status}`, '--method', 'POST']);
+    ok(ordinary, `ordinary ${status} redirect`);
+    const redirected = JSON.parse(ordinary.stdout);
+    assert.equal(redirected.status, 200);
+    assert.equal(redirected.redirected, true);
+    assert.deepEqual(redirected.links, payload.links);
+    assert.equal(
+      server.ordinaryHits.at(-1).method,
+      status === 307 || status === 308 ? 'POST' : 'GET'
+    );
+    for (const hop of ['/to-seven', '/to-vault']) {
+      const mark = server.ordinaryHits.length;
+      const result = await pw(['fetch', `/via-protected?status=${status}&hop=${hop}`]);
+      assert.equal(result.code, 1, `${status} ${hop}\n${result.stdout}\n${result.stderr}`);
+      clean(result);
+      assert.deepEqual(
+        server.ordinaryHits.slice(mark).map(({ path }) => path),
+        ['/via-protected', hop]
+      );
+      assert.deepEqual(
+        server.protectedHits,
+        [],
+        `protected host must receive zero requests after ${status} ${hop}`
+      );
+    }
+  }
   for (const hop of ['/to-seven', '/to-vault']) {
     const redirected = await pw(['fetch', hop]);
     assert.equal(redirected.code, 1, `${hop}\n${redirected.stdout}\n${redirected.stderr}`);
     clean(redirected);
     assert.doesNotMatch(redirected.stdout, /"status": 200/);
+    assert.deepEqual(server.protectedHits, [], `${hop}: protected host must receive zero requests`);
   }
   for (const url of ['http://seven.sliccy.ai/os/', `http://vault.sliccy.ai/?code=${marker}`]) {
     const refused = await pw(['fetch', url]);

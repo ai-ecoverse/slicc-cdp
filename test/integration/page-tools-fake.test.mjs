@@ -355,7 +355,7 @@ test('fetch runs in the tab, lists ordinary Link entries and drops protected one
       value: {
         status: 200,
         url: 'https://example.test/app/data?id=QUERYSECRET',
-        redirected: true,
+        redirected: false,
         link: linkHeader,
       },
     },
@@ -366,7 +366,7 @@ test('fetch runs in the tab, lists ordinary Link entries and drops protected one
     assert.equal(result.stderr, '');
     const payload = JSON.parse(result.stdout);
     assert.equal(payload.status, 200);
-    assert.equal(payload.redirected, true);
+    assert.equal(payload.redirected, false);
     assert.equal(payload.url, 'https://example.test/app/data?id=\u2026');
     assert.deepEqual(
       payload.links.map((link) => [link.href, link.rel]),
@@ -386,8 +386,116 @@ test('fetch runs in the tab, lists ordinary Link entries and drops protected one
     assert.ok(seen[0].expression.includes('"https://example.test/app/data?id=QUERYSECRET"'));
     assert.ok(seen[0].expression.includes('method: "HEAD"'));
     assert.ok(seen[0].expression.includes("credentials: 'include'"));
+    assert.ok(seen[0].expression.includes("redirect: 'manual'"));
     assert.doesNotMatch(seen[0].expression, /\.text\(\)|arrayBuffer|\.json\(\)/);
   });
+});
+
+function redirectBackend(destinations, { status = 302, missing = false, ambiguous = false } = {}) {
+  const seen = [];
+  const resolving = fetchBackend(() => ({})).intercept;
+  const intercept = (message, send, answer) => {
+    const expression = message.params?.expression ?? '';
+    if (message.method !== 'Runtime.evaluate' || !expression.includes('await fetch('))
+      return resolving(message, send, answer);
+    const [url, method] = [...expression.matchAll(/(?:fetch\(|method: )("(?:[^"\\]|\\.)*")/g)].map(
+      (match) => JSON.parse(match[1])
+    );
+    seen.push({ url, method, expression });
+    const location = destinations[url];
+    if (!location) {
+      answer({
+        result: {
+          type: 'object',
+          value: { status: 200, url, redirected: false, link: '<child>; rel="next"' },
+        },
+      });
+      return true;
+    }
+    const event = (name, params) => send({ method: name, sessionId: message.sessionId, params });
+    if (!missing) {
+      for (const requestId of ambiguous ? ['FETCH', 'OTHER'] : ['FETCH']) {
+        event('Network.requestWillBeSent', {
+          requestId,
+          type: 'Fetch',
+          request: { url, method, headers: {} },
+        });
+        event('Network.responseReceived', {
+          requestId,
+          type: 'Fetch',
+          response: { url, status, headers: { Location: location } },
+        });
+      }
+    }
+    if (expression.includes("redirect: 'manual'")) {
+      answer({
+        result: {
+          type: 'object',
+          value: { type: 'opaqueredirect', status: 0, url: '', redirected: false, link: null },
+        },
+      });
+    } else {
+      let next = url;
+      for (let hop = 0; hop < 20 && destinations[next]; hop += 1) {
+        next = new URL(destinations[next], next).href;
+        seen.push({ url: next, method });
+      }
+      answer({ exceptionDetails: { text: 'Failed to fetch' } });
+    }
+    return true;
+  };
+  return { seen, intercept };
+}
+
+for (const kind of ['native', 'kernel']) {
+  const fixture = kind === 'native' ? withFake : withKernel;
+  test(`${kind} fetch checks every redirect hop before contacting a protected origin`, async () => {
+    for (const host of ['seven.sliccy.ai', 'vault.sliccy.ai']) {
+      const { seen, intercept } = redirectBackend({
+        'https://example.test/start': '/middle',
+        'https://example.test/middle': `https://${host}/auth/callback?code=REDIRECTSECRET`,
+      });
+      await fixture(intercept, async (_fake, pw) => {
+        const result = await pw(['fetch', 'https://example.test/start']);
+        assert.equal(result.code, 1, result.stdout + result.stderr);
+        assert.doesNotMatch(result.stdout + result.stderr, /REDIRECTSECRET/);
+        assert.deepEqual(
+          seen.map(({ url }) => url),
+          ['https://example.test/start', 'https://example.test/middle']
+        );
+        assert.ok(seen.every(({ expression }) => expression.includes("redirect: 'manual'")));
+      });
+    }
+  });
+  test(`${kind} fetch follows an ordinary redirect and uses the final Link base`, async () => {
+    const { seen, intercept } = redirectBackend({ 'https://example.test/start': '/dir/final' });
+    await fixture(intercept, async (_fake, pw) => {
+      const result = await pw(['fetch', 'https://example.test/start', '--method', 'POST']);
+      assert.equal(result.code, 0, result.stdout + result.stderr);
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.redirected, true);
+      assert.equal(payload.links[0].href, 'https://example.test/dir/child');
+      assert.deepEqual(
+        seen.map(({ url, method }) => [url, method]),
+        [
+          ['https://example.test/start', 'POST'],
+          ['https://example.test/dir/final', 'GET'],
+        ]
+      );
+    });
+  });
+}
+
+test('fetch fails closed when redirect metadata is missing or ambiguous', async () => {
+  for (const options of [{ missing: true }, { ambiguous: true }]) {
+    const { seen, intercept } = redirectBackend({ 'https://example.test/start': '/next' }, options);
+    await withFake(intercept, async (_fake, pw) => {
+      const result = await pw(['fetch', 'https://example.test/start']);
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /redirect metadata is unavailable or ambiguous/);
+      assert.equal(seen.length, 1);
+    });
+  }
 });
 
 test('fetch refuses protected destinations before connecting and after resolving', async () => {
@@ -439,6 +547,20 @@ test('fetch never sends a request whose tab-relative URL resolves to a protected
     assert.match(refused.stderr, /^slicc: refused: /);
     assert.doesNotMatch(refused.stderr + refused.stdout, /SECRET/);
     assert.deepEqual(seen, []);
+  });
+});
+
+test('fetch returns a nonzero exit code for non-2xx responses', async () => {
+  const { intercept } = fetchBackend(() => ({
+    result: {
+      type: 'object',
+      value: { status: 404, url: 'https://example.test/missing', redirected: false, link: null },
+    },
+  }));
+  await withFake(intercept, async (_fake, pw) => {
+    const result = await pw(['fetch', 'https://example.test/missing']);
+    assert.equal(result.code, 1);
+    assert.equal(JSON.parse(result.stdout).status, 404);
   });
 });
 

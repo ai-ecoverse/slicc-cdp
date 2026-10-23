@@ -97,7 +97,19 @@ Only the hash-pinned shim can use the dedicated installer. Its inert pre-executi
 - The vendored script is `injectedScriptSource` from `playwright-core@1.64.0-alpha-1790635538000` (`lib/coreBundle.js`), minified with `esbuild@0.25.10`. `node scripts/vendor-playwright-injected.mjs [version]` downloads that package with `npm pack`, extracts and minifies the source the same way, and rewrites the file, `LICENSE` and `NOTICE`; with the default version it reproduces the committed bytes. The `.txt` extension keeps the license header out of the no-comment lint, and the file is only embedded with `include_str!`.
 - These ref commands take snapshot refs only, not selectors, like `click`. Errors go to stderr; upstream prints them on stdout under `### Error`, except for `highlight` with neither a ref nor `--hide`, which prints upstream's error.
 - `eval-file <path> [--tab] [--frame] [--output|--filename <file>]` reads only the file you name, up to 16 MiB of UTF-8, and evaluates it through `eval`'s guarded path: a function expression is called, and top-level `await` and `return` work. `--output` prints `Result saved to <file> (<n> KB)`.
-- `fetch <url> [--method <method>] [--tab]` runs `fetch()` in the tab, like curlwright, so the tab's cookies, origin and CORS rules apply. It is not SLICC's proxied fetch and has no `--discover`. A relative URL is resolved against the document. Only http and https are fetched. A protected destination is refused before connecting and again after it is resolved, redirects run under the same guard as curlwright, and the body is never read. It prints JSON with `url`, `status`, `redirected`, the `links` from the `Link` header (one entry per `rel`, protected targets dropped) and the SLICC `upskill` link as `handoff`, and exits 1 with an `error` when the request fails. The guard redacts SLICC's `handoff` relation, which names seven's origin, so it is listed only as that origin and never reported as a handoff.
+- `fetch <url> [--method <method>] [--tab]` runs `fetch()` in the tab, so the tab's cookies, origin and CORS rules apply. It is not SLICC's proxied fetch and has no `--discover`. A relative URL is resolved against the document. Only http and https are fetched. A protected destination is refused before connecting and again after it is resolved. Every request uses `redirect: 'manual'`: ordinary redirect Locations must be unambiguously correlated to that request in admitted CDP Network events and pass the guard before the next hop is sent. Missing or ambiguous redirect metadata fails closed, and at most 20 redirects are followed. POST becomes GET on 301/302, and 303 becomes GET except for HEAD; 307/308 preserve the method. The body is never read. It prints JSON with `url`, `status`, `redirected`, the `links` from the final `Link` header (one entry per `rel`, protected targets dropped) and the SLICC `upskill` link as `handoff`, and exits 1 on non-2xx responses or with an `error` when the request fails. The guard redacts SLICC's `handoff` relation, which names seven's origin, so it is listed only as that origin and never reported as a handoff.
+
+## Regenerating the Playwright injected script
+
+From the repository root, run:
+
+```sh
+node scripts/vendor-playwright-injected.mjs 1.64.0-alpha-1790635538000
+git diff -- crates/playwright-cli/vendor
+npm run lint
+```
+
+The pinned package and `esbuild@0.25.10` produce the committed bytes. Keep the upstream copyright and Apache-2.0 header, `LICENSE` and `NOTICE` together when updating. If changing the source version, update the script's default version and this README, then run the native and kernel `page-tools.test.mjs` locator regressions in CI.
 
 ## Develop
 

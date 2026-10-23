@@ -132,7 +132,10 @@ fn fetch(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Result<
     state.current = Some(target);
     let shown = sanitize::display_url(&url);
     let (payload, code) = match outcome {
-        Ok(value) => (fetched(cdp, &url, &shown, &value), 0),
+        Ok(value) => {
+            let code = if value.get("status").and_then(Value::as_u64).is_some_and(|status| (200..=299).contains(&status)) { 0 } else { 1 };
+            (fetched(cdp, &url, &shown, &value), code)
+        },
         Err(error) => (json!({ "url": shown, "links": [], "handoff": null, "error": error.trim_end() }), 1),
     };
     let text = sanitize::json_c1(&serde_json::to_string_pretty(&payload).unwrap_or_default());
@@ -153,16 +156,87 @@ fn fetch_in(cdp: &mut Cdp, session: &str, raw: &str, method: &str) -> Result<Fet
     if cdp.guard().url(&url) {
         return Err(format!("{}\n", cdp.guard().refusal_for_url(&url)));
     }
-    let script = format!(
-        "(async () => {{ const r = await fetch({}, {{ method: {}, credentials: 'include', redirect: 'follow' }}); try {{ await r.body?.cancel(); }} catch {{}} return {{ status: r.status, url: r.url, redirected: r.redirected, link: r.headers.get('link') }}; }})()",
-        Value::from(url.as_str()),
-        Value::from(method)
-    );
-    let outcome = browser::evaluate(cdp, session, &script, true).map(|value| value.value);
+    let outcome = fetch_hops(cdp, session, &url, method);
     match outcome {
         Err(message) if message.starts_with("slicc: refused:") || cdp::transport_error(&message) => Err(message),
         other => Ok((url, other)),
     }
+}
+
+fn fetch_hops(cdp: &mut Cdp, session: &str, initial: &str, method: &str) -> Result<Value, String> {
+    let mut url = initial.to_string();
+    let mut method = method.to_string();
+    let mut hop = 0;
+    loop {
+        if cdp.guard().url(&url) {
+            return Err(format!("{}\n", cdp.guard().refusal_for_url(&url)));
+        }
+        let mark = cdp.events().len();
+        let script = format!(
+            "(async () => {{ const r = await fetch({}, {{ method: {}, credentials: 'include', redirect: 'manual' }}); try {{ await r.body?.cancel(); }} catch {{}} return {{ type: r.type, status: r.status, url: r.url, redirected: r.redirected, link: r.headers.get('link') }}; }})()",
+            Value::from(url.as_str()),
+            Value::from(method.as_str())
+        );
+        let mut value = browser::evaluate(cdp, session, &script, true)?.value;
+        if value.get("redirected").and_then(Value::as_bool) == Some(true) {
+            return Err("fetch: refused an automatically followed redirect\n".to_string());
+        }
+        if value.get("type").and_then(Value::as_str) != Some("opaqueredirect") {
+            if !value.get("status").and_then(Value::as_u64).is_some_and(|status| (200..=599).contains(&status) && !redirect_status(status)) {
+                return Err("fetch: response metadata is unavailable\n".to_string());
+            }
+            value["redirected"] = json!(hop > 0);
+            return Ok(value);
+        }
+        let (status, next) = redirect_hop(&cdp.events()[mark..], session, &url, &method)?;
+        if cdp.guard().url(&next) {
+            return Err(format!("{}\n", cdp.guard().refusal_for_url(&next)));
+        }
+        if hop == 20 {
+            return Err("fetch: too many redirects\n".to_string());
+        }
+        if status == 303 && !method.eq_ignore_ascii_case("HEAD") || matches!(status, 301 | 302) && method.eq_ignore_ascii_case("POST") {
+            method = "GET".to_string();
+        }
+        url = next;
+        hop += 1;
+    }
+}
+
+fn redirect_status(status: u64) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn redirect_hop(events: &[Value], session: &str, current: &str, method: &str) -> Result<(u64, String), String> {
+    let unavailable = || "fetch: redirect metadata is unavailable or ambiguous\n".to_string();
+    let mut base = url::Url::parse(current).map_err(|_| unavailable())?;
+    base.set_fragment(None);
+    let events: Vec<_> = events.iter().filter(|event| event["sessionId"].as_str() == Some(session)).collect();
+    let ids: std::collections::BTreeSet<_> = events.iter().filter(|event| {
+        event["method"] == "Network.requestWillBeSent"
+            && event["params"]["type"] == "Fetch"
+            && event.pointer("/params/request/url").and_then(Value::as_str) == Some(base.as_str())
+            && event.pointer("/params/request/method").and_then(Value::as_str).is_some_and(|sent| sent.eq_ignore_ascii_case(method))
+    }).filter_map(|event| event.pointer("/params/requestId").and_then(Value::as_str)).collect();
+    if ids.len() != 1 { return Err(unavailable()); }
+    let id = ids.into_iter().next().ok_or_else(unavailable)?;
+    let mut hops = std::collections::BTreeSet::new();
+    for event in events.iter().filter(|event| event.pointer("/params/requestId").and_then(Value::as_str) == Some(id)) {
+        let (status, headers) = match event["method"].as_str() {
+            Some("Network.responseReceived") => (event.pointer("/params/response/status"), event.pointer("/params/response/headers")),
+            Some("Network.responseReceivedExtraInfo") => (event.pointer("/params/statusCode"), event.pointer("/params/headers")),
+            _ => continue,
+        };
+        let Some(status) = status.and_then(Value::as_u64).filter(|status| redirect_status(*status)) else { continue; };
+        for (_, value) in headers.and_then(Value::as_object).into_iter().flatten().filter(|(name, _)| name.eq_ignore_ascii_case("location")) {
+            hops.insert((status, value.as_str().ok_or_else(unavailable)?.to_string()));
+        }
+    }
+    if hops.len() != 1 { return Err(unavailable()); }
+    let (status, location) = hops.into_iter().next().ok_or_else(unavailable)?;
+    let next = base.join(&location).map_err(|_| unavailable())?;
+    if !matches!(next.scheme(), "http" | "https") || !next.has_host() { return Err(unavailable()); }
+    Ok((status, next.to_string()))
 }
 
 fn fetched(cdp: &Cdp, url: &str, shown: &str, value: &Value) -> Value {
