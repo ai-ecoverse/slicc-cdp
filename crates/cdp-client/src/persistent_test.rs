@@ -141,3 +141,103 @@ fn scoped_bindings_are_refused_even_in_a_verified_page_world() {
     }
     assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.addBinding"));
 }
+
+fn network_state_params(offline: bool) -> Value {
+    json!({"offline":offline,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1})
+}
+
+fn network_state_sent(state: &Rc<RefCell<PersistentState>>) -> Vec<Value> {
+    state.borrow().sent.iter().filter(|command| command["method"] == "Network.emulateNetworkConditions").cloned().collect()
+}
+
+#[test]
+fn network_state_admits_only_the_offline_toggle_on_an_ordinary_page_session() {
+    for offline in [true, false] {
+        let (mut cdp, state) = persistent_client();
+        cdp.call("Network.emulateNetworkConditions", network_state_params(offline), Some("S")).unwrap();
+        let sent = network_state_sent(&state);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["params"], network_state_params(offline));
+        assert_eq!(sent[0]["sessionId"], "S");
+    }
+}
+
+#[test]
+fn network_state_refuses_every_other_shape_and_condition_method() {
+    let shapes = [
+        json!({"offline":true,"latency":0,"downloadThroughput":0,"uploadThroughput":0}),
+        json!({"offline":true,"latency":5,"downloadThroughput":-1,"uploadThroughput":-1}),
+        json!({"offline":true,"latency":0.0,"downloadThroughput":-1,"uploadThroughput":-1}),
+        json!({"offline":true,"latency":0,"downloadThroughput":-1.0,"uploadThroughput":-1}),
+        json!({"offline":"true","latency":0,"downloadThroughput":-1,"uploadThroughput":-1}),
+        json!({"offline":null,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1}),
+        json!({"offline":true,"latency":0,"downloadThroughput":-1}),
+        json!({"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"connectionType":"none"}),
+        json!({"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"connectionType":"wifi"}),
+        json!({"offline":false,"latency":0,"downloadThroughput":-1,"uploadThroughput":-1,"packetLoss":100}),
+        json!([]),
+        json!(null),
+    ];
+    for params in shapes {
+        let (mut cdp, state) = persistent_client();
+        assert!(cdp.call("Network.emulateNetworkConditions", params.clone(), Some("S")).unwrap_err().contains("persistent page capabilities"), "{params}");
+        assert!(cdp.notify("Network.emulateNetworkConditions", params.clone(), Some("S")).unwrap_err().contains("persistent page capabilities"), "{params}");
+        assert!(network_state_sent(&state).is_empty(), "{params}");
+    }
+    for method in ["Network.emulateNetworkConditionsByRule", "Network.overrideNetworkState", "Network.setBlockedURLs", "Network.setBypassServiceWorker"] {
+        let (mut cdp, state) = persistent_client();
+        assert!(cdp.call(method, network_state_params(true), Some("S")).unwrap_err().starts_with("slicc: refused:"), "{method}");
+        assert!(!state.borrow().sent.iter().any(|command| command["method"] == method), "{method}");
+    }
+}
+
+#[test]
+fn network_state_is_refused_off_an_ordinary_page_session() {
+    let (mut cdp, state) = persistent_client();
+    assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), None).is_err());
+    assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("UNKNOWN")).is_err());
+    cdp.guard_sessions.insert("G".into());
+    cdp.session_targets.insert("G".into(), "T".into());
+    assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("G")).is_err());
+    cdp.dialog_sessions.insert("D".into());
+    cdp.session_targets.insert("D".into(), "T".into());
+    assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("D")).is_err());
+    for kind in ["iframe", "worker", "service_worker", "shared_worker", "other"] {
+        let target = format!("T-{kind}");
+        let session = format!("S-{kind}");
+        cdp.session_targets.insert(session.clone(), target.clone());
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":target,"type":kind,"url":"https://ordinary.test/"}}}));
+        assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some(&session)).is_err(), "{kind}");
+    }
+    assert!(network_state_sent(&state).is_empty());
+    for url in ["https://seven.sliccy.ai/", "https://vault.sliccy.ai/", "https://catalog.ordinary.test/"] {
+        let (mut cdp, state) = persistent_client();
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":url}}}));
+        assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("S")).is_err(), "{url}");
+        assert!(network_state_sent(&state).is_empty(), "{url}");
+    }
+    for mark in ["protected", "abandoned", "blocked"] {
+        let (mut cdp, state) = persistent_client();
+        match mark {
+            "protected" => { cdp.protected_targets.insert("T".into()); }
+            "abandoned" => { cdp.abandoned.insert("T".into()); }
+            _ => { cdp.blocked.insert("S".into()); }
+        }
+        assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(false), Some("S")).is_err(), "{mark}");
+        assert!(network_state_sent(&state).is_empty(), "{mark}");
+    }
+    let (mut cdp, state) = persistent_client();
+    cdp.targets.remove("T");
+    assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("S")).is_err());
+    assert!(network_state_sent(&state).is_empty());
+}
+
+#[test]
+fn network_state_cannot_reach_a_page_after_a_protected_commit() {
+    for url in ["https://seven.sliccy.ai/", "https://vault.sliccy.ai/"] {
+        let (mut cdp, state) = persistent_client();
+        persistent_commit(&mut cdp, &state, url, "navigation");
+        assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("S")).is_err(), "{url}");
+        assert!(network_state_sent(&state).is_empty(), "{url}");
+    }
+}

@@ -74,6 +74,11 @@ pub fn global_help() -> String {
         row("route <pattern>", "mock network requests matching a url pattern"),
         row("route-list", "list all active network routes"),
         row("unroute [pattern]", "remove routes matching a pattern (or all routes)"),
+        row("network-state-set <state>", "set the browser network state to online or offline"),
+        String::new(),
+        "DevTools:".to_string(),
+        row("generate-locator <target>", "generate a playwright locator for the given element"),
+        row("highlight [target]", "show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."),
         String::new(),
         "Browsers:".to_string(),
         row(
@@ -92,6 +97,8 @@ pub fn global_help() -> String {
         String::new(),
         "SLICC-only:".to_string(),
         row("frames", "list frame IDs for the current page"),
+        row("eval-file <path>", "evaluate javascript from a local file on page"),
+        row("fetch <url>", "fetch a url in the tab and list its link headers"),
         String::new(),
         "Install:".to_string(),
         row("upgrade [--check]", "replace this binary with the latest release (alias: update)"),
@@ -147,6 +154,56 @@ pub fn command_help(spec: &Spec) -> String {
 fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
         "upgrade" | "update" => crate::upgrade::usage(name),
+        "generate-locator" => page(
+            "generate-locator <target>",
+            &["Generate a Playwright locator for the given element"],
+            &[("<target>", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[],
+        ),
+        "highlight" => page(
+            "highlight [target]",
+            &["Show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."],
+            &[("[target]", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[
+                ("--hide", "hide a previously added highlight for this element, or all page highlights when no element is given"),
+                ("--style", "additional inline css applied to the highlight overlay, e.g. \"outline: 2px dashed red\""),
+            ],
+        ),
+        "network-state-set" => page(
+            "network-state-set <state>",
+            &[
+                "Set the browser network state to online or offline",
+                "The state is saved with the session. Offline applies to each tab while a later command is attached to it.",
+            ],
+            &[("<state>", "set to \"offline\" to simulate offline mode, \"online\" to restore network connectivity")],
+            &[],
+        ),
+        "eval-file" => page(
+            "eval-file <path>",
+            &[
+                "Evaluate JavaScript from a local file on page",
+                "Reads only the file you name and evaluates it like eval: a function expression is called, and top-level await and return work.",
+            ],
+            &[("<path>", "file with the JavaScript to evaluate")],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+                ("--frame <frameId>", "frame to run in, in an isolated world"),
+                ("--output <path>", "save the result to a file (alias: --filename)"),
+            ],
+        ),
+        "fetch" => page(
+            "fetch <url>",
+            &[
+                "Fetch a URL in the tab and list its Link headers",
+                "Runs fetch() in the tab with its cookies and origin, like curlwright, and prints JSON with the status, the Link header entries and any SLICC handoff link. The body is not read.",
+                "Seven's origins and the vault are refused, and a redirect to them fails the request.",
+            ],
+            &[("<url>", "http(s) URL, absolute or relative to the tab")],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+                ("--method <method>", "request method, defaults to GET"),
+            ],
+        ),
         "open" => page(
             "open [url]",
             &[

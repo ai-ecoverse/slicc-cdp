@@ -574,7 +574,7 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
-        if shield::persistent_capability(method) {
+        if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
             return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
@@ -689,6 +689,21 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    fn network_state_admitted(&self, method: &str, params: &Value, session_id: Option<&str>) -> bool {
+        let Some(session) = session_id else { return false };
+        shield::network_state(method, params)
+            && !self.guard_sessions.contains(session)
+            && !self.dialog_sessions.contains(session)
+            && !self.blocked.contains(session)
+            && self.session_target(session).is_some_and(|target| {
+                !self.protected_targets.contains(&target)
+                    && !self.abandoned.contains(&target)
+                    && self.targets.get(&target).is_some_and(|info| {
+                        info.get("type").and_then(Value::as_str) == Some("page") && !self.info_protected(info, &[])
+                    })
+            })
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
