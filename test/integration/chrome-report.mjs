@@ -52,6 +52,7 @@ export const CHROME_FILES = new Set(
     'sliccy-browser',
     'snapshot-golden',
     'snapshot-oopif-chrome',
+    'storage-chrome',
     'webmcp-polyfill-chrome',
     'webmcp-unavailable',
     'webmcp',
