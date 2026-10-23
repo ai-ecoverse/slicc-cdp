@@ -1,10 +1,10 @@
 use cdp_client::cdp::Cdp;
 #[path = "support/forward_ledger.rs"]
 mod forward_ledger;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 #[cfg(not(target_os = "wasi"))]
 use std::io::BufRead;
@@ -190,6 +190,48 @@ fn input() -> Box<dyn FnMut() -> Result<String, mpsc::TryRecvError>> {
     }
 }
 
+fn settled(cdp: &Cdp, message: &Value) -> Option<String> {
+    let mut params = message["params"].clone();
+    if let Some(params) = params.as_object_mut() { params.remove("__guardBridgeNotify"); }
+    cdp.settled_refusal(message["method"].as_str()?, &params, message["sessionId"].as_str())
+}
+
+struct Dispatcher {
+    read: Box<dyn FnMut() -> Result<String, mpsc::TryRecvError>>,
+    queue: VecDeque<Value>,
+    closed: bool,
+    busy: bool,
+}
+
+impl Dispatcher {
+    fn ingest(&mut self) {
+        while !self.closed {
+            match (self.read)() {
+                Ok(line) => {
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    emit(json!({"audit":{"id":message["id"],"stage":"received","method":message["method"].as_str().unwrap()}}));
+                    self.queue.push_back(message);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.closed = true,
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+    }
+
+    fn settle(&mut self, cdp: &Cdp) {
+        self.ingest();
+        if !self.busy { return }
+        self.queue.retain(|message| {
+            let Some(reason) = settled(cdp, message) else { return true };
+            if message["method"] == "Runtime.evaluate" && message["params"]["awaitPromise"] == true {
+                diagnostic(message["id"].as_u64().unwrap(), "original", None, Some(&reason));
+            }
+            answer(message["id"].clone(), Err(reason));
+            false
+        });
+    }
+}
+
 fn main() {
     #[cfg(target_os = "wasi")]
     let url = std::env::var("SLICC_CDP_URL").unwrap();
@@ -200,7 +242,9 @@ fn main() {
     let mut cdp = Cdp::from_transport(Box::new(transport));
     let origin = std::env::args().nth(2).unwrap();
     cdp.protect_origins(&[&origin]);
-    let mut input = input();
+    let dispatcher = Rc::new(RefCell::new(Dispatcher { read: input(), queue: VecDeque::new(), closed: false, busy: false }));
+    let waiting = dispatcher.clone();
+    cdp.set_waiter(Some(Box::new(move |cdp: &Cdp| waiting.borrow_mut().settle(cdp))));
     let mut seen = 0;
     let mut pending = BTreeMap::<u64, Pending>::new();
     let mut navigations = BTreeMap::<u64, (i64, Instant)>::new();
@@ -208,13 +252,14 @@ fn main() {
     let mut wait = BUSY;
     loop {
         let mut busy = !pending.is_empty() || !navigations.is_empty();
-        match input() {
-            Ok(line) => {
+        dispatcher.borrow_mut().ingest();
+        let next = dispatcher.borrow_mut().queue.pop_front();
+        match next {
+            Some(message) => {
                 busy = true;
-                let message: Value = serde_json::from_str(&line).unwrap();
+                dispatcher.borrow_mut().busy = true;
                 let method = message["method"].as_str().unwrap();
                 command.set(message["id"].as_u64());
-                emit(json!({"audit":{"id":message["id"],"stage":"received","method":method}}));
                 let mut params = message["params"].clone();
                 let notify = params.as_object_mut().and_then(|params| params.remove("__guardBridgeNotify")).and_then(|value| value.as_bool()).unwrap_or(false);
                 let session = message["sessionId"].as_str();
@@ -270,9 +315,10 @@ fn main() {
                     answer(message["id"].clone(), result);
                 }
                 command.set(None);
+                dispatcher.borrow_mut().busy = false;
             }
-            Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => {}
+            None if dispatcher.borrow().closed => break,
+            None => {}
         }
         busy |= cdp.pump(Instant::now() + wait).unwrap_or(false);
         while let Ok(Some(paused)) = cdp.next_paused(None, Duration::ZERO) {
@@ -290,6 +336,7 @@ fn main() {
         drain_navigations(&mut cdp, &mut navigations, Instant::now(), answer);
         wait = if busy { BUSY } else { (wait * 2).min(IDLE) };
         let mut done = Vec::new();
+        dispatcher.borrow_mut().busy = true;
         for (id, evaluation) in &pending {
             command.set(Some(*id));
             if let Some(result) = poll(&mut cdp, evaluation) {
@@ -300,6 +347,7 @@ fn main() {
             }
             command.set(None);
         }
+        dispatcher.borrow_mut().busy = false;
         for id in done {
             pending.remove(&id);
         }
