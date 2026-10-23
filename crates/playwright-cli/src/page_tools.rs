@@ -137,7 +137,7 @@ fn fetch_precheck(invocation: &Invocation) -> Result<(), String> {
     let Some(destination) = destination.filter(|parsed| matches!(parsed.scheme(), "http" | "https")) else {
         return Err("fetch: only http and https URLs can be fetched\n".to_string());
     };
-    if guard.url(destination.as_str()) || guard.url(url) {
+    if guard.url(destination.as_str()) {
         return Err(format!("{}\n", guard.refusal_for_url(destination.as_str())));
     }
     Ok(())

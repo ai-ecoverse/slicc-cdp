@@ -41,6 +41,7 @@ export const CHROME_FILES = new Set(
     'guard-setup-budget',
     'kernel-session',
     'launch',
+    'page-tools',
     'plant',
     'privileged-ui',
     'redirect-navigation',

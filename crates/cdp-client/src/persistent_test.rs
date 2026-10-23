@@ -194,7 +194,8 @@ fn network_state_refuses_every_other_shape_and_condition_method() {
 #[test]
 fn network_state_is_refused_off_an_ordinary_page_session() {
     let (mut cdp, state) = persistent_client();
-    assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), None).is_err());
+    let method = "Network.emulateNetworkConditions";
+    assert!(cdp.call(method, network_state_params(true), None).is_err());
     assert!(cdp.call("Network.emulateNetworkConditions", network_state_params(true), Some("UNKNOWN")).is_err());
     cdp.guard_sessions.insert("G".into());
     cdp.session_targets.insert("G".into(), "T".into());
