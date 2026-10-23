@@ -190,7 +190,7 @@ fn set_options(invocation: &Invocation) -> Result<Vec<(&'static str, Value)>, St
     Ok(fields)
 }
 
-fn js_number(text: &str) -> Option<f64> {
+pub(crate) fn js_number(text: &str) -> Option<f64> {
     let text = text.trim();
     if text.is_empty() {
         return Some(0.0);
