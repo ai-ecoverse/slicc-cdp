@@ -237,6 +237,63 @@ test('HAR rejects protected and unknown URLs and bodies, redacts redirect carrie
   });
 });
 
+test('HAR admits only the ordinary main document ending a pause and omits unverified candidates', async () => {
+  await harFixture(async ({ home, backend, tab, start, send, request, response, checkpoint }) => {
+    tab.url = 'about:blank';
+    const held = await start(['--content=embed']);
+    await held.event('paused');
+    request('PAUSED_FETCH', 'https://example.test/not-recorded');
+    response('PAUSED_FETCH', 'https://example.test/not-recorded');
+    request(
+      'CHILD_DOCUMENT',
+      'https://example.test/child',
+      {},
+      { type: 'Document', frameId: 'CHILD', documentURL: 'https://example.test/child' }
+    );
+    response('CHILD_DOCUMENT', 'https://example.test/child');
+    request(
+      'UNVERIFIED_DOCUMENT',
+      'https://example.test/unverified',
+      {},
+      {
+        type: 'Document',
+        frameId: 'TAB',
+        documentURL: 'https://example.test/unverified',
+        loaderId: 'UNVERIFIED',
+      }
+    );
+    response('UNVERIFIED_DOCUMENT', 'https://example.test/unverified');
+    await checkpoint(0);
+    request(
+      'DOCUMENT',
+      'https://example.test/page',
+      {},
+      { type: 'Document', frameId: 'TAB', documentURL: 'https://example.test/page', loaderId: 'L' }
+    );
+    tab.url = 'https://example.test/page';
+    send('Page.frameNavigated', {
+      frame: { id: 'TAB', loaderId: 'L', url: tab.url, securityOrigin: 'https://example.test' },
+    });
+    await held.event('resumed');
+    response('DOCUMENT', 'https://example.test/page');
+    const har = await checkpoint(1);
+    assert.equal(har.log.entries[0].request.url, tab.url);
+    assert.equal(har.log.entries[0].response.content.text, 'ordinary-body');
+    assert.ok(!JSON.stringify(har).includes('not-recorded'));
+    assert.ok(!JSON.stringify(har).includes('/child'));
+    assert.ok(!JSON.stringify(har).includes('/unverified'));
+    assert.deepEqual(
+      backend.calls
+        .filter((call) => call.method === 'Network.getResponseBody')
+        .map((call) => call.params.requestId),
+      ['DOCUMENT']
+    );
+    const stopped = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+  });
+});
+
 test('completed ordinary traffic survives a later protected navigation without reading its body', async () => {
   await harFixture(async ({ backend, tab, file, start, request, response, send }) => {
     const held = await start(['--content=embed']);

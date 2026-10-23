@@ -46,7 +46,10 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
       '--no-proxy-server',
     ]);
     raw = await rawSocket(browser.wsUrl);
-    const target = await raw.open(`${origin}/initial`);
+    const opened = await harCommand(browser.wsUrl, ['tab-new', 'about:blank'], home);
+    assert.equal(opened.code, 0, opened.stderr);
+    const target = opened.stdout.match(/targetId: ([^\]]+)\]/)?.[1];
+    assert.ok(target, opened.stdout);
     const { sessionId } = await raw.send('Target.attachToTarget', {
       targetId: target,
       flatten: true,
@@ -55,6 +58,11 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
     const file = path.join(home, 'traffic.har');
     held = harHolder(browser.wsUrl, ['har-start', '--tab', target, file], home);
     await held.event('ready');
+    await held.event('paused');
+    const initialLoad = raw.event('Page.loadEventFired', sessionId);
+    await raw.send('Page.navigate', { url: `${origin}/initial` }, sessionId);
+    await initialLoad.seen;
+    await held.event('resumed');
     const evaluate = async (expression) => {
       const result = await raw.send(
         'Runtime.evaluate',
@@ -78,7 +86,7 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
     await barrierLoad.seen;
     await held.event('checkpoint');
     const checkpoint = JSON.parse(await readFile(file, 'utf8'));
-    for (const pathname of ['/ordinary-api', '/redirect']) {
+    for (const pathname of ['/initial', '/ordinary-api', '/redirect']) {
       assert.ok(
         checkpoint.log.entries.some((entry) => entry.request.url === `${origin}${pathname}`),
         JSON.stringify(checkpoint)
