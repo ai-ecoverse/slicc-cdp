@@ -8,6 +8,7 @@ mod connect;
 mod cookie_headers;
 mod cookies;
 mod discover;
+mod dialog_holder;
 #[cfg(test)]
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
