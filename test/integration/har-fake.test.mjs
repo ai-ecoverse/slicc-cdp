@@ -294,6 +294,66 @@ test('HAR admits only the ordinary main document ending a pause and omits unveri
   });
 });
 
+test('HAR keeps the main document of the resumed loader when its loading completes before the commit', async () => {
+  await harFixture(async ({ home, backend, tab, file, start, send, request, response }) => {
+    tab.url = 'about:blank';
+    tab.loaderId = 'BLANK';
+    const held = await start();
+    await held.event('paused');
+    const trees = () => backend.calls.filter((call) => call.method === 'Page.getFrameTree').length;
+    const absorbed = async () => {
+      const from = trees();
+      while (trees() < from + 2) await new Promise((resolve) => setTimeout(resolve, 10));
+    };
+    const document = (id, url, loaderId, extra = {}) =>
+      request(
+        id,
+        url,
+        {},
+        { type: 'Document', frameId: 'TAB', documentURL: url, loaderId, ...extra }
+      );
+    document('OTHER', 'https://example.test/unverified', 'OTHER');
+    response('OTHER', 'https://example.test/unverified');
+    document('DOCUMENT', 'https://example.test/start', 'NEXT');
+    await absorbed();
+    document('DOCUMENT', 'https://example.test/page', 'NEXT', {
+      redirectResponse: {
+        url: 'https://example.test/start',
+        status: 302,
+        statusText: 'Found',
+        headers: { Location: 'https://example.test/page' },
+      },
+    });
+    response('DOCUMENT', 'https://example.test/page');
+    await absorbed();
+    const before = held.events().filter((event) => event.event === 'checkpoint').length;
+    tab.url = 'https://example.test/page';
+    tab.loaderId = 'NEXT';
+    send('Page.frameNavigated', {
+      frame: { id: 'TAB', loaderId: 'NEXT', url: tab.url, securityOrigin: 'https://example.test' },
+    });
+    await held.event('resumed');
+    await held.event(
+      'checkpoint',
+      () => held.events().filter((event) => event.event === 'checkpoint').length > before
+    );
+    const stopped = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+    const har = JSON.parse(await readFile(file, 'utf8'));
+    assert.deepEqual(
+      har.log.entries.map((entry) => [entry.request.url, entry.response.status]),
+      [
+        ['https://example.test/start', 302],
+        ['https://example.test/page', 200],
+      ],
+      JSON.stringify(har)
+    );
+    assert.ok(!JSON.stringify(har).includes('/unverified'));
+    assert.ok(!backend.calls.some((call) => call.method === 'Network.getResponseBody'));
+  });
+});
+
 test('completed ordinary traffic survives a later protected navigation without reading its body', async () => {
   await harFixture(async ({ backend, tab, file, start, request, response, send }) => {
     const held = await start(['--content=embed']);
