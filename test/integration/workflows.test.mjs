@@ -59,7 +59,7 @@ test('the pipeline picks its runners, reviews no Renovate pull request and runs 
     assert.equal(input(name), undefined, name);
   }
   assert.doesNotMatch(ci, /vars\.|CERT_|cert-review/);
-  assert.equal(input('shards'), '4');
+  assert.equal(input('shards'), '8');
   assert.equal(input('timeout-minutes'), '30');
   assert.match(input('review-prompt'), /^\|$/);
 });

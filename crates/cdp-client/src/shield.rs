@@ -198,7 +198,7 @@ pub fn mentions(guard: &Protected, value: &Value) -> bool {
     }
 }
 
-fn decode_percent(text: &str) -> String {
+pub(crate) fn decode_percent(text: &str) -> String {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -860,14 +860,7 @@ mod tests {
                 }
                 last_ready = Some(ready);
             }
-            assert!(
-                Instant::now() < deadline,
-                "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} session_blocked={} content_blocked={} guard_document={} target_protected={:?}",
-                cdp.session_blocked(session),
-                cdp.content_blocked(session),
-                cdp.document_evidence(target),
-                cdp.target_protected(target, false)
-            );
+            assert!(Instant::now() < deadline, "allowed error page never settled: tree={tree:?} info={info:?} last_ready={last_ready:?} subject_blocked={} target_protected={} content_blocked={} guard_document={}", cdp.session_blocked(session), cdp.is_protected_target(target), cdp.content_blocked(session), cdp.document_evidence(target));
         }
         raw.call("Target.detachFromTarget", json!({ "sessionId": observer }), None).unwrap();
     }

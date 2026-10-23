@@ -104,6 +104,7 @@ export async function fakeCdp({
   answers = {},
   attachEvents = false,
   discoverEvents = false,
+  pauseNavigation = false,
   childFrames = [],
   intercept,
   aria = () => defaultAria,
@@ -114,10 +115,14 @@ export async function fakeCdp({
 } = {}) {
   let lastAria = defaultAria;
   const calls = [];
+  const navigationPauses = new Map();
+  const fetchSessions = new Set();
   const jar = cookies.map((cookie) => ({ ...cookie }));
   let requests = 0;
   const targets = [];
   const sessions = new Map();
+  const sessionSends = new Map();
+  const paged = new Set();
   let next = 0;
   let tabs = 0;
   const info = (target) => ({
@@ -148,7 +153,15 @@ export async function fakeCdp({
   const sockets = new Set();
   server.on('upgrade', (req, socket) => {
     sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('close', () => {
+      sockets.delete(socket);
+      for (const [session, owner] of sessionSends) {
+        if (owner !== send) continue;
+        sessions.delete(session);
+        sessionSends.delete(session);
+        paged.delete(session);
+      }
+    });
     socket.on('error', () => socket.destroy());
     const accept = createHash('sha1')
       .update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -157,7 +170,6 @@ export async function fakeCdp({
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     let noise;
-    const paged = new Set();
     socket.on('close', () => clearInterval(noise));
     const send = (message) => {
       if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
@@ -231,6 +243,7 @@ export async function fakeCdp({
           next += 1;
           const session = `S${next}`;
           sessions.set(session, found);
+          sessionSends.set(session, send);
           if (attachEvents)
             event('Target.attachedToTarget', {
               sessionId: session,
@@ -241,6 +254,8 @@ export async function fakeCdp({
         }
         case 'Target.detachFromTarget':
           sessions.delete(params.sessionId);
+          sessionSends.delete(params.sessionId);
+          paged.delete(params.sessionId);
           return answer({});
         case 'Target.closeTarget': {
           const index = targets.findIndex((item) => item.targetId === params.targetId);
@@ -263,6 +278,18 @@ export async function fakeCdp({
               childFrames,
             },
           });
+        case 'Fetch.enable':
+          fetchSessions.add(sessionId);
+          return answer({});
+        case 'Fetch.disable':
+          fetchSessions.delete(sessionId);
+          return answer({});
+        case 'Fetch.continueRequest': {
+          const complete = navigationPauses.get(params.requestId);
+          navigationPauses.delete(params.requestId);
+          complete?.();
+          return answer({});
+        }
         case 'Page.enable':
           paged.add(sessionId);
           return answer({});
@@ -282,66 +309,83 @@ export async function fakeCdp({
             }
           );
         case 'Page.navigate': {
-          if (target) {
-            target.url = params.url;
-            delete target.frame;
-            delete target.history;
-          }
-          answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
-          const committed = {
-            frame: {
-              id: target?.targetId ?? 'F',
-              loaderId: `L${next}`,
-              url: params.url,
-              securityOrigin: new URL(params.url).origin,
-            },
-          };
-          for (const [peer, found] of sessions)
-            if (target && found === target && peer !== sessionId && paged.has(peer))
-              send({ method: 'Page.frameNavigated', params: committed, sessionId: peer });
-          event('Page.frameNavigated', committed);
-          emitConsole(params.url);
-          for (const item of traffic) {
-            requests += 1;
-            const requestId = `R${requests}`;
-            event('Network.requestWillBeSent', {
-              requestId,
-              loaderId: `L${next}`,
-              documentURL: params.url,
-              request: { url: item.url, method: 'GET', headers: {} },
-              timestamp: 1,
-              wallTime: 1,
-              initiator: { type: 'other' },
-              type: 'Fetch',
-            });
-            event('Network.requestWillBeSentExtraInfo', {
-              requestId,
-              associatedCookies: item.associatedCookies ?? [],
-              headers: item.requestHeaders,
-            });
-            event('Network.responseReceived', {
-              requestId,
-              loaderId: `L${next}`,
-              timestamp: 1,
-              type: 'Fetch',
-              response: {
-                url: item.url,
-                status: 200,
-                statusText: 'OK',
-                headers: { 'content-type': 'text/plain' },
-                mimeType: 'text/plain',
+          const complete = () => {
+            if (target) {
+              target.url = params.url;
+              delete target.frame;
+              delete target.history;
+            }
+            answer({ frameId: target?.targetId ?? 'F', loaderId: `L${next}` });
+            const committed = {
+              frame: {
+                id: target?.targetId ?? 'F',
+                loaderId: `L${next}`,
+                url: params.url,
+                securityOrigin: new URL(params.url).origin,
               },
-            });
-            event('Network.responseReceivedExtraInfo', {
+            };
+            for (const [peer, found] of sessions)
+              if (target && found === target && peer !== sessionId && paged.has(peer))
+                sessionSends.get(peer)?.({
+                  method: 'Page.frameNavigated',
+                  params: committed,
+                  sessionId: peer,
+                });
+            event('Page.frameNavigated', committed);
+            emitConsole(params.url);
+            for (const item of traffic) {
+              requests += 1;
+              const requestId = `R${requests}`;
+              event('Network.requestWillBeSent', {
+                requestId,
+                loaderId: `L${next}`,
+                documentURL: params.url,
+                request: { url: item.url, method: 'GET', headers: {} },
+                timestamp: 1,
+                wallTime: 1,
+                initiator: { type: 'other' },
+                type: 'Fetch',
+              });
+              event('Network.requestWillBeSentExtraInfo', {
+                requestId,
+                associatedCookies: item.associatedCookies ?? [],
+                headers: item.requestHeaders,
+              });
+              event('Network.responseReceived', {
+                requestId,
+                loaderId: `L${next}`,
+                timestamp: 1,
+                type: 'Fetch',
+                response: {
+                  url: item.url,
+                  status: 200,
+                  statusText: 'OK',
+                  headers: { 'content-type': 'text/plain' },
+                  mimeType: 'text/plain',
+                },
+              });
+              event('Network.responseReceivedExtraInfo', {
+                requestId,
+                blockedCookies: [],
+                statusCode: 200,
+                headers: item.responseHeaders,
+              });
+              event('Network.loadingFinished', { requestId, timestamp: 1, encodedDataLength: 0 });
+            }
+            event('Page.domContentEventFired', { timestamp: 1 });
+            event('Page.loadEventFired', { timestamp: 1 });
+          };
+          if (pauseNavigation && fetchSessions.has(sessionId)) {
+            const requestId = `NAV-${sessionId}`;
+            navigationPauses.set(requestId, complete);
+            event('Fetch.requestPaused', {
               requestId,
-              blockedCookies: [],
-              statusCode: 200,
-              headers: item.responseHeaders,
+              networkId: `NET-${sessionId}`,
+              frameId: target?.targetId ?? 'F',
+              resourceType: 'Document',
+              request: { url: params.url, method: 'GET', headers: {} },
             });
-            event('Network.loadingFinished', { requestId, timestamp: 1, encodedDataLength: 0 });
-          }
-          event('Page.domContentEventFired', { timestamp: 1 });
-          event('Page.loadEventFired', { timestamp: 1 });
+          } else complete();
           return;
         }
         case 'Runtime.enable':

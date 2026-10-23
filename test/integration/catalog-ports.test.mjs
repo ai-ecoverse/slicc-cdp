@@ -387,7 +387,8 @@ test('list --json lists a real seven tab in sevenTabs only, and an http stand-in
     const ids = (tabs) => tabs.map((tab) => tab.id);
     assert.equal(entry.endpoint.sevenOpen, true);
     assert.deepEqual(ids(entry.endpoint.sevenTabs), [real]);
-    assert.equal(entry.endpoint.sevenTabs[0].url, 'https://seven.sliccy.ai/');
+    assert.equal(entry.endpoint.sevenTabs[0].url, 'https://seven.sliccy.ai');
+    assert.equal(entry.endpoint.sevenTabs[0].title, 'https://seven.sliccy.ai');
     assert.ok(!ids(entry.endpoint.tabs).includes(real), listed.stdout);
     assert.ok(!ids(entry.endpoint.tabs).includes(stand), listed.stdout);
     assert.ok(!listed.stdout.includes(`seven.sliccy.ai:${server.port}`), listed.stdout);

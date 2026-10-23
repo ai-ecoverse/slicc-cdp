@@ -33,9 +33,13 @@ function tracked(fn, ci) {
     }, context);
 }
 
-export function chromeTest(name, options, fn) {
+export function chromeTestArguments(options, fn) {
   const [settings, callback] = argumentsFor(options, fn);
   const ci = Boolean(process.env.CI);
   const skip = ci ? false : chromeSkipReason() || settings.skip;
-  return test(name, { ...settings, skip }, tracked(callback, ci));
+  return [{ ...settings, skip }, tracked(callback, ci)];
+}
+
+export function chromeTest(name, options, fn) {
+  return test(name, ...chromeTestArguments(options, fn));
 }
