@@ -16,6 +16,7 @@ mod input;
 mod keys;
 mod launch;
 mod net;
+mod recording;
 mod route;
 mod sanitize;
 mod session;
@@ -102,6 +103,9 @@ pub fn execute_in(
     }
     if route::is_route_command(&command) {
         return route::run(&invocation);
+    }
+    if recording::is_stop(&command) {
+        return recording::stop(&invocation);
     }
     if command == "webmcp-call" {
         if invocation.positionals.is_empty() {
