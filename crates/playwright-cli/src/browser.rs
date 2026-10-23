@@ -1250,24 +1250,15 @@ pub fn check_ref(
         let pos = evaluate_in_frame(cdp, session, frame_id, &click_expr)?;
         let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let cx = frame_offset.0 + fx;
-        let cy = frame_offset.1 + fy;
-        for kind in ["mousePressed", "mouseReleased"] {
-            cdp.call(
-                "Input.dispatchMouseEvent",
-                json!({ "type": kind, "x": cx, "y": cy, "button": "left", "clickCount": 1 }),
-                Some(input_session(session, rec)),
-            )?;
-        }
+        let point = (frame_offset.0 + fx, frame_offset.1 + fy);
+        let input = input_session(session, rec);
+        let scope = Scope { session, frame: Some(frame_id), input };
+        landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), TOGGLE, &mut |cdp| dispatch_click(cdp, input, point, "left", 0))?;
         let post_expr = format!(
             "(function() {{ var el = document.querySelector({}); return el ? el.checked : null; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
-        let post = evaluate_in_frame(cdp, session, frame_id, &post_expr)?;
-        let after = post.value.as_bool().unwrap_or(!checked);
-        if after != checked {
-            return Err(format!("check: element state did not change to {}\n", checked));
-        }
+        toggled(cdp, checked, &mut |cdp| Ok(evaluate_in_frame(cdp, session, frame_id, &post_expr)?.value.as_bool()))?;
         return Ok(true);
     }
     if let Some(backend) = rec.backend_node_id {
@@ -1321,35 +1312,40 @@ fn check_backend(
         Some(session),
     )?;
     let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
-    let cx = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cy = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    for kind in ["mousePressed", "mouseReleased"] {
-        cdp.call(
-            "Input.dispatchMouseEvent",
+    let point = (
+        value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+    );
+    landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), point, TOGGLE, &mut |cdp| dispatch_click(cdp, session, point, "left", 0))?;
+    toggled(cdp, checked, &mut |cdp| {
+        let post = cdp.call(
+            "Runtime.callFunctionOn",
             json!({
-                "type": kind,
-                "x": cx,
-                "y": cy,
-                "button": "left",
-                "clickCount": 1,
+                "objectId": object_id,
+                "functionDeclaration": "function() { return this.checked; }",
+                "returnByValue": true,
             }),
             Some(session),
         )?;
-    }
-    let post = cdp.call(
-        "Runtime.callFunctionOn",
-        json!({
-            "objectId": object_id,
-            "functionDeclaration": "function() { return this.checked; }",
-            "returnByValue": true,
-        }),
-        Some(session),
-    )?;
-    let after = post.pointer("/result/value").and_then(|v| v.as_bool()).unwrap_or(!checked);
-    if after != checked {
-        return Err(format!("check: element state did not change to {}\n", checked));
-    }
+        Ok(post.pointer("/result/value").and_then(|v| v.as_bool()))
+    })?;
     Ok(true)
+}
+
+const TOGGLE: Gesture<'static> = Gesture::Click { button: "left", modifiers: 0 };
+const TOGGLE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn toggled(cdp: &mut Cdp, checked: bool, read: &mut dyn FnMut(&mut Cdp) -> Result<Option<bool>, String>) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + TOGGLE_WAIT;
+    loop {
+        if read(cdp)? == Some(checked) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("check: element state did not change to {}\n", checked));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 pub fn drag_refs(

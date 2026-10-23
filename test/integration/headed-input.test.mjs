@@ -111,6 +111,11 @@ async function steps(pw, out, raw, tab, seven) {
   await until(out, 'hovered', 'hover');
   await pw(['dblclick', refOf(await pw(['snapshot']), 'button', 'Go')]);
   await until(out, 'dblclicked', 'dblclick');
+  const agree = () => inTab(raw, tab, "document.getElementById('agree').checked");
+  await pw(['check', refOf(await pw(['snapshot']), 'checkbox', 'Agree')]);
+  await until(agree, true, 'check');
+  await pw(['uncheck', refOf(await pw(['snapshot']), 'checkbox', 'Agree')]);
+  await until(agree, false, 'uncheck');
   await pw(['fill', refOf(await pw(['snapshot']), 'textbox', 'Name'), 'ada']);
   await pw(['type', 'x']);
   await pw(['press', 'Enter']);

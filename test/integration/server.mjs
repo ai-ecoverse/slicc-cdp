@@ -135,7 +135,7 @@ function snapshotPage(pathname) {
 }
 
 function childPage() {
-  return '<!doctype html><title>Child</title><style>.hoverable:hover { background: lime; }</style><p>child-frame</p><div class="hoverable" id="hover-target" aria-label="hover me">hover me</div><script>document.getElementById("hover-target").addEventListener("mouseenter", function() { this.setAttribute("data-hovered", "true"); });</script>';
+  return '<!doctype html><title>Child</title><style>.hoverable:hover { background: lime; }</style><p>child-frame</p><div class="hoverable" id="hover-target" aria-label="hover me">hover me</div><input type="checkbox" id="inner" aria-label="Inner"><script>document.getElementById("hover-target").addEventListener("mouseenter", function() { this.setAttribute("data-hovered", "true"); });</script>';
 }
 
 function bootPage() {
