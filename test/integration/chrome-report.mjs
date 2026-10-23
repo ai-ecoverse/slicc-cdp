@@ -43,6 +43,7 @@ export const CHROME_FILES = new Set(
     'launch',
     'plant',
     'privileged-ui',
+    'recording',
     'redirect-navigation',
     'redirect-protected',
     'redirect-userinfo',

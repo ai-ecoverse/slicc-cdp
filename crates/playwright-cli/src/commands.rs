@@ -159,6 +159,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
         "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
+        _ if crate::recording::is_start(command) => crate::recording::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
