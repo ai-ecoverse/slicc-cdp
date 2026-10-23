@@ -21,16 +21,7 @@ impl Transport for WindowBackend {
                 self.attached += 1;
                 json!({ "sessionId": if self.attached == 1 { "U" } else { "G" } })
             }
-            "Target.getTargetInfo" => {
-                let found = browser.targets.iter().find(|info| info["targetId"] == call["params"]["targetId"]).cloned();
-                match found {
-                    Some(info) => json!({ "targetInfo": info }),
-                    None => {
-                        self.inbox.push_back(json!({ "id": call["id"], "error": { "message": "No target with given id found" } }).to_string());
-                        return Ok(());
-                    }
-                }
-            }
+            "Target.getTargetInfo" => json!({ "targetInfo": browser.targets.iter().find(|info| info["targetId"] == call["params"]["targetId"]).cloned().unwrap_or(Value::Null) }),
             "Target.getTargets" => json!({ "targetInfos": browser.targets }),
             "Page.getFrameTree" => json!({ "frameTree": {
                 "frame": { "id": "T", "loaderId": "LT", "url": "https://ordinary.test/", "securityOrigin": "https://ordinary.test" },

@@ -295,11 +295,5 @@ pub fn mac_commands(code: &str, modifiers: &[String]) -> Vec<String> {
 }
 
 pub fn mask(modifiers: &[String]) -> i64 {
-    modifiers.iter().fold(0, |mask, name| mask | match name.as_str() {
-        "Alt" => 1,
-        "Control" => 2,
-        "Meta" => 4,
-        "Shift" => 8,
-        _ => 0,
-    })
+    MODIFIERS.iter().enumerate().filter(|(_, name)| modifiers.iter().any(|held| held == *name)).fold(0, |mask, (bit, _)| mask | 1 << bit)
 }

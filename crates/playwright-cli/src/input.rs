@@ -67,11 +67,7 @@ impl Pointer {
     }
 
     fn buttons_mask(&self) -> i64 {
-        self.buttons.iter().fold(0, |mask, name| mask | match name.as_str() {
-            "left" => 1,
-            "right" => 2,
-            _ => 4,
-        })
+        BUTTONS.iter().enumerate().filter(|(_, name)| self.buttons.iter().any(|held| held == *name)).fold(0, |mask, (bit, _)| mask | 1 << bit)
     }
 
     fn modifiers_mask(&self) -> i64 {
@@ -433,26 +429,21 @@ struct DropFile {
 }
 
 fn cwd(invocation: &Invocation) -> PathBuf {
-    if let Some(dir) = &invocation.cwd {
-        return dir.clone();
-    }
     #[cfg(target_arch = "wasm32")]
     let dir = cdp_client::state::wasm_cwd(|name| std::env::var(name).ok());
     #[cfg(not(target_arch = "wasm32"))]
     let dir = std::env::current_dir().ok();
-    dir.unwrap_or_else(|| PathBuf::from("/"))
+    invocation.cwd.clone().or(dir).unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn absolute(base: &Path, path: &str) -> PathBuf {
     let joined = base.join(path);
     let mut out = PathBuf::new();
     for part in joined.components() {
-        match part {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
+        if part == Component::ParentDir {
+            out.pop();
+        } else {
+            out.push(part.as_os_str());
         }
     }
     out
@@ -466,7 +457,7 @@ fn stat_error(path: &str, error: &std::io::Error) -> String {
 }
 
 fn read_files(paths: &[&str], base: &Path) -> Result<Vec<DropFile>, String> {
-    let mut found: Vec<(PathBuf, String)> = Vec::new();
+    let mut found: Vec<(PathBuf, String, std::fs::Metadata)> = Vec::new();
     let mut directory = false;
     for path in paths {
         let resolved = absolute(base, path);
@@ -481,7 +472,7 @@ fn read_files(paths: &[&str], base: &Path) -> Result<Vec<DropFile>, String> {
             }
             directory = true;
         } else {
-            found.push((resolved, shown));
+            found.push((resolved, shown, meta));
         }
     }
     if directory && !found.is_empty() {
@@ -492,12 +483,8 @@ fn read_files(paths: &[&str], base: &Path) -> Result<Vec<DropFile>, String> {
     }
     let mut files = Vec::new();
     let mut total = 0u64;
-    for (resolved, shown) in found {
+    for (resolved, shown, meta) in found {
         let file = std::fs::File::open(&resolved).map_err(|error| format!("Error: {error}, open '{shown}'\n"))?;
-        let meta = file.metadata().map_err(|error| stat_error(&shown, &error))?;
-        if !meta.is_file() {
-            return Err(format!("Error: {shown} is not a regular file\n"));
-        }
         let mut bytes = Vec::new();
         file.take(MAX_DROP_BYTES + 1 - total).read_to_end(&mut bytes).map_err(|error| format!("Error: {error}, read '{shown}'\n"))?;
         total += bytes.len() as u64;
@@ -513,10 +500,7 @@ fn read_files(paths: &[&str], base: &Path) -> Result<Vec<DropFile>, String> {
 
 fn drop(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, report: &mut Report) -> Output {
     let id = invocation.positionals[0].clone();
-    let data = match drop_data(invocation) {
-        Ok(data) => data,
-        Err(message) => return Output::err(message),
-    };
+    let data = drop_data(invocation).unwrap_or_default();
     let paths = invocation.repeated("path");
     let base = cwd(invocation);
     let output = with_ref(cdp, state, invocation, report, &id, |cdp, session, rec| {
