@@ -35,6 +35,10 @@ pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
+const WAITER_SLICE: Duration = Duration::from_millis(5);
+const AUTO_ATTACH: &str = "slicc: refused: auto-attach is not supported by slicc-cdp\n";
+const FLATTEN: &str = "slicc: refused: attach with flatten: true\n";
+const PERSISTENT: &str = "slicc: refused: persistent page capabilities are not supported by slicc-cdp\n";
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
@@ -88,6 +92,8 @@ struct MainDocument {
     previous: bool,
     probed: bool,
 }
+
+pub type Waiter = Box<dyn FnMut(&Cdp)>;
 
 pub struct Cdp {
     ws: Box<dyn Transport>,
@@ -157,6 +163,8 @@ pub struct Cdp {
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
     issued: issued::Issued,
+    waiter: Option<Waiter>,
+    waiter_due: Instant,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
@@ -235,6 +243,8 @@ impl Cdp {
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
             issued: issued::Issued::default(),
+            waiter: None,
+            waiter_due: Instant::now(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -588,17 +598,17 @@ impl Cdp {
         if method == "Browser.setWindowBounds" {
             self.admit_window(params, session_id)?;
         } else if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
-            return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
+            return Err(PERSISTENT.into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
             && params.get("autoAttach").and_then(|v| v.as_bool()) == Some(true)
         {
-            return Err("slicc: refused: auto-attach is not supported by slicc-cdp\n".into());
+            return Err(AUTO_ATTACH.into());
         }
         if matches!(method, "Target.attachToTarget" | "Target.setAutoAttach")
             && params.get("flatten").and_then(|v| v.as_bool()) != Some(true)
         {
-            return Err("slicc: refused: attach with flatten: true\n".into());
+            return Err(FLATTEN.into());
         }
         if let Some(reason) = shield::command_url_refusal(&self.guard, params, method) {
             if reason == self.guard.refusal() && shield::cookie_method(method) {
@@ -702,6 +712,31 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    pub fn settled_refusal(&self, method: &str, params: &Value, session_id: Option<&str>) -> Option<String> {
+        let session_id = session_id.filter(|id| !id.is_empty());
+        if method == "Page.handleJavaScriptDialog" || harmless(method, params) { return None }
+        if session_id.is_some_and(|session| self.blocked.contains(session)) { return Some(self.refusal()) }
+        let reason = if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
+            self.refusal()
+        } else if shield::persistent_capability(method) && method != "Browser.setWindowBounds" && (session_id.is_none() || !shield::network_state(method, params)) {
+            PERSISTENT.to_string()
+        } else if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach" && params.get("autoAttach").and_then(Value::as_bool) == Some(true) {
+            AUTO_ATTACH.to_string()
+        } else if matches!(method, "Target.attachToTarget" | "Target.setAutoAttach") && params.get("flatten").and_then(Value::as_bool) != Some(true) {
+            FLATTEN.to_string()
+        } else {
+            return None;
+        };
+        if session_id.is_some_and(|session| self.dialog_sessions.contains(session) || self.guard_sessions.contains(session))
+            || self.content_refused(method, params, session_id.unwrap_or("")) {
+            return Some(self.refusal());
+        }
+        if reason == self.refusal() { return Some(reason) }
+        if Worlds::selectors(params) || Worlds::sensitive(method) { return None }
+        if params.get("targetId").and_then(Value::as_str).is_some_and(|target| self.abandoned.contains(target)) { return Some(UNGUARDED.to_string()) }
+        Some(shield::browser_wide(method, params, session_id, &self.contexts).unwrap_or(reason))
     }
 
     fn network_state_admitted(&self, method: &str, params: &Value, session_id: Option<&str>) -> bool {
@@ -2763,7 +2798,7 @@ impl Cdp {
             let value = match self.call_replies.remove(&id) {
                 Some(value) => value,
                 None => {
-                    let text = match self.ws.recv_text(deadline)? {
+                    let text = match self.recv(deadline)? {
                         Some(text) => text,
                         None => return Err(if pinned && session_id.is_some_and(|session| self.blocked.contains(session)) { self.refusal() } else { format!("{method} timed out\n") }),
                     };
@@ -2810,9 +2845,28 @@ impl Cdp {
         Ok(id)
     }
 
+    pub fn set_waiter(&mut self, waiter: Option<Waiter>) {
+        self.waiter = waiter;
+    }
+
+    fn recv(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        loop {
+            let Some(mut waiter) = self.waiter.take() else { return self.ws.recv_text(deadline) };
+            let now = Instant::now();
+            if now >= self.waiter_due {
+                waiter(self);
+                self.waiter_due = now + WAITER_SLICE;
+            }
+            self.waiter = Some(waiter);
+            let until = deadline.min(self.waiter_due);
+            if let Some(text) = self.ws.recv_text(until)? { return Ok(Some(text)) }
+            if until == deadline { return Ok(None) }
+        }
+    }
+
     pub fn pump(&mut self, deadline: Instant) -> Result<bool, String> {
         self.webmcp_sweep();
-        let result = match self.ws.recv_text(deadline)? {
+        let result = match self.recv(deadline)? {
             Some(text) => {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                     self.absorb(value);
@@ -3589,6 +3643,7 @@ mod tests {
     include!("guard_attach_tree_test.rs");
     include!("front_test.rs");
     include!("window_test.rs");
+    include!("settled_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
