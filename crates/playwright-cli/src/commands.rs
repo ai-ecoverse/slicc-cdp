@@ -733,7 +733,7 @@ fn cmd_type(
         Err(message) => return Output::err(message),
     };
     let result: Result<(), String> = (|| {
-        browser::insert_text(cdp, &session, &text)?;
+        browser::type_text(cdp, &session, &text)?;
         if submit {
             browser::press_key(cdp, &session, "Enter")?;
         }

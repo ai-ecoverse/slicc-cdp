@@ -424,7 +424,7 @@ test('pointer input over an embedded frame or outside the main document is refus
 
 test('mousewheel scrolls a background tab in place and only falls back to bringing it forward', async () => {
   const background =
-    'Error: mousewheel could not scroll the background tab in place, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run "playwright-cli tab-select <index> --foreground" first.\n';
+    'Error: mousewheel could not scroll the background tab in place, and brings it to the front only when the tab that was in front can be switched back to. Run "playwright-cli tab-select <index> --foreground" first.\n';
   const synthetic = (fake) =>
     params(fake, 'Runtime.evaluate').filter((call) =>
       call.expression.startsWith('(function(x, y, dx, dy')
@@ -468,6 +468,16 @@ test('mousewheel scrolls a background tab in place and only falls back to bringi
   });
   await withFake({ hidden: true, wakes: true, synthetic: 'nothing' }, async (fake, pw) => {
     fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+    const result = await pw(['mousewheel', '0', '100', '--tab', 'TAB']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(params(fake, 'Target.activateTarget'), [
+      { targetId: 'TAB' },
+      { targetId: 'SEVEN' },
+    ]);
+    assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 1);
+  });
+  await withFake({ hidden: true, wakes: true, synthetic: 'nothing' }, async (fake, pw) => {
+    fake.targets.push({ targetId: 'VAULT', url: 'https://vault.sliccy.ai/' });
     const result = await pw(['mousewheel', '0', '100', '--tab', 'TAB']);
     assert.equal(result.code, 1);
     assert.equal(result.stderr, background);

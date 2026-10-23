@@ -22,7 +22,7 @@ const FOCUS: &str = "(() => { let e = document.activeElement; while (e && e.shad
 const INNER: &str = "[innerWidth, innerHeight]";
 const DROP: &str = "function(payloads, data) { if (!this.isConnected || this.nodeType !== 1) return 'error:notconnected'; this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); const point = {x:r.x+r.width/2,y:r.y+r.height/2}; const dt = new DataTransfer(); for (const p of payloads) { const bytes = Uint8Array.from(atob(p.buffer), (c) => c.charCodeAt(0)); dt.items.add(new File([bytes], p.name, { type: p.mimeType, lastModified: p.lastModifiedMs })); } for (const entry of data) dt.setData(entry.mimeType, entry.value); const make = (type) => new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y, dataTransfer: dt }); this.dispatchEvent(make('dragenter')); const over = make('dragover'); this.dispatchEvent(over); if (!over.defaultPrevented) { this.dispatchEvent(make('dragleave')); return 'not-accepted'; } this.dispatchEvent(make('drop')); return 'accepted'; }";
 const NOT_ACCEPTED: &str = "Error: Drop target did not accept the drop \u{2014} its dragover handler did not call preventDefault()\n";
-const BACKGROUND: &str = "Error: mousewheel could not scroll the background tab in place, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const BACKGROUND: &str = "Error: mousewheel could not scroll the background tab in place, and brings it to the front only when the tab that was in front can be switched back to. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
 const SYNTHETIC_WHEEL: &str = "function(x, y, dx, dy, alt, ctrl, meta, shift, buttons) { let target = document.elementFromPoint(x, y); while (target && target.shadowRoot) { const inner = target.shadowRoot.elementFromPoint(x, y); if (!inner || inner === target) break; target = inner; } const root = document.scrollingElement || document.documentElement; if (!target) target = root; if (/^(iframe|frame|object|embed|fencedframe|portal)$/i.test(target.localName)) return 'frame'; const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, screenX: x, screenY: y, deltaX: dx, deltaY: dy, deltaMode: 0, altKey: alt, ctrlKey: ctrl, metaKey: meta, shiftKey: shift, buttons }); if (!target.dispatchEvent(event)) return 'prevented'; const parent = (node) => node.assignedSlot || node.parentElement || (node.getRootNode() instanceof ShadowRoot ? node.getRootNode().host : null); const room = (node, axis, delta) => { const style = getComputedStyle(node); if (!/(auto|scroll|overlay)/.test(axis === 'x' ? style.overflowX : style.overflowY)) return false; const at = axis === 'x' ? node.scrollLeft : node.scrollTop; const end = axis === 'x' ? node.scrollWidth - node.clientWidth : node.scrollHeight - node.clientHeight; return delta > 0 ? at < end - 0.5 : at > 0.5; }; const scroller = (axis, delta) => { if (!delta) return root; for (let node = target; node && node !== root; node = parent(node)) if (room(node, axis, delta)) return node; return root; }; const sx = scroller('x', dx); const sy = scroller('y', dy); if (sx === sy) sx.scrollBy({ left: dx, top: dy, behavior: 'instant' }); else { sx.scrollBy({ left: dx, top: 0, behavior: 'instant' }); sy.scrollBy({ left: 0, top: dy, behavior: 'instant' }); } return 'scrolled'; }";
 const FOREGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const WHEEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -199,7 +199,7 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
         Err(message) => return Output::err(message),
     };
     let mut pointer = Pointer::load(state.input.get(&target));
-    let result = act(cdp, &session, &target, invocation, command, &mut pointer);
+    let result = act(cdp, &session, invocation, command, &mut pointer);
     let _ = cdp.call("Runtime.releaseObjectGroup", json!({ "objectGroup": GROUP }), Some(&session));
     let watched = browser::watch_detach(cdp, state, &target, &session);
     state.input.retain(|known, _| pages.iter().any(|page| &page.target_id == known));
@@ -215,7 +215,7 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
     }
 }
 
-fn act(cdp: &mut Cdp, session: &str, target: &str, invocation: &Invocation, command: &str, pointer: &mut Pointer) -> Result<String, String> {
+fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, pointer: &mut Pointer) -> Result<String, String> {
     match command {
         "keydown" => key_down(cdp, session, &key_name(invocation)?, pointer),
         "keyup" => key_up(cdp, session, &key_name(invocation)?, pointer),
@@ -251,10 +251,7 @@ fn act(cdp: &mut Cdp, session: &str, target: &str, invocation: &Invocation, comm
         "mousewheel" => {
             let (dx, dy) = numbers(invocation, ["dx", "dy"])?;
             admit_point(cdp, session, pointer.x, pointer.y)?;
-            if foreground(cdp, session, target, pointer, (dx, dy))? {
-                let wheel = json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy });
-                cdp.call_for("Input.dispatchMouseEvent", wheel, Some(session), WHEEL_WAIT).map_err(|message| if message == "Input.dispatchMouseEvent timed out\n" { BACKGROUND.to_string() } else { message })?;
-            }
+            wheel(cdp, session, pointer, (dx, dy))?;
             Ok(code(&format!("// Scroll mouse wheel\nawait page.mouse.wheel({}, {});", js(dx), js(dy))))
         }
         _ => {
@@ -297,21 +294,23 @@ fn synthetic_wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, (dx, dy): (f
     }
 }
 
-fn foreground(cdp: &mut Cdp, session: &str, target: &str, pointer: &Pointer, delta: (f64, f64)) -> Result<bool, String> {
+fn trusted_wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, (dx, dy): (f64, f64)) -> Result<(), String> {
+    let wheel = json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy });
+    cdp.call_for("Input.dispatchMouseEvent", wheel, Some(session), WHEEL_WAIT).map_err(|message| if message == "Input.dispatchMouseEvent timed out\n" { BACKGROUND.to_string() } else { message })?;
+    Ok(())
+}
+
+fn wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, delta: (f64, f64)) -> Result<(), String> {
     if visible(cdp, session, std::time::Duration::ZERO)? {
-        return Ok(true);
+        return trusted_wheel(cdp, session, pointer, delta);
     }
     if synthetic_wheel(cdp, session, pointer, delta)? {
-        return Ok(false);
+        return Ok(());
     }
-    if cdp.admit_foreground(session).ok().as_deref() != Some(target) {
-        return Err(BACKGROUND.to_string());
-    }
-    browser::activate(cdp, target)?;
-    if !visible(cdp, session, FOREGROUND_WAIT)? {
-        return Err(BACKGROUND.to_string());
-    }
-    Ok(true)
+    let front = cdp.bring_forward(session).map_err(|_| BACKGROUND.to_string())?;
+    let result = visible(cdp, session, FOREGROUND_WAIT).and_then(|shown| if shown { trusted_wheel(cdp, session, pointer, delta) } else { Err(BACKGROUND.to_string()) });
+    let restored = cdp.restore_front(front);
+    result.and(restored)
 }
 
 fn mouse(cdp: &mut Cdp, session: &str, kind: &str, pointer: &Pointer, button: &str, clicks: Option<i64>) -> Result<(), String> {

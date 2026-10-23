@@ -3531,6 +3531,7 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
 }
 
 include!("dialog.rs");
+include!("front.rs");
 include!("window.rs");
 
 #[cfg(test)]
@@ -3562,6 +3563,7 @@ mod tests {
     include!("redirect_relation_test.rs");
     include!("redirect_userinfo_test.rs");
     include!("guard_attach_tree_test.rs");
+    include!("front_test.rs");
     include!("window_test.rs");
 
     #[test]
