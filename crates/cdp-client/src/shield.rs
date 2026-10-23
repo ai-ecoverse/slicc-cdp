@@ -475,7 +475,7 @@ fn site_protected(guard: &Protected, site: &str) -> bool {
     url_protected(guard, site) || host_of(site).is_some_and(|host| guard.cookie_domain(&host))
 }
 
-fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
+pub fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
     if let Some(domain) = cookie.get("domain").and_then(|v| v.as_str()) {
         if guard.cookie_scope(domain) {
             return true;
