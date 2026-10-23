@@ -112,7 +112,7 @@ test('a caller-observed recovery from an error page stays drivable when the guar
       (call) =>
         call.sessionId === sessionId &&
         call.method === 'Fetch.enable' &&
-        call.params?.patterns?.some((item) => item.resourceType === 'Document')
+        call.params?.patterns?.some((item) => item.urlPattern === '*' && !item.resourceType)
     );
   const fake = await fakeCdp({
     refuseWhen: (message, calls) =>
@@ -280,7 +280,7 @@ test('an unobserved protected commit after a recoverable error page is caught be
       (call) =>
         call.sessionId === sessionId &&
         call.method === 'Fetch.enable' &&
-        call.params?.patterns?.some((item) => item.resourceType === 'Document')
+        call.params?.patterns?.some((item) => item.urlPattern === '*' && !item.resourceType)
     );
   await bridged(
     {

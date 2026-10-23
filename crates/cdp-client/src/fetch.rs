@@ -945,7 +945,7 @@ mod tests {
             .filter(|item| item["method"] == "Fetch.continueRequest")
             .map(|item| item["params"]["requestId"].as_str().unwrap())
             .collect();
-        assert_eq!(continued, ["R2"]);
+        assert!(continued.is_empty());
         let failed: Vec<(&str, &str)> = sent
             .iter()
             .filter(|item| item["method"] == "Fetch.failRequest")
@@ -956,7 +956,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(failed, [("R1", "BlockedByClient"), ("R3", "BlockedByClient")]);
+        assert_eq!(failed, [("R1", "BlockedByClient"), ("R2", "BlockedByClient"), ("R3", "BlockedByClient")]);
         assert!(sent.iter().all(|item| item["params"].get("url").is_none()));
         assert_eq!(cdp.events().len(), 1);
         assert_eq!(cdp.events()[0]["params"]["responseHeaders"][0]["value"], "https://vault.sliccy.ai");
@@ -1104,12 +1104,12 @@ mod tests {
         ] {
             assert!(refused(cdp.call(method, json!({ "requestId": "R1", "interceptionId": "R1" }), Some("S"))), "{method}");
         }
-        assert_eq!(methods(&log), ["Fetch.continueRequest"]);
+        assert_eq!(methods(&log), ["Fetch.failRequest"]);
         let old = cdp
             .call("Network.setRequestInterception", json!({ "patterns": [{ "urlPattern": "*" }] }), Some("S"))
             .unwrap_err();
         assert!(old.starts_with("slicc: refused"), "{old}");
-        assert_eq!(methods(&log), ["Fetch.continueRequest"]);
+        assert_eq!(methods(&log), ["Fetch.failRequest"]);
     }
 
     #[test]
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_attaches_without_a_page_guard_and_a_page_without_page_domains_still_does() {
+    fn workers_and_pages_without_page_domains_still_receive_request_guards() {
         let (mut cdp, log) = fake(
             Vec::new(),
             Box::new(|message| match message["method"].as_str().unwrap() {
@@ -1192,7 +1192,8 @@ mod tests {
             }),
         );
         crate::cdp::attach(&mut cdp, "W").unwrap();
-        assert_eq!(methods(&log), ["Target.getTargetInfo", "Target.attachToTarget"]);
+        assert!(methods(&log).contains(&"Fetch.enable".to_string()));
+        assert!(methods(&log).contains(&"Target.setAutoAttach".to_string()));
         crate::cdp::attach(&mut cdp, "P").unwrap();
         assert!(methods(&log).contains(&"Network.setBypassServiceWorker".to_string()));
     }
@@ -1436,6 +1437,7 @@ mod tests {
                 "Fetch.enable",
                 "Network.enable",
                 "Network.setBypassServiceWorker",
+                "Target.setAutoAttach",
                 "Page.enable",
                 "Page.getFrameTree",
                 "Page.getFrameTree",

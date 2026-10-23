@@ -57,7 +57,9 @@ for (const delivery of ['settled', 'inflight']) {
       guardSession = backend.calls.find(
         (call) =>
           call.method === 'Fetch.enable' &&
-          call.params?.patterns?.some((pattern) => pattern.resourceType === 'Document')
+          call.params?.patterns?.some(
+            (pattern) => pattern.urlPattern === '*' && !pattern.resourceType
+          )
       ).sessionId;
       const target = backend.targets.find((target) => target.targetId === targetId);
       target.url = failed;
