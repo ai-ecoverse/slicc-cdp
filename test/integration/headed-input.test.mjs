@@ -87,6 +87,20 @@ async function flow(runner, raw, site, seven) {
   const out = async () => (await pw(['eval', "document.getElementById('out').textContent"])).trim();
   const tab = (await pw(['open', `${site.origin}/page`])).match(/\[targetId: ([^\]]+)\]/)?.[1];
   assert.ok(tab);
+  try {
+    await steps(pw, out, raw, tab, seven);
+  } finally {
+    const attached = await raw
+      .send('Target.attachToTarget', { targetId: tab, flatten: true })
+      .catch(() => ({}));
+    await raw
+      .send('Page.handleJavaScriptDialog', { accept: false }, attached.sessionId)
+      .catch(() => {});
+    await raw.send('Target.closeTarget', { targetId: tab }).catch(() => {});
+  }
+}
+
+async function steps(pw, out, raw, tab, seven) {
   const visibility = (target) => inTab(raw, target, 'document.visibilityState');
   assert.equal(await visibility(tab), 'hidden');
   assert.equal(await visibility(seven), 'visible');
@@ -111,26 +125,41 @@ async function flow(runner, raw, site, seven) {
   await inTab(
     raw,
     tab,
+    'document.body.insertAdjacentHTML(\'beforeend\', \'<form onsubmit="window.submitted = true; return false"><textarea aria-label="Message"></textarea><button>Send</button></form>\')'
+  );
+  await pw(['fill', refOf(await pw(['snapshot']), 'textbox', 'Message'), 'hi']);
+  await pw(['press', 'Enter']);
+  await until(
+    () => inTab(raw, tab, "document.querySelector('textarea').value"),
+    'hi\n',
+    'Enter in a textarea'
+  );
+  assert.equal(await inTab(raw, tab, 'window.submitted'), undefined);
+
+  await inTab(
+    raw,
+    tab,
     "document.getElementById('go').onclick = () => { window.answer = confirm('sure?'); }"
   );
   const { sessionId } = await raw.send('Target.attachToTarget', { targetId: tab, flatten: true });
   try {
     await raw.send('Page.enable', {}, sessionId);
     const opening = raw.event('Page.javascriptDialogOpening', sessionId);
-    await pw(['click', refOf(await pw(['snapshot']), 'button', 'Go')]);
+    const button = refOf(await pw(['snapshot']), 'button', 'Go');
+    const clicked = pw(['click', button]);
     const dialog = await Promise.race([
       opening.seen,
-      new Promise((resolve) => setTimeout(() => resolve(null), 10000)),
+      clicked.then(() => new Promise((resolve) => setTimeout(() => resolve(null), 10000))),
     ]);
     opening.cancel();
     assert.equal(dialog?.message, 'sure?');
     await raw.send('Page.handleJavaScriptDialog', { accept: true }, sessionId);
+    await clicked;
   } finally {
     await raw.send('Target.detachFromTarget', { sessionId }).catch(() => {});
   }
   await until(() => inTab(raw, tab, 'window.answer'), true, 'the dialog answered the click');
   assert.equal(await visibility(seven), 'visible');
-  await pw(['close']);
 }
 
 test('headed Chrome takes playwright-cli input on a background tab and keeps seven in front', {

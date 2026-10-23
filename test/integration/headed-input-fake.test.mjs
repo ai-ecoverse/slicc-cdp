@@ -392,3 +392,26 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
   });
 }
+
+for (const [transport, runner] of Object.entries(runners)) {
+  test(`${transport}: a trusted click Chrome never acknowledges is checked, not reported as an error`, {
+    timeout: 120000,
+  }, async () => {
+    const swallow = (message) =>
+      message.method === 'Input.dispatchMouseEvent' && message.params.type === 'mouseReleased';
+    for (const [reads, pointer] of [
+      [[['mousedown', 'click']], 'missing'],
+      [[[]], 'done'],
+    ]) {
+      const setup = scene({ reads, pointer });
+      setup.fake = { intercept: swallow };
+      await withScene(runner, setup, async (s) => {
+        const result = await s.run(['click', s.ref]);
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(modes(s.state, 'read').length, 1);
+        assert.equal(modes(s.state, 'pointer').length, pointer === 'done' ? 1 : 0);
+        assert.deepEqual(s.state.activated, []);
+      });
+    }
+  });
+}

@@ -52,9 +52,9 @@
   const erasers = { Backspace: 'delete', Delete: 'forwardDelete' };
   const fallback = (target, typed) => {
     if (typed) return edit(target, 'insertText', args.text);
-    if (target.form) return target.form.requestSubmit();
     if (!(target instanceof HTMLInputElement))
-      edit(target, target.isContentEditable ? 'insertParagraph' : 'insertLineBreak');
+      return edit(target, target.isContentEditable ? 'insertParagraph' : 'insertLineBreak');
+    target.form?.requestSubmit();
   };
   const press = (node) => {
     const enter = args.key === 'Enter';

@@ -745,7 +745,7 @@ fn dispatch_click(
     modifiers: i64,
 ) -> Result<(), String> {
     for kind in ["mousePressed", "mouseReleased"] {
-        cdp.call(
+        cdp.call_for(
             "Input.dispatchMouseEvent",
             json!({
                 "type": kind,
@@ -756,6 +756,7 @@ fn dispatch_click(
                 "modifiers": modifiers,
             }),
             Some(session),
+            landing::INPUT_WAIT,
         )?;
     }
     Ok(())
@@ -825,7 +826,7 @@ pub fn fill_ref(cdp: &mut Cdp, session: &str, rec: &RefRec, text: &str) -> Resul
 }
 
 pub fn insert_text(cdp: &mut Cdp, session: &str, text: &str) -> Result<(), String> {
-    cdp.call("Input.insertText", json!({ "text": text }), Some(session))?;
+    cdp.call_for("Input.insertText", json!({ "text": text }), Some(session), landing::INPUT_WAIT)?;
     Ok(())
 }
 
@@ -851,8 +852,8 @@ fn dispatch_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> {
     if let Some(text) = text {
         down["text"] = json!(text);
     }
-    cdp.call("Input.dispatchKeyEvent", down, Some(session))?;
-    cdp.call(
+    cdp.call_for("Input.dispatchKeyEvent", down, Some(session), landing::INPUT_WAIT)?;
+    cdp.call_for(
         "Input.dispatchKeyEvent",
         json!({
             "type": "keyUp",
@@ -862,6 +863,7 @@ fn dispatch_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> {
             "modifiers": modifiers,
         }),
         Some(session),
+        landing::INPUT_WAIT,
     )?;
     Ok(())
 }
@@ -1081,7 +1083,7 @@ fn dblclick_backend(
     let gesture = Gesture::Double { button, modifiers };
     landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), (cx, cy), gesture, &mut |cdp| {
         for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
-            cdp.call(
+            cdp.call_for(
                 "Input.dispatchMouseEvent",
                 json!({
                     "type": kind,
@@ -1092,6 +1094,7 @@ fn dblclick_backend(
                     "modifiers": modifiers,
                 }),
                 Some(session),
+                landing::INPUT_WAIT,
             )?;
         }
         Ok(())
@@ -1158,7 +1161,7 @@ fn hover_backend(
 }
 
 fn move_mouse(cdp: &mut Cdp, session: &str, (x, y): (f64, f64)) -> Result<(), String> {
-    cdp.call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }), Some(session))?;
+    cdp.call_for("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }), Some(session), landing::INPUT_WAIT)?;
     Ok(())
 }
 

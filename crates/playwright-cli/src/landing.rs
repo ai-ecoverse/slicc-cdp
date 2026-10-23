@@ -7,6 +7,7 @@ const WORLD: &str = "slicc-landing";
 const GROUP: &str = "slicc-landing";
 const FOREGROUND_WAIT: Duration = Duration::from_secs(3);
 const READ_WAIT: Duration = Duration::from_secs(3);
+pub const INPUT_WAIT: Duration = Duration::from_secs(5);
 pub const NOT_EDITABLE: &str = "Error: type needs a focused editable element, and none is focused. Focus one first, for example with click or fill.\n";
 
 pub struct Scope<'a> {
@@ -157,7 +158,11 @@ fn landed(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted
     if mode(cdp, scope, context, "arm", json!({ "types": types }))? != "armed" {
         return Err("Error: the input check could not start in the page.\n".to_string());
     }
-    trusted(cdp)?;
+    if let Err(message) = trusted(cdp) {
+        if !message.ends_with(" timed out\n") {
+            return Err(message);
+        }
+    }
     match run(cdp, scope, context, "read", json!({}), READ_WAIT) {
         Ok(Value::Array(seen)) => Ok(!seen.is_empty()),
         _ => Ok(true),
