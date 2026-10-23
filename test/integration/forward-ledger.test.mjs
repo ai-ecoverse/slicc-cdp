@@ -181,7 +181,7 @@ test('held inbound history replies produce terminal real non-forwarding evidence
     const raw = (await made.unguarded.send('Target.attachToTarget', { targetId, flatten: true }))
       .sessionId;
     await made.unguarded.send('Page.enable', {}, raw);
-    const protectedURL = `${protectedOrigin}/bfcache?n=audit-seed`;
+    const protectedURL = `${protectedOrigin}/bfcache?n=audit-seed-p`;
     const ordinaryURL = `${ordinaryOrigin}/bfcache?n=audit-seed-b`;
     await made.unguarded.send('Page.navigate', { url: protectedURL }, raw);
     await made.unguarded.send('Page.navigate', { url: ordinaryURL }, raw);
@@ -202,6 +202,8 @@ test('held inbound history replies produce terminal real non-forwarding evidence
       side: 'guarded',
       gate: true,
     });
+    assert.equal(gate.protectedObserved, true);
+    assert.equal(gate.ordinaryObserved, true);
     const params = { entryId: 1 };
     const sentAt = Date.now();
     const outcome = made.client.send('Page.navigateToHistoryEntry', params, session);

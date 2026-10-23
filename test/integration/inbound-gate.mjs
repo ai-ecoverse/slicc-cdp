@@ -52,8 +52,12 @@ export class InboundGate {
     }
     if (url.pathname !== '/bfcache') return;
     const tag = url.searchParams.get('n') ?? '';
-    if (url.origin === this.protectedOrigin)
-      this.seeds.set(targetId, { tag, protectedObserved: true, ordinaryObserved: false });
+    if (url.origin === this.protectedOrigin && tag.endsWith('-p') && tag.length > 2)
+      this.seeds.set(targetId, {
+        tag: tag.slice(0, -2),
+        protectedObserved: true,
+        ordinaryObserved: false,
+      });
     else if (url.origin === this.ordinaryOrigin) {
       const seed = this.seeds.get(targetId);
       if (seed && tag === `${seed.tag}-b`) seed.ordinaryObserved = true;

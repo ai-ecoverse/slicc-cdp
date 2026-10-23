@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { verdictProblems } from './guard-set.mjs';
-import { protectedX1Exposure, recordX1Client, x1Privacy } from './x1-audit.mjs';
+import { finalizeX1Privacy, protectedX1Exposure, recordX1Client, x1Privacy } from './x1-audit.mjs';
 
 const ordinary = 'http://plain.guard.test:18100';
 const protectedOrigin = 'http://seven.sliccy.ai:18100';
@@ -280,4 +280,28 @@ test('X1 recorder captures actual outgoing results, refusals and completed close
   assert.equal(actor.closed, false);
   await client.close();
   assert.equal(actor.closed, true);
+});
+
+test('final X1 privacy uses actual completed resource closes, not the earlier row-log snapshot', async () => {
+  const { actors, row } = evidence();
+  const clones = actors.map((actor) => ({
+    messages: actor.messages,
+    send: async () => ({}),
+    close: async () => {},
+  }));
+  const captured = clones.map(recordX1Client);
+  for (const [i, actor] of captured.entries()) actor.calls.push(...actors[i].calls);
+  const records = new Map([
+    ['X1.after-exit/seven/prompt', { actors: captured, ordinary, protectedOrigin }],
+  ]);
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, false);
+  const legs = [row.control, row.guarded, row.live];
+  await Promise.all(clones.map((client) => client.close()));
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, true);
+  assert.deepEqual([row.control, row.guarded, row.live], legs);
+  captured[1].closed = false;
+  finalizeX1Privacy([row], records);
+  assert.equal(row.x1Privacy.measured, false);
 });

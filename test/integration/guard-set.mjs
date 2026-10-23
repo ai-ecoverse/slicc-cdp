@@ -14,7 +14,7 @@ import { guarded, observer } from './guard-client.mjs';
 import { guardDiagnostics } from './guard-diagnostics.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 import { inboundClients } from './inbound-clients.mjs';
-import { recordX1Client, x1Privacy } from './x1-audit.mjs';
+import { finalizeX1Privacy, recordX1Client, x1Privacy } from './x1-audit.mjs';
 
 const { containsSecret } = await import(
   new URL('./redirect-secret.mjs', import.meta.resolve('@ai-ecoverse/slicc-browsers/package.json'))
@@ -640,6 +640,12 @@ export async function runPartition(t, id) {
             process.stdout.write(`${JSON.stringify(row)}\n`);
         },
       });
+      finalizeX1Privacy(execution.results, exitClients);
+      for (const row of execution.results) {
+        if (row.id !== 'X1.after-exit') continue;
+        const recorded = recordedRows.find((saved) => rowKey(saved) === rowKey(row));
+        if (recorded) recorded.x1Privacy = structuredClone(row.x1Privacy);
+      }
       return execution.results;
     } catch (error) {
       failures.push(error);

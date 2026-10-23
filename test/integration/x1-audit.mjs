@@ -5,6 +5,14 @@ const { containsSecret } = await import(
     .href
 );
 
+export function finalizeX1Privacy(rows, records) {
+  for (const row of rows) {
+    if (row.id !== 'X1.after-exit') continue;
+    const record = records.get(`${row.id}/${row.target}/${row.variant}`);
+    if (record) row.x1Privacy = x1Privacy(record.actors, record);
+  }
+}
+
 export function recordX1Client(client) {
   const calls = [];
   const actor = { messages: client.messages, calls, closed: false };
