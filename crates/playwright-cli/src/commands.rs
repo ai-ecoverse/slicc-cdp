@@ -139,7 +139,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         loaded_kind.as_deref(),
     ) {
         Some(kind) => {
-            state.endpoint = Some(endpoint);
+            state.endpoint = Some(endpoint.clone());
             state.provenance = Some(kind);
         }
         None if explicit || !cfg!(target_arch = "wasm32") => {
@@ -167,6 +167,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if trace::is_request_command(command) => {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
+        "har-start" | "record" => crate::har::hold(&mut cdp, &mut state, invocation, &endpoint),
         "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
         _ if crate::recording::is_start(command) => crate::recording::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
