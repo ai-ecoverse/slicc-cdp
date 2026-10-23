@@ -454,7 +454,8 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 "Accept a dialog",
                 "",
-                "Accepts the dialog that is open on the tab, or the next one that opens within 5 seconds.",
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
             ],
             &[("[prompt]", "the text of the prompt in case of a prompt dialog.")],
             &[("--tab <targetId>", "tab with the dialog")],
@@ -464,7 +465,8 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 "Dismiss a dialog",
                 "",
-                "Dismisses the dialog that is open on the tab, or the next one that opens within 5 seconds.",
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
             ],
             &[],
             &[("--tab <targetId>", "tab with the dialog")],

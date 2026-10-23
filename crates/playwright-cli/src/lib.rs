@@ -304,14 +304,18 @@ mod tests {
             "playwright-cli dialog-accept [prompt]\n\nAccept a dialog\n",
             &[
                 "  [prompt]                    the text of the prompt in case of a prompt dialog.",
-                "Accepts the dialog that is open on the tab, or the next one that opens within 5 seconds.",
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
             ],
             &["Not implemented"],
         );
         assert_page(
             "dialog-dismiss",
             "playwright-cli dialog-dismiss\n\nDismiss a dialog\n",
-            &["Dismisses the dialog that is open on the tab, or the next one that opens within 5 seconds."],
+            &[
+                "Arm before triggering a dialog; waits up to 5 seconds for a verified ordinary main-frame dialog.",
+                "Already-open dialogs need the foreground dialog holder (follow-up #529).",
+            ],
             &["Not implemented"],
         );
         assert_page(

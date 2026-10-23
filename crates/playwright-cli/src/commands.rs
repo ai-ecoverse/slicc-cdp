@@ -1346,15 +1346,15 @@ fn default_pdf_path() -> PathBuf {
 
 fn cmd_dialog(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, accept: bool) -> Output {
     let prompt = (accept && !invocation.positionals.is_empty()).then(|| invocation.positionals.join(" "));
-    let pages = match browser::list_pages(cdp) {
-        Ok(pages) => pages,
-        Err(message) => return Output::err(message),
+    let target = match invocation.flags.get("tab").cloned().or_else(|| state.current.clone()) {
+        Some(target) => target,
+        None => match cdp.dialog_targets() {
+            Ok(targets) if targets.len() == 1 => targets[0].clone(),
+            Ok(_) => return Output::err("Error: --tab <targetId> is required. Run 'playwright-cli tab-list' to get tab IDs.\n"),
+            Err(message) => return Output::err(message),
+        },
     };
-    let target = match resolve_target(cdp, invocation, state, &pages, false) {
-        Ok(target) => target,
-        Err(message) => return Output::err(message),
-    };
-    let session = match cdp::attach(cdp, &target) {
+    let session = match cdp.attach_dialog(&target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };

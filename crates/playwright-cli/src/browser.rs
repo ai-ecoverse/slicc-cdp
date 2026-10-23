@@ -978,28 +978,13 @@ pub fn handle_dialog(
     accept: bool,
     prompt: Option<&str>,
 ) -> Result<String, String> {
-    let from = cdp.events().len();
-    cdp.notify("Page.enable", json!({}), Some(session))?;
+    cdp.wait_dialog(session, DIALOG_WAIT)?;
     let mut params = json!({ "accept": accept });
     if let Some(text) = prompt {
         params["promptText"] = json!(text);
     }
-    match cdp.call_for("Page.handleJavaScriptDialog", params.clone(), Some(session), DIALOG_WAIT) {
-        Err(message) if message.contains("No dialog is showing") => {
-            cdp.wait_event(from, DIALOG_WAIT, |event| dialog_opening(event, session))?
-                .ok_or_else(|| "Error: No dialog visible\n".to_string())?;
-            cdp.call_for("Page.handleJavaScriptDialog", params, Some(session), DIALOG_WAIT)?;
-        }
-        other => {
-            other?;
-        }
-    }
+    cdp.call_for("Page.handleJavaScriptDialog", params, Some(session), DIALOG_WAIT)?;
     Ok(if accept { "Accepted the dialog\n" } else { "Dismissed the dialog\n" }.to_string())
-}
-
-fn dialog_opening(event: &Value, session: &str) -> bool {
-    event.get("method").and_then(Value::as_str) == Some("Page.javascriptDialogOpening")
-        && event.get("sessionId").and_then(Value::as_str) == Some(session)
 }
 
 pub fn format_eval(result: &EvalValue) -> String {
