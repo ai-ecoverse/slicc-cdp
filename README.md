@@ -30,6 +30,8 @@ npm install @ai-ecoverse/slicc-cdp
 
 Windows binaries are on the [releases page](https://github.com/ai-ecoverse/slicc-cdp/releases/latest).
 
+`playwright-cli upgrade`, or `playwright-cli update`, replaces a prebuilt `playwright-cli` with the latest release, in place. It fetches over https only, and the download must match the release's `SHA256SUMS` and report the release version. `--check` only reports whether a newer release exists. It only replaces a binary it can write; a development build needs `--force`, and a copy installed with Cargo is left to `cargo install slicc-cdp`. The wasm build can't upgrade itself.
+
 ## Use
 
 ```sh

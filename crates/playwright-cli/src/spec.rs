@@ -105,6 +105,8 @@ static SPECS: &[Spec] = &[
     spec("webmcp-polyfill", &[], false, &[("tab", S), ("reload", B)], true, RefMode::None),
     spec("webmcp-list", &[], false, &[("tab", S), ("json", B), ("from-origin", S)], true, RefMode::None),
     spec("webmcp-call", &["name", "json-input"], false, &[("tab", S), ("allow-consequential", B), ("from-origin", S), ("frame", S)], true, RefMode::None),
+    spec("upgrade", &[], false, &[("check", B), ("force", B)], true, RefMode::None),
+    spec("update", &[], false, &[("check", B), ("force", B)], true, RefMode::None),
 ];
 
 const fn spec(

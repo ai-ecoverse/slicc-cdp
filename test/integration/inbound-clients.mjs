@@ -1,5 +1,6 @@
 import { cdpProxy } from './cdp-proxy.mjs';
 import { acquire } from './cleanup.mjs';
+import { ForwardLedger } from './forward-ledger.mjs';
 import { recordedClient } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { InboundGate } from './inbound-gate.mjs';
@@ -9,11 +10,18 @@ export async function inboundClients(
   origin,
   { variant, detachDelay, protectedOrigin, ordinaryOrigin, signal, deadlineAt = Date.now() + 35000 }
 ) {
-  const controlGate = new InboundGate({ protectedOrigin, ordinaryOrigin });
+  const controlLedger = new ForwardLedger({ raw: true });
+  const guardedLedger = new ForwardLedger();
+  const controlGate = new InboundGate({
+    protectedOrigin,
+    ordinaryOrigin,
+    auditFactory: (session) => controlLedger.auditor(session),
+  });
   const guardedGate = new InboundGate({
     protectedOrigin,
     ordinaryOrigin,
     seedSource: (targetId) => controlGate.observedSeed(targetId),
+    auditFactory: (session) => guardedLedger.auditor(session),
   });
   const guardedProxy = await cdpProxy(wsUrl, { inbound: guardedGate });
   let controlProxy;
@@ -22,19 +30,31 @@ export async function inboundClients(
   let closed;
   const close = () =>
     (closed ??= (async () => {
+      controlLedger.close();
+      guardedLedger.close();
       await Promise.all([guardedProxy.close(), controlProxy?.close()]);
       await Promise.all([client?.close(), unguarded?.close()]);
     })());
   try {
     signal?.throwIfAborted();
-    controlProxy = await cdpProxy(wsUrl, { inbound: controlGate });
+    controlProxy = await cdpProxy(wsUrl, {
+      inbound: controlGate,
+      forwarded: (message) => controlLedger.rawForward(message),
+      observe: (direction, message) => {
+        if (direction === 'browser' && message.id !== undefined) controlLedger.rawReply(message);
+      },
+    });
     client = await acquire(
       (ownedSignal) =>
         recordedClient((onMessage) =>
           guarded(guardedProxy.url, origin, {
             variant,
             detachDelay,
-            onMessage,
+            onMessage: (message) => {
+              guardedLedger.message(message);
+              onMessage(message);
+            },
+            onCommand: (message) => guardedLedger.request(message),
             signal: AbortSignal.any([ownedSignal, ...(signal ? [signal] : [])]),
             deadlineAt,
           })
@@ -47,6 +67,7 @@ export async function inboundClients(
       (ownedSignal) =>
         recordedClient((onMessage) =>
           observer(controlProxy.url, onMessage, {
+            onCommand: (message) => controlLedger.request(message),
             signal: AbortSignal.any([ownedSignal, ...(signal ? [signal] : [])]),
             deadlineAt,
           })
@@ -55,12 +76,13 @@ export async function inboundClients(
       (resource) => resource.close(),
       Math.max(1, deadlineAt - Date.now())
     );
+    await guardedLedger.initialized(Math.max(1, deadlineAt - Date.now()));
     client.inboundDelay = (args) => {
       const expected = args.side === 'control' ? unguarded : client;
       if (args.client?.events !== expected.events) throw new Error('inbound gate client mismatch');
       return (args.side === 'control' ? controlGate : guardedGate).arm(args);
     };
-    return { client, unguarded, close };
+    return { client, unguarded, close, forwardLedger: guardedLedger };
   } catch (error) {
     await close();
     throw error;

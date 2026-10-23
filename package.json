@@ -68,9 +68,9 @@
     "chrome": "156.0.8078.4"
   },
   "devDependencies": {
-    "@ai-ecoverse/slicc-browsers": "1.18.5",
-    "@ai-ecoverse/slicc-kernel": "1.148.0",
-    "@ai-ecoverse/slicc-shared-web": "2.11.0",
+    "@ai-ecoverse/slicc-browsers": "1.18.11",
+    "@ai-ecoverse/slicc-kernel": "1.149.0",
+    "@ai-ecoverse/slicc-shared-web": "2.11.1",
     "@biomejs/biome": "2.5.15",
     "lefthook": "2.2.2",
     "semantic-release": "25.0.9"

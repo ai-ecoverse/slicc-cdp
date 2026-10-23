@@ -21,6 +21,7 @@ export const CHROME_FILES = new Set(
     'chromium-kernel-guards',
     'chromium',
     'current-document',
+    'data-document',
     'dialog',
     'dialog-holder-chrome',
     'discover-payments',
