@@ -670,6 +670,10 @@ impl Cdp {
     }
 
     pub fn target_protected(&mut self, target_id: &str, frame: bool) -> Result<bool, String> {
+        self.judge_target(target_id, frame, true)
+    }
+
+    fn judge_target(&mut self, target_id: &str, frame: bool, refusal_protects: bool) -> Result<bool, String> {
         if self.protected_targets.contains(target_id) {
             return Ok(true);
         }
@@ -680,7 +684,7 @@ impl Cdp {
             Duration::from_secs(30),
         ) {
             Ok(info) => info.get("targetInfo").cloned().unwrap_or(Value::Null),
-            Err(message) if message.starts_with("Target.getTargetInfo: slicc: refused:") => {
+            Err(message) if refusal_protects && message.starts_with("Target.getTargetInfo: slicc: refused:") => {
                 self.protected_targets.insert(target_id.to_string());
                 return Ok(true);
             }
@@ -1176,7 +1180,8 @@ impl Cdp {
         if self.frame_protected(frame_id) || known && !self.frame_verified(frame_id) {
             return Ok(true);
         }
-        let target_allowed = match self.target_protected(frame_id, false) {
+        let other_target = session_id.and_then(|session| self.session_target(session)).is_some_and(|target| target != frame_id);
+        let target_allowed = match self.judge_target(frame_id, false, !other_target) {
             Ok(true) => return Ok(true),
             Ok(false) => self.targets.get(frame_id).is_some_and(|info| info.get("targetId").and_then(Value::as_str) == Some(frame_id)
                 && info.get("url").and_then(Value::as_str).is_some_and(frame_text_known)),
