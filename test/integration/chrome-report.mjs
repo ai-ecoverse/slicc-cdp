@@ -41,6 +41,7 @@ export const CHROME_FILES = new Set(
     'guard-native',
     'guard-persistent',
     'guard-setup-budget',
+    'headed-input',
     'kernel-session',
     'launch',
     'page-tools',

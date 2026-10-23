@@ -87,6 +87,12 @@ Only the hash-pinned shim can use the dedicated installer. Its inert pre-executi
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
 
+### Input on background tabs
+
+Headed Chrome doesn't deliver trusted input to a tab it isn't showing, and playwright-cli's tabs usually stay in the background next to seven's. So `click`, `dblclick`, `hover`, `type` and `press` check from an isolated world which events reached the page. If Chrome dropped them, the same events are dispatched in place to the element under the point, or to the focused element, without bringing the tab forward. The page then sees them with `isTrusted: false`: there is no user activation, `:hover` doesn't change, and `click` is dispatched just after the command returns, so a dialog it opens doesn't block it. `type` needs a focused editable element. `press` handles printable keys, `Enter`, `Escape`, `Backspace` and `Delete` in place.
+
+Only when that can't work (another key, focus inside a frame, or nothing at the point) does it bring the tab to the front, send the input again, check that it arrived and switch back to the tab that was in front. The guard does the switching. It reads which tab is visible from isolated worlds of the ordinary tabs in the window, and switches back to seven's tab only when no ordinary tab there was visible and seven's is the one protected tab in that window. It refuses, so that no tab is activated, when the vault, another protected or unknown tab could have been in front, when a protected tab is in another window, or when the window is minimized. The error names `tab-select --foreground`. Input that still doesn't arrive fails with an error rather than reporting success.
+
 ## Page tools
 
 `generate-locator`, `highlight` and `network-state-set` take Microsoft's arguments and options and print its output and exit codes. `eval-file` and `fetch` are SLICC-only. Where they differ from Microsoft's, or from SLICC's own handlers:
@@ -169,6 +175,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Target.closeTarget` (`crates/playwright-cli/src/browser.rs` `close_target`)
 - `Target.activateTarget` (`crates/playwright-cli/src/browser.rs` `activate`)
 - `Browser.getVersion` (`crates/playwright-cli/src/webmcp.rs` `chrome_major_version`)
+- `Browser.getWindowForTarget` (`crates/cdp-client/src/front.rs` `front_window`)
 - `Slicc.action` (`crates/playwright-cli/src/action.rs` `begin`)
 
 ### Browser-level events

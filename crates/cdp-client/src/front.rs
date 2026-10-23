@@ -16,7 +16,7 @@ impl Cdp {
         let mine = infos.iter().find(|info| text(info, "targetId") == own).cloned().ok_or_else(|| self.refusal())?;
         if text(&mine, "type") != "page" || self.info_protected(&mine, &infos) { return Err(self.refusal()) }
         let context = text(&mine, "browserContextId");
-        let window = self.front_window(&own)?;
+        let window = self.front_window(&own).map_err(|_| self.refusal())?;
         if self.front_visible(&own) != Some(false) { return Err(self.refusal()) }
         let mut visible = Vec::new();
         let mut opaque = Vec::new();
@@ -29,7 +29,7 @@ impl Cdp {
             let open = !id.is_empty() && url::Url::parse(&text(info, "url")).is_ok() && !self.protected_targets.contains(&id) && !self.info_protected(info, &infos);
             let same = match self.front_window(&id) {
                 Ok(found) => found == window,
-                Err(_) if open => continue,
+                Err(_) if open || kind != "page" => continue,
                 Err(_) => return Err(self.refusal()),
             };
             if !open && !same { return Err(self.refusal()) }

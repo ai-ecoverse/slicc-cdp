@@ -131,6 +131,8 @@ export async function fakeCdp({
   intercept,
   aria = () => defaultAria,
   landing = landed,
+  visibility,
+  windows = () => ({ windowId: 1, bounds: { windowState: 'normal' } }),
   tree = { nodes: [] },
   location,
   frameTree,
@@ -297,6 +299,8 @@ export async function fakeCdp({
           if (index >= 0) targets.splice(index, 1);
           return answer({ success: index >= 0 });
         }
+        case 'Browser.getWindowForTarget':
+          return answer(windows(params.targetId ?? target?.targetId));
         case 'Browser.getVersion':
           return answer({ product: 'Chrome/140.0.0.0', protocolVersion: '1.3' });
         case 'Page.getFrameTree':
@@ -540,6 +544,8 @@ export async function fakeCdp({
         case 'Runtime.evaluate': {
           const call = landingCall(params);
           if (call) return answer({ result: { type: 'string', value: landing(...call, target) } });
+          if (visibility && params.expression === 'document.visibilityState')
+            return answer({ result: { type: 'string', value: visibility(target) } });
           if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {
             target.history.currentIndex -= 1;
             target.url = target.history.entries[target.history.currentIndex].url;

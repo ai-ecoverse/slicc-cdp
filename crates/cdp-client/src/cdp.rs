@@ -3539,6 +3539,7 @@ mod tests {
     include!("redirect_relation_test.rs");
     include!("redirect_userinfo_test.rs");
     include!("guard_attach_tree_test.rs");
+    include!("front_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
