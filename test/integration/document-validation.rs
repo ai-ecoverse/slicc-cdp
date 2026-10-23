@@ -22,6 +22,7 @@ struct Backend {
     next_worker_url: Option<String>,
     navigation_event: bool,
     block_during_execution: bool,
+    execution_error: Option<&'static str>,
     attach_event: Option<Value>,
     event_loader: String,
     event_session: Option<String>,
@@ -95,6 +96,10 @@ impl Transport for Fake {
                     let event = json!({"method":"Page.frameNavigated","sessionId":backend.event_session.clone().unwrap_or_else(|| call["sessionId"].as_str().unwrap().to_string()),"params":{"frame":{"id":"F","loaderId":backend.event_loader,"url":"https://ordinary.example/","securityOrigin":"https://ordinary.example"}}});
                     backend.inbox.push_back(event.to_string());
                 }
+                if let Some(message) = backend.execution_error {
+                    backend.inbox.push_back(json!({"id":call["id"],"error":{"code":-32000,"message":message}}).to_string());
+                    return Ok(())
+                }
                 match call["params"]["expression"].as_str() {
                     Some("0") => json!({"result":{"type":"number","value":0}}),
                     Some("document.readyState") => json!({"result":{"type":"string","value":"complete"}}),
@@ -122,7 +127,7 @@ impl Transport for Fake {
 
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
-        worker:None, tree:tree("L1"), next_tree:None, navigation_tree:None, navigation_reply:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, clear_after_enable:false, pending_context_clear:None, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, attach_event:None,
+        worker:None, tree:tree("L1"), next_tree:None, navigation_tree:None, navigation_reply:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, clear_after_enable:false, pending_context_clear:None, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, execution_error:None, attach_event:None,
         event_loader:"L2".into(), event_session:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
@@ -528,6 +533,34 @@ fn current_policy_is_still_checked_when_a_loader_id_is_unchanged() {
     next["frameTree"]["frame"]["securityOrigin"] = json!("https://seven.sliccy.ai");
     backend.borrow_mut().next_tree = Some(next);
     refused(cdp.call("DOM.getDocument", json!({}), Some(&session)));
+}
+
+#[test]
+fn context_teardown_errors_obey_the_current_document_guard_decision() {
+    for shape in ["unchanged", "ordinary", "protected", "unknown", "protected-event"] {
+        let (mut cdp, backend) = fixture();
+        let session = attach(&mut cdp, "T");
+        {
+            let mut state = backend.borrow_mut();
+            state.execution_error = Some("Cannot find context with specified id");
+            state.next_tree = match shape {
+                "ordinary" => Some(tree("L2")),
+                "protected" | "protected-event" => Some(json!({"frameTree":{"frame":{"id":"F","loaderId":"LPROTECTED","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai"}}})),
+                "unknown" => Some(json!({"frameTree":{"frame":{"id":"F","loaderId":"LUNKNOWN","url":"","securityOrigin":""}}})),
+                _ => None,
+            };
+            state.block_during_execution = shape == "protected-event";
+        }
+        let from = backend.borrow().calls.len();
+        let error = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap_err();
+        if matches!(shape, "unchanged" | "ordinary") {
+            assert_eq!(error, "Runtime.evaluate: Cannot find context with specified id\n");
+        } else { assert!(error.starts_with("slicc: refused:"), "{shape}: {error}"); }
+        let state = backend.borrow();
+        let calls = state.calls[from..].iter().filter(|call| call["method"] == "Runtime.evaluate").collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["params"]["uniqueContextId"], "main:L1");
+    }
 }
 
 #[test]

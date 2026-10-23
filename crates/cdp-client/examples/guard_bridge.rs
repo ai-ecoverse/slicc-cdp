@@ -97,9 +97,10 @@ fn completion(value: &Value) -> Option<Result<Value, String>> {
 }
 
 fn poll(cdp: &mut Cdp, pending: &Pending) -> Option<Result<Value, String>> {
-    if superseded(cdp, pending) { return Some(Err(SUPERSEDED.to_string())) }
+    if superseded(cdp, pending) && !cdp.content_blocked(&pending.session) { return Some(Err(SUPERSEDED.to_string())) }
     let expression = format!("JSON.stringify(globalThis[{:?}])", pending.key);
     let result = cdp.call_for("Runtime.evaluate", json!({"expression":expression,"returnByValue":true,"uniqueContextId":pending.document.context}), Some(&pending.session), Duration::from_secs(2));
+    if cdp.content_blocked(&pending.session) && result.is_err() { return Some(result) }
     if superseded(cdp, pending) { return Some(Err(SUPERSEDED.to_string())) }
     match result {
         Ok(value) => {

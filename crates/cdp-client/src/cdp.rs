@@ -360,7 +360,13 @@ impl Cdp {
             session_id.and_then(|session| self.session_target(session)).and_then(|target| self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target))).cloned()
         } else { None };
         let frame_epoch = self.frame_epoch;
-        let result = self.raw_call_execution(method, sent, compile_session.as_deref().or(session_id), timeout, executed)?;
+        let result = match self.raw_call_execution(method, sent, compile_session.as_deref().or(session_id), timeout, executed) {
+            Ok(result) => result,
+            Err(message) => {
+                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false)?; }
+                return Err(message);
+            }
+        };
         if content_command(method, &params) == Some(true) && !executed {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"))?;
         }
@@ -2240,6 +2246,7 @@ impl Cdp {
                 .map_err(|err| format!("CDP response was not JSON: {err}\n"))?;
             if value.get("id").and_then(|item| item.as_i64()) == Some(id) {
                 if let Some(error) = value.get("error") {
+                    if pinned && session_id.is_some_and(|session| self.blocked.contains(session)) { return Err(self.refusal()) }
                     let text = error
                         .get("message")
                         .and_then(|item| item.as_str())

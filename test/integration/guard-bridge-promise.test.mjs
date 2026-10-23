@@ -25,6 +25,8 @@ for (const transport of ['native', 'wasi']) {
     'poll-navigation',
     'poll-refusal',
     'original-refusal',
+    'protected-poll',
+    'protected-poll-error',
   ]) {
     test(`guard promise bridge ${transport}: ${mode}`, { timeout: 60000 }, async () => {
       let backend;
@@ -82,11 +84,34 @@ for (const transport of ['native', 'wasi']) {
                   params: { frame: backend.targets[0].frame },
                 });
             }
+            if (mode === 'protected-poll') {
+              backend.targets[0].frame = frame('LPROTECTED', 'https://seven.sliccy.ai');
+              backend.targets[0].url = backend.targets[0].frame.url;
+              send({
+                method: 'Page.frameNavigated',
+                sessionId: session,
+                params: { type: 'BackForwardCacheRestore', frame: backend.targets[0].frame },
+              });
+            }
             return true;
           }
           if (message.params.expression.startsWith('JSON.stringify(globalThis[')) {
             polls += 1;
-            reply(message, send, JSON.stringify({ done: polls >= 2, value: 'actual-outcome' }));
+            if (mode === 'protected-poll-error') {
+              backend.targets[0].frame = frame('LPROTECTED', 'https://seven.sliccy.ai');
+              backend.targets[0].url = backend.targets[0].frame.url;
+              send({
+                method: 'Page.frameNavigated',
+                sessionId: session,
+                params: { type: 'BackForwardCacheRestore', frame: backend.targets[0].frame },
+              });
+              send({
+                id: message.id,
+                sessionId: session,
+                error: { code: -32000, message: 'Cannot find context with specified id' },
+              });
+            } else
+              reply(message, send, JSON.stringify({ done: polls >= 2, value: 'actual-outcome' }));
             return true;
           }
           return false;
@@ -129,7 +154,7 @@ for (const transport of ['native', 'wasi']) {
           assert(messages.some((message) => message.diagnostic?.phase === 'superseded'));
         } else {
           await assert.rejects(outcome, /slicc: refused:/);
-          assert.equal(polls, 0);
+          assert.equal(polls, mode === 'protected-poll-error' ? 1 : 0);
           if (mode === 'original-refusal') {
             assert.equal(started, false);
             assert(
