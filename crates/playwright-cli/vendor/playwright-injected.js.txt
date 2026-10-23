@@ -1,3 +1,23 @@
+/**
+ * Copyright (c) Microsoft Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Playwright injected script from playwright-core@1.64.0-alpha-1790635538000, lib/coreBundle.js
+ * (packages/playwright-core/src/generated/injectedScriptSource.ts), minified with esbuild@0.25.10
+ * by scripts/vendor-playwright-injected.mjs. See LICENSE and NOTICE in this directory.
+ */
 var sliccInjected=(()=>{var Et=Object.defineProperty;var ui=Object.getOwnPropertyDescriptor;var hi=Object.getOwnPropertyNames;var fi=Object.prototype.hasOwnProperty;var di=(e,t)=>{for(var r in t)Et(e,r,{get:t[r],enumerable:!0})},pi=(e,t,r,n)=>{if(t&&typeof t=="object"||typeof t=="function")for(let i of hi(t))!fi.call(e,i)&&i!==r&&Et(e,i,{get:()=>t[i],enumerable:!(n=ui(t,i))||n.enumerable});return e};var gi=e=>pi(Et({},"__esModule",{value:!0}),e);var Qo={};di(Qo,{sliccInjectedScriptClass:()=>Xo});const Hr={};var mi=(e,t)=>{for(var r in t)e[r]=t[r]};var vi=e=>({...e,__esModule:!0}),Br={};mi(Br,{InjectedScript:()=>Go});Hr.exports=vi(Br);function ot(e){return e.box.cursor==="pointer"}function bi(e,t,r={}){var n;const i=new e.LineCounter,s={keepSourceTokens:!0,lineCounter:i,...r},a=e.parseDocument(t,s),o=[],l=f=>[i.linePos(f[0]),i.linePos(f[1])],c=f=>{o.push({message:f.message,range:[i.linePos(f.pos[0]),i.linePos(f.pos[1])]})},u=(f,p)=>{for(const m of p.items){if(m instanceof e.Scalar&&typeof m.value=="string"){const w=cr.parse(m,s,o);w&&(f.children=f.children||[],f.children.push(w));continue}if(m instanceof e.YAMLMap){h(f,m);continue}o.push({message:"Sequence items should be strings or maps",range:l(m.range||p.range)})}},h=(f,p)=>{var m;for(const g of p.items){if(f.children=f.children||[],!(g.key instanceof e.Scalar&&typeof g.key.value=="string")){o.push({message:"Only string keys are supported",range:l(g.key.range||p.range)});continue}const w=g.key,y=g.value;if(w.value==="text"){if(!(y instanceof e.Scalar&&typeof y.value=="string")){o.push({message:"Text value should be a string",range:l(g.value.range||p.range)});continue}f.children.push({kind:"text",text:St(y.value)});continue}if(w.value==="/children"){if(!(y instanceof e.Scalar&&typeof y.value=="string")||y.value!=="contain"&&y.value!=="equal"&&y.value!=="deep-equal"){o.push({message:'Strict value should be "contain", "equal" or "deep-equal"',range:l(g.value.range||p.range)});continue}f.containerMode=y.value;continue}if(w.value.startsWith("/")){if(!(y instanceof e.Scalar&&typeof y.value=="string")){o.push({message:"Property value should be a string",range:l(g.value.range||p.range)});continue}f.props=(m=f.props)!=null?m:{},f.props[w.value.slice(1)]=St(y.value);continue}const C=cr.parse(w,s,o);if(!C)continue;if(y instanceof e.Scalar){const F=typeof y.value;if(F!=="string"&&F!=="number"&&F!=="boolean"){o.push({message:"Node value should be a string or a sequence",range:l(g.value.range||p.range)});continue}f.children.push({...C,children:[{kind:"text",text:St(String(y.value))}]});continue}if(y instanceof e.YAMLSeq){f.children.push(C),u(C,y);continue}o.push({message:"Map values should be strings or sequences",range:l(g.value.range||p.range)})}},d={kind:"role",role:"fragment"};return a.errors.forEach(c),o.length?{errors:o,fragment:d}:(a.contents instanceof e.YAMLSeq||o.push({message:'Aria snapshot must be a YAML sequence, elements starting with " -"',range:a.contents?l(a.contents.range):[{line:0,col:0},{line:0,col:0}]}),o.length?{errors:o,fragment:d}:(u(d,a.contents),o.length?{errors:o,fragment:xi}:((n=d.children)==null?void 0:n.length)===1&&(!d.containerMode||d.containerMode==="contain")?{fragment:d.children[0],errors:[]}:{fragment:d,errors:[]}))}var xi={kind:"role",role:"fragment"};function Ur(e){return e.replace(/[\u200b\u00ad]/g,"").replace(/[\r\n\s\t]+/g," ").trim()}function St(e){return{raw:e,normalized:Ur(e)}}var cr=class jr{static parse(t,r,n){try{return new jr(t.value)._parse()}catch(i){if(i instanceof ur){const s=r.prettyErrors===!1?i.message:i.message+`:
 
 `+t.value+`

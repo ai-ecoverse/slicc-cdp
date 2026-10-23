@@ -8,7 +8,7 @@ use crate::session::{self, Session};
 use crate::snapshot::{FrameRec, RefRec};
 use serde_json::{json, Value};
 
-const INJECTED: &str = include_str!("../vendor/playwright-injected.js");
+const INJECTED: &str = include_str!("../vendor/playwright-injected.js.txt");
 const ENTER_FRAME: &str = " >> internal:control=enter-frame >> ";
 const MAX_SCRIPT: u64 = 16 * 1024 * 1024;
 const UPSKILL_REL: &str = "https://www.sliccy.ai/rel/upskill";
