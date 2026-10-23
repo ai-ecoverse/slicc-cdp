@@ -156,7 +156,6 @@ impl Drop for Lease {
 pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoint: &str) -> Output {
     let files = match files(invocation) { Ok(files) => files, Err(message) => return Output::err(message) };
     if read(&files.record).is_some_and(|value| live(&value)) { return Output::err(ALREADY) }
-    let _lease = match Lease::claim(&files) { Ok(lease) => lease, Err(message) => return Output::err(message) };
     let alias = invocation.command.as_deref() == Some("record");
     let target = if alias {
         browser::create_target(cdp, state, "about:blank", true)
@@ -175,6 +174,20 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
         minimal: invocation.flags.get("mode").is_some_and(|value| value == "minimal"),
         credentials: invocation.flags.get("include-credentials").is_some_and(|value| value == "true"),
         filter: invocation.flags.get("filter").or_else(|| invocation.flags.get("url-filter")).and_then(|pattern| Glob::parse(pattern).ok()),
+    };
+    holder.paused = holder.verify(cdp).is_none();
+    let _lease = match Lease::claim(&holder.files) {
+        Ok(lease) => lease,
+        Err(message) => {
+            cdp.set_decider(holder.session.as_deref().unwrap(), None);
+            cdp::detach(cdp, holder.session.as_deref().unwrap());
+            if alias {
+                let _ = browser::close_target(cdp, &target);
+                state.owned.retain(|owned| owned != &target);
+                state.created_blanks.remove(&target);
+            }
+            return Output::err(message);
+        }
     };
     let result = holder.run(cdp, state, endpoint, if alias { invocation.positionals.first().map(String::as_str) } else { None });
     if let Some(session) = &holder.session { cdp.set_decider(session, None); cdp::detach(cdp, session); }
@@ -214,6 +227,7 @@ struct Pending {
     response: Option<Value>,
     extra_headers: Option<(u64, Value)>,
     ordinary_document: bool,
+    document_url: String,
     timestamp: f64,
     wall: f64,
     end: f64,
@@ -253,10 +267,9 @@ impl Holder {
     }
 
     fn run(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str, url: Option<&str>) -> Result<(), String> {
-        self.checkpoint(cdp)?;
         self.beat()?;
+        if let Err(message) = self.checkpoint(cdp) { clear(&self.files); return Err(message) }
         let mut input = crate::webmcp_polyfill::input()?;
-        self.paused = self.verify(cdp).is_none();
         emit(self.status("ready"))?;
         if self.paused { emit(self.status("paused"))?; }
         let watched = (|| {
@@ -295,6 +308,7 @@ impl Holder {
             if fs::read_to_string(&self.files.stop).is_ok_and(|id| id == self.id) { return Ok("stop".into()) }
             if beat.elapsed() >= Duration::from_secs(1) { self.beat()?; beat = Instant::now(); }
             if self.session.as_deref().is_some_and(|session| cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) {
+                if self.absorb(cdp)? { return Ok("closed".into()) }
                 if let Some(session) = self.session.take() { cdp.set_decider(&session, None); cdp::detach(cdp, &session); }
                 self.pending.clear();
                 self.failed.clear();
@@ -317,7 +331,13 @@ impl Holder {
                 let verified = self.verify(cdp);
                 if verified.is_some() {
                     if self.paused { self.paused = false; emit(self.status("resumed"))?; }
-                } else { self.pending.clear(); self.failed.clear(); self.pause()?; }
+                } else {
+                    if self.absorb(cdp)? { return Ok("closed".into()) }
+                    self.pending.clear();
+                    self.failed.clear();
+                    self.checkpoint(cdp)?;
+                    self.pause()?;
+                }
                 retry = Instant::now() + Duration::from_millis(250);
             }
             for notice in cdp.take_notices() { eprint!("{notice}"); }
@@ -358,11 +378,10 @@ impl Holder {
                     let request = &params["request"];
                     if !ordinary(cdp.guard(), text(request, "url")) { self.pending.remove(id); self.denied.insert(id.to_string()); continue }
                     if self.denied.contains(id) { continue }
-                    let document = text(params, "type") == "Document";
-                    if self.paused && !document { continue }
-                    if !ordinary(cdp.guard(), text(params, "documentURL")) { continue }
+                    if self.paused { continue }
+                    if !ordinary(cdp.guard(), text(params, "documentURL")) || text(params, "loaderId").is_empty() { continue }
                     if self.filter.as_ref().is_some_and(|filter| !filter.matches(text(request, "url"))) { continue }
-                    self.pending.insert(id.to_string(), Pending { request: request.clone(), response: None, extra_headers: None, ordinary_document: !self.paused, timestamp: number(params, "timestamp"), wall: number(params, "wallTime"), end: number(params, "timestamp"), loader: text(params, "loaderId").to_string() });
+                    self.pending.insert(id.to_string(), Pending { request: request.clone(), response: None, extra_headers: None, ordinary_document: true, document_url: text(params, "documentURL").to_string(), timestamp: number(params, "timestamp"), wall: number(params, "wallTime"), end: number(params, "timestamp"), loader: text(params, "loaderId").to_string() });
                 }
                 "Network.responseReceived" => {
                     let response = &params["response"];
@@ -431,11 +450,11 @@ impl Holder {
     fn finish(&mut self, cdp: &mut Cdp, id: &str, body: bool) -> Result<(), String> {
         let Some(pending) = self.pending.remove(id) else { return Ok(()) };
         let Some(response) = &pending.response else { return Ok(()) };
-        if !ordinary(cdp.guard(), text(&pending.request, "url")) || !ordinary(cdp.guard(), text(response, "url")) { return Ok(()) }
+        if !pending.ordinary_document || !ordinary(cdp.guard(), &pending.document_url) || !ordinary(cdp.guard(), text(&pending.request, "url")) || !ordinary(cdp.guard(), text(response, "url")) { return Ok(()) }
         if !body && !response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) { return Ok(()) }
         let verified = self.verify(cdp).is_some_and(|loader| loader == pending.loader);
         let redirect = response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308));
-        if !redirect && (!verified || self.paused) || redirect && !pending.ordinary_document && !verified { return Ok(()) }
+        if self.paused && !redirect { return Ok(()) }
         let can_embed = self.embed && verified && !self.paused && self.session.as_deref().is_some_and(|session| cdp.ordinary_response_body(session, id));
         let content = if can_embed && body {
             cdp.call_for("Network.getResponseBody", json!({"requestId":id}), self.session.as_deref(), Duration::from_secs(2)).ok()

@@ -12,6 +12,7 @@ export async function harFixture(body, options = {}) {
   const emitters = new Map();
   const backend = await fakeCdp({
     refuseWhen: options.refuseWhen,
+    intercept: options.intercept,
     onCommand(message, emit) {
       if (message.sessionId) emitters.set(message.sessionId, emit);
     },
@@ -236,6 +237,31 @@ test('HAR rejects protected and unknown URLs and bodies, redacts redirect carrie
   });
 });
 
+test('completed ordinary traffic survives a later protected navigation without reading its body', async () => {
+  await harFixture(async ({ backend, tab, file, start, request, response, send }) => {
+    const held = await start(['--content=embed']);
+    request('COMPLETED_BEFORE_NAV', 'https://example.test/completed-before-nav');
+    response('COMPLETED_BEFORE_NAV', 'https://example.test/completed-before-nav');
+    tab.url = 'https://seven.sliccy.ai/private';
+    send('Page.frameNavigated', {
+      frame: {
+        id: 'TAB',
+        loaderId: 'PROTECTED',
+        url: tab.url,
+        securityOrigin: 'https://seven.sliccy.ai',
+      },
+    });
+    await held.event('paused');
+    const har = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(har.log.entries.length, 1, JSON.stringify(har));
+    assert.equal(har.log.entries[0].request.url, 'https://example.test/completed-before-nav');
+    assert.equal(har.log.entries[0].response.content.text, undefined);
+    assert.ok(!backend.calls.some((call) => call.method === 'Network.getResponseBody'));
+    held.child.stdin.end();
+    assert.equal((await held.ended).code, 0);
+  });
+});
+
 test('HAR retains ordinary redirect sources delivered through Network extra-info before a guarded failure', async () => {
   await harFixture(async ({ home, backend, start, request, send, checkpoint }) => {
     const held = await start(['--content=embed']);
@@ -330,6 +356,57 @@ test('a stale killed HAR holder is reclaimed automatically', async () => {
     assert.equal(next.code, 0, next.stderr);
     assert.equal(JSON.parse(next.stdout.trim().split('\n').at(-1)).reason, 'stdin');
   });
+});
+
+test('slow HAR setup cannot steal an active holder lease after the stale interval', async () => {
+  let entered;
+  let release;
+  const waiting = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let intercepted = false;
+  await harFixture(
+    async ({ home, backend, file }) => {
+      const slow = harHolder(
+        backend.url,
+        ['har-start', '--tab', 'TAB', path.join(home, 'slow.har')],
+        home
+      );
+      let fast;
+      try {
+        await waiting;
+        await new Promise((resolve) => setTimeout(resolve, 5200));
+        fast = harHolder(backend.url, ['har-start', '--tab', 'TAB', file], home);
+        await fast.event('ready');
+        release();
+        slow.child.stdin.end();
+        const rejected = await slow.ended;
+        assert.equal(rejected.code, 1, rejected.stdout);
+        assert.match(rejected.stderr, /already in progress/);
+        const stopped = await harCommand(backend.url, ['har-stop'], home);
+        assert.equal(stopped.code, 0, stopped.stderr);
+        assert.equal((await fast.ended).code, 0);
+      } finally {
+        slow.child.kill('SIGKILL');
+        fast?.child.kill('SIGKILL');
+      }
+    },
+    {
+      intercept(message, send) {
+        if (
+          !intercepted &&
+          message.method === 'Fetch.enable' &&
+          message.params.patterns?.some((pattern) => pattern.requestStage === 'Response')
+        ) {
+          intercepted = true;
+          release = () => send({ id: message.id, sessionId: message.sessionId, result: {} });
+          entered();
+          return true;
+        }
+        return false;
+      },
+    }
+  );
 });
 
 test('HAR refuses protected and unclassifiable selected tabs before any body method reaches CDP', async () => {
