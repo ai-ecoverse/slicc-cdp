@@ -171,6 +171,13 @@ impl Cdp {
             || self.session_target(session_id).and_then(|target| self.documents.get(&target)).is_some_and(|doc| self.sealed(doc))
     }
 
+    #[cfg(test)]
+    pub(crate) fn document_evidence(&self, target_id: &str) -> String {
+        self.documents.get(target_id).map_or_else(|| "none".to_string(), |doc| {
+            format!("url={} unreachable={} navigating={} previous={} probed={}", doc.url, doc.unreachable_url, doc.navigating, doc.previous, doc.probed)
+        })
+    }
+
     pub fn is_protected_target(&self, target_id: &str) -> bool {
         self.protected_targets.contains(target_id)
             || self
@@ -924,9 +931,13 @@ impl Cdp {
         if self.documents.get(target_id).is_none_or(|doc| doc.probed) {
             let left = budget.saturating_duration_since(Instant::now());
             if !left.is_zero() {
-                if let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left.min(OPTIONAL_STEP)) {
+                let epoch = self.frame_epoch;
+                if let Ok(tree) = self.raw_reply("Page.getFrameTree", json!({}), Some(&session), left.min(OPTIONAL_STEP)) {
+                    if self.tree_current(&tree, epoch) {
+                        self.record_frames(&tree, &session);
+                    }
                     if self.documents.get(target_id).is_none_or(|doc| doc.probed) {
-                        if let Some(frame) = tree.pointer("/frameTree/frame") {
+                        if let Some(frame) = tree.pointer("/frameTree/frame").filter(|frame| self.main_frame_current(frame, epoch)) {
                             self.main_commit(&session, frame);
                         }
                     }
@@ -1181,6 +1192,14 @@ impl Cdp {
     fn frame_verified(&self, frame_id: &str) -> bool {
         frame_text_known(frame_id) && !self.protected_targets.contains(frame_id)
             && self.frames.get(frame_id).is_some_and(|known| known.len() >= 2 && known.iter().all(|text| frame_text_known(text) && !self.guard.url(text)))
+    }
+
+    fn tree_current(&self, tree: &Value, epoch: u64) -> bool {
+        epoch == self.frame_epoch || self.tree_matches_updates(tree, epoch)
+    }
+
+    fn main_frame_current(&self, frame: &Value, epoch: u64) -> bool {
+        frame.get("id").and_then(Value::as_str).is_some_and(|id| self.frame_versions.get(id).is_none_or(|version| *version <= epoch))
     }
 
     fn tree_matches_updates(&self, tree: &Value, epoch: u64) -> bool {
@@ -1651,6 +1670,23 @@ impl Cdp {
         timeout: Duration,
     ) -> Result<Value, String> {
         let frame_epoch = self.frame_epoch;
+        let result = self.raw_reply(method, params, session_id, timeout)?;
+        if method == "Page.getFrameTree" {
+            if !self.tree_current(&result, frame_epoch) {
+                return Err(self.refusal());
+            }
+            self.record_frames(&result, session_id.unwrap_or(""));
+        }
+        Ok(result)
+    }
+
+    fn raw_reply(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.send(method, params, session_id)?;
         let deadline = Instant::now() + timeout;
         let was_blocked = session_id.is_some_and(|session| self.blocked.contains(session));
@@ -1670,14 +1706,7 @@ impl Cdp {
                     let (text, _) = shield::redact_text(&self.guard, text);
                     return Err(format!("{method}: {text}\n"));
                 }
-                let result = value.get("result").cloned().unwrap_or(Value::Null);
-                if method == "Page.getFrameTree" {
-                    if frame_epoch != self.frame_epoch && !self.tree_matches_updates(&result, frame_epoch) {
-                        return Err(self.refusal());
-                    }
-                    self.record_frames(&result, session_id.unwrap_or(""));
-                }
-                return Ok(result);
+                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
             let detached = value.get("method").and_then(|v| v.as_str())
                 == Some("Target.detachedFromTarget")
@@ -2327,6 +2356,7 @@ mod tests {
     include!("redirect_fragment_test.rs");
     include!("redirect_review_test.rs");
     include!("redirect_relation_test.rs");
+    include!("guard_attach_tree_test.rs");
 
     struct Pending {
         inbox: VecDeque<String>,
