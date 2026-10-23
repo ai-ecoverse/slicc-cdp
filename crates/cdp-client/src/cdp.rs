@@ -1308,7 +1308,7 @@ impl Cdp {
         };
         if kind
             .as_deref()
-            .is_some_and(|kind| !matches!(kind, "page" | "iframe" | "background_page" | "webview" | "other" | "worker" | "service_worker" | "shared_worker"))
+            .is_some_and(|kind| !matches!(kind, "page" | "iframe" | "background_page" | "webview" | "other"))
         {
             return Ok(());
         }
@@ -1354,11 +1354,10 @@ impl Cdp {
         let setup = [
             (
                 "Fetch.enable",
-                json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
+                json!({ "patterns": [{ "urlPattern": "*", "resourceType": "Document", "requestStage": "Request" }] }),
             ),
             ("Network.enable", json!({})),
             ("Network.setBypassServiceWorker", json!({ "bypass": true })),
-            ("Target.setAutoAttach", Self::worker_attachment()),
             ("Page.enable", json!({})),
             ("Runtime.enable", json!({})),
         ];
@@ -1424,37 +1423,6 @@ impl Cdp {
             }
         }
         Ok(())
-    }
-
-    fn worker_attachment() -> Value {
-        json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"worker"},{"type":"shared_worker"},{"type":"service_worker"},{"exclude":true}]})
-    }
-
-    fn guard_worker(&mut self, value: &Value) -> bool {
-        if value["method"] != "Target.attachedToTarget"
-            || !value["sessionId"].as_str().is_some_and(|session| self.guard_sessions.contains(session)) {
-            return false;
-        }
-        let info = &value["params"]["targetInfo"];
-        if !matches!(info["type"].as_str(), Some("worker" | "service_worker" | "shared_worker")) { return false }
-        let (Some(target), Some(session)) = (info["targetId"].as_str(), value["params"]["sessionId"].as_str()) else { return true };
-        self.targets.insert(target.to_string(), info.clone());
-        self.guards.insert(target.to_string(), session.to_string());
-        self.guard_sessions.insert(session.to_string());
-        self.session_targets.insert(session.to_string(), target.to_string());
-        let setup = [
-            ("Fetch.enable", json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]})),
-            ("Network.enable", json!({})),
-            ("Target.setAutoAttach", Self::worker_attachment()),
-        ];
-        for (method, params) in setup {
-            if self.raw_call(method, params, Some(session), GUARD_SETUP).is_err() {
-                self.abandon(target);
-                return true;
-            }
-        }
-        let _ = self.send("Runtime.runIfWaitingForDebugger", json!({}), Some(session));
-        true
     }
 
     fn abandon(&mut self, target_id: &str) {
@@ -1575,7 +1543,7 @@ impl Cdp {
     }
 
     fn document_state_for(&mut self, target: &str, content: bool, scope: Option<&str>) -> Option<DocumentState> {
-        let Some(guard) = self.guards.get(target).cloned().filter(|_| !self.targets.get(target).is_some_and(|info| matches!(info["type"].as_str(), Some("worker" | "service_worker" | "shared_worker")))) else {
+        let Some(guard) = self.guards.get(target).cloned() else {
             if self.protected_targets.contains(target) { return None }
             let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
             let info = result.get("targetInfo")?;
@@ -1936,7 +1904,7 @@ impl Cdp {
     fn answer_protected(&mut self, paused: &Paused) {
         self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
         self.settle(&paused.session_id, &paused.request_id);
-        if !paused.is_response() || paused.resource_type == "Document" || self.guard.url(&paused.full_url()) || self.guard.resource_key(&paused.full_url()).is_none() {
+        if paused.resource_type == "Document" {
             let _ = self.send(
                 "Fetch.failRequest",
                 json!({ "requestId": paused.request_id, "errorReason": "BlockedByClient" }),
@@ -2460,18 +2428,6 @@ impl Cdp {
         Some((delay, (!target.is_empty()).then_some(target)))
     }
 
-    pub fn ordinary_redirect_target(&self, source: &str, target: &str) -> Result<String, String> {
-        let targets = Self::carrier_targets(&self.guard, target, source).ok_or_else(|| self.refusal())?;
-        if target.trim().is_empty() || targets.iter().any(|target| target.protected) {
-            return Err(self.refusal());
-        }
-        let url = &targets[0].url;
-        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
-            return Err(self.refusal());
-        }
-        Ok(url.to_string())
-    }
-
     fn carrier_targets(guard: &Protected, target: &str, source: &str) -> Option<Vec<CarrierTarget>> {
         let base = url::Url::parse(source).ok()?;
         let mut target = target.trim().to_string();
@@ -2893,7 +2849,6 @@ impl Cdp {
             }
             return;
         }
-        if self.guard_worker(&value) { return }
         self.observe_dialog(&value);
         if value.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget") {
             let session = value.pointer("/params/sessionId").and_then(Value::as_str);
@@ -2921,17 +2876,8 @@ impl Cdp {
         }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
             let Some(mut paused) = Paused::from_event(&value) else {
-                if let (Some(session), Some(request)) = (value["sessionId"].as_str(), value["params"]["requestId"].as_str()) {
-                    let _ = self.send("Fetch.failRequest", json!({"requestId":request,"errorReason":"BlockedByClient"}), Some(session));
-                }
                 return;
             };
-            if self.guard_sessions.contains(&paused.session_id) && !paused.is_response() && paused.resource_type != "Document"
-                && url::Url::parse(&paused.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-                && !self.guard.url(&paused.full_url()) && !shield::scheme_less_protected(&self.guard, &value["params"]["request"]) {
-                self.continue_plain(&paused.session_id, &paused.request_id);
-                return;
-            }
             if let Some(network) = &paused.network_id {
                 self.request_aliases.entry(network.clone()).or_default().insert(paused.request_id.clone());
                 self.request_aliases.entry(paused.request_id.clone()).or_default().insert(network.clone());
@@ -2946,8 +2892,8 @@ impl Cdp {
                 self.protect_body_request(&paused.request_id);
                 if let Some(network) = &paused.network_id { self.protect_body_request(network); self.protect_resource(&paused.session_id, &paused.url); }
             }
-            let loaded_protected = self.guard.resource_key(&paused.full_url()).is_none() || self.guard.url(&paused.full_url()) || authority_protected;
-            let reaches = loaded_protected || redirect;
+            let reaches = self.guard.url(&paused.full_url()) || redirect || authority_protected;
+            let loaded_protected = self.guard.url(&paused.full_url()) || authority_protected;
             let protected = reaches;
             if loaded_protected {
                 self.protect_resource(&paused.session_id, &paused.full_url());
@@ -2997,7 +2943,7 @@ impl Cdp {
                     .push((paused.session_id.clone(), observed_url, reason));
             }
             if self.guard_sessions.contains(&paused.session_id) {
-                if loaded_protected || reaches && paused.resource_type == "Document" {
+                if reaches && paused.resource_type == "Document" {
                     self.answer_protected(&paused);
                 } else {
                     self.continue_plain(&paused.session_id, &paused.request_id);

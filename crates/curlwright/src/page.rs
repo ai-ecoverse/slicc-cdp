@@ -3,7 +3,7 @@ use crate::parse::Stop;
 use crate::request::{PreparedRequest, RequestBody};
 use cdp_client::cdp::{self, Cdp};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const RESPONSE_HANDLING: &str = "const h = {};r.headers.forEach((v, k) => { h[k] = v; });const ct = r.headers.get('content-type') || '';const __rt = \"binary\";const __ctl = ct.toLowerCase();const __binPrefixes = ['image/','audio/','video/','application/octet-stream','application/pdf','application/protobuf','application/x-protobuf','application/wasm','application/zip'];const __isXml = __ctl.indexOf('+xml') !== -1 || __ctl.indexOf('application/xml') === 0 || __ctl.indexOf('text/xml') === 0;const __isBinary = __rt === 'binary' || (__rt !== 'text' && __rt !== 'json' && !__isXml && __binPrefixes.some((p) => __ctl.indexOf(p) === 0));const __meta = { ok: r.ok, status: r.status, statusText: r.statusText, url: r.url, redirected: !!r.redirected, headers: h };if (__isBinary) {const __u = new Uint8Array(await r.arrayBuffer());let __s = ''; const __cs = 0x8000;for (let __i = 0; __i < __u.length; __i += __cs) { __s += String.fromCharCode.apply(null, __u.subarray(__i, __i + __cs)); }return Object.assign(__meta, { body: btoa(__s), bodyEncoding: 'base64' });}const t = await r.text();let b;const __jsonWanted = __rt === 'json' || (__rt !== 'text' && ct.indexOf('application/json') !== -1);if (__jsonWanted) { if (!t) { b = null; } else { try { b = JSON.parse(t); } catch (e) { b = t; } } }else { b = t; }return Object.assign(__meta, { body: b });";
 
@@ -18,7 +18,6 @@ pub struct FetchResult {
 
 pub fn fetch_script(request: &PreparedRequest) -> String {
     let mut init = serde_json::Map::new();
-    init.insert("redirect".into(), json!("manual"));
     init.insert("method".into(), json!(request.method));
     init.insert("credentials".into(), json!(request.credentials));
     init.insert("headers".into(), Value::Object(request.headers.clone()));
@@ -37,9 +36,9 @@ pub fn fetch_script(request: &PreparedRequest) -> String {
     script.push(';');
     script.push_str(&timeout);
     script.push_str(&reconstruct(&request.body));
-    script.push_str("const __url = new URL(");
+    script.push_str("const r = await fetch(");
     script.push_str(&url_json);
-    script.push_str(", location.href).href;const r = await fetch(__url, __init);if (r.type === 'opaqueredirect') return { manualRedirect: true, requestUrl: __url };");
+    script.push_str(", __init);");
     script.push_str(RESPONSE_HANDLING);
     script.push_str("})()");
     script
@@ -170,68 +169,13 @@ pub fn run_fetch(
     context_id: Option<i64>,
     full_urls: bool,
 ) -> Result<FetchResult, String> {
-    cdp.call("Network.enable", json!({}), Some(session))?;
+    let script = fetch_script(request);
     let timeout = match request.timeout_ms {
         Some(ms) if ms > 0 => Duration::from_millis(ms.saturating_add(1_000)),
         _ => Duration::from_secs(30),
     };
-    let deadline = Instant::now() + timeout;
-    let mut request = request.clone();
-    let mut hop = 0;
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() { return Err("Runtime.evaluate timed out\n".into()) }
-        let from = cdp.events().len();
-        let value = evaluate(cdp, session, &fetch_script(&request), context_id, left, full_urls)?;
-        if value["manualRedirect"] != true {
-            let mut result = parse_fetch_result(&value)?;
-            result.redirected = hop > 0;
-            return Ok(result);
-        }
-        if hop == 20 { return Err("curlwright: too many redirects\n".into()) }
-        let source = value["requestUrl"].as_str().ok_or_else(|| cdp.guard().refusal().to_string())?;
-        let (status, location) = redirect_metadata(&cdp.events()[from..], session, source, &request.method)
-            .ok_or_else(|| cdp.guard().refusal().to_string())?;
-        let next = cdp.ordinary_redirect_target(source, &location)?;
-        rewrite_redirect(&mut request, source, &next, status);
-        request.url = next;
-        hop += 1;
-    }
-}
-
-fn redirect_metadata(events: &[Value], session: &str, source: &str, method: &str) -> Option<(u16, String)> {
-    let requests: Vec<&Value> = events.iter().filter(|event| {
-        event["sessionId"] == session && event["method"] == "Network.requestWillBeSent"
-            && event["params"]["request"]["url"] == source && event["params"]["request"]["method"] == method
-    }).collect();
-    if requests.len() != 1 { return None }
-    let id = requests[0]["params"]["requestId"].as_str()?;
-    let responses: Vec<&Value> = events.iter().filter(|event| {
-        event["sessionId"] == session && event["method"] == "Network.responseReceived"
-            && event["params"]["requestId"] == id && event["params"]["response"]["url"] == source
-    }).collect();
-    if responses.len() != 1 { return None }
-    let response = &responses[0]["params"]["response"];
-    let status = response["status"].as_u64()? as u16;
-    if !matches!(status, 301 | 302 | 303 | 307 | 308) { return None }
-    let locations: Vec<&str> = response["headers"].as_object()?.iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("location"))
-        .filter_map(|(_, value)| value.as_str()).collect();
-    if locations.len() != 1 || locations[0].is_empty() { return None }
-    Some((status, locations[0].to_string()))
-}
-
-fn rewrite_redirect(request: &mut PreparedRequest, source: &str, next: &str, status: u16) {
-    let post = request.method.eq_ignore_ascii_case("POST");
-    let get_or_head = request.method.eq_ignore_ascii_case("GET") || request.method.eq_ignore_ascii_case("HEAD");
-    if matches!(status, 301 | 302) && post || status == 303 && !get_or_head {
-        request.method = "GET".into();
-        request.body = RequestBody::None;
-        request.headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(), "content-type" | "content-length" | "content-encoding" | "content-language" | "content-location"));
-    }
-    if url::Url::parse(source).ok().map(|url| url.origin()) != url::Url::parse(next).ok().map(|url| url.origin()) {
-        request.headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(), "authorization" | "proxy-authorization" | "cookie"));
-    }
+    let value = evaluate(cdp, session, &script, context_id, timeout, full_urls)?;
+    parse_fetch_result(&value)
 }
 
 pub fn attach(cdp: &mut Cdp, target_id: &str) -> Result<String, String> {
