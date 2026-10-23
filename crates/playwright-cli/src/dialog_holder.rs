@@ -17,18 +17,22 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let result = run(cdp, state, target, &held, input);
+    let result = run(cdp, state, target, &held, input, emit);
     cdp::detach(cdp, &held);
     *state = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     match result { Ok(()) => Output::ok(""), Err(message) => Output::err(message) }
 }
 
 fn emit(value: Value) -> Result<(), String> {
-    println!("{}", crate::sanitize::json_c1(&value.to_string()));
-    io::stdout().flush().map_err(|_| "dialog-hold: failed to write event\n".into())
+    write_event(&mut io::stdout().lock(), value)
 }
 
-fn run(cdp: &mut Cdp, state: &mut Session, target: &str, held: &str, make_input: impl FnOnce() -> Result<Input, String>) -> Result<(), String> {
+fn write_event(writer: &mut impl Write, value: Value) -> Result<(), String> {
+    writeln!(writer, "{}", crate::sanitize::json_c1(&value.to_string()))
+        .and_then(|_| writer.flush()).map_err(|_| "dialog-hold: failed to write event\n".into())
+}
+
+fn run(cdp: &mut Cdp, state: &mut Session, target: &str, held: &str, make_input: impl FnOnce() -> Result<Input, String>, mut emit: impl FnMut(Value) -> Result<(), String>) -> Result<(), String> {
     let mut input = make_input()?;
     let mut ready = cdp.dialog_ready(held)?;
     state.current = Some(target.to_string());
@@ -42,12 +46,13 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, held: &str, make_input:
     loop {
         cdp.pump(Instant::now() + Duration::from_millis(50))?;
         let dialog = cdp.dialog_id(held);
+        let mut notifications = Vec::new();
         if dialog != last_dialog {
             if let Some(epoch) = dialog {
                 let allowed = cdp.verify_dialog(held, epoch).is_ok();
-                emit(json!({"event":if allowed {"dialog-opened"} else {"dialog-refused"},"target":target,"dialogId":epoch}))?;
-            } else if let Some(epoch) = last_dialog {
-                emit(json!({"event":"dialog-closed","target":target,"dialogId":epoch}))?;
+                notifications.push(json!({"event":if allowed {"dialog-opened"} else {"dialog-refused"},"target":target,"dialogId":epoch}));
+            } else {
+                notifications.push(json!({"event":"dialog-closed","target":target,"dialogId":last_dialog}));
             }
             last_dialog = dialog;
         }
@@ -57,10 +62,11 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, held: &str, make_input:
             let mut document = cdp.dialog_ready(held)?;
             if !document["loaderId"].is_null() && document["loaderId"] != ready["loaderId"] {
                 document["event"] = json!("document-ready");
-                emit(document.clone())?;
+                notifications.push(document.clone());
             }
             ready = document;
         }
+        for notification in notifications { emit(notification)?; }
         if cdp.session_blocked(held) || cdp.is_protected_target(target)
             || cdp.events().iter().rev().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == target) {
             emit(json!({"event":"stopped","target":target,"reason":"target closed, changed or refused"}))?;
