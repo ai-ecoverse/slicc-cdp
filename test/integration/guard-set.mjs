@@ -14,6 +14,7 @@ import { guarded, observer } from './guard-client.mjs';
 import { guardDiagnostics } from './guard-diagnostics.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 import { inboundClients } from './inbound-clients.mjs';
+import { describeLoad, watchLoad } from './load.mjs';
 import { finalizeX1Privacy, recordX1Client, x1Privacy } from './x1-audit.mjs';
 
 const { containsSecret } = await import(
@@ -292,6 +293,8 @@ const extensionPath = fileURLToPath(
   new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
 );
 
+const launched = [];
+
 async function guardBrowser(
   startup,
   { privileged, extension, target, slot, siteIsolationOff, signal, deadlineAt }
@@ -310,6 +313,7 @@ async function guardBrowser(
     Math.max(1, deadlineAt - Date.now()),
     (error) => controller.abort(error)
   );
+  launched.push({ target, slot, browser: started });
   const browser = {
     ...started,
     close: () =>
@@ -373,6 +377,8 @@ export async function runPartition(t, id) {
       .filter((vector) => vector.targets.length),
   };
   const started = Date.now();
+  launched.length = 0;
+  const stopLoad = watchLoad();
   const setupDeadline = started + Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000) - 35000;
   const remaining = () => Math.max(1, setupDeadline - Date.now());
   execFileSync(
@@ -698,8 +704,13 @@ export async function runPartition(t, id) {
   report.transport =
     process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
   const problems = verdictProblems(report.results);
+  const load = stopLoad();
+  const deaths = launched
+    .map(({ target, slot, browser }) => ({ target, slot, died: browser.died?.() ?? null }))
+    .filter(({ died }) => died);
+  const pressure = `${launched.length} guard browsers; ${describeLoad(load)}\nChrome deaths: ${deaths.length}${deaths.map(({ target, slot, died }) => `\n- ${target} slot ${slot}: ${died}`).join('')}`;
   const ms = Date.now() - started;
-  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every mandatory row PASS or its declared applicability skip'}\n\n${table(report.results)}\n`;
+  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every mandatory row PASS or its declared applicability skip'}\n${pressure}\n\n${table(report.results)}\n`;
   const file =
     process.env.SLICC_GUARD_REPORT ??
     path.join(fileURLToPath(new URL('../../artifacts/', import.meta.url)), `guard-${id}.md`);
@@ -713,6 +724,9 @@ export async function runPartition(t, id) {
         ms,
         parallel,
         problems,
+        load,
+        browsers: launched.length,
+        deaths,
         diagnostics: diagnostics.map(({ references, ...record }) => record),
       },
       null,
@@ -738,7 +752,11 @@ export async function runPartition(t, id) {
   );
   for (const error of availability)
     process.stderr.write(`HARNESS-AVAILABILITY ${JSON.stringify(error)}\n`);
-  assert.deepEqual(availability, [], 'all target invocations and cleanup must succeed');
+  assert.deepEqual(
+    availability,
+    [],
+    `all target invocations and cleanup must succeed\n${pressure}`
+  );
   assert.deepEqual(
     report.results.map(rowKey).sort(),
     rowsFor(selectedTargets).map(rowKey).sort(),
@@ -747,6 +765,10 @@ export async function runPartition(t, id) {
   assertGuardReport(report, id, report.sha);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  assert.deepEqual(problems, [], 'every row is PASS or its declared not-applicable skip');
+  assert.deepEqual(
+    problems,
+    [],
+    `every row is PASS or its declared not-applicable skip\n${pressure}`
+  );
   assert.equal(report.pass, true, report.line);
 }

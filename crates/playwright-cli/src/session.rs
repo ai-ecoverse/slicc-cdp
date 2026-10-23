@@ -20,9 +20,11 @@ pub struct Session {
     pub console: BTreeMap<String, Vec<ConsoleEntry>>,
     pub requests: BTreeMap<String, Vec<NetRequest>>,
     pub routes: Vec<Route>,
+    pub offline: bool,
     pub webmcp: BTreeMap<String, Value>,
     pub webmcp_connection: String,
     pub cwd: Option<PathBuf>,
+    pub input: BTreeMap<String, Value>,
 }
 
 #[allow(dead_code)]
@@ -200,9 +202,11 @@ fn decode(text: &str) -> Session {
             .and_then(|item| item.as_array())
             .map(|items| items.iter().filter_map(route::decode).collect())
             .unwrap_or_default(),
+        offline: value.get("networkOffline").and_then(Value::as_bool).unwrap_or(false),
         webmcp: value.get("webmcp").and_then(Value::as_object).map(|entries| entries.iter().map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
         webmcp_connection: String::new(),
         cwd: None,
+        input: value.get("input").and_then(Value::as_object).map(|entries| entries.iter().filter(|(_, value)| value.is_object()).map(|(target, value)| (target.clone(), value.clone())).collect()).unwrap_or_default(),
     }
 }
 
@@ -255,7 +259,7 @@ fn encode(session: &Session) -> Value {
         }
         snapshots.insert(target.clone(), Value::Object(object));
     }
-    json!({
+    let mut value = json!({
         "current": session.current,
         "endpoint": session.endpoint,
         "provenance": session.provenance,
@@ -267,7 +271,12 @@ fn encode(session: &Session) -> Value {
         "requests": encode_lists(&session.requests, |request| Some(stored_request(request))),
         "routes": session.routes.iter().map(route::encode).collect::<Vec<_>>(),
         "webmcp": session.webmcp,
-    })
+        "input": session.input,
+    });
+    if session.offline {
+        value["networkOffline"] = json!(true);
+    }
+    value
 }
 
 const REDACTED: &str = "[redacted]";

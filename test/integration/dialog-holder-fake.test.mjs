@@ -210,6 +210,43 @@ test('holder validates line JSON and does not invent document loader ownership',
   });
 });
 
+test('holder stops on its flat-session detach with stdin still open and discovery disabled', async () => {
+  for (const observed of [false, true]) {
+    await fixture(async (process, backend, emit) => {
+      await process.wait((event) => event.event === 'ready');
+      if (observed) {
+        emit('Page.javascriptDialogOpening', { frameId: 'TAB', url: URL, type: 'confirm' });
+        await process.wait((event) => event.event === 'dialog-opened');
+      }
+      const held = backend.calls.find((call) => call.method === 'Page.enable').sessionId;
+      emit('Target.detachedFromTarget', { sessionId: 'UNRELATED' });
+      request(process, { id: 91, dialogId: 999, command: 'dialog-dismiss' });
+      assert.ok(
+        ['no-dialog', 'stale-dialog'].includes(
+          (await process.wait((event) => event.id === 91)).event
+        )
+      );
+      assert.equal(
+        backend.calls.filter((call) => call.method === 'Target.setDiscoverTargets').length,
+        0
+      );
+      emit('Page.frameNavigated', {
+        frame: { id: 'TAB', loaderId: 'LAST', url: URL, securityOrigin: 'https://ordinary.test' },
+      });
+      emit('Target.detachedFromTarget', { sessionId: held, targetId: 'TAB' });
+      const stopped = await process.wait((event) => event.event === 'stopped');
+      assert.equal(stopped.reason, 'target closed, changed or refused');
+      assert.notEqual((await process.ended).code, 0);
+      assert.equal(process.child.stdin.writableEnded, false);
+      assert.equal(
+        backend.calls.filter((call) => call.method === 'Page.handleJavaScriptDialog').length,
+        0
+      );
+      assert.equal(process.events.filter((event) => event.event === 'stopped').length, 1);
+    });
+  }
+});
+
 test('WASI holder follows stdin EOF and uses the same JSON-ready protocol', async () => {
   const backend = await fakeCdp();
   backend.targets.push({ targetId: 'TAB', url: URL });

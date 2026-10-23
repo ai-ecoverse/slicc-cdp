@@ -29,9 +29,18 @@ pub fn global_help() -> String {
         row("dialog-accept [prompt]", "accept a dialog"),
         row("dialog-dismiss", "dismiss a dialog"),
         row("dialog-hold", "hold a foreground guarded dialog session"),
+        row("resize <w> <h>", "resize the browser window"),
         String::new(),
         "Keyboard:".to_string(),
         row("press <key>", "press a key on the keyboard, `a`, `arrowleft`"),
+        row("keydown <key>", "press a key down on the keyboard"),
+        row("keyup <key>", "press a key up on the keyboard"),
+        String::new(),
+        "Mouse:".to_string(),
+        row("mousemove <x> <y>", "move mouse to a given position"),
+        row("mousedown [button]", "press mouse down"),
+        row("mouseup [button]", "press mouse up"),
+        row("mousewheel <dx> <dy>", "scroll mouse wheel"),
         String::new(),
         "Pointer and form:".to_string(),
         row("hover <ref>", "hover over an element"),
@@ -41,6 +50,7 @@ pub fn global_help() -> String {
         row("uncheck <ref>", "uncheck a checkbox"),
         row("upload <ref> <file...>", "upload files to a file input"),
         row("drag <startRef> <endRef>", "drag one element to another"),
+        row("drop <target>", "drop files or data onto an element"),
         String::new(),
         "Navigation:".to_string(),
         row("go-back", "navigate to the previous page in history"),
@@ -87,6 +97,11 @@ pub fn global_help() -> String {
         row("route <pattern>", "mock network requests matching a url pattern"),
         row("route-list", "list all active network routes"),
         row("unroute [pattern]", "remove routes matching a pattern (or all routes)"),
+        row("network-state-set <state>", "set the browser network state to online or offline"),
+        String::new(),
+        "DevTools:".to_string(),
+        row("generate-locator <target>", "generate a playwright locator for the given element"),
+        row("highlight [target]", "show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."),
         String::new(),
         "Recording:".to_string(),
         row("recording-start", "start recording user actions"),
@@ -111,6 +126,8 @@ pub fn global_help() -> String {
         String::new(),
         "SLICC-only:".to_string(),
         row("frames", "list frame IDs for the current page"),
+        row("eval-file <path>", "evaluate javascript from a local file on page"),
+        row("fetch <url>", "fetch a url in the tab and list its link headers"),
         String::new(),
         "Install:".to_string(),
         row("upgrade [--check]", "replace this binary with the latest release (alias: update)"),
@@ -166,6 +183,56 @@ pub fn command_help(spec: &Spec) -> String {
 fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
         "upgrade" | "update" => crate::upgrade::usage(name),
+        "generate-locator" => page(
+            "generate-locator <target>",
+            &["Generate a Playwright locator for the given element"],
+            &[("<target>", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[],
+        ),
+        "highlight" => page(
+            "highlight [target]",
+            &["Show (or with --hide, remove) a highlight overlay for an element; `--hide` without a target hides all page highlights."],
+            &[("[target]", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[
+                ("--hide", "hide a previously added highlight for this element, or all page highlights when no element is given"),
+                ("--style", "additional inline css applied to the highlight overlay, e.g. \"outline: 2px dashed red\""),
+            ],
+        ),
+        "network-state-set" => page(
+            "network-state-set <state>",
+            &[
+                "Set the browser network state to online or offline",
+                "The state is saved with the session. Offline applies to each tab while a later command is attached to it.",
+            ],
+            &[("<state>", "set to \"offline\" to simulate offline mode, \"online\" to restore network connectivity")],
+            &[],
+        ),
+        "eval-file" => page(
+            "eval-file <path>",
+            &[
+                "Evaluate JavaScript from a local file on page",
+                "Reads only the file you name and evaluates it like eval: a function expression is called, and top-level await and return work.",
+            ],
+            &[("<path>", "file with the JavaScript to evaluate")],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+                ("--frame <frameId>", "frame to run in, in an isolated world"),
+                ("--output <path>", "save the result to a file (alias: --filename)"),
+            ],
+        ),
+        "fetch" => page(
+            "fetch <url>",
+            &[
+                "Fetch a URL in the tab and list its Link headers",
+                "Runs fetch() in the tab with its cookies and origin and prints JSON with the status, the Link header entries and any SLICC upskill link. The body is not read. Redirects are manual: every hop must pass the guard, and missing or ambiguous redirect metadata is refused.",
+                "Seven's origins and the vault are refused, and a redirect to them fails the request.",
+            ],
+            &[("<url>", "http(s) URL, absolute or relative to the tab")],
+            &[
+                ("--tab <targetId>", "tab to run in"),
+                ("--method <method>", "request method, defaults to GET"),
+            ],
+        ),
         "recording-start" | "record" => page(
             &format!("{name} "),
             &[
@@ -481,6 +548,58 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("<endRef>", "element reference for the drop target"),
             ],
             &[],
+        ),
+        "resize" => page(
+            "resize <w> <h>",
+            &[
+                "Resize the browser window",
+                "",
+                "Sets the window bounds so the viewport becomes <w> by <h> CSS pixels and stays that size after the command exits.",
+                "Refused while a protected or unverified tab or frame is open in the same browser profile.",
+            ],
+            &[("<w>", "width of the browser window"), ("<h>", "height of the browser window")],
+            &[],
+        ),
+        "keydown" | "keyup" => page(
+            &format!("{name} <key>"),
+            &[
+                if name == "keydown" { "Press a key down on the keyboard" } else { "Press a key up on the keyboard" },
+                "",
+                "Held keys and modifiers are kept per tab in the saved session. Refused while focus is inside an iframe or a closed shadow root.",
+            ],
+            &[("<key>", "name of the key to press or a character to generate, such as `arrowleft` or `a`")],
+            &[],
+        ),
+        "mousemove" => page(
+            "mousemove <x> <y>",
+            &["Move mouse to a given position", "", "The pointer position and held buttons are kept per tab in the saved session. Refused over an iframe or other embedded frame."],
+            &[("<x>", "x coordinate"), ("<y>", "y coordinate")],
+            &[],
+        ),
+        "mousedown" | "mouseup" => page(
+            &format!("{name} [button]"),
+            &[
+                if name == "mousedown" { "Press mouse down" } else { "Press mouse up" },
+                "",
+                "Uses the position from the last mousemove on this tab. Refused over an iframe or other embedded frame.",
+            ],
+            &[("[button]", "button to press, defaults to left")],
+            &[],
+        ),
+        "mousewheel" => page(
+            "mousewheel <dx> <dy>",
+            &["Scroll mouse wheel", "", "Scrolls at the position from the last mousemove on this tab. Refused over an iframe or other embedded frame. A background tab is scrolled in place with an untrusted wheel event, because Chrome never answers trusted wheel events there."],
+            &[("<dx>", "x delta"), ("<dy>", "y delta")],
+            &[],
+        ),
+        "drop" => page(
+            "drop <target>",
+            &["Drop files or data onto an element", "", "Only the regular files named by --path are read, up to 25 MiB in total."],
+            &[("<target>", "exact target element reference from the page snapshot, or a unique element selector")],
+            &[
+                ("--path", "absolute path to a file to drop onto the element (repeatable)"),
+                ("--data", "data to drop in \"mime/type=value\" format, e.g. --data \"text/plain=hello\" (repeatable)"),
+            ],
         ),
         "frames" => page(
             "frames",

@@ -57,6 +57,10 @@ impl Cdp {
         Ok(json!({"target":target,"loaderId":loader,"loaderIdSource":if loader.is_some() {"frame-navigated"} else {"unavailable"},"status":if loader.is_some() {"document-verified"} else {"observing"}}))
     }
 
+    pub fn dialog_attached(&self, session: &str, target: &str) -> bool {
+        self.dialog_sessions.contains(session) && self.session_target(session).as_deref() == Some(target)
+    }
+
     pub fn dialog_id(&self, session: &str) -> Option<u64> {
         self.dialogs.get(session).map(|dialog| dialog.epoch)
     }

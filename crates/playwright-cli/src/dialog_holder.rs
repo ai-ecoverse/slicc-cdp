@@ -45,6 +45,11 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, held: &str, make_input:
     let mut seen = cdp.events().len();
     loop {
         cdp.pump(Instant::now() + Duration::from_millis(50))?;
+        if !cdp.dialog_attached(held, target) || cdp.session_blocked(held) || cdp.is_protected_target(target)
+            || cdp.events().iter().rev().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == target) {
+            emit(json!({"event":"stopped","target":target,"reason":"target closed, changed or refused"}))?;
+            return Err("dialog-hold: target closed, changed or refused\n".into());
+        }
         let dialog = cdp.dialog_id(held);
         let mut notifications = Vec::new();
         if dialog != last_dialog {
@@ -67,11 +72,6 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, held: &str, make_input:
             ready = document;
         }
         for notification in notifications { emit(notification)?; }
-        if cdp.session_blocked(held) || cdp.is_protected_target(target)
-            || cdp.events().iter().rev().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == target) {
-            emit(json!({"event":"stopped","target":target,"reason":"target closed, changed or refused"}))?;
-            return Err("dialog-hold: target closed, changed or refused\n".into());
-        }
         match input() {
             Err(mpsc::TryRecvError::Disconnected) => {
                 if !pending.is_empty() || overflow { emit(json!({"event":"invalid-request","id":null,"reason":"incomplete JSON line at EOF"}))?; }

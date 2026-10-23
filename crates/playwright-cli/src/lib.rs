@@ -13,8 +13,11 @@ mod dialog_holder;
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
 mod help;
+mod input;
+mod keys;
 mod launch;
 mod net;
+mod page_tools;
 mod recording;
 mod route;
 mod sanitize;
@@ -103,6 +106,9 @@ pub fn execute_in(
     if route::is_route_command(&command) {
         return route::run(&invocation);
     }
+    if command == "network-state-set" {
+        return page_tools::network_state_set(&invocation);
+    }
     if recording::is_stop(&command) {
         return recording::stop(&invocation);
     }
@@ -184,7 +190,7 @@ mod tests {
         assert!(!pending.contains("dblclick"));
         assert!(!pending.contains("dialog-accept"));
         assert!(!pending.contains("dialog-dismiss"));
-        assert!(pending.contains("resize"));
+        assert!(!pending.contains("resize"));
         assert!(!output.stdout.contains("cdp.slicc.internal"));
         assert!(!output.stdout.contains("cdp.kernel.localhost"));
         assert!(!output.stdout.contains("/devtools/browser/slicc"));
@@ -288,8 +294,8 @@ mod tests {
         ] {
             assert!(!pending_names.contains(&name), "{name} listed as pending");
         }
-        for name in ["resize", "keydown"] {
-            assert!(pending_names.contains(&name), "{name}");
+        for name in ["resize", "keydown", "keyup", "mousemove", "mousedown", "mouseup", "mousewheel", "drop"] {
+            assert!(!pending_names.contains(&name), "{name}");
         }
 
         assert_page(
