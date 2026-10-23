@@ -139,8 +139,7 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
     await withScene(runner, setup, async (s) => {
       await s.ok(['hover', s.ref]);
-      assert.deepEqual(s.state.activated.at(-1), 'OTHER');
-      assert.equal(s.state.activated.length, 2);
+      assert.deepEqual(s.state.activated, [own(s), 'OTHER']);
     });
   });
 
@@ -323,6 +322,73 @@ for (const [transport, runner] of Object.entries(runners)) {
       const result = await s.run(['dblclick', s.ref]);
       assert.equal(result.code, 1);
       assert.match(result.stderr, /Input\.dispatchMouseEvent refused/);
+    });
+  });
+}
+
+const vaultTab = { targetId: 'VAULT', url: 'https://vault.sliccy.ai/' };
+
+for (const [transport, runner] of Object.entries(runners)) {
+  for (const [name, others, front] of [
+    ['a second protected tab shares the window', [sevenTab, vaultTab], 'NONE'],
+    [
+      'an ordinary tab in the window is visible',
+      [sevenTab, { targetId: 'OTHER', url: 'http://other.test/' }],
+      'OTHER',
+    ],
+    [
+      'the window also holds a protected tab of unknown kind',
+      [sevenTab, { targetId: 'APP', type: 'other', url: 'https://vault.sliccy.ai/app' }],
+      'NONE',
+    ],
+  ]) {
+    test(`${transport}: seven is never switched back to when ${name}`, async () => {
+      const setup = scene({ front, others, reads: [[], ['click']] });
+      await withScene(runner, setup, async (s) => {
+        const result = await s.run(['click', s.ref]);
+        assert.ok(!s.state.activated.includes('SEVEN'), JSON.stringify(s.state.activated));
+        if (front === 'OTHER') {
+          assert.equal(result.code, 0, result.stderr);
+          assert.deepEqual(s.state.activated, [own(s), 'OTHER']);
+        } else {
+          assert.equal(result.code, 1);
+          assert.equal(result.stderr, background('click'));
+          assert.deepEqual(s.state.activated, []);
+        }
+      });
+    });
+  }
+
+  test(`${transport}: input aimed at seven's or the vault's tab is refused before anything reaches it`, async () => {
+    const setup = scene({ others: [sevenTab, vaultTab] });
+    await withScene(runner, setup, async (s) => {
+      const before = s.fake.calls.length;
+      for (const tab of ['SEVEN', 'VAULT']) {
+        for (const args of [
+          ['click', s.ref],
+          ['dblclick', s.ref],
+          ['hover', s.ref],
+          ['type', 'secret'],
+          ['press', 'Tab'],
+          ['mousewheel', '0', '100'],
+        ]) {
+          const result = await s.run([...args, '--tab', tab]);
+          assert.equal(result.code, 1, `${args[0]} ${tab}: ${result.stdout}`);
+          assert.match(result.stderr, /^slicc: refused:/, `${args[0]} ${tab}`);
+        }
+      }
+      const reached = s.fake.calls
+        .slice(before)
+        .filter(
+          (call) =>
+            call.method.startsWith('Input.') ||
+            call.method === 'Target.activateTarget' ||
+            call.method === 'Browser.getWindowForTarget' ||
+            (['SEVEN', 'VAULT'].includes(call.target) && call.method !== 'Page.getFrameTree')
+        );
+      assert.deepEqual(reached, []);
+      assert.deepEqual(s.state.modes, []);
+      assert.deepEqual(s.state.activated, []);
     });
   });
 }
