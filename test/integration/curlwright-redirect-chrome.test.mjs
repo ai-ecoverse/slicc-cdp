@@ -85,9 +85,11 @@ for (const transport of ['native', 'wasi']) {
           [
             '--tab',
             targetId,
+            '-X',
+            'post',
             '-d',
             'body',
-            `${base}/hop?statuses=${statuses.join(',')}&host=ordinary`,
+            `${base}/hop?statuses=${statuses.join(',')}&host=ordinary#fragment`,
           ],
           cwd
         );
@@ -102,9 +104,11 @@ for (const transport of ['native', 'wasi']) {
             [
               '--tab',
               targetId,
+              '-X',
+              'post',
               '-d',
               'body',
-              `${base}/hop?statuses=${statuses.join(',')}&host=${host}`,
+              `${base}/hop?statuses=${statuses.join(',')}&host=${host}#fragment`,
             ],
             cwd
           );

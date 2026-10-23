@@ -39,7 +39,7 @@ pub fn fetch_script(request: &PreparedRequest) -> String {
     script.push_str(&reconstruct(&request.body));
     script.push_str("const __url = new URL(");
     script.push_str(&url_json);
-    script.push_str(", location.href).href;const r = await fetch(__url, __init);if (r.type === 'opaqueredirect') return { manualRedirect: true, requestUrl: __url };");
+    script.push_str(", location.href);__url.hash = '';const r = await fetch(__url.href, __init);if (r.type === 'opaqueredirect') return { manualRedirect: true, requestUrl: __url.href };");
     script.push_str(RESPONSE_HANDLING);
     script.push_str("})()");
     script
@@ -203,7 +203,8 @@ fn redirect_metadata(events: &[Value], session: &str, source: &str, method: &str
     let requests: Vec<&Value> = events.iter().filter(|event| {
         event["sessionId"] == session && event["method"] == "Network.requestWillBeSent"
             && event["params"].get("redirectResponse").is_none()
-            && event["params"]["request"]["url"] == source && event["params"]["request"]["method"] == method
+            && event["params"]["request"]["url"] == source
+            && event["params"]["request"]["method"].as_str().is_some_and(|actual| actual.eq_ignore_ascii_case(method))
     }).collect();
     if requests.len() != 1 { return None }
     let id = requests[0]["params"]["requestId"].as_str()?;

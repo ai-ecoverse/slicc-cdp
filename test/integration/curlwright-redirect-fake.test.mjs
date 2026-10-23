@@ -52,8 +52,15 @@ for (const host of ['ordinary', 'seven.sliccy.ai', 'vault.sliccy.ai']) {
             )
               return false;
             const browserFetch = async (url, init) => {
-              let source = url;
+              const parsed = new URL(url);
+              parsed.hash = '';
+              let source = parsed.href;
               let options = { ...init, redirect: 'manual' };
+              const method = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'].includes(
+                options.method.toUpperCase()
+              )
+                ? options.method.toUpperCase()
+                : options.method;
               for (let hop = 0; hop <= 20; hop += 1) {
                 const id = `R${++requestId}`;
                 const actual = new URL(source).hostname.endsWith('sliccy.ai')
@@ -64,7 +71,7 @@ for (const host of ['ordinary', 'seven.sliccy.ai', 'vault.sliccy.ai']) {
                   sessionId: message.sessionId,
                   params: {
                     requestId: id,
-                    request: { url: source, method: options.method, headers: {} },
+                    request: { url: source, method, headers: {} },
                   },
                 });
                 const response = await fetch(actual, options);
@@ -122,7 +129,7 @@ for (const host of ['ordinary', 'seven.sliccy.ai', 'vault.sliccy.ai']) {
         runner = nativeRunner(null, path.resolve('target/debug/curlwright'), backend.url);
         const cwd = await runner.fresh();
         const result = await runner.curl(
-          ['--tab', 'TAB', `${base}/hop?statuses=${statuses.join(',')}`],
+          ['--tab', 'TAB', '-X', 'get', `${base}/hop?statuses=${statuses.join(',')}#fragment`],
           cwd
         );
         assert.equal(hits, 0, 'protected fixture received a redirect request');
