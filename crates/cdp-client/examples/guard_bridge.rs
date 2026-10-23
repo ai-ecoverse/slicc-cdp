@@ -97,9 +97,10 @@ fn completion(value: &Value) -> Option<Result<Value, String>> {
 }
 
 fn poll(cdp: &mut Cdp, pending: &Pending) -> Option<Result<Value, String>> {
-    if superseded(cdp, pending) { return Some(Err(SUPERSEDED.to_string())) }
+    if superseded(cdp, pending) && !cdp.content_blocked(&pending.session) { return Some(Err(SUPERSEDED.to_string())) }
     let expression = format!("JSON.stringify(globalThis[{:?}])", pending.key);
     let result = cdp.call_for("Runtime.evaluate", json!({"expression":expression,"returnByValue":true,"uniqueContextId":pending.document.context}), Some(&pending.session), Duration::from_secs(2));
+    if cdp.content_blocked(&pending.session) && result.is_err() { return Some(result) }
     if superseded(cdp, pending) { return Some(Err(SUPERSEDED.to_string())) }
     match result {
         Ok(value) => {
@@ -127,6 +128,21 @@ fn answer(id: Value, result: Result<Value, String>) {
         Ok(value) => emit(json!({"id":id,"result":value})),
         Err(message) => emit(json!({"id":id,"error":{"message":message}})),
     }
+}
+
+fn drain_navigations(cdp: &mut Cdp, navigations: &mut BTreeMap<u64, (i64, Instant)>, now: Instant, mut reply: impl FnMut(Value, Result<Value, String>)) {
+    let mut finished = Vec::new();
+    for (id, (call, started)) in navigations.iter() {
+        if let Some(result) = cdp.poll_navigation(*call) {
+            reply(json!(id), result);
+            finished.push(*id);
+        } else if now.duration_since(*started) > Duration::from_secs(30) {
+            cdp.cancel_navigation(*call);
+            reply(json!(id), Err("Page.navigate timed out\n".into()));
+            finished.push(*id);
+        }
+    }
+    for id in finished { navigations.remove(&id); }
 }
 
 fn input() -> Box<dyn FnMut() -> Result<String, mpsc::TryRecvError>> {
@@ -180,9 +196,10 @@ fn main() {
     let mut input = input();
     let mut seen = 0;
     let mut pending = BTreeMap::<u64, Pending>::new();
+        let mut navigations = BTreeMap::<u64, (i64, Instant)>::new();
     let mut wait = BUSY;
     loop {
-        let mut busy = !pending.is_empty();
+        let mut busy = !pending.is_empty() || !navigations.is_empty();
         match input() {
             Ok(line) => {
                 busy = true;
@@ -193,6 +210,11 @@ fn main() {
                 let session = message["sessionId"].as_str();
                 if notify && method == "Page.navigate" {
                     answer(message["id"].clone(), cdp.notify(method, params, session).map(|_| json!({})));
+                } else if method == "Page.navigate" {
+                    match cdp.start_navigation(params, session) {
+                        Ok(id) => { navigations.insert(message["id"].as_u64().unwrap(), (id, Instant::now())); }
+                        Err(error) => answer(message["id"].clone(), Err(error)),
+                    }
                 } else if method == "Runtime.evaluate" && params["awaitPromise"] == true {
                     let id = message["id"].as_u64().unwrap();
                     let key = format!("__guard_bridge_{id}");
@@ -246,7 +268,7 @@ fn main() {
             busy = true;
             let headers: BTreeMap<String, String> = paused.headers.into_iter().collect();
             emit(
-                json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"responseHeaders":paused.response_headers.as_ref().map(|headers| headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>()),"request":{"url":paused.url,"method":paused.method,"headers":headers}}}}),
+                json!({"event":{"method":"Fetch.requestPaused","sessionId":paused.session_id,"params":{"requestId":paused.request_id,"networkId":paused.network_id,"frameId":paused.frame_id,"resourceType":paused.resource_type,"responseStatusCode":paused.status,"responseHeaders":paused.response_headers.as_ref().map(|headers| headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>()),"request":{"url":paused.url,"method":paused.method,"headers":headers}}}}),
             );
         }
         for event in &cdp.events()[seen..] {
@@ -254,6 +276,7 @@ fn main() {
         }
         busy |= cdp.events().len() > seen;
         seen = cdp.events().len();
+        drain_navigations(&mut cdp, &mut navigations, Instant::now(), answer);
         wait = if busy { BUSY } else { (wait * 2).min(IDLE) };
         let mut done = Vec::new();
         for (id, evaluation) in &pending {

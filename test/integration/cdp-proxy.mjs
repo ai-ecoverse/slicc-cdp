@@ -80,6 +80,7 @@ export async function cdpProxy(
     before = [],
     holdEvents = () => false,
     responseBarrier = () => null,
+    inbound,
   } = {}
 ) {
   const pending = Object.fromEntries(
@@ -124,7 +125,10 @@ export async function cdpProxy(
       fromClient = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
-        if (message) observe('client', message);
+        if (message) {
+          observe('client', message);
+          inbound?.outbound(message);
+        }
         if (
           delayGuardAttachMs &&
           !delayed &&
@@ -195,12 +199,14 @@ export async function cdpProxy(
       }
     });
     browser.on('data', (chunk) => {
-      if (!upgraded.down) {
-        upgraded.down = true;
-        toClient(chunk);
-        return;
-      }
       fromBrowser = Buffer.concat([fromBrowser, chunk]);
+      if (!upgraded.down) {
+        const end = fromBrowser.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        toClient(fromBrowser.subarray(0, end + 4));
+        fromBrowser = Buffer.from(fromBrowser.subarray(end + 4));
+        upgraded.down = true;
+      }
       const { out, rest } = frames(fromBrowser);
       fromBrowser = Buffer.from(rest);
       for (const frame of out) {
@@ -242,10 +248,14 @@ export async function cdpProxy(
           setTimeout(() => toClient(frame.raw), delayGuardAttachMs);
           continue;
         }
-        toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
+        const deliver = () =>
+          toClient(message ? textFrame(JSON.stringify(transform(message))) : frame.raw);
+        if (inbound) inbound.inbound(message, deliver);
+        else deliver();
       }
     });
     const end = () => {
+      inbound?.close();
       client.destroy();
       browser.destroy();
     };
@@ -263,6 +273,7 @@ export async function cdpProxy(
       for (const release of releases.splice(0)) release();
     },
     close: async () => {
+      inbound?.close();
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
     },
