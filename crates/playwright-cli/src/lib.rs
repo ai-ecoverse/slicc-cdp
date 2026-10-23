@@ -20,11 +20,17 @@ mod session;
 mod snapshot;
 mod spec;
 mod trace;
+mod upgrade;
 mod webmcp;
 mod webmcp_frames;
 mod webmcp_polyfill;
 
 pub use args::Output;
+
+#[cfg(windows)]
+pub fn remove_parked_binary() {
+    upgrade::remove_parked();
+}
 
 pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     execute_with_session(argv, cdp_env, None)
@@ -78,6 +84,9 @@ pub fn execute_in(
     }
     if let Err(output) = args::validate(&invocation, spec) {
         return output;
+    }
+    if command == "upgrade" || command == "update" {
+        return upgrade::run(&invocation);
     }
     if command == "list" {
         return discover::run(&invocation, cdp_env);
