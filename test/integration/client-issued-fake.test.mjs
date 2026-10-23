@@ -295,22 +295,14 @@ async function start(page, path, options = {}) {
 }
 
 for (const host of PROTECTED) {
-  test(`fake: a url override into ${host} is refused before it is sent`, async (t) => {
-    const page = await world(t);
-    const { done, requestId } = await start(page, '');
-    await assert.rejects(
-      page.send('Fetch.continueRequest', { requestId, url: `http://${host}/protected` }),
-      /slicc: refused:/
-    );
-    await page.send('Fetch.failRequest', { requestId, errorReason: 'Failed' });
-    assert.deepEqual(await done, { failed: 'Failed' });
-    assert.deepEqual(page.hits, []);
-  });
-
   for (const chain of CHAINS) {
-    test(`fake: an ordinary url override that ${chain.join(' → ')}s into ${host} is refused at the hop`, async (t) => {
+    test(`fake: url overrides into ${host}, direct or by ${chain.join(' → ')}, are refused before they are sent`, async (t) => {
       const page = await world(t);
       const { done, requestId } = await start(page, '');
+      await assert.rejects(
+        page.send('Fetch.continueRequest', { requestId, url: `http://${host}/protected` }),
+        /slicc: refused:/
+      );
       await page.send('Fetch.continueRequest', {
         requestId,
         url: `${page.base}/hop?statuses=${chain.join(',')}&host=${host}`,

@@ -178,15 +178,17 @@ impl Cdp {
         for id in ids { self.issued.chains.insert((session.to_string(), id)); }
     }
 
-    pub(super) fn issue(&mut self, method: &str, params: &Value, session: Option<&str>, wait: bool) -> Result<(), String> {
-        let session = session.ok_or_else(|| self.refusal())?;
+    pub(super) fn issue(&mut self, params: &Value, session: &str, wait: bool) -> Result<(), String> {
         self.arm_fetch(session, wait)?;
-        if method == "Network.replayXHR" {
-            let url = self.replay_url(params, session).ok_or_else(|| self.refusal())?;
-            self.issued.replays.push((session.to_string(), url, Instant::now() + REPLAY_WINDOW));
-        } else {
-            self.track_issued(session, &crate::shield::request_key(params).unwrap_or_default());
-        }
+        self.track_issued(session, &crate::shield::request_key(params).unwrap_or_default());
+        Ok(())
+    }
+
+    pub(super) fn replay(&mut self, params: &Value, session: Option<&str>) -> Result<(), String> {
+        let session = session.ok_or_else(|| self.refusal())?;
+        let url = self.replay_url(params, session).ok_or_else(|| self.refusal())?;
+        self.arm_fetch(session, true)?;
+        self.issued.replays.push((session.to_string(), url, Instant::now() + REPLAY_WINDOW));
         Ok(())
     }
 
@@ -306,6 +308,8 @@ impl Cdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("client_issued_test.rs");
 
     #[test]
     fn wildcards_follow_chrome_match_pattern() {
