@@ -106,8 +106,12 @@ pub fn global_help() -> String {
         "Recording:".to_string(),
         row("recording-start", "start recording user actions"),
         row("recording-stop", "stop recording user actions and print them as playwright code"),
-        row("record", "alias of recording-start"),
-        row("stop-recording", "alias of recording-stop"),
+        String::new(),
+        "HAR recording (SLICC):".to_string(),
+        row("har-start <file>", "hold a guarded HAR 1.2 recording"),
+        row("har-stop", "stop this session's HAR holder"),
+        row("record [url]", "alias of har-start; open a new tab, save to /recordings/<id>/"),
+        row("stop-recording [id]", "alias of har-stop"),
         String::new(),
         "Browsers:".to_string(),
         row(
@@ -233,7 +237,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("--method <method>", "request method, defaults to GET"),
             ],
         ),
-        "recording-start" | "record" => page(
+        "recording-start" => page(
             &format!("{name} "),
             &[
                 "Start recording user actions",
@@ -244,12 +248,30 @@ fn implemented_page(name: &str) -> Option<String> {
             &[],
             &[("--tab <targetId>", "tab to record")],
         ),
-        "recording-stop" | "stop-recording" => page(
+        "recording-stop" => page(
             &format!("{name} "),
             &[
                 "Stop recording user actions and print them as Playwright code",
                 "Stops the recording-start holder of this session and prints the actions it recorded.",
             ],
+            &[],
+            &[],
+        ),
+        "har-start" | "record" => page(
+            if name == "record" { "record [url] [--filter=<glob>]" } else { "har-start <file>" },
+            &[
+                "Record ordinary network traffic as HAR 1.2 (SLICC extension)",
+                "A foreground holder: stdin EOF or har-stop ends recording. JSON ready, paused, resumed, checkpoint and stopped events include recordingId and path.",
+                "Writes atomically on main-frame navigation and stop. Capture pauses on protected or unknown documents and resumes on ordinary documents.",
+                "Protected and unknown requests and redirect hops are excluded; protected redirect carriers are redacted. Bodies are omitted by default.",
+                "record opens a new tab (about:blank by default) and writes /recordings/<recordingId>/recording.har. Filters are URL globs, never JavaScript.",
+            ],
+            &[("<file>", "HAR output file (har-start)"), ("[url]", "ordinary http(s) URL to open in a new tab (record)")],
+            &[("--tab <targetId>", "existing tab to capture (har-start)"), ("--url-filter <glob>", "URL glob to include (record: --filter=<glob>)"), ("--content <omit|embed>", "omit bodies (default), or embed only on verified ordinary documents"), ("--mode <full|minimal>", "full timing metadata (default), or replay-oriented minimal metadata"), ("--include-credentials", "include ordinary credential headers; protected traffic remains excluded")],
+        ),
+        "har-stop" | "stop-recording" => page(
+            if name == "stop-recording" { "stop-recording [recordingId]" } else { "har-stop" },
+            &["Stop this session's HAR foreground holder", "Signals the holder, waits for its atomic final write, and prints JSON with recordingId and path. An optional recordingId must match this session."],
             &[],
             &[],
         ),

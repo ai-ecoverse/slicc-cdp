@@ -12,6 +12,7 @@ mod dialog_holder;
 #[cfg(test)]
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
+mod har;
 mod help;
 mod input;
 mod keys;
@@ -110,6 +111,12 @@ pub fn execute_in(
     }
     if command == "network-state-set" {
         return page_tools::network_state_set(&invocation);
+    }
+    if let Some(message) = har::precheck(&invocation) {
+        return Output::err(message);
+    }
+    if matches!(command.as_str(), "har-stop" | "stop-recording") {
+        return har::stop(&invocation);
     }
     if recording::is_stop(&command) {
         return recording::stop(&invocation);

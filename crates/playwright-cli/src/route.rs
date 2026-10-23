@@ -500,12 +500,12 @@ enum Tok {
     Group(Vec<Vec<Tok>>),
 }
 
-struct Glob {
+pub(crate) struct Glob {
     tokens: Vec<Tok>,
 }
 
 impl Glob {
-    fn parse(glob: &str) -> Result<Self, String> {
+    pub(crate) fn parse(glob: &str) -> Result<Self, String> {
         let chars: Vec<char> = glob.chars().collect();
         let mut top: Vec<Tok> = Vec::new();
         let mut group: Option<Vec<Vec<Tok>>> = None;
@@ -576,7 +576,7 @@ impl Glob {
         Ok(Self { tokens: top })
     }
 
-    fn matches(&self, text: &str) -> bool {
+    pub(crate) fn matches(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
         matches_at(&self.tokens, &chars)
     }

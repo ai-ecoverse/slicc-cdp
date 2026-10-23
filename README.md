@@ -155,7 +155,7 @@ The pinned package and `esbuild@0.25.10` produce the committed bytes. Keep the u
 
 ## Recording
 
-`recording-start` and `recording-stop` are Microsoft's commands of the same names; `record` and `stop-recording` are aliases. Microsoft keeps the browser in a daemon, so its `recording-start` returns at once. There is no daemon here: `recording-start` is a foreground holder, like `webmcp-polyfill`. It records until its stdin closes or `recording-stop` runs in another terminal with the same session.
+`recording-start` and `recording-stop` are Microsoft's user-action recording commands. `record` and `stop-recording` are SLICC HAR aliases, not aliases for these commands. Microsoft keeps the browser in a daemon, so its `recording-start` returns at once. There is no daemon here: `recording-start` is a foreground holder, like `webmcp-polyfill`. It records until its stdin closes or `recording-stop` runs in another terminal with the same session.
 
 ```sh
 playwright-cli recording-start --tab <targetId>
@@ -175,7 +175,27 @@ Deliberate differences from Microsoft's recorder:
 - Only the selected tab's main frame is recorded: no iframes, popups (`page1`), dialog, download or popup signals, and no assertions.
 - Events are observed, not intercepted: there is no recorder overlay, and the locator generator is a smaller version of Playwright's.
 - The code is always JavaScript; the `codegen` language setting does not exist here.
-- `--tab <targetId>` picks the tab. The old SLICC placeholders `record [url] --filter` and `stop-recording <recordingId>` (HAR recording) are gone; the names remain as argument-free aliases.
+- `--tab <targetId>` picks the tab. SLICC's `record [url] [--filter=<glob>]` and `stop-recording [recordingId]` record HAR traffic instead, as described below. They do not record user actions.
+
+### HAR recording (SLICC extension)
+
+```sh
+playwright-cli -s capture har-start --tab <targetId> --url-filter '**/api/**' --content omit --mode full traffic.har
+playwright-cli -s capture har-stop
+```
+
+`har-start [--tab <id>] [--url-filter <glob>] [--content omit|embed] [--mode full|minimal] [--include-credentials] <file>` is a foreground holder, not a daemon. Keep stdin open; stdin EOF or `har-stop` in another terminal with the same working directory and session ends it. JSON events (`ready`, `paused`, `resumed`, `checkpoint`, `stopped`) include `recordingId`, the tab, output path and entry count. HAR 1.2 is atomically checkpointed on main-frame navigation and written on stop, for Chrome DevTools and Playwright `routeFromHAR`. The snapshots are cumulative; the supplied file is replaced atomically, not appended. The archive is private (0600 on native Unix and WASI), but existing output directories and their parents keep their original permissions. Session control files remain in the private config directory. A killed holder's stale lease is reclaimed automatically after five seconds; an active holder's lease is never removed by a regular stop command.
+
+Bodies, including request post data, are omitted by default. `--content embed` enables body capture only while the current document and response are verified ordinary. `--mode minimal` uses zero replay timings; `full` retains capture duration. Cookie, Set-Cookie, Authorization and Proxy-Authorization headers are stripped and cookies arrays are empty by default. `--include-credentials` permits ordinary credential headers; it never admits protected traffic. Protected or unclassifiable URLs, protected schemes and their redirect hops are excluded. An ordinary redirect response into a protected destination can remain as its own entry with redirect carriers redacted by the guard; no destination entry or body is retained. Capture pauses on protected or unknown documents and reattaches only after a fresh guarded verification of an ordinary page. Each admitted request retains its issuing document URL and loader. Completed ordinary metadata survives a later navigation, but body reads still require the current document to verify. Paused fetches and child-document traffic are never retained. An ordinary main-document transition can be quarantined while paused, but enters the HAR only after its issuing loader verifies as the current ordinary document.
+
+For the slicc6 skill:
+
+```sh
+playwright-cli -s capture record https://example.com --filter='**/api/**'
+playwright-cli -s capture stop-recording <recordingId>
+```
+
+`record [url] [--filter=<glob>] [--content omit|embed] [--mode full|minimal] [--include-credentials]` opens a new tab (default `about:blank`), attaches before navigating, and writes `/recordings/<recordingId>/recording.har`. Its JSON `ready` event prints the recordingId and path. The directory must be writable. The filter is now a URL glob; slicc6's arbitrary JavaScript filter functions are rejected with an explanatory error. `stop-recording [recordingId]` aliases `har-stop`; an optional ID must belong to the same session. The Microsoft action commands remain `recording-start` and `recording-stop`.
 - Microsoft's `video-*` and `tracing-*` commands are not offered: `Page.startScreencast` and `Tracing.start` keep capturing across navigations, including into protected documents, and the guard refuses both.
 
 ## Develop
