@@ -55,6 +55,12 @@ The cookie commands, `cookie-list`, `cookie-get`, `cookie-set`, `cookie-delete` 
 
 Saved sessions never contain cookie values or value hashes. They retain only cookie names and scopes (domain and path), with Cookie and Set-Cookie header values redacted. `request-headers`, `response-headers` and `request` look up those scopes in the live guarded cookie jar and label any values they show as current jar values, not necessarily what was sent at that time. Removed and protected cookies stay `[redacted]`. A header with no retained scopes can show current cookies applicable to its URL only when that URL cannot share a protected parent-domain cookie. Cookie-bearing console messages may be shown live but are not saved.
 
+The web storage commands, `localstorage-list`, `-get`, `-set`, `-delete` and `-clear` and the same five `sessionstorage-` commands, work like Microsoft's and print ordinary values as they are, with terminal control characters escaped. They run in a fresh isolated world of the tab's main frame through the guarded client, so a tab whose current document is protected, unverified, an error page or opaque is refused. Seven's and the vault's localStorage and sessionStorage are never read or written. `--tab` picks the tab; otherwise the current tab is used.
+
+`state-save [filename]` writes Microsoft's storageState JSON: `cookies` in Playwright's cookie shape and `origins` with each origin's `localStorage`. Without a filename it writes `.playwright-cli/storage-state-<timestamp>.json`. **The file is a credential.** It holds live cookie values, including HttpOnly session cookies, and localStorage, where sites often keep login tokens, so anyone who reads it can sign in as you on those sites. On Unix it is created owner-only (0600). Keep it out of version control, chat transcripts and shared directories, and delete it when you're done. It never holds seven's or the vault's cookies (parent-domain and partitioned ones included) or their origins, and like Microsoft's it never holds sessionStorage. Deviations: the origins are those of the open ordinary tabs, read in place, not every origin the browser context has visited; a tab the guard can't verify is skipped. An absolute filename prints as given.
+
+`state-load <filename>` checks the whole file before it changes anything. A protected, malformed or non-http(s) cookie scope or origin refuses the file, and so do IndexedDB, OPFS and credential entries, which are not restored. It then clears the ordinary cookies (protected ones stay) and sets the file's cookies. For each origin in the file it opens one temporary background tab, answers the tab's requests to those origins with an empty page through guarded interception, and, as Microsoft does, unregisters that origin's service workers, deletes its IndexedDB databases, clears its localStorage and writes the file's localStorage. The tab is then closed. Deviations: the HTTP cache is not cleared, because that would clear seven's, and origins that are not in the file keep their storage. Errors from these commands go to stderr as `Error: ...` and exit 1.
+
 ## WebMCP
 
 `webmcp-list` and `webmcp-call` prefer native WebMCP, including declarative tools when the browser supports them. For an app that registers JavaScript tools without native WebMCP, keep a dedicated holder running:
@@ -95,6 +101,31 @@ The holder retains its observing CDP session. A `dialog-opened` event supplies `
 `id` and `dialogId` are unsigned integers. Each request gets a reply event correlated by `id`: `handled`, `no-dialog`, `stale-dialog`, `dialog-refused` or `invalid-request`. A request with no observed open dialog gets `no-dialog`; dialogs opened before this holder attached are still unanswerable. `dialog-closed` revokes the observed ID. Only current verified ordinary main-frame ownership can be answered; protected, unknown, opaque, stale or subframe ownership stays refused. Closing stdin emits `stopped` and detaches.
 
 `ready` contains `target`, `loaderId`, `loaderIdSource` and `status`. The initial `loaderId` can be null (`unavailable`, `observing`): the holder never invents one or queries a frozen renderer. A verified ordinary main-frame `frameNavigated` event supplies the loader ID in `document-ready` (`frame-navigated`, `document-verified`). Dialog ownership is independently reverified before every answer; a loader ID is not permission to handle a dialog. No dialog message, URL or prompt answer is echoed in events.
+
+## Recording
+
+`recording-start` and `recording-stop` are Microsoft's commands of the same names; `record` and `stop-recording` are aliases. Microsoft keeps the browser in a daemon, so its `recording-start` returns at once. There is no daemon here: `recording-start` is a foreground holder, like `webmcp-polyfill`. It records until its stdin closes or `recording-stop` runs in another terminal with the same session.
+
+```sh
+playwright-cli recording-start --tab <targetId>
+playwright-cli recording-stop
+```
+
+The holder prints one JSON event per line: `ready` with the tab and `loaderId`, `paused` and `resumed` around documents it may not record, and `stopped` with a `reason` (`stdin`, `stop`, `closed` or `refused`) and the recorded `actions`. `recording-stop` prints Microsoft's result: `### Result`, `Recording stopped. Recorded actions:` and the actions in a `js` code block, or `Recording stopped. No actions were recorded.` Without a running holder it prints Microsoft's `Error: No recording in progress, use browser_start_recording to start one.` on stderr and exits 1. A second `recording-start` while one runs prints `Error: Recording is already in progress.` and exits 1.
+
+The recorder writes Playwright code for trusted clicks, double clicks, right and middle clicks, fills, key presses, checks, selects and file choices in the main frame. A new document is recorded as `page.goto` unless a click, press or fill came less than five seconds before it. Locators prefer a test id, then role and accessible name (from Playwright's aria code in `aria-snapshot.js`), placeholder, label, text, role alone, a stable id, and finally `nth` or a CSS path.
+
+The recorder runs in an isolated world that the guarded client installs only after the guard has verified the current main-frame document, and its events are read through guarded `Runtime.evaluate` calls pinned to that context. It uses no binding, init script, screencast or tracing. When the holder stops it removes the recorder's listeners, each start replaces any earlier recorder on that document, and a recorder that nobody drains for five seconds drops what it sees, so input between recordings is never captured. Nothing is installed in or read from seven's, the vault's, protected, unverified or unknown documents: capture pauses on an unverified document, and recording stops with `reason: "refused"` and exit 1 when the tab turns protected. Actions recorded before that stay available to `recording-stop`. Frames are not recorded, so a protected iframe is never read. A `goto` URL is redacted like every other URL unless `--full-urls` is given. The holder keeps the actions in memory; when it stops for `recording-stop`, a closed tab or a refusal, the result waits in a 0600 file next to the saved session until `recording-stop` reads and deletes it.
+
+Deliberate differences from Microsoft's recorder:
+
+- `recording-start` holds the terminal and prints JSON events instead of `### Result` and returning.
+- `recording-stop` prints no `### Page` or `### Snapshot` section, like the other commands here.
+- Only the selected tab's main frame is recorded: no iframes, popups (`page1`), dialog, download or popup signals, and no assertions.
+- Events are observed, not intercepted: there is no recorder overlay, and the locator generator is a smaller version of Playwright's.
+- The code is always JavaScript; the `codegen` language setting does not exist here.
+- `--tab <targetId>` picks the tab. The old SLICC placeholders `record [url] --filter` and `stop-recording <recordingId>` (HAR recording) are gone; the names remain as argument-free aliases.
+- Microsoft's `video-*` and `tracing-*` commands are not offered: `Page.startScreencast` and `Tracing.start` keep capturing across navigations, including into protected documents, and the guard refuses both.
 
 ## Develop
 

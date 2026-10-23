@@ -58,11 +58,23 @@ pub fn global_help() -> String {
         row("tab-select <index>", "select a browser tab"),
         String::new(),
         "Storage:".to_string(),
+        row("state-load <filename>", "loads browser storage (authentication) state from a file"),
+        row("state-save [filename]", "saves the current storage (authentication) state to a file"),
         row("cookie-list", "list all cookies (optionally filtered by domain/path)"),
         row("cookie-get <name>", "get a specific cookie by name"),
         row("cookie-set <name> <value>", "set a cookie with optional flags"),
         row("cookie-delete <name>", "delete a specific cookie"),
         row("cookie-clear", "clear all cookies"),
+        row("localstorage-list", "list all localstorage key-value pairs"),
+        row("localstorage-get <key>", "get a localstorage item by key"),
+        "  localstorage-set <key> <value> set a localstorage item".to_string(),
+        row("localstorage-delete <key>", "delete a localstorage item"),
+        row("localstorage-clear", "clear all localstorage"),
+        row("sessionstorage-list", "list all sessionstorage key-value pairs"),
+        row("sessionstorage-get <key>", "get a sessionstorage item by key"),
+        "  sessionstorage-set <key> <value> set a sessionstorage item".to_string(),
+        row("sessionstorage-delete <key>", "delete a sessionstorage item"),
+        row("sessionstorage-clear", "clear all sessionstorage"),
         String::new(),
         "Console and network:".to_string(),
         row("console [min-level]", "list console messages"),
@@ -75,6 +87,12 @@ pub fn global_help() -> String {
         row("route <pattern>", "mock network requests matching a url pattern"),
         row("route-list", "list all active network routes"),
         row("unroute [pattern]", "remove routes matching a pattern (or all routes)"),
+        String::new(),
+        "Recording:".to_string(),
+        row("recording-start", "start recording user actions"),
+        row("recording-stop", "stop recording user actions and print them as playwright code"),
+        row("record", "alias of recording-start"),
+        row("stop-recording", "alias of recording-stop"),
         String::new(),
         "Browsers:".to_string(),
         row(
@@ -148,6 +166,26 @@ pub fn command_help(spec: &Spec) -> String {
 fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
         "upgrade" | "update" => crate::upgrade::usage(name),
+        "recording-start" | "record" => page(
+            &format!("{name} "),
+            &[
+                "Start recording user actions",
+                "A foreground holder: it records until stdin closes or recording-stop runs in another terminal.",
+                "Stdout is JSON events: ready, paused, resumed, and stopped with the recorded actions.",
+                "Only verified ordinary main-frame documents are recorded. Capture pauses on unverified documents and stops when the tab turns protected.",
+            ],
+            &[],
+            &[("--tab <targetId>", "tab to record")],
+        ),
+        "recording-stop" | "stop-recording" => page(
+            &format!("{name} "),
+            &[
+                "Stop recording user actions and print them as Playwright code",
+                "Stops the recording-start holder of this session and prints the actions it recorded.",
+            ],
+            &[],
+            &[],
+        ),
         "open" => page(
             "open [url]",
             &[
@@ -555,6 +593,38 @@ fn implemented_page(name: &str) -> Option<String> {
             &[],
         ),
         "cookie-clear" => "playwright-cli cookie-clear \n\nClear all cookies\n\n".to_string(),
+        "localstorage-list" => "playwright-cli localstorage-list \n\nList all localStorage key-value pairs\n\n".to_string(),
+        "localstorage-get" => page("localstorage-get <key>", &["Get a localStorage item by key"], &[("<key>", "key to get")], &[]),
+        "localstorage-set" => page(
+            "localstorage-set <key> <value>",
+            &["Set a localStorage item"],
+            &[("<key>", "key to set"), ("<value>", "value to set")],
+            &[],
+        ),
+        "localstorage-delete" => page("localstorage-delete <key>", &["Delete a localStorage item"], &[("<key>", "key to delete")], &[]),
+        "localstorage-clear" => "playwright-cli localstorage-clear \n\nClear all localStorage\n\n".to_string(),
+        "sessionstorage-list" => "playwright-cli sessionstorage-list \n\nList all sessionStorage key-value pairs\n\n".to_string(),
+        "sessionstorage-get" => page("sessionstorage-get <key>", &["Get a sessionStorage item by key"], &[("<key>", "key to get")], &[]),
+        "sessionstorage-set" => page(
+            "sessionstorage-set <key> <value>",
+            &["Set a sessionStorage item"],
+            &[("<key>", "key to set"), ("<value>", "value to set")],
+            &[],
+        ),
+        "sessionstorage-delete" => page("sessionstorage-delete <key>", &["Delete a sessionStorage item"], &[("<key>", "key to delete")], &[]),
+        "sessionstorage-clear" => "playwright-cli sessionstorage-clear \n\nClear all sessionStorage\n\n".to_string(),
+        "state-save" => page(
+            "state-save [filename]",
+            &["Saves the current storage (authentication) state to a file"],
+            &[("[filename]", "file name to save the storage state to.")],
+            &[],
+        ),
+        "state-load" => page(
+            "state-load <filename>",
+            &["Loads browser storage (authentication) state from a file"],
+            &[("<filename>", "file name to load the storage state from.")],
+            &[],
+        ),
         "unroute" => page(
             "unroute [pattern]",
             &["Remove routes matching a pattern (or all routes)"],
@@ -743,7 +813,6 @@ fn arg_optional(spec: &Spec, index: usize) -> bool {
             | ("console", 0)
             | ("dialog-accept", 0)
             | ("unroute", 0)
-            | ("record", 0)
             | ("highlight", 0)
     )
 }

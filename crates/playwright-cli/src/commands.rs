@@ -22,6 +22,9 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = cookies::precheck(command, invocation) {
         return Output::err(message);
     }
+    if let Some(message) = crate::storage::precheck(command, invocation) {
+        return Output::err(message);
+    }
     if let Some(message) = launch::reject_wasm_flags(command, &invocation.flags) {
         return Output::err(message);
     }
@@ -159,8 +162,10 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
         "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
+        _ if crate::recording::is_start(command) => crate::recording::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
+        _ if crate::storage::is_command(command) => crate::storage::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
         "go-forward" => cmd_go_forward(&mut cdp, &mut state, invocation, &mut report),
