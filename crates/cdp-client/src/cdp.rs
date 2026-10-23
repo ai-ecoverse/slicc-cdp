@@ -945,7 +945,7 @@ impl Cdp {
             let left = budget.saturating_duration_since(Instant::now());
             if !left.is_zero() {
                 let epoch = self.frame_epoch;
-                if let Ok(tree) = self.raw_reply("Page.getFrameTree", json!({}), Some(&session), left.min(OPTIONAL_STEP)) {
+                if let Ok(tree) = self.raw_exchange("Page.getFrameTree", json!({}), Some(&session), left.min(OPTIONAL_STEP)) {
                     if self.tree_current(&tree, epoch) {
                         self.record_frames(&tree, &session);
                     }
@@ -1691,7 +1691,7 @@ impl Cdp {
         timeout: Duration,
     ) -> Result<Value, String> {
         let frame_epoch = self.frame_epoch;
-        let result = self.raw_reply(method, params, session_id, timeout)?;
+        let result = self.raw_exchange(method, params, session_id, timeout)?;
         if method == "Page.getFrameTree" {
             if !self.tree_current(&result, frame_epoch) {
                 return Err(self.refusal());
@@ -1701,7 +1701,7 @@ impl Cdp {
         Ok(result)
     }
 
-    fn raw_reply(
+    fn raw_exchange(
         &mut self,
         method: &str,
         params: Value,
@@ -1710,13 +1710,13 @@ impl Cdp {
     ) -> Result<Value, String> {
         let id = self.send(method, params, session_id)?;
         self.waiting_calls.insert(id);
-        let result = self.raw_reply(method, id, session_id, timeout, frame_epoch);
+        let result = self.raw_reply(method, id, session_id, timeout);
         self.waiting_calls.remove(&id);
         self.call_replies.remove(&id);
         result
     }
 
-    fn raw_reply(&mut self, method: &str, id: i64, session_id: Option<&str>, timeout: Duration, frame_epoch: u64) -> Result<Value, String> {
+    fn raw_reply(&mut self, method: &str, id: i64, session_id: Option<&str>, timeout: Duration) -> Result<Value, String> {
         let deadline = Instant::now() + timeout;
         let was_blocked = session_id.is_some_and(|session| self.blocked.contains(session));
         loop {
