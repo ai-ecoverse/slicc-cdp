@@ -75,6 +75,17 @@ impl Protected {
         self.judge_url(text, false)
     }
 
+    pub fn resource_key(&self, text: &str) -> Option<String> {
+        let mut url = self.unwrap(parse(text)).map(|url| self.rewrite_about(url))?;
+        url.set_username("").ok()?;
+        url.set_password(None).ok()?;
+        url.set_query(None);
+        url.set_fragment(None);
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(if path.is_empty() { "/" } else { &path });
+        Some(url.to_string())
+    }
+
     pub fn redaction_schemes(&self) -> impl Iterator<Item = &str> {
         self.rules.schemes.iter()
             .chain(&self.rules.protected_schemes)

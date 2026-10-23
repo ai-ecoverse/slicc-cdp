@@ -4,11 +4,263 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
+import { skipReason } from '@ai-ecoverse/slicc-browsers/guard-driver.mjs';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
 import { launchBrowser, rawSocket } from './browser.mjs';
 import { requireChrome } from './chrome-policy.mjs';
+import { acquire, cleanup, cleanupGrace, deadline, normalizeError } from './cleanup.mjs';
+import { recordedClient, requireRedirectRegistration } from './guard-c2-support.mjs';
 import { guarded, observer } from './guard-client.mjs';
 import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
+import { inboundClients } from './inbound-clients.mjs';
+import { isExpectedX1Failure150, recordX1Client, x1Disposition, x1Privacy } from './x1-known.mjs';
+
+const { containsSecret } = await import(
+  new URL('./redirect-secret.mjs', import.meta.resolve('@ai-ecoverse/slicc-browsers/package.json'))
+    .href
+);
+
+export const expectedBfcacheFailure477 = new Set([
+  'C8.protected-bfcache-restore',
+  'C8.protected-bfcache-restore.history',
+]);
+export const expectedBfcacheFailureReason = 'slicc-cdp#477';
+
+export function containsMarkerToken(value, marker) {
+  const pattern = new RegExp(
+    `(^|[^A-Za-z0-9_-])${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[^A-Za-z0-9_-])`
+  );
+  const seen = new Set();
+  const objects = new Set();
+  const visit = (item, depth = 0) => {
+    if (item && typeof item === 'object') {
+      if (objects.has(item)) return false;
+      objects.add(item);
+      return Object.values(item).some((field) => visit(field, depth));
+    }
+    if (typeof item !== 'string') return false;
+    let logical = item;
+    for (let pass = 0; pass < 8; pass++) {
+      const decoded = logical.replace(/%([0-9a-f]{2})|\\u([0-9a-f]{4})/gi, (_, percent, unicode) =>
+        String.fromCharCode(parseInt(percent ?? unicode, 16))
+      );
+      if (decoded === logical) break;
+      logical = decoded;
+    }
+    if (pattern.test(logical)) return true;
+    const key = `${depth}:${item}`;
+    if (depth >= 8 || seen.has(key)) return false;
+    seen.add(key);
+    const decoded = [];
+    try {
+      decoded.push(decodeURIComponent(item));
+    } catch {}
+    try {
+      decoded.push(JSON.parse(item));
+    } catch {}
+    try {
+      decoded.push(JSON.parse(`"${item}"`));
+    } catch {}
+    for (const [chunk] of item.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g)) {
+      const normalized = chunk.replaceAll('-', '+').replaceAll('_', '/').replace(/=+$/, '');
+      for (let offset = 0; offset < 4; offset++)
+        decoded.push(Buffer.from(normalized.slice(offset), 'base64').toString('utf8'));
+    }
+    return decoded.some((candidate) => candidate !== item && visit(candidate, depth + 1));
+  };
+  return visit(value);
+}
+
+export function bfcachePrivacy(row, messages) {
+  const url = row.evidence?.guarded?.restore?.seed?.protectedURL;
+  if (typeof url !== 'string' || !Array.isArray(messages) || !messages.length)
+    return { measured: false };
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { measured: false };
+  }
+  const tag = parsed.searchParams.get('n');
+  if (!tag) return { measured: false };
+  return {
+    measured: true,
+    markerExposed: containsMarkerToken(messages, `bfcache-marker-${tag}`),
+    ordinaryBMarkerObserved: containsMarkerToken(messages, `bfcache-marker-${tag}-b`),
+    upstreamMarkerSubstring: containsSecret(messages, `bfcache-marker-${tag}`),
+    markerIdentity: 'whole-token',
+    auditDifference:
+      !containsMarkerToken(messages, `bfcache-marker-${tag}`) &&
+      containsSecret(messages, `bfcache-marker-${tag}`) &&
+      containsMarkerToken(messages, `bfcache-marker-${tag}-b`)
+        ? 'upstream substring matches the public ordinary-B marker; no whole P marker token delivered'
+        : null,
+    protectedPathExposed:
+      containsSecret(messages, `${parsed.origin}${parsed.pathname}`) ||
+      containsSecret(messages, `${parsed.host}${parsed.pathname}`) ||
+      containsMarkerToken(messages, `${parsed.pathname}${parsed.search}`),
+  };
+}
+
+export function bfcacheScreenshotExposed(row) {
+  return (
+    row.evidence?.guarded?.restore?.probes?.some(
+      (probe) =>
+        probe.protectedCurrent !== false &&
+        probe.method === 'Page.captureScreenshot' &&
+        probe.reply?.ok &&
+        probe.reply?.result?.data
+    ) === true
+  );
+}
+
+export function historyRepliesProvenOrdinaryB(restore) {
+  const url = restore?.seed?.ordinaryAnswer?.result?.frameTree?.frame?.url;
+  const protectedURL = restore?.seed?.protectedURL;
+  if (typeof url !== 'string' || typeof protectedURL !== 'string') return false;
+  let ordinary;
+  let protectedPage;
+  try {
+    ordinary = new URL(url);
+    protectedPage = new URL(protectedURL);
+  } catch {
+    return false;
+  }
+  const tag = protectedPage.searchParams.get('n');
+  if (
+    !tag ||
+    ordinary.origin === protectedPage.origin ||
+    ordinary.pathname !== '/bfcache' ||
+    ordinary.searchParams.get('n') !== `${tag}-b`
+  )
+    return false;
+  const marker = `bfcache-marker-${tag}-b`;
+  const isB = (state) =>
+    state?.origin === ordinary.origin &&
+    state.marker === marker &&
+    state.stored === marker &&
+    state.persisted === false;
+  if (!isB(restore.beforeRelease) || !isB(restore.sideEffect)) return false;
+  if (
+    !Array.isArray(restore.probes) ||
+    !restore.probes.length ||
+    restore.probes.some((probe) => probe.protectedCurrent !== false)
+  )
+    return false;
+  const answered = restore.probes.filter((probe) => probe.outcome === 'answered');
+  const required = [
+    'Runtime.evaluate',
+    'Runtime.callFunctionOn',
+    'DOM.getDocument',
+    'Accessibility.getFullAXTree',
+    'Page.captureScreenshot',
+  ];
+  if (required.some((method) => !answered.some((probe) => probe.method === method))) return false;
+  return answered.every((probe) => {
+    if (!probe.reply?.ok) return false;
+    const result = probe.reply.result;
+    if (probe.method === 'Page.captureScreenshot')
+      return (
+        typeof result?.data === 'string' &&
+        result.data.length > 0 &&
+        restore.screenshotProof?.url === url &&
+        restore.screenshotProof.reply?.ok === true &&
+        result.data === restore.screenshotProof.reply.result?.data
+      );
+    if (probe.method === 'DOM.getDocument') return result?.root?.documentURL === url;
+    if (probe.method === 'Accessibility.getFullAXTree')
+      return (
+        Array.isArray(result?.nodes) && result.nodes.some((node) => node.name?.value === marker)
+      );
+    if (['Runtime.evaluate', 'Runtime.callFunctionOn'].includes(probe.method)) {
+      let state;
+      try {
+        state = JSON.parse(result?.result?.value);
+      } catch {
+        return false;
+      }
+      return state?.origin === ordinary.origin && state.marker === marker;
+    }
+    return probe.method === 'Input.dispatchKeyEvent';
+  });
+}
+
+export function isExpectedBfcacheHistoryFailure477(row) {
+  const restore = row.evidence?.guarded?.restore;
+  const observation = row.observations?.guarded;
+  const audit = row.guardedPrivacy;
+  return (
+    row.id === 'C8.protected-bfcache-restore.history' &&
+    ['seven', 'vault'].includes(row.target) &&
+    ['prompt', 'lagging'].includes(row.variant) &&
+    row.control === 'pass' &&
+    row.guarded === 'fail' &&
+    row.live === 'pass' &&
+    observation?.markerHidden === false &&
+    observation.originHidden === true &&
+    observation.restoredObserved === 'incomplete' &&
+    observation.sideEffectAbsent === 'incomplete' &&
+    observation.probesRefusedOrUnforwarded === false &&
+    observation.sessionLive === true &&
+    restore?.trigger?.ok === false &&
+    restore.trigger.error?.message === 'no answer' &&
+    restore.delay?.acknowledged === true &&
+    restore.delay.seeding?.protectedObserved === true &&
+    restore.delay.seeding?.ordinaryObserved === true &&
+    restore.delay.release?.ok === true &&
+    restore.delay.release.result?.delayedEvents === 0 &&
+    restore.restoreAt === undefined &&
+    audit?.measured === true &&
+    audit.markerIdentity === 'whole-token' &&
+    audit.markerExposed === false &&
+    audit.protectedPathExposed === false &&
+    audit.upstreamMarkerSubstring === true &&
+    audit.ordinaryBMarkerObserved === true &&
+    typeof audit.auditDifference === 'string' &&
+    audit.auditDifference.length > 0 &&
+    historyRepliesProvenOrdinaryB(restore)
+  );
+}
+
+export function isExpectedBfcacheFailure477(row) {
+  if (isExpectedBfcacheHistoryFailure477(row)) return true;
+  const observation = row.observations?.guarded;
+  const audit = row.guardedPrivacy;
+  return (
+    expectedBfcacheFailure477.has(row.id) &&
+    row.control === 'pass' &&
+    row.guarded === 'fail' &&
+    row.live === 'pass' &&
+    observation?.markerHidden === true &&
+    observation?.originHidden === true &&
+    observation.restoredObserved === true &&
+    observation.sessionLive === true &&
+    audit?.measured === true &&
+    audit.markerExposed === false &&
+    audit.protectedPathExposed === false &&
+    (observation.sideEffectAbsent === false || observation.probesRefusedOrUnforwarded === false) &&
+    !bfcacheScreenshotExposed(row)
+  );
+}
+
+export function expectedFailureDispositions(results) {
+  return results
+    .filter(isExpectedBfcacheFailure477)
+    .map((row) => ({
+      id: row.id,
+      target: row.target,
+      variant: row.variant,
+      reason: expectedBfcacheFailureReason,
+      ...(isExpectedBfcacheHistoryFailure477(row)
+        ? {
+            class: 'history-no-answer-ordinary-B',
+            auditDifference: row.guardedPrivacy.auditDifference,
+            deletionHook: 'slicc-cdp#478 or fixed slicc-browsers vectors',
+          }
+        : {}),
+    }))
+    .concat(results.filter(isExpectedX1Failure150).map(x1Disposition));
+}
 
 export const published = JSON.parse(
   await readFile(
@@ -40,11 +292,49 @@ export const mandatory = (id) =>
   id.startsWith('C2.redirect-') || /^C4\.iframe-preattach\..*\.shared$/.test(id);
 
 export function canonicalSkip(vector, target) {
-  if (vector.skip?.target === target) return vector.skip.reason;
-  if (vector.observable?.[target] === false) return 'not-applicable:unobservable-target';
-  if (JSON.stringify(vector).includes('{ordinary-same-site}'))
-    return 'not-applicable:no-ordinary-same-site-origin';
-  return null;
+  if (!vector) return null;
+  const declared = skipReason(vector, target, 'slicc-cdp');
+  if (typeof declared === 'string' && declared.startsWith('not-applicable')) return declared;
+  const reason = 'not-applicable:no-ordinary-same-site-origin';
+  const row = {
+    id: vector.id,
+    target,
+    variant: Object.keys(published.variants)[0],
+    transport: 'cdp',
+    control: 'skip',
+    guarded: 'skip',
+    live: 'skip',
+    reason,
+  };
+  const probe = summary({
+    set: {
+      ...published,
+      variants: { [row.variant]: published.variants[row.variant] },
+      vectors: [{ ...vector, targets: [target] }],
+    },
+    results: [row],
+    guard: 'slicc-cdp',
+    sha: 'applicability-check',
+  });
+  return probe.forged.length === 0 ? reason : null;
+}
+
+export function validApplicabilitySkip(vector, row) {
+  if (!vector || typeof row.reason !== 'string' || !row.reason.startsWith('not-applicable'))
+    return false;
+  const set = {
+    ...published,
+    variants: { [row.variant]: published.variants[row.variant] },
+    vectors: [{ ...vector, targets: [row.target] }],
+  };
+  return (
+    summary({
+      set,
+      results: [{ ...row, transport: 'cdp', control: 'skip', guarded: 'skip', live: 'skip' }],
+      guard: 'slicc-cdp',
+      sha: 'applicability-reason-check',
+    }).forged.length === 0
+  );
 }
 
 export function verdictProblems(results) {
@@ -53,7 +343,38 @@ export function verdictProblems(results) {
     const vector = published.vectors.find((vector) => vector.id === row.id);
     const legs = [row.control, row.guarded, row.live];
     const where = `${row.id} ${row.target} ${row.variant}`;
+    if (
+      expectedBfcacheFailure477.has(row.id) &&
+      (row.guardedPrivacy?.measured !== true ||
+        row.guardedPrivacy.markerExposed !== false ||
+        row.guardedPrivacy.protectedPathExposed !== false ||
+        (row.observations?.guarded?.markerHidden === false &&
+          !isExpectedBfcacheHistoryFailure477(row)) ||
+        row.observations?.guarded?.originHidden === false ||
+        bfcacheScreenshotExposed(row))
+    ) {
+      problems.push(`${where} lacks measured non-exposure or discloses protected content`);
+      continue;
+    }
+    if (
+      row.id === 'X1.after-exit' &&
+      row.x1Privacy &&
+      (row.x1Privacy.measured !== true ||
+        row.x1Privacy.markerExposed !== false ||
+        row.x1Privacy.protectedExposed !== false ||
+        row.x1Privacy.screenshotExposed !== false)
+    ) {
+      problems.push(`${where} lacks measured X1 non-exposure or discloses protected content`);
+      continue;
+    }
+    if (isExpectedBfcacheFailure477(row) || isExpectedX1Failure150(row)) continue;
     if (legs.every((leg) => leg === 'pass')) continue;
+    if (expectedBfcacheFailure477.has(row.id)) {
+      problems.push(
+        `${where} is not PASS or the exact ${expectedBfcacheFailureReason} expected failure`
+      );
+      continue;
+    }
     if (mandatory(row.id)) {
       problems.push(
         `${where} must pass and is never skipped: ${legs.join('/')} ${row.reason ?? ''}`
@@ -62,9 +383,7 @@ export function verdictProblems(results) {
     }
     if (vector?.kind === 'text' && legs.every((leg) => leg === 'not-run')) continue;
     const reason = canonicalSkip(vector, row.target);
-    const inactive =
-      vector?.skip?.target === row.target || vector?.observable?.[row.target] === false;
-    const declared = row.reason === reason || (inactive && row.reason === 'not-applicable');
+    const declared = validApplicabilitySkip(vector, row);
     if (legs.every((leg) => leg === 'skip') && reason && declared) continue;
     problems.push(
       `${where} is ${legs.join('/')}${row.reason ? ` (${row.reason})` : ''}, not PASS${reason ? ` or the declared skip "${reason}"` : ''}`
@@ -73,31 +392,106 @@ export function verdictProblems(results) {
   return problems;
 }
 
+export function assertGuardReport(report, id, head) {
+  const targets = partitions[id];
+  assert.ok(targets, 'guard partition must be declared');
+  const set = {
+    ...published,
+    vectors: published.vectors
+      .map((vector) => ({
+        ...vector,
+        targets: vector.targets.filter((target) => targets.includes(target)),
+      }))
+      .filter((vector) => vector.targets.length),
+  };
+  assert.equal(report.sha, head, 'guard report head binding');
+  assert.equal(report.guard, 'slicc-cdp', 'guard scope binding');
+  assert.equal(
+    report.set,
+    `@ai-ecoverse/slicc-browsers@${published.setVersion}`,
+    'guard vector binding'
+  );
+  assert.deepEqual(
+    [...report.selection.targets].sort(),
+    [...targets].sort(),
+    'guard target ownership'
+  );
+  assert.deepEqual(
+    report.results.map(rowKey).sort(),
+    rowsFor(targets).map(rowKey).sort(),
+    'every assigned row must be recorded exactly once'
+  );
+  const checked = summary({ set, results: report.results, guard: 'slicc-cdp', sha: head });
+  assert.equal(report.pass, checked.pass, 'guard producer and recomputed raw verdicts must agree');
+  assert.deepEqual(checked.missing, [], 'guard rows must not be missing');
+  assert.deepEqual(checked.forged, [], 'guard rows must not be forged');
+  assert.ok(
+    checked.pass ||
+      report.results.some((row) => isExpectedBfcacheFailure477(row) || isExpectedX1Failure150(row)),
+    'raw failures require the exact expected class'
+  );
+  assert.deepEqual(
+    verdictProblems(report.results),
+    [],
+    'strict mandatory and applicability verdicts'
+  );
+}
+
 const extensionPath = fileURLToPath(
   new URL('./harness/extension', import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json'))
 );
 
-async function guardBrowser(startup, { privileged, extension, target, slot }) {
-  const browser = await startup.start(
-    [
-      ...browserArgs({ privileged: privileged || extension }),
-      ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
-    ],
-    { target, slot }
+async function guardBrowser(
+  startup,
+  { privileged, extension, target, slot, siteIsolationOff, signal, deadlineAt }
+) {
+  const controller = new AbortController();
+  const started = await deadline(
+    () =>
+      startup.start(
+        [
+          ...browserArgs({ privileged: privileged || extension, siteIsolationOff }),
+          ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
+        ],
+        { target, slot, signal: AbortSignal.any([signal, controller.signal]), deadlineAt }
+      ),
+    'browser-startup',
+    Math.max(1, deadlineAt - Date.now()),
+    (error) => controller.abort(error)
   );
+  const browser = {
+    ...started,
+    close: () =>
+      deadline(
+        () => started.close(),
+        'browser-close',
+        cleanupGrace(deadlineAt + 30000),
+        (error) => controller.abort(error)
+      ),
+  };
   if (!extension) return browser;
   let raw;
   try {
-    raw = await rawSocket(browser.wsUrl);
-    const { id } = await raw.send('Extensions.loadUnpacked', {
-      path: extensionPath,
-      enableInIncognito: true,
-    });
+    raw = await deadline(
+      () => rawSocket(browser.wsUrl),
+      'extension-socket-startup',
+      Math.max(1, deadlineAt - Date.now()),
+      (error) => controller.abort(error)
+    );
+    const { id } = await deadline(
+      () =>
+        raw.send('Extensions.loadUnpacked', {
+          path: extensionPath,
+          enableInIncognito: true,
+        }),
+      'extension-load',
+      Math.max(1, deadlineAt - Date.now()),
+      (error) => controller.abort(error)
+    );
     assert.equal(id, 'ankmbodmgimjemnojmeddfcdlbocolob');
     return browser;
   } catch (error) {
-    await browser.close();
-    throw error;
+    await cleanup([() => browser.close()], error);
   } finally {
     raw?.close();
   }
@@ -117,6 +511,7 @@ function table(results) {
 export async function runPartition(t, id) {
   requireChrome();
   const selectedTargets = partitions[id];
+  assert.ok(selectedTargets, 'guard partition must be declared');
   const set = {
     ...published,
     vectors: published.vectors
@@ -127,6 +522,8 @@ export async function runPartition(t, id) {
       .filter((vector) => vector.targets.length),
   };
   const started = Date.now();
+  const setupDeadline = started + Number(process.env.SLICC_GUARD_TIMEOUT ?? 900000) - 35000;
+  const remaining = () => Math.max(1, setupDeadline - Date.now());
   execFileSync(
     'cargo',
     ['build', '--locked', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'],
@@ -149,14 +546,16 @@ export async function runPartition(t, id) {
       ],
       { stdio: 'inherit' }
     );
-  const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 9);
+  const parallel = Number(process.env.SLICC_GUARD_PARALLEL ?? 4);
   const diagnostics = [];
+  const recordedRows = [];
+  const restoreClients = new Map();
+  const exitClients = new Map();
   const startup = browserStartup(launchBrowser, (retry) => {
     process.stdout.write(`chrome-startup-retry ${JSON.stringify(retry)}\n`);
   });
   const executeTarget = async (target) => {
-    const fixture = await fixtureServer();
-    const targets = origins(fixture);
+    let fixture;
     const browsers = new Map();
     const selected = {
       ...set,
@@ -164,7 +563,16 @@ export async function runPartition(t, id) {
         .filter((vector) => vector.targets.includes(target))
         .map((vector) => ({ ...vector, targets: [target] })),
     };
+    const failures = [];
     try {
+      fixture = await acquire(
+        (signal) => fixtureServer({ signal }),
+        'fixture-startup',
+        (resource) => resource.close(),
+        remaining()
+      );
+      requireRedirectRegistration(fixture);
+      const targets = origins(fixture);
       const execution = await run(selected, {
         fixture,
         targets,
@@ -175,6 +583,10 @@ export async function runPartition(t, id) {
           chromeUrlsAttach: true,
           extensionWorld: true,
           browserContexts: true,
+          discovery: true,
+          clientExit: true,
+          siteIsolationOff: true,
+          inboundDelay: true,
         },
         variant: Object.keys(set.variants),
         parallel,
@@ -188,26 +600,83 @@ export async function runPartition(t, id) {
             startup.markRowStarted();
             return {};
           }
-          if (!browsers.has(slot))
+          const siteIsolationOff = vector.requires?.includes('siteIsolationOff') === true;
+          const key = `${slot}/${siteIsolationOff ? 'shared' : 'isolated'}`;
+          if (!browsers.has(key))
             browsers.set(
-              slot,
+              key,
               guardBrowser(startup, {
                 privileged: vector.id.startsWith('C8.'),
                 extension: selected.vectors.some((row) => row.id.startsWith('C9.')),
                 target,
                 slot,
+                siteIsolationOff,
+                signal: t.signal,
+                deadlineAt: setupDeadline,
               })
             );
-          const browser = await browsers.get(slot);
-          const client = await guarded(browser.wsUrl, targets.client, { variant, detachDelay });
+          const browser = await browsers.get(key);
+          if (vector.requires?.includes('inboundDelay')) {
+            const made = await acquire(
+              (signal) =>
+                inboundClients(browser.wsUrl, targets.client, {
+                  variant,
+                  detachDelay,
+                  signal,
+                  deadlineAt: setupDeadline,
+                  protectedOrigin: targets[target],
+                  ordinaryOrigin: targets.ordinary,
+                }),
+              'inbound-clients-startup',
+              (resource) => resource.close(),
+              remaining()
+            );
+            restoreClients.set(`${vector.id}/${target}/${variant}`, made.client.messages);
+            startup.markRowStarted();
+            return made;
+          }
+          const client = await acquire(
+            (signal) =>
+              recordedClient((onMessage) =>
+                guarded(browser.wsUrl, targets.client, {
+                  variant,
+                  detachDelay,
+                  onMessage,
+                  signal,
+                  deadlineAt: setupDeadline,
+                })
+              ),
+            'guarded-client-startup',
+            (resource) => resource.close(),
+            remaining()
+          );
+          if (vector.id === 'X1.after-exit') {
+            const key = `${vector.id}/${target}/${variant}`;
+            if (!exitClients.has(key))
+              exitClients.set(key, {
+                actors: [],
+                ordinary: targets.ordinary,
+                protectedOrigin: targets[target],
+              });
+            exitClients.get(key).actors.push(recordX1Client(client));
+          }
           let unguarded;
           try {
-            unguarded = await observer(browser.wsUrl);
+            unguarded = await acquire(
+              (signal) =>
+                recordedClient((onMessage) =>
+                  observer(browser.wsUrl, onMessage, { signal, deadlineAt: setupDeadline })
+                ),
+              'observer-startup',
+              (resource) => resource.close(),
+              remaining()
+            );
           } catch (error) {
-            await client.close();
-            await browser.close();
-            browsers.delete(slot);
-            throw error;
+            try {
+              await cleanup([() => client.close(), () => browser.close()], error);
+            } finally {
+              browsers.delete(key);
+            }
           }
           let diagnostic;
           if (vector.id === 'C5.guessed-id.continue-response') {
@@ -253,8 +722,7 @@ export async function runPartition(t, id) {
                 diagnostic.afterCleanup = diagnostic.references.map((details) =>
                   structuredClone(details)
                 );
-              await client.close();
-              await unguarded.close();
+              await cleanup([() => client.close(), () => unguarded.close()]);
             },
           };
         },
@@ -268,6 +736,16 @@ export async function runPartition(t, id) {
           diagnostic.references.push(details);
         },
         log: (row) => {
+          if (row.id === 'X1.after-exit') {
+            const exit = exitClients.get(`${row.id}/${row.target}/${row.variant}`);
+            row.x1Privacy = x1Privacy(exit?.actors, exit ?? {});
+          }
+          if (expectedBfcacheFailure477.has(row.id))
+            row.guardedPrivacy = bfcachePrivacy(
+              row,
+              restoreClients.get(`${row.id}/${row.target}/${row.variant}`)
+            );
+          recordedRows.push(structuredClone(row));
           if (process.env.SLICC_GUARD_PROGRESS)
             process.stdout.write(`row ${row.id} ${row.target} ${row.variant}\n`);
           if ([row.control, row.guarded, row.live].includes('fail'))
@@ -275,20 +753,36 @@ export async function runPartition(t, id) {
         },
       });
       return execution.results;
+    } catch (error) {
+      failures.push(error);
     } finally {
-      await Promise.all([...browsers.values()].map(async (browser) => (await browser).close()));
-      await fixture.close();
+      await cleanup(
+        [
+          ...[...browsers.values()].map((browser) => async () => (await browser).close()),
+          () => fixture?.close(),
+        ],
+        ...failures
+      );
     }
   };
   const targetNames = [...new Set(set.vectors.flatMap((vector) => vector.targets))];
-  const settled = await Promise.allSettled(targetNames.map(executeTarget));
-  const rejected = settled.filter((value) => value.status === 'rejected');
-  if (rejected.length)
-    throw new AggregateError(
-      rejected.map((value) => value.reason),
-      'target invocations failed'
+  const targetParallel = Number(process.env.SLICC_GUARD_TARGET_PARALLEL ?? 2);
+  const settled = [];
+  for (let index = 0; index < targetNames.length; index += targetParallel) {
+    settled.push(
+      ...(await Promise.allSettled(
+        targetNames.slice(index, index + targetParallel).map(executeTarget)
+      ))
     );
-  const results = settled.flatMap((value) => value.value);
+  }
+  const completed = settled
+    .filter((value) => value.status === 'fulfilled')
+    .flatMap((value) => value.value);
+  const completedTargets = new Set(completed.map((row) => row.target));
+  const results = [
+    ...completed,
+    ...recordedRows.filter((row) => !completedTargets.has(row.target)),
+  ];
   const report = summary({
     set,
     results,
@@ -297,19 +791,22 @@ export async function runPartition(t, id) {
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
+  const recorded = new Set(report.results.map(rowKey));
+  const missing = new Set(report.missing.map(rowKey));
+  report.missing.push(
+    ...rowsFor(selectedTargets).filter(
+      (row) => !recorded.has(rowKey(row)) && !missing.has(rowKey(row))
+    )
+  );
   report.partition = id;
   report.startupRetries = startup.retries;
   report.selection = { targets: selectedTargets };
   report.transport =
     process.env.SLICC_GUARD_TRANSPORT === 'wasi' ? 'wasi-kernel-cdp' : 'native-websocket';
-  report.results = report.results.map((row) => {
-    const vector = published.vectors.find((vector) => vector.id === row.id);
-    const reason = row.control === 'skip' && vector && canonicalSkip(vector, row.target);
-    return reason && row.reason === 'not-applicable' ? { ...row, reason } : row;
-  });
+  report.expectedFailures = expectedFailureDispositions(report.results);
   const problems = verdictProblems(report.results);
   const ms = Date.now() - started;
-  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS or its declared skip'}\n\n${table(report.results)}\n`;
+  const output = `${report.line}\nPartition ${id}: ${selectedTargets.join(', ')}\nRuntime: ${(ms / 1000).toFixed(1)}s\nStrict verdicts: ${problems.length ? `${problems.length} problems` : 'every row PASS, its declared skip, or an exact recorded expected failure'}\n\n${table(report.results)}\n`;
   const file =
     process.env.SLICC_GUARD_REPORT ??
     path.join(fileURLToPath(new URL('../../artifacts/', import.meta.url)), `guard-${id}.md`);
@@ -331,13 +828,36 @@ export async function runPartition(t, id) {
   );
   process.stdout.write(output);
   t.diagnostic(`report: ${file}`);
+  const availability = settled.flatMap((result, index) =>
+    result.status === 'rejected'
+      ? [
+          {
+            target: targetNames[index],
+            phase: 'target-execution-or-cleanup',
+            error: normalizeError(result.reason),
+          },
+        ]
+      : []
+  );
+  await writeFile(
+    `${file}.availability.json`,
+    JSON.stringify({ type: 'HARNESS_AVAILABILITY', failures: availability }, null, 2)
+  );
+  for (const error of availability)
+    process.stderr.write(`HARNESS-AVAILABILITY ${JSON.stringify(error)}\n`);
+  assert.deepEqual(availability, [], 'all target invocations and cleanup must succeed');
   assert.deepEqual(
     report.results.map(rowKey).sort(),
     rowsFor(selectedTargets).map(rowKey).sort(),
     `partition ${id} must record every published row of its targets, once`
   );
+  assertGuardReport(report, id, report.sha);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
-  assert.deepEqual(problems, [], 'every row is PASS or its declared not-applicable skip');
-  assert.equal(report.pass, true, report.line);
+  assert.deepEqual(
+    problems,
+    [],
+    'every row is PASS, its declared not-applicable skip, or an exact expected failure'
+  );
+  assert.ok(report.pass || report.expectedFailures.length > 0, report.line);
 }

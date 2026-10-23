@@ -30,7 +30,9 @@ test('every Chrome-owning integration file is in the shard proof inventory', asy
   for (const name of files.filter((name) => name.endsWith('.test.mjs'))) {
     const source = await readFile(path.join(directory, name), 'utf8');
     const gated =
-      /import\s+\{[^}]*\bchromeTest\b[^}]*\}\s+from\s+['"]\.\/chrome-policy\.mjs['"]/.test(source);
+      /import\s+\{[^}]*\bchromeTest(?:Arguments)?\b[^}]*\}\s+from\s+['"]\.\/chrome-policy\.mjs['"]/.test(
+        source
+      );
     const launches =
       /import\s+\{[^}]*\b(?:launchBrowser|launchManagedBrowser)\b[^}]*\}\s+from\s+['"]\.\/browser\.mjs['"]/.test(
         source
