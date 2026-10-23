@@ -235,6 +235,7 @@ impl Cdp {
         let session = paused.session_id.clone();
         let key = |id: &str| (session.clone(), id.to_string());
         self.issued.urls.insert(key(&paused.request_id), paused.url.clone());
+        self.issued.auth.remove(&key(&paused.request_id));
         let now = Instant::now();
         self.issued.replays.retain(|(_, _, deadline)| *deadline > now);
         let redirected = value.pointer("/params/redirectedRequestId").and_then(Value::as_str);
