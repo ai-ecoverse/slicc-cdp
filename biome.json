@@ -2,10 +2,6 @@
   "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
   "extends": ["@ai-ecoverse/slicc-shared-web/biome"],
   "files": {
-    "includes": [
-      "**",
-      "!crates/playwright-cli/src/aria-snapshot.js",
-      "!crates/playwright-cli/vendor/playwright-injected.js"
-    ]
+    "includes": ["**", "!crates/playwright-cli/src/aria-snapshot.js"]
   }
 }
