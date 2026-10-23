@@ -155,6 +155,46 @@ fn quarantined_future_installer_does_not_run_in_the_existing_document() {
     }
 }
 
+#[test]
+fn readiness_waits_until_a_quarantined_child_gate_is_decided() {
+    for destination in ["https://ordinary.test/child", "https://seven.sliccy.ai/"] {
+        let (mut cdp, state) = client();
+        assert!(cdp.webmcp_settled());
+        state.borrow_mut().tree = frame("about:blank");
+        cdp.webmcp.quarantined.insert("H".into());
+        cdp.webmcp_install("H", true, None).unwrap();
+        assert!(!cdp.webmcp_settled());
+        assert!(cdp.webmcp_snapshot().is_empty());
+        cdp.absorb(event("Page.frameNavigated", json!({"frame":frame(destination)["frameTree"]["frame"]})));
+        enter_document(&mut cdp, &state, frame(destination), "F");
+        assert!(cdp.webmcp_settled(), "{destination}");
+        assert_eq!(cdp.webmcp_snapshot().len(), usize::from(!destination.contains("seven")));
+    }
+}
+
+#[test]
+fn readiness_waits_for_pending_frame_generations_of_an_admitted_holder() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp("H").unwrap();
+    assert!(cdp.webmcp_settled());
+    let mut next = frame("https://ordinary.test/next");
+    next["frameTree"]["frame"]["loaderId"] = json!("NEXT");
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":next["frameTree"]["frame"]})));
+    assert!(!cdp.webmcp_settled());
+    enter_document(&mut cdp, &state, next, "F");
+    assert!(cdp.webmcp_alive("H"));
+    assert!(cdp.webmcp_settled());
+    let mut fresh = context("F", "https://ordinary.test");
+    fresh["params"]["context"]["uniqueId"] = json!("FRESH");
+    cdp.absorb(fresh);
+    assert!(!cdp.webmcp_settled());
+    cdp.guard_sessions.insert("H".into());
+    assert!(cdp.webmcp_settled());
+    cdp.guard_sessions.remove("H");
+    cdp.block("H");
+    assert!(cdp.webmcp_settled());
+}
+
 fn enter_document(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, tree: Value, frame: &str) {
     {
         let mut backend = state.borrow_mut();

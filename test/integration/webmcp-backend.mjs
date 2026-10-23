@@ -17,6 +17,9 @@ export async function webmcpBackend({
   const permitted = new Map();
   const paused = new Map();
   const queues = new Map();
+  const lateFrames = new Set();
+  let held = null;
+  let loadFired = false;
   const configs = [
     { id: 'TAB', origin: 'https://ordinary.test', policy, definitions },
     ...children,
@@ -155,6 +158,11 @@ export async function webmcpBackend({
         writers.delete(params.sessionId);
         scripts.delete(params.sessionId);
         answer({});
+        if (params.sessionId === 'LATE_MARKER') {
+          const release = held;
+          held = null;
+          release?.();
+        }
         return true;
       }
       if (method === 'Page.getFrameTree') {
@@ -244,6 +252,10 @@ export async function webmcpBackend({
         answer({ result: { type: 'boolean', value } });
         return true;
       }
+      const loadEverywhere = () => {
+        loadFired = true;
+        for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
+      };
       if (method === 'Debugger.resume') {
         const page = pages.get(paused.get(sessionId));
         if (page && permitted.get(sessionId) && scripts.has(sessionId)) {
@@ -261,12 +273,26 @@ export async function webmcpBackend({
           }
         }
         answer({});
-        if (!pause(sessionId) && page?.loaded)
-          for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
+        if (page?.loaded && lateFrames.delete(queues.get(sessionId)?.[0])) {
+          held = () => pause(sessionId);
+          loadEverywhere();
+          event('Target.attachedToTarget', {
+            sessionId: 'LATE_MARKER',
+            targetInfo: {
+              targetId: 'LATE_MARKER',
+              type: 'iframe',
+              url: 'https://seven.sliccy.ai/',
+            },
+            waitingForDebugger: true,
+          });
+          return true;
+        }
+        if (!pause(sessionId) && page?.loaded && !loadFired) loadEverywhere();
         return true;
       }
       if (method === 'Page.reload') {
         reset(`RELOAD${++reloads}`);
+        loadFired = false;
         answer({});
         for (const peer of sessions.keys()) {
           for (const page of pages.values())
@@ -341,5 +367,8 @@ export async function webmcpBackend({
     },
     sessions,
     scripts,
+    admitLate(frameId) {
+      lateFrames.add(frameId);
+    },
   };
 }

@@ -200,6 +200,65 @@ await test('fake: document readiness follows generation metadata persistence', a
   }
 });
 
+await test('fake: document readiness waits for a child frame admitted after the top load event', async () => {
+  const backend = await webmcpBackend({
+    definitions: [{ name: 'top', execute: () => 'top' }],
+    children: [
+      {
+        id: 'CHILD',
+        origin: 'https://ordinary.test',
+        definitions: [{ name: 'late_child', execute: () => 'late child' }],
+      },
+    ],
+  });
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-late-'));
+  const holder = launch(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, backend.url);
+  try {
+    await holder.ready;
+    backend.admitLate('CHILD');
+    const complete = new Promise((resolve, reject) => {
+      let text = '';
+      const timer = setTimeout(
+        () =>
+          reject(
+            new Error(`document readiness did not arrive: ${holder.stdout()} ${holder.stderr()}`)
+          ),
+        15000
+      );
+      holder.child.stdout.on('data', (bytes) => {
+        text += bytes;
+        for (const line of text.split('\n').slice(0, -1)) {
+          const value = JSON.parse(line);
+          if (value.event !== 'document-ready') continue;
+          clearTimeout(timer);
+          resolve({ value, childLoaded: backend.pages.get('CHILD').loaded === true });
+        }
+      });
+    });
+    const reload = await run(['reload', '--tab', 'TAB'], cwd, backend.url);
+    assert.equal(reload.code, 0, reload.stderr);
+    const ready = await complete;
+    assert.equal(ready.value.tab, 'TAB');
+    assert.equal(ready.childLoaded, true, 'document-ready preceded the child frame admission');
+    assert.match(holder.stderr(), /webmcp-polyfill: child refused at target/);
+    const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
+    assert.equal(listed.code, 0, listed.stderr);
+    assert.deepEqual(
+      JSON.parse(listed.stdout).map((tool) => [tool.name, tool.frameId]),
+      [
+        ['late_child', 'CHILD'],
+        ['top', 'TAB'],
+      ]
+    );
+    holder.child.stdin.end();
+    assert.equal((await holder.ended).code, 0);
+  } finally {
+    holder.child.kill('SIGKILL');
+    await backend.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 await test('fake: collection refreshes holder policy metadata after its initial session snapshot', async () => {
   let file;
   let fresh;
