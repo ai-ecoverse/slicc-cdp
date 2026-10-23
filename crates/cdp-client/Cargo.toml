@@ -16,7 +16,7 @@ publish = true
 name = "cdp_client"
 
 [dependencies]
-getrandom = "0.3"
+getrandom = "0.4"
 serde_json = "1"
 slicc-browsers = { version = "=1.18.5", features = ["serde"] }
 url = "2.5"
