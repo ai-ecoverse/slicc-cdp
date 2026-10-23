@@ -69,6 +69,9 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     while index < args.len() {
         let token = &args[index];
         if token == "--" {
+            if !rest.is_empty() {
+                rest.push(token.clone());
+            }
             rest.extend(args[index + 1..].iter().cloned());
             break;
         }

@@ -22,6 +22,9 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if let Some(message) = cookies::precheck(command, invocation) {
         return Output::err(message);
     }
+    if let Some(message) = crate::input::precheck(command, invocation) {
+        return Output::err(message);
+    }
     if let Some(output) = crate::page_tools::precheck(command, invocation) {
         return output;
     }
@@ -168,6 +171,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if crate::recording::is_start(command) => crate::recording::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
+        _ if crate::input::is_command(command) => crate::input::run(&mut cdp, &mut state, invocation, command, &mut report),
         _ if crate::storage::is_command(command) => crate::storage::run(&mut cdp, &mut state, invocation, command),
         "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
@@ -967,7 +971,7 @@ fn retry_await(
     }
 }
 
-fn with_ref(
+pub(crate) fn with_ref(
     cdp: &mut Cdp,
     state: &mut Session,
     invocation: &Invocation,

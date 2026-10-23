@@ -154,7 +154,12 @@ async function storageFlow(runner, site, raw, protectedTabs) {
     await run(['state-load', 'load.json']),
     `### Result\nStorage state restored from load.json\n${code("await page.context().setStorageState('load.json');")}`
   );
-  assert.equal((await pages(raw)).length, before);
+  let after = (await pages(raw)).length;
+  for (let waited = 0; after !== before && waited < 5000; waited += 100) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    after = (await pages(raw)).length;
+  }
+  assert.equal(after, before, 'state-load closed its blank tab');
   assert.equal(
     await pageEval(raw, tab, 'JSON.stringify({ ...localStorage })'),
     '{"restored":"fixture-restored"}'
