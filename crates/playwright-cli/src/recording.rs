@@ -30,11 +30,11 @@ const MAX_ACTIONS: usize = 10000;
 const MAX_TEXT: usize = 65536;
 
 pub fn is_start(command: &str) -> bool {
-    matches!(command, "recording-start" | "record")
+    command == "recording-start"
 }
 
 pub fn is_stop(command: &str) -> bool {
-    matches!(command, "recording-stop" | "stop-recording")
+    command == "recording-stop"
 }
 
 struct Files {

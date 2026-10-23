@@ -2507,6 +2507,30 @@ impl Cdp {
         }
     }
 
+    pub fn ordinary_response_body(&self, session: &str, request_id: &str) -> bool {
+        !self.content_blocked(session) && self.request_state(request_id) == Some(false)
+            && !self.protected_body_requests.contains(request_id) && self.ordinary_network_source(session, request_id).is_some()
+    }
+
+    pub fn redact_redirect_carriers(&self, headers: &mut Value, source: &str) {
+        let Some(fields) = headers.as_object_mut() else { return };
+        fields.retain(|name, value| {
+            let kind = name.to_ascii_lowercase();
+            if !matches!(kind.as_str(), "location" | "content-location" | "refresh" | "link") { return true }
+            let Some(text) = value.as_str() else { return false };
+            let targets = match kind.as_str() {
+                "refresh" => Self::refresh_parts(text).and_then(|(_, target)| Self::carrier_targets(&self.guard, target.unwrap_or(source), source)),
+                "link" => text.split(',').map(|part| part.trim().strip_prefix('<').and_then(|part| part.split_once('>')).and_then(|(target, _)| Self::carrier_targets(&self.guard, target, source))).collect::<Option<Vec<_>>>().map(|parts| parts.into_iter().flatten().collect()),
+                _ => Self::carrier_targets(&self.guard, text, source),
+            };
+            if targets.is_some_and(|targets| !targets.is_empty() && targets.iter().all(|target| !target.protected && matches!(target.url.scheme(), "http" | "https") && target.url.has_host())) { return true }
+            match Self::redirect_header_value(&self.guard, name, text, source) {
+                Some(safe) => { *value = json!(safe); true }
+                None => false,
+            }
+        });
+    }
+
     fn redirect_headers(headers: &mut Value, source: &str, guard: &Protected) {
         match headers {
             Value::Object(fields) => fields.retain(|name, value| {
