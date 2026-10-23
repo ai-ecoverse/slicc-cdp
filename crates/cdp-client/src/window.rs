@@ -11,13 +11,23 @@ impl Cdp {
             || !bounds.keys().all(|key| matches!(key.as_str(), "width" | "height"))
             || !size("width") || !size("height") { return Err(self.refusal()) }
         let window = params.get("windowId").and_then(Value::as_i64).ok_or_else(|| self.refusal())?;
+        let target = self.exclusive_profile(session)?;
+        let owned = self.raw_call("Browser.getWindowForTarget", json!({}), Some(session), DOCUMENT_CHECK).map_err(|_| self.refusal())?;
+        if owned.get("windowId").and_then(Value::as_i64) != Some(window) { return Err(self.refusal()) }
+        if self.blocked.contains(session) || self.session_target(session).as_deref() != Some(target.as_str()) { return Err(self.refusal()) }
+        Ok(())
+    }
+
+    pub fn admit_foreground(&mut self, session: &str) -> Result<String, String> {
+        self.exclusive_profile(session)
+    }
+
+    fn exclusive_profile(&mut self, session: &str) -> Result<String, String> {
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         if self.guard_sessions.contains(session) || self.blocked.contains(session) || self.protected_targets.contains(&target) {
             return Err(self.refusal());
         }
         self.document_state_for(&target, true, None).ok_or_else(|| self.refusal())?;
-        let owned = self.raw_call("Browser.getWindowForTarget", json!({}), Some(session), DOCUMENT_CHECK).map_err(|_| self.refusal())?;
-        if owned.get("windowId").and_then(Value::as_i64) != Some(window) { return Err(self.refusal()) }
         let listed = self.raw_call("Target.getTargets", json!({}), None, DOCUMENT_CHECK)?;
         let infos = listed.get("targetInfos").and_then(Value::as_array).cloned().ok_or_else(|| self.refusal())?;
         let text = |info: &Value, key: &str| info.get(key).and_then(Value::as_str).unwrap_or("").to_string();
@@ -33,6 +43,6 @@ impl Cdp {
             }
         }
         if self.blocked.contains(session) || self.session_target(session).as_deref() != Some(target.as_str()) { return Err(self.refusal()) }
-        Ok(())
+        Ok(target)
     }
 }

@@ -22,7 +22,8 @@ const FOCUS: &str = "(() => { let e = document.activeElement; while (e && e.shad
 const INNER: &str = "[innerWidth, innerHeight]";
 const DROP: &str = "function(payloads, data) { if (!this.isConnected || this.nodeType !== 1) return 'error:notconnected'; this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); const point = {x:r.x+r.width/2,y:r.y+r.height/2}; const dt = new DataTransfer(); for (const p of payloads) { const bytes = Uint8Array.from(atob(p.buffer), (c) => c.charCodeAt(0)); dt.items.add(new File([bytes], p.name, { type: p.mimeType, lastModified: p.lastModifiedMs })); } for (const entry of data) dt.setData(entry.mimeType, entry.value); const make = (type) => new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y, dataTransfer: dt }); this.dispatchEvent(make('dragenter')); const over = make('dragover'); this.dispatchEvent(over); if (!over.defaultPrevented) { this.dispatchEvent(make('dragleave')); return 'not-accepted'; } this.dispatchEvent(make('drop')); return 'accepted'; }";
 const NOT_ACCEPTED: &str = "Error: Drop target did not accept the drop \u{2014} its dragover handler did not call preventDefault()\n";
-const BACKGROUND: &str = "Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const BACKGROUND: &str = "Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const FOREGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const WHEEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const NO_PAYLOAD: &str = "Error: At least one of \"paths\" or \"data\" must be provided.\n";
 
@@ -197,7 +198,7 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
         Err(message) => return Output::err(message),
     };
     let mut pointer = Pointer::load(state.input.get(&target));
-    let result = act(cdp, &session, invocation, command, &mut pointer);
+    let result = act(cdp, &session, &target, invocation, command, &mut pointer);
     let _ = cdp.call("Runtime.releaseObjectGroup", json!({ "objectGroup": GROUP }), Some(&session));
     let watched = browser::watch_detach(cdp, state, &target, &session);
     state.input.retain(|known, _| pages.iter().any(|page| &page.target_id == known));
@@ -213,7 +214,7 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
     }
 }
 
-fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, pointer: &mut Pointer) -> Result<String, String> {
+fn act(cdp: &mut Cdp, session: &str, target: &str, invocation: &Invocation, command: &str, pointer: &mut Pointer) -> Result<String, String> {
     match command {
         "keydown" => key_down(cdp, session, &key_name(invocation)?, pointer),
         "keyup" => key_up(cdp, session, &key_name(invocation)?, pointer),
@@ -249,10 +250,7 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
         "mousewheel" => {
             let (dx, dy) = numbers(invocation, ["dx", "dy"])?;
             admit_point(cdp, session, pointer.x, pointer.y)?;
-            let frame = main_frame(cdp, session)?;
-            if browser::evaluate_in_frame(cdp, session, &frame, "document.visibilityState")?.value != json!("visible") {
-                return Err(BACKGROUND.to_string());
-            }
+            foreground(cdp, session, target)?;
             let wheel = json!({ "type": "mouseWheel", "x": pointer.x, "y": pointer.y, "modifiers": pointer.modifiers_mask(), "deltaX": dx, "deltaY": dy });
             cdp.call_for("Input.dispatchMouseEvent", wheel, Some(session), WHEEL_WAIT).map_err(|message| if message == "Input.dispatchMouseEvent timed out\n" { BACKGROUND.to_string() } else { message })?;
             Ok(code(&format!("// Scroll mouse wheel\nawait page.mouse.wheel({}, {});", js(dx), js(dy))))
@@ -263,6 +261,37 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
             Ok(code(&format!("await page.setViewportSize({{ width: {width}, height: {height} }});")))
         }
     }
+}
+
+fn visible(cdp: &mut Cdp, session: &str, waited: std::time::Duration) -> Result<bool, String> {
+    let frame = main_frame(cdp, session)?;
+    let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
+    let context = world.get("executionContextId").cloned().ok_or_else(|| BACKGROUND.to_string())?;
+    let deadline = std::time::Instant::now() + waited;
+    loop {
+        let state = cdp.call("Runtime.evaluate", json!({ "expression": "document.visibilityState", "contextId": context, "returnByValue": true }), Some(session))?;
+        if state.pointer("/result/value") == Some(&json!("visible")) {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn foreground(cdp: &mut Cdp, session: &str, target: &str) -> Result<(), String> {
+    if visible(cdp, session, std::time::Duration::ZERO)? {
+        return Ok(());
+    }
+    if cdp.admit_foreground(session).ok().as_deref() != Some(target) {
+        return Err(BACKGROUND.to_string());
+    }
+    browser::activate(cdp, target)?;
+    if !visible(cdp, session, FOREGROUND_WAIT)? {
+        return Err(BACKGROUND.to_string());
+    }
+    Ok(())
 }
 
 fn mouse(cdp: &mut Cdp, session: &str, kind: &str, pointer: &Pointer, button: &str, clicks: Option<i64>) -> Result<(), String> {

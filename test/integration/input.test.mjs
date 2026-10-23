@@ -170,15 +170,40 @@ async function flow(runner, raw, port) {
   assert.ok((await drain()).some((event) => event.type === 'wheel' && event.dy === 200));
   const background = await raw.open(`http://127.0.0.1:${port}/input`);
   try {
-    const started = Date.now();
-    const hidden = await pw(['mousewheel', '0', '200', '--tab', background]);
-    assert.equal(hidden.code, 1);
-    assert.match(hidden.stderr, /^Error: mousewheel needs the tab in the foreground/);
-    assert.ok(Date.now() - started < 9000, 'a background wheel fails fast');
+    await run(['mousemove', '100', '100', '--tab', background]);
+    await run(['mousewheel', '0', '200', '--tab', background]);
+    await until(
+      async () =>
+        JSON.parse(
+          (
+            await run([
+              'eval',
+              "JSON.stringify(document.getElementById('pad').scrollTop)",
+              '--tab',
+              background,
+            ])
+          ).stdout
+        ),
+      (top) => top > 0,
+      'a background tab was brought forward and scrolled'
+    );
   } finally {
     await raw.send('Target.closeTarget', { targetId: background });
   }
-
+  const sevenTab = await raw.open('http://seven.sliccy.ai/frame?k=WHEEL_SECRET');
+  const hiddenTab = await raw.open(`http://127.0.0.1:${port}/input`);
+  try {
+    const started = Date.now();
+    const hidden = await pw(['mousewheel', '0', '200', '--tab', hiddenTab]);
+    assert.equal(hidden.code, 1);
+    assert.match(hidden.stderr, /^Error: mousewheel needs the tab in the foreground/);
+    assert.doesNotMatch(hidden.stderr, /WHEEL_SECRET/);
+    assert.ok(Date.now() - started < 9000, 'a refused background wheel fails fast');
+  } finally {
+    await raw.send('Target.closeTarget', { targetId: hiddenTab });
+    await raw.send('Target.closeTarget', { targetId: sevenTab });
+  }
+  await until(sevenGone, Boolean, 'protected tab gone after the wheel check');
   await runner.write(cwd, 'note.txt', 'dropped bytes');
   const shot = (await run(['snapshot'])).stdout;
   const zone = shot.match(/region "Drop zone" \[ref=(e\d+)\]/)?.[1];

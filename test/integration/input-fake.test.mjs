@@ -85,7 +85,12 @@ function page(script) {
       return true;
     }
     if (method === 'Runtime.evaluate' && params.expression === 'document.visibilityState') {
-      reply({ result: { type: 'string', value: script.visibility ?? 'visible' } });
+      reply({ result: { type: 'string', value: script.hidden ? 'hidden' : 'visible' } });
+      return true;
+    }
+    if (method === 'Target.activateTarget') {
+      if (script.wakes) script.hidden = false;
+      reply({});
       return true;
     }
     if (method === 'Page.getLayoutMetrics') {
@@ -411,14 +416,28 @@ test('pointer input over an embedded frame or outside the main document is refus
   });
 });
 
-test('mousewheel is refused in a background tab instead of waiting for an answer Chrome never sends', async () => {
-  await withFake({ visibility: 'hidden' }, async (fake, pw) => {
+test('mousewheel brings a background tab forward only while no protected tab is open', async () => {
+  const background =
+    'Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab, and it only brings a tab to the front while no protected or unverified tab is open in the browser profile. Run "playwright-cli tab-select <index> --foreground" first.\n';
+  await withFake({ hidden: true, wakes: true }, async (fake, pw) => {
+    const result = await pw(['mousewheel', '0', '100']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(params(fake, 'Target.activateTarget'), [{ targetId: 'TAB' }]);
+    assert.equal(params(fake, 'Input.dispatchMouseEvent').length, 1);
+  });
+  await withFake({ hidden: true, wakes: true }, async (fake, pw) => {
+    fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+    const result = await pw(['mousewheel', '0', '100', '--tab', 'TAB']);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, background);
+    assert.equal(sent(fake, 'Target.activateTarget').length, 0);
+    assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
+  });
+  await withFake({ hidden: true }, async (fake, pw) => {
     const result = await pw(['mousewheel', '0', '100']);
     assert.equal(result.code, 1);
-    assert.equal(
-      result.stderr,
-      'Error: mousewheel needs the tab in the foreground, because Chrome never answers wheel events in a background tab. Run "playwright-cli tab-select <index> --foreground" first.\n'
-    );
+    assert.equal(result.stderr, background);
+    assert.equal(sent(fake, 'Target.activateTarget').length, 1);
     assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
   });
 });
