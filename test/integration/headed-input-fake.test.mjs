@@ -13,7 +13,7 @@ const background = (verb) =>
   `Error: ${verb} could not reach the background tab in place, and brings it to the front only when the tab that was in front can be switched back to. Run "playwright-cli tab-select <index> --foreground" first.\n`;
 
 function scene({ front = 'SEVEN', others = [], reads = [[]], pointer = 'missing', ...rest } = {}) {
-  const state = { front, reads: [...reads], modes: [], activated: [] };
+  const state = { front, reads: [...reads], modes: [], activated: [], lag: 0 };
   const fallback = { arm: 'armed', focus: 'editable', insert: 'unchanged', key: 'unsupported' };
   const options = {
     visibility: (target) => (target?.targetId === state.front ? 'visible' : 'hidden'),
@@ -23,6 +23,10 @@ function scene({ front = 'SEVEN', others = [], reads = [[]], pointer = 'missing'
     }),
     landing: (mode, args, target) => {
       state.modes.push([mode, args, target?.targetId]);
+      if (mode === 'visible' && state.lag > 0) {
+        state.lag -= 1;
+        return 'hidden';
+      }
       if (mode === 'visible') return target?.targetId === state.front ? 'visible' : 'hidden';
       if (mode === 'read') return state.reads.length ? state.reads.shift() : ['landed'];
       if (mode === 'pointer') return pointer;
@@ -31,7 +35,9 @@ function scene({ front = 'SEVEN', others = [], reads = [[]], pointer = 'missing'
     onCommand: (message) => {
       if (message.method !== 'Target.activateTarget') return;
       state.activated.push(message.params.targetId);
+      if (rest.stuck) return;
       state.front = message.params.targetId;
+      state.lag = rest.lag ?? 0;
     },
   };
   return { state, options, others };
@@ -39,7 +45,7 @@ function scene({ front = 'SEVEN', others = [], reads = [[]], pointer = 'missing'
 
 async function withScene(runner, setup, body) {
   const { state, options, others } = setup;
-  const fake = await fakeCdp(options);
+  const fake = await fakeCdp({ ...options, ...setup.fake });
   for (const target of others) fake.targets.push({ ...target });
   const pw = await runner(fake.url);
   try {
@@ -159,7 +165,7 @@ for (const [transport, runner] of Object.entries(runners)) {
       {},
     ],
     ['seven is in another window', [sevenTab], { SEVEN: 2 }],
-    ['no tab is in front', [], {}],
+    ['no tab is visibly in front', [{ targetId: 'HIDDEN', url: 'https://other.test/' }], {}],
   ]) {
     test(`${transport}: no tab is activated when ${name}`, async () => {
       const setup = scene({ front: 'NONE', others, windows });
@@ -221,6 +227,102 @@ for (const [transport, runner] of Object.entries(runners)) {
       await s.ok(['type', 'b']);
       assert.equal(s.state.activated.length, 4);
       assert.deepEqual(modes(s.state, 'arm'), []);
+    });
+  });
+}
+
+const own = (s) =>
+  s.fake.targets.find((target) => target.url.startsWith('http://example.test')).targetId;
+
+for (const [transport, runner] of Object.entries(runners)) {
+  test(`${transport}: a ref without a backend node lands by its selector`, async () => {
+    const setup = scene({ reads: [[]], pointer: 'done' });
+    setup.fake = {
+      aria: () => ({
+        json: [{ role: 'button', name: 'Go', ref: 'e1', cursor: 'pointer' }],
+        refs: [{ ref: 'e1', selector: '#go' }],
+        base: 'http://example.test/',
+        nodes: [null],
+      }),
+    };
+    await withScene(runner, setup, async (s) => {
+      await s.ok(['click', s.ref]);
+      assert.equal(modes(s.state, 'pointer')[0][1].selector, '#go');
+    });
+  });
+
+  test(`${transport}: a page that cannot run the check fails the command`, async () => {
+    await withScene(runner, scene({ arm: 'nope' }), async (s) => {
+      const result = await s.run(['click', s.ref]);
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, 'Error: the input check could not start in the page.\n');
+      assert.ok(!s.fake.calls.some((call) => call.method === 'Input.dispatchMouseEvent'));
+    });
+    await withScene(runner, scene({ focus: { exception: 'focus broke' } }), async (s) => {
+      const result = await s.run(['type', 'x']);
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /focus broke/);
+    });
+  });
+
+  test(`${transport}: a probe that vanished with the page counts as landed`, async () => {
+    await withScene(runner, scene({ reads: [null] }), async (s) => {
+      await s.ok(['click', s.ref]);
+      assert.deepEqual(modes(s.state, 'pointer'), []);
+    });
+  });
+
+  test(`${transport}: the visible tab gets the trusted input once and fails if it is dropped`, async () => {
+    await withScene(runner, scene({ reads: [[]] }), async (s) => {
+      s.state.front = own(s);
+      const result = await s.run(['click', s.ref]);
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /click did not reach the page/);
+      assert.deepEqual(s.state.activated, []);
+    });
+    await withScene(runner, scene({ focus: 'frame' }), async (s) => {
+      s.state.front = own(s);
+      await s.ok(['press', 'a']);
+      assert.deepEqual(s.state.activated, []);
+      assert.equal(
+        s.fake.calls.filter((call) => call.method === 'Input.dispatchKeyEvent').length,
+        2
+      );
+    });
+  });
+
+  test(`${transport}: the tab is waited for after activation and restored when it never shows`, async () => {
+    await withScene(
+      runner,
+      scene({ reads: [[], ['click']], lag: 2, others: [sevenTab] }),
+      async (s) => {
+        await s.ok(['click', s.ref]);
+        assert.deepEqual(s.state.activated, [own(s), 'SEVEN']);
+      }
+    );
+    await withScene(runner, scene({ stuck: true, others: [sevenTab] }), async (s) => {
+      const result = await s.run(['hover', s.ref]);
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, background('hover'));
+      assert.deepEqual(s.state.activated, [own(s), 'SEVEN']);
+    });
+  });
+
+  test(`${transport}: type falls back to the front when it cannot insert in place`, async () => {
+    await withScene(runner, scene({ reads: [[], ['input']], others: [sevenTab] }), async (s) => {
+      await s.ok(['type', 'x']);
+      assert.deepEqual(s.state.activated, [own(s), 'SEVEN']);
+      assert.equal(s.fake.calls.filter((call) => call.method === 'Input.insertText').length, 2);
+    });
+  });
+
+  test(`${transport}: a refused trusted double click is reported`, async () => {
+    const setup = scene();
+    setup.fake = { refuse: ['Input.dispatchMouseEvent'] };
+    await withScene(runner, setup, async (s) => {
+      const result = await s.run(['dblclick', s.ref]);
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /Input\.dispatchMouseEvent refused/);
     });
   });
 }

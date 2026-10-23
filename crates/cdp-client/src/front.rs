@@ -1,4 +1,3 @@
-const FRONT_SKIP: &[&str] = &["service_worker", "shared_worker", "worker", "worklet", "auction_worklet", "shared_storage_worklet", "browser", "iframe"];
 pub const FRONT_RESTORE: &str = "Error: the input landed, but the tab that was in front could not be brought back to the front.\n";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,12 +17,13 @@ impl Cdp {
         let context = text(&mine, "browserContextId");
         let window = self.front_window(&own).map_err(|_| self.refusal())?;
         if self.front_visible(&own) != Some(false) { return Err(self.refusal()) }
+        let mut shared = 0;
         let mut visible = Vec::new();
         let mut opaque = Vec::new();
         for info in &infos {
             let id = text(info, "targetId");
             let kind = text(info, "type");
-            if id == own || FRONT_SKIP.contains(&kind.as_str()) || top_chrome_target(info) { continue }
+            if id == own || kind == "iframe" || WINDOWLESS.contains(&kind.as_str()) || top_chrome(info) { continue }
             let other = text(info, "browserContextId");
             if !context.is_empty() && !other.is_empty() && other != context { continue }
             let open = !id.is_empty() && url::Url::parse(&text(info, "url")).is_ok() && !self.protected_targets.contains(&id) && !self.info_protected(info, &infos);
@@ -34,6 +34,7 @@ impl Cdp {
             };
             if !open && !same { return Err(self.refusal()) }
             if !same { continue }
+            shared += 1;
             match (open && kind == "page").then(|| self.front_visible(&id)).flatten() {
                 Some(true) => visible.push(id),
                 Some(false) => {}
@@ -41,13 +42,14 @@ impl Cdp {
             }
         }
         let restore = match (visible.as_slice(), opaque.as_slice()) {
-            ([front], _) => (front.clone(), false),
-            ([], [seven]) if text(seven, "type") == "page" && seven_page(&text(seven, "url")) => (text(seven, "targetId"), true),
+            _ if shared == 0 => None,
+            ([front], _) => Some((front.clone(), false)),
+            ([], [seven]) if text(seven, "type") == "page" && seven_page(&text(seven, "url")) => Some((text(seven, "targetId"), true)),
             _ => return Err(self.refusal()),
         };
         self.front_own(session).ok().filter(|again| again == &own).ok_or_else(|| self.refusal())?;
         self.raw_call("Target.activateTarget", json!({ "targetId": own }), None, DOCUMENT_CHECK)?;
-        Ok(Front { own, window, restore: Some(restore) })
+        Ok(Front { own, window, restore })
     }
 
     pub fn restore_front(&mut self, front: Front) -> Result<(), String> {
@@ -103,12 +105,6 @@ impl Cdp {
         self.guard_sessions.remove(&session);
         state
     }
-}
-
-fn top_chrome_target(info: &Value) -> bool {
-    info.get("type").and_then(Value::as_str) == Some("browser_ui")
-        && info.get("url").and_then(Value::as_str).and_then(|text| url::Url::parse(text).ok())
-            .is_some_and(|url| url.scheme() == "chrome" && url.host_str().is_some_and(|host| host.ends_with(".top-chrome")) && url.username().is_empty() && url.password().is_none())
 }
 
 fn seven_rules() -> &'static slicc_browsers::Seven {

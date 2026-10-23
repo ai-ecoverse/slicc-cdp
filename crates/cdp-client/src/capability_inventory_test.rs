@@ -1,9 +1,9 @@
 #[test]
 fn production_cdp_methods_have_a_lifetime_classification() {
     let document = set(&[
-        "DOM.describeNode", "DOM.getDocument", "DOM.getFrameOwner", "DOM.querySelectorAll", "DOM.resolveNode", "DOM.setFileInputFiles",
+        "DOM.describeNode", "DOM.getDocument", "DOM.getFrameOwner", "DOM.getNodeForLocation", "DOM.querySelectorAll", "DOM.resolveNode", "DOM.setFileInputFiles",
         "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.insertText",
-        "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree",
+        "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree", "Page.getLayoutMetrics",
         "Page.getNavigationHistory", "Page.handleJavaScriptDialog", "Page.getPermissionsPolicyState", "Page.navigate", "Page.printToPDF", "Page.reload",
         "Runtime.callFunctionOn", "Runtime.compileScript", "Runtime.evaluate", "Runtime.getProperties", "Runtime.releaseObjectGroup",
         "Debugger.resume",
@@ -20,10 +20,11 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Target.activateTarget", "Target.attachToTarget", "Target.closeTarget", "Target.createTarget",
         "Target.detachFromTarget", "Target.getTargetInfo", "Target.getTargets",
     ]);
-    let internal = set(&["Browser.getVersion", "Browser.getWindowForTarget", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker"]);
+    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker"]);
     let vetted_shim = set(&["Debugger.enable", "Debugger.getScriptSource", "Debugger.evaluateOnCallFrame", "Page.addScriptToEvaluateOnNewDocument", "Page.removeScriptToEvaluateOnNewDocument", "Runtime.runIfWaitingForDebugger", "Target.setAutoAttach"]);
+    let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);
     let network_state = set(&["Network.emulateNetworkConditions"]);
-    let inventory = [&document, &observation, &request, &origin, &target, &internal, &vetted_shim, &network_state];
+    let inventory = [&document, &observation, &request, &origin, &target, &internal, &vetted_shim, &window, &network_state];
     let mut methods: BTreeSet<String> = sent().into_iter()
         .filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs"))
         .map(|(method, _, _)| method)
@@ -45,6 +46,13 @@ fn production_cdp_methods_have_a_lifetime_classification() {
                 assert!(source.contains("vetted_source(SHIM)?"));
                 assert!(source.contains("sha256_hex(source.as_bytes()) != SHIM_HASH"));
                 assert!(source.contains("__slicc_webmcp_admitted"));
+                continue;
+            }
+            if window.contains(method) {
+                let guard = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
+                let source = fs::read_to_string(root().join("crates/cdp-client/src/window.rs")).unwrap();
+                assert!(guard.contains("if method == \"Browser.setWindowBounds\" {\n            self.admit_window(params, session_id)?;"));
+                assert!(source.contains("fn admit_window") && source.contains("self.info_protected(info, &infos)"));
                 continue;
             }
             if network_state.contains(method) {

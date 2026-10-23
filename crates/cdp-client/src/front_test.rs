@@ -42,7 +42,6 @@ impl Transport for FrontBackend {
             "Runtime.evaluate" if params["expression"] == "document.visibilityState" => {
                 json!({ "result": { "type": "string", "value": if browser.front == target { "visible" } else { "hidden" } } })
             }
-            "Runtime.evaluate" => json!({ "result": { "type": "string", "value": "complete" } }),
             "Browser.getWindowForTarget" => match browser.windows.get(params["targetId"].as_str().unwrap_or("")) {
                 Some(Value::Null) => {
                     self.inbox.push_back(json!({ "id": call["id"], "error": { "message": "No window" } }).to_string());
@@ -116,6 +115,16 @@ fn bringing_a_tab_forward_restores_seven_only_when_seven_was_in_front() {
 }
 
 #[test]
+fn bringing_a_tab_alone_in_its_window_forward_switches_nothing_back() {
+    let (mut cdp, session, browser) = front_client(vec![front_page("SEVEN", "https://seven.sliccy.ai/")], "NONE", vec![("SEVEN", front_window(3, "normal")), ("T", front_window(2, "normal"))]);
+    assert!(cdp.bring_forward(&session).is_err());
+    browser.borrow_mut().targets.remove(1);
+    let front = cdp.bring_forward(&session).unwrap();
+    cdp.restore_front(front).unwrap();
+    assert_eq!(front_activated(&browser), ["T"]);
+}
+
+#[test]
 fn bringing_a_tab_forward_restores_the_ordinary_tab_that_was_in_front() {
     let (mut cdp, session, browser) = front_client(vec![front_page("SEVEN", "https://seven.sliccy.ai/"), front_page("OTHER", "https://other.test/")], "OTHER", vec![]);
     let front = cdp.bring_forward(&session).unwrap();
@@ -127,7 +136,7 @@ fn bringing_a_tab_forward_restores_the_ordinary_tab_that_was_in_front() {
 fn bringing_a_tab_forward_is_refused_when_the_front_tab_is_not_provably_seven_or_ordinary() {
     let seven = || front_page("SEVEN", "https://seven.sliccy.ai/");
     for (extra, front, windows) in [
-        (vec![], "NONE", vec![]),
+        (vec![front_page("HIDDEN", "https://other.test/")], "NONE", vec![]),
         (vec![front_page("VAULT", "https://vault.sliccy.ai/")], "VAULT", vec![]),
         (vec![seven(), front_page("VAULT", "https://vault.sliccy.ai/")], "SEVEN", vec![]),
         (vec![seven()], "SEVEN", vec![("SEVEN", front_window(2, "normal"))]),

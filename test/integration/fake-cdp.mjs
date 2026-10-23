@@ -543,7 +543,13 @@ export async function fakeCdp({
           });
         case 'Runtime.evaluate': {
           const call = landingCall(params);
-          if (call) return answer({ result: { type: 'string', value: landing(...call, target) } });
+          const landed = call && landing(...call, target);
+          if (landed?.exception)
+            return answer({
+              result: { type: 'object' },
+              exceptionDetails: { text: landed.exception },
+            });
+          if (call) return answer({ result: { type: 'string', value: landed } });
           if (visibility && params.expression === 'document.visibilityState')
             return answer({ result: { type: 'string', value: visibility(target) } });
           if (params.expression === 'history.back()' && target?.history?.currentIndex > 0) {

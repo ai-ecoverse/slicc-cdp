@@ -576,7 +576,9 @@ impl Cdp {
         if let Some(reason) = shield::browser_wide(method, params, session_id, &self.contexts) {
             return Err(reason);
         }
-        if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
+        if method == "Browser.setWindowBounds" {
+            self.admit_window(params, session_id)?;
+        } else if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
             return Err("slicc: refused: persistent page capabilities are not supported by slicc-cdp\n".into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
@@ -3509,6 +3511,7 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
 
 include!("dialog.rs");
 include!("front.rs");
+include!("window.rs");
 
 #[cfg(test)]
 mod tests {
@@ -3540,6 +3543,7 @@ mod tests {
     include!("redirect_userinfo_test.rs");
     include!("guard_attach_tree_test.rs");
     include!("front_test.rs");
+    include!("window_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

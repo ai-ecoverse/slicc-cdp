@@ -160,7 +160,6 @@ fn landed(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted
     trusted(cdp)?;
     match run(cdp, scope, context, "read", json!({}), READ_WAIT) {
         Ok(Value::Array(seen)) => Ok(!seen.is_empty()),
-        Err(message) if message.starts_with("slicc: refused:") => Err(message),
         _ => Ok(true),
     }
 }
