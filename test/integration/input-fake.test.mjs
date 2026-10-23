@@ -642,6 +642,14 @@ test('resize is refused while a protected or unverified tab shares the browser p
             browserContextId: 'OTHER',
           },
           {
+            targetId: 'OMNIBOX',
+            type: 'browser_ui',
+            url: 'chrome://omnibox-popup.top-chrome/',
+            title: '',
+            attached: false,
+            browserContextId: 'CTX',
+          },
+          {
             targetId: 'SW',
             type: 'service_worker',
             url: 'https://seven.sliccy.ai/sw.js',

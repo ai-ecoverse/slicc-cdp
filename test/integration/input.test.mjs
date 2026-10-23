@@ -171,10 +171,22 @@ async function flow(runner, raw, port) {
   const sevenTab = await raw.open('http://seven.sliccy.ai/frame?k=WHEEL_SECRET');
   const background = await raw.open(`http://127.0.0.1:${port}/input`);
   try {
-    const on = async (expression) =>
-      JSON.parse(
-        (await run(['eval', `JSON.stringify(${expression})`, '--tab', background])).stdout
-      );
+    const on = async (expression) => {
+      const { sessionId } = await raw.send('Target.attachToTarget', {
+        targetId: background,
+        flatten: true,
+      });
+      try {
+        const { result } = await raw.send(
+          'Runtime.evaluate',
+          { expression, returnByValue: true },
+          sessionId
+        );
+        return result.value;
+      } finally {
+        await raw.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+      }
+    };
     assert.equal(await on('document.visibilityState'), 'hidden');
     await run(['mousemove', '100', '100', '--tab', background]);
     const started = Date.now();

@@ -68,6 +68,10 @@ fn window_bounds_are_admitted_for_an_ordinary_page_alone_in_its_profile() {
         vec![window_page("OTHER", "https://other.test/", "CTX")],
         vec![window_page("SEVEN", "https://seven.sliccy.ai/", "ELSEWHERE")],
         vec![json!({ "targetId": "SW", "type": "service_worker", "url": "https://seven.sliccy.ai/sw.js", "browserContextId": "CTX" })],
+        vec![
+            json!({ "targetId": "OMNIBOX", "type": "browser_ui", "url": "chrome://omnibox-popup.top-chrome/", "browserContextId": "CTX" }),
+            json!({ "targetId": "OMNIBOX2", "type": "browser_ui", "url": "chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html", "browserContextId": "CTX" }),
+        ],
     ] {
         let (mut cdp, session, browser) = window_client(extra.clone(), vec![]);
         cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_or_else(|error| panic!("{extra:?}: {error}"));
@@ -86,6 +90,11 @@ fn window_bounds_are_refused_when_a_protected_or_unknown_target_could_share_the_
         json!({ "targetId": "FRAME", "type": "iframe", "url": "https://vault.sliccy.ai/frame", "browserContextId": "CTX", "parentFrameId": "T" }),
         json!({ "targetId": "PANEL", "type": "other", "url": "chrome-extension://abc/panel.html", "browserContextId": "CTX" }),
         json!({ "targetId": "", "type": "page", "url": "https://other.test/", "browserContextId": "CTX" }),
+        window_page("FAKEUI", "chrome://omnibox-popup.top-chrome/", "CTX"),
+        json!({ "targetId": "UI", "type": "browser_ui", "url": "chrome://settings/", "browserContextId": "CTX" }),
+        json!({ "targetId": "UIEXT", "type": "browser_ui", "url": "chrome-extension://abc.top-chrome/panel.html", "browserContextId": "CTX" }),
+        json!({ "targetId": "UIUSER", "type": "browser_ui", "url": "chrome://seven@omnibox-popup.top-chrome/", "browserContextId": "CTX" }),
+        json!({ "targetId": "UISEVEN", "type": "browser_ui", "url": "https://seven.sliccy.ai/", "browserContextId": "CTX" }),
     ] {
         let (mut cdp, session, browser) = window_client(vec![extra.clone()], vec![]);
         let refused = cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).err().unwrap_or_else(|| panic!("{extra} was admitted"));

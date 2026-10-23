@@ -35,7 +35,7 @@ impl Cdp {
         if text(own, "type") != "page" || self.info_protected(own, &infos) { return Err(self.refusal()) }
         let context = text(own, "browserContextId");
         for info in &infos {
-            if text(info, "targetId") == target || WINDOWLESS.contains(&text(info, "type").as_str()) { continue }
+            if text(info, "targetId") == target || WINDOWLESS.contains(&text(info, "type").as_str()) || top_chrome(info) { continue }
             let other = text(info, "browserContextId");
             if !context.is_empty() && !other.is_empty() && other != context { continue }
             if text(info, "targetId").is_empty() || url::Url::parse(&text(info, "url")).is_err() || self.protected_targets.contains(&text(info, "targetId")) || self.info_protected(info, &infos) {
@@ -45,4 +45,10 @@ impl Cdp {
         if self.blocked.contains(session) || self.session_target(session).as_deref() != Some(target.as_str()) { return Err(self.refusal()) }
         Ok(target)
     }
+}
+
+fn top_chrome(info: &Value) -> bool {
+    info.get("type").and_then(Value::as_str) == Some("browser_ui")
+        && info.get("url").and_then(Value::as_str).and_then(|text| url::Url::parse(text).ok())
+            .is_some_and(|url| url.scheme() == "chrome" && url.host_str().is_some_and(|host| host.ends_with(".top-chrome")) && url.username().is_empty() && url.password().is_none())
 }
