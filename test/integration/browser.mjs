@@ -6,6 +6,9 @@ import path from 'node:path';
 import { requireChrome } from './chrome-policy.mjs';
 import { chromeLaunched } from './chrome-report.mjs';
 
+const workerDeadline = Date.now() + Number(process.env.SLICC_ROW_TIMEOUT_MS ?? 605000);
+const cleanupGrace = (deadlineAt = workerDeadline - 5000) =>
+  Math.max(30000, deadlineAt - Date.now());
 const { findBrowser } = await import(
   process.env.SLICC_FIXTURE_BROWSER_API ?? '../../src/browser.js'
 );
@@ -22,7 +25,7 @@ export function freePort() {
   });
 }
 
-export async function waitExit(exited, timeoutMs = 5000) {
+export async function waitExit(exited, timeoutMs = cleanupGrace()) {
   let timer;
   try {
     await Promise.race([
@@ -38,6 +41,7 @@ export async function waitExit(exited, timeoutMs = 5000) {
 
 export async function launchBrowser(extraArgs = [], options = {}) {
   requireChrome();
+  options.signal?.throwIfAborted();
   let port = options.port ?? 0;
   if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
@@ -65,24 +69,56 @@ export async function launchBrowser(extraArgs = [], options = {}) {
   child.stderr.on('data', (chunk) => {
     chromeLog = (chromeLog + chunk.toString('utf8')).slice(-4000);
   });
-  const stop = async () => {
-    const running = child.exitCode === null && !child.signalCode;
-    try {
-      if (process.platform === 'win32') child.kill('SIGKILL');
-      else process.kill(-child.pid, 'SIGKILL');
-    } catch {
-      if (running) child.kill('SIGKILL');
-    }
-    try {
-      if (running) await waitExit(exited);
-    } finally {
-      child.stderr.destroy();
-    }
+  let stopping;
+  const stop = () =>
+    (stopping ??= (async () => {
+      const running = child.exitCode === null && !child.signalCode;
+      const sendSignal = (signal) => {
+        try {
+          if (process.platform === 'win32') child.kill(signal);
+          else process.kill(-child.pid, signal);
+        } catch {
+          if (child.exitCode === null && !child.signalCode) child.kill(signal);
+        }
+      };
+      try {
+        if (running) {
+          sendSignal('SIGTERM');
+          try {
+            await waitExit(exited, cleanupGrace((options.deadlineAt ?? workerDeadline) + 30000));
+          } catch (error) {
+            sendSignal('SIGKILL');
+            process.stderr.write(
+              'HARNESS-AVAILABILITY {"phase":"browser-close","message":"grace expired; forced SIGKILL"}\n'
+            );
+            await waitExit(exited, cleanupGrace((options.deadlineAt ?? workerDeadline) + 30000));
+            throw error;
+          }
+        }
+      } finally {
+        child.stderr.destroy();
+      }
+    })());
+  const abort = () => {
+    void stop().catch(() => {});
   };
+  options.signal?.addEventListener('abort', abort, { once: true });
   try {
+    options.signal?.throwIfAborted();
     const status = () => chromeStatus(child, chromeLog);
-    if (!port) port = await activePort(userDataDir, status);
-    const version = await waitVersion(port, status);
+    if (!port)
+      port = await activePort(
+        userDataDir,
+        status,
+        options.signal,
+        options.deadlineAt ?? workerDeadline
+      );
+    const version = await waitVersion(
+      port,
+      status,
+      options.signal,
+      options.deadlineAt ?? workerDeadline
+    );
     const wsUrl = version.webSocketDebuggerUrl;
     if (typeof wsUrl !== 'string' || !wsUrl.startsWith('ws://') || /:922[2-9]\//.test(wsUrl)) {
       throw new Error(`unexpected debugger url ${wsUrl}`);
@@ -95,11 +131,13 @@ export async function launchBrowser(extraArgs = [], options = {}) {
         return child.exitCode !== null || child.signalCode ? chromeStatus(child, chromeLog) : null;
       },
       async close() {
+        options.signal?.removeEventListener('abort', abort);
         await stop();
         await rm(userDataDir, { recursive: true, force: true });
       },
     };
   } catch (error) {
+    options.signal?.removeEventListener('abort', abort);
     await stop();
     await rm(userDataDir, { recursive: true, force: true });
     throw error;
@@ -123,30 +161,40 @@ function chromeStatus(child, log) {
   return tail;
 }
 
-async function activePort(userDataDir, status) {
-  const deadline = Date.now() + 20000;
+async function activePort(userDataDir, status, signal, deadlineAt) {
+  const deadline = deadlineAt;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     const early = status();
     if (early.startsWith('chromium exited')) throw new Error(early);
     const text = await readFile(path.join(userDataDir, 'DevToolsActivePort'), 'utf8').catch(
       () => ''
     );
     const port = Number(text.split('\n')[0]);
-    if (Number.isInteger(port) && port > 0) return port;
+    if (Number.isInteger(port) && port > 0) {
+      if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
+      return port;
+    }
     await delay(100);
   }
   const detail = status();
   throw new Error(`chromium wrote no DevToolsActivePort${detail ? `\n${detail}` : ''}`);
 }
 
-async function waitVersion(port, status) {
-  const deadline = Date.now() + 20000;
+async function waitVersion(port, status, signal, deadlineAt) {
+  const deadline = deadlineAt;
   let last = 'no response';
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     const early = status();
     if (early.startsWith('chromium exited')) throw new Error(early);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+        signal: AbortSignal.any([
+          AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+          ...(signal ? [signal] : []),
+        ]),
+      });
       if (response.ok) return await response.json();
       last = `status ${response.status}`;
     } catch (error) {

@@ -1468,6 +1468,7 @@ fn parse_tabs(body: &str, origins: &[&str]) -> Option<Vec<TabDraft>> {
         if !seven && guard.url(url) {
             continue;
         }
+        let url = if seven { comparable_origin(url).unwrap_or_default() } else { url.to_string() };
         tabs.push(TabDraft {
             seven,
             id: item
@@ -1475,12 +1476,12 @@ fn parse_tabs(body: &str, origins: &[&str]) -> Option<Vec<TabDraft>> {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_string(),
-            url: url.to_string(),
-            title: item
+            url: url.clone(),
+            title: if seven { url } else { item
                 .get("title")
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
-                .to_string(),
+                .to_string() },
         });
     }
     Some(tabs)
@@ -2579,6 +2580,7 @@ fn path_exists(path: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    include!("discover_redaction_test.rs");
 
     #[test]
     fn empty_listing_keeps_every_section() {

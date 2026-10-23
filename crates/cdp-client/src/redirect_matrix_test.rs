@@ -1,5 +1,5 @@
 #[test]
-fn redirect_extra_info_pairing_and_ordinary_controls_remain_visible() {
+fn redirect_extra_info_before_an_unseen_request_is_withheld_and_ordinary_controls_remain_visible() {
     let url = redirect_url("seven");
     let ordinary_marker = "P0_ORDINARY_CONTROL_5D2B";
     let ordinary_url = format!("https://example.test/ordinary?control={ordinary_marker}");
@@ -7,9 +7,7 @@ fn redirect_extra_info_pairing_and_ordinary_controls_remain_visible() {
     cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"S","params":{"requestId":"R","statusCode":302,"headers":{"Location":url,"X-Control":"ordinary"},"headersText":format!("HTTP/1.1 302\r\nLocation: {url}\r\nX-Control: ordinary\r\n")}}));
     assert!(cdp.events().is_empty());
     cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"R","request":{"url":"https://example.test/start"}}}));
-    assert_eq!(cdp.events().len(), 2);
-    assert_eq!(cdp.events()[1]["params"]["headers"]["Location"], "https://seven.sliccy.ai");
-    assert_eq!(cdp.events()[1]["params"]["headers"]["X-Control"], "ordinary");
+    assert!(cdp.events().is_empty());
     assert!(cdp.call("Network.getResponseBody", json!({"requestId":"R"}), Some("S")).is_err());
     let headers = json!({"Location":ordinary_url,"Link":format!("<{ordinary_url}>; rel=preconnect"),"Refresh":format!("0;url={ordinary_url}")});
     cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"ORDINARY","request":{"url":ordinary_url},"redirectResponse":{"url":"https://example.test/start","status":302,"headers":headers}}}));

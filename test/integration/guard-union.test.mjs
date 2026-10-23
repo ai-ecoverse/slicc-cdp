@@ -42,7 +42,11 @@ test('strict verdicts take PASS or the declared skip with its reason, and nothin
   const declared = published.vectors.find((vector) => vector.skip);
   const plain = published.vectors.find(
     (vector) =>
-      vector.kind !== 'text' && !vector.skip && !vector.observable && !mandatory(vector.id)
+      vector.kind !== 'text' &&
+      !vector.skip &&
+      !vector.observable &&
+      !mandatory(vector.id) &&
+      !vector.id.startsWith('C8.protected-bfcache-restore')
   );
   const row = (vector, target, legs, reason) => ({
     id: vector.id,
@@ -73,7 +77,14 @@ test('strict verdicts take PASS or the declared skip with its reason, and nothin
   if (declared) {
     const { target, reason } = declared.skip;
     assert.deepEqual(verdictProblems([row(declared, target, 'skip', reason)]), []);
-    assert.deepEqual(verdictProblems([row(declared, target, 'skip', 'not-applicable')]), []);
+    if (reason === 'not-applicable')
+      assert.deepEqual(verdictProblems([row(declared, target, 'skip', reason)]), []);
+    else
+      assert.equal(
+        verdictProblems([row(declared, target, 'skip', 'not-applicable')]).length,
+        1,
+        'the declared reason is exact'
+      );
     assert.equal(
       verdictProblems([row(declared, target, 'skip', 'not-supported:browserSession')]).length,
       1
@@ -87,7 +98,11 @@ test('strict verdicts take PASS or the declared skip with its reason, and nothin
         'declared for another target only'
       );
   }
-  for (const id of ['C2.redirect-secret', 'C4.iframe-preattach.popup.shared']) {
+  for (const id of [
+    'C2.redirect-secret',
+    'C4.iframe-preattach.popup.shared',
+    'C8.protected-bfcache-restore.history',
+  ]) {
     const vector = { id, targets: ['ordinary'] };
     assert.equal(
       verdictProblems([{ ...row(vector, 'ordinary', 'skip', 'not-applicable') }]).length,
