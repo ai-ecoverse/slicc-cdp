@@ -93,6 +93,9 @@ pub fn global_help() -> String {
         "SLICC-only:".to_string(),
         row("frames", "list frame IDs for the current page"),
         String::new(),
+        "Install:".to_string(),
+        row("upgrade [--check]", "replace this binary with the latest release (alias: update)"),
+        String::new(),
         "Not implemented yet:".to_string(),
     ];
     let pending: Vec<&str> = spec::all()
@@ -143,6 +146,7 @@ pub fn command_help(spec: &Spec) -> String {
 
 fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
+        "upgrade" | "update" => crate::upgrade::usage(name),
         "open" => page(
             "open [url]",
             &[

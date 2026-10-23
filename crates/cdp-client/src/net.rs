@@ -130,17 +130,75 @@ pub fn http_post_json(url: &str, body: &str) -> Result<ProbeResponse, String> {
 
 #[cfg(not(target_os = "wasi"))]
 fn probe_request(method: &str, url: &str, headers: &str, body: &str) -> Result<ProbeResponse, String> {
+    exchange(
+        Exchange {
+            label: "probe",
+            method,
+            headers,
+            body,
+            cap: PROBE_MAX_BODY,
+            connect: Duration::from_secs(3),
+            read: Duration::from_secs(1),
+            total: Duration::from_secs(5),
+        },
+        url,
+    )
+}
+
+#[cfg(not(target_os = "wasi"))]
+pub fn http_fetch(url: &str, headers: &[(&str, &str)], cap: usize, total: Duration) -> Result<ProbeResponse, String> {
+    let mut lines = String::new();
+    for (name, value) in headers {
+        if [name, value].iter().any(|text| text.contains(['\r', '\n'])) {
+            return Err(format!("bad header {name}\n"));
+        }
+        lines.push_str(&format!("{name}: {value}\r\n"));
+    }
+    let response = exchange(
+        Exchange {
+            label: "download",
+            method: "GET",
+            headers: &lines,
+            body: "",
+            cap: cap.saturating_add(1),
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(30),
+            total,
+        },
+        url,
+    )?;
+    if response.body.len() > cap {
+        return Err(format!("{url} is larger than {cap} bytes\n"));
+    }
+    Ok(response)
+}
+
+#[cfg(not(target_os = "wasi"))]
+struct Exchange<'a> {
+    label: &'a str,
+    method: &'a str,
+    headers: &'a str,
+    body: &'a str,
+    cap: usize,
+    connect: Duration,
+    read: Duration,
+    total: Duration,
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn exchange(spec: Exchange<'_>, url: &str) -> Result<ProbeResponse, String> {
+    let Exchange { label, method, headers, body, cap, connect, read, total } = spec;
     let parts = parse_url(url)?;
     if parts.scheme != "http" && parts.scheme != "https" {
-        return Err(format!("probe URL must be http or https: {url}\n"));
+        return Err(format!("{label} URL must be http or https: {url}\n"));
     }
     refuse_real_debug_port(&parts);
     let addrs = candidates(&parts.host, parts.port)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let tcp = connect_any(&addrs, Duration::from_secs(3), Some(deadline))
-        .map_err(|err| format!("probe connect failed for {url}: {err}\n"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|err| format!("probe timeout setup failed: {err}\n"))?;
+    let deadline = Instant::now() + total;
+    let tcp = connect_any(&addrs, connect, Some(deadline))
+        .map_err(|err| format!("{label} connect failed for {url}: {err}\n"))?;
+    tcp.set_read_timeout(Some(read))
+        .map_err(|err| format!("{label} timeout setup failed: {err}\n"))?;
     tcp.set_nodelay(true).ok();
     let mut stream: Box<dyn ReadWrite> = if parts.scheme == "https" {
         wrap_tls(&parts.host, tcp)?
@@ -154,18 +212,23 @@ fn probe_request(method: &str, url: &str, headers: &str, body: &str) -> Result<P
     );
     stream
         .write_all(request.as_bytes())
-        .map_err(|err| format!("probe write failed for {url}: {err}\n"))?;
+        .map_err(|err| format!("{label} write failed for {url}: {err}\n"))?;
     if Instant::now() >= deadline {
-        return Err(format!("probe deadline exceeded for {url}\n"));
+        return Err(format!("{label} deadline exceeded for {url}\n"));
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     tcp_set_read_deadline(stream.as_mut(), remaining);
-    let (status, headers, body, _rest) = read_http_capped(stream.as_mut(), Some(PROBE_MAX_BODY), Some(deadline))?;
+    let (status, headers, body, _rest) = read_http_capped(stream.as_mut(), Some(cap), Some(deadline))?;
     Ok(ProbeResponse {
         status,
         headers,
         body,
     })
+}
+
+#[cfg(target_os = "wasi")]
+pub fn http_fetch(_url: &str, _headers: &[(&str, &str)], _cap: usize, _total: Duration) -> Result<ProbeResponse, String> {
+    Err("http_fetch not available on wasi\n".to_string())
 }
 
 #[cfg(target_os = "wasi")]
