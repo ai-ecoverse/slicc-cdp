@@ -179,7 +179,29 @@ pub struct Cdp {
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
+impl Drop for Cdp {
+    fn drop(&mut self) {
+        self.retire_private_sessions(Instant::now() + DOCUMENT_CHECK);
+    }
+}
+
 impl Cdp {
+    fn retire_private_sessions(&mut self, deadline: Instant) {
+        self.waiter = None;
+        let sessions = self.guard_sessions.clone();
+        for session in sessions {
+            if !self.guard_sessions.contains(&session) { continue }
+            if self.guards.values().any(|guard| guard == &session) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { let _ = self.send("Fetch.disable", json!({}), Some(&session)); }
+                else { let _ = self.raw_call("Fetch.disable", json!({}), Some(&session), left); }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { let _ = self.send("Target.detachFromTarget", json!({"sessionId":session}), None); }
+            else { let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":session}), None, left); }
+        }
+    }
+
     pub fn connect(url: &str) -> Result<Self, String> {
         Ok(Self::from_transport(Box::new(crate::net::ws_connect(url)?)))
     }

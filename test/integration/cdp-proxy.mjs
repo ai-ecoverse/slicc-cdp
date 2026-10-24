@@ -77,6 +77,7 @@ export async function cdpProxy(
     early = [],
     transform = (message) => message,
     observe = () => {},
+    connectionClosed = () => {},
     forwarded = () => {},
     before = [],
     holdEvents = () => false,
@@ -93,7 +94,9 @@ export async function cdpProxy(
   const releases = [];
   const sockets = new Set();
   let delayed = false;
+  let nextConnection = 0;
   const server = net.createServer((client) => {
+    const connection = ++nextConnection;
     sockets.add(client);
     const browser = net.connect(Number(upstream.port), upstream.hostname);
     sockets.add(browser);
@@ -127,7 +130,7 @@ export async function cdpProxy(
       for (const frame of out) {
         const message = json(frame);
         if (message) {
-          observe('client', message);
+          observe('client', message, connection);
           inbound?.outbound(message);
         }
         if (
@@ -213,7 +216,7 @@ export async function cdpProxy(
       fromBrowser = Buffer.from(rest);
       for (const frame of out) {
         const message = json(frame);
-        if (message) observe('browser', message);
+        if (message) observe('browser', message, connection);
         if (message?.method && holdEvents(message)) {
           heldEvents.push(message);
           releases.push(() => toClient(frame.raw));
@@ -256,7 +259,11 @@ export async function cdpProxy(
         else deliver();
       }
     });
+    let closed = false;
     const end = () => {
+      if (closed) return;
+      closed = true;
+      connectionClosed(connection);
       inbound?.close();
       client.destroy();
       browser.destroy();

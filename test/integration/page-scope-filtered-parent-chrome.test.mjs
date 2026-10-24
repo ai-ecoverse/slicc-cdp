@@ -131,7 +131,14 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     );
     assert.ok(child.parentFrameId);
     const wire = [];
-    const pending = new Map();
+    const peers = new Map();
+    const lifecycle = () =>
+      [...peers].map(([connection, peer]) => ({
+        connection,
+        closed: peer.closed,
+        sessions: [...peer.sessions.values()],
+        pauses: [...peer.pauses.values()],
+      }));
     const identities = new Map();
     const identity = (value) => {
       if (!value) return 0;
@@ -139,22 +146,65 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       return identities.get(value);
     };
     proxy = await cdpProxy(browser.wsUrl, {
-      observe(direction, message) {
+      connectionClosed(connection) {
+        const peer = peers.get(connection);
+        if (peer) peer.closed = true;
+      },
+      observe(direction, message, connection) {
+        if (!peers.has(connection))
+          peers.set(connection, {
+            closed: false,
+            pending: new Map(),
+            sessions: new Map(),
+            pauses: new Map(),
+          });
+        const peer = peers.get(connection);
+        const session = identity(message.sessionId);
         if (direction === 'client') {
           const entry = {
+            connection,
+            session,
+            target: identity(message.params?.targetId),
+            detached: identity(message.params?.sessionId),
+            request: identity(message.params?.requestId),
             method: message.method,
             type: message.params?.type,
             flush: message.method === 'Runtime.evaluate' && message.params?.expression === '0',
             sent: Date.now(),
           };
-          pending.set(message.id, entry);
+          peer.pending.set(message.id, entry);
           wire.push(entry);
           if (wire.length > 40) wire.shift();
-        } else if (message.id && pending.has(message.id)) {
-          const entry = pending.get(message.id);
-          pending.delete(message.id);
+        } else if (message.id && peer.pending.has(message.id)) {
+          const entry = peer.pending.get(message.id);
+          peer.pending.delete(message.id);
           entry.elapsed = Date.now() - entry.sent;
           entry.reply = message.error ? 'error' : 'success';
+          if (!message.error) {
+            if (entry.method === 'Target.attachToTarget') {
+              const attached = identity(message.result?.sessionId);
+              peer.sessions.set(attached, {
+                session: attached,
+                target: entry.target,
+                fetch: false,
+              });
+              entry.attached = attached;
+            }
+            if (entry.method === 'Target.detachFromTarget') peer.sessions.delete(entry.detached);
+            if (entry.method === 'Fetch.enable' && peer.sessions.has(entry.session))
+              peer.sessions.get(entry.session).fetch = true;
+            if (entry.method === 'Fetch.disable') {
+              if (peer.sessions.has(entry.session)) peer.sessions.get(entry.session).fetch = false;
+              for (const [key, pause] of peer.pauses)
+                if (pause.session === entry.session) peer.pauses.delete(key);
+            }
+            if (
+              /^Fetch\.(continueRequest|continueResponse|fulfillRequest|failRequest)$/.test(
+                entry.method
+              )
+            )
+              peer.pauses.delete(`${entry.session}:${entry.request}`);
+          }
           const frame = message.result?.frameTree?.frame;
           if (frame) {
             entry.frame = identity(frame.id);
@@ -163,8 +213,20 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
             entry.knownUrl = Boolean(frame.url);
             entry.knownOrigin = Boolean(frame.securityOrigin && frame.securityOrigin !== '://');
           }
-        } else if (message.method?.startsWith('Page.frame')) {
-          wire.push({ event: message.method });
+        } else {
+          if (message.method === 'Target.detachedFromTarget')
+            peer.sessions.delete(identity(message.params?.sessionId));
+          if (message.method === 'Fetch.requestPaused') {
+            const request = identity(message.params?.requestId);
+            peer.pauses.set(`${session}:${request}`, {
+              session,
+              request,
+              type: message.params?.resourceType,
+            });
+            wire.push({ connection, event: message.method, session, request });
+          } else if (message.method?.startsWith('Page.frame')) {
+            wire.push({ connection, event: message.method, session });
+          }
           if (wire.length > 40) wire.shift();
         }
       },
@@ -216,12 +278,17 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
           )
         ).result.value === 'visible'
     );
+    const beforeDrag = lifecycle();
     wire.length = 0;
     const dragged = await runner.playwright(
       ['drag', ref(drag, 'Drag source'), ref(drag, 'Drop target')],
       cwd
     );
-    assert.equal(dragged.code, 0, `drag: ${dragged.stderr} ${JSON.stringify(wire)}`);
+    assert.equal(
+      dragged.code,
+      0,
+      `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, afterDrag: lifecycle(), wire })}`
+    );
     await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const denied = await runner.playwright(['eval', '--tab', background, 'document.title'], cwd);
     assert.notEqual(denied.code, 0);
