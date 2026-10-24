@@ -779,7 +779,7 @@ impl Cdp {
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
-        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope(session)?) } else { None };
+        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope_state(session)?) } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -814,6 +814,8 @@ impl Cdp {
                 let mut state = if self.document_paused(&target) {
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
+                } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, _)| proof.0 == target) {
+                    state.clone()
                 } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
@@ -828,7 +830,7 @@ impl Cdp {
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
-                state.page_scope = page_scope;
+                state.page_scope = page_scope.map(|(proof, _)| proof);
                 checks.push((target, state));
             }
         }
@@ -926,12 +928,16 @@ impl Cdp {
 
     fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool, stable_page: bool) -> Result<(), String> {
         for (target, expected) in checks {
-            if let Some(proof) = &expected.page_scope {
+            let current = if let Some(proof) = &expected.page_scope {
                 let session = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
-                let current = self.verify_page_scope(Some(&session))?;
+                let (current, state) = self.verify_page_scope_state(Some(&session))?;
                 if stable_page && &current != proof { return Err(self.refusal()) }
-            }
-            let current = self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
+                (current.0 == *target).then_some(state)
+            } else { None };
+            let current = match current {
+                Some(state) => state,
+                None => self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?,
+            };
             if same_document && &current != expected { return Err(self.refusal()) }
         }
         Ok(())

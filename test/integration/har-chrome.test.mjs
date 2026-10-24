@@ -84,7 +84,7 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
     const barrierLoad = raw.event('Page.loadEventFired', sessionId);
     await raw.send('Page.navigate', { url: `${origin}/before-protected` }, sessionId);
     await barrierLoad.seen;
-    await held.event('checkpoint');
+    await held.event('checkpoint', (event) => event.entries >= 3);
     const checkpoint = JSON.parse(await readFile(file, 'utf8'));
     for (const pathname of ['/initial', '/ordinary-api', '/redirect']) {
       assert.ok(
@@ -194,12 +194,14 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
       );
   } catch (error) {
     const output = held?.output();
-    error.message = [
+    const context = [
       error.message,
       `holder stdout:\n${output?.stdout ?? ''}`,
       `holder stderr:\n${output?.stderr ?? ''}`,
       `fixture hits: ${JSON.stringify(hits.map((hit) => `${hit.host}${hit.url}`))}`,
     ].join('\n');
+    error.stack = `${error.stack}\n${context}`;
+    error.message = context;
     throw error;
   } finally {
     held?.child.kill('SIGKILL');

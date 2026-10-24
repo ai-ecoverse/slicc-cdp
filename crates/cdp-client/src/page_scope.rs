@@ -10,6 +10,10 @@ pub(super) fn content(method: &str) -> bool {
 
 impl Cdp {
     pub(super) fn verify_page_scope(&mut self, session: Option<&str>) -> Result<(String, u64, u64), String> {
+        self.verify_page_scope_state(session).map(|(proof, _)| proof)
+    }
+
+    pub(super) fn verify_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
         let target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
         let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, DOCUMENT_CHECK).map_err(|_| self.refusal())?;
         let infos = listed.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.refusal())?;
@@ -96,7 +100,18 @@ impl Cdp {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
             self.note_parent(id, &evidence[4]);
         }
-        Ok((page, epoch, unknown))
+        let proof = (page.clone(), epoch, unknown);
+        let state = DocumentState { frames, worker:None, scope:None, epoch:self.document_epochs.get(&page).copied().unwrap_or(0), page_scope:Some(proof.clone()) };
+        if target == page && !self.document_paused(&page) {
+            for (id, evidence) in &state.frames {
+                self.frame_decisions.insert(id.clone(), false);
+                if !evidence[0].is_empty() { self.document_versions.insert((page.clone(), id.clone()), evidence[0].clone()); }
+            }
+            let mut cached = state.clone();
+            cached.page_scope = None;
+            self.cached_documents.insert(page, cached);
+        }
+        Ok((proof, state))
     }
 
     fn page_scope_inventory(&mut self, selected: &str, selected_info: &Value, candidates: &[Value], deadline: Instant) -> Result<(Vec<Value>, BTreeMap<String, Value>), String> {
