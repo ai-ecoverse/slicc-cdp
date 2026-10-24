@@ -50,6 +50,7 @@ export const CHROME_FILES = new Set(
     'launch',
     'page-tools',
     'page-scope-chrome',
+    'page-scope-filtered-parent-chrome',
     'plant',
     'privileged-ui',
     'real-extension',
