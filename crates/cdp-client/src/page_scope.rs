@@ -16,15 +16,15 @@ impl Cdp {
         let selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
         if !matches!(selected.get("type").and_then(Value::as_str), Some("page" | "iframe")) { return Err(self.refusal()) }
         let context = selected.get("browserContextId").cloned();
-        let has_iframes = infos.iter().any(|info| info.get("browserContextId") == context.as_ref() && info.get("type").and_then(Value::as_str) == Some("iframe"));
-        let infos: Vec<Value> = infos.iter().filter(|info| info.get("browserContextId") == context.as_ref()
-            && matches!(info.get("type").and_then(Value::as_str), Some("page" | "iframe"))
-            && (has_iframes || info.get("targetId").and_then(Value::as_str) == Some(&target))).cloned().collect();
+        let candidates: Vec<Value> = infos.iter().filter(|info| info.get("browserContextId") == context.as_ref()
+            && matches!(info.get("type").and_then(Value::as_str), Some("page" | "iframe"))).cloned().collect();
+        let epochs = self.page_scope_epochs.clone();
+        let unknown = self.page_scope_unknown;
+        let deadline = Instant::now() + DOCUMENT_CHECK;
+        let (infos, mut trees) = self.page_scope_inventory(&target, selected, &candidates, deadline)?;
         if infos.len() > MAX_TARGETS { return Err(self.refusal()) }
         let mut ids = BTreeSet::new();
         if infos.iter().any(|info| info.get("targetId").and_then(Value::as_str).is_none_or(|id| !ids.insert(id))) { return Err(self.refusal()) }
-        let epochs = self.page_scope_epochs.clone();
-        let unknown = self.page_scope_unknown;
         for info in &infos {
             if let Some(id) = info.get("targetId").and_then(Value::as_str) { self.targets.insert(id.to_string(), info.clone()); }
         }
@@ -33,7 +33,6 @@ impl Cdp {
         let mut target_roots = BTreeMap::new();
         let mut iframe_roots = Vec::new();
         let mut protected_iframes = Vec::new();
-        let deadline = Instant::now() + DOCUMENT_CHECK;
         for info in &infos {
             let id = info.get("targetId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?;
             let url = info.get("url").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
@@ -46,7 +45,7 @@ impl Cdp {
                 if iframe { iframe_roots.push(id.to_string()); protected_iframes.push(id.to_string()); } else { roots.insert(id.to_string(), id.to_string()); }
                 continue;
             }
-            let mut tree = self.page_scope_tree(id, deadline)?;
+            let mut tree = trees.remove(id).ok_or_else(|| self.refusal())?;
             let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.refusal())?;
             let root = frame.get("id").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?.to_string();
             if iframe {
@@ -98,6 +97,54 @@ impl Cdp {
             self.note_parent(id, &evidence[4]);
         }
         Ok((page, epoch, unknown))
+    }
+
+    fn page_scope_inventory(&mut self, selected: &str, selected_info: &Value, candidates: &[Value], deadline: Instant) -> Result<(Vec<Value>, BTreeMap<String, Value>), String> {
+        let pages = candidates.iter().filter(|info| info.get("type").and_then(Value::as_str) == Some("page")
+            && (selected_info.get("type").and_then(Value::as_str) == Some("iframe") || info.get("targetId").and_then(Value::as_str) == Some(selected)));
+        let mut found = None;
+        for page in pages {
+            let id = page.get("targetId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+            if self.info_protected(page, &[]) || self.protected_targets.contains(id) { continue }
+            let tree = self.page_scope_tree(id, deadline)?;
+            let root = tree.get("frameTree").ok_or_else(|| self.refusal())?;
+            if root.pointer("/frame/parentId").is_some() { return Err(self.refusal()) }
+            let mut nodes = BTreeMap::new();
+            Self::page_scope_nodes(root, None, &mut nodes).ok_or_else(|| self.refusal())?;
+            let mut infos = vec![page.clone()];
+            let mut trees = BTreeMap::from([(id.to_string(), tree)]);
+            let mut pending = candidates.iter().filter(|info| info.get("type").and_then(Value::as_str) == Some("iframe")).cloned().collect::<Vec<_>>();
+            loop {
+                let from = infos.len();
+                let mut remaining = Vec::new();
+                for info in pending {
+                    let target = info.get("targetId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+                    let parent = info.get("parentFrameId").and_then(Value::as_str);
+                    if parent.is_none_or(|parent| !nodes.contains_key(parent)) { remaining.push(info); continue }
+                    let parent = parent.unwrap();
+                    if self.info_protected(&info, &[]) || self.protected_targets.contains(target) {
+                        nodes.entry(target.to_string()).or_insert_with(|| json!({"id":target,"parentId":parent}));
+                    } else {
+                        let mut tree = self.page_scope_tree(target, deadline)?;
+                        let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.refusal())?;
+                        if frame.get("parentId").is_some_and(|id| id.as_str() != Some(parent)) { return Err(self.refusal()) }
+                        frame["parentId"] = json!(parent);
+                        Self::page_scope_nodes(&tree["frameTree"], Some(parent), &mut nodes).ok_or_else(|| self.refusal())?;
+                        trees.insert(target.to_string(), tree);
+                    }
+                    infos.push(info);
+                    if infos.len() > MAX_TARGETS { return Err(self.refusal()) }
+                }
+                pending = remaining;
+                if infos.len() == from { break }
+            }
+            if pending.iter().any(|info| info.get("targetId").and_then(Value::as_str).is_some_and(|target| nodes.contains_key(target) || self.page_scope_owner(target).as_deref() == Some(id))) { return Err(self.refusal()) }
+            if id == selected || infos.iter().any(|info| info.get("targetId").and_then(Value::as_str) == Some(selected)) {
+                if found.is_some() { return Err(self.refusal()) }
+                found = Some((infos, trees));
+            }
+        }
+        found.ok_or_else(|| self.refusal())
     }
 
     fn page_scope_tree(&mut self, target: &str, deadline: Instant) -> Result<Value, String> {
