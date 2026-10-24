@@ -5,10 +5,12 @@ use crate::commands::resolve_target;
 use crate::route::Glob;
 use crate::session::{self, Session};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -323,21 +325,7 @@ impl Holder {
                 self.pause()?;
             }
             if Instant::now() >= retry {
-                if self.session.is_none() {
-                    let mut fresh = Cdp::connect(endpoint)?;
-                    let pages = browser::list_pages(&mut fresh)?;
-                    let found = pages.iter().any(|page| page.target_id == self.target && ordinary(fresh.guard(), &page.url));
-                    fresh.trail(|| format!("holder fresh ordinary={found}"));
-                    if found {
-                        let attached = attach(&mut fresh, state, &self.target);
-                        fresh.trail(|| format!("holder fresh attached={}", attached.is_ok()));
-                        if let Ok(session) = attached {
-                            *cdp = fresh;
-                            self.session = Some(session);
-                            self.seen = cdp.events().len();
-                        }
-                    }
-                }
+                if self.session.is_none() { self.reattach(cdp, state, endpoint)?; }
                 let verified = self.verify(cdp);
                 cdp.trail(|| format!("holder verify attached={} verified={} paused={}", self.session.is_some(), verified.is_some(), self.paused));
                 if let Some(loader) = verified {
@@ -354,6 +342,35 @@ impl Holder {
             }
             for notice in cdp.take_notices() { eprint!("{notice}"); }
             cdp.pump(Instant::now() + Duration::from_millis(50))?;
+        }
+    }
+
+    fn reattach(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str) -> Result<(), String> {
+        let previous = Rc::new(RefCell::new(Some(std::mem::replace(cdp, Cdp::connect(endpoint)?))));
+        let pumped = Rc::clone(&previous);
+        cdp.set_waiter(Some(Box::new(move |_: &Cdp| {
+            if let Some(previous) = pumped.borrow_mut().as_mut() { drain(previous); }
+        })));
+        let attached = browser::list_pages(cdp).map(|pages| {
+            let found = pages.iter().any(|page| page.target_id == self.target && ordinary(cdp.guard(), &page.url));
+            cdp.trail(|| format!("holder fresh ordinary={found}"));
+            if !found { return None }
+            let attached = attach(cdp, state, &self.target);
+            cdp.trail(|| format!("holder fresh attached={}", attached.is_ok()));
+            attached.ok()
+        });
+        cdp.set_waiter(None);
+        let previous = previous.borrow_mut().take();
+        match attached {
+            Ok(Some(session)) => {
+                self.session = Some(session);
+                self.seen = cdp.events().len();
+                Ok(())
+            }
+            attached => {
+                if let Some(previous) = previous { *cdp = previous; }
+                attached.map(|_| ())
+            }
         }
     }
 
@@ -490,6 +507,12 @@ impl Holder {
         } else { None };
         self.entries.push(entry(cdp, &pending, content.as_ref(), self.credentials, can_embed && pending.ordinary_document, self.minimal));
         Ok(())
+    }
+}
+
+fn drain(cdp: &mut Cdp) {
+    for _ in 0..64 {
+        if !matches!(cdp.pump(Instant::now() + Duration::from_millis(1)), Ok(true)) { break }
     }
 }
 
