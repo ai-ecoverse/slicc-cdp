@@ -185,11 +185,19 @@ async function rawInput(pw, raw, tab, seven) {
   await until(log, 'mousedown:src mouseup:dst click:pad', 'drag');
   assert.equal(await inTab(raw, tab, 'window.moved'), 'dst:1');
 
-  console.log('drag diagnostic', await inTab(raw, tab, 'window.inputDiagnostic'));
-  await inTab(raw, tab, 'window.inputDiagnostic.length = 0');
   await clear();
+  await inTab(raw, tab, 'window.inputDiagnostic.length = 0');
   await pw(['mousemove', '70', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'src:0', 'mousemove');
+  console.log(
+    'selection before separate press',
+    await inTab(
+      raw,
+      tab,
+      `(() => { const selection = getSelection(); const range = selection.rangeCount ? selection.getRangeAt(0) : null; return { text: selection.toString(), rangeCount: selection.rangeCount, collapsed: selection.isCollapsed, start: range?.startContainer.nodeName, startParent: range?.startContainer.parentElement?.id, startOffset: range?.startOffset, end: range?.endContainer.nodeName, endParent: range?.endContainer.parentElement?.id, endOffset: range?.endOffset, sourceSelected: selection.containsNode(document.getElementById('src'), true) }; })()`
+    )
+  );
+  await inTab(raw, tab, 'getSelection().removeAllRanges()');
   await pw(['mousedown']);
   await pw(['mousemove', '350', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'dst:1', 'mousemove with the button held');
