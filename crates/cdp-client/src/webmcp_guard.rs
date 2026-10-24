@@ -232,11 +232,21 @@ impl Cdp {
         }
     }
 
-    fn webmcp_frame_verified(&self, frame: &Value) -> bool {
+    fn webmcp_frame_refusal(&self, frame: &Value) -> Option<&'static str> {
         let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
-        let web = url::Url::parse(text("url")).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == text("securityOrigin"));
-        web && !text("id").is_empty() && !text("loaderId").is_empty() && text("unreachableUrl").is_empty()
-            && !self.guard.url(text("url")) && !self.guard.url(text("securityOrigin"))
+        if text("url").is_empty() { return Some("empty document URL"); }
+        let Ok(url) = url::Url::parse(text("url")) else { return Some("unknown document URL"); };
+        if self.guard.url(text("url")) || self.guard.url(text("securityOrigin")) { return Some("protected document"); }
+        if !matches!(url.scheme(), "http" | "https") { return Some("non-HTTP document"); }
+        if url.origin().ascii_serialization() != text("securityOrigin") { return Some("document origin mismatch"); }
+        if text("id").is_empty() { return Some("missing frame id"); }
+        if text("loaderId").is_empty() { return Some("missing document loader"); }
+        if !text("unreachableUrl").is_empty() { return Some("unreachable document"); }
+        None
+    }
+
+    fn webmcp_frame_verified(&self, frame: &Value) -> bool {
+        self.webmcp_frame_refusal(frame).is_none()
     }
 
     fn webmcp_tree_verified(&self, tree: &Value, frame: Option<&str>) -> bool {
@@ -541,10 +551,15 @@ impl Cdp {
             }
         }
         if method == "Page.frameNavigated" {
-            let invalid = !self.webmcp_frame_verified(&value["params"]["frame"]);
             let frame = &value["params"]["frame"];
-            let initial_child = frame.get("parentId").is_some() && frame.get("url").and_then(Value::as_str) == Some("about:blank") && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty());
-            if invalid && !initial_child { self.webmcp_revoke(session); }
+            let initial_child = (frame.get("parentId").is_some() || self.webmcp.parents.contains_key(session))
+                && frame.get("url").and_then(Value::as_str).is_some_and(|url| url.is_empty() || url == "about:blank")
+                && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty());
+            if let Some(reason) = self.webmcp_frame_refusal(frame).filter(|_| !initial_child) {
+                let role = if self.webmcp.parents.contains_key(session) { "OOPIF" } else if frame.get("parentId").is_some() { "subframe" } else { "top frame" };
+                self.notices.push(format!("webmcp-polyfill: frame navigation refused ({role}, {reason})\n"));
+                self.webmcp_revoke(session);
+            }
             self.webmcp_navigated(session, value);
         }
         if method == "Debugger.paused" {

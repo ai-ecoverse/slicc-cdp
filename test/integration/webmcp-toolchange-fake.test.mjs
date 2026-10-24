@@ -634,6 +634,45 @@ await test('fake: late protected frame evidence does not revoke a fresh ordinary
   );
 });
 
+for (const url of ['about:blank', '']) {
+  await test(`fake: a provisional OOPIF root navigation without parentId stays gated for ${url || 'empty URL'}`, async () => {
+    let provisional = false;
+    await scenario(
+      {
+        children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
+        onCommand(message, pages, send, sessions) {
+          if (
+            provisional ||
+            message.method !== 'Page.addScriptToEvaluateOnNewDocument' ||
+            sessions.get(message.sessionId) !== 'CROSS'
+          )
+            return;
+          provisional = true;
+          const page = pages.get('CROSS');
+          send({
+            method: 'Page.frameNavigated',
+            sessionId: message.sessionId,
+            params: {
+              frame: { id: page.id, loaderId: page.loader, url, securityOrigin: page.origin },
+            },
+          });
+        },
+      },
+      async ({ backend, held }) => {
+        assert.equal(provisional, true);
+        const from = held.lines.length;
+        backend.pages.get('CROSS').document.modelContext.registerTool({
+          name: 'after_provisional',
+          exposedTo: ['https://ordinary.test'],
+          execute: () => 'after_provisional',
+        });
+        assert.deepEqual(names(await held.next(changed('CROSS'), from)), ['after_provisional']);
+        assert.doesNotMatch(held.stderr(), /refused|target closed/);
+      }
+    );
+  });
+}
+
 await test('fake: a pending change is dropped when the document navigates, and the next document reports its own generation', async () => {
   let pending = false;
   let backend;
