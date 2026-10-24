@@ -131,10 +131,40 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     );
     assert.ok(child.parentFrameId);
     const wire = [];
+    const pending = new Map();
+    const identities = new Map();
+    const identity = (value) => {
+      if (!value) return 0;
+      if (!identities.has(value)) identities.set(value, identities.size + 1);
+      return identities.get(value);
+    };
     proxy = await cdpProxy(browser.wsUrl, {
       observe(direction, message) {
         if (direction === 'client') {
-          wire.push({ method: message.method, type: message.params?.type });
+          const entry = {
+            method: message.method,
+            type: message.params?.type,
+            flush: message.method === 'Runtime.evaluate' && message.params?.expression === '0',
+            sent: Date.now(),
+          };
+          pending.set(message.id, entry);
+          wire.push(entry);
+          if (wire.length > 40) wire.shift();
+        } else if (message.id && pending.has(message.id)) {
+          const entry = pending.get(message.id);
+          pending.delete(message.id);
+          entry.elapsed = Date.now() - entry.sent;
+          entry.reply = message.error ? 'error' : 'success';
+          const frame = message.result?.frameTree?.frame;
+          if (frame) {
+            entry.frame = identity(frame.id);
+            entry.loader = identity(frame.loaderId);
+            entry.parent = identity(frame.parentId);
+            entry.knownUrl = Boolean(frame.url);
+            entry.knownOrigin = Boolean(frame.securityOrigin && frame.securityOrigin !== '://');
+          }
+        } else if (message.method?.startsWith('Page.frame')) {
+          wire.push({ event: message.method });
           if (wire.length > 40) wire.shift();
         }
       },
