@@ -251,12 +251,14 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     ).sessionId;
     assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
     await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
-    const ordinaryFramesReady = held.next(
-      (line) => line.event === 'document-ready' && line.loaderId !== document.loaderId,
-      held.lines.length
-    );
+    assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+    assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
+    held.child.stdin.end();
+    assert.equal(await held.ended, 0, held.stderr());
+    held = undefined;
     await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    await ordinaryFramesReady;
+    held = stream(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    await held.next((line) => line.event === 'ready', 0);
     const cross = (await raw.send('Target.getTargets', {})).targetInfos.find(
       (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
     );

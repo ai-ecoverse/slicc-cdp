@@ -10,6 +10,7 @@ const literals = (text) =>
 const events = new Set([
   'Audits.issueAdded',
   'CSS.styleSheetAdded',
+  'DOM.documentUpdated',
   'Debugger.paused',
   'Debugger.scriptFailedToParse',
   'Debugger.scriptParsed',

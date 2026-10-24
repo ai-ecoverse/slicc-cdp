@@ -1843,12 +1843,12 @@ impl Cdp {
         let Some(session) = session_id else {
             return Ok(true);
         };
-        self.verify_page_scope(Some(session))?;
         let tree = match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
             Ok(tree) => tree,
             Err(message) if transport_error(&message) => return Err(message),
             Err(_) => return Ok(true),
         };
+        self.verify_page_scope(Some(session))?;
         Ok(tree.get("frameTree").is_none_or(|node| self.tree_node_refused(node)))
     }
 
