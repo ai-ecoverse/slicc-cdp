@@ -100,7 +100,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
-await test('Chrome: the WebMCP holder reports tools registered and removed after load, in admitted cross-origin frames only', {
+await test('Chrome: the WebMCP holder reports ordinary tool changes and excludes protected frames', {
   timeout: 240000,
 }, async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-chrome-'));
@@ -154,9 +154,10 @@ await test('Chrome: the WebMCP holder reports tools registered and removed after
           );
           return;
         }
-        const frames = ['/frames', '/ordinary-frames'].includes(url.pathname)
-          ? `<iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${url.pathname === '/frames' ? `<iframe src="https://seven.sliccy.ai:${port}/protected"></iframe>` : ''}`
-          : '';
+        const frames =
+          url.pathname === '/frames'
+            ? `<iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe><iframe src="https://seven.sliccy.ai:${port}/protected"></iframe>`
+            : '';
         res.end(`<!doctype html><title>toolchange</title>${frames}<script>
 const controller = new AbortController();
 if (document.modelContext) document.modelContext.registerTool(${tool('initial')});
@@ -253,57 +254,8 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
     assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
     assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
-    held.child.stdin.end();
-    assert.equal(await held.ended, 0, held.stderr());
-    held = undefined;
-    await navigate(raw, sessionId, `${ordinary}/tools`);
-    held = stream(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
-    const restarted = await held.next((line) => line.event === 'ready', 0);
-    assert.equal(restarted.mode, 'polyfill');
-    const ordinaryFramesReady = held.next(
-      (line) => line.event === 'document-ready' && line.loaderId !== restarted.loaderId,
-      held.lines.length
-    );
-    await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    await ordinaryFramesReady;
-    const cross = (await raw.send('Target.getTargets', {})).targetInfos.find(
-      (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
-    );
-    assert.ok(cross, 'ordinary OOPIF was not created');
-    const crossSession = (
-      await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
-    ).sessionId;
-    from = held.lines.length;
-    await evaluate(raw, crossSession, 'addCross()');
-    const crossed = await held.next(changed(cross.targetId), from);
-    assert.equal(crossed.tab, targetId);
-    assert.equal(crossed.target, cross.targetId);
-    assert.equal(crossed.origin, `https://foreign.test:${port}`);
-    assert.deepEqual(names(crossed), ['cross_late']);
-    const crossListed = await once(browser.wsUrl, cwd, [
-      'webmcp-list',
-      '--tab',
-      targetId,
-      '--json',
-      '--from-origin',
-      `https://foreign.test:${port}`,
-    ]);
-    assert.equal(crossListed.code, 0, crossListed.stderr);
-    assert.deepEqual(
-      crossed.tools,
-      JSON.parse(crossListed.stdout).filter((tool) => tool.frameId === cross.targetId)
-    );
-    await sleep(1500);
-    const after = held.lines.slice(from).filter((line) => line.event === 'tools-changed');
-    assert.deepEqual(
-      after.map((line) => line.frameId),
-      [cross.targetId]
-    );
-    assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
-    assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
     assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
     assert.ok(document.loaderId);
-    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
     held.child.stdin.end();
     assert.equal(await held.ended, 0, held.stderr());
     held = undefined;

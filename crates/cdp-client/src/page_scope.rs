@@ -106,7 +106,10 @@ impl Cdp {
         let session = match self.guards.get(target).or_else(|| self.page_scope_sessions.get(target)).cloned() {
             Some(session) => session,
             None => {
-                let result = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, left).map_err(|_| self.refusal())?;
+                self.guarding.insert(target.to_string());
+                let attached = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, left);
+                self.guarding.remove(target);
+                let result = attached.map_err(|_| self.refusal())?;
                 let session = result.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?.to_string();
                 self.guard_sessions.insert(session.clone());
                 self.session_targets.insert(session.clone(), target.to_string());
