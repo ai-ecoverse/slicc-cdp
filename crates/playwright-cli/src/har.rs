@@ -5,10 +5,12 @@ use crate::commands::resolve_target;
 use crate::route::Glob;
 use crate::session::{self, Session};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -169,7 +171,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     let path = if path.is_absolute() { path } else { invocation.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default().join(path) };
     let mut holder = Holder {
         files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
-        entries: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), denied: BTreeSet::new(),
+        entries: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
         embed: invocation.flags.get("content").is_some_and(|value| value == "embed"),
         minimal: invocation.flags.get("mode").is_some_and(|value| value == "minimal"),
         credentials: invocation.flags.get("include-credentials").is_some_and(|value| value == "true"),
@@ -247,6 +249,7 @@ struct Holder {
     entries: Vec<Value>,
     pending: BTreeMap<String, Pending>,
     failed: BTreeMap<String, Pending>,
+    held: Vec<(String, Pending, bool)>,
     denied: BTreeSet<String>,
     embed: bool,
     minimal: bool,
@@ -315,29 +318,20 @@ impl Holder {
                 if let Some(session) = self.session.take() { cdp.set_decider(&session, None); cdp::detach(cdp, &session); }
                 self.pending.clear();
                 self.failed.clear();
+                self.held.clear();
                 self.checkpoint(cdp)?;
                 emit(self.status("checkpoint"))?;
                 self.pause()?;
             }
             if Instant::now() >= retry {
-                if self.session.is_none() {
-                    let mut fresh = Cdp::connect(endpoint)?;
-                    let pages = browser::list_pages(&mut fresh)?;
-                    if pages.iter().any(|page| page.target_id == self.target && ordinary(fresh.guard(), &page.url)) {
-                        if let Ok(session) = attach(&mut fresh, state, &self.target) {
-                            *cdp = fresh;
-                            self.session = Some(session);
-                            self.seen = cdp.events().len();
-                        }
-                    }
-                }
-                let verified = self.verify(cdp);
-                if verified.is_some() {
+                if self.session.is_none() { self.reattach(cdp, state, endpoint)?; }
+                if let Some(loader) = self.verify(cdp) {
                     if self.paused { self.paused = false; emit(self.status("resumed"))?; }
+                    self.release(cdp, &loader, false)?;
                 } else {
                     if self.absorb(cdp)? { return Ok("closed".into()) }
-                    self.pending.clear();
-                    self.failed.clear();
+                    self.pending.retain(|_, pending| pending.recovering_document);
+                    self.failed.retain(|_, pending| pending.recovering_document);
                     self.checkpoint(cdp)?;
                     self.pause()?;
                 }
@@ -345,6 +339,31 @@ impl Holder {
             }
             for notice in cdp.take_notices() { eprint!("{notice}"); }
             cdp.pump(Instant::now() + Duration::from_millis(50))?;
+        }
+    }
+
+    fn reattach(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str) -> Result<(), String> {
+        let previous = Rc::new(RefCell::new(Some(std::mem::replace(cdp, Cdp::connect(endpoint)?))));
+        let pumped = Rc::clone(&previous);
+        cdp.set_waiter(Some(Box::new(move |_: &Cdp| {
+            if let Some(previous) = pumped.borrow_mut().as_mut() { drain(previous); }
+        })));
+        let attached = browser::list_pages(cdp).map(|pages| {
+            if !pages.iter().any(|page| page.target_id == self.target && ordinary(cdp.guard(), &page.url)) { return None }
+            attach(cdp, state, &self.target).ok()
+        });
+        cdp.set_waiter(None);
+        let previous = previous.borrow_mut().take();
+        match attached {
+            Ok(Some(session)) => {
+                self.session = Some(session);
+                self.seen = cdp.events().len();
+                Ok(())
+            }
+            attached => {
+                if let Some(previous) = previous { *cdp = previous; }
+                attached.map(|_| ())
+            }
         }
     }
 
@@ -367,9 +386,10 @@ impl Holder {
                 "Page.frameNavigated" if params["frame"].get("parentId").is_none() => {
                     self.checkpoint(cdp)?;
                     emit(self.status("checkpoint"))?;
-                    if self.verify(cdp).is_some() {
+                    if let Some(loader) = self.verify(cdp) {
                         if self.paused { self.paused = false; emit(self.status("resumed"))?; }
-                    } else { self.pending.clear(); self.failed.clear(); self.pause()?; }
+                        self.release(cdp, &loader, true)?;
+                    } else { self.pending.clear(); self.failed.clear(); self.held.clear(); self.pause()?; }
                 }
                 "Network.requestWillBeSent" => {
                     if let Some(response) = params.get("redirectResponse") {
@@ -451,13 +471,27 @@ impl Holder {
         Ok(false)
     }
 
+    fn release(&mut self, cdp: &mut Cdp, loader: &str, committed: bool) -> Result<(), String> {
+        let (ready, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(_, pending, _)| pending.loader == loader);
+        if !committed { self.held = rest; }
+        for (id, pending, body) in ready { self.admit(cdp, &id, pending, body)?; }
+        Ok(())
+    }
+
     fn finish(&mut self, cdp: &mut Cdp, id: &str, body: bool) -> Result<(), String> {
         let Some(pending) = self.pending.remove(id) else { return Ok(()) };
+        self.admit(cdp, id, pending, body)
+    }
+
+    fn admit(&mut self, cdp: &mut Cdp, id: &str, pending: Pending, body: bool) -> Result<(), String> {
         let Some(response) = &pending.response else { return Ok(()) };
         if !ordinary(cdp.guard(), &pending.document_url) || !ordinary(cdp.guard(), text(&pending.request, "url")) || !ordinary(cdp.guard(), text(response, "url")) { return Ok(()) }
         if !body && !response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) { return Ok(()) }
         let verified = self.verify(cdp).is_some_and(|loader| loader == pending.loader);
-        if !pending.ordinary_document && !(pending.recovering_document && verified && !self.paused) { return Ok(()) }
+        if !pending.ordinary_document && !(pending.recovering_document && verified && !self.paused) {
+            if pending.recovering_document { self.held.push((id.to_string(), pending, body)); }
+            return Ok(())
+        }
         let redirect = response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308));
         if self.paused && !redirect { return Ok(()) }
         let can_embed = self.embed && verified && !self.paused && self.session.as_deref().is_some_and(|session| cdp.ordinary_response_body(session, id));
@@ -466,6 +500,12 @@ impl Holder {
         } else { None };
         self.entries.push(entry(cdp, &pending, content.as_ref(), self.credentials, can_embed && pending.ordinary_document, self.minimal));
         Ok(())
+    }
+}
+
+fn drain(cdp: &mut Cdp) {
+    for _ in 0..64 {
+        if !matches!(cdp.pump(Instant::now() + Duration::from_millis(1)), Ok(true)) { break }
     }
 }
 

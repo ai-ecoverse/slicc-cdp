@@ -2855,7 +2855,7 @@ impl Cdp {
             let now = Instant::now();
             if now >= self.waiter_due {
                 waiter(self);
-                self.waiter_due = now + WAITER_SLICE;
+                self.waiter_due = Instant::now() + WAITER_SLICE;
             }
             self.waiter = Some(waiter);
             let until = deadline.min(self.waiter_due);

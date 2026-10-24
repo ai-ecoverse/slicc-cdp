@@ -237,6 +237,95 @@ test('HAR rejects protected and unknown URLs and bodies, redacts redirect carrie
   });
 });
 
+test('a paused holder answers the old connection guard while it reattaches on a fresh one', async () => {
+  const sockets = [];
+  const guards = new Map();
+  const answers = new Map();
+  let held;
+  let paused;
+  const answered = new Promise((resolve) => {
+    paused = resolve;
+  });
+  const pause = (send, sessionId, requestId, url) =>
+    send({
+      method: 'Fetch.requestPaused',
+      sessionId,
+      params: {
+        requestId,
+        networkId: requestId,
+        frameId: 'TAB',
+        resourceType: 'Document',
+        request: { url, method: 'GET', headers: {} },
+      },
+    });
+  await harFixture(
+    async ({ tab, start, send }) => {
+      const holder = await start();
+      tab.url = 'https://seven.sliccy.ai/private';
+      send('Page.frameNavigated', {
+        frame: { id: 'TAB', loaderId: 'P', url: tab.url, securityOrigin: new URL(tab.url).origin },
+      });
+      await holder.event('paused');
+      tab.url = 'https://example.test/back';
+      const settled = await Promise.race([
+        answered.then(() => 'answered'),
+        new Promise((resolve) => setTimeout(() => resolve('stalled'), 8000)),
+      ]);
+      assert.equal(settled, 'answered', JSON.stringify([...answers]));
+      assert.deepEqual(Object.fromEntries(answers), {
+        'OLD-ORDINARY': { method: 'Fetch.continueRequest' },
+        'OLD-PROTECTED': { method: 'Fetch.failRequest', errorReason: 'BlockedByClient' },
+      });
+      await holder.event('resumed');
+      holder.child.stdin.end();
+      assert.equal((await holder.ended).code, 0);
+    },
+    {
+      intercept(message, send) {
+        if (!sockets.includes(send)) sockets.push(send);
+        const connection = sockets.indexOf(send);
+        if (
+          message.method === 'Fetch.enable' &&
+          message.params.patterns?.some((pattern) => pattern.resourceType === 'Document')
+        )
+          guards.set(connection, message.sessionId);
+        if (
+          connection === 0 &&
+          ['Fetch.continueRequest', 'Fetch.failRequest'].includes(message.method) &&
+          message.params.requestId?.startsWith('OLD-')
+        ) {
+          answers.set(message.params.requestId, {
+            method: message.method,
+            ...(message.params.errorReason ? { errorReason: message.params.errorReason } : {}),
+          });
+          if (answers.size === 2) {
+            paused();
+            held?.();
+          }
+          return false;
+        }
+        if (
+          connection === 1 &&
+          !held &&
+          message.method === 'Network.enable' &&
+          message.sessionId === guards.get(1)
+        ) {
+          held = () => send({ id: message.id, sessionId: message.sessionId, result: {} });
+          pause(sockets[0], guards.get(0), 'OLD-ORDINARY', 'https://example.test/back');
+          pause(
+            sockets[0],
+            guards.get(0),
+            'OLD-PROTECTED',
+            'https://seven.sliccy.ai/private?old-secret=1'
+          );
+          return true;
+        }
+        return false;
+      },
+    }
+  );
+});
+
 test('HAR admits only the ordinary main document ending a pause and omits unverified candidates', async () => {
   await harFixture(async ({ home, backend, tab, start, send, request, response, checkpoint }) => {
     tab.url = 'about:blank';
@@ -291,6 +380,66 @@ test('HAR admits only the ordinary main document ending a pause and omits unveri
     const stopped = await harCommand(backend.url, ['har-stop'], home);
     assert.equal(stopped.code, 0, stopped.stderr);
     assert.equal((await held.ended).code, 0);
+  });
+});
+
+test('HAR keeps the main document of the resumed loader when its loading completes before the commit', async () => {
+  await harFixture(async ({ home, backend, tab, file, start, send, request, response }) => {
+    tab.url = 'about:blank';
+    tab.loaderId = 'BLANK';
+    const held = await start();
+    await held.event('paused');
+    const trees = () => backend.calls.filter((call) => call.method === 'Page.getFrameTree').length;
+    const absorbed = async () => {
+      const from = trees();
+      while (trees() < from + 2) await new Promise((resolve) => setTimeout(resolve, 10));
+    };
+    const document = (id, url, loaderId, extra = {}) =>
+      request(
+        id,
+        url,
+        {},
+        { type: 'Document', frameId: 'TAB', documentURL: url, loaderId, ...extra }
+      );
+    document('OTHER', 'https://example.test/unverified', 'OTHER');
+    response('OTHER', 'https://example.test/unverified');
+    document('DOCUMENT', 'https://example.test/start', 'NEXT');
+    await absorbed();
+    document('DOCUMENT', 'https://example.test/page', 'NEXT', {
+      redirectResponse: {
+        url: 'https://example.test/start',
+        status: 302,
+        statusText: 'Found',
+        headers: { Location: 'https://example.test/page' },
+      },
+    });
+    response('DOCUMENT', 'https://example.test/page');
+    await absorbed();
+    const before = held.events().filter((event) => event.event === 'checkpoint').length;
+    tab.url = 'https://example.test/page';
+    tab.loaderId = 'NEXT';
+    send('Page.frameNavigated', {
+      frame: { id: 'TAB', loaderId: 'NEXT', url: tab.url, securityOrigin: 'https://example.test' },
+    });
+    await held.event('resumed');
+    await held.event(
+      'checkpoint',
+      () => held.events().filter((event) => event.event === 'checkpoint').length > before
+    );
+    const stopped = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+    const har = JSON.parse(await readFile(file, 'utf8'));
+    assert.deepEqual(
+      har.log.entries.map((entry) => [entry.request.url, entry.response.status]),
+      [
+        ['https://example.test/start', 302],
+        ['https://example.test/page', 200],
+      ],
+      JSON.stringify(har)
+    );
+    assert.ok(!JSON.stringify(har).includes('/unverified'));
+    assert.ok(!backend.calls.some((call) => call.method === 'Network.getResponseBody'));
   });
 });
 

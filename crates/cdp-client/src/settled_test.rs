@@ -129,3 +129,24 @@ fn a_waiter_runs_while_a_reply_is_still_held() {
     assert_eq!(timed.call_for("Browser.getVersion", json!({}), None, Duration::from_millis(30)).unwrap_err(), "Browser.getVersion timed out\n");
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn a_slow_waiter_still_leaves_a_window_to_read_the_reply() {
+    struct Ready {
+        sent: Rc<RefCell<Vec<i64>>>,
+    }
+    impl Transport for Ready {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            let message: Value = serde_json::from_str(text).unwrap();
+            self.sent.borrow_mut().push(message["id"].as_i64().unwrap());
+            Ok(())
+        }
+        fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+            if deadline <= Instant::now() { return Ok(None) }
+            Ok(self.sent.borrow_mut().pop().map(|id| json!({"id":id,"result":{"product":"read"}}).to_string()))
+        }
+    }
+    let mut cdp = Cdp::from_transport(Box::new(Ready { sent: Rc::new(RefCell::new(Vec::new())) }));
+    cdp.set_waiter(Some(Box::new(|_: &Cdp| std::thread::sleep(Duration::from_millis(10)))));
+    assert_eq!(cdp.call_for("Browser.getVersion", json!({}), None, Duration::from_millis(500)).unwrap()["product"], "read");
+}

@@ -54,7 +54,8 @@ export function harHolder(endpoint, args, cwd) {
       await new Promise((resolve) => waiting.push(resolve));
     }
   };
-  return { child, ended, event, events };
+  const output = () => ({ stdout, stderr });
+  return { child, ended, event, events, output };
 }
 
 export async function harCommand(endpoint, args, cwd) {
