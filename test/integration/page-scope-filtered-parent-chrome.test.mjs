@@ -130,7 +130,14 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       )
     );
     assert.ok(child.parentFrameId);
+    const wire = [];
     proxy = await cdpProxy(browser.wsUrl, {
+      observe(direction, message) {
+        if (direction === 'client') {
+          wire.push({ method: message.method, type: message.params?.type });
+          if (wire.length > 40) wire.shift();
+        }
+      },
       transform(message) {
         if (message.result?.targetInfos)
           message.result.targetInfos = message.result.targetInfos.filter(
@@ -146,7 +153,15 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
       return result.stdout;
     };
-    await run('open', '--foreground', `https://localhost:${secure.address().port}/ordinary`);
+    const userUrl = `https://localhost:${secure.address().port}/ordinary`;
+    await run('open', '--foreground', userUrl);
+    const user = (await raw.send('Target.getTargets', {})).targetInfos.find(
+      (target) => target.type === 'page' && target.url === userUrl
+    );
+    assert.ok(user);
+    const userSession = (
+      await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
+    ).sessionId;
     await until(async () => {
       const value = await run('eval', 'document.documentElement.dataset.extensionFixture');
       return /[a-p]{32}/.test(value);
@@ -160,7 +175,24 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     await runner.write(cwd, 'attachment.txt', 'fixture bytes');
     await run('upload', ref(await run('snapshot'), 'Attachment'), 'attachment.txt');
     const drag = await run('snapshot');
-    await run('drag', ref(drag, 'Drag source'), ref(drag, 'Drop target'));
+    await raw.send('Target.activateTarget', { targetId: user.targetId });
+    await until(
+      async () =>
+        (
+          await raw.send(
+            'Runtime.evaluate',
+            { expression: 'document.visibilityState', returnByValue: true },
+            userSession
+          )
+        ).result.value === 'visible'
+    );
+    wire.length = 0;
+    const dragged = await runner.playwright(
+      ['drag', ref(drag, 'Drag source'), ref(drag, 'Drop target')],
+      cwd
+    );
+    assert.equal(dragged.code, 0, `drag: ${dragged.stderr} ${JSON.stringify(wire)}`);
+    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const denied = await runner.playwright(['eval', '--tab', background, 'document.title'], cwd);
     assert.notEqual(denied.code, 0);
     assert.match(denied.stderr, /refused/);
