@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { attachKernel, createNodeKernel } from '@ai-ecoverse/slicc-kernel/node';
@@ -142,6 +142,25 @@ export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
       const client = await attachKernel(await kernel.connect());
       try {
         return await client.fs.stat(file);
+      } finally {
+        await client.close();
+      }
+    },
+    async install(name) {
+      const root = path.resolve('node_modules', name);
+      for (const entry of await readdir(root, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const file = path.join(entry.parentPath, entry.name);
+        await kernel.writeFile(
+          `/node_modules/${name}/${path.relative(root, file).split(path.sep).join('/')}`,
+          await readFile(file)
+        );
+      }
+    },
+    async processes() {
+      const client = await attachKernel(await kernel.connect());
+      try {
+        return await client.ps();
       } finally {
         await client.close();
       }
