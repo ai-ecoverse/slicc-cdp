@@ -102,7 +102,8 @@
       const erase = erasers[args.key];
       const go = send('keydown') && editable(target);
       if (go && erase) edit(target, erase);
-      else if (go && args.key !== 'Escape' && send('keypress')) fallback();
+      else if (go && !/^(Escape|Alt|Control|Meta|Shift)$/.test(args.key) && send('keypress'))
+        fallback();
     };
     if (args.phase === 'up') {
       if (args.key === ' ' && button) return 'unsupported';

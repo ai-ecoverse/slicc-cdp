@@ -99,20 +99,43 @@ pub struct Motion {
     pub modifiers: i64,
 }
 
+fn event(kind: &str) -> &'static str {
+    match kind {
+        "down" => "mousedown",
+        "up" => "mouseup",
+        _ => "mousemove",
+    }
+}
+
 impl Motion {
     fn kinds(&self) -> Vec<&'static str> {
         let mut kinds: Vec<&'static str> = Vec::new();
         for step in &self.steps {
-            let kind = match step.kind {
-                "down" => "mousedown",
-                "up" => "mouseup",
-                _ => "mousemove",
-            };
+            let kind = event(step.kind);
             if !kinds.contains(&kind) {
                 kinds.push(kind);
             }
         }
         kinds
+    }
+
+    fn required(&self) -> Vec<&'static str> {
+        let kinds = self.kinds();
+        if kinds.len() == 1 {
+            return kinds;
+        }
+        kinds.into_iter().filter(|kind| *kind != "mousemove").collect()
+    }
+
+    fn rest(&self, missing: &[&str]) -> Motion {
+        let at = self.steps.iter().position(|step| missing.contains(&event(step.kind))).unwrap_or(0);
+        let before = &self.steps[..at];
+        Motion {
+            steps: self.steps[at..].to_vec(),
+            from: before.last().map(|step| step.point).or(self.from),
+            press: before.iter().rfind(|step| step.kind == "down").map(|step| step.point).or(self.press),
+            modifiers: self.modifiers,
+        }
     }
 
     fn args(&self) -> Value {
@@ -208,6 +231,10 @@ fn pointer_on(cdp: &mut Cdp, scope: &Scope, context: &Value, anchor: &Anchor, ar
 }
 
 fn landed(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted: Trusted) -> Result<bool, String> {
+    Ok(seen(cdp, scope, context, types, trusted)?.is_none_or(|seen| !seen.is_empty()))
+}
+
+fn seen(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted: Trusted) -> Result<Option<Vec<String>>, String> {
     if mode(cdp, scope, context, "arm", json!({ "types": types }))? != "armed" {
         return Err("Error: the input check could not start in the page.\n".to_string());
     }
@@ -217,8 +244,8 @@ fn landed(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted
         }
     }
     match run(cdp, scope, context, "read", json!({}), READ_WAIT) {
-        Ok(Value::Array(seen)) => Ok(!seen.is_empty()),
-        _ => Ok(true),
+        Ok(Value::Array(seen)) => Ok(Some(seen.iter().filter_map(Value::as_str).map(str::to_string).collect())),
+        _ => Ok(None),
     }
 }
 
@@ -315,33 +342,34 @@ pub fn key(cdp: &mut Cdp, session: &str, keyed: &Keyed, trusted: Trusted) -> Res
 
 pub fn mouse(cdp: &mut Cdp, scope: &Scope, verb: &str, motion: &Motion, in_place: bool, trusted: Trusted) -> Result<(), String> {
     let context = context(cdp, scope)?;
-    if visible(cdp, scope, &context, Duration::ZERO) {
-        return trusted(cdp);
-    }
+    let required = motion.required();
     let kinds = motion.kinds();
-    if landed(cdp, scope, &context, &kinds, trusted)? {
+    let Some(seen) = seen(cdp, scope, &context, &kinds, trusted)? else {
+        return Ok(());
+    };
+    let unseen: Vec<&str> = kinds.into_iter().filter(|kind| !seen.iter().any(|known| known == kind)).collect();
+    if !required.iter().any(|kind| unseen.contains(kind)) {
         return Ok(());
     }
     if !in_place {
-        return forward(cdp, scope, &context, verb, Some(&kinds), trusted);
+        return forward(cdp, scope, &context, verb, Some(&required), trusted);
     }
-    let answer = mode(cdp, scope, &context, "mouse", motion.args())?;
-    if let Some(step) = answer.strip_prefix("frame:").and_then(|index| index.parse::<usize>().ok()).and_then(|index| motion.steps.get(index)) {
+    let rest = motion.rest(&unseen);
+    let answer = mode(cdp, scope, &context, "mouse", rest.args())?;
+    if let Some(step) = answer.strip_prefix("frame:").and_then(|index| index.parse::<usize>().ok()).and_then(|index| rest.steps.get(index)) {
         return Err(frame_refusal(step.point.0, step.point.1));
     }
     match answer.as_str() {
         "done" => Ok(()),
+        "missing" if visible(cdp, scope, &context, Duration::ZERO) => Ok(()),
         "missing" => forward(cdp, scope, &context, verb, None, trusted),
-        _ => forward(cdp, scope, &context, verb, Some(&kinds), trusted),
+        _ => forward(cdp, scope, &context, verb, Some(&required), trusted),
     }
 }
 
 pub fn stroke(cdp: &mut Cdp, session: &str, stroke: &Stroke, trusted: Trusted) -> Result<(), String> {
     let scope = Scope::page(session);
     let context = context(cdp, &scope)?;
-    if visible(cdp, &scope, &context, Duration::ZERO) {
-        return trusted(cdp);
-    }
     let (verb, phase) = if stroke.up { ("keyup", "up") } else { ("keydown", "down") };
     let kinds = [verb];
     if landed(cdp, &scope, &context, &kinds, trusted)? {

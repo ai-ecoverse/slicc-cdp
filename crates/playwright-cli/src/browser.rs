@@ -1366,10 +1366,9 @@ pub fn drag_refs(
     let in_place = [start_rec, end_rec].iter().all(|rec| rec.frame_id.is_none() && rec.target.is_none());
     let scope = Scope { session: start_session, frame: start_rec.frame_id.as_deref(), input: session };
     landing::mouse(cdp, &scope, "drag", &motion, in_place, &mut |cdp| {
-        for (kind, (x, y)) in [("mouseMoved", start), ("mousePressed", start), ("mouseMoved", end), ("mouseReleased", end)] {
-            let mut params = json!({ "type": kind, "x": x, "y": y });
+        for (kind, (x, y), button, buttons) in [("mouseMoved", start, "none", 0), ("mousePressed", start, "left", 1), ("mouseMoved", end, "left", 1), ("mouseReleased", end, "left", 0)] {
+            let mut params = json!({ "type": kind, "x": x, "y": y, "button": button, "buttons": buttons });
             if kind != "mouseMoved" {
-                params["button"] = json!("left");
                 params["clickCount"] = json!(1);
             }
             cdp.call_for("Input.dispatchMouseEvent", params, Some(session), landing::INPUT_WAIT)?;

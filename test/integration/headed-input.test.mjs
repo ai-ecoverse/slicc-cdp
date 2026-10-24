@@ -168,7 +168,7 @@ async function steps(pw, out, raw, tab, seven) {
   await rawInput(pw, raw, tab, seven);
 }
 
-const PAD = `<div id="pad" style="position:fixed;left:0;top:0;width:600px;height:200px;background:#fff;z-index:9"><div id="src" role="button" aria-label="Source" style="position:absolute;left:20px;top:20px;width:100px;height:60px"></div><div id="dst" role="button" aria-label="Target" style="position:absolute;left:300px;top:20px;width:100px;height:60px"></div><input id="field" aria-label="Field" style="position:absolute;left:20px;top:120px"></div>`;
+const PAD = `<div id="pad" style="position:fixed;left:0;top:0;width:600px;height:200px;background:#fff;z-index:9"><div id="src" role="button" aria-label="Source" style="position:absolute;left:20px;top:20px;width:100px;height:60px"></div><div id="dst" role="button" aria-label="Target" style="position:absolute;left:300px;top:20px;width:100px;height:60px"></div><input id="field" aria-label="Field" style="position:absolute;left:20px;top:120px"><textarea id="area" style="position:absolute;left:300px;top:120px"></textarea><form id="form" style="position:absolute;left:20px;top:160px"><input id="inform"></form></div>`;
 const LOG = `window.log = []; for (const type of ['mousedown', 'mouseup', 'click', 'keydown', 'keyup']) document.getElementById('pad').addEventListener(type, (event) => log.push(type + ':' + event.target.id + (event.shiftKey ? ':shift' : '')), true); document.getElementById('pad').addEventListener('mousemove', (event) => { window.moved = event.target.id + ':' + event.buttons; }, true);`;
 
 async function rawInput(pw, raw, tab, seven) {
@@ -209,6 +209,19 @@ async function rawInput(pw, raw, tab, seven) {
     'keydown and keyup'
   );
   assert.equal(await inTab(raw, tab, "document.getElementById('field').value"), 'A');
+  await inTab(
+    raw,
+    tab,
+    "document.getElementById('form').onsubmit = () => { window.formSent = true; return false; }"
+  );
+  for (const target of ['area', 'inform']) {
+    await inTab(raw, tab, `document.getElementById('${target}').focus()`);
+    await pw(['keydown', 'Shift']);
+    await pw(['keyup', 'Shift']);
+    await pw(['press', 'Shift']);
+  }
+  assert.equal(await inTab(raw, tab, "document.getElementById('area').value"), '');
+  assert.equal(await inTab(raw, tab, 'window.formSent'), undefined);
   assert.equal(await visibility(seven), 'visible');
   assert.equal(await visibility(tab), 'hidden');
 

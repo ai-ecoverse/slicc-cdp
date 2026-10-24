@@ -29,7 +29,8 @@ function scene({ front = 'SEVEN', others = [sevenTab], reads = [], ...rest } = {
     landing: (mode, args, target) => {
       state.modes.push([mode, args, target?.targetId]);
       if (mode === 'visible') return target?.targetId === state.front ? 'visible' : 'hidden';
-      if (mode === 'read') return state.reads.length ? state.reads.shift() : ['landed'];
+      if (mode === 'arm') state.armed = args.types;
+      if (mode === 'read') return state.reads.length ? state.reads.shift() : state.armed;
       return answers[mode] ?? 'done';
     },
     onCommand: (message) => {
@@ -95,16 +96,75 @@ const RAW = [
 ];
 
 for (const [transport, runner] of Object.entries(runners)) {
-  test(`${transport}: raw input and drag on the tab in front are sent once, as before`, async () => {
+  test(`${transport}: raw input and drag on the tab in front are checked and sent once`, async () => {
     await withScene(runner, scene(), async (s) => {
       s.state.front = s.tab;
       for (const args of RAW) await s.ok(args);
-      assert.deepEqual(modes(s.state, 'arm'), []);
-      assert.equal(modes(s.state, 'visible').length, RAW.length);
+      assert.equal(modes(s.state, 'arm').length, RAW.length);
+      assert.deepEqual(modes(s.state, 'mouse'), []);
       assert.equal(s.sent('Input.dispatchMouseEvent').length, 7);
       assert.equal(s.sent('Input.dispatchKeyEvent').length, 2);
       assert.deepEqual(s.state.activated, []);
+      assert.deepEqual(
+        s
+          .sent('Input.dispatchMouseEvent')
+          .slice(3)
+          .map(({ params }) => [params.type, params.button, params.buttons]),
+        [
+          ['mouseMoved', 'none', 0],
+          ['mousePressed', 'left', 1],
+          ['mouseMoved', 'left', 1],
+          ['mouseReleased', 'left', 0],
+        ]
+      );
     });
+    await withScene(
+      runner,
+      scene({ mouse: 'missing', key: 'unsupported', reads: [[], []] }),
+      async (s) => {
+        s.state.front = s.tab;
+        await s.ok(['mousemove', '10', '20']);
+        assert.equal(s.sent('Input.dispatchMouseEvent').length, 1);
+        const pressed = await s.run(['keydown', 'Tab']);
+        assert.equal(pressed.code, 1);
+        assert.equal(
+          pressed.stderr,
+          'Error: keydown did not reach the page: Chrome dropped the input even with the tab in front.\n'
+        );
+        assert.equal(s.sent('Input.dispatchKeyEvent').length, 1);
+        assert.deepEqual(s.state.activated, []);
+      }
+    );
+  });
+
+  test(`${transport}: a drag Chrome delivered in part is finished in place from the first missing step`, async () => {
+    await withScene(
+      runner,
+      scene({ reads: [['mousemove'], ['mousemove', 'mousedown']] }),
+      async (s) => {
+        await s.ok(['drag', 'e1', 'e2']);
+        await s.ok(['snapshot']);
+        await s.ok(['drag', 'e1', 'e2']);
+        assert.deepEqual(
+          modes(s.state, 'mouse').map(([, args]) => args),
+          [
+            {
+              steps: [
+                ['down', 5, 5, 1, 0],
+                ['move', 5, 5, 1, 0],
+                ['up', 5, 5, 0, 0],
+              ],
+              from: [5, 5],
+              press: null,
+              modifiers: 0,
+            },
+            { steps: [['up', 5, 5, 0, 0]], from: [5, 5], press: [5, 5], modifiers: 0 },
+          ]
+        );
+        assert.equal(s.sent('Input.dispatchMouseEvent').length, 8);
+        assert.deepEqual(s.state.activated, []);
+      }
+    );
   });
 
   test(`${transport}: raw input and drag Chrome delivers to a background tab are not repeated`, async () => {
