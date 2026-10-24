@@ -236,12 +236,10 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       JSON.stringify(held.lines)
     );
     const targets = (await raw.send('Target.getTargets', {})).targetInfos;
-    assert.ok(
-      targets.some(
-        (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
-      ),
-      'cross-origin OOPIF was not created'
+    const cross = targets.find(
+      (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
     );
+    assert.ok(cross, 'cross-origin OOPIF was not created');
     const sealed = targets.find(
       (target) =>
         target.type === 'iframe' && target.url === `https://seven.sliccy.ai:${port}/protected`
@@ -252,6 +250,31 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     ).sessionId;
     assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
     await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
+    const crossSession = (
+      await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
+    ).sessionId;
+    await evaluate(raw, crossSession, 'addCross()');
+    const crossListed = await once(browser.wsUrl, cwd, [
+      'webmcp-list',
+      '--tab',
+      targetId,
+      '--json',
+      '--from-origin',
+      `https://foreign.test:${port}`,
+    ]);
+    assert.notEqual(crossListed.code, 0);
+    assert.equal(crossListed.stdout, '');
+    assert.match(crossListed.stderr, /slicc: refused:/);
+    await sleep(1500);
+    assert.deepEqual(held.lines.slice(navigated).filter(changed(cross.targetId)), []);
+    assert.equal(
+      (await raw.send('Target.getTargetInfo', { targetId: sealed.targetId })).targetInfo.url,
+      `https://seven.sliccy.ai:${port}/protected`
+    );
+    assert.equal(JSON.stringify(held.lines.slice(navigated)).includes('cross_late'), false);
+    assert.equal(JSON.stringify(watcher.lines).includes('cross_late'), false);
+    assert.match(held.stderr(), /webmcp-polyfill: .*refused/);
+    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
     assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
     assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
     assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
