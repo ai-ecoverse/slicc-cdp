@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { fakeCdp } from './fake-cdp.mjs';
+import { mousePage } from './mouse-page.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import './watchdog.mjs';
 
@@ -96,6 +97,74 @@ const RAW = [
 ];
 
 for (const [transport, runner] of Object.entries(runners)) {
+  test(`${transport}: separate invocations preserve exactly one click across delivery mixes and no click after a native drag`, async () => {
+    for (const [down, move, up, drag] of [
+      [true, true, true, false],
+      [true, false, true, false],
+      [true, true, false, false],
+      [true, false, false, false],
+      [false, true, true, false],
+      [false, false, true, false],
+      [false, true, false, false],
+      [false, false, false, false],
+      [true, true, true, true],
+    ]) {
+      const click = down && up && !drag;
+      const page = mousePage();
+      const setup = scene();
+      const intercept = setup.options.intercept;
+      let pressed = false;
+      setup.options.intercept = (message, send) => {
+        const { params, method } = message;
+        const reply = (result) => send({ id: message.id, sessionId: message.sessionId, result });
+        if (params?.expression?.includes("Symbol.for('slicc-landing')")) {
+          reply({ result: { value: page.evaluate(params.expression) } });
+          return true;
+        }
+        if (method !== 'Input.dispatchMouseEvent') return intercept(message, send);
+        const types = {
+          mousePressed: 'mousedown',
+          mouseMoved: 'mousemove',
+          mouseReleased: 'mouseup',
+        };
+        const delivered = { mousePressed: down, mouseMoved: move, mouseReleased: up };
+        if (delivered[params.type]) {
+          page.send(types[params.type], params);
+          if (params.type === 'mousePressed') pressed = true;
+          if (params.type === 'mouseMoved' && pressed && drag) {
+            page.send('dragstart', params, page.src);
+            page.send('dragend', params, page.src);
+          }
+          if (params.type === 'mouseReleased') {
+            if (pressed && click) page.send('click', params, page.pad);
+            pressed = false;
+          }
+        }
+        reply({});
+        return true;
+      };
+      await withScene(runner, setup, async (s) => {
+        await s.ok(['mousemove', '70', '50']);
+        await s.ok(['mousedown']);
+        await s.ok(['mousemove', '350', '50']);
+        await s.ok(['mouseup']);
+        const kinds = (type) => page.events.filter((event) => event.type === type);
+        const mix = JSON.stringify({ down, move, up, drag });
+        assert.equal(kinds('mousedown').length, 1, mix);
+        assert.equal(kinds('mouseup').length, 1, mix);
+        assert.equal(kinds('click').length, drag ? 0 : 1, mix);
+        assert.equal(kinds('dragstart').length, drag ? 1 : 0, mix);
+        if (!drag) {
+          assert.equal(kinds('click')[0].target.id, 'pad', mix);
+          assert.equal(kinds('click')[0].isTrusted, click, mix);
+        }
+        await s.ok(['mouseup']);
+        assert.equal(kinds('click').length, drag ? 0 : 1, mix);
+        assert.deepEqual(s.state.activated, []);
+      });
+    }
+  });
+
   test(`${transport}: raw input and drag on the tab in front are checked and sent once`, async () => {
     await withScene(runner, scene(), async (s) => {
       s.state.front = s.tab;

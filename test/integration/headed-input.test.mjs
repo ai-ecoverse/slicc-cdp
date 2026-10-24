@@ -178,7 +178,7 @@ async function rawInput(pw, raw, tab, seven) {
   await inTab(
     raw,
     tab,
-    `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(PAD)}); ${LOG}; window.inputDiagnostic = []; for (const type of ['pointerdown', 'pointerup', 'mousemove', 'mousedown', 'mouseup', 'click', 'dragstart', 'dragend']) addEventListener(type, (event) => inputDiagnostic.push({ type, target: event.target.id, trusted: event.isTrusted, buttons: event.buttons }), true);`
+    `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(PAD)}); ${LOG}`
   );
   const shot = await pw(['snapshot']);
   await pw(['drag', refOf(shot, 'button', 'Source'), refOf(shot, 'button', 'Target')]);
@@ -186,23 +186,13 @@ async function rawInput(pw, raw, tab, seven) {
   assert.equal(await inTab(raw, tab, 'window.moved'), 'dst:1');
 
   await clear();
-  await inTab(raw, tab, 'window.inputDiagnostic.length = 0');
   await pw(['mousemove', '70', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'src:0', 'mousemove');
-  console.log(
-    'selection before separate press',
-    await inTab(
-      raw,
-      tab,
-      `(() => { const selection = getSelection(); const range = selection.rangeCount ? selection.getRangeAt(0) : null; return { text: selection.toString(), rangeCount: selection.rangeCount, collapsed: selection.isCollapsed, start: range?.startContainer.nodeName, startParent: range?.startContainer.parentElement?.id, startOffset: range?.startOffset, end: range?.endContainer.nodeName, endParent: range?.endContainer.parentElement?.id, endOffset: range?.endOffset, sourceSelected: selection.containsNode(document.getElementById('src'), true) }; })()`
-    )
-  );
   await inTab(raw, tab, 'getSelection().removeAllRanges()');
   await pw(['mousedown']);
   await pw(['mousemove', '350', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'dst:1', 'mousemove with the button held');
   await pw(['mouseup']);
-  console.log('separate command diagnostic', await inTab(raw, tab, 'window.inputDiagnostic'));
   await until(log, 'mousedown:src mouseup:dst click:pad', 'mousedown and mouseup');
 
   await clear();
