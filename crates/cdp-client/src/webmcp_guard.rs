@@ -54,6 +54,19 @@ pub(super) struct Webmcp {
     samples: Vec<u128>,
 }
 
+impl Webmcp {
+    pub(super) fn forget(&mut self, session: &str) {
+        self.arms.remove(session);
+        self.contexts.retain(|(owner, _), _| owner != session);
+        self.scripts.retain(|(owner, _), _| owner != session);
+        self.paused.remove(session);
+        self.deferred.remove(session);
+        self.quarantined.remove(session);
+        self.parents.retain(|child, parent| child != session && parent != session);
+        self.children.retain(|(_, owner, _)| owner != session);
+    }
+}
+
 impl Cdp {
     pub fn start_webmcp(&mut self, session: &str) -> Result<String, String> {
         self.admit("Runtime.enable", &json!({}), Some(session))?;
