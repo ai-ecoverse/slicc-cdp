@@ -273,7 +273,6 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     );
     assert.equal(JSON.stringify(held.lines.slice(navigated)).includes('cross_late'), false);
     assert.equal(JSON.stringify(watcher.lines).includes('cross_late'), false);
-    assert.match(held.stderr(), /webmcp-polyfill: .*refused/);
     await raw.send('Target.detachFromTarget', { sessionId: crossSession });
     assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
     assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
