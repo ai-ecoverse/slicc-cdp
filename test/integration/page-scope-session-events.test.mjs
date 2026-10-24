@@ -41,8 +41,14 @@ test('page scope metadata sessions remain internal during attachment', async () 
     assert.deepEqual(attached, [], JSON.stringify(attached));
     assert.ok(
       fake.calls.some(
-        (call) => call.method === 'Target.attachToTarget' && call.params.targetId === 'Q'
+        (call) => call.method === 'Target.attachToTarget' && call.params.targetId === 'V'
       )
+    );
+    assert.equal(
+      fake.calls.some(
+        (call) => call.method === 'Target.attachToTarget' && call.params.targetId === 'Q'
+      ),
+      false
     );
     await client.send('Target.closeTarget', { targetId: 'P' });
     assert.ok(fake.targets.some((target) => target.targetId === 'Q'));

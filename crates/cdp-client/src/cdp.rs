@@ -182,7 +182,29 @@ pub struct Cdp {
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
+impl Drop for Cdp {
+    fn drop(&mut self) {
+        self.retire_private_sessions(Instant::now() + DOCUMENT_CHECK);
+    }
+}
+
 impl Cdp {
+    fn retire_private_sessions(&mut self, deadline: Instant) {
+        self.waiter = None;
+        let sessions = self.guard_sessions.clone();
+        for session in sessions {
+            if !self.guard_sessions.contains(&session) { continue }
+            if self.guards.values().any(|guard| guard == &session) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { let _ = self.send("Fetch.disable", json!({}), Some(&session)); }
+                else { let _ = self.raw_call("Fetch.disable", json!({}), Some(&session), left); }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { let _ = self.send("Target.detachFromTarget", json!({"sessionId":session}), None); }
+            else { let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":session}), None, left); }
+        }
+    }
+
     pub fn connect(url: &str) -> Result<Self, String> {
         Ok(Self::from_transport(Box::new(crate::net::ws_connect(url)?)))
     }
@@ -785,7 +807,7 @@ impl Cdp {
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
         let runtime = method.starts_with("Runtime.");
-        let page_scope = if page_scope::content(method) && !runtime { Some(self.verify_page_scope(session)?) } else { None };
+        let page_scope = if page_scope::content(method) && !runtime { Some(self.verify_page_scope_state(session)?) } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -820,6 +842,8 @@ impl Cdp {
                 let mut state = if self.document_paused(&target) {
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
+                } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, _)| proof.0 == target) {
+                    state.clone()
                 } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
@@ -834,7 +858,7 @@ impl Cdp {
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
-                state.page_scope = if runtime { Some(self.verify_page_scope(Some(session))?) } else { page_scope };
+                state.page_scope = if runtime { Some(self.verify_page_scope(Some(session))?) } else { page_scope.map(|(proof, _)| proof) };
                 state.runtime_scope_epoch = state.page_scope.as_ref().filter(|_| runtime).map(|proof| self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0));
                 checks.push((target, state));
             }
@@ -933,12 +957,16 @@ impl Cdp {
 
     fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool, stable_page: bool) -> Result<(), String> {
         for (target, expected) in checks {
-            if let Some(proof) = &expected.page_scope {
+            let current = if let Some(proof) = &expected.page_scope {
                 let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
-                let current = self.verify_page_scope(Some(&session))?;
+                let (current, state) = self.verify_page_scope_state(Some(&session))?;
                 if stable_page && &current != proof { return Err(self.refusal()) }
-            }
-            let current = self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
+                (current.0 == *target && expected.runtime_scope_epoch.is_none()).then_some(state)
+            } else { None };
+            let current = match current {
+                Some(state) => state,
+                None => self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?,
+            };
             if same_document && &current != expected { return Err(self.refusal()) }
         }
         Ok(())
