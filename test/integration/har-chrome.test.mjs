@@ -192,6 +192,15 @@ test('HAR records Chrome traffic but never protected navigations or fetches, cre
         ),
         JSON.stringify(hits)
       );
+  } catch (error) {
+    const output = held?.output();
+    error.message = [
+      error.message,
+      `holder stdout:\n${output?.stdout ?? ''}`,
+      `holder stderr:\n${output?.stderr ?? ''}`,
+      `fixture hits: ${JSON.stringify(hits.map((hit) => `${hit.host}${hit.url}`))}`,
+    ].join('\n');
+    throw error;
   } finally {
     held?.child.kill('SIGKILL');
     raw?.close();
