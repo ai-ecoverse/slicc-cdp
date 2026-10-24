@@ -167,7 +167,8 @@ function peer(req, socket, onMessage, onClose) {
 
 async function extensionBridge() {
   const traffic = [];
-  const clients = new Set();
+  const sockets = new Set();
+  const connections = new Set();
   const pending = new Map();
   let next = 0;
   let seven;
@@ -175,11 +176,19 @@ async function extensionBridge() {
   const connected = new Promise((resolve) => {
     sevenReady = resolve;
   });
+  const toSeven = (message, waiting) => {
+    next += 1;
+    if (waiting) pending.set(next, waiting);
+    traffic.push({ at: Date.now(), dir: 'command', ...message });
+    seven?.send({ ...message, id: next });
+  };
   const server = createServer((_req, res) => {
     res.writeHead(404);
     res.end();
   });
   server.on('upgrade', (req, socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
     const url = new URL(req.url, 'http://bridge');
     if (url.pathname === '/seven') {
       seven = peer(
@@ -189,13 +198,12 @@ async function extensionBridge() {
           if (typeof message.id === 'number') {
             const waiting = pending.get(message.id);
             pending.delete(message.id);
-            if (!waiting) return;
-            traffic.push({ at: Date.now(), dir: 'reply', method: waiting.method, ...message });
-            waiting.client.send({ ...message, id: waiting.id });
+            traffic.push({ at: Date.now(), dir: 'reply', method: waiting?.method, ...message });
+            waiting?.done(message);
             return;
           }
           traffic.push({ at: Date.now(), dir: 'event', ...message });
-          for (const client of clients) client.send(message);
+          for (const connection of connections) connection.event(message);
         },
         () => {
           seven = undefined;
@@ -204,24 +212,66 @@ async function extensionBridge() {
       sevenReady(url.searchParams.get('extension') === '1');
       return;
     }
+    const sessions = new Map();
+    let closed = false;
+    const attached = (sessionId, by) => {
+      const count = (sessions.get(sessionId) ?? 0) + by;
+      if (count > 0) sessions.set(sessionId, count);
+      else sessions.delete(sessionId);
+    };
+    const connection = {
+      event(message) {
+        if (closed || !sessions.has(message.sessionId)) return;
+        if (message.method === 'Target.detachedFromTarget') sessions.delete(message.sessionId);
+        if (message.method === 'Target.attachedToTarget' && message.params?.sessionId)
+          attached(message.params.sessionId, 1);
+        client.send(message);
+      },
+    };
     const client = peer(
       req,
       socket,
       async (message) => {
         await connected;
-        next += 1;
-        pending.set(next, { client, id: message.id, method: message.method });
-        traffic.push({ at: Date.now(), dir: 'command', ...message });
+        const { id, method, params } = message;
         if (!seven) {
-          pending.delete(next);
-          client.send({ id: message.id, error: { code: -32000, message: 'seven is gone' } });
+          client.send({ id, error: { code: -32000, message: 'seven is gone' } });
           return;
         }
-        seven.send({ ...message, id: next });
+        toSeven(message, {
+          method,
+          done(reply) {
+            if (reply.error) {
+              if (!closed) client.send({ id, error: reply.error });
+              return;
+            }
+            const result = reply.result ?? {};
+            if (method === 'Target.attachToTarget' && result.sessionId) {
+              if (closed) {
+                toSeven({
+                  method: 'Target.detachFromTarget',
+                  params: { sessionId: result.sessionId },
+                });
+                return;
+              }
+              attached(result.sessionId, 1);
+            }
+            if (method === 'Target.detachFromTarget' && sessions.has(params?.sessionId))
+              attached(params.sessionId, -1);
+            if (!closed) client.send({ id, result });
+          },
+        });
       },
-      () => clients.delete(client)
+      () => {
+        closed = true;
+        connections.delete(connection);
+        for (const [sessionId, count] of sessions)
+          for (let n = 0; n < count; n += 1)
+            toSeven({ method: 'Target.detachFromTarget', params: { sessionId } });
+        sessions.clear();
+      }
     );
-    clients.add(client);
+    connections.add(connection);
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
@@ -231,8 +281,7 @@ async function extensionBridge() {
     connected,
     wsUrl: `ws://127.0.0.1:${port}/devtools/browser/seven`,
     close: () => {
-      seven?.close();
-      for (const client of clients) client.close();
+      for (const socket of sockets) socket.destroy();
       server.closeAllConnections?.();
       return new Promise((resolve) => server.close(resolve));
     },
