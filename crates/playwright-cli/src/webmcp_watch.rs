@@ -152,10 +152,10 @@ impl Watch {
         let now = Instant::now();
         let due = generations.iter().filter(|generation| self.generations.get(&key(generation)).and_then(|tracked| tracked.due).is_some_and(|due| due <= now)).collect::<Vec<_>>();
         if due.is_empty() { return Ok(Vec::new()); }
-        let Some(frames) = self.lists(cdp, state, &generations.iter().collect::<Vec<_>>())? else { return Ok(Vec::new()); };
         for generation in &due {
             if let Some(tracked) = self.generations.get_mut(&key(generation)) { tracked.first = None; tracked.due = None; }
         }
+        let Some(frames) = self.lists(cdp, state, &generations.iter().collect::<Vec<_>>())? else { return Ok(Vec::new()); };
         let (after, top) = self.current(cdp);
         if self.moved(top) { return Ok(Vec::new()); }
         let live = after.iter().map(key).collect::<BTreeSet<_>>();
