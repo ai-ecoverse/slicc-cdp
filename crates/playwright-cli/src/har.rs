@@ -314,7 +314,6 @@ impl Holder {
             if fs::read_to_string(&self.files.stop).is_ok_and(|id| id == self.id) { return Ok("stop".into()) }
             if beat.elapsed() >= Duration::from_secs(1) { self.beat()?; beat = Instant::now(); }
             if self.session.as_deref().is_some_and(|session| cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) {
-                cdp.trail(|| format!("holder detach blocked={} protected={}", self.session.as_deref().is_some_and(|session| cdp.content_blocked(session)), cdp.is_protected_target(&self.target)));
                 if self.absorb(cdp)? { return Ok("closed".into()) }
                 if let Some(session) = self.session.take() { cdp.set_decider(&session, None); cdp::detach(cdp, &session); }
                 self.pending.clear();
@@ -326,9 +325,7 @@ impl Holder {
             }
             if Instant::now() >= retry {
                 if self.session.is_none() { self.reattach(cdp, state, endpoint)?; }
-                let verified = self.verify(cdp);
-                cdp.trail(|| format!("holder verify attached={} verified={} paused={}", self.session.is_some(), verified.is_some(), self.paused));
-                if let Some(loader) = verified {
+                if let Some(loader) = self.verify(cdp) {
                     if self.paused { self.paused = false; emit(self.status("resumed"))?; }
                     self.release(cdp, &loader, false)?;
                 } else {
@@ -352,12 +349,8 @@ impl Holder {
             if let Some(previous) = pumped.borrow_mut().as_mut() { drain(previous); }
         })));
         let attached = browser::list_pages(cdp).map(|pages| {
-            let found = pages.iter().any(|page| page.target_id == self.target && ordinary(cdp.guard(), &page.url));
-            cdp.trail(|| format!("holder fresh ordinary={found}"));
-            if !found { return None }
-            let attached = attach(cdp, state, &self.target);
-            cdp.trail(|| format!("holder fresh attached={}", attached.is_ok()));
-            attached.ok()
+            if !pages.iter().any(|page| page.target_id == self.target && ordinary(cdp.guard(), &page.url)) { return None }
+            attach(cdp, state, &self.target).ok()
         });
         cdp.set_waiter(None);
         let previous = previous.borrow_mut().take();

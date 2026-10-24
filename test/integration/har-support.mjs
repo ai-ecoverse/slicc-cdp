@@ -18,7 +18,6 @@ export function harHolder(endpoint, args, cwd) {
     XDG_STATE_HOME: cwd,
     APPDATA: cwd,
     SLICC_CDP_PORTS: HARNESS_PORTS,
-    SLICC_FETCH_TRAIL: '1',
   };
   delete env.SLICC_CDP_URL;
   const child = spawn(harBinary, ['--cdp', endpoint, ...args], {

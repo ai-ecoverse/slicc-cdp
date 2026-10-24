@@ -165,7 +165,6 @@ pub struct Cdp {
     issued: issued::Issued,
     waiter: Option<Waiter>,
     waiter_due: Instant,
-    trail: crate::trail::Trail,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
@@ -246,7 +245,6 @@ impl Cdp {
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
-            trail: crate::trail::Trail::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -359,12 +357,7 @@ impl Cdp {
                 .any(|(session, target)| target == target_id && self.blocked.contains(session))
     }
 
-    pub fn trail(&self, line: impl FnOnce() -> String) {
-        self.trail.note(line);
-    }
-
     pub fn set_decider(&mut self, session_id: &str, decider: Option<Decider>) {
-        self.trail.note(|| format!("decider {} session={} queued={}", if decider.is_some() { "set" } else { "unset" }, crate::trail::word(session_id), self.paused.len()));
         match decider {
             Some(decider) => {
                 self.deciders.insert(session_id.to_string(), decider);
@@ -2840,7 +2833,6 @@ impl Cdp {
     fn send(&mut self, method: &str, params: Value, session_id: Option<&str>) -> Result<i64, String> {
         self.next_id += 1;
         let id = self.next_id;
-        self.trail.sent(id, method, &params, session_id);
         let mut message = json!({
             "id": id,
             "method": method,
@@ -2858,12 +2850,6 @@ impl Cdp {
     }
 
     fn recv(&mut self, deadline: Instant) -> Result<Option<String>, String> {
-        let text = self.recv_waiting(deadline)?;
-        if let Some(text) = &text { self.trail.received(text); }
-        Ok(text)
-    }
-
-    fn recv_waiting(&mut self, deadline: Instant) -> Result<Option<String>, String> {
         loop {
             let Some(mut waiter) = self.waiter.take() else { return self.ws.recv_text(deadline) };
             let now = Instant::now();
@@ -2940,9 +2926,6 @@ impl Cdp {
     }
 
     pub(crate) fn forget_paused(&mut self, session_id: &str) {
-        for paused in self.paused.iter().filter(|paused| paused.session_id == session_id) {
-            self.trail.note(|| format!("forget session={} requestId={}", crate::trail::word(session_id), crate::trail::word(&paused.request_id)));
-        }
         self.paused.retain(|paused| paused.session_id != session_id);
         self.deciders.remove(session_id);
     }
@@ -3004,7 +2987,6 @@ impl Cdp {
         }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.requestPaused") {
             let Some(mut paused) = Paused::from_event(&value) else {
-                self.trail.note(|| "paused unparsed".into());
                 return;
             };
             if let Some(network) = &paused.network_id {
@@ -3108,7 +3090,6 @@ impl Cdp {
             if self.deciders.contains_key(&paused.session_id) {
                 self.decide_inline(paused);
             } else {
-                self.trail.note(|| format!("queued session={} requestId={}", crate::trail::word(&paused.session_id), crate::trail::word(&paused.request_id)));
                 self.paused.push_back(paused);
             }
             return;
@@ -3123,12 +3104,8 @@ impl Cdp {
             self.answer_protected(&paused);
             return;
         }
-        if self.defer_issued(&paused) {
-            self.trail.note(|| format!("deferred session={} requestId={}", crate::trail::word(&paused.session_id), crate::trail::word(&paused.request_id)));
-            return;
-        }
+        if self.defer_issued(&paused) { return }
         let Some(decider) = self.deciders.get_mut(&paused.session_id) else {
-            self.trail.note(|| format!("queued session={} requestId={}", crate::trail::word(&paused.session_id), crate::trail::word(&paused.request_id)));
             self.paused.push_back(paused);
             return;
         };

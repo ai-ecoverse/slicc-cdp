@@ -22,9 +22,9 @@ concurrency:
 jobs:
   ci:
     uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.11.3
+    secrets: inherit
     with:
-      test-glob: test/integration/har-chrome*.test.mjs
-      test: export PATH="$HOME/.cargo/bin:$PATH" && cargo build --locked -p slicc-cdp && npm run -s browser >/dev/null && node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-timeout=600000 'test/integration/har-chrome*.test.mjs'
+      test-glob: test/integration/*.test.mjs
       shards: 8
       timeout-minutes: 30
       review-timeout-minutes: 90
