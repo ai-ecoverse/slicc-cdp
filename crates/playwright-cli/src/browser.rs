@@ -1354,49 +1354,28 @@ pub fn drag_refs(
     (start_session, start_rec): (&str, &RefRec),
     (end_session, end_rec): (&str, &RefRec),
 ) -> Result<(), String> {
-    let start_box = element_center(cdp, start_session, start_rec)?;
-    let end_box = element_center(cdp, end_session, end_rec)?;
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mouseMoved",
-            "x": start_box.0,
-            "y": start_box.1,
-        }),
-        Some(session),
-    )?;
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mousePressed",
-            "x": start_box.0,
-            "y": start_box.1,
-            "button": "left",
-            "clickCount": 1,
-        }),
-        Some(session),
-    )?;
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mouseMoved",
-            "x": end_box.0,
-            "y": end_box.1,
-        }),
-        Some(session),
-    )?;
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        json!({
-            "type": "mouseReleased",
-            "x": end_box.0,
-            "y": end_box.1,
-            "button": "left",
-            "clickCount": 1,
-        }),
-        Some(session),
-    )?;
-    Ok(())
+    let start = element_center(cdp, start_session, start_rec)?;
+    let end = element_center(cdp, end_session, end_rec)?;
+    let step = |kind, point, buttons| landing::Step { kind, point, buttons, button: 0 };
+    let motion = landing::Motion {
+        steps: vec![step("move", start, 0), step("down", start, 1), step("move", end, 1), step("up", end, 0)],
+        from: None,
+        press: None,
+        modifiers: 0,
+    };
+    let in_place = [start_rec, end_rec].iter().all(|rec| rec.frame_id.is_none() && rec.target.is_none());
+    let scope = Scope { session: start_session, frame: start_rec.frame_id.as_deref(), input: session };
+    landing::mouse(cdp, &scope, "drag", &motion, in_place, &mut |cdp| {
+        for (kind, (x, y)) in [("mouseMoved", start), ("mousePressed", start), ("mouseMoved", end), ("mouseReleased", end)] {
+            let mut params = json!({ "type": kind, "x": x, "y": y });
+            if kind != "mouseMoved" {
+                params["button"] = json!("left");
+                params["clickCount"] = json!(1);
+            }
+            cdp.call_for("Input.dispatchMouseEvent", params, Some(session), landing::INPUT_WAIT)?;
+        }
+        Ok(())
+    })
 }
 
 fn element_center(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f64), String> {

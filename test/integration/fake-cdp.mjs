@@ -95,7 +95,7 @@ function landingCall(params) {
   if (params.functionDeclaration?.includes(LANDING))
     return [params.arguments?.[0]?.value, params.arguments?.[1]?.value];
   const match = params.expression?.includes(LANDING)
-    ? params.expression.match(/\}\)\("(\w+)", (.*)\)$/s)
+    ? params.expression.match(/\("(\w+)", (\{.*\})\)$/s)
     : null;
   return match ? [match[1], JSON.parse(match[2])] : undefined;
 }

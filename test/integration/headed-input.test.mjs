@@ -71,7 +71,7 @@ async function until(read, expected, label) {
   let last;
   while (Date.now() < deadline) {
     last = await read();
-    if (last === expected) return;
+    if (typeof expected === 'function' ? expected(last) : last === expected) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.fail(`${label}: ${JSON.stringify(last)}`);
@@ -165,6 +165,62 @@ async function steps(pw, out, raw, tab, seven) {
   }
   await until(() => inTab(raw, tab, 'window.answer'), true, 'the dialog answered the click');
   assert.equal(await visibility(seven), 'visible');
+  await rawInput(pw, raw, tab, seven);
+}
+
+const PAD = `<div id="pad" style="position:fixed;left:0;top:0;width:600px;height:200px;background:#fff;z-index:9"><div id="src" role="button" aria-label="Source" style="position:absolute;left:20px;top:20px;width:100px;height:60px"></div><div id="dst" role="button" aria-label="Target" style="position:absolute;left:300px;top:20px;width:100px;height:60px"></div><input id="field" aria-label="Field" style="position:absolute;left:20px;top:120px"></div>`;
+const LOG = `window.log = []; for (const type of ['mousedown', 'mouseup', 'click', 'keydown', 'keyup']) document.getElementById('pad').addEventListener(type, (event) => log.push(type + ':' + event.target.id + (event.shiftKey ? ':shift' : '')), true); document.getElementById('pad').addEventListener('mousemove', (event) => { window.moved = event.target.id + ':' + event.buttons; }, true);`;
+
+async function rawInput(pw, raw, tab, seven) {
+  const visibility = (target) => inTab(raw, target, 'document.visibilityState');
+  const log = () => inTab(raw, tab, "window.log.join(' ')");
+  const clear = () => inTab(raw, tab, "window.log.length = 0; window.moved = ''");
+  await inTab(
+    raw,
+    tab,
+    `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(PAD)}); ${LOG}`
+  );
+  const shot = await pw(['snapshot']);
+  await pw(['drag', refOf(shot, 'button', 'Source'), refOf(shot, 'button', 'Target')]);
+  await until(log, 'mousedown:src mouseup:dst click:pad', 'drag');
+  assert.equal(await inTab(raw, tab, 'window.moved'), 'dst:1');
+
+  await clear();
+  await pw(['mousemove', '70', '50']);
+  await until(() => inTab(raw, tab, 'window.moved'), 'src:0', 'mousemove');
+  await pw(['mousedown']);
+  await pw(['mousemove', '350', '50']);
+  await until(() => inTab(raw, tab, 'window.moved'), 'dst:1', 'mousemove with the button held');
+  await pw(['mouseup']);
+  await until(log, 'mousedown:src mouseup:dst click:pad', 'mousedown and mouseup');
+
+  await clear();
+  await inTab(raw, tab, "document.getElementById('field').focus()");
+  for (const [command, key] of [
+    ['keydown', 'Shift'],
+    ['keydown', 'KeyA'],
+    ['keyup', 'KeyA'],
+    ['keyup', 'Shift'],
+  ])
+    await pw([command, key]);
+  await until(
+    log,
+    'keydown:field:shift keydown:field:shift keyup:field:shift keyup:field',
+    'keydown and keyup'
+  );
+  assert.equal(await inTab(raw, tab, "document.getElementById('field').value"), 'A');
+  assert.equal(await visibility(seven), 'visible');
+  assert.equal(await visibility(tab), 'hidden');
+
+  await pw(['keydown', 'Tab']);
+  await until(
+    () => inTab(raw, tab, 'document.activeElement.id'),
+    (id) => id !== 'field',
+    'Tab moved focus'
+  );
+  await pw(['keyup', 'Tab']);
+  await until(() => visibility(seven), 'visible', 'seven is back in front after the raw Tab');
+  assert.equal(await visibility(tab), 'hidden');
 }
 
 test('headed Chrome takes playwright-cli input on a background tab and keeps seven in front', {
