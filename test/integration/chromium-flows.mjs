@@ -516,6 +516,18 @@ async function basicsBatchFlow(runner, site) {
   );
   assert.equal(hoverAttr.code, 0, hoverAttr.stderr);
   assert.equal(hoverAttr.stdout, 'true\n');
+  const innerSnap = await runner.playwright(['snapshot', `--frame=${childFrameId}`], cwd);
+  assert.equal(innerSnap.code, 0, `${innerSnap.stderr}\n${innerSnap.stdout}`);
+  const inner = innerSnap.stdout.match(/checkbox "Inner" \[ref=(f\d+e\d+)\]/)?.[1];
+  assert.ok(inner, innerSnap.stdout);
+  const innerChecked = await runner.playwright(['check', inner], cwd);
+  assert.equal(innerChecked.code, 0, innerChecked.stderr);
+  assert.match(innerChecked.stdout, /Checked/);
+  const innerState = await runner.playwright(
+    ['eval', `--frame=${childFrameId}`, 'document.getElementById("inner").checked'],
+    cwd
+  );
+  assert.equal(innerState.stdout, 'true\n');
 
   const closed = await runner.playwright(['close'], cwd);
   assert.equal(closed.code, 0, closed.stderr);

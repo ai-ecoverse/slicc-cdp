@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { modeFlags, screenFor } from '@ai-ecoverse/slicc-shared-web/harness';
+import { headlessByDefault, modeFlags, screenFor } from '@ai-ecoverse/slicc-shared-web/harness';
 import { requireChrome } from './chrome-policy.mjs';
 import { chromeLaunched } from './chrome-report.mjs';
 
@@ -40,12 +40,63 @@ export async function waitExit(exited, timeoutMs = cleanupGrace()) {
   }
 }
 
+const QUIET = [
+  '--disable-background-networking',
+  '--disable-component-update',
+  '--disable-sync',
+  '--disable-domain-reliability',
+  '--disable-client-side-phishing-detection',
+  '--disable-breakpad',
+  '--disable-search-engine-choice-screen',
+  '--metrics-recording-only',
+  '--no-pings',
+  '--no-service-autorun',
+];
+const QUIET_FEATURES = [
+  'Translate',
+  'MediaRouter',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'OptimizationHints',
+  'OptimizationHintsFetching',
+  'OptimizationGuideModelDownloading',
+  'OptimizationTargetPrediction',
+  'LensOverlay',
+  'AutofillServerCommunication',
+  'CertificateTransparencyComponentUpdater',
+  'InterestFeedContentSuggestions',
+  'ZeroSuggestPrefetching',
+];
+const OFFLINE = ['google.com', '*.google.com', '*.googleapis.com', '*.gstatic.com', '*.gvt1.com'];
+
+function quiet(extraArgs) {
+  const merged = (prefix, own, separator) =>
+    prefix +
+    [
+      ...extraArgs.filter((arg) => arg.startsWith(prefix)).map((arg) => arg.slice(prefix.length)),
+      ...own,
+    ]
+      .filter(Boolean)
+      .join(separator);
+  const features = '--disable-features=';
+  const rules = '--host-resolver-rules=';
+  return [
+    ...extraArgs.filter((arg) => !arg.startsWith(features) && !arg.startsWith(rules)),
+    merged(features, QUIET_FEATURES, ','),
+    merged(
+      rules,
+      OFFLINE.map((host) => `MAP ${host} ~NOTFOUND`),
+      ', '
+    ),
+  ];
+}
+
 export async function launchBrowser(extraArgs = [], options = {}) {
   requireChrome();
   options.signal?.throwIfAborted();
   let port = options.port ?? 0;
   if (port >= 9222 && port <= 9229) throw new Error(`refusing debugging port ${port}`);
-  const headless = options.headless ?? true;
+  const headless = options.headless ?? headlessByDefault(process.env);
   const executable = process.env.CHROMIUM_EXECUTABLE || (await findBrowser())?.executable;
   const userDataDir = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-chrome-'));
   let screen;
@@ -65,12 +116,13 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       ...modeFlags(headless),
       '--no-first-run',
       '--no-default-browser-check',
+      ...QUIET,
       ...(headless ? ['--disable-gpu'] : ['--window-size=1280,800']),
       '--disable-dev-shm-usage',
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--remote-allow-origins=*',
-      ...extraArgs,
+      ...quiet(extraArgs),
       'about:blank',
     ],
     {

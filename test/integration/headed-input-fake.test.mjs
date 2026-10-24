@@ -315,6 +315,62 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
   });
 
+  test(`${transport}: check and uncheck land in place when Chrome drops the click`, async () => {
+    const box = { checked: false, stale: 0, flips: true };
+    const setup = scene({ reads: [[], [], []], pointer: 'done' });
+    const landing = setup.options.landing;
+    setup.options.landing = (mode, args, target) => {
+      const result = landing(mode, args, target);
+      if (mode === 'pointer' && box.flips) {
+        box.checked = !box.checked;
+        box.stale = 2;
+      }
+      return result;
+    };
+    setup.fake = {
+      intercept: (message, send) => {
+        const source = message.params?.functionDeclaration ?? '';
+        let value;
+        if (source.includes('JSON.stringify({ checked: this.checked'))
+          value = JSON.stringify({ checked: box.checked, disabled: false });
+        else if (source === 'function() { return this.checked; }') {
+          value = box.stale > 0 ? !box.checked : box.checked;
+          box.stale -= 1;
+        } else return false;
+        send({ id: message.id, sessionId: message.sessionId, result: { result: { value } } });
+        return true;
+      },
+    };
+    await withScene(runner, setup, async (s) => {
+      const checked = await s.ok(['check', s.ref]);
+      assert.match(checked.stdout, /Checked/);
+      assert.equal(box.checked, true);
+      await s.ok(['snapshot']);
+      await s.ok(['uncheck', s.ref]);
+      assert.equal(box.checked, false);
+      const sent = modes(s.state, 'pointer').map(([, args]) => [
+        args.steps,
+        args.button,
+        args.buttons,
+      ]);
+      const click = [
+        ['mousedown', 1],
+        ['mouseup', 1],
+        ['click', 1],
+      ];
+      assert.deepEqual(sent, [
+        [click, 0, 1],
+        [click, 0, 1],
+      ]);
+      assert.deepEqual(s.state.activated, []);
+      box.flips = false;
+      await s.ok(['snapshot']);
+      const stuck = await s.run(['check', s.ref]);
+      assert.equal(stuck.code, 1);
+      assert.equal(stuck.stderr, 'check: element state did not change to true\n');
+    });
+  });
+
   test(`${transport}: a refused trusted double click is reported`, async () => {
     const setup = scene();
     setup.fake = { refuse: ['Input.dispatchMouseEvent'] };

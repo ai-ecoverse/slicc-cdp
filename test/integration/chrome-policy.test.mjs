@@ -38,6 +38,8 @@ const modes = [{}, { CI: 'true' }, { SLICC_LOCAL_CHROME: '1' }, { SLICC_LOCAL_CH
 
 test('real Chrome launch boundaries refuse local runs and allow CI or explicit opt-in', async (t) => {
   const saved = { CI: process.env.CI, SLICC_LOCAL_CHROME: process.env.SLICC_LOCAL_CHROME };
+  const headless = process.env.SLICC_HEADLESS;
+  process.env.SLICC_HEADLESS = '1';
   const profiles = new Set();
   let spawned = 0;
   t.mock.method(childProcess, 'spawn', (_file, args) => {
@@ -79,6 +81,8 @@ test('real Chrome launch boundaries refuse local runs and allow CI or explicit o
     }
   } finally {
     setEnv(saved);
+    if (headless === undefined) delete process.env.SLICC_HEADLESS;
+    else process.env.SLICC_HEADLESS = headless;
     t.mock.restoreAll();
     syncBuiltinESMExports();
     await Promise.all(
