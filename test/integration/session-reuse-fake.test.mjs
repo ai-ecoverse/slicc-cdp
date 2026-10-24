@@ -159,12 +159,57 @@ for (const detachEvent of [false, true]) {
     assert.ok(prefix.some((event) => event.sessionId === second.sessionId));
     await client.send('Target.detachFromTarget', { sessionId: second.sessionId });
     assert.deepEqual(client.events.slice(0, prefix.length), prefix);
+    if (detachEvent)
+      assert.ok(
+        client.events.some(
+          (event) =>
+            event.method === 'Target.detachedFromTarget' &&
+            event.params.sessionId === second.sessionId
+        )
+      );
+    await assert.rejects(
+      client.send('Page.getNavigationHistory', {}, second.sessionId),
+      /slicc: refused/
+    );
     await client.send('Runtime.evaluate', { expression: 'document.title' }, first.sessionId);
     const fresh = await attach();
     assert.equal(fresh.sessionId, second.sessionId);
     await client.send('Runtime.evaluate', { expression: 'document.title' }, fresh.sessionId);
   });
 }
+
+test('ordinary physical detach evidence survives an acknowledgement before its event', async (t) => {
+  const { fake, client } = await fixture(t, [{ targetId: 'TAB', url: AFTER }], {
+    intercept: (message, send) => {
+      if (message.method !== 'Target.detachFromTarget') return false;
+      send({ id: message.id, result: {} });
+      send({
+        method: 'Target.detachedFromTarget',
+        params: { sessionId: message.params.sessionId },
+      });
+      return true;
+    },
+  });
+  const { sessionId } = await client.send('Target.attachToTarget', {
+    targetId: 'TAB',
+    flatten: true,
+  });
+  await client.send('Target.detachFromTarget', { sessionId });
+  await client.send('Target.getTargets');
+  assert.ok(
+    client.events.some(
+      (event) =>
+        event.method === 'Target.detachedFromTarget' && event.params.sessionId === sessionId
+    )
+  );
+  const from = fake.calls.length;
+  await assert.rejects(client.send('Page.getNavigationHistory', {}, sessionId), /slicc: refused/);
+  await assert.rejects(
+    client.send('Runtime.evaluate', { expression: 'document.title' }, sessionId),
+    /slicc: refused/
+  );
+  assert.equal(fake.calls.length, from);
+});
 
 for (const detachOwn of [false, true]) {
   test(`a pending call is affected only by its detached session, own ${detachOwn}`, async (t) => {

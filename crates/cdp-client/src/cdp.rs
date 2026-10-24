@@ -99,6 +99,7 @@ pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: i64,
     detaching: BTreeMap<i64, String>,
+    detached_ordinary: BTreeSet<String>,
     navigations: BTreeMap<i64, Navigation>,
     events: Vec<Value>,
     dialog_sessions: BTreeSet<String>,
@@ -180,6 +181,7 @@ impl Cdp {
             ws,
             next_id: 0,
             detaching: BTreeMap::new(),
+            detached_ordinary: BTreeSet::new(),
             navigations: BTreeMap::new(),
             events: Vec::new(),
             dialog_sessions: BTreeSet::new(),
@@ -2343,7 +2345,8 @@ impl Cdp {
                 }
             }
             if let Some(child) = value.pointer("/params/sessionId").and_then(|v| v.as_str()) {
-                if self.guard_sessions.contains(child) || self.blocked.contains(child) {
+                if self.guard_sessions.contains(child) || self.blocked.contains(child)
+                    && !(method == "Target.detachedFromTarget" && self.detached_ordinary.contains(child)) {
                     return true;
                 }
             }
@@ -2817,6 +2820,7 @@ impl Cdp {
                 if method == "Target.attachToTarget" {
                     if let Some(session) = value.pointer("/result/sessionId").and_then(Value::as_str) {
                         self.blocked.remove(session);
+                        self.detached_ordinary.remove(session);
                     }
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
@@ -2945,6 +2949,9 @@ impl Cdp {
     }
 
     fn forget_session(&mut self, session: &str) {
+        if !self.blocked.contains(session) && !self.guard_sessions.contains(session) {
+            self.detached_ordinary.insert(session.to_string());
+        }
         let target = self.session_target(session);
         if self.blocked.contains(session) {
             if let Some(target) = &target { self.protected_targets.insert(target.clone()); }
