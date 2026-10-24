@@ -278,7 +278,13 @@ test('a paused holder answers the old connection guard while it reattaches on a 
       });
       await holder.event('resumed');
       holder.child.stdin.end();
-      assert.equal((await holder.ended).code, 0);
+      const ended = await holder.ended;
+      assert.equal(ended.code, 0);
+      assert.match(
+        ended.stderr,
+        /send #\d+ Fetch\.failRequest session=\S+ requestId=OLD-PROTECTED/
+      );
+      assert.ok(!/old-secret|sliccy|:\/\//.test(ended.stderr), ended.stderr);
     },
     {
       intercept(message, send) {
