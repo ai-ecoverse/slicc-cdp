@@ -673,6 +673,77 @@ for (const url of ['about:blank', '']) {
   });
 }
 
+await test('fake: refused navigation traces contain only sanitized frame evidence and event order', async () => {
+  await scenario(
+    { children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }] },
+    async ({ backend, held }) => {
+      const peer = [...backend.scripts.keys()].find(
+        (session) => backend.sessions.get(session) === 'CROSS'
+      );
+      const page = backend.pages.get('CROSS');
+      const trace = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          held.child.stderr.off('data', check);
+          reject(new Error('sanitized navigation trace did not arrive'));
+        }, 5000);
+        const check = () => {
+          const line = held
+            .stderr()
+            .split('\n')
+            .find(
+              (line) =>
+                line.startsWith('webmcp-polyfill: {') && line.includes('guard-navigation-trace')
+            );
+          if (!line) return;
+          clearTimeout(timer);
+          held.child.stderr.off('data', check);
+          resolve(JSON.parse(line.slice('webmcp-polyfill: '.length)));
+        };
+        held.child.stderr.on('data', check);
+        check();
+      });
+      backend.inject({
+        method: 'Target.targetInfoChanged',
+        sessionId: peer,
+        params: {
+          targetInfo: {
+            targetId: page.id,
+            type: 'iframe',
+            parentFrameId: 'TAB',
+            url: `${page.origin}/`,
+          },
+        },
+      });
+      backend.inject({
+        method: 'Page.frameNavigated',
+        sessionId: peer,
+        params: {
+          frame: {
+            id: page.id,
+            loaderId: page.loader,
+            url: 'about:srcdoc#private',
+            securityOrigin: page.origin,
+            unreachableUrl: 'https://user:secret@foreign.test/private',
+          },
+        },
+      });
+      const reported = await trace;
+      assert.equal(reported.eventFrame.scheme, 'about:srcdoc');
+      assert.equal(reported.eventFrame.parentIdPresent, false);
+      assert.equal(reported.eventFrame.unreachableUrlNonempty, true);
+      assert.equal(reported.frameInGuardTree, true);
+      assert.equal(reported.guardFrame.scheme, 'https');
+      assert.equal(reported.loaderEqual, true);
+      assert.equal(reported.targetType, 'iframe');
+      assert.ok(reported.lifecycleBefore.attachedToTarget < reported.sequence);
+      assert.ok(reported.lifecycleBefore.targetInfoChanged < reported.sequence);
+      assert.equal(JSON.stringify(reported).includes('private'), false);
+      assert.equal(JSON.stringify(reported).includes('secret'), false);
+      assert.equal(JSON.stringify(reported).includes('foreign.test'), false);
+    }
+  );
+});
+
 await test('fake: a pending change is dropped when the document navigates, and the next document reports its own generation', async () => {
   let pending = false;
   let backend;

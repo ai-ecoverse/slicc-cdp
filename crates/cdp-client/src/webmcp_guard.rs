@@ -55,6 +55,8 @@ pub(super) struct Webmcp {
     parents: BTreeMap<String, String>,
     children: Vec<(String, String, String)>,
     samples: Vec<u128>,
+    trace_sequence: u64,
+    trace_lifecycle: BTreeMap<(String, &'static str), u64>,
 }
 
 impl Webmcp {
@@ -524,9 +526,65 @@ impl Cdp {
         self.webmcp.handling_gate = false;
     }
 
+    fn webmcp_trace_scheme(value: &str) -> &'static str {
+        if value.is_empty() { return "empty"; }
+        let Ok(url) = url::Url::parse(value) else { return "invalid"; };
+        match (url.scheme(), url.path()) {
+            ("about", "blank") => "about:blank",
+            ("about", "srcdoc") => "about:srcdoc",
+            ("about", _) => "about:other",
+            ("chrome-error", _) => "chrome-error",
+            ("http", _) => "http",
+            ("https", _) => "https",
+            ("data", _) => "data",
+            ("blob", _) => "blob",
+            ("file", _) => "file",
+            ("chrome", _) => "chrome",
+            ("chrome-extension", _) => "extension",
+            _ => "other",
+        }
+    }
+
+    fn webmcp_trace_frame(&self, frame: &Value) -> Value {
+        let text = |key| frame.get(key).and_then(Value::as_str).unwrap_or("");
+        json!({"scheme":Self::webmcp_trace_scheme(text("url")),"parentIdPresent":frame.get("parentId").is_some(),"unreachableUrlPresent":frame.get("unreachableUrl").is_some(),"unreachableUrlNonempty":!text("unreachableUrl").is_empty(),"loaderPresent":!text("loaderId").is_empty(),"refusal":self.webmcp_frame_refusal(frame)})
+    }
+
+    fn webmcp_trace_order(&self, target: &str) -> Value {
+        let mut order = serde_json::Map::new();
+        for method in ["attachedToTarget", "detachedFromTarget", "targetInfoChanged"] {
+            order.insert(method.into(), json!(self.webmcp.trace_lifecycle.get(&(target.to_string(), method))));
+        }
+        Value::Object(order)
+    }
+
+    fn webmcp_trace_navigation(&mut self, session: &str, frame: &Value) {
+        let sequence = self.webmcp.trace_sequence;
+        let target = self.session_target(session).unwrap_or_default();
+        let kind = self.targets.get(&target).and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or("");
+        let kind = match kind { "page" => "page", "iframe" => "iframe", "worker" => "worker", "" => "unknown", _ => "other" };
+        let before = self.webmcp_trace_order(&target);
+        let epoch = self.frame_epoch;
+        let tree = self.guards.get(&target).cloned().and_then(|guard| self.raw_exchange("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP, false).ok());
+        let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+        let current = tree.as_ref().and_then(|tree| tree.get("frameTree")).and_then(|node| Self::webmcp_frame(node, id));
+        let current_metadata = current.map(|current| self.webmcp_trace_frame(current));
+        let loader_equal = current.map(|current| current.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()) == frame.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()));
+        let trace = json!({"event":"guard-navigation-trace","sequence":sequence,"targetType":kind,"eventFrame":self.webmcp_trace_frame(frame),"guardTreeAvailable":tree.is_some(),"frameInGuardTree":current.is_some(),"guardFrame":current_metadata,"loaderEqual":loader_equal,"frameEpochStable":epoch == self.frame_epoch,"lifecycleBefore":before,"lifecycleAfter":self.webmcp_trace_order(&target),"probeEndSequence":self.webmcp.trace_sequence});
+        self.notices.push(format!("webmcp-polyfill: {trace}\n"));
+    }
+
     pub(super) fn webmcp_event(&mut self, value: &Value) -> bool {
+        self.webmcp.trace_sequence += 1;
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let lifecycle = match method { "Target.attachedToTarget" => Some("attachedToTarget"), "Target.detachedFromTarget" => Some("detachedFromTarget"), "Target.targetInfoChanged" => Some("targetInfoChanged"), _ => None };
+        if let Some(lifecycle) = lifecycle {
+            let target = value.pointer("/params/targetInfo/targetId").or_else(|| value.pointer("/params/targetId")).and_then(Value::as_str).map(str::to_string)
+                .or_else(|| value.pointer("/params/sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session))).unwrap_or_default();
+            if self.webmcp.trace_lifecycle.len() >= 1024 { self.webmcp.trace_lifecycle.clear(); }
+            self.webmcp.trace_lifecycle.insert((target, lifecycle), self.webmcp.trace_sequence);
+        }
         if method == "Target.attachedToTarget" && self.webmcp.arms.contains_key(session) {
             self.webmcp_gate_event(value);
             return true;
@@ -556,6 +614,7 @@ impl Cdp {
                 && frame.get("url").and_then(Value::as_str).is_some_and(|url| url.is_empty() || url == "about:blank")
                 && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty());
             if let Some(reason) = self.webmcp_frame_refusal(frame).filter(|_| !initial_child) {
+                self.webmcp_trace_navigation(session, frame);
                 let role = if self.webmcp.parents.contains_key(session) { "OOPIF" } else if frame.get("parentId").is_some() { "subframe" } else { "top frame" };
                 self.notices.push(format!("webmcp-polyfill: frame navigation refused ({role}, {reason})\n"));
                 self.webmcp_revoke(session);
