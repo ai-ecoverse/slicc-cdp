@@ -76,7 +76,10 @@ function page(script) {
       reply({ node: script.focusNode ?? { nodeType: 1, nodeName: 'INPUT', localName: 'input' } });
       return true;
     }
-    if (method === 'Runtime.evaluate' && params.expression?.includes('document.activeElement')) {
+    if (
+      method === 'Runtime.evaluate' &&
+      params.expression?.startsWith('(() => { let e = document.activeElement')
+    ) {
       reply({ result: script.focus ?? { type: 'object', subtype: 'node', objectId: 'FOCUSED' } });
       return true;
     }

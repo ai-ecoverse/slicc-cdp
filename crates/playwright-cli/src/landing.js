@@ -48,42 +48,6 @@
     probe?.stop();
     return probe ? probe.seen : null;
   };
-  const activatable = 'a[href],area[href],button,input,select,summary,[role=button]';
-  const erasers = { Backspace: 'delete', Delete: 'forwardDelete' };
-  const fallback = (target, typed) => {
-    if (typed) return edit(target, 'insertText', args.text);
-    if (!(target instanceof HTMLInputElement))
-      return edit(target, target.isContentEditable ? 'insertParagraph' : 'insertLineBreak');
-    target.form?.requestSubmit();
-  };
-  const press = (node) => {
-    const enter = args.key === 'Enter';
-    const erase = erasers[args.key];
-    const typed = !!args.text && !enter && args.key !== 'Tab' && !(args.modifiers & 6);
-    const target = node ?? document.body;
-    const activates =
-      (enter || args.key === ' ') && !editable(target) && !!target.closest(activatable);
-    if (activates || !(typed || enter || erase || args.key === 'Escape')) return 'unsupported';
-    const init = {
-      key: args.key,
-      code: args.code,
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: window,
-      ...held(args.modifiers),
-    };
-    const go = target.dispatchEvent(new KeyboardEvent('keydown', init)) && editable(target);
-    if (go && erase) edit(target, erase);
-    else if (
-      go &&
-      args.key !== 'Escape' &&
-      target.dispatchEvent(new KeyboardEvent('keypress', init))
-    )
-      fallback(target, typed);
-    target.dispatchEvent(new KeyboardEvent('keyup', init));
-    return 'pressed';
-  };
   const deepest = (x, y) => {
     let hit = document.elementFromPoint(x, y);
     let inner = hit?.shadowRoot?.elementFromPoint(x, y);
@@ -165,8 +129,9 @@
     read,
     focus: near((node) => (editable(node) ? 'editable' : 'none')),
     insert: near((node) => (edit(node, 'insertText', args.text) ? 'inserted' : 'unchanged')),
-    key: near(press),
+    key: near((node) => raw.keys(args, node ?? document.body, { edit, editable, held })),
     pointer: point,
+    mouse: () => raw.mouse(args, { up, deepest, owner, held, focusable }),
   };
   return modes[mode]();
 });

@@ -4,6 +4,7 @@ use crate::browser;
 use crate::cdp::Cdp;
 use crate::commands::{resolve_target, with_ref};
 use crate::keys::{self, Key};
+use crate::landing::{self, Motion, Scope, Step};
 use crate::sanitize;
 use crate::session::Session;
 use crate::snapshot::RefRec;
@@ -40,6 +41,8 @@ struct Pointer {
     buttons: Vec<String>,
     keys: Vec<String>,
     modifiers: Vec<String>,
+    press: Option<(f64, f64)>,
+    placed: bool,
 }
 
 impl Pointer {
@@ -55,6 +58,10 @@ impl Pointer {
             }
             out
         };
+        let press = value.get("press").and_then(Value::as_array).and_then(|pair| match pair.as_slice() {
+            [x, y] => x.as_f64().zip(y.as_f64()).filter(|(x, y)| x.is_finite() && y.is_finite()),
+            _ => None,
+        });
         let last = value.get("lastButton").and_then(Value::as_str).filter(|name| BUTTONS.contains(name)).unwrap_or("none");
         Pointer {
             x: number("x"),
@@ -63,11 +70,13 @@ impl Pointer {
             buttons: names("buttons", &|name| BUTTONS.contains(&name)),
             keys: names("keys", &|name| keys::lookup(name).is_some_and(|key| key.code == name)),
             modifiers: names("modifiers", &|name| keys::MODIFIERS.contains(&name)),
+            press,
+            placed: value.get("placed").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 
     fn save(&self) -> Value {
-        json!({ "x": self.x, "y": self.y, "lastButton": self.last, "buttons": self.buttons, "keys": self.keys, "modifiers": self.modifiers })
+        json!({ "x": self.x, "y": self.y, "lastButton": self.last, "buttons": self.buttons, "keys": self.keys, "modifiers": self.modifiers, "press": self.press.map(|(x, y)| json!([x, y])), "placed": self.placed })
     }
 
     fn buttons_mask(&self) -> i64 {
@@ -76,6 +85,16 @@ impl Pointer {
 
     fn modifiers_mask(&self) -> i64 {
         keys::mask(&self.modifiers)
+    }
+
+    fn motion(&self, next: &Pointer, kind: &'static str, button: &str) -> Motion {
+        let button = match button {
+            "middle" => 1,
+            "right" => 2,
+            _ => 0,
+        };
+        let step = Step { kind, point: (next.x, next.y), buttons: next.buttons_mask(), button };
+        Motion { steps: vec![step], from: Some((self.x, self.y)), press: self.press, modifiers: next.modifiers_mask() }
     }
 }
 
@@ -225,7 +244,8 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
             let mut next = pointer.clone();
             next.x = x;
             next.y = y;
-            mouse(cdp, session, "mouseMoved", &next, &next.last.clone(), None)?;
+            let motion = pointer.motion(&next, "move", "none");
+            landing::mouse(cdp, &Scope::page(session), command, &motion, true, &mut |cdp| mouse(cdp, session, "mouseMoved", &next, &next.last, None))?;
             *pointer = next;
             Ok(code(&format!("// Move mouse to ({}, {})\nawait page.mouse.move({}, {});", js(x), js(y), js(x), js(y))))
         }
@@ -237,13 +257,19 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
             let (kind, verb) = if command == "mousedown" {
                 next.last = name.clone();
                 add(&mut next.buttons, &name);
+                next.press = Some((next.x, next.y));
                 ("mousePressed", "down")
             } else {
                 next.last = "none".to_string();
                 next.buttons.retain(|known| known != &name);
+                next.press = None;
                 ("mouseReleased", "up")
             };
-            mouse(cdp, session, kind, &next, &name, Some(1))?;
+            let motion = pointer.motion(&next, verb, &name);
+            let scope = Scope::page(session);
+            let mut send = |cdp: &mut Cdp| mouse(cdp, session, kind, &next, &name, Some(1));
+            let placed = if command == "mouseup" && pointer.placed { landing::placed(cdp, &scope, command, &motion, &mut send)? } else { landing::mouse(cdp, &scope, command, &motion, true, &mut send)? };
+            next.placed = command == "mousedown" && placed;
             *pointer = next;
             let options = chosen.map(|name| format!("{{\n  button: {}\n}}", quoted(&name))).unwrap_or_default();
             Ok(code(&format!("// Press mouse {verb}\nawait page.mouse.{verb}({options});")))
@@ -321,7 +347,7 @@ fn mouse(cdp: &mut Cdp, session: &str, kind: &str, pointer: &Pointer, button: &s
     if kind != "mouseReleased" {
         params["force"] = json!(if pointer.buttons.is_empty() { 0.0 } else { 0.5 });
     }
-    cdp.call("Input.dispatchMouseEvent", params, Some(session))?;
+    cdp.call_for("Input.dispatchMouseEvent", params, Some(session), landing::INPUT_WAIT)?;
     Ok(())
 }
 
@@ -357,7 +383,7 @@ fn key_down(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> R
     }
     admit_focus(cdp, session)?;
     let commands = if mac { keys::mac_commands(&key.code, &next.modifiers) } else { Vec::new() };
-    cdp.call("Input.dispatchKeyEvent", json!({
+    let params = json!({
         "type": if key.text.is_empty() { "rawKeyDown" } else { "keyDown" },
         "modifiers": next.modifiers_mask(),
         "windowsVirtualKeyCode": key.key_code,
@@ -369,7 +395,9 @@ fn key_down(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> R
         "autoRepeat": repeat,
         "location": key.location,
         "isKeypad": key.location == keys::KEYPAD,
-    }), Some(session))?;
+    });
+    let stroke = stroke(&key, next.modifiers_mask(), false, repeat);
+    landing::stroke(cdp, session, &stroke, &mut |cdp| dispatch_key(cdp, session, &params))?;
     *pointer = next;
     Ok(code(&format!("await page.keyboard.down({});", quoted(raw))))
 }
@@ -383,7 +411,7 @@ fn key_up(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> Res
     }
     next.keys.retain(|held| held != &key.code);
     admit_focus(cdp, session)?;
-    cdp.call("Input.dispatchKeyEvent", json!({
+    let params = json!({
         "type": "keyUp",
         "modifiers": next.modifiers_mask(),
         "key": key.key,
@@ -391,9 +419,21 @@ fn key_up(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> Res
         "code": key.code,
         "location": key.location,
         "isKeypad": key.location == keys::KEYPAD,
-    }), Some(session))?;
+    });
+    let stroke = stroke(&key, next.modifiers_mask(), true, false);
+    landing::stroke(cdp, session, &stroke, &mut |cdp| dispatch_key(cdp, session, &params))?;
     *pointer = next;
     Ok(code(&format!("await page.keyboard.up({});", quoted(raw))))
+}
+
+fn stroke(key: &Key, modifiers: i64, up: bool, repeat: bool) -> landing::Stroke<'_> {
+    let text = Some(key.text.as_str()).filter(|text| !text.is_empty());
+    landing::Stroke { keyed: landing::Keyed { key: &key.key, code: &key.code, text, modifiers }, up, repeat, location: key.location }
+}
+
+fn dispatch_key(cdp: &mut Cdp, session: &str, params: &Value) -> Result<(), String> {
+    cdp.call_for("Input.dispatchKeyEvent", params.clone(), Some(session), landing::INPUT_WAIT)?;
+    Ok(())
 }
 
 fn main_frame(cdp: &mut Cdp, session: &str) -> Result<String, String> {
@@ -442,7 +482,7 @@ fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<(), Strin
 }
 
 fn admit_focus(cdp: &mut Cdp, session: &str) -> Result<(), String> {
-    let refused = || "slicc: refused: keyboard focus is inside an embedded frame or a closed shadow root\n".to_string();
+    let refused = || landing::FOCUS_REFUSAL.to_string();
     let frame = main_frame(cdp, session)?;
     let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
     let context = world.get("executionContextId").cloned().ok_or_else(refused)?;
