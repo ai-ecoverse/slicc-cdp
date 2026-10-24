@@ -256,9 +256,16 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     held.child.stdin.end();
     assert.equal(await held.ended, 0, held.stderr());
     held = undefined;
-    await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
+    await navigate(raw, sessionId, `${ordinary}/tools`);
     held = stream(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
-    await held.next((line) => line.event === 'ready', 0);
+    const restarted = await held.next((line) => line.event === 'ready', 0);
+    assert.equal(restarted.mode, 'polyfill');
+    const ordinaryFramesReady = held.next(
+      (line) => line.event === 'document-ready' && line.loaderId !== restarted.loaderId,
+      held.lines.length
+    );
+    await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
+    await ordinaryFramesReady;
     const cross = (await raw.send('Target.getTargets', {})).targetInfos.find(
       (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
     );
