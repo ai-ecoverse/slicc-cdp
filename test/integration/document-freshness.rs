@@ -132,6 +132,7 @@ fn current_document_is_verified_before_content_commands_after_history_navigation
                     assert!(cdp.call("Page.navigate", json!({"url":PROTECTED}), Some(&session)).is_err());
                     backend.borrow_mut().commit(PROTECTED, false);
                     drain(&mut cdp);
+                    assert!(cdp.session_blocked(&session));
                     assert!(cdp.is_protected_target("T"));
                     backend.borrow_mut().commit(ORDINARY, false);
                     drain(&mut cdp);

@@ -1178,7 +1178,7 @@ mod tests {
         );
         cdp.set_decider("S", panic_decider());
         while cdp.pump(Instant::now() + Duration::from_millis(10)).unwrap() {}
-        assert!(!cdp.session_blocked("S"));
+        assert!(cdp.session_blocked("S"));
         assert!(!cdp.has_decider("S"));
         assert_eq!(
             methods(&log),

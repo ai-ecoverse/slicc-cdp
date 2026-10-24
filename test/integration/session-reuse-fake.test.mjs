@@ -38,9 +38,9 @@ async function fixture(t, tabs, options = {}) {
   const fake = await fakeCdp({
     tabSessions: true,
     ...options,
-    intercept: (_message, send) => {
+    intercept: (message, send) => {
       emit = send;
-      return false;
+      return options.intercept?.(message, send) ?? false;
     },
   });
   fake.targets.push(...tabs);
@@ -139,6 +139,86 @@ for (const reported of [VAULT, ERROR]) {
         .length,
       0
     );
+  });
+}
+
+for (const detachEvent of [false, true]) {
+  test(`detaching a different session preserves published event cursors, event ${detachEvent}`, async (t) => {
+    const { client } = await fixture(t, [{ targetId: 'TAB', url: AFTER }], {
+      onCommand: (message, event) => {
+        if (detachEvent && message.method === 'Target.detachFromTarget')
+          event('Target.detachedFromTarget', { sessionId: message.params.sessionId });
+      },
+    });
+    const attach = () => client.send('Target.attachToTarget', { targetId: 'TAB', flatten: true });
+    const first = await attach();
+    const second = await attach();
+    await client.send('Runtime.enable', {}, first.sessionId);
+    await client.send('Runtime.enable', {}, second.sessionId);
+    const prefix = structuredClone(client.events);
+    assert.ok(prefix.some((event) => event.sessionId === second.sessionId));
+    await client.send('Target.detachFromTarget', { sessionId: second.sessionId });
+    assert.deepEqual(client.events.slice(0, prefix.length), prefix);
+    await client.send('Runtime.evaluate', { expression: 'document.title' }, first.sessionId);
+    const fresh = await attach();
+    assert.equal(fresh.sessionId, second.sessionId);
+    await client.send('Runtime.evaluate', { expression: 'document.title' }, fresh.sessionId);
+  });
+}
+
+for (const detachOwn of [false, true]) {
+  test(`a pending call is affected only by its detached session, own ${detachOwn}`, async (t) => {
+    let other;
+    const { fake, client } = await fixture(t, [{ targetId: 'TAB', url: AFTER }], {
+      intercept: (message, send) => {
+        if (
+          message.method === 'Runtime.evaluate' &&
+          message.params.expression === 'pendingPromise'
+        ) {
+          send({
+            id: message.id,
+            result: { result: { type: 'object', subtype: 'promise', objectId: 'P' } },
+          });
+          return true;
+        }
+        if (message.method === 'Runtime.awaitPromise') {
+          send({
+            method: 'Target.detachedFromTarget',
+            params: { sessionId: detachOwn ? message.sessionId : other },
+          });
+          send({ id: message.id, result: { result: { type: 'string', value: 'own reply' } } });
+          return true;
+        }
+        return false;
+      },
+    });
+    const first = await client.send('Target.attachToTarget', { targetId: 'TAB', flatten: true });
+    const second = await client.send('Target.attachToTarget', { targetId: 'TAB', flatten: true });
+    other = second.sessionId;
+    await client.send('Runtime.enable', {}, first.sessionId);
+    await client.send('Runtime.enable', {}, second.sessionId);
+    const promise = await client.send(
+      'Runtime.evaluate',
+      { expression: 'pendingPromise' },
+      first.sessionId
+    );
+    const pending = client.send(
+      'Runtime.awaitPromise',
+      { promiseObjectId: promise.result.objectId, returnByValue: true },
+      first.sessionId
+    );
+    if (detachOwn) {
+      await assert.rejects(pending, /slicc: refused/);
+      const from = fake.calls.length;
+      await assert.rejects(
+        client.send('Page.getNavigationHistory', {}, first.sessionId),
+        /slicc: refused/
+      );
+      assert.equal(fake.calls.length, from);
+    } else {
+      assert.equal((await pending).result.value, 'own reply');
+      await client.send('Runtime.evaluate', { expression: 'document.title' }, first.sessionId);
+    }
   });
 }
 

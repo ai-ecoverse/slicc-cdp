@@ -2814,6 +2814,11 @@ impl Cdp {
                     let (text, _) = shield::redact_text(&self.guard, text);
                     return Err(format!("{method}: {text}\n"));
                 }
+                if method == "Target.attachToTarget" {
+                    if let Some(session) = value.pointer("/result/sessionId").and_then(Value::as_str) {
+                        self.blocked.remove(session);
+                    }
+                }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
             let detached = value.get("method").and_then(|v| v.as_str())
@@ -2947,7 +2952,7 @@ impl Cdp {
         let guards: Vec<String> = self.guards.iter().filter(|(_, guard)| guard.as_str() == session).map(|(target, _)| target.clone()).collect();
         self.session_targets.remove(session);
         self.guard_sessions.remove(session);
-        self.blocked.remove(session);
+        self.blocked.insert(session.to_string());
         self.detaching.retain(|_, owner| owner != session);
         for target in guards {
             self.guards.remove(&target);
@@ -2970,7 +2975,6 @@ impl Cdp {
         self.answering.retain(|_, (owner, _)| owner != session);
         self.decided.retain(|_, (owner, _)| owner != session);
         self.held.remove(session);
-        self.events.retain(|event| event.get("sessionId").and_then(Value::as_str) != Some(session));
         self.navigated_blanks.retain(|_, (owner, _, _)| owner != session);
         self.seen_network.retain(|(owner, _), _| owner != session);
         self.terminal_network.retain(|(owner, _)| owner != session);
