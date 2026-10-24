@@ -101,6 +101,8 @@ pub type Waiter = Box<dyn FnMut(&Cdp)>;
 pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: i64,
+    detaching: BTreeMap<i64, String>,
+    detached_ordinary: BTreeSet<String>,
     navigations: BTreeMap<i64, Navigation>,
     events: Vec<Value>,
     dialog_sessions: BTreeSet<String>,
@@ -186,6 +188,8 @@ impl Cdp {
         Self {
             ws,
             next_id: 0,
+            detaching: BTreeMap::new(),
+            detached_ordinary: BTreeSet::new(),
             navigations: BTreeMap::new(),
             events: Vec::new(),
             dialog_sessions: BTreeSet::new(),
@@ -1140,7 +1144,8 @@ impl Cdp {
                 return doc.previous || self.guard.url(url) || doc.navigation_url.is_empty() || self.guard.url(&doc.navigation_url);
             }
             if (self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) && !self.masked_error(doc, url) {
-                if !self.guard.error_document(&doc.url, &doc.origin) || !self.reported_unreachable(&doc.unreachable_url, url) {
+                if !self.guard.error_document(&doc.url, &doc.origin)
+                    || !(self.reported_unreachable(&doc.unreachable_url, url) || self.guard.error_page_url(url) && doc.url == url && !doc.unreachable_url.is_empty()) {
                     return true;
                 }
                 return self.guard.target_with_document(&doc.unreachable_url, doc.previous, Opener::None,
@@ -1757,7 +1762,7 @@ impl Cdp {
     fn probe_candidate(&self, info: &Value) -> bool {
         let text = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or("");
         let target = text("targetId");
-        !target.is_empty() && text("type") == "page" && text("openerId").is_empty() && self.guard.url(text("url")) && !self.guard.unparseable(text("url"))
+        !target.is_empty() && text("type") == "page" && text("openerId").is_empty() && (self.guard.url(text("url")) || self.guard.error_page_url(text("url"))) && !self.guard.unparseable(text("url"))
             && !self.documents.contains_key(target) && !self.abandoned.contains(target) && !self.guards.contains_key(target)
     }
 
@@ -1779,7 +1784,8 @@ impl Cdp {
         self.guard_sessions.insert(session.clone());
         let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&session), OPTIONAL_STEP).ok()
             .and_then(|tree| tree.pointer("/frameTree/frame").cloned())
-            .filter(|frame| self.guard.error_document(&text(frame, "url"), &text(frame, "securityOrigin")) && self.reported_unreachable(&text(frame, "unreachableUrl"), &url));
+            .filter(|frame| self.guard.error_document(&text(frame, "url"), &text(frame, "securityOrigin"))
+                && (self.reported_unreachable(&text(frame, "unreachableUrl"), &url) || self.guard.error_page_url(&url) && text(frame, "url") == url));
         let history = match frame {
             Some(_) => self.raw_call("Page.getNavigationHistory", json!({}), Some(&session), OPTIONAL_STEP).ok(),
             None => None,
@@ -2334,15 +2340,7 @@ impl Cdp {
             }
             "Target.detachedFromTarget" => {
                 if let Some(child) = params.get("sessionId").and_then(|v| v.as_str()) {
-                    self.session_targets.remove(child);
-                    self.page_scope_sessions.retain(|_, session| session != child);
-                    self.guard_sessions.remove(child);
-                    let targets: Vec<String> = self.guards.iter().filter(|(_, session)| session.as_str() == child).map(|(target, _)| target.clone()).collect();
-                    for target in targets {
-                        self.documents.remove(&target);
-                        self.abandon(&target);
-                    }
-                    self.guards.retain(|_, session| session != child);
+                    self.forget_session(child);
                 }
             }
             _ => {}
@@ -2397,7 +2395,8 @@ impl Cdp {
                 }
             }
             if let Some(child) = value.pointer("/params/sessionId").and_then(|v| v.as_str()) {
-                if self.guard_sessions.contains(child) || self.blocked.contains(child) {
+                if self.guard_sessions.contains(child) || self.blocked.contains(child)
+                    && !(method == "Target.detachedFromTarget" && self.detached_ordinary.contains(child)) {
                     return true;
                 }
             }
@@ -2875,6 +2874,7 @@ impl Cdp {
                 }
             };
             if value.get("id").and_then(|item| item.as_i64()) == Some(id) {
+                self.detach_reply(id, &value);
                 if let Some(error) = value.get("error") {
                     if pinned && session_id.is_some_and(|session| self.blocked.contains(session)) { return Err(self.refusal()) }
                     let text = error
@@ -2883,6 +2883,12 @@ impl Cdp {
                         .unwrap_or("CDP error");
                     let (text, _) = shield::redact_text(&self.guard, text);
                     return Err(format!("{method}: {text}\n"));
+                }
+                if method == "Target.attachToTarget" {
+                    if let Some(session) = value.pointer("/result/sessionId").and_then(Value::as_str) {
+                        self.blocked.remove(session);
+                        self.detached_ordinary.remove(session);
+                    }
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
@@ -2910,6 +2916,11 @@ impl Cdp {
             message["sessionId"] = json!(session_id);
         }
         self.ws.send_text(&message.to_string())?;
+        if method == "Target.detachFromTarget" {
+            if let Some(session) = message.pointer("/params/sessionId").and_then(Value::as_str) {
+                self.detaching.insert(id, session.to_string());
+            }
+        }
         Ok(id)
     }
 
@@ -2998,8 +3009,66 @@ impl Cdp {
         self.deciders.remove(session_id);
     }
 
+    fn detach_reply(&mut self, id: i64, value: &Value) {
+        if let Some(session) = self.detaching.remove(&id) {
+            if value.get("error").is_none() { self.forget_session(&session); }
+        }
+    }
+
+    fn forget_session(&mut self, session: &str) {
+        if !self.blocked.contains(session) && !self.guard_sessions.contains(session) {
+            self.detached_ordinary.insert(session.to_string());
+        }
+        let target = self.session_target(session);
+        if self.blocked.contains(session) {
+            if let Some(target) = &target { self.protected_targets.insert(target.clone()); }
+        }
+        let guards: Vec<String> = self.guards.iter().filter(|(_, guard)| guard.as_str() == session).map(|(target, _)| target.clone()).collect();
+        self.session_targets.remove(session);
+        self.page_scope_sessions.retain(|_, owner| owner != session);
+        self.guard_sessions.remove(session);
+        self.blocked.insert(session.to_string());
+        self.detaching.retain(|_, owner| owner != session);
+        for target in guards {
+            self.guards.remove(&target);
+            self.documents.remove(&target);
+            self.cached_documents.remove(&target);
+            self.abandon(&target);
+        }
+        self.runtime_sessions.retain(|_, owner| owner != session);
+        self.frame_sessions.remove(session);
+        self.context_frames.retain(|(owner, _), _| owner != session);
+        self.context_proofs.retain(|(owner, _), _| owner != session);
+        self.created_contexts.retain(|(owner, _)| owner != session);
+        self.executing_sessions.remove(session);
+        self.dialog_sessions.remove(session);
+        self.dialogs.remove(session);
+        self.dialog_documents.remove(session);
+        self.forget_paused(session);
+        self.paused_documents.retain(|(owner, _)| owner != session);
+        self.handed.retain(|(owner, _)| owner != session);
+        self.answering.retain(|_, (owner, _)| owner != session);
+        self.decided.retain(|_, (owner, _)| owner != session);
+        self.held.remove(session);
+        self.navigated_blanks.retain(|_, (owner, _, _)| owner != session);
+        self.seen_network.retain(|(owner, _), _| owner != session);
+        self.terminal_network.retain(|(owner, _)| owner != session);
+        self.client_navigation_urls.remove(session);
+        self.protected_request_pages.retain(|(owner, _)| owner != session);
+        self.protected_resources.retain(|(owner, _)| owner != session);
+        self.source_resources.retain(|(owner, _), _| owner != session);
+        for resources in self.request_resources.values_mut() { resources.retain(|(owner, _)| owner != session); }
+        for navigation in self.navigations.values_mut() {
+            if navigation.session.as_deref() == Some(session) { navigation.detached = true; }
+        }
+        self.worlds.event(&json!({"method":"Target.detachedFromTarget","params":{"sessionId":session}}), &self.guard);
+        self.issued.forget(session);
+        self.webmcp.forget(session);
+    }
+
     fn absorb(&mut self, mut value: Value) {
         if let Some(id) = value.get("id").and_then(|item| item.as_i64()) {
+            self.detach_reply(id, &value);
             if self.waiting_calls.contains(&id) {
                 self.call_replies.insert(id, value.clone());
             }
@@ -3456,12 +3525,6 @@ pub fn attach(cdp: &mut Cdp, target_id: &str) -> Result<String, String> {
 }
 
 pub fn detach(cdp: &mut Cdp, session_id: &str) {
-    cdp.forget_paused(session_id);
-    cdp.blocked.remove(session_id);
-    cdp.session_targets.remove(session_id);
-    cdp.dialog_sessions.remove(session_id);
-    cdp.dialogs.remove(session_id);
-    cdp.dialog_documents.remove(session_id);
     let _ = cdp.call(
         "Target.detachFromTarget",
         json!({ "sessionId": session_id }),

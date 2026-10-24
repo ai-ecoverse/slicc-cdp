@@ -52,6 +52,7 @@ export const CHROME_FILES = new Set(
     'page-scope-chrome',
     'plant',
     'privileged-ui',
+    'real-extension',
     'recording',
     'redirect-navigation',
     'redirect-protected',

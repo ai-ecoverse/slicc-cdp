@@ -22,6 +22,19 @@ pub(super) struct Issued {
     deferred: BTreeMap<String, Vec<Paused>>,
 }
 
+impl Issued {
+    pub(super) fn forget(&mut self, session: &str) {
+        self.client.remove(session);
+        self.armed.remove(session);
+        self.arming.remove(session);
+        self.deferred.remove(session);
+        self.chains.retain(|(owner, _)| owner != session);
+        self.urls.retain(|(owner, _), _| owner != session);
+        self.auth.retain(|(owner, _)| owner != session);
+        self.responses.retain(|(owner, _), _| owner != session);
+    }
+}
+
 enum Token {
     Any,
     One,
