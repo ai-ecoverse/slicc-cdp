@@ -6,6 +6,7 @@ export async function webmcpBackend({
   definitions = [],
   children = [],
   native = false,
+  reentrantPauses = false,
   onCommand = () => {},
 } = {}) {
   let next = 0;
@@ -19,6 +20,7 @@ export async function webmcpBackend({
   const paused = new Map();
   const queues = new Map();
   const lateFrames = new Set();
+  const autoAttached = new Set();
   let held = null;
   let navigateLatest = () => {};
   let loadFired = false;
@@ -93,13 +95,15 @@ export async function webmcpBackend({
   const frame = (page) => ({
     id: page.id,
     loaderId: page.loader,
-    url: `${page.origin}/`,
+    url: page.blank ? 'about:blank' : `${page.origin}/`,
     securityOrigin: page.origin,
     ...(page.id === 'TAB' ? {} : { parentId: 'TAB' }),
   });
   const tree = () => ({
     frame: frame(pages.get('TAB')),
-    childFrames: children.map((child) => ({ frame: frame(pages.get(child.id)) })),
+    childFrames: children
+      .filter((child) => !child.oopif)
+      .map((child) => ({ frame: frame(pages.get(child.id)) })),
   });
   const fake = await fakeCdp({
     intercept(message, send) {
@@ -108,8 +112,14 @@ export async function webmcpBackend({
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) =>
         (writers.get(peer) || send)({ method, params, sessionId: peer });
+      const localPages = (peer) => {
+        const target = sessions.get(peer) || 'TAB';
+        return target === 'TAB'
+          ? [...pages.values()].filter((page) => !page.oopif)
+          : [pages.get(target)].filter(Boolean);
+      };
       const created = (peer) => {
-        for (const page of pages.values()) {
+        for (const page of localPages(peer)) {
           event(
             'Runtime.executionContextCreated',
             {
@@ -161,18 +171,21 @@ export async function webmcpBackend({
         return true;
       };
       const begin = (peer) => {
-        queues.set(peer, [...pages.keys()]);
+        queues.set(
+          peer,
+          localPages(peer).map((page) => page.id)
+        );
         pause(peer);
       };
       const navigate = () => {
         reset(`RELOAD${++reloads}`);
         loadFired = false;
         for (const peer of sessions.keys()) {
-          for (const page of pages.values())
+          for (const page of localPages(peer))
             event('Page.frameNavigated', { frame: frame(page) }, peer);
           event('Runtime.executionContextsCleared', {}, peer);
           created(peer);
-          for (const page of pages.values())
+          for (const page of localPages(peer))
             event(
               'Network.responseReceived',
               {
@@ -212,7 +225,31 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.getFrameTree') {
-        answer({ frameTree: tree() });
+        const target = sessions.get(sessionId) || 'TAB';
+        answer({ frameTree: target === 'TAB' ? tree() : { frame: frame(pages.get(target)) } });
+        return true;
+      }
+      if (method === 'Target.setAutoAttach') {
+        if (params.autoAttach && sessions.get(sessionId) === 'TAB') {
+          for (const page of pages.values()) {
+            if (!page.oopif || autoAttached.has(`${sessionId}:${page.id}`)) continue;
+            autoAttached.add(`${sessionId}:${page.id}`);
+            const peer = `PEER${++next}`;
+            sessions.set(peer, page.id);
+            writers.set(peer, send);
+            event('Target.attachedToTarget', {
+              sessionId: peer,
+              targetInfo: {
+                targetId: page.id,
+                type: 'iframe',
+                parentFrameId: 'TAB',
+                url: `${page.origin}/`,
+              },
+              waitingForDebugger: true,
+            });
+          }
+        }
+        answer({});
         return true;
       }
       if (method === 'Browser.getVersion') {
@@ -330,6 +367,11 @@ export async function webmcpBackend({
               page.document.modelContext?.registerTool?.(definition);
           }
         }
+        if (reentrantPauses && queues.get(sessionId)?.length) {
+          pause(sessionId);
+          answer({});
+          return true;
+        }
         answer({});
         if (page?.loaded && lateFrames.delete(queues.get(sessionId)?.[0])) {
           held = () => pause(sessionId);
@@ -392,6 +434,13 @@ export async function webmcpBackend({
     },
   });
   fake.targets.push({ targetId: 'TAB', url: 'https://ordinary.test/' });
+  for (const child of children.filter((child) => child.oopif))
+    fake.targets.push({
+      targetId: child.id,
+      type: 'iframe',
+      parentFrameId: 'TAB',
+      url: `${child.origin}/`,
+    });
   return {
     ...fake,
     get page() {

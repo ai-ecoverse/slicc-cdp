@@ -85,10 +85,10 @@ const changed = (frameId) => (value) =>
   value.event === 'tools-changed' && value.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
-async function scenario(options, check) {
+async function scenario(options, check, args) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-'));
   const backend = await webmcpBackend(options);
-  const held = holder(backend.url, cwd);
+  const held = holder(backend.url, cwd, args);
   try {
     await held.next((value) => value.event === 'ready', 0);
     await check({ backend, cwd, held });
@@ -209,6 +209,200 @@ await test('fake: a cross-origin iframe registering after load reports its frame
         false
       );
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+    }
+  );
+});
+
+await test('fake: a frame change while a frame document is gated is checked again, not refused', async () => {
+  let reloaded = false;
+  let gated = false;
+  let raced = 0;
+  await scenario(
+    {
+      definitions: [{ name: 'top', execute: () => 'top' }],
+      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
+      onCommand(message, _pages, send) {
+        if (message.method === 'Page.reload') reloaded = true;
+        if (
+          reloaded &&
+          message.method === 'Debugger.getScriptSource' &&
+          message.params.scriptId.endsWith('-CROSS')
+        )
+          gated = raced === 0;
+        if (!gated || message.method !== 'Page.getFrameTree') return;
+        gated = false;
+        raced += 1;
+        send({
+          method: 'Page.frameDetached',
+          params: { frameId: 'SWAPPED', reason: 'swap' },
+          sessionId: message.sessionId,
+        });
+      },
+    },
+    async ({ backend, cwd, held }) => {
+      assert.equal(raced, 1);
+      const from = held.lines.length;
+      backend.pages.get('CROSS').document.modelContext.registerTool({
+        name: 'foreign',
+        exposedTo: ['https://ordinary.test'],
+        execute: () => 'foreign',
+      });
+      const event = await held.next(changed('CROSS'), from);
+      assert.equal(event.loaderId, backend.pages.get('CROSS').loader);
+      assert.deepEqual(names(event), ['foreign']);
+      const listed = await run(backend.url, cwd, [
+        'webmcp-list',
+        '--tab',
+        'TAB',
+        '--json',
+        '--from-origin',
+        'https://foreign.test',
+      ]);
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.deepEqual(
+        event.tools,
+        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'CROSS')
+      );
+      assert.doesNotMatch(held.stderr(), /refused|target closed/);
+    }
+  );
+});
+
+await test('fake: a change held back by a protected frame is reported only after the frame leaves', async () => {
+  await scenario(
+    {
+      definitions: [{ name: 'top', execute: () => 'top' }],
+      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
+    },
+    async ({ backend, cwd, held }) => {
+      const sealed = {
+        targetId: 'SEALED',
+        type: 'iframe',
+        parentFrameId: 'TAB',
+        url: 'https://seven.sliccy.ai/',
+      };
+      backend.targets.push(sealed);
+      const from = held.lines.length;
+      backend.pages.get('CROSS').document.modelContext.registerTool({
+        name: 'foreign',
+        exposedTo: ['https://ordinary.test'],
+        execute: () => 'foreign',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      assert.deepEqual(
+        held.lines.slice(from).filter((line) => line.event === 'tools-changed'),
+        []
+      );
+      const locked = await run(backend.url, cwd, [
+        'webmcp-list',
+        '--tab',
+        'TAB',
+        '--json',
+        '--from-origin',
+        'https://foreign.test',
+      ]);
+      assert.notEqual(locked.code, 0);
+      assert.equal(locked.stdout, '');
+      backend.targets.splice(backend.targets.indexOf(sealed), 1);
+      const event = await held.next(changed('CROSS'), from);
+      assert.deepEqual(names(event), ['foreign']);
+      assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+    }
+  );
+});
+
+for (const reload of [false, true]) {
+  await test(`fake: a preloaded OOPIF survives frame-tree churn with reload=${reload}`, async () => {
+    let armed = false;
+    let raced = false;
+    await scenario(
+      {
+        children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
+        onCommand(message, _pages, send) {
+          if (message.method === 'Target.setAutoAttach') armed = true;
+          if (!armed || raced || message.method !== 'Page.getFrameTree') return;
+          raced = true;
+          send({
+            method: 'Page.frameDetached',
+            params: { frameId: 'SWAPPED', reason: 'swap' },
+            sessionId: message.sessionId,
+          });
+        },
+      },
+      async ({ backend, cwd, held }) => {
+        assert.equal(raced, true);
+        assert.ok(
+          backend.calls.some(
+            (call) =>
+              call.method === 'Page.addScriptToEvaluateOnNewDocument' &&
+              backend.sessions.get(call.sessionId) === 'CROSS'
+          )
+        );
+        const check = async () => {
+          const controller = new AbortController();
+          let from = held.lines.length;
+          backend.pages
+            .get('CROSS')
+            .document.modelContext.registerTool(
+              { name: 'foreign', exposedTo: ['https://ordinary.test'], execute: () => 'foreign' },
+              { signal: controller.signal }
+            );
+          const added = await held.next(changed('CROSS'), from);
+          const list = async () => {
+            const result = await run(backend.url, cwd, [
+              'webmcp-list',
+              '--tab',
+              'TAB',
+              '--json',
+              '--from-origin',
+              'https://foreign.test',
+            ]);
+            assert.equal(result.code, 0, result.stderr);
+            return JSON.parse(result.stdout).filter((tool) => tool.frameId === 'CROSS');
+          };
+          assert.deepEqual(names(added), ['foreign']);
+          assert.equal(added.target, 'CROSS');
+          assert.equal(added.loaderId, backend.pages.get('CROSS').loader);
+          assert.deepEqual(added.tools, await list());
+          from = held.lines.length;
+          controller.abort();
+          const removed = await held.next(changed('CROSS'), from);
+          assert.deepEqual(removed.tools, []);
+          assert.deepEqual(await list(), []);
+        };
+        assert.equal(
+          typeof backend.pages.get('CROSS').document.modelContext.registerTool,
+          'function'
+        );
+        if (reload) await check();
+        const from = held.lines.length;
+        backend.reload();
+        await held.next((line) => line.event === 'document-ready', from);
+        await check();
+        assert.doesNotMatch(held.stderr(), /child refused|target closed/);
+      },
+      ['webmcp-polyfill', '--tab', 'TAB', ...(reload ? ['--reload'] : [])]
+    );
+  });
+}
+
+await test('fake: a blank child pause received before the parent resume reply can rearm for an ordinary document', async () => {
+  const child = { id: 'CROSS', origin: 'https://ordinary.test', blank: true, allow: 'tools *' };
+  await scenario(
+    {
+      children: [child],
+      reentrantPauses: true,
+      onCommand(message) {
+        if (message.method === 'Page.reload') child.blank = false;
+      },
+    },
+    async ({ backend, held }) => {
+      const from = held.lines.length;
+      backend.pages
+        .get('CROSS')
+        .document.modelContext.registerTool({ name: 'child', execute: () => 'child' });
+      assert.deepEqual(names(await held.next(changed('CROSS'), from)), ['child']);
+      assert.doesNotMatch(held.stderr(), /refused|target closed/);
     }
   );
 });
