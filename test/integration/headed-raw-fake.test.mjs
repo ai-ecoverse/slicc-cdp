@@ -137,6 +137,39 @@ for (const [transport, runner] of Object.entries(runners)) {
     );
   });
 
+  test(`${transport}: a press done in place is released in place, and a dropped release after Chrome's press still clicks`, async () => {
+    await withScene(runner, scene({ reads: [[]] }), async (s) => {
+      await s.ok(['mousedown']);
+      await s.ok(['mouseup']);
+      assert.equal(modes(s.state, 'arm').length, 1);
+      assert.deepEqual(
+        modes(s.state, 'mouse').map(([, args]) => args),
+        [
+          { steps: [['down', 0, 0, 1, 0]], from: [0, 0], press: null, modifiers: 0 },
+          { steps: [['up', 0, 0, 0, 0]], from: [0, 0], press: [0, 0], modifiers: 0 },
+        ]
+      );
+      assert.deepEqual(
+        s.sent('Input.dispatchMouseEvent').map(({ params }) => params.type),
+        ['mousePressed']
+      );
+    });
+    await withScene(runner, scene({ reads: [['mousedown'], []] }), async (s) => {
+      await s.ok(['mousedown']);
+      await s.ok(['mouseup']);
+      await s.ok(['mouseup']);
+      assert.equal(modes(s.state, 'arm').length, 3);
+      assert.deepEqual(
+        modes(s.state, 'mouse').map(([, args]) => args),
+        [{ steps: [['up', 0, 0, 0, 0]], from: [0, 0], press: [0, 0], modifiers: 0 }]
+      );
+      assert.deepEqual(
+        s.sent('Input.dispatchMouseEvent').map(({ params }) => params.type),
+        ['mousePressed', 'mouseReleased', 'mouseReleased']
+      );
+    });
+  });
+
   test(`${transport}: a drag Chrome delivered in part is finished in place from the first missing step`, async () => {
     await withScene(
       runner,
@@ -243,7 +276,7 @@ for (const [transport, runner] of Object.entries(runners)) {
           key('a', 'KeyA', 'a', 0, 'up', false, 0),
         ]
       );
-      assert.equal(s.sent('Input.dispatchMouseEvent').length, 8);
+      assert.equal(s.sent('Input.dispatchMouseEvent').length, 7);
       assert.equal(s.sent('Input.dispatchKeyEvent').length, 5);
       assert.deepEqual(s.state.activated, []);
     });

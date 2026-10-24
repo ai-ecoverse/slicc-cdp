@@ -1374,7 +1374,8 @@ pub fn drag_refs(
             cdp.call_for("Input.dispatchMouseEvent", params, Some(session), landing::INPUT_WAIT)?;
         }
         Ok(())
-    })
+    })?;
+    Ok(())
 }
 
 fn element_center(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f64), String> {

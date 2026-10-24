@@ -42,6 +42,7 @@ struct Pointer {
     keys: Vec<String>,
     modifiers: Vec<String>,
     press: Option<(f64, f64)>,
+    placed: bool,
 }
 
 impl Pointer {
@@ -70,11 +71,12 @@ impl Pointer {
             keys: names("keys", &|name| keys::lookup(name).is_some_and(|key| key.code == name)),
             modifiers: names("modifiers", &|name| keys::MODIFIERS.contains(&name)),
             press,
+            placed: value.get("placed").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 
     fn save(&self) -> Value {
-        json!({ "x": self.x, "y": self.y, "lastButton": self.last, "buttons": self.buttons, "keys": self.keys, "modifiers": self.modifiers, "press": self.press.map(|(x, y)| json!([x, y])) })
+        json!({ "x": self.x, "y": self.y, "lastButton": self.last, "buttons": self.buttons, "keys": self.keys, "modifiers": self.modifiers, "press": self.press.map(|(x, y)| json!([x, y])), "placed": self.placed })
     }
 
     fn buttons_mask(&self) -> i64 {
@@ -264,7 +266,10 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
                 ("mouseReleased", "up")
             };
             let motion = pointer.motion(&next, verb, &name);
-            landing::mouse(cdp, &Scope::page(session), command, &motion, true, &mut |cdp| mouse(cdp, session, kind, &next, &name, Some(1)))?;
+            let scope = Scope::page(session);
+            let mut send = |cdp: &mut Cdp| mouse(cdp, session, kind, &next, &name, Some(1));
+            let placed = if command == "mouseup" && pointer.placed { landing::placed(cdp, &scope, command, &motion, &mut send)? } else { landing::mouse(cdp, &scope, command, &motion, true, &mut send)? };
+            next.placed = command == "mousedown" && placed;
             *pointer = next;
             let options = chosen.map(|name| format!("{{\n  button: {}\n}}", quoted(&name))).unwrap_or_default();
             Ok(code(&format!("// Press mouse {verb}\nawait page.mouse.{verb}({options});")))

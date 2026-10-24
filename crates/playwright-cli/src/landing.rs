@@ -340,30 +340,39 @@ pub fn key(cdp: &mut Cdp, session: &str, keyed: &Keyed, trusted: Trusted) -> Res
     forward(cdp, &scope, &context, "press", Some(&kinds), trusted)
 }
 
-pub fn mouse(cdp: &mut Cdp, scope: &Scope, verb: &str, motion: &Motion, in_place: bool, trusted: Trusted) -> Result<(), String> {
+pub fn mouse(cdp: &mut Cdp, scope: &Scope, verb: &str, motion: &Motion, in_place: bool, trusted: Trusted) -> Result<bool, String> {
     let context = context(cdp, scope)?;
     let required = motion.required();
     let kinds = motion.kinds();
     let Some(seen) = seen(cdp, scope, &context, &kinds, trusted)? else {
-        return Ok(());
+        return Ok(false);
     };
     let unseen: Vec<&str> = kinds.into_iter().filter(|kind| !seen.iter().any(|known| known == kind)).collect();
     if !required.iter().any(|kind| unseen.contains(kind)) {
-        return Ok(());
+        return Ok(false);
     }
     if !in_place {
-        return forward(cdp, scope, &context, verb, Some(&required), trusted);
+        return forward(cdp, scope, &context, verb, Some(&required), trusted).map(|_| false);
     }
-    let rest = motion.rest(&unseen);
-    let answer = mode(cdp, scope, &context, "mouse", rest.args())?;
+    replay(cdp, scope, &context, verb, &motion.rest(&unseen), true, trusted)
+}
+
+pub fn placed(cdp: &mut Cdp, scope: &Scope, verb: &str, motion: &Motion, trusted: Trusted) -> Result<bool, String> {
+    let context = context(cdp, scope)?;
+    replay(cdp, scope, &context, verb, motion, false, trusted)
+}
+
+fn replay(cdp: &mut Cdp, scope: &Scope, context: &Value, verb: &str, rest: &Motion, sent: bool, trusted: Trusted) -> Result<bool, String> {
+    let answer = mode(cdp, scope, context, "mouse", rest.args())?;
     if let Some(step) = answer.strip_prefix("frame:").and_then(|index| index.parse::<usize>().ok()).and_then(|index| rest.steps.get(index)) {
         return Err(frame_refusal(step.point.0, step.point.1));
     }
+    let required = rest.required();
     match answer.as_str() {
-        "done" => Ok(()),
-        "missing" if visible(cdp, scope, &context, Duration::ZERO) => Ok(()),
-        "missing" => forward(cdp, scope, &context, verb, None, trusted),
-        _ => forward(cdp, scope, &context, verb, Some(&required), trusted),
+        "done" => Ok(true),
+        "missing" if visible(cdp, scope, context, Duration::ZERO) => if sent { Ok(false) } else { trusted(cdp).map(|_| false) },
+        "missing" => forward(cdp, scope, context, verb, None, trusted).map(|_| false),
+        _ => forward(cdp, scope, context, verb, Some(&required), trusted).map(|_| false),
     }
 }
 

@@ -87,8 +87,12 @@ function ariaAnswer(capture, location, expression) {
 
 const LANDING = "Symbol.for('slicc-landing')";
 
-function landed(mode) {
-  return { arm: 'armed', read: ['landed'], visible: 'visible', focus: 'editable' }[mode] ?? 'done';
+function landed() {
+  let armed = ['landed'];
+  return (mode, args) => {
+    if (mode === 'arm') armed = args.types;
+    return { arm: 'armed', read: armed, visible: 'visible', focus: 'editable' }[mode] ?? 'done';
+  };
 }
 
 function landingCall(params) {
@@ -130,7 +134,7 @@ export async function fakeCdp({
   childFrames = [],
   intercept,
   aria = () => defaultAria,
-  landing = landed,
+  landing = landed(),
   visibility,
   windows = () => ({ windowId: 1, bounds: { windowState: 'normal' } }),
   tree = { nodes: [] },
