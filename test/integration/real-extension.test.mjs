@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { biosGuard } from './bios-guard.mjs';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
@@ -165,7 +166,7 @@ function peer(req, socket, onMessage, onClose) {
   return { send, close: () => socket.destroy() };
 }
 
-async function extensionBridge() {
+async function extensionBridge(protect = (connection) => connection) {
   const traffic = [];
   const sockets = new Set();
   const connections = new Set();
@@ -225,52 +226,60 @@ async function extensionBridge() {
         if (message.method === 'Target.detachedFromTarget') sessions.delete(message.sessionId);
         if (message.method === 'Target.attachedToTarget' && message.params?.sessionId)
           attached(message.params.sessionId, 1);
-        client.send(message);
+        raw.onmessage?.(JSON.stringify(message));
       },
     };
-    const client = peer(
-      req,
-      socket,
-      async (message) => {
-        await connected;
-        const { id, method, params } = message;
-        if (!seven) {
-          client.send({ id, error: { code: -32000, message: 'seven is gone' } });
-          return;
-        }
-        toSeven(message, {
-          method,
-          done(reply) {
-            if (reply.error) {
-              if (!closed) client.send({ id, error: reply.error });
+    const forward = async (message) => {
+      await connected;
+      const { id, method, params } = message;
+      if (!seven) {
+        raw.onmessage?.(JSON.stringify({ id, error: { code: -32000, message: 'seven is gone' } }));
+        return;
+      }
+      toSeven(message, {
+        method,
+        done(reply) {
+          if (reply.error) {
+            if (!closed) raw.onmessage?.(JSON.stringify({ id, error: reply.error }));
+            return;
+          }
+          const result = reply.result ?? {};
+          if (method === 'Target.attachToTarget' && result.sessionId) {
+            if (closed) {
+              toSeven({
+                method: 'Target.detachFromTarget',
+                params: { sessionId: result.sessionId },
+              });
               return;
             }
-            const result = reply.result ?? {};
-            if (method === 'Target.attachToTarget' && result.sessionId) {
-              if (closed) {
-                toSeven({
-                  method: 'Target.detachFromTarget',
-                  params: { sessionId: result.sessionId },
-                });
-                return;
-              }
-              attached(result.sessionId, 1);
-            }
-            if (method === 'Target.detachFromTarget' && sessions.has(params?.sessionId))
-              attached(params.sessionId, -1);
-            if (!closed) client.send({ id, result });
-          },
-        });
-      },
-      () => {
+            attached(result.sessionId, 1);
+          }
+          if (method === 'Target.detachFromTarget' && sessions.has(params?.sessionId))
+            attached(params.sessionId, -1);
+          if (!closed) raw.onmessage?.(JSON.stringify({ id, result }));
+        },
+      });
+    };
+    const raw = {
+      onmessage: null,
+      send: (text) => void forward(JSON.parse(text)),
+      close() {
         closed = true;
         connections.delete(connection);
         for (const [sessionId, count] of sessions)
           for (let n = 0; n < count; n += 1)
             toSeven({ method: 'Target.detachFromTarget', params: { sessionId } });
         sessions.clear();
-      }
+      },
+    };
+    const guarded = protect(raw);
+    const client = peer(
+      req,
+      socket,
+      (message) => guarded.send(JSON.stringify(message)),
+      () => guarded.close()
     );
+    guarded.onmessage = (text) => client.send(JSON.parse(text));
     connections.add(connection);
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -347,7 +356,7 @@ function summary(traffic) {
     .join('\n');
 }
 
-async function scenario(extension, transport) {
+async function scenario(extension, transport, bios = false) {
   const extensionRoot = await unpacked(extension);
   const manifest = JSON.parse(await readFile(path.join(extensionRoot, 'manifest.json'), 'utf8'));
   assert.equal(manifest.version, extension.version);
@@ -368,7 +377,7 @@ async function scenario(extension, transport) {
   const ordinaryPort = ordinary.address().port;
   const vault = `http://vault.sliccy.ai:${ordinaryPort}/vault`;
   const local = (file) => `http://localhost:${ordinaryPort}${file}`;
-  const bridge = await extensionBridge();
+  const bridge = await extensionBridge(bios ? await biosGuard() : undefined);
   const tls = createTlsServer(await certificate(), (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(sevenPage(bridge.port));
@@ -442,7 +451,7 @@ async function scenario(extension, transport) {
     const dir = path.join(root, 'artifacts', 'real-extension');
     await mkdir(dir, { recursive: true }).catch(() => {});
     await writeFile(
-      path.join(dir, `${extension.version}-${transport}.log`),
+      path.join(dir, `${extension.version}-${transport}${bios ? '-bios' : ''}.log`),
       `${log.join('\n')}\n${bridge.traffic.map((entry) => JSON.stringify(entry)).join('\n')}\n`
     ).catch(() => {});
     await runner?.close();
@@ -465,4 +474,9 @@ for (const extension of EXTENSIONS) {
       () => scenario(extension, transport)
     );
   }
+  test(
+    `real slicc-extension ${extension.version} over WASI through bios's guard: after the HTTP vault meta-refresh and two-second sleep, an ordinary goto restores driving without exposing the vault`,
+    { timeout: 300000 },
+    () => scenario(extension, 'wasi', true)
+  );
 }
