@@ -49,6 +49,7 @@ export const CHROME_FILES = new Set(
     'kernel-session',
     'launch',
     'page-tools',
+    'page-scope-chrome',
     'plant',
     'privileged-ui',
     'real-extension',

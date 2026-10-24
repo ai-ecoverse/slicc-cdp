@@ -124,7 +124,9 @@ fn unknown_frames_fail_closed() {
 
 #[test]
 fn ordinary_frames_stay_readable() {
-    let (mut cdp, sent) = client(true);
+    let mut ordinary = frame_tree();
+    ordinary["frameTree"]["childFrames"].as_array_mut().unwrap().retain(|node| node["frame"]["id"] == "PLAIN");
+    let (mut cdp, sent) = broken_client(Some(ordinary), "");
     cdp.call("Target.attachToTarget", json!({"targetId":"MAIN","flatten":true}), None).unwrap();
     for frame in ["MAIN", "PLAIN"] {
         let tree = cdp.call("Accessibility.getFullAXTree", json!({ "frameId": frame }), Some("S")).unwrap_or_else(|error| panic!("{frame}: {error}; {:?}", sent.borrow()));
@@ -214,8 +216,9 @@ fn a_refused_lookup_of_a_frame_id_that_is_not_the_sessions_tab_defers_to_the_fra
         for (method, mut params) in reads.clone() {
             params["frameId"] = json!(frame);
             let (mut cdp, sent, _) = over_extension(MAIN_FRAME);
-            assert!(cdp.call(method, params, Some("S")).is_ok(), "{method} {frame}");
-            assert_eq!(sent_with_frame(&sent, frame), [method], "{method} {frame}");
+            let whole_page = method.starts_with("DOM.") || method.starts_with("Accessibility.");
+            assert_eq!(cdp.call(method, params, Some("S")).is_err(), whole_page, "{method} {frame}");
+            assert_eq!(sent_with_frame(&sent, frame), if whole_page { Vec::new() } else { vec![method.to_string()] }, "{method} {frame}");
             assert!(!cdp.is_protected_target(frame), "{method} {frame}");
         }
     }

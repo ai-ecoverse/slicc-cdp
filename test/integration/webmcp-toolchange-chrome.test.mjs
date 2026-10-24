@@ -100,7 +100,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
-await test('Chrome: the WebMCP holder reports tools registered and removed after load, in admitted cross-origin frames only', {
+await test('Chrome: the WebMCP holder reports ordinary tool changes and excludes protected frames', {
   timeout: 240000,
 }, async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-chrome-'));
@@ -239,26 +239,21 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     const cross = targets.find(
       (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
     );
+    assert.ok(cross, 'cross-origin OOPIF was not created');
     const sealed = targets.find(
       (target) =>
         target.type === 'iframe' && target.url === `https://seven.sliccy.ai:${port}/protected`
     );
-    assert.ok(cross, 'cross-origin OOPIF was not created');
     assert.ok(sealed, 'protected OOPIF was not created');
     const protectedSession = (
       await raw.send('Target.attachToTarget', { targetId: sealed.targetId, flatten: true })
     ).sessionId;
     assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
+    await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
     const crossSession = (
       await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
     ).sessionId;
-    from = held.lines.length;
     await evaluate(raw, crossSession, 'addCross()');
-    const crossed = await held.next(changed(cross.targetId), from);
-    assert.equal(crossed.tab, targetId);
-    assert.equal(crossed.target, cross.targetId);
-    assert.equal(crossed.origin, `https://foreign.test:${port}`);
-    assert.deepEqual(names(crossed), ['cross_late']);
     const crossListed = await once(browser.wsUrl, cwd, [
       'webmcp-list',
       '--tab',
@@ -267,23 +262,22 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.equal(crossListed.code, 0, crossListed.stderr);
-    assert.deepEqual(
-      crossed.tools,
-      JSON.parse(crossListed.stdout).filter((tool) => tool.frameId === cross.targetId)
-    );
+    assert.notEqual(crossListed.code, 0);
+    assert.equal(crossListed.stdout, '');
+    assert.match(crossListed.stderr, /slicc: refused:/);
     await sleep(1500);
-    const after = held.lines.slice(from).filter((line) => line.event === 'tools-changed');
-    assert.deepEqual(
-      after.map((line) => line.frameId),
-      [cross.targetId]
+    assert.deepEqual(held.lines.slice(navigated).filter(changed(cross.targetId)), []);
+    assert.equal(
+      (await raw.send('Target.getTargetInfo', { targetId: sealed.targetId })).targetInfo.url,
+      `https://seven.sliccy.ai:${port}/protected`
     );
+    assert.equal(JSON.stringify(held.lines.slice(navigated)).includes('cross_late'), false);
+    assert.equal(JSON.stringify(watcher.lines).includes('cross_late'), false);
+    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
     assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
     assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
     assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
     assert.ok(document.loaderId);
-    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
-    await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
     held.child.stdin.end();
     assert.equal(await held.ended, 0, held.stderr());
     held = undefined;

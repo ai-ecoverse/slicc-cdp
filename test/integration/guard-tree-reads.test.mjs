@@ -56,8 +56,14 @@ test('cross-frame reads fail closed for protected or unverified frame trees', as
           false
         );
       }
-      await client.send('DOM.describeNode', { nodeId: 1, depth: 0 }, sessionId);
-      await client.send('DOM.getDocument', { depth: 1, pierce: false }, sessionId);
+      await assert.rejects(
+        client.send('DOM.describeNode', { nodeId: 1, depth: 0 }, sessionId),
+        /slicc: refused:/
+      );
+      await assert.rejects(
+        client.send('DOM.getDocument', { depth: 1, pierce: false }, sessionId),
+        /slicc: refused:/
+      );
     });
   }
 });
