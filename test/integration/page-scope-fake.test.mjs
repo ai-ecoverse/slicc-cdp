@@ -30,7 +30,7 @@ function node(id, parentId, protectedFrame = false) {
   };
 }
 
-async function fixture(layout, protectedFrame, run) {
+async function fixture(layout, protectedFrame, run, onCommand) {
   const trees = { TOP: node('TOP') };
   const targets = [{ targetId: 'TOP', type: 'page', url: trees.TOP.frame.url }];
   if (layout === 'a') {
@@ -51,6 +51,7 @@ async function fixture(layout, protectedFrame, run) {
   }
   const fake = await fakeCdp({
     discoverEvents: true,
+    onCommand: (message, event) => onCommand?.(message, event, trees),
     intercept(message, send) {
       if (message.method !== 'Page.getFrameTree') return false;
       const target = fake.calls.at(-1)?.target;
@@ -76,45 +77,24 @@ async function fixture(layout, protectedFrame, run) {
 }
 
 for (const layout of ['a', 'b', 'c']) {
-  test(`page scope ${layout} refuses protected content`, async () => {
-    await fixture(layout, true, async (client, session, fake) => {
-      for (const [method, params] of surfaces) {
-        const from = fake.calls.length;
-        await assert.rejects(client.send(method, params, session), /slicc: refused:/);
-        assert.equal(
-          fake.calls.slice(from).some((call) => call.method === method),
-          false,
-          method
-        );
-      }
-      for (const method of [
-        'Page.startScreencast',
-        'LayerTree.makeSnapshot',
-        'LayerTree.replaySnapshot',
-        'LayerTree.profileSnapshot',
-        'LayerTree.snapshotCommandLog',
-        'HeadlessExperimental.beginFrame',
-        'Cast.startTabMirroring',
-      ]) {
-        await assert.rejects(client.send(method, {}, session), /slicc: refused:/);
+  for (const [method, params] of surfaces) {
+    test(`page scope ${layout} ${method} protected and ordinary rows`, async () => {
+      for (const protectedFrame of [true, false]) {
+        await fixture(layout, protectedFrame, async (client, session, fake) => {
+          const from = fake.calls.length;
+          if (protectedFrame)
+            await assert.rejects(client.send(method, params, session), /slicc: refused:/);
+          else await client.send(method, params, session);
+          assert.equal(
+            fake.calls.slice(from).filter((call) => call.method === method).length,
+            protectedFrame ? 0 : 1
+          );
+        });
       }
     });
-  });
-  test(`page scope ${layout} retains ordinary content`, async () => {
-    await fixture(layout, false, async (client, session, fake) => {
-      for (const [method, params] of surfaces) {
-        const from = fake.calls.length;
-        await client.send(method, params, session);
-        assert.equal(
-          fake.calls.slice(from).filter((call) => call.method === method).length,
-          1,
-          method
-        );
-      }
-    });
-  });
-  test(`page scope ${layout} checks late replies`, async () => {
-    for (const method of ['Page.captureScreenshot', 'Page.printToPDF']) {
+  }
+  for (const method of ['Page.captureScreenshot', 'Page.printToPDF']) {
+    test(`page scope ${layout} ${method} late reply`, async () => {
       await fixture(layout, false, async (client, session, fake, trees) => {
         const push = fake.calls.push.bind(fake.calls);
         fake.calls.push = (call) => {
@@ -126,6 +106,68 @@ for (const layout of ['a', 'b', 'c']) {
         };
         await assert.rejects(client.send(method, {}, session), /slicc: refused:/);
       });
+    });
+  }
+}
+
+test('page scope retains existing paint capability refusals', async () => {
+  await fixture('a', false, async (client, session, fake) => {
+    for (const method of [
+      'Page.startScreencast',
+      'LayerTree.makeSnapshot',
+      'LayerTree.replaySnapshot',
+      'LayerTree.profileSnapshot',
+      'LayerTree.snapshotCommandLog',
+      'HeadlessExperimental.beginFrame',
+      'Cast.startTabMirroring',
+    ]) {
+      const from = fake.calls.length;
+      await assert.rejects(client.send(method, {}, session), /slicc: refused:/);
+      assert.equal(
+        fake.calls.slice(from).some((call) => call.method === method),
+        false
+      );
     }
   });
-}
+});
+
+test('page scope stops and discards unadmitted cast events', async () => {
+  await fixture(
+    'a',
+    false,
+    async (client, session, fake) => {
+      const from = client.events.length;
+      await client.send('Runtime.evaluate', { expression: '0' }, session);
+      assert.equal(
+        client.events.slice(from).filter((event) => event.method === 'Page.screencastFrame').length,
+        0
+      );
+      assert.ok(
+        fake.calls.some(
+          (call) => call.method === 'Page.stopScreencast' && call.sessionId === session
+        )
+      );
+    },
+    (message, event) => {
+      if (message.method === 'Runtime.evaluate' && message.params.expression === '0') {
+        event('Page.frameNavigated', { frame: node('NEW', 'TOP', true).frame });
+        event('Page.screencastFrame', { data: 'marker', sessionId: 1, metadata: {} });
+      }
+    }
+  );
+});
+
+test('page scope refuses unplaced frames without locking unrelated protected pages', async () => {
+  await fixture('b', false, async (client, session, fake) => {
+    fake.targets.push({ targetId: 'PROTECTED', type: 'page', url: 'http://localhost:9401/' });
+    fake.targets.push({
+      targetId: 'VAULT',
+      type: 'iframe',
+      parentFrameId: 'PROTECTED',
+      url: 'https://vault.sliccy.ai/',
+    });
+    await client.send('Page.captureScreenshot', {}, session);
+    fake.targets[1].parentFrameId = 'MISSING';
+    await assert.rejects(client.send('Page.captureScreenshot', {}, session), /slicc: refused:/);
+  });
+});

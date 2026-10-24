@@ -28,6 +28,8 @@ impl Transport for Scripted {
                 }
                 json!({})
             })
+        } else if method == "Target.getTargets" {
+            Some(json!({"targetInfos":[{"targetId":"fixture-page","type":"page","url":"https://example.test/"}]}))
         } else if method == "Target.getTargetInfo" && call["params"]["targetId"] == "fixture-page" {
             Some(json!({"targetInfo":{"targetId":"fixture-page","type":"page","url":"https://example.test/"}}))
         } else if method == "Target.attachToTarget" && call["params"]["targetId"] == "fixture-page" {

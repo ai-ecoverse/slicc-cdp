@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 #[path = "webmcp_guard.rs"]
 mod webmcp_guard;
+#[path = "page_scope.rs"]
+mod page_scope;
 #[path = "issued.rs"]
 mod issued;
 pub(crate) use issued::target_refusal;
@@ -114,6 +116,8 @@ pub struct Cdp {
     session_targets: BTreeMap<String, String>,
     protected_targets: BTreeSet<String>,
     guards: BTreeMap<String, String>,
+    page_scope_sessions: BTreeMap<String, String>,
+    checking_page_events: bool,
     guard_sessions: BTreeSet<String>,
     guarding: BTreeSet<String>,
     probing: BTreeSet<String>,
@@ -194,6 +198,8 @@ impl Cdp {
             session_targets: BTreeMap::new(),
             protected_targets: BTreeSet::new(),
             guards: BTreeMap::new(),
+            page_scope_sessions: BTreeMap::new(),
+            checking_page_events: false,
             guard_sessions: BTreeSet::new(),
             guarding: BTreeSet::new(),
             probing: BTreeSet::new(),
@@ -257,11 +263,15 @@ impl Cdp {
             inbox: VecDeque<String>,
             worlds: BTreeMap<String, Vec<Value>>,
             pending_worlds: BTreeMap<i64, (String, Value)>,
+            target_infos: Vec<Value>,
         }
         impl Transport for Fixture {
             fn send_text(&mut self, text: &str) -> Result<(), String> {
                 let call: Value = serde_json::from_str(text).unwrap();
-                if call["method"] == "Page.getFrameTree" && call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:") || session == "S" || session == "OTHER") {
+                if call["method"] == "Target.getTargets" && call["params"]["filter"] == json!([{}]) {
+                    self.inbox.push_back(json!({"id":call["id"],"result":{"targetInfos":self.target_infos}}).to_string());
+                    Ok(())
+                } else if call["method"] == "Page.getFrameTree" && call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:") || session == "S" || session == "OTHER") {
                     self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":{"id":"F","loaderId":"L","url":"https://example.test/","securityOrigin":"https://example.test"}}}}).to_string());
                     Ok(())
                 } else if call["sessionId"].as_str().is_some_and(|session| session.starts_with("fixture-guard:")) && matches!(call["method"].as_str(), Some("Runtime.disable" | "Runtime.enable")) {
@@ -307,7 +317,7 @@ impl Cdp {
         self.guard_sessions.insert(guard);
         self.unobserved.insert(target);
         let inner = std::mem::replace(&mut self.ws, Box::new(Empty));
-        self.ws = Box::new(Fixture { inner, inbox:VecDeque::new(), worlds:BTreeMap::new(), pending_worlds:BTreeMap::new() });
+        self.ws = Box::new(Fixture { inner, inbox:VecDeque::new(), worlds:BTreeMap::new(), pending_worlds:BTreeMap::new(), target_infos:self.targets.values().cloned().collect() });
     }
 
     pub fn events(&self) -> &[Value] {
@@ -459,8 +469,11 @@ impl Cdp {
         if crosses_frames(method, &params) && self.frame_tree_refused(session_id)? {
             return Err(self.refusal());
         }
-        if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params)) && frame_epoch != self.frame_epoch {
+        if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params) || page_scope::content(method)) && frame_epoch != self.frame_epoch {
             return Err(self.refusal());
+        }
+        if page_scope::content(method) && content_command(method, &params) == Some(true) {
+            self.verify_page_scope(session_id)?;
         }
         let result = self.after(method, &params, session_id, result)?;
         self.bind_streams(method, session_id, &result, &checks);
@@ -758,6 +771,7 @@ impl Cdp {
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
+        if page_scope::content(method) { self.verify_page_scope(session)?; }
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -783,7 +797,7 @@ impl Cdp {
                         self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
                     })
                 });
-                let scope = if crosses_frames(method, params) { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
+                let scope = if crosses_frames(method, params) || page_scope::content(method) { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
                 let state = if self.document_paused(&target) {
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
@@ -2143,7 +2157,7 @@ impl Cdp {
         } {
             self.source_resources.insert((session.clone().unwrap_or_default(), id.to_string()), url.to_string());
         }
-        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument") {
+        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument" | "Target.targetCreated" | "Target.targetInfoChanged" | "Target.targetDestroyed" | "Target.detachedFromTarget") {
             self.frame_epoch += 1;
         }
         match method.as_str() {
@@ -2285,6 +2299,7 @@ impl Cdp {
             "Target.detachedFromTarget" => {
                 if let Some(child) = params.get("sessionId").and_then(|v| v.as_str()) {
                     self.session_targets.remove(child);
+                    self.page_scope_sessions.retain(|_, session| session != child);
                     self.guard_sessions.remove(child);
                     let targets: Vec<String> = self.guards.iter().filter(|(_, session)| session.as_str() == child).map(|(target, _)| target.clone()).collect();
                     for target in targets {
@@ -2656,6 +2671,20 @@ impl Cdp {
 
     fn deliver(&mut self, mut value: Value) {
         self.watch(&mut value);
+        if value.get("method").and_then(Value::as_str) == Some("Page.screencastFrame") {
+            if let Some(session) = value.get("sessionId").and_then(Value::as_str) {
+                let _ = self.send("Page.stopScreencast", json!({}), Some(session));
+            }
+            return;
+        }
+        if value.get("method").and_then(Value::as_str).is_some_and(page_scope::content) {
+            let session = value.get("sessionId").and_then(Value::as_str);
+            if self.checking_page_events || session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
+            self.checking_page_events = true;
+            let verified = self.verify_page_scope(session).is_ok();
+            self.checking_page_events = false;
+            if !verified { return }
+        }
         let key = (value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string(), value.pointer("/params/requestId").and_then(Value::as_str).unwrap_or("").to_string());
         let terminal = self.terminal_network.contains(&key);
         let late_ordinary = terminal && matches!(value["method"].as_str(), Some("Network.responseReceivedExtraInfo" | "Network.requestWillBeSentExtraInfo")) && self.ordinary_late_extra_info(&value);

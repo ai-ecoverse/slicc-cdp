@@ -95,7 +95,7 @@ const surfaces = [
 ];
 
 for (const layout of ['a', 'b', 'c']) {
-  test(`page scope ${layout} capture and input controls`, { timeout: 180000 }, async () => {
+  test(`page scope ${layout} capture and input controls`, { timeout: 180000 }, async (t) => {
     const marker =
       '<style>html,body{margin:0;background:rgb(241,17,223);height:280px}</style><button>Frame marker</button>';
     const inner = await site(
@@ -160,25 +160,55 @@ for (const layout of ['a', 'b', 'c']) {
           ordinaryControl ? 'http://localhost:1' : `http://localhost:${inner.port}`,
           { variant: 'prompt', detachDelay: 0 }
         );
-        const { sessionId } = await client.send('Target.attachToTarget', {
-          targetId,
-          flatten: true,
-        });
+        const attached = await client
+          .send('Target.attachToTarget', { targetId, flatten: true })
+          .then(
+            (result) => ({ result }),
+            (error) => ({ error })
+          );
+        const sessionId = attached.result?.sessionId;
+        if (ordinaryControl) assert.ok(sessionId, attached.error?.message);
         const start = client.events.length;
-        for (const [method, params] of surfaces) {
-          if (ordinaryControl) {
-            const answer = await client.send(method, params, sessionId);
-            if (method === 'Page.captureScreenshot') assert.ok(pixels(answer.data) > 1000);
-            if (method === 'Page.printToPDF')
-              assert.ok(Buffer.from(answer.data, 'base64').length > 100);
-          } else {
-            await assert.rejects(client.send(method, params, sessionId), /slicc: refused:/, method);
-          }
-        }
-        await assert.rejects(
-          client.send('Page.startScreencast', { format: 'png' }, sessionId),
-          /slicc: refused:/
-        );
+        const check = async (method, params) => {
+          await t.test(`${method} ${ordinaryControl ? 'ordinary' : 'protected'}`, async () => {
+            const outcome = attached.error
+              ? attached
+              : await client.send(method, params, sessionId).then(
+                  (result) => ({ result }),
+                  (error) => ({ error })
+                );
+            const markerPixels =
+              method === 'Page.captureScreenshot' && outcome.result?.data
+                ? pixels(outcome.result.data)
+                : 0;
+            if (method === 'Page.captureScreenshot')
+              t.diagnostic(
+                JSON.stringify({
+                  layout,
+                  ordinary: ordinaryControl,
+                  markerPixels,
+                  refused: Boolean(outcome.error),
+                })
+              );
+            if (ordinaryControl) {
+              assert.equal(outcome.error, undefined, outcome.error?.message);
+              if (method === 'Page.captureScreenshot') assert.ok(markerPixels > 1000);
+              if (method === 'Page.printToPDF')
+                assert.ok(Buffer.from(outcome.result.data, 'base64').length > 100);
+            } else {
+              assert.equal(markerPixels, 0);
+              assert.match(outcome.error?.message ?? '', /slicc: refused:/);
+              assert.equal(outcome.result?.data ?? '', '');
+            }
+          });
+        };
+        for (const [method, params] of surfaces) await check(method, params);
+        if (attached.error) assert.match(attached.error.message, /slicc: refused:/);
+        else
+          await assert.rejects(
+            client.send('Page.startScreencast', { format: 'png' }, sessionId),
+            /slicc: refused:/
+          );
         assert.equal(
           client.events.slice(start).filter((event) => event.method === 'Page.screencastFrame')
             .length,
@@ -190,14 +220,38 @@ for (const layout of ['a', 'b', 'c']) {
           { depth: 1 },
           ordinaryControl ? sessionId : rawSession
         );
-        const nodeId = dom.root.nodeId;
+        const nodeId = dom.root.children.find((node) => node.nodeType === 1).nodeId;
         for (const [method, params] of [
           ['DOM.getOuterHTML', { nodeId }],
           ['CSS.getComputedStyleForNode', { nodeId }],
           ['Accessibility.getPartialAXTree', { nodeId }],
-        ]) {
-          if (ordinaryControl) await client.send(method, params, sessionId);
-          else await assert.rejects(client.send(method, params, sessionId), /slicc: refused:/);
+        ])
+          await check(method, params);
+        if (middle) {
+          const frameAttach = await client
+            .send('Target.attachToTarget', { targetId: middle.targetId, flatten: true })
+            .then(
+              (result) => ({ result }),
+              (error) => ({ error })
+            );
+          if (ordinaryControl) {
+            assert.equal(frameAttach.error, undefined, frameAttach.error?.message);
+            await client.send(
+              'Page.captureScreenshot',
+              { format: 'png' },
+              frameAttach.result.sessionId
+            );
+            await client.send('DOM.getDocument', { depth: 1 }, frameAttach.result.sessionId);
+          } else if (frameAttach.error) assert.match(frameAttach.error.message, /slicc: refused:/);
+          else
+            await assert.rejects(
+              client.send(
+                'Page.captureScreenshot',
+                { format: 'png' },
+                frameAttach.result.sessionId
+              ),
+              /slicc: refused:/
+            );
         }
         await client.close();
         client = undefined;
