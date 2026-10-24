@@ -259,15 +259,17 @@ for (const [label, start] of [
     });
   });
 
-  test(`${label} snapshot shows a protected cross-origin iframe as a bare placeholder and never reads it`, async () => {
+  test(`${label} snapshot refuses a page containing a protected cross-origin iframe`, async () => {
     const seven = remote('SEVEN', 'https://seven.sliccy.ai/os/?k=SECRET#inbox');
     await drive(
       start,
       ['SEVEN', 'XO'],
       [seven, remote('XO', child)],
       async (run, fake, attempt) => {
-        const snapshot = await run(['snapshot']);
-        assert.equal(snapshot.stdout, shot([...head, '  - iframe [ref=e3]', ...inner('f2', 'e4')]));
+        const snapshot = await attempt(['snapshot']);
+        assert.notEqual(snapshot.code, 0);
+        assert.match(snapshot.stderr, /slicc: refused:/);
+        assert.equal(snapshot.stdout, '');
         const frames = await run(['frames']);
         assert.match(
           frames.stdout,
@@ -298,18 +300,11 @@ for (const [label, start] of [
       start,
       ['GHOST', 'BLANK', 'UNVERIFIED', 'XO'],
       [remote('BLANK', ''), unverified, remote('XO', child)],
-      async (run, fake) => {
-        const snapshot = await run(['snapshot']);
-        assert.equal(
-          snapshot.stdout,
-          shot([
-            ...head,
-            '  - iframe [ref=e3]',
-            '  - iframe [ref=e4]',
-            '  - iframe [ref=e5]',
-            ...inner('f3', 'e6'),
-          ])
-        );
+      async (_run, fake, attempt) => {
+        const snapshot = await attempt(['snapshot']);
+        assert.notEqual(snapshot.code, 0);
+        assert.match(snapshot.stderr, /slicc: refused:/);
+        assert.equal(snapshot.stdout, '');
         assert.doesNotMatch(snapshot.stdout, /_CONTENT/);
         assert.deepEqual(
           fake.calls.filter((call) => call.params?.frameId === 'GHOST'),

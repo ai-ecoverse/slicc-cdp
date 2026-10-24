@@ -75,8 +75,10 @@ async function flow(runner, port) {
   assert.match((await run(['snapshot'])).stdout, /button "Pressed" \[ref=f1e\d+\]/);
   await run(['goto', `http://127.0.0.1:${port}/guarded.html`]);
   await new Promise((resolve) => setTimeout(resolve, 1000));
-  const guarded = await run(['snapshot']);
-  assert.match(guarded.stdout, /- heading "Top" \[level=1\] \[ref=e2\]\n {2}- iframe \[ref=e3\]/);
+  const guarded = await runner.playwright(['snapshot'], cwd);
+  assert.notEqual(guarded.code, 0);
+  assert.match(guarded.stderr, /slicc: refused:/);
+  assert.equal(guarded.stdout, '');
   const listed = await run(['frames']);
   for (const output of [guarded, listed]) {
     assert.doesNotMatch(

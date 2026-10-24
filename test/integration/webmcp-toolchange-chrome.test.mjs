@@ -154,10 +154,9 @@ await test('Chrome: the WebMCP holder reports tools registered and removed after
           );
           return;
         }
-        const frames =
-          url.pathname === '/frames'
-            ? `<iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe><iframe src="https://seven.sliccy.ai:${port}/protected"></iframe>`
-            : '';
+        const frames = ['/frames', '/ordinary-frames'].includes(url.pathname)
+          ? `<iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${url.pathname === '/frames' ? `<iframe src="https://seven.sliccy.ai:${port}/protected"></iframe>` : ''}`
+          : '';
         res.end(`<!doctype html><title>toolchange</title>${frames}<script>
 const controller = new AbortController();
 if (document.modelContext) document.modelContext.registerTool(${tool('initial')});
@@ -236,19 +235,34 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       JSON.stringify(held.lines)
     );
     const targets = (await raw.send('Target.getTargets', {})).targetInfos;
-    const cross = targets.find(
-      (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
+    assert.ok(
+      targets.some(
+        (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
+      ),
+      'cross-origin OOPIF was not created'
     );
     const sealed = targets.find(
       (target) =>
         target.type === 'iframe' && target.url === `https://seven.sliccy.ai:${port}/protected`
     );
-    assert.ok(cross, 'cross-origin OOPIF was not created');
     assert.ok(sealed, 'protected OOPIF was not created');
     const protectedSession = (
       await raw.send('Target.attachToTarget', { targetId: sealed.targetId, flatten: true })
     ).sessionId;
     assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
+    await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
+    assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+    assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
+    held.child.stdin.end();
+    assert.equal(await held.ended, 0, held.stderr());
+    held = undefined;
+    await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
+    held = stream(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    await held.next((line) => line.event === 'ready', 0);
+    const cross = (await raw.send('Target.getTargets', {})).targetInfos.find(
+      (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
+    );
+    assert.ok(cross, 'ordinary OOPIF was not created');
     const crossSession = (
       await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
     ).sessionId;
@@ -283,7 +297,6 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
     assert.ok(document.loaderId);
     await raw.send('Target.detachFromTarget', { sessionId: crossSession });
-    await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
     held.child.stdin.end();
     assert.equal(await held.ended, 0, held.stderr());
     held = undefined;

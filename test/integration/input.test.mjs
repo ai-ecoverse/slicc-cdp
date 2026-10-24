@@ -246,11 +246,10 @@ async function flow(runner, raw, port) {
   assert.equal(await value('(scrollTo(0, 250), scrollY)'), 250);
   const over = await pw(['mousemove', '600', '100']);
   assert.equal(over.code, 1);
-  assert.equal(
-    over.stderr,
-    'slicc: refused: mouse input at (600, 100) would reach an embedded frame\n'
-  );
-  await run(['mousemove', '10', '10']);
+  assert.match(over.stderr, /slicc: refused:/);
+  const outside = await pw(['mousemove', '10', '10']);
+  assert.equal(outside.code, 1);
+  assert.match(outside.stderr, /slicc: refused:/);
   assert.equal(
     (
       await run([
@@ -262,11 +261,11 @@ async function flow(runner, raw, port) {
   );
   const typed = await pw(['keydown', 'a']);
   assert.equal(typed.code, 1);
-  assert.match(typed.stderr, /keyboard focus is inside an embedded frame/);
+  assert.match(typed.stderr, /slicc: refused:/);
   const framedResize = await pw(['resize', '900', '650']);
   assert.equal(framedResize.code, 1);
   assert.match(framedResize.stderr, /refused/);
-  for (const output of [over, typed, framedResize])
+  for (const output of [over, outside, typed, framedResize])
     assert.doesNotMatch(output.stdout + output.stderr, /FRAME_SECRET/);
   assert.ok(
     (await drain()).every((event) => !(event.type === 'mousemove' && event.x === 600)),

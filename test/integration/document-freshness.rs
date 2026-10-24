@@ -47,6 +47,7 @@ impl Transport for Fake {
         backend.calls.push(call.clone());
         let result = match call["method"].as_str().unwrap() {
             "Target.getTargetInfo" => json!({"targetInfo":backend.info()}),
+            "Target.getTargets" => json!({"targetInfos":[backend.info()]}),
             "Target.attachToTarget" => {
                 let session = format!("S{}", backend.sessions.len() + 1);
                 backend.sessions.push(session.clone());

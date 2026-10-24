@@ -169,10 +169,9 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
               'set_preferences',
               'send_reply',
             ];
-        const frames =
-          req.url === '/frames'
-            ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe><iframe src="${protectedUrl}"></iframe>`
-            : '';
+        const frames = ['/frames', '/ordinary-frames'].includes(req.url)
+          ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${req.url === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
+          : '';
         res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
 if (document.modelContext) {
   for (const name of ${JSON.stringify(names)}) document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
@@ -257,6 +256,19 @@ if (document.modelContext) {
     const framesReady = holder.documentReady();
     await navigate(raw, sessionId, `${ordinary}/frames`);
     await framesReady;
+    const targetInfos = (await raw.send('Target.getTargets', {})).targetInfos;
+    const protectedChild = targetInfos.find(
+      (target) => target.type === 'iframe' && target.url === protectedUrl
+    );
+    assert.ok(protectedChild, 'protected OOPIF was not created');
+    const childSession = (
+      await raw.send('Target.attachToTarget', { targetId: protectedChild.targetId, flatten: true })
+    ).sessionId;
+    assert.equal((await hasShim(raw, childSession)).api, false);
+    await raw.send('Target.detachFromTarget', { sessionId: childSession });
+    const ordinaryFramesReady = holder.documentReady();
+    await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
+    await ordinaryFramesReady;
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);
     assert.equal(JSON.parse(same.stdout).length, 9);
@@ -281,16 +293,7 @@ if (document.modelContext) {
     ]);
     assert.equal(crossCall.code, 0, crossCall.stderr);
     assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
-    const targetInfos = (await raw.send('Target.getTargets', {})).targetInfos;
-    const protectedChild = targetInfos.find(
-      (target) => target.type === 'iframe' && target.url === protectedUrl
-    );
-    assert.ok(protectedChild, 'protected OOPIF was not created');
-    const childSession = (
-      await raw.send('Target.attachToTarget', { targetId: protectedChild.targetId, flatten: true })
-    ).sessionId;
-    assert.equal((await hasShim(raw, childSession)).api, false);
-    await raw.send('Target.detachFromTarget', { sessionId: childSession });
+
     const restored = raw.waitEvent(
       (event) => event.method === 'Page.frameNavigated' && event.sessionId === sessionId,
       15000

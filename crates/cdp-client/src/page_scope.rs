@@ -1,0 +1,241 @@
+use super::*;
+
+const MAX_FRAMES: usize = 4096;
+const MAX_TARGETS: usize = 256;
+
+pub(super) fn content(method: &str) -> bool {
+    ["DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
+        || matches!(method, "Page.captureScreenshot" | "Page.printToPDF" | "Page.startScreencast")
+}
+
+impl Cdp {
+    pub(super) fn verify_page_scope(&mut self, session: Option<&str>) -> Result<(String, u64, u64), String> {
+        let target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
+        let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, DOCUMENT_CHECK).map_err(|_| self.refusal())?;
+        let infos = listed.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.refusal())?;
+        let selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
+        if !matches!(selected.get("type").and_then(Value::as_str), Some("page" | "iframe")) { return Err(self.refusal()) }
+        let context = selected.get("browserContextId").cloned();
+        let has_iframes = infos.iter().any(|info| info.get("browserContextId") == context.as_ref() && info.get("type").and_then(Value::as_str) == Some("iframe"));
+        let infos: Vec<Value> = infos.iter().filter(|info| info.get("browserContextId") == context.as_ref()
+            && matches!(info.get("type").and_then(Value::as_str), Some("page" | "iframe"))
+            && (has_iframes || info.get("targetId").and_then(Value::as_str) == Some(&target))).cloned().collect();
+        if infos.len() > MAX_TARGETS { return Err(self.refusal()) }
+        let mut ids = BTreeSet::new();
+        if infos.iter().any(|info| info.get("targetId").and_then(Value::as_str).is_none_or(|id| !ids.insert(id))) { return Err(self.refusal()) }
+        let epochs = self.page_scope_epochs.clone();
+        let unknown = self.page_scope_unknown;
+        for info in &infos {
+            if let Some(id) = info.get("targetId").and_then(Value::as_str) { self.targets.insert(id.to_string(), info.clone()); }
+        }
+        let mut nodes = BTreeMap::new();
+        let mut roots = BTreeMap::new();
+        let mut target_roots = BTreeMap::new();
+        let mut iframe_roots = Vec::new();
+        let mut protected_iframes = Vec::new();
+        let deadline = Instant::now() + DOCUMENT_CHECK;
+        for info in &infos {
+            let id = info.get("targetId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?;
+            let url = info.get("url").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+            let iframe = info.get("type").and_then(Value::as_str) == Some("iframe");
+            let error_probe = self.guard.error_page_url(url) && self.guards.contains_key(id) && self.documents.get(id).is_some_and(|doc| !doc.previous);
+            let protected = !frame_text_known(url) || !error_probe && self.info_protected(info, &[]) || self.protected_targets.contains(id);
+            if protected {
+                let parent = if iframe { Some(info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?) } else { None };
+                nodes.entry(id.to_string()).or_insert_with(|| json!({"id":id,"parentId":parent,"url":url,"securityOrigin":url,"loaderId":"protected"}));
+                if iframe { iframe_roots.push(id.to_string()); protected_iframes.push(id.to_string()); } else { roots.insert(id.to_string(), id.to_string()); }
+                continue;
+            }
+            let mut tree = self.page_scope_tree(id, deadline)?;
+            let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.refusal())?;
+            let root = frame.get("id").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?.to_string();
+            if iframe {
+                let parent = info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?;
+                if frame.get("parentId").is_some_and(|id| id.as_str() != Some(parent)) { return Err(self.refusal()) }
+                frame["parentId"] = json!(parent);
+                iframe_roots.push(root.clone());
+                if self.protected_targets.contains(id) { protected_iframes.push(root.clone()); }
+            } else {
+                if frame.get("parentId").is_some() || roots.insert(root.to_string(), id.to_string()).is_some() { return Err(self.refusal()) }
+            }
+            target_roots.insert(id.to_string(), root);
+            Self::page_scope_nodes(tree.get("frameTree").unwrap(), None, &mut nodes).ok_or_else(|| self.refusal())?;
+        }
+        let owner = |id: &str| -> Option<String> {
+            let mut current = id;
+            let mut visited = BTreeSet::new();
+            while visited.insert(current.to_string()) {
+                if let Some(owner) = roots.get(current) { return Some(owner.clone()) }
+                current = nodes.get(current)?.get("parentId")?.as_str()?;
+            }
+            None
+        };
+        for id in &iframe_roots { owner(id).ok_or_else(|| self.refusal())?; }
+        for id in nodes.keys() {
+            if let Some(page) = owner(id) { self.page_scope_owners.insert(id.clone(), page); }
+        }
+        for (target, root) in &target_roots {
+            if let Some(page) = owner(root) { self.page_scope_owners.insert(target.clone(), page); }
+        }
+        for info in &infos {
+            let id = info.get("targetId").and_then(Value::as_str).unwrap();
+            if info.get("type").and_then(Value::as_str) == Some("page") { self.page_scope_owners.insert(id.to_string(), id.to_string()); }
+        }
+        let page = if selected.get("type").and_then(Value::as_str) == Some("page") { target.clone() } else { owner(target_roots.get(&target).map(String::as_str).unwrap_or(&target)).ok_or_else(|| self.refusal())? };
+        if protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page)) { return Err(self.refusal()) }
+        let root = roots.iter().find(|(_, owner)| *owner == &page).map(|(id, _)| id).ok_or_else(|| self.refusal())?;
+        let tree = Self::page_scope_join(root, &nodes, &mut BTreeSet::new()).ok_or_else(|| self.refusal())?;
+        let mut frames = BTreeMap::new();
+        let epoch = epochs.get(&page).copied().unwrap_or(0);
+        if epoch != self.page_scope_epochs.get(&page).copied().unwrap_or(0) || unknown != self.page_scope_unknown || !self.collect_document_frames(&tree, &mut frames, true, None)
+            || frames.iter().any(|(id, frame)| {
+                let ordinary_error = self.guard.error_document(&frame[1], &frame[2]) && !self.unverified_error(&frame[1], &frame[3])
+                    && if frame[4].is_empty() { self.documents.get(&page).is_some_and(|doc| !doc.previous) } else { self.frame_decisions.get(id) == Some(&false) };
+                !ordinary_error && (self.guard.url(&frame[1]) || self.guard.url(&frame[2]))
+            }) { return Err(self.refusal()) }
+        for (id, evidence) in &frames {
+            self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
+            self.note_parent(id, &evidence[4]);
+        }
+        Ok((page, epoch, unknown))
+    }
+
+    fn page_scope_tree(&mut self, target: &str, deadline: Instant) -> Result<Value, String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err(self.refusal()) }
+        let session = match self.guards.get(target).or_else(|| self.page_scope_sessions.get(target)).cloned() {
+            Some(session) => session,
+            None => {
+                let result = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, left).map_err(|_| self.refusal())?;
+                let session = result.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?.to_string();
+                self.guard_sessions.insert(session.clone());
+                self.session_targets.insert(session.clone(), target.to_string());
+                self.page_scope_sessions.insert(target.to_string(), session.clone());
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || self.raw_call("Page.enable", json!({}), Some(&session), left).is_err() {
+                    self.page_scope_sessions.remove(target);
+                    let _ = self.send("Target.detachFromTarget", json!({"sessionId":session}), None);
+                    self.guard_sessions.remove(&session);
+                    self.session_targets.remove(&session);
+                    return Err(self.refusal());
+                }
+                session
+            }
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err(self.refusal()) }
+        let mut tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.refusal())?;
+        if self.page_scope_versions(target, &tree)? {
+            self.context_proofs.retain(|(owner, _), _| owner != &session);
+            for method in ["Runtime.disable", "Runtime.enable"] {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { return Err(self.refusal()) }
+                if self.raw_call(method, json!({}), Some(&session), left).is_err() {
+                    if self.protected_targets.contains(target) { return Ok(tree) }
+                    return Err(self.refusal());
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(self.refusal()) }
+            tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.refusal())?;
+        }
+        Ok(tree)
+    }
+
+    fn page_scope_nodes(node: &Value, parent: Option<&str>, nodes: &mut BTreeMap<String, Value>) -> Option<()> {
+        let frame = node.get("frame")?;
+        let id = frame.get("id")?.as_str().filter(|id| frame_text_known(id))?;
+        if nodes.len() >= MAX_FRAMES || parent.is_some_and(|parent| frame.get("parentId").is_some_and(|id| id.as_str() != Some(parent))) { return None }
+        let mut frame = frame.clone();
+        if let Some(parent) = parent { frame["parentId"] = json!(parent); }
+        if let Some(previous) = nodes.get(id) {
+            if previous.get("parentId") != frame.get("parentId") { return None }
+        }
+        nodes.insert(id.to_string(), frame);
+        if let Some(children) = node.get("childFrames") {
+            for child in children.as_array()? { Self::page_scope_nodes(child, Some(id), nodes)?; }
+        }
+        Some(())
+    }
+
+    fn page_scope_join(id: &str, nodes: &BTreeMap<String, Value>, visited: &mut BTreeSet<String>) -> Option<Value> {
+        if !visited.insert(id.to_string()) { return None }
+        let frame = nodes.get(id)?;
+        let mut children = Vec::new();
+        for (child, frame) in nodes {
+            if frame.get("parentId").and_then(Value::as_str) == Some(id) { children.push(Self::page_scope_join(child, nodes, visited)?); }
+        }
+        Some(json!({"frame":frame,"childFrames":children}))
+    }
+
+    fn page_scope_versions(&mut self, target: &str, tree: &Value) -> Result<bool, String> {
+        let root = tree.get("frameTree").ok_or_else(|| self.refusal())?;
+        let mut queue = vec![(root, false)];
+        let mut inherited = false;
+        let mut count = 0;
+        while let Some((node, child)) = queue.pop() {
+            count += 1;
+            if count > MAX_FRAMES { return Err(self.refusal()) }
+            let frame = node.get("frame").ok_or_else(|| self.refusal())?;
+            let id = frame.get("id").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+            if let Some(loader) = frame.get("loaderId").and_then(Value::as_str) {
+                self.document_versions.insert((target.to_string(), id.to_string()), loader.to_string());
+            }
+            inherited |= (child || frame.get("parentId").is_some()) && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
+                && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or("")) && self.page_scope_origin(frame).is_none();
+            if let Some(children) = node.get("childFrames") {
+                for child in children.as_array().ok_or_else(|| self.refusal())? { queue.push((child, true)); }
+            }
+        }
+        Ok(inherited)
+    }
+
+    pub(super) fn page_scope_origin<'a>(&'a self, frame: &Value) -> Option<&'a str> {
+        if frame.get("securityOrigin").and_then(Value::as_str) != Some("://")
+            || !self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or("")) { return None }
+        let id = frame.get("id")?.as_str()?;
+        let loader = frame.get("loaderId")?.as_str()?;
+        self.context_proofs.iter().find(|((session, _), proof)| {
+            self.guard_sessions.contains(session) && proof.default && proof.frame == id && proof.loader.as_deref() == Some(loader)
+                && frame_text_known(&proof.origin)
+        }).map(|(_, proof)| proof.origin.as_str())
+    }
+
+    pub(super) fn page_scope_owner(&self, id: &str) -> Option<String> {
+        let mut current = id;
+        let mut visited = BTreeSet::new();
+        while visited.insert(current.to_string()) && visited.len() <= MAX_FRAMES {
+            if let Some(page) = self.page_scope_owners.get(current) { return Some(page.clone()) }
+            if let Some(info) = self.targets.get(current) {
+                if info.get("type").and_then(Value::as_str) == Some("page") { return Some(current.to_string()) }
+                if let Some(parent) = info.get("parentFrameId").and_then(Value::as_str) { current = parent; continue; }
+            }
+            current = self.frame_parents.get(current)?;
+        }
+        None
+    }
+
+    pub(super) fn page_scope_changed(&mut self, method: &str, params: &Value, session: Option<&str>) {
+        let mut pages = BTreeSet::new();
+        if matches!(method, "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument") {
+            if method == "Page.frameNavigated" {
+                let frame = &params["frame"];
+                let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+                if self.frames.get(id).is_some_and(|known| known.first() == frame.get("url").and_then(Value::as_str).map(String::from).as_ref()
+                    && known.get(1) == frame.get("securityOrigin").and_then(Value::as_str).map(String::from).as_ref())
+                    && session.and_then(|session| self.session_target(session)).is_some_and(|target| self.document_versions.get(&(target, id.to_string())).map(String::as_str) == frame.get("loaderId").and_then(Value::as_str)) { return }
+            }
+            if let Some(page) = session.and_then(|session| self.session_target(session)).and_then(|target| self.page_scope_owner(&target)) { pages.insert(page); }
+        } else if matches!(method, "Target.targetCreated" | "Target.targetInfoChanged" | "Target.targetDestroyed") {
+            let info = params.get("targetInfo");
+            let id = info.and_then(|info| info.get("targetId")).or_else(|| params.get("targetId")).and_then(Value::as_str).unwrap_or("");
+            let previous = self.targets.get(id);
+            if info.or(previous).and_then(|info| info.get("type")).and_then(Value::as_str) != Some("iframe") { return }
+            if info.is_some_and(|info| previous.is_some_and(|previous| ["url", "parentFrameId"].iter().all(|key| previous.get(*key) == info.get(*key)))) { return }
+            if let Some(page) = self.page_scope_owner(id) { pages.insert(page); }
+            if let Some(page) = info.and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).and_then(|parent| self.page_scope_owner(parent)) { pages.insert(page); }
+        } else { return }
+        if pages.is_empty() { self.page_scope_unknown += 1; }
+        for page in pages { *self.page_scope_epochs.entry(page).or_default() += 1; }
+    }
+}

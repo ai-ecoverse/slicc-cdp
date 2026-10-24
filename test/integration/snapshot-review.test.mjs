@@ -17,7 +17,7 @@ const cli = path.join(
 );
 const base = 'https://example.test/page';
 
-async function snapshot(options, check) {
+async function snapshot(options, check, refused = false) {
   const backend = await fakeCdp({ ...options, location: { href: base, title: 'Review' } });
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-snapshot-review-'));
   const env = {
@@ -40,8 +40,17 @@ async function snapshot(options, check) {
     });
   try {
     await run(['open', base]);
-    const result = await run(['snapshot']);
-    await check(result.stdout, backend, run);
+    if (refused) {
+      await assert.rejects(run(['snapshot']), (error) => {
+        assert.match(error.stderr, /slicc: refused:/);
+        assert.equal(error.stdout, '');
+        return true;
+      });
+      await check('', backend, run);
+    } else {
+      const result = await run(['snapshot']);
+      await check(result.stdout, backend, run);
+    }
   } finally {
     await backend.close();
     await rm(home, { recursive: true, force: true });
@@ -61,7 +70,7 @@ for (const metadata of [
   frame('PRIVATE', 'about:blank', 'https://seven.sliccy.ai'),
   frame('PRIVATE', 'https://example.test/child', ''),
 ]) {
-  test(`snapshot skips unreadable child metadata for ${metadata.frame.url}`, async () => {
+  test(`snapshot refuses unreadable child metadata for ${metadata.frame.url}`, async () => {
     await snapshot(
       {
         frameTree: {
@@ -93,9 +102,7 @@ for (const metadata of [
                 ),
       },
       async (output, backend) => {
-        assert.match(output, /Public heading/);
-        assert.match(output, /Allowed sibling/);
-        assert.doesNotMatch(output, /CHILD_CONTENT_MUST_NOT_APPEAR/);
+        assert.equal(output, '');
         assert.equal(
           backend.calls.some(
             (call) =>
@@ -103,7 +110,8 @@ for (const metadata of [
           ),
           false
         );
-      }
+      },
+      true
     );
   });
 }

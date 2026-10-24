@@ -202,9 +202,9 @@ function frames(main) {
   ];
 }
 
-async function overExtension(start, body) {
+async function overExtension(start, body, children = frames) {
   const state = {};
-  const fake = await fakeCdp({ intercept: extensionTabs(state, frames) });
+  const fake = await fakeCdp({ intercept: extensionTabs(state, children) });
   state.fake = fake;
   const runner = await start(fake.url);
   try {
@@ -226,21 +226,25 @@ for (const [label, start] of [
 ]) {
   test(`${label}: over slicc-extension 7.6's tab ids, an ordinary localhost page on another port opens, goes and snapshots`, async () => {
     assert.ok(label === 'native' || existsSync(path.join(wasmDir, 'playwright-cli.wasm')));
-    await overExtension(start, async (run, fake) => {
-      const opened = await run(['open', 'about:blank']);
-      assert.equal(opened.code, 0, opened.stderr);
-      const went = await run(['goto', driven]);
-      assert.equal(went.code, 0, went.stderr);
-      const shot = await run(['snapshot']);
-      assert.equal(shot.code, 0, shot.stderr);
-      assert.match(shot.stdout, /button "Go"/);
-      const tab = fake.targets.at(-1);
-      assert.equal(tab.url, driven);
-      assert.equal(isolated(fake, mainFrame(tab.targetId)).length, 1);
-      const framed = await run(['snapshot', `--frame=${mainFrame(tab.targetId)}-PLAIN`]);
-      assert.equal(framed.code, 0, framed.stderr);
-      assert.equal(isolated(fake, `${mainFrame(tab.targetId)}-PLAIN`).length, 1);
-    });
+    await overExtension(
+      start,
+      async (run, fake) => {
+        const opened = await run(['open', 'about:blank']);
+        assert.equal(opened.code, 0, opened.stderr);
+        const went = await run(['goto', driven]);
+        assert.equal(went.code, 0, went.stderr);
+        const shot = await run(['snapshot']);
+        assert.equal(shot.code, 0, shot.stderr);
+        assert.match(shot.stdout, /button "Go"/);
+        const tab = fake.targets.at(-1);
+        assert.equal(tab.url, driven);
+        assert.equal(isolated(fake, mainFrame(tab.targetId)).length, 1);
+        const framed = await run(['snapshot', `--frame=${mainFrame(tab.targetId)}-PLAIN`]);
+        assert.equal(framed.code, 0, framed.stderr);
+        assert.equal(isolated(fake, `${mainFrame(tab.targetId)}-PLAIN`).length, 1);
+      },
+      (main) => frames(main).filter((node) => node.frame.id.endsWith('-PLAIN'))
+    );
   });
 
   test(`${label}: over slicc-extension 7.6's tab ids, frames on seven's origin or the vault stay refused`, async () => {

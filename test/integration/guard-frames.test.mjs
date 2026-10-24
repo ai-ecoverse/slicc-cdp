@@ -96,10 +96,18 @@ test('frame-scoped reads of a protected child frame committed before attach are 
         frame
       );
     }
+    const locked = await run(['--cdp', fake.url, 'snapshot', '--frame=PLAIN'], home);
+    assert.notEqual(locked.code, 0);
+    assert.match(locked.stderr, /slicc: refused:/);
+    childFrames.splice(0, 2);
+    const from = fake.calls.length;
     const plain = await run(['--cdp', fake.url, 'snapshot', '--frame=PLAIN'], home);
     assert.equal(plain.code, 0, plain.stderr);
     assert.deepEqual(
-      fake.calls.filter((call) => call.params?.frameId === 'PLAIN').map((call) => call.method),
+      fake.calls
+        .slice(from)
+        .filter((call) => call.params?.frameId === 'PLAIN')
+        .map((call) => call.method),
       ['Page.createIsolatedWorld']
     );
   } finally {

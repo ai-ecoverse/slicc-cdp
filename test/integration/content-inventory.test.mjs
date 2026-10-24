@@ -10,6 +10,7 @@ const literals = (text) =>
 const events = new Set([
   'Audits.issueAdded',
   'CSS.styleSheetAdded',
+  'DOM.documentUpdated',
   'Debugger.paused',
   'Debugger.scriptFailedToParse',
   'Debugger.scriptParsed',
@@ -34,6 +35,7 @@ const events = new Set([
   'Page.lifecycleEvent',
   'Page.loadEventFired',
   'Page.navigatedWithinDocument',
+  'Page.screencastFrame',
   'Runtime.bindingCalled',
   'Runtime.consoleAPICalled',
   'Runtime.exceptionThrown',
