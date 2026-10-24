@@ -56,6 +56,7 @@ struct DocumentState {
     worker: Option<(String, String)>,
     scope: Option<String>,
     epoch: u64,
+    page_scope: Option<(String, u64, u64)>,
 }
 
 impl PartialEq for DocumentState {
@@ -118,6 +119,9 @@ pub struct Cdp {
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
     checking_page_events: bool,
+    page_scope_owners: BTreeMap<String, String>,
+    page_scope_epochs: BTreeMap<String, u64>,
+    page_scope_unknown: u64,
     guard_sessions: BTreeSet<String>,
     guarding: BTreeSet<String>,
     probing: BTreeSet<String>,
@@ -200,6 +204,9 @@ impl Cdp {
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
             checking_page_events: false,
+            page_scope_owners: BTreeMap::new(),
+            page_scope_epochs: BTreeMap::new(),
+            page_scope_unknown: 0,
             guard_sessions: BTreeSet::new(),
             guarding: BTreeSet::new(),
             probing: BTreeSet::new(),
@@ -441,12 +448,12 @@ impl Cdp {
         let result = match self.raw_call_execution(&forwarded, sent, compile_session.as_deref().or(session_id), timeout, executed) {
             Ok(result) => result,
             Err(message) => {
-                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false)?; }
+                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false, true)?; }
                 return Err(message);
             }
         };
         if content_command(method, &params) == Some(true) && !executed {
-            self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"))?;
+            self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"), !method.starts_with("Input."))?;
         }
         if executed { self.verify_execution(&checks)?; }
         if let (true, Some(session), Some(id)) = (
@@ -469,11 +476,8 @@ impl Cdp {
         if crosses_frames(method, &params) && self.frame_tree_refused(session_id)? {
             return Err(self.refusal());
         }
-        if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params) || page_scope::content(method)) && frame_epoch != self.frame_epoch {
+        if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params)) && frame_epoch != self.frame_epoch {
             return Err(self.refusal());
-        }
-        if page_scope::content(method) && content_command(method, &params) == Some(true) {
-            self.verify_page_scope(session_id)?;
         }
         let result = self.after(method, &params, session_id, result)?;
         self.bind_streams(method, session_id, &result, &checks);
@@ -771,7 +775,7 @@ impl Cdp {
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
-        if page_scope::content(method) { self.verify_page_scope(session)?; }
+        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope(session)?) } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -782,7 +786,12 @@ impl Cdp {
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
-            let current = self.document_state_for(&target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
+            let mut current = self.document_state_for(&target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
+            if let Some(proof) = &expected.page_scope {
+                let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
+                if &self.verify_page_scope(Some(&guard))? != proof { return Err(self.refusal()) }
+                current.page_scope = Some(proof.clone());
+            }
             if current != expected { return Err(self.refusal()) }
             checks.push((target, current));
         }
@@ -798,7 +807,7 @@ impl Cdp {
                     })
                 });
                 let scope = if crosses_frames(method, params) || page_scope::content(method) { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
-                let state = if self.document_paused(&target) {
+                let mut state = if self.document_paused(&target) {
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
                 } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
@@ -815,6 +824,7 @@ impl Cdp {
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
+                state.page_scope = page_scope;
                 checks.push((target, state));
             }
         }
@@ -910,8 +920,13 @@ impl Cdp {
         })
     }
 
-    fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool) -> Result<(), String> {
+    fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool, stable_page: bool) -> Result<(), String> {
         for (target, expected) in checks {
+            if let Some(proof) = &expected.page_scope {
+                let session = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
+                let current = self.verify_page_scope(Some(&session))?;
+                if stable_page && &current != proof { return Err(self.refusal()) }
+            }
             let current = self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
             if same_document && &current != expected { return Err(self.refusal()) }
         }
@@ -1683,7 +1698,7 @@ impl Cdp {
             }
         }
         let scope = if parent.is_some() && scope == Some("") { frame.get("id").and_then(Value::as_str) } else { scope };
-        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch };
+        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch, page_scope:None };
         if content { self.cached_documents.insert(target.to_string(), state.clone()); }
         Some(state)
     }
@@ -1697,7 +1712,8 @@ impl Cdp {
 
     fn collect_document_frames(&self, node: &Value, frames: &mut BTreeMap<String, Vec<String>>, content: bool, parent: Option<&str>) -> bool {
         let Some(frame) = node.get("frame") else { return false };
-        let text = |key| frame.get(key).and_then(Value::as_str).unwrap_or("");
+        let origin = self.page_scope_origin(frame);
+        let text = |key| if key == "securityOrigin" { origin.unwrap_or_else(|| frame.get(key).and_then(Value::as_str).unwrap_or("")) } else { frame.get(key).and_then(Value::as_str).unwrap_or("") };
         let root = parent.is_none();
         if ["id", "url"].iter().any(|key| matches!(text(*key), "" | "null" | "://"))
             || frame.get("parentId").is_some_and(|id| id.as_str() != parent) { return false }
@@ -1711,7 +1727,7 @@ impl Cdp {
         let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error || data;
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
             || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
-            || !root && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))
+            || !root && !allowed_error && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))
             || self.unverified_error(text("url"), text("unreachableUrl"))) { return false }
         let evidence = vec![text("loaderId").to_string(), format!("{}{}", text("url"), text("urlFragment")), text("securityOrigin").to_string(), text("unreachableUrl").to_string(), parent.unwrap_or("").to_string()];
         if frames.insert(text("id").to_string(), evidence).is_some() { return false }
@@ -1843,6 +1859,9 @@ impl Cdp {
     }
 
     fn frame_refused(&mut self, frame_id: &str, session_id: Option<&str>) -> Result<bool, String> {
+        if self.frames.get(frame_id).is_some_and(|known| known.first().is_some_and(|url| self.guard.inheriting(url)) && !self.frame_verified(frame_id)) {
+            self.verify_page_scope(session_id)?;
+        }
         let known = self.frames.contains_key(frame_id);
         if self.frame_protected(frame_id) || known && !self.frame_verified(frame_id) {
             return Ok(true);
@@ -1903,6 +1922,18 @@ impl Cdp {
         let mut frames = BTreeMap::new();
         if let Some(node) = tree.get("frameTree") {
             Self::collect_frames(node, &mut frames);
+            let mut queue = vec![(node, None::<&str>)];
+            while let Some((node, parent)) = queue.pop() {
+                if let Some(frame) = node.get("frame") {
+                    if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                        if let Some(known) = frames.get_mut(id) {
+                            if let Some(origin) = self.page_scope_origin(frame) { known[1] = origin.to_string(); }
+                            if let Some(parent) = parent { if frame.get("parentId").is_none() { known[2] = parent.to_string(); } }
+                        }
+                        for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() { queue.push((child, Some(id))); }
+                    }
+                }
+            }
         }
         let ids = frames.keys().cloned().collect::<BTreeSet<_>>();
         for id in self.frame_sessions.insert(session.to_string(), ids.clone()).unwrap_or_default().difference(&ids) {
@@ -2064,6 +2095,7 @@ impl Cdp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        self.page_scope_changed(&method, &params, session.as_deref());
         if let Some(target) = session.as_deref().and_then(|session| self.session_target(session)) {
             if method == "Page.frameNavigated" {
                 let id = params.pointer("/frame/id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -2157,7 +2189,7 @@ impl Cdp {
         } {
             self.source_resources.insert((session.clone().unwrap_or_default(), id.to_string()), url.to_string());
         }
-        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument" | "Target.targetCreated" | "Target.targetInfoChanged" | "Target.targetDestroyed" | "Target.detachedFromTarget") {
+        if matches!(method.as_str(), "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument") {
             self.frame_epoch += 1;
         }
         match method.as_str() {
@@ -2794,9 +2826,12 @@ impl Cdp {
         pinned: bool,
     ) -> Result<Value, String> {
         let frame_epoch = self.frame_epoch;
+        let page = session_id.and_then(|session| self.session_target(session)).and_then(|target| self.page_scope_owner(&target))
+            .map(|page| (page.clone(), self.page_scope_epochs.get(&page).copied().unwrap_or(0), self.page_scope_unknown));
         let result = self.raw_exchange(method, params, session_id, timeout, pinned)?;
         if method == "Page.getFrameTree" {
-            if !self.tree_current(&result, frame_epoch) {
+            let stable_page = page.is_some_and(|(page, epoch, unknown)| self.page_scope_epochs.get(&page).copied().unwrap_or(0) == epoch && self.page_scope_unknown == unknown);
+            if !stable_page && !self.tree_current(&result, frame_epoch) {
                 return Err(self.refusal());
             }
             self.record_frames(&result, session_id.unwrap_or(""));

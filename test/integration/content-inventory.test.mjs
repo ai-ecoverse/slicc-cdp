@@ -34,6 +34,7 @@ const events = new Set([
   'Page.lifecycleEvent',
   'Page.loadEventFired',
   'Page.navigatedWithinDocument',
+  'Page.screencastFrame',
   'Runtime.bindingCalled',
   'Runtime.consoleAPICalled',
   'Runtime.exceptionThrown',
