@@ -105,7 +105,7 @@ impl Cdp {
         let mut found = None;
         for page in pages {
             let id = page.get("targetId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
-            if self.info_protected(page, &[]) || self.protected_targets.contains(id) { continue }
+            if page.get("url").and_then(Value::as_str).is_none_or(|url| !frame_text_known(url)) || self.info_protected(page, &[]) || self.protected_targets.contains(id) { continue }
             let tree = self.page_scope_tree(id, deadline)?;
             let root = tree.get("frameTree").ok_or_else(|| self.refusal())?;
             if root.pointer("/frame/parentId").is_some() { return Err(self.refusal()) }
@@ -122,7 +122,7 @@ impl Cdp {
                     let parent = info.get("parentFrameId").and_then(Value::as_str);
                     if parent.is_none_or(|parent| !nodes.contains_key(parent)) { remaining.push(info); continue }
                     let parent = parent.unwrap();
-                    if self.info_protected(&info, &[]) || self.protected_targets.contains(target) {
+                    if info.get("url").and_then(Value::as_str).is_none_or(|url| !frame_text_known(url)) || self.info_protected(&info, &[]) || self.protected_targets.contains(target) {
                         nodes.entry(target.to_string()).or_insert_with(|| json!({"id":target,"parentId":parent}));
                     } else {
                         let mut tree = self.page_scope_tree(target, deadline)?;
