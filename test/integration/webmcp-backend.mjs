@@ -9,6 +9,7 @@ export async function webmcpBackend({
   reentrantPauses = false,
   attachDuringRearm = false,
   onCommand = () => {},
+  beforeNavigateFrame = () => {},
 } = {}) {
   let next = 0;
   let reloads = 0;
@@ -206,8 +207,10 @@ export async function webmcpBackend({
         reset(`RELOAD${++reloads}`);
         loadFired = false;
         for (const peer of sessions.keys()) {
-          for (const page of localPages(peer))
+          for (const page of localPages(peer)) {
+            beforeNavigateFrame(peer, page, event, sessions);
             event('Page.frameNavigated', { frame: frame(page) }, peer);
+          }
           event('Runtime.executionContextsCleared', {}, peer);
           created(peer);
           for (const page of localPages(peer))

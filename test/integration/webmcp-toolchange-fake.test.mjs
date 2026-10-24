@@ -569,6 +569,71 @@ await test('fake: frame churn during blank-frame rearm preserves the holder and 
   );
 });
 
+await test('fake: late protected frame evidence does not revoke a fresh ordinary frame navigation', async () => {
+  let active = false;
+  let raced = false;
+  let backend;
+  await scenario(
+    {
+      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
+      beforeNavigateFrame(peer, page, event, sessions) {
+        if (!active || raced || page.id !== 'CROSS' || !backend.scripts.has(peer)) return;
+        const guard = [...sessions.keys()].find(
+          (session) => sessions.get(session) === 'TAB' && !backend.scripts.has(session)
+        );
+        assert.ok(guard);
+        raced = true;
+        event(
+          'Page.frameNavigated',
+          {
+            frame: {
+              id: page.id,
+              parentId: 'TAB',
+              loaderId: 'STALE',
+              url: 'https://seven.sliccy.ai/',
+              securityOrigin: 'https://seven.sliccy.ai',
+            },
+          },
+          guard
+        );
+      },
+    },
+    async (context) => {
+      backend = context.backend;
+      const { held, cwd } = context;
+      const from = held.lines.length;
+      active = true;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', from);
+      assert.equal(raced, true);
+      const start = held.lines.length;
+      backend.pages.get('CROSS').document.modelContext.registerTool({
+        name: 'fresh_cross',
+        exposedTo: ['https://ordinary.test'],
+        execute: () => 'fresh_cross',
+      });
+      const event = await held.next(changed('CROSS'), start);
+      assert.equal(event.loaderId, backend.pages.get('CROSS').loader);
+      assert.deepEqual(names(event), ['fresh_cross']);
+      const listed = await run(backend.url, cwd, [
+        'webmcp-list',
+        '--tab',
+        'TAB',
+        '--json',
+        '--from-origin',
+        'https://foreign.test',
+      ]);
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.deepEqual(
+        event.tools,
+        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'CROSS')
+      );
+      assert.doesNotMatch(held.stderr(), /refused|target closed/);
+      assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+    }
+  );
+});
+
 await test('fake: a pending change is dropped when the document navigates, and the next document reports its own generation', async () => {
   let pending = false;
   let backend;
