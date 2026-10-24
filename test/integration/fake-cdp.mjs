@@ -126,6 +126,7 @@ export async function fakeCdp({
   consoleLines = [],
   answers = {},
   attachEvents = false,
+  tabSessions = false,
   discoverEvents = false,
   delayHistoryEvents = false,
   onUpgrade,
@@ -282,7 +283,11 @@ export async function fakeCdp({
           const found = targets.find((item) => item.targetId === params.targetId);
           if (!found) return send({ id, error: { code: -32602, message: 'No target' } });
           next += 1;
-          const session = `S${next}`;
+          let session = `S${next}`;
+          if (tabSessions) {
+            session = found.targetId;
+            for (let n = 1; sessions.has(session); n += 1) session = `${found.targetId}.${n}`;
+          }
           sessions.set(session, found);
           sessionSends.set(session, send);
           if (attachEvents)
