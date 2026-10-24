@@ -178,13 +178,15 @@ async function rawInput(pw, raw, tab, seven) {
   await inTab(
     raw,
     tab,
-    `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(PAD)}); ${LOG}`
+    `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(PAD)}); ${LOG}; window.inputDiagnostic = []; for (const type of ['pointerdown', 'pointerup', 'mousemove', 'mousedown', 'mouseup', 'click', 'dragstart', 'dragend']) addEventListener(type, (event) => inputDiagnostic.push({ type, target: event.target.id, trusted: event.isTrusted, buttons: event.buttons }), true);`
   );
   const shot = await pw(['snapshot']);
   await pw(['drag', refOf(shot, 'button', 'Source'), refOf(shot, 'button', 'Target')]);
   await until(log, 'mousedown:src mouseup:dst click:pad', 'drag');
   assert.equal(await inTab(raw, tab, 'window.moved'), 'dst:1');
 
+  console.log('drag diagnostic', await inTab(raw, tab, 'window.inputDiagnostic'));
+  await inTab(raw, tab, 'window.inputDiagnostic.length = 0');
   await clear();
   await pw(['mousemove', '70', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'src:0', 'mousemove');
@@ -192,6 +194,7 @@ async function rawInput(pw, raw, tab, seven) {
   await pw(['mousemove', '350', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'dst:1', 'mousemove with the button held');
   await pw(['mouseup']);
+  console.log('separate command diagnostic', await inTab(raw, tab, 'window.inputDiagnostic'));
   await until(log, 'mousedown:src mouseup:dst click:pad', 'mousedown and mouseup');
 
   await clear();
