@@ -314,30 +314,44 @@ await test('fake: a change held back by a protected frame is reported only after
 for (const reload of [false, true]) {
   await test(`fake: a preloaded OOPIF survives frame-tree churn with reload=${reload}`, async () => {
     let armed = false;
-    let raced = false;
+    let guard;
+    let raced = 0;
     await scenario(
       {
         children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
-        onCommand(message, _pages, send) {
+        onCommand(message, _pages, send, sessions) {
           if (message.method === 'Target.setAutoAttach') armed = true;
-          if (!armed || raced || message.method !== 'Page.getFrameTree') return;
-          raced = true;
+          if (
+            message.method === 'Runtime.enable' &&
+            sessions.get(message.sessionId) === 'CROSS' &&
+            !guard
+          )
+            guard = message.sessionId;
+          if (
+            !armed ||
+            raced >= 2 ||
+            message.method !== 'Page.getFrameTree' ||
+            message.sessionId !== guard
+          )
+            return;
+          raced += 1;
           send({
             method: 'Page.frameDetached',
-            params: { frameId: 'SWAPPED', reason: 'swap' },
+            params: { frameId: `SWAPPED${raced}`, reason: 'swap' },
             sessionId: message.sessionId,
           });
         },
       },
       async ({ backend, cwd, held }) => {
-        assert.equal(raced, true);
         assert.ok(
           backend.calls.some(
             (call) =>
               call.method === 'Page.addScriptToEvaluateOnNewDocument' &&
               backend.sessions.get(call.sessionId) === 'CROSS'
-          )
+          ),
+          held.stderr()
         );
+        assert.equal(raced, 2);
         const check = async () => {
           const controller = new AbortController();
           let from = held.lines.length;
@@ -403,6 +417,102 @@ await test('fake: a blank child pause received before the parent resume reply ca
         .document.modelContext.registerTool({ name: 'child', execute: () => 'child' });
       assert.deepEqual(names(await held.next(changed('CROSS'), from)), ['child']);
       assert.doesNotMatch(held.stderr(), /refused|target closed/);
+    }
+  );
+});
+
+await test('fake: an OOPIF attachment received inside blank-frame rearm waits for the parent installer', async () => {
+  await scenario(
+    {
+      attachDuringRearm: true,
+      children: [
+        { id: 'BLANK', origin: 'https://ordinary.test', allow: 'tools *' },
+        {
+          id: 'CROSS',
+          origin: 'https://foreign.test',
+          allow: 'tools *',
+          oopif: true,
+          definitions: [
+            { name: 'resumed', exposedTo: ['https://ordinary.test'], execute: () => 'resumed' },
+          ],
+        },
+      ],
+    },
+    async ({ backend, cwd, held }) => {
+      const peer = [...backend.scripts.keys()].find(
+        (session) => backend.sessions.get(session) === 'TAB'
+      );
+      const blank = backend.pages.get('BLANK');
+      blank.blank = true;
+      blank.loader = 'PENDING-BLANK';
+      backend.pages.get('CROSS').blank = true;
+      backend.inject({
+        method: 'Page.frameNavigated',
+        sessionId: peer,
+        params: {
+          frame: {
+            id: blank.id,
+            parentId: 'TAB',
+            loaderId: blank.loader,
+            url: 'about:blank',
+            securityOrigin: blank.origin,
+          },
+        },
+      });
+      backend.inject({
+        method: 'Runtime.executionContextCreated',
+        sessionId: peer,
+        params: {
+          context: {
+            id: blank.main,
+            uniqueId: `main-${blank.loader}`,
+            origin: blank.origin,
+            auxData: { frameId: blank.id, isDefault: true },
+          },
+        },
+      });
+      backend.inject({
+        method: 'Debugger.scriptParsed',
+        sessionId: peer,
+        params: { scriptId: `${peer}-BLANK`, executionContextId: blank.main },
+      });
+      backend.inject({
+        method: 'Debugger.paused',
+        sessionId: peer,
+        params: {
+          callFrames: [
+            {
+              callFrameId: `${peer}-BLANK`,
+              functionName: '__slicc_webmcp_gate',
+              location: { scriptId: `${peer}-BLANK`, lineNumber: 0, columnNumber: 0 },
+            },
+          ],
+        },
+      });
+      await held
+        .next(
+          (line) => line.event === 'tools-changed' && line.frameId === 'CROSS',
+          held.lines.length
+        )
+        .catch((error) => {
+          assert.fail(`child gate did not run: ${error.message}`);
+        });
+      const listed = await run(backend.url, cwd, [
+        'webmcp-list',
+        '--tab',
+        'TAB',
+        '--json',
+        '--from-origin',
+        'https://foreign.test',
+      ]);
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.deepEqual(
+        JSON.parse(listed.stdout)
+          .filter((tool) => tool.frameId === 'CROSS')
+          .map((tool) => tool.name),
+        ['resumed']
+      );
+      assert.doesNotMatch(held.stderr(), /child refused|target closed/);
     }
   );
 });

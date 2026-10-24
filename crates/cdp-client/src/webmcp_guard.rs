@@ -47,8 +47,8 @@ pub(super) struct Webmcp {
     contexts: BTreeMap<(String, i64), Context>,
     scripts: BTreeMap<(String, String), i64>,
     paused: BTreeSet<String>,
-    handling_pause: bool,
-    pending_pauses: VecDeque<Value>,
+    handling_gate: bool,
+    pending_gates: VecDeque<Value>,
     pub(super) deferred: BTreeSet<String>,
     pub(super) quarantined: BTreeSet<String>,
     parents: BTreeMap<String, String>,
@@ -62,7 +62,7 @@ impl Webmcp {
         self.contexts.retain(|(owner, _), _| owner != session);
         self.scripts.retain(|(owner, _), _| owner != session);
         self.paused.remove(session);
-        self.pending_pauses.retain(|value| value.get("sessionId").and_then(Value::as_str) != Some(session));
+        self.pending_gates.retain(|value| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
         self.deferred.remove(session);
         self.quarantined.remove(session);
         self.parents.retain(|child, parent| child != session && parent != session);
@@ -470,11 +470,29 @@ impl Cdp {
         }
     }
 
+    fn webmcp_gate_event(&mut self, value: &Value) {
+        if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
+            if let Some(session) = value.get("sessionId").and_then(Value::as_str) { self.webmcp.paused.insert(session.to_string()); }
+        }
+        self.webmcp.pending_gates.push_back(value.clone());
+        if self.webmcp.handling_gate { return; }
+        self.webmcp.handling_gate = true;
+        while let Some(gate) = self.webmcp.pending_gates.pop_front() {
+            let owner = gate.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            if gate.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
+                self.webmcp_adopt_child(&gate, owner);
+            } else {
+                self.webmcp_handle_pause(&gate, owner);
+            }
+        }
+        self.webmcp.handling_gate = false;
+    }
+
     pub(super) fn webmcp_event(&mut self, value: &Value) -> bool {
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "Target.attachedToTarget" && self.webmcp.arms.contains_key(session) {
-            self.webmcp_adopt_child(value, session);
+            self.webmcp_gate_event(value);
             return true;
         }
         if matches!(method, "Page.frameDetached" | "Runtime.executionContextCreated" | "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared" | "Debugger.scriptParsed") {
@@ -504,16 +522,7 @@ impl Cdp {
             self.webmcp_navigated(session, value);
         }
         if method == "Debugger.paused" {
-            self.webmcp.paused.insert(session.to_string());
-            self.webmcp.pending_pauses.push_back(value.clone());
-            if !self.webmcp.handling_pause {
-                self.webmcp.handling_pause = true;
-                while let Some(paused) = self.webmcp.pending_pauses.pop_front() {
-                    let owner = paused.get("sessionId").and_then(Value::as_str).unwrap_or("");
-                    self.webmcp_handle_pause(&paused, owner);
-                }
-                self.webmcp.handling_pause = false;
-            }
+            self.webmcp_gate_event(value);
             return true;
         }
         false

@@ -7,6 +7,7 @@ export async function webmcpBackend({
   children = [],
   native = false,
   reentrantPauses = false,
+  attachDuringRearm = false,
   onCommand = () => {},
 } = {}) {
   let next = 0;
@@ -21,6 +22,7 @@ export async function webmcpBackend({
   const queues = new Map();
   const lateFrames = new Set();
   const autoAttached = new Set();
+  const autoParents = new Set();
   let held = null;
   let navigateLatest = () => {};
   let loadFired = false;
@@ -108,7 +110,7 @@ export async function webmcpBackend({
   const fake = await fakeCdp({
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
-      if (onCommand(message, pages, send) === true) return true;
+      if (onCommand(message, pages, send, sessions) === true) return true;
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) =>
         (writers.get(peer) || send)({ method, params, sessionId: peer });
@@ -117,6 +119,29 @@ export async function webmcpBackend({
         return target === 'TAB'
           ? [...pages.values()].filter((page) => !page.oopif)
           : [pages.get(target)].filter(Boolean);
+      };
+      const attachOopifs = (parent) => {
+        for (const page of pages.values()) {
+          if (!page.oopif || autoAttached.has(`${parent}:${page.id}`)) continue;
+          autoAttached.add(`${parent}:${page.id}`);
+          const peer = `PEER${++next}`;
+          sessions.set(peer, page.id);
+          writers.set(peer, send);
+          event(
+            'Target.attachedToTarget',
+            {
+              sessionId: peer,
+              targetInfo: {
+                targetId: page.id,
+                type: 'iframe',
+                parentFrameId: 'TAB',
+                url: `${page.origin}/`,
+              },
+              waitingForDebugger: true,
+            },
+            parent
+          );
+        }
       };
       const created = (peer) => {
         for (const page of localPages(peer)) {
@@ -231,23 +256,8 @@ export async function webmcpBackend({
       }
       if (method === 'Target.setAutoAttach') {
         if (params.autoAttach && sessions.get(sessionId) === 'TAB') {
-          for (const page of pages.values()) {
-            if (!page.oopif || autoAttached.has(`${sessionId}:${page.id}`)) continue;
-            autoAttached.add(`${sessionId}:${page.id}`);
-            const peer = `PEER${++next}`;
-            sessions.set(peer, page.id);
-            writers.set(peer, send);
-            event('Target.attachedToTarget', {
-              sessionId: peer,
-              targetInfo: {
-                targetId: page.id,
-                type: 'iframe',
-                parentFrameId: 'TAB',
-                url: `${page.origin}/`,
-              },
-              waitingForDebugger: true,
-            });
-          }
+          autoParents.add(sessionId);
+          if (!attachDuringRearm) attachOopifs(sessionId);
         }
         answer({});
         return true;
@@ -327,6 +337,8 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.addScriptToEvaluateOnNewDocument') {
+        if (attachDuringRearm && !params.runImmediately && autoParents.has(sessionId))
+          attachOopifs(sessionId);
         scripts.set(sessionId, params.source);
         answer({ identifier: sessionId });
         if (params.runImmediately) begin(sessionId);
@@ -388,6 +400,35 @@ export async function webmcpBackend({
           return true;
         }
         if (!pause(sessionId) && page?.loaded && !loadFired) loadEverywhere();
+        return true;
+      }
+      if (method === 'Runtime.runIfWaitingForDebugger') {
+        const page = pages.get(sessions.get(sessionId));
+        if (page?.blank && page.oopif && scripts.has(sessionId)) {
+          page.blank = false;
+          for (const peer of sessions.keys()) {
+            if (sessions.get(peer) !== page.id) continue;
+            event('Page.frameNavigated', { frame: frame(page) }, peer);
+            event('Runtime.executionContextsCleared', {}, peer);
+            created(peer);
+            event(
+              'Network.responseReceived',
+              {
+                frameId: page.id,
+                loaderId: page.loader,
+                type: 'Document',
+                response: {
+                  url: `${page.origin}/`,
+                  status: 200,
+                  headers: { 'permissions-policy': page.policy || '' },
+                },
+              },
+              peer
+            );
+          }
+          begin(sessionId);
+        }
+        answer({});
         return true;
       }
       if (method === 'Page.reload') {
