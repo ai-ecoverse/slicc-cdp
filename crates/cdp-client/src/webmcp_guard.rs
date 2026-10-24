@@ -57,6 +57,8 @@ pub(super) struct Webmcp {
     samples: Vec<u128>,
     trace_sequence: u64,
     trace_lifecycle: BTreeMap<(String, &'static str), u64>,
+    trace_requests: BTreeMap<(String, String), (String, u64)>,
+    trace_fetch: BTreeMap<String, Value>,
 }
 
 impl Webmcp {
@@ -558,8 +560,29 @@ impl Cdp {
         Value::Object(order)
     }
 
+    pub(super) fn webmcp_trace_fetch_command(&mut self, method: &str, params: &Value, session: Option<&str>) {
+        let decision = match method { "Fetch.continueRequest" => "continue", "Fetch.failRequest" => "fail", "Fetch.fulfillRequest" => "fulfill", _ => return };
+        let Some(request) = params.get("requestId").and_then(Value::as_str) else { return; };
+        let Some((frame, sequence)) = self.webmcp.trace_requests.remove(&(session.unwrap_or("").to_string(), request.to_string())) else { return; };
+        let reason = params.get("errorReason").and_then(Value::as_str).map(|reason| match reason { "BlockedByClient" => "BlockedByClient", "Aborted" => "Aborted", "TimedOut" => "TimedOut", _ => "other" });
+        if let Some(record) = self.webmcp.trace_fetch.get_mut(&frame).filter(|record| record.get("pauseSequence").and_then(Value::as_u64) == Some(sequence)) { record["decision"] = json!(decision); record["errorReason"] = json!(reason); record["decisionSequence"] = json!(self.webmcp.trace_sequence); }
+    }
+
+    fn webmcp_trace_page(&self, session: &str) -> &'static str {
+        let mut root = session;
+        let mut visited = BTreeSet::new();
+        while let Some(parent) = self.webmcp.parents.get(root) {
+            if !visited.insert(root) { return "unknown"; }
+            root = parent;
+        }
+        let url = self.session_target(root).and_then(|target| self.documents.get(&target)).map(|document| document.url.as_str()).unwrap_or("");
+        match url::Url::parse(url).ok().map(|url| url.path().to_string()).as_deref() { Some("/frames") => "frames", Some("/ordinary-frames") => "ordinary-frames", Some(_) => "other", None => "unknown" }
+    }
+
     fn webmcp_trace_navigation(&mut self, session: &str, frame: &Value) {
+        if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() != Some("1") { return; }
         let sequence = self.webmcp.trace_sequence;
+        let page = self.webmcp_trace_page(session);
         let target = self.session_target(session).unwrap_or_default();
         let kind = self.targets.get(&target).and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or("");
         let kind = match kind { "page" => "page", "iframe" => "iframe", "worker" => "worker", "" => "unknown", _ => "other" };
@@ -570,21 +593,36 @@ impl Cdp {
         let current = tree.as_ref().and_then(|tree| tree.get("frameTree")).and_then(|node| Self::webmcp_frame(node, id));
         let current_metadata = current.map(|current| self.webmcp_trace_frame(current));
         let loader_equal = current.map(|current| current.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()) == frame.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()));
-        let trace = json!({"event":"guard-navigation-trace","sequence":sequence,"targetType":kind,"eventFrame":self.webmcp_trace_frame(frame),"guardTreeAvailable":tree.is_some(),"frameInGuardTree":current.is_some(),"guardFrame":current_metadata,"loaderEqual":loader_equal,"frameEpochStable":epoch == self.frame_epoch,"lifecycleBefore":before,"lifecycleAfter":self.webmcp_trace_order(&target),"probeEndSequence":self.webmcp.trace_sequence});
+        let trace = json!({"event":"guard-navigation-trace","sequence":sequence,"targetType":kind,"eventFrame":self.webmcp_trace_frame(frame),"guardTreeAvailable":tree.is_some(),"frameInGuardTree":current.is_some(),"guardFrame":current_metadata,"loaderEqual":loader_equal,"frameEpochStable":epoch == self.frame_epoch,"lifecycleBefore":before,"lifecycleAfter":self.webmcp_trace_order(&target),"probeEndSequence":self.webmcp.trace_sequence,"documentFetch":self.webmcp.trace_fetch.get(id),"page":page,"pageAfter":self.webmcp_trace_page(session),"unreachableProtected":frame.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty() && self.guard.url(url)),"targetURLProtected":self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.url(url))});
         self.notices.push(format!("webmcp-polyfill: {trace}\n"));
     }
 
-    pub(super) fn webmcp_event(&mut self, value: &Value) -> bool {
+    fn webmcp_trace_event(&mut self, value: &Value) {
+        if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() != Some("1") { return; }
         self.webmcp.trace_sequence += 1;
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         let lifecycle = match method { "Target.attachedToTarget" => Some("attachedToTarget"), "Target.detachedFromTarget" => Some("detachedFromTarget"), "Target.targetInfoChanged" => Some("targetInfoChanged"), _ => None };
+        if method == "Fetch.requestPaused" && value.pointer("/params/resourceType").and_then(Value::as_str) == Some("Document") {
+            if let (Some(request), Some(frame)) = (value.pointer("/params/requestId").and_then(Value::as_str), value.pointer("/params/frameId").and_then(Value::as_str)) {
+                if self.webmcp.trace_requests.len() >= 1024 || self.webmcp.trace_fetch.len() >= 1024 { self.webmcp.trace_requests.clear(); self.webmcp.trace_fetch.clear(); }
+                self.webmcp.trace_requests.insert((session.to_string(), request.to_string()), (frame.to_string(), self.webmcp.trace_sequence));
+                let protected = value.pointer("/params/request/url").and_then(Value::as_str).is_some_and(|url| self.guard.url(url));
+                self.webmcp.trace_fetch.insert(frame.to_string(), json!({"pauseSequence":self.webmcp.trace_sequence,"decision":"pending","destinationProtected":protected,"guardSession":self.guard_sessions.contains(session)}));
+            }
+        }
         if let Some(lifecycle) = lifecycle {
             let target = value.pointer("/params/targetInfo/targetId").or_else(|| value.pointer("/params/targetId")).and_then(Value::as_str).map(str::to_string)
                 .or_else(|| value.pointer("/params/sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session))).unwrap_or_default();
             if self.webmcp.trace_lifecycle.len() >= 1024 { self.webmcp.trace_lifecycle.clear(); }
             self.webmcp.trace_lifecycle.insert((target, lifecycle), self.webmcp.trace_sequence);
         }
+    }
+
+    pub(super) fn webmcp_event(&mut self, value: &Value) -> bool {
+        self.webmcp_trace_event(value);
+        let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "Target.attachedToTarget" && self.webmcp.arms.contains_key(session) {
             self.webmcp_gate_event(value);
             return true;

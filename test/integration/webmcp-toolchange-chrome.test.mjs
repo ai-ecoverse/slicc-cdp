@@ -25,7 +25,7 @@ function environment(cwd) {
 function stream(endpoint, cwd, args) {
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
-    env: environment(cwd),
+    env: { ...environment(cwd), SLICC_WEBMCP_TRACE: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let pending = '';

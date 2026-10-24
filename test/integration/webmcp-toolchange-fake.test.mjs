@@ -24,7 +24,7 @@ function environment(cwd) {
 function holder(endpoint, cwd, args = ['webmcp-polyfill', '--tab', 'TAB', '--reload']) {
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
-    env: environment(cwd),
+    env: { ...environment(cwd), SLICC_WEBMCP_TRACE: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -702,6 +702,19 @@ await test('fake: refused navigation traces contain only sanitized frame evidenc
         held.child.stderr.on('data', check);
         check();
       });
+      const guard = [...backend.sessions.keys()].find(
+        (session) => backend.sessions.get(session) === 'CROSS' && !backend.scripts.has(session)
+      );
+      backend.inject({
+        method: 'Fetch.requestPaused',
+        sessionId: guard,
+        params: {
+          requestId: 'PRIVATE-REQUEST',
+          frameId: page.id,
+          resourceType: 'Document',
+          request: { url: `${page.origin}/private`, method: 'GET', headers: {} },
+        },
+      });
       backend.inject({
         method: 'Target.targetInfoChanged',
         sessionId: peer,
@@ -735,6 +748,12 @@ await test('fake: refused navigation traces contain only sanitized frame evidenc
       assert.equal(reported.guardFrame.scheme, 'https');
       assert.equal(reported.loaderEqual, true);
       assert.equal(reported.targetType, 'iframe');
+      assert.equal(reported.documentFetch.decision, 'continue');
+      assert.equal(reported.documentFetch.errorReason, null);
+      assert.equal(reported.documentFetch.destinationProtected, false);
+      assert.equal(reported.unreachableProtected, false);
+      assert.ok(reported.documentFetch.pauseSequence <= reported.documentFetch.decisionSequence);
+      assert.equal(JSON.stringify(reported).includes('PRIVATE-REQUEST'), false);
       assert.ok(reported.lifecycleBefore.attachedToTarget < reported.sequence);
       assert.ok(reported.lifecycleBefore.targetInfoChanged < reported.sequence);
       assert.equal(JSON.stringify(reported).includes('private'), false);
