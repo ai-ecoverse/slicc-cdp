@@ -105,6 +105,11 @@ for (const reply of ['value', 'exception', 'error']) {
         if (message.method !== 'Runtime.evaluate' || message.params.expression !== 'lateMarker')
           return false;
         page.childFrames.push({ frame: frame('LATE', protectedOrigin, 'P') });
+        send({
+          method: 'Page.frameAttached',
+          sessionId: message.sessionId,
+          params: { frameId: 'LATE', parentFrameId: 'P' },
+        });
         if (reply === 'error') {
           send({ id: message.id, error: { code: -32000, message: 'runtime marker' } });
           return true;

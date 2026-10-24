@@ -247,6 +247,11 @@ impl Cdp {
             if let Some(page) = info.and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).and_then(|parent| self.page_scope_owner(parent)) { pages.insert(page); }
         } else { return }
         if pages.is_empty() { self.page_scope_unknown += 1; }
-        for page in pages { *self.page_scope_epochs.entry(page).or_default() += 1; }
+        for page in pages {
+            let frame = params.pointer("/frame/id").or_else(|| params.get("frameId")).and_then(Value::as_str);
+            let main_navigation = matches!(method, "Page.frameNavigated" | "Page.navigatedWithinDocument") && self.documents.get(&page).is_some_and(|doc| frame == Some(doc.frame_id.as_str()));
+            if !main_navigation { *self.runtime_scope_epochs.entry(page.clone()).or_default() += 1; }
+            *self.page_scope_epochs.entry(page).or_default() += 1;
+        }
     }
 }

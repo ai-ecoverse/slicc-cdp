@@ -57,6 +57,7 @@ struct DocumentState {
     scope: Option<String>,
     epoch: u64,
     page_scope: Option<(String, u64, u64)>,
+    runtime_scope_epoch: Option<u64>,
 }
 
 impl PartialEq for DocumentState {
@@ -121,6 +122,8 @@ pub struct Cdp {
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
     checking_page_events: bool,
+    pending_page_events: VecDeque<Value>,
+    runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
     page_scope_epochs: BTreeMap<String, u64>,
     page_scope_unknown: u64,
@@ -208,6 +211,8 @@ impl Cdp {
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
             checking_page_events: false,
+            pending_page_events: VecDeque::new(),
+            runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
             page_scope_epochs: BTreeMap::new(),
             page_scope_unknown: 0,
@@ -830,6 +835,7 @@ impl Cdp {
                     }
                 }
                 state.page_scope = if runtime { Some(self.verify_page_scope(Some(session))?) } else { page_scope };
+                state.runtime_scope_epoch = state.page_scope.as_ref().filter(|_| runtime).map(|proof| self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0));
                 checks.push((target, state));
             }
         }
@@ -942,7 +948,10 @@ impl Cdp {
         for (_, state) in checks {
             if let Some(proof) = &state.page_scope {
                 let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
-                if self.verify_page_scope(Some(&session))?.0 != proof.0 { return Err(self.refusal()) }
+                if self.session_target(&session).as_deref() != Some(&proof.0) { return Err(self.refusal()) }
+                if self.page_scope_unknown != proof.2 || state.runtime_scope_epoch != Some(self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0)) {
+                    if self.verify_page_scope(Some(&session))?.0 != proof.0 { return Err(self.refusal()) }
+                }
             }
         }
         let sealed = checks.iter().any(|(target, state)| {
@@ -1710,7 +1719,7 @@ impl Cdp {
             }
         }
         let scope = if parent.is_some() && scope == Some("") { frame.get("id").and_then(Value::as_str) } else { scope };
-        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch, page_scope:None };
+        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch, page_scope:None, runtime_scope_epoch:None };
         if content { self.cached_documents.insert(target.to_string(), state.clone()); }
         Some(state)
     }
@@ -2711,7 +2720,14 @@ impl Cdp {
         true
     }
 
-    fn deliver(&mut self, mut value: Value) {
+    fn deliver(&mut self, value: Value) {
+        self.deliver_event(value);
+        if !self.checking_page_events {
+            while let Some(event) = self.pending_page_events.pop_front() { self.deliver_event(event); }
+        }
+    }
+
+    fn deliver_event(&mut self, mut value: Value) {
         self.watch(&mut value);
         if value.get("method").and_then(Value::as_str) == Some("Page.screencastFrame") {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) {
@@ -2721,7 +2737,8 @@ impl Cdp {
         }
         if value.get("method").and_then(Value::as_str).is_some_and(page_scope::content_event) {
             let session = value.get("sessionId").and_then(Value::as_str);
-            if self.checking_page_events || session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
+            if session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
+            if self.checking_page_events { self.pending_page_events.push_back(value); return }
             self.checking_page_events = true;
             let verified = self.verify_page_scope(session).is_ok();
             self.checking_page_events = false;

@@ -69,6 +69,26 @@ test('Chrome: Runtime page scope with a preloaded remote frame', { timeout: 1200
         targetId,
         flatten: true,
       });
+      if (!locked) {
+        await client.send('Runtime.enable', {}, sessionId);
+        const from = client.events.length;
+        await client.send(
+          'Runtime.evaluate',
+          {
+            expression:
+              "(() => { for (let index = 0; index < 20; index++) console.log('ordinary-message-' + index); return document.title; })()",
+            returnByValue: true,
+          },
+          sessionId
+        );
+        assert.deepEqual(
+          client.events
+            .slice(from)
+            .filter((event) => event.method === 'Runtime.consoleAPICalled')
+            .map((event) => event.params.args[0].value),
+          Array.from({ length: 20 }, (_, index) => `ordinary-message-${index}`)
+        );
+      }
       const methods = [
         ['Runtime.evaluate', { expression: 'document.title', returnByValue: true }],
         [

@@ -57,6 +57,7 @@ export const CHROME_FILES = new Set(
     'redirect-navigation',
     'redirect-protected',
     'redirect-userinfo',
+    'runtime-page-scope-chrome',
     'session',
     'sliccy-browser',
     'snapshot-golden',
