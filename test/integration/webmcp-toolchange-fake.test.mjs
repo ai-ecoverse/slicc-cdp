@@ -85,6 +85,58 @@ const changed = (frameId) => (value) =>
   value.event === 'tools-changed' && value.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
+function pauseBlank(backend, frameId) {
+  const peer = [...backend.scripts.keys()].find(
+    (session) => backend.sessions.get(session) === 'TAB'
+  );
+  const frame = backend.pages.get(frameId);
+  frame.blank = true;
+  frame.loader = `PENDING-${frameId}`;
+  backend.inject({
+    method: 'Page.frameNavigated',
+    sessionId: peer,
+    params: {
+      frame: {
+        id: frame.id,
+        parentId: 'TAB',
+        loaderId: frame.loader,
+        url: 'about:blank',
+        securityOrigin: frame.origin,
+      },
+    },
+  });
+  backend.inject({
+    method: 'Runtime.executionContextCreated',
+    sessionId: peer,
+    params: {
+      context: {
+        id: frame.main,
+        uniqueId: `main-${frame.loader}`,
+        origin: frame.origin,
+        auxData: { frameId: frame.id, isDefault: true },
+      },
+    },
+  });
+  backend.inject({
+    method: 'Debugger.scriptParsed',
+    sessionId: peer,
+    params: { scriptId: `${peer}-${frameId}`, executionContextId: frame.main },
+  });
+  backend.inject({
+    method: 'Debugger.paused',
+    sessionId: peer,
+    params: {
+      callFrames: [
+        {
+          callFrameId: `${peer}-${frameId}`,
+          functionName: '__slicc_webmcp_gate',
+          location: { scriptId: `${peer}-${frameId}`, lineNumber: 0, columnNumber: 0 },
+        },
+      ],
+    },
+  });
+}
+
 async function scenario(options, check, args) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-'));
   const backend = await webmcpBackend(options);
@@ -439,56 +491,8 @@ await test('fake: an OOPIF attachment received inside blank-frame rearm waits fo
       ],
     },
     async ({ backend, cwd, held }) => {
-      const peer = [...backend.scripts.keys()].find(
-        (session) => backend.sessions.get(session) === 'TAB'
-      );
-      const blank = backend.pages.get('BLANK');
-      blank.blank = true;
-      blank.loader = 'PENDING-BLANK';
       backend.pages.get('CROSS').blank = true;
-      backend.inject({
-        method: 'Page.frameNavigated',
-        sessionId: peer,
-        params: {
-          frame: {
-            id: blank.id,
-            parentId: 'TAB',
-            loaderId: blank.loader,
-            url: 'about:blank',
-            securityOrigin: blank.origin,
-          },
-        },
-      });
-      backend.inject({
-        method: 'Runtime.executionContextCreated',
-        sessionId: peer,
-        params: {
-          context: {
-            id: blank.main,
-            uniqueId: `main-${blank.loader}`,
-            origin: blank.origin,
-            auxData: { frameId: blank.id, isDefault: true },
-          },
-        },
-      });
-      backend.inject({
-        method: 'Debugger.scriptParsed',
-        sessionId: peer,
-        params: { scriptId: `${peer}-BLANK`, executionContextId: blank.main },
-      });
-      backend.inject({
-        method: 'Debugger.paused',
-        sessionId: peer,
-        params: {
-          callFrames: [
-            {
-              callFrameId: `${peer}-BLANK`,
-              functionName: '__slicc_webmcp_gate',
-              location: { scriptId: `${peer}-BLANK`, lineNumber: 0, columnNumber: 0 },
-            },
-          ],
-        },
-      });
+      pauseBlank(backend, 'BLANK');
       await held
         .next(
           (line) => line.event === 'tools-changed' && line.frameId === 'CROSS',
@@ -513,6 +517,54 @@ await test('fake: an OOPIF attachment received inside blank-frame rearm waits fo
         ['resumed']
       );
       assert.doesNotMatch(held.stderr(), /child refused|target closed/);
+    }
+  );
+});
+
+await test('fake: frame churn during blank-frame rearm preserves the holder and its next document installer', async () => {
+  let rearming = false;
+  let raced = false;
+  let backend;
+  await scenario(
+    {
+      children: [{ id: 'BLANK', origin: 'https://ordinary.test', allow: 'tools *' }],
+      onCommand(message, _pages, send) {
+        if (message.method === 'Page.removeScriptToEvaluateOnNewDocument') rearming = true;
+        if (rearming && !raced && message.method === 'Page.getFrameTree') {
+          raced = true;
+          send({
+            method: 'Page.frameDetached',
+            params: { frameId: 'SWAPPED', reason: 'swap' },
+            sessionId: message.sessionId,
+          });
+        }
+        if (
+          rearming &&
+          message.method === 'Page.addScriptToEvaluateOnNewDocument' &&
+          !message.params.runImmediately
+        )
+          backend.page.document.modelContext.registerTool({
+            name: 'recovered',
+            execute: () => 'recovered',
+          });
+      },
+    },
+    async (context) => {
+      backend = context.backend;
+      const { held } = context;
+      const from = held.lines.length;
+      pauseBlank(backend, 'BLANK');
+      assert.deepEqual(names(await held.next(changed('TAB'), from)), ['recovered']);
+      assert.equal(raced, true);
+      const generation = held.lines.length;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', generation);
+      const changedFrom = held.lines.length;
+      backend.pages
+        .get('BLANK')
+        .document.modelContext.registerTool({ name: 'next_child', execute: () => 'next_child' });
+      assert.deepEqual(names(await held.next(changed('BLANK'), changedFrom)), ['next_child']);
+      assert.doesNotMatch(held.stderr(), /refused|target closed/);
     }
   );
 });

@@ -44,15 +44,23 @@ function stream(endpoint, cwd, args) {
   child.stderr.on('data', (bytes) => {
     stderr += bytes;
   });
-  const ended = new Promise((resolve) => child.once('close', (code) => resolve(code)));
+  let closed = false;
+  const ended = new Promise((resolve) =>
+    child.once('close', (code) => {
+      closed = true;
+      resolve(code);
+      for (const waiter of [...waiters]) waiter();
+    })
+  );
   const next = (predicate, from, timeout = 20000) =>
     new Promise((resolve, reject) => {
       const check = () => {
         const found = lines.slice(from).find(predicate);
-        if (!found) return;
+        if (!found && !closed) return;
         clearTimeout(timer);
         waiters.delete(check);
-        resolve(found);
+        if (found) resolve(found);
+        else reject(new Error(`holder exited before event: ${JSON.stringify(lines)} ${stderr}`));
       };
       const timer = setTimeout(() => {
         waiters.delete(check);
@@ -86,8 +94,11 @@ async function navigate(raw, session, url) {
     (event) => event.method === 'Page.loadEventFired' && event.sessionId === session,
     15000
   );
-  await raw.send('Page.navigate', { url }, session);
-  await loaded;
+  await Promise.all([raw.send('Page.navigate', { url }, session), loaded]).catch((error) => {
+    throw new Error(`Page.loadEventFired did not arrive for ${new URL(url).pathname}`, {
+      cause: error,
+    });
+  });
 }
 
 async function evaluate(raw, session, expression) {
@@ -220,8 +231,10 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       (line) => line.event === 'document-ready' && line.loaderId !== ready.loaderId,
       navigated
     );
-    await navigate(raw, sessionId, `${ordinary}/frames`);
-    const document = await framesReady;
+    const [, document] = await Promise.all([
+      navigate(raw, sessionId, `${ordinary}/frames`),
+      framesReady,
+    ]);
     await sleep(1500);
     assert.equal(
       held.lines
@@ -325,8 +338,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       (line) => line.event === 'document-ready' && line.loaderId !== document.loaderId,
       held.lines.length
     );
-    await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    await ordinaryReady;
+    await Promise.all([navigate(raw, sessionId, `${ordinary}/ordinary-frames`), ordinaryReady]);
     const navigatedCross = await crossControl([cross.targetId]);
     assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
     assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);

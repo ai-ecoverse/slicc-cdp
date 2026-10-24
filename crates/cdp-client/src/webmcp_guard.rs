@@ -332,7 +332,11 @@ impl Cdp {
         if !admitted {
             let removable = self.webmcp.arms.get(session).is_some_and(|arm| arm.identifier.is_some());
             self.webmcp_revoke(session);
-            if removable { let _ = self.webmcp_rearm_blank_child(session, value, deadline); }
+            let rearmed = if removable { self.webmcp_rearm_blank_child(session, value, deadline) } else { Err(self.refusal()) };
+            if let Err(message) = rearmed {
+                let stage = message.strip_prefix("slicc: refused: WebMCP blank-frame rearm ").map(str::trim).unwrap_or("unverified gate");
+                self.notices.push(format!("webmcp-polyfill: document gate refused; blank-frame rearm {stage}\n"));
+            }
         }
         let resumed = self.raw_call("Debugger.resume", json!({}), Some(session), Duration::from_secs(2));
         if resumed.is_err() {
@@ -394,26 +398,39 @@ impl Cdp {
     }
 
     fn webmcp_rearm_blank_child(&mut self, session: &str, paused: &Value, deadline: Instant) -> Result<(), String> {
+        loop {
+            let epoch = self.frame_epoch;
+            let result = self.webmcp_rearm_blank_child_once(session, paused, deadline);
+            if result.as_ref().is_err_and(|message| epoch != self.frame_epoch && !transport_error(message)) && Instant::now() < deadline && !self.content_blocked(session) { continue; }
+            return result;
+        }
+    }
+
+    fn webmcp_rearm_blank_child_once(&mut self, session: &str, paused: &Value, deadline: Instant) -> Result<(), String> {
         if self.content_blocked(session) || self.webmcp.quarantined.contains(session) { return Err(self.refusal()); }
         let call = paused.pointer("/params/callFrames/0").ok_or_else(|| self.refusal())?;
         if call.get("functionName").and_then(Value::as_str) != Some(GATE) { return Err(self.refusal()); }
         let script = call.pointer("/location/scriptId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
         let id = *self.webmcp.scripts.get(&(session.to_string(), script.to_string())).ok_or_else(|| self.refusal())?;
-        let context = self.webmcp.contexts.get(&(session.to_string(), id)).cloned().ok_or_else(|| self.refusal())?;
+        let context = self.webmcp.contexts.get(&(session.to_string(), id)).cloned().ok_or_else(|| "slicc: refused: WebMCP blank-frame rearm lost context\n".to_string())?;
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
         let epoch = self.frame_epoch;
         let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()))?;
         let top = &tree["frameTree"]["frame"];
-        let child = Self::webmcp_frame(&tree["frameTree"], &context.frame).ok_or_else(|| self.refusal())?;
+        let child = Self::webmcp_frame(&tree["frameTree"], &context.frame).ok_or_else(|| "slicc: refused: WebMCP blank-frame rearm lost child frame\n".to_string())?;
         let arm = self.webmcp.arms.get(session).ok_or_else(|| self.refusal())?;
-        if epoch != self.frame_epoch || Instant::now() >= deadline || !self.webmcp_tree_verified(&tree, None)
-            || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed)
-            || child.get("url").and_then(Value::as_str) != Some("about:blank") || child.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty())
+        if epoch != self.frame_epoch || Instant::now() >= deadline { return Err("slicc: refused: WebMCP blank-frame rearm changed frame epoch\n".into()); }
+        if !self.webmcp_tree_verified(&tree, None) || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed) {
+            return Err("slicc: refused: WebMCP blank-frame rearm unverified parent document\n".into());
+        }
+        if child.get("url").and_then(Value::as_str) != Some("about:blank") || child.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty())
             || child.get("parentId") != top.get("id") || child.get("securityOrigin") != top.get("securityOrigin")
-            || child.get("securityOrigin").and_then(Value::as_str) != Some(&context.origin) || context.unique.is_empty()
-            || !arm.accepted.iter().any(|(frame, loader, _)| Some(frame.as_str()) == top.get("id").and_then(Value::as_str) && Some(loader.as_str()) == top.get("loaderId").and_then(Value::as_str)) {
-            return Err(self.refusal());
+            || child.get("securityOrigin").and_then(Value::as_str) != Some(&context.origin) || context.unique.is_empty() {
+            return Err("slicc: refused: WebMCP blank-frame rearm unverified child document\n".into());
+        }
+        if !arm.accepted.iter().any(|(frame, loader, _)| Some(frame.as_str()) == top.get("id").and_then(Value::as_str) && Some(loader.as_str()) == top.get("loaderId").and_then(Value::as_str)) {
+            return Err("slicc: refused: WebMCP blank-frame rearm parent gate not admitted\n".into());
         }
         let source = arm.source.clone();
         let result = self.raw_call("Page.addScriptToEvaluateOnNewDocument", json!({"source":source,"runImmediately":false}), Some(session), deadline.saturating_duration_since(Instant::now()))?;
