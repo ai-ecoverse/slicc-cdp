@@ -360,10 +360,16 @@ fn allowed_document_and_frame_changes_keep_content_responses() {
                 backend.borrow_mut().attach_event = Some(json!({"method":"Page.frameAttached","sessionId":guard,"params":{"frameId":"CHILD","parentFrameId":"F"}}));
             }
             backend.borrow_mut().next_tree = Some(next);
-            if notify { cdp.notify("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap(); } else {
-                assert_eq!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap()["result"]["value"], "document-value");
+            if shape == "iframe-error" {
+                if notify { refused(cdp.notify("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).map(|_| json!({}))); }
+                else { refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session))); }
+                refused(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)));
+            } else {
+                if notify { cdp.notify("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap(); } else {
+                    assert_eq!(cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap()["result"]["value"], "document-value");
+                }
+                cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
             }
-            cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
         }
     }
 }
@@ -723,7 +729,7 @@ fn initial_private_context_identity_survives_withheld_runtime_events() {
 }
 
 #[test]
-fn a_paused_document_uses_only_an_already_verified_runtime_identity() {
+fn a_paused_document_keeps_its_runtime_identity_and_rechecks_page_scope() {
     let (mut cdp, backend) = fixture();
     let session = attach(&mut cdp, "T");
     backend.borrow_mut().inbox.push_back(json!({"method":"Fetch.requestPaused","sessionId":session,"params":{"requestId":"PAUSE","resourceType":"Document","request":{"url":"https://ordinary.example/next","method":"GET"},"frameId":"F"}}).to_string());
@@ -731,7 +737,8 @@ fn a_paused_document_uses_only_an_already_verified_runtime_identity() {
     let from = backend.borrow().calls.len();
     cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session)).unwrap();
     let backend = backend.borrow();
-    assert!(!backend.calls[from..].iter().any(|call| matches!(call["method"].as_str(), Some("Page.getFrameTree" | "Runtime.enable" | "Runtime.disable"))));
+    assert!(backend.calls[from..].iter().any(|call| call["method"] == "Page.getFrameTree"));
+    assert!(!backend.calls[from..].iter().any(|call| matches!(call["method"].as_str(), Some("Runtime.enable" | "Runtime.disable"))));
 }
 
 #[test]
@@ -848,7 +855,8 @@ fn evaluation_replies_are_refused_when_a_protected_error_document_commits_in_fli
         let error = error_tree(unreachable);
         backend.borrow_mut().attach_event = Some(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":error["frameTree"]["frame"]}}));
         backend.borrow_mut().next_tree = Some(error);
-        backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":unreachable}));
+        backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":"https://ordinary.example/"}));
+        backend.borrow_mut().next_worker_url = Some(unreachable.to_string());
         let result = cdp.call("Runtime.evaluate", json!({"expression":"location.href"}), Some(&session));
         assert!(backend.borrow().calls.iter().any(|call| call["method"] == "Runtime.evaluate" && call["params"]["expression"] == "location.href"));
         let next = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));

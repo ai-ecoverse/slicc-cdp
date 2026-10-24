@@ -779,7 +779,8 @@ impl Cdp {
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
-        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope(session)?) } else { None };
+        let runtime = method.starts_with("Runtime.");
+        let page_scope = if page_scope::content(method) && !runtime { Some(self.verify_page_scope(session)?) } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -810,7 +811,7 @@ impl Cdp {
                         self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
                     })
                 });
-                let scope = if crosses_frames(method, params) || page_scope::content(method) { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
+                let scope = if crosses_frames(method, params) || page_scope::content(method) && !runtime { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
                 let mut state = if self.document_paused(&target) {
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
@@ -828,7 +829,7 @@ impl Cdp {
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
-                state.page_scope = page_scope;
+                state.page_scope = if runtime { Some(self.verify_page_scope(Some(session))?) } else { page_scope };
                 checks.push((target, state));
             }
         }
@@ -927,7 +928,7 @@ impl Cdp {
     fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool, stable_page: bool) -> Result<(), String> {
         for (target, expected) in checks {
             if let Some(proof) = &expected.page_scope {
-                let session = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
+                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
                 let current = self.verify_page_scope(Some(&session))?;
                 if stable_page && &current != proof { return Err(self.refusal()) }
             }
@@ -937,7 +938,13 @@ impl Cdp {
         Ok(())
     }
 
-    fn verify_execution(&self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+    fn verify_execution(&mut self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+        for (_, state) in checks {
+            if let Some(proof) = &state.page_scope {
+                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
+                if self.verify_page_scope(Some(&session))?.0 != proof.0 { return Err(self.refusal()) }
+            }
+        }
         let sealed = checks.iter().any(|(target, state)| {
             let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
             self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
@@ -2712,7 +2719,7 @@ impl Cdp {
             }
             return;
         }
-        if value.get("method").and_then(Value::as_str).is_some_and(|method| page_scope::content(method) && method != "DOM.documentUpdated") {
+        if value.get("method").and_then(Value::as_str).is_some_and(page_scope::content_event) {
             let session = value.get("sessionId").and_then(Value::as_str);
             if self.checking_page_events || session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
             self.checking_page_events = true;
@@ -3875,7 +3882,10 @@ mod tests {
         impl Transport for Observed {
             fn send_text(&mut self, text: &str) -> Result<(), String> {
                 let call: Value = serde_json::from_str(text).unwrap();
-                if call["method"] == "Page.getFrameTree" {
+                if call["method"] == "Target.getTargets" {
+                    self.inbox.push_back(json!({"id":call["id"],"result":{"targetInfos":[{"targetId":"T","type":"page","url":self.frame["url"]}]}}).to_string());
+                    Ok(())
+                } else if call["method"] == "Page.getFrameTree" {
                     self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":self.frame}}}).to_string());
                     Ok(())
                 } else if call["method"] == "Runtime.enable" {

@@ -4,16 +4,24 @@ const MAX_FRAMES: usize = 4096;
 const MAX_TARGETS: usize = 256;
 
 pub(super) fn content(method: &str) -> bool {
-    ["DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
+    ["Runtime.", "DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
         || matches!(method, "Page.captureScreenshot" | "Page.printToPDF" | "Page.startScreencast")
+}
+
+pub(super) fn content_event(method: &str) -> bool {
+    content(method) && !matches!(method, "DOM.documentUpdated" | "Runtime.executionContextCreated" | "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared")
 }
 
 impl Cdp {
     pub(super) fn verify_page_scope(&mut self, session: Option<&str>) -> Result<(String, u64, u64), String> {
-        let target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
+        let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
         let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, DOCUMENT_CHECK).map_err(|_| self.refusal())?;
         let infos = listed.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.refusal())?;
-        let selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
+        let mut selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
+        if matches!(selected.get("type").and_then(Value::as_str), Some("worker" | "service_worker" | "shared_worker")) {
+            target = selected.get("openerId").and_then(Value::as_str).filter(|owner| self.guards.contains_key(*owner)).ok_or_else(|| self.refusal())?.to_string();
+            selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
+        }
         if !matches!(selected.get("type").and_then(Value::as_str), Some("page" | "iframe")) { return Err(self.refusal()) }
         let context = selected.get("browserContextId").cloned();
         let has_iframes = infos.iter().any(|info| info.get("browserContextId") == context.as_ref() && info.get("type").and_then(Value::as_str) == Some("iframe"));
