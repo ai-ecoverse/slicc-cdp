@@ -20,6 +20,7 @@ for (const protectedFrame of [false, true]) {
             securityOrigin: origin,
           },
         });
+        event('DOM.documentUpdated', {});
         event('DOM.setChildNodes', {
           parentId: 1,
           nodes: [{ nodeId: 2, nodeName: '#text', nodeValue: 'frame marker' }],
@@ -37,6 +38,10 @@ for (const protectedFrame of [false, true]) {
       const { sessionId } = await client.send('Target.attachToTarget', { targetId, flatten: true });
       const from = client.events.length;
       await client.send('Runtime.evaluate', { expression: '0' }, sessionId);
+      assert.equal(
+        client.events.slice(from).filter((event) => event.method === 'DOM.documentUpdated').length,
+        1
+      );
       assert.equal(
         client.events.slice(from).filter((event) => event.method === 'DOM.setChildNodes').length,
         protectedFrame ? 0 : 1

@@ -80,6 +80,8 @@ for (const layout of ['local', 'remote']) {
             'Input.dispatchKeyEvent',
           ])
             await client.send(method, {}, session);
+          await client.send('DOM.getDocument', { depth: -1, pierce: true }, session);
+          await client.send('DOMSnapshot.captureSnapshot', { computedStyles: [] }, session);
         } else if (attached.error) assert.match(attached.error.message, /slicc: refused:/);
         else
           await assert.rejects(

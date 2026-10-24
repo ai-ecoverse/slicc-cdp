@@ -236,20 +236,11 @@ for (const layout of ['a', 'b', 'c']) {
             );
           if (ordinaryControl) {
             assert.equal(frameAttach.error, undefined, frameAttach.error?.message);
-            await client.send(
-              'Page.captureScreenshot',
-              { format: 'png' },
-              frameAttach.result.sessionId
-            );
             await client.send('DOM.getDocument', { depth: 1 }, frameAttach.result.sessionId);
           } else if (frameAttach.error) assert.match(frameAttach.error.message, /slicc: refused:/);
           else
             await assert.rejects(
-              client.send(
-                'Page.captureScreenshot',
-                { format: 'png' },
-                frameAttach.result.sessionId
-              ),
+              client.send('DOM.getDocument', { depth: 1 }, frameAttach.result.sessionId),
               /slicc: refused:/
             );
         }

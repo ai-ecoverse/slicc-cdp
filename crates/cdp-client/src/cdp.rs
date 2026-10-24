@@ -1843,6 +1843,7 @@ impl Cdp {
         let Some(session) = session_id else {
             return Ok(true);
         };
+        self.verify_page_scope(Some(session))?;
         let tree = match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
             Ok(tree) => tree,
             Err(message) if transport_error(&message) => return Err(message),
@@ -1853,7 +1854,10 @@ impl Cdp {
 
     fn tree_node_refused(&self, node: &Value) -> bool {
         let frame = node.get("frame").unwrap_or(&Value::Null);
-        let unknown = ["id", "url", "securityOrigin"].iter().any(|key| frame.get(key).and_then(Value::as_str).is_none_or(|text| !frame_text_known(text)));
+        let unknown = ["id", "url", "securityOrigin"].iter().any(|key| {
+            let text = if *key == "securityOrigin" { self.page_scope_origin(frame).or_else(|| frame.get(*key).and_then(Value::as_str)) } else { frame.get(*key).and_then(Value::as_str) };
+            text.is_none_or(|text| !frame_text_known(text))
+        });
         unknown || self.frame_protected(frame.get("id").and_then(Value::as_str).unwrap_or(""))
             || node.get("childFrames").is_some_and(|children| children.as_array().is_none_or(|children| children.iter().any(|child| self.tree_node_refused(child))))
     }
@@ -2709,7 +2713,7 @@ impl Cdp {
             }
             return;
         }
-        if value.get("method").and_then(Value::as_str).is_some_and(page_scope::content) {
+        if value.get("method").and_then(Value::as_str).is_some_and(|method| page_scope::content(method) && method != "DOM.documentUpdated") {
             let session = value.get("sessionId").and_then(Value::as_str);
             if self.checking_page_events || session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
             self.checking_page_events = true;
