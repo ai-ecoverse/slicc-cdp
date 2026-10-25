@@ -939,12 +939,12 @@ impl Cdp {
                 };
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 if !same {
-                    let ordinary_loader_change = state.worker.is_none() && state.scope.as_deref() == Some("") && state.frames.len() == 1
+                    let ordinary_default_commit = state.worker.is_none() && state.scope.as_deref() == Some("") && state.frames.len() == 1
                         && !Worlds::selectors(params) && self.guards.get(&target) == Some(&guard)
                         && state.page_scope.as_ref().is_some_and(|proof| proof.0 == target)
                         && state.frames.iter().all(|(id, before)| current.frames.get(id).is_some_and(|after| before[0] != after[0]
-                            && before[2] == after[2] && Self::runtime_page_reusable(&current)));
-                    if attempt != 0 || !ordinary_loader_change { return Err(self.refusal()) }
+                            && Self::runtime_page_reusable(&current)));
+                    if attempt != 0 || !ordinary_default_commit { return Err(self.refusal()) }
                     *checks = self.prepare(method, params, Some(session))?;
                     state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
                     continue;
