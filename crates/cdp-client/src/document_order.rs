@@ -1,5 +1,18 @@
 use super::*;
 
+pub(super) struct ObservedDocument {
+    pub(super) frame: Value,
+    pub(super) epoch: u64,
+    pub(super) root: Option<(String, String)>,
+}
+
+fn ordinary_document(guard: &Protected, frame: &Value) -> bool {
+    ["id", "loaderId"].iter().all(|key| frame.get(*key).and_then(Value::as_str).is_some_and(frame_text_known))
+        && ["url", "securityOrigin"].iter().all(|key| frame.get(*key).and_then(Value::as_str).is_some_and(|text| frame_text_known(text) && !guard.url(text)))
+        && !guard.error_page_url(frame.get("url").and_then(Value::as_str).unwrap_or(""))
+        && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty())
+}
+
 fn document_matches(observed: &Value, fresh: &Value) -> bool {
     ["id", "parentId", "loaderId", "url", "urlFragment", "securityOrigin", "unreachableUrl"].iter().all(|key| {
         observed.get(*key).and_then(Value::as_str).unwrap_or("") == fresh.get(*key).and_then(Value::as_str).unwrap_or("")
@@ -14,16 +27,21 @@ impl Cdp {
         if self.unobserved.contains(&target) || !self.guards.contains_key(&target) { return }
         let frame = params.get("frame").cloned().unwrap_or(Value::Null);
         let id = frame.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        self.unchecked_documents.insert((target, session.to_string(), id), frame);
+        let root = self.documents.get(&target).map(|doc| doc.frame_id.clone()).or_else(|| frame.get("parentId").is_none().then(|| id.clone())).and_then(|root| {
+            let loader = if root == id { frame.get("loaderId").and_then(Value::as_str) }
+                else { self.document_versions.get(&(target.clone(), root.clone())).map(String::as_str) };
+            Some((root, loader.filter(|loader| frame_text_known(loader))?.to_string()))
+        });
+        self.unchecked_documents.insert((target, session.to_string(), id), ObservedDocument { frame, epoch:self.frame_epoch, root });
     }
 
     pub(super) fn forget_frame_order(&mut self, target: &str, session: &str, id: &str, retired: bool) {
         let guard = &self.guard;
         self.unchecked_documents.retain(|(owner, peer, frame), observed| {
             owner != target || frame != id || peer != session && (!retired
-                || ["url", "securityOrigin"].iter().any(|key| observed.get(*key).and_then(Value::as_str).is_none_or(|text| !frame_text_known(text) || guard.url(text)))
-                || guard.error_page_url(observed.get("url").and_then(Value::as_str).unwrap_or(""))
-                || observed.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty()))
+                || ["url", "securityOrigin"].iter().any(|key| observed.frame.get(*key).and_then(Value::as_str).is_none_or(|text| !frame_text_known(text) || guard.url(text)))
+                || guard.error_page_url(observed.frame.get("url").and_then(Value::as_str).unwrap_or(""))
+                || observed.frame.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty()))
         });
     }
 
@@ -57,17 +75,50 @@ impl Cdp {
             }
         }
         if self.guard_sessions.contains(session) {
+            let mut matched = BTreeMap::<String, u64>::new();
+            for ((owner, peer, id), observed) in &self.unchecked_documents {
+                if owner == &target && !self.guard_sessions.contains(peer) && frames.get(id.as_str()).is_some_and(|fresh| ordinary_document(&self.guard, fresh) && document_matches(&observed.frame, fresh)) {
+                    matched.entry(id.clone()).and_modify(|epoch| *epoch = (*epoch).max(observed.epoch)).or_insert(observed.epoch);
+                }
+            }
             let guard = &self.guard;
-            self.unchecked_documents.retain(|(owner, _, id), observed| owner != &target || frames.get(id.as_str()).is_none_or(|fresh| {
-                !document_matches(observed, fresh) || guard.error_page_url(fresh.get("url").and_then(Value::as_str).unwrap_or(""))
-                    || fresh.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty())
-            }));
+            let sessions = &self.guard_sessions;
+            let main = &tree["frameTree"]["frame"];
+            let main_id = main.get("id").and_then(Value::as_str).unwrap_or("");
+            let main_loader = main.get("loaderId").and_then(Value::as_str).unwrap_or("");
+            let main_epoch = ordinary_document(guard, main).then(|| matched.get(main_id).copied()).flatten();
+            self.unchecked_documents.retain(|(owner, peer, id), observed| {
+                if owner == &target && !frames.contains_key(id.as_str()) && ordinary_document(guard, &observed.frame)
+                    && main_epoch.is_some_and(|epoch| epoch > observed.epoch)
+                    && observed.root.as_ref().is_some_and(|(root, loader)| root == main_id && loader != main_loader) { return false }
+                owner != &target || frames.get(id.as_str()).is_none_or(|fresh| {
+                    (!document_matches(&observed.frame, fresh) && !(sessions.contains(peer) && ordinary_document(guard, &observed.frame)
+                        && matched.get(id).is_some_and(|epoch| *epoch > observed.epoch)))
+                        || guard.error_page_url(fresh.get("url").and_then(Value::as_str).unwrap_or(""))
+                        || fresh.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty())
+                })
+            });
         }
         let mut verified = self.guard_sessions.contains(session);
         for ((owner, _, id), observed) in &self.unchecked_documents {
             if owner != &target { continue }
-            let fresh = frames.get(id.as_str()).ok_or_else(|| self.refusal())?;
-            if !document_matches(observed, fresh) { return Err(self.refusal()) }
+            let Some(fresh) = frames.get(id.as_str()) else {
+                #[cfg(test)]
+                {
+                    self.runtime_probe.push(json!({"stage":"document-frame-missing","ordinary":ordinary_document(&self.guard, &observed.frame),"root_known":observed.root.is_some()}));
+                    if std::env::var_os("CI").is_some() { eprintln!("document verification missing frame: ordinary={} root_known={}", ordinary_document(&self.guard, &observed.frame), observed.root.is_some()); }
+                }
+                return Err(self.refusal());
+            };
+            if !document_matches(&observed.frame, fresh) {
+                #[cfg(test)]
+                {
+                    let fields = ["id","parentId","loaderId","url","urlFragment","securityOrigin","unreachableUrl"].iter().filter(|key| observed.frame.get(**key).and_then(Value::as_str).unwrap_or("") != fresh.get(**key).and_then(Value::as_str).unwrap_or("")).collect::<Vec<_>>();
+                    self.runtime_probe.push(json!({"stage":"document-order-mismatch","guard":self.guard_sessions.contains(session),"fields":fields}));
+                    if std::env::var_os("CI").is_some() { eprintln!("document verification mismatch: fields={fields:?}"); }
+                }
+                return Err(self.refusal());
+            }
             let text = |key| fresh.get(key).and_then(Value::as_str).unwrap_or("");
             verified &= !self.unverified_error(text("url"), text("unreachableUrl"));
         }

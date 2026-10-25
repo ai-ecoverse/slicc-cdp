@@ -156,7 +156,7 @@ pub struct Cdp {
     held: BTreeMap<String, Vec<Value>>,
     streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
     document_epochs: BTreeMap<String, u64>,
-    unchecked_documents: BTreeMap<(String, String, String), Value>,
+    unchecked_documents: BTreeMap<(String, String, String), document_order::ObservedDocument>,
     document_versions: BTreeMap<(String, String), String>,
     created_blanks: BTreeMap<String, (String, String, i64)>,
     navigated_blanks: BTreeMap<String, (String, String, String)>,
@@ -522,7 +522,12 @@ impl Cdp {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        self.call_for(method, params, session_id, Duration::from_secs(30))
+        let result = self.call_for(method, params, session_id, Duration::from_secs(30));
+        #[cfg(test)]
+        if result.is_err() && method == "Runtime.evaluate" && std::env::var_os("CI").is_some() {
+            eprintln!("document call refused: stages={:?}", self.runtime_diagnostics().iter().filter_map(|probe| probe.get("stage").and_then(Value::as_str)).collect::<Vec<_>>());
+        }
+        result
     }
 
     pub fn call_for(
