@@ -3,9 +3,20 @@ import { fakeCdp } from './fake-cdp.mjs';
 export async function webmcpWire(endpoint) {
   const peers = new Map();
   const recent = [];
+  const gates = [];
   const record = (entry) => {
+    entry.at = Date.now();
     recent.push(entry);
     if (recent.length > 120) recent.shift();
+    if (
+      entry.event ||
+      /Debugger\.(resume|evaluateOnCallFrame)|Page\.(addScript|removeScript)|Runtime\.runIfWaiting|Fetch\./.test(
+        entry.method || entry.reply
+      )
+    ) {
+      gates.push(entry);
+      if (gates.length > 160) gates.shift();
+    }
   };
   const proxy = await fakeCdp({
     intercept(message, send) {
@@ -97,6 +108,7 @@ export async function webmcpWire(endpoint) {
         method: message.method,
         session: message.sessionId,
         target: message.params?.targetId,
+        immediate: message.params?.runImmediately,
       };
       peer.commands.set(message.id, command);
       if (message.method.startsWith('Fetch.') && message.params?.requestId) {
@@ -111,6 +123,7 @@ export async function webmcpWire(endpoint) {
     url: proxy.url,
     snapshot: () => ({
       recent,
+      gates,
       pending: [...peers.values()].flatMap((peer) => [...peer.commands.values()]),
       pauses: [...peers.values()].flatMap((peer) => [...peer.pauses.values()]),
       fetches: [...peers.values()].flatMap((peer) => [...peer.fetches.values()]),

@@ -204,7 +204,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
       const ready = await held.next((line) => line.event === 'ready', 0);
       assert.equal(ready.mode, 'polyfill');
-      watcher = stream(browser.wsUrl, cwd, ['discover', '--json', '--no-probe']);
+      watcher = stream(wire.url, cwd, ['discover', '--json', '--no-probe']);
       await sleep(3000);
 
       let from = held.lines.length;
@@ -215,7 +215,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       assert.equal(added.loaderId, ready.loaderId);
       assert.deepEqual(names(added), ['initial', 'late']);
       assert.ok(added.tools.every((tool) => tool.polyfilled === true && tool.policy === 'allowed'));
-      const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+      const listed = await once(wire.url, cwd, ['webmcp-list', '--tab', targetId, '--json']);
       assert.equal(listed.code, 0, listed.stderr);
       assert.deepEqual(added.tools, JSON.parse(listed.stdout));
       const reported = await watcher.next(
@@ -292,7 +292,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
         ).sessionId;
         await evaluate(raw, crossSession, 'addCross()');
-        const crossListed = await once(browser.wsUrl, cwd, [
+        const crossListed = await once(wire.url, cwd, [
           'webmcp-list',
           '--tab',
           targetId,
@@ -331,7 +331,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           await raw.send('Target.attachToTarget', { targetId: child.targetId, flatten: true })
         ).sessionId;
         const fromOrigin = async () => {
-          const listed = await once(browser.wsUrl, cwd, [
+          const listed = await once(wire.url, cwd, [
             'webmcp-list',
             '--tab',
             targetId,
