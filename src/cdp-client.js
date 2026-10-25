@@ -80,6 +80,9 @@ export class CDPClient {
     if (this.#state !== 'connected' || !this.#ws) {
       return Promise.reject(new Error('CDP client is not connected\n'));
     }
+    if (this.#nextId >= 2 ** 30 - 1) {
+      return Promise.reject(new Error('CDP client message ID range exhausted\n'));
+    }
     const id = ++this.#nextId;
     const message = { id, method };
     if (params !== undefined) message.params = params;

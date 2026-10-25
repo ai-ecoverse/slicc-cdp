@@ -3195,6 +3195,7 @@ impl Cdp {
     }
 
     fn send(&mut self, method: &str, params: Value, session_id: Option<&str>) -> Result<i64, String> {
+        if self.next_id >= (1 << 30) - 1 { return Err("CDP client message ID range exhausted\n".into()) }
         self.webmcp_trace_fetch_command(method, &params, session_id);
         self.next_id += 1;
         let id = self.next_id;
@@ -4069,6 +4070,7 @@ mod tests {
     include!("window_test.rs");
     include!("settled_test.rs");
     include!("renderer_crash_test.rs");
+    include!("client_id_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
