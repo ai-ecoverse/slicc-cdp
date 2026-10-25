@@ -375,7 +375,7 @@ export async function fakeCdp({
             const committed = {
               frame: {
                 id: target?.targetId ?? 'F',
-                loaderId: `L${next}`,
+                loaderId,
                 url: params.url,
                 securityOrigin: new URL(params.url).origin,
               },
@@ -394,7 +394,7 @@ export async function fakeCdp({
               const requestId = `R${requests}`;
               event('Network.requestWillBeSent', {
                 requestId,
-                loaderId: `L${next}`,
+                loaderId,
                 documentURL: params.url,
                 request: { url: item.url, method: 'GET', headers: {} },
                 timestamp: 1,
@@ -409,7 +409,7 @@ export async function fakeCdp({
               });
               event('Network.responseReceived', {
                 requestId,
-                loaderId: `L${next}`,
+                loaderId,
                 timestamp: 1,
                 type: 'Fetch',
                 response: {
