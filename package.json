@@ -70,7 +70,7 @@
   "devDependencies": {
     "@ai-ecoverse/slicc-browsers": "1.18.14",
     "@ai-ecoverse/slicc-kernel": "1.166.5",
-    "@ai-ecoverse/slicc-shared-web": "2.12.3",
+    "@ai-ecoverse/slicc-shared-web": "2.12.4",
     "@ai-ecoverse/wasm-bash": "5.3.0-23",
     "@ai-ecoverse/wasm-coreutils": "9.12.0-15",
     "@biomejs/biome": "2.5.15",
