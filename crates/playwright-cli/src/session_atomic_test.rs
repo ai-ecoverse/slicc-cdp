@@ -8,9 +8,9 @@ fn session_atomic_publication_fake_keeps_generation_metadata_during_an_open_writ
     let observed = path.clone();
     let expected = previous.webmcp.clone();
     PRIVATE_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(move |opened| {
+        assert_eq!(load_at(&observed).webmcp, expected);
         assert_ne!(opened, observed);
         assert_eq!(fs::metadata(opened).unwrap().len(), 0);
-        assert_eq!(load_at(&observed).webmcp, expected);
         serde_json::from_str::<Value>(&fs::read_to_string(&observed).unwrap()).unwrap();
     })));
     struct Reset;

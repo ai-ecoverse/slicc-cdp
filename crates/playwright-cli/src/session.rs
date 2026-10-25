@@ -813,7 +813,7 @@ fn wasi_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String>
     let written = wasi_mode::chmod(file.as_raw_fd(), 0o600).and_then(|()| {
         #[cfg(test)]
         PRIVATE_OPEN.with(|hook| { if let Some(opened) = hook.borrow().as_ref() { opened(path); } });
-        file.write_all(body.as_bytes()).map_err(|err| format!("session: {err}\n"))
+        std::io::Write::write_all(&mut file, body.as_bytes()).map_err(|err| format!("session: {err}\n"))
     });
     drop(file);
     if written.is_err() { let _ = fs::remove_file(path); }
