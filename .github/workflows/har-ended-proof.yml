@@ -1,0 +1,25 @@
+name: HAR ended holder proof
+on:
+  push:
+    branches: [fix/619-holder-end-cleanup]
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: ai-ecoverse/slicc-shared-web/actions/development@v1
+        with:
+          rust: 'true'
+      - run: |
+          cp crates/playwright-cli/src/har.rs /tmp/har-fixed.rs
+          git show 9875a0c:crates/playwright-cli/src/har.rs > crates/playwright-cli/src/har.rs
+          cargo build --locked -j 4 -p slicc-cdp
+          if node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-name-pattern='promptly cleans' test/integration/har-live-lease.test.mjs; then exit 1; fi
+          cp /tmp/har-fixed.rs crates/playwright-cli/src/har.rs
+          cargo build --locked -j 4 -p slicc-cdp
+          cargo build --locked -j 4 --target wasm32-wasip1 -p slicc-cdp -p slicc-curlwright
+          cargo test --locked -j 4 -p slicc-cdp har_completion -- --test-threads=1
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/har-live-lease.test.mjs test/integration/har-fake.test.mjs test/integration/har-kernel-holder.test.mjs
