@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import path from 'node:path';
 import test from 'node:test';
 import { fakeCdp } from './fake-cdp.mjs';
@@ -102,34 +101,15 @@ test('a backgrounded har-start fed by a sleep loop records across bash calls unt
     );
     await new Promise((resolve) => setTimeout(resolve, 12000));
     assert.ok(!(await log()).some((event) => event.event === 'stopped'));
-    const key = createHash('sha256').update(`${cwd}\0har`).digest('hex');
-    const record = `/root/.config/slicc/playwright-cli/sessions/${key}.har.json`;
-    const decoded = (file) =>
-      runner.readFile(file).then(
-        (bytes) => new TextDecoder().decode(bytes),
-        () => 'unavailable'
-      );
-    const beforeStop = {
-      record: await decoded(record),
-      owner: await decoded(record.replace(/\.json$/, '.lock/owner')),
-      processes: await runner.processes(),
-    };
     const second = await runner.run(['bash', '-c', 'playwright-cli -s har har-stop'], cwd);
     let diagnostics = '';
     if (second.code !== 0) {
-      let pid;
-      try {
-        pid = JSON.parse(beforeStop.owner).process?.split(':')[0];
-      } catch {}
-      const process = /^\d+$/.test(pid ?? '')
+      const processes = await runner.processes();
+      const pid = processes.find((entry) => entry.argv.includes('har-start'))?.pid;
+      const process = Number.isInteger(pid)
         ? await runner.run(['bash', '-c', `cat /proc/${pid}/stat /proc/stat`], cwd)
         : undefined;
-      diagnostics = JSON.stringify({
-        beforeStop,
-        afterLog: await log(),
-        processes: await runner.processes(),
-        process,
-      });
+      diagnostics = JSON.stringify({ afterLog: await log(), processes, process });
     }
     assert.equal(second.code, 0, `${second.stderr} ${diagnostics}`);
     const stopped = JSON.parse(second.stdout.trim());

@@ -87,7 +87,9 @@ fn clear(files: &Files) {
 
 pub fn stop(invocation: &Invocation) -> Output {
     let files = match files(invocation) { Ok(files) => files, Err(message) => return Output::err(message) };
-    let Some(found) = read(&files.record) else { return Output::err(NONE) };
+    let found = read(&files.record);
+    eprintln!("HAR stop record={} state={:?} beat={:?}", files.record.display(), found.as_ref().map(|value| &value["state"]), found.as_ref().map(|value| &value["beat"]));
+    let Some(found) = found else { return Output::err(NONE) };
     if invocation.positionals.first().is_some_and(|id| found["recordingId"].as_str() != Some(id)) {
         return Output::err("stop-recording: recordingId does not belong to this session\n");
     }
