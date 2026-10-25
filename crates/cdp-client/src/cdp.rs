@@ -922,7 +922,10 @@ impl Cdp {
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
         let runtime = method.starts_with("Runtime.");
-        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope_state(session)?) } else { None };
+        let page_scope = if page_scope::content(method) {
+            Some(if method == "Runtime.evaluate" && !Worlds::selectors(params) { self.verify_runtime_page_scope_state(session)? }
+                else { self.verify_page_scope_state(session)? })
+        } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);

@@ -18,12 +18,22 @@ impl Cdp {
     }
 
     pub(super) fn verify_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state(session, false, None)
+    }
+
+    pub(super) fn verify_runtime_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state(session, true, None)
+    }
+
+    pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
         #[cfg(test)]
         self.runtime_prepare_probe("scope-selected-session", json!({"target_known":session.and_then(|session| self.session_target(session)).is_some()}));
         let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-read", json!({}));
-        let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, DOCUMENT_CHECK).map_err(|_| self.refusal())?;
+        let left = saved_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(DOCUMENT_CHECK);
+        if left.is_zero() { return Err(self.refusal()) }
+        let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, left).map_err(|_| self.refusal())?;
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-selected-presence", json!({"inventory_valid":listed.get("targetInfos").is_some_and(Value::is_array),"selected_present":listed.get("targetInfos").and_then(Value::as_array).is_some_and(|infos| infos.iter().any(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)))}));
         let infos = listed.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.refusal())?;
@@ -39,8 +49,10 @@ impl Cdp {
         let candidates: Vec<Value> = infos.iter().filter(|info| info.get("browserContextId") == context.as_ref()
             && matches!(info.get("type").and_then(Value::as_str), Some("page" | "iframe"))).cloned().collect();
         let epochs = self.page_scope_epochs.clone();
+        let runtime_epochs = self.runtime_scope_epochs.clone();
+        let guard = self.guards.get(&target).cloned();
         let unknown = self.page_scope_unknown;
-        let deadline = Instant::now() + DOCUMENT_CHECK;
+        let deadline = saved_deadline.unwrap_or_else(|| Instant::now() + DOCUMENT_CHECK);
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-completeness", json!({}));
         let (infos, mut trees) = self.page_scope_inventory(&target, selected, &candidates, deadline)?;
@@ -128,7 +140,15 @@ impl Cdp {
         let epoch = epochs.get(&page).copied().unwrap_or(0);
         #[cfg(test)]
         self.runtime_prepare_probe("scope-stability", json!({"page_epoch_stable":epoch == self.page_scope_epochs.get(&page).copied().unwrap_or(0),"frame_epoch_stable":unknown == self.page_scope_unknown}));
-        if epoch != self.page_scope_epochs.get(&page).copied().unwrap_or(0) || unknown != self.page_scope_unknown { return Err(self.refusal()) }
+        if epoch != self.page_scope_epochs.get(&page).copied().unwrap_or(0) || unknown != self.page_scope_unknown {
+            if refresh_main && target == page && session.and_then(|session| self.session_target(session)).as_deref() == Some(page.as_str())
+                && unknown == self.page_scope_unknown && runtime_epochs.get(&page).copied().unwrap_or(0) == self.runtime_scope_epochs.get(&page).copied().unwrap_or(0)
+                && guard.is_some() && guard.as_ref() == self.guards.get(&page) && !self.protected_targets.contains(&page)
+                && session.is_some_and(|session| !self.blocked.contains(session)) {
+                return self.page_scope_state(session, false, Some(deadline));
+            }
+            return Err(self.refusal());
+        }
         if !self.collect_document_frames(&tree, &mut frames, true, None) {
             #[cfg(test)]
             self.runtime_prepare_frames(&tree, &frames);
