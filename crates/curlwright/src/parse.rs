@@ -56,6 +56,9 @@ pub struct Options {
     pub version: bool,
     pub cdp: Option<String>,
     pub runtime: Option<String>,
+    pub sign_key: Option<String>,
+    pub signature_agent: Option<String>,
+    pub signature_agent_legacy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +113,9 @@ fn empty_options() -> Options {
         version: false,
         cdp: None,
         runtime: None,
+        sign_key: None,
+        signature_agent: None,
+        signature_agent_legacy: false,
     }
 }
 
@@ -181,6 +187,8 @@ fn takes_value(name: &str) -> bool {
             | "frame"
             | "cdp"
             | "runtime"
+            | "sign-key"
+            | "signature-agent"
     )
 }
 
@@ -200,6 +208,7 @@ fn is_bool(name: &str) -> bool {
             | "full-urls"
             | "help"
             | "version"
+            | "signature-agent-legacy"
     )
 }
 
@@ -337,6 +346,9 @@ fn apply_option(
         "frame" => opts.frame = Some(owned(value)),
         "cdp" => opts.cdp = Some(owned(value)),
         "runtime" => opts.runtime = Some(owned(value)),
+        "sign-key" => opts.sign_key = Some(owned(value)),
+        "signature-agent" => opts.signature_agent = Some(owned(value)),
+        "signature-agent-legacy" => opts.signature_agent_legacy = true,
         "silent" => opts.silent = true,
         "show-error" => opts.show_error = true,
         "include" => opts.include = true,

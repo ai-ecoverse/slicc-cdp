@@ -325,4 +325,16 @@ curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 
 Without `--tab` it uses the tab `playwright-cli` last selected, else the one open tab on the URL's origin.
 
+#### Web Bot Auth signing
+
+`--sign-key <file>` signs every request curlwright sends in that run, redirect hops included, with [Web Bot Auth](https://datatracker.ietf.org/doc/draft-ietf-webbotauth-httpsig-protocol/) (RFC 9421 HTTP Message Signatures). The file is an Ed25519 private JWK (`kty` `OKP`, `crv` `Ed25519`, `d`, and `x` if you like); any other key exits 2 without printing it. Each hop gets `Signature-Input` and `Signature` under the label `sig1`, covering that hop's `@authority`, with `created`, `expires` 60 seconds later, `keyid` (the key's RFC 7638 JWK thumbprint), `alg="ed25519"`, a random `nonce` and `tag="web-bot-auth"`.
+
+```
+curlwright --sign-key bot.jwk --signature-agent https://bot.example https://example.com/
+```
+
+`--signature-agent <https URL>` names your key directory: it sends `Signature-Agent: sig1="<url>"`, the dictionary form of draft -00, and covers it as `"signature-agent";key="sig1"`. Cloudflare's verifier still expects the older bare string, so `--signature-agent-legacy` sends `Signature-Agent: "<url>"` and covers `"signature-agent"`. The draft wants Signature-Agent on every signed request; leave it out only for a verifier that already holds your key. Serving the directory is up to you.
+
+Nothing is signed without `--sign-key`, and `playwright-cli` never signs: its navigations, `fetch` and `discover` probes are the user's own browser traffic. The headers ride on the page's `fetch()`, so a cross-origin server has to allow them in a CORS preflight, which the browser sends unsigned. Signing needs an absolute http(s) URL. The signer is tested against Cloudflare's published Ed25519 test vectors, the draft's Appendix E.2.
+
 Prebuilt binaries: `curl -fsSL https://get.sliccy.ai/curlwright | sh`. See [slicc-cdp](https://github.com/ai-ecoverse/slicc-cdp).

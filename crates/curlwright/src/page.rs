@@ -169,6 +169,7 @@ pub fn run_fetch(
     request: &PreparedRequest,
     context_id: Option<i64>,
     full_urls: bool,
+    signer: Option<&crate::sign::Signer>,
 ) -> Result<FetchResult, String> {
     cdp.call("Network.enable", json!({}), Some(session))?;
     let timeout = match request.timeout_ms {
@@ -195,6 +196,9 @@ pub fn run_fetch(
         let next = cdp.ordinary_redirect_target(source, &location)?;
         rewrite_redirect(&mut request, source, &next, status);
         request.url = next;
+        if let Some(signer) = signer {
+            signer.apply(&mut request)?;
+        }
         hop += 1;
     }
 }
