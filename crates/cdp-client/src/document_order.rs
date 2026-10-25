@@ -35,6 +35,12 @@ impl Cdp {
         self.unchecked_documents.insert((target, session.to_string(), id), ObservedDocument { frame, epoch:self.frame_epoch, root });
     }
 
+    pub(super) fn note_frame_removal(&mut self, target: &str, id: &str) {
+        let Some(root) = self.documents.get(target).map(|doc| doc.frame_id.clone()) else { return };
+        let Some(loader) = self.document_versions.get(&(target.to_string(), root.clone())).filter(|loader| frame_text_known(loader)).cloned() else { return };
+        self.removed_frames.insert((target.to_string(), id.to_string()), (root, loader));
+    }
+
     pub(super) fn forget_frame_order(&mut self, target: &str, session: &str, id: &str, retired: bool) {
         let guard = &self.guard;
         self.unchecked_documents.retain(|(owner, peer, frame), observed| {
@@ -87,7 +93,10 @@ impl Cdp {
             let main_id = main.get("id").and_then(Value::as_str).unwrap_or("");
             let main_loader = main.get("loaderId").and_then(Value::as_str).unwrap_or("");
             let main_epoch = ordinary_document(guard, main).then(|| matched.get(main_id).copied()).flatten();
+            let removed = &self.removed_frames;
             self.unchecked_documents.retain(|(owner, peer, id), observed| {
+                if owner == &target && !frames.contains_key(id.as_str()) && ordinary_document(guard, main) && ordinary_document(guard, &observed.frame)
+                    && removed.get(&(owner.clone(), id.clone())).is_some_and(|root| observed.root.as_ref() == Some(root) && root.0 == main_id && root.1 == main_loader) { return false }
                 if owner == &target && !frames.contains_key(id.as_str()) && ordinary_document(guard, &observed.frame)
                     && main_epoch.is_some_and(|epoch| epoch > observed.epoch)
                     && observed.root.as_ref().is_some_and(|(root, loader)| root == main_id && loader != main_loader) { return false }

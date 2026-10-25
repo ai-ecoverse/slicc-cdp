@@ -157,6 +157,7 @@ pub struct Cdp {
     streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
     document_epochs: BTreeMap<String, u64>,
     unchecked_documents: BTreeMap<(String, String, String), document_order::ObservedDocument>,
+    removed_frames: BTreeMap<(String, String), (String, String)>,
     document_versions: BTreeMap<(String, String), String>,
     created_blanks: BTreeMap<String, (String, String, i64)>,
     navigated_blanks: BTreeMap<String, (String, String, String)>,
@@ -275,6 +276,7 @@ impl Cdp {
             streams: BTreeMap::new(),
             document_epochs: BTreeMap::new(),
             unchecked_documents: BTreeMap::new(),
+            removed_frames: BTreeMap::new(),
             document_versions: BTreeMap::new(),
             created_blanks: BTreeMap::new(),
             navigated_blanks: BTreeMap::new(),
@@ -2392,10 +2394,13 @@ impl Cdp {
                 }
             } else if method == "Page.frameDetached" {
                 let id = params.get("frameId").and_then(Value::as_str).unwrap_or("").to_string();
+                if params.get("reason").and_then(Value::as_str) == Some("remove") { self.note_frame_removal(&target, &id); }
                 self.forget_frame_order(&target, session.as_deref().unwrap_or(""), &id, matches!(params.get("reason").and_then(Value::as_str), Some("remove" | "swap")));
                 if self.document_versions.remove(&(target.clone(), id)).is_some() {
                     *self.document_epochs.entry(target).or_default() += 1;
                 }
+            } else if method == "Page.frameAttached" {
+                if let Some(id) = params.get("frameId").and_then(Value::as_str) { self.removed_frames.remove(&(target, id.to_string())); }
             }
         }
         if matches!(method.as_str(), "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared") {
@@ -2612,6 +2617,7 @@ impl Cdp {
                     self.navigated_blanks.remove(target);
                     self.documents.remove(target);
                     self.unchecked_documents.retain(|(owner, _, _), _| owner != target);
+                    self.removed_frames.retain(|(owner, _), _| owner != target);
                     self.unobserved.remove(target);
                 }
             }
