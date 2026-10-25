@@ -10,7 +10,7 @@ permissions:
 jobs:
   proof:
     runs-on: cloud-run-job
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -33,7 +33,7 @@ jobs:
           cargo build --locked -j 4 --target wasm32-wasip1 -p slicc-cdp -p curlwright
           cargo test --locked -j 4 -p slicc-cdp har_lease -- --test-threads=1
           node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/har-live-lease.test.mjs test/integration/har-fake.test.mjs
-          for round in $(seq 1 20); do
+          for round in $(seq 1 100); do
             echo "Background HAR kernel lease round $round"
             node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/har-kernel-holder.test.mjs
           done
