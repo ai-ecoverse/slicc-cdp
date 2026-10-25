@@ -98,7 +98,7 @@ test('HAR stop retains traffic absorbed while finalizing another completed reque
   let inject = false;
   await harFixture(
     async ({ home, file, start, request, response, send }) => {
-      const held = await start();
+      const held = await start(['--content', 'embed']);
       const ready = await held.event('ready');
       finish = () => {
         const [record] = globSync(`${home}/**/*.har.json`);
@@ -129,7 +129,7 @@ test('HAR stop retains traffic absorbed while finalizing another completed reque
     },
     {
       intercept(message) {
-        if (inject && message.method === 'Page.getFrameTree') {
+        if (inject && message.method === 'Network.getResponseBody') {
           inject = false;
           finish();
         }
