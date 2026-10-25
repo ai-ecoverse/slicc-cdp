@@ -242,7 +242,11 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     cwd = await runner.fresh();
     const run = async (...args) => {
       const result = await runner.playwright(args, cwd);
-      assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
+      assert.equal(
+        result.code,
+        0,
+        `${args.join(' ')}: ${result.stderr} ${JSON.stringify({ lifecycle: lifecycle(), wire })}`
+      );
       return result.stdout;
     };
     const userUrl = `https://localhost:${secure.address().port}/ordinary`;

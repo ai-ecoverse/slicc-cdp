@@ -124,7 +124,7 @@
     return owner(node) ? 'frame' : run(node);
   };
   const modes = {
-    visible: () => document.visibilityState,
+    visible: () => (args.focus && !document.hasFocus() ? 'hidden' : document.visibilityState),
     arm,
     read,
     focus: near((node) => (editable(node) ? 'editable' : 'none')),

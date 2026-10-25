@@ -252,7 +252,7 @@ fn seen(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted: 
 fn visible(cdp: &mut Cdp, scope: &Scope, context: &Value, waited: Duration) -> bool {
     let deadline = Instant::now() + waited;
     loop {
-        if mode(cdp, scope, context, "visible", json!({})).as_deref() == Ok("visible") {
+        if mode(cdp, scope, context, "visible", json!({"focus": !waited.is_zero()})).as_deref() == Ok("visible") {
             return true;
         }
         if Instant::now() >= deadline {

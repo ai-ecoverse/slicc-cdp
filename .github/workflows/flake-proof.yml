@@ -1,0 +1,57 @@
+name: Flake proof
+
+on:
+  push:
+    branches: [fix/611-har-stop-headed-focus]
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: |
+          git show 8b36aaf:crates/playwright-cli/src/har.rs > crates/playwright-cli/src/har.rs
+          git show 8b36aaf:crates/playwright-cli/src/landing.rs > crates/playwright-cli/src/landing.rs
+          git show 8b36aaf:crates/playwright-cli/src/landing.js > crates/playwright-cli/src/landing.js
+          cargo build --locked -j 4 -p slicc-cdp -p curlwright
+          set +e
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-name-pattern='HAR stop retains|native: Tab waits' test/integration/har-fake.test.mjs test/integration/headed-input-fake.test.mjs
+          status=$?
+          set -e
+          test "$status" -ne 0
+          git restore crates/playwright-cli/src/har.rs crates/playwright-cli/src/landing.rs crates/playwright-cli/src/landing.js
+          cargo build --locked -j 4 -p slicc-cdp -p curlwright
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-name-pattern='HAR stop retains|native: Tab waits' test/integration/har-fake.test.mjs test/integration/headed-input-fake.test.mjs
+  repeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        file: [har-chrome, headed-input, page-scope-filtered-parent-chrome]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64
+      - run: npm run pretest
+        env:
+          CARGO_BUILD_JOBS: '4'
+      - run: |
+          for round in $(seq 1 20); do
+            echo "Proof round $round: $FILE"
+            node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-timeout=600000 "test/integration/$FILE.test.mjs"
+          done
+        env:
+          FILE: ${{ matrix.file }}
+          CI: 'true'

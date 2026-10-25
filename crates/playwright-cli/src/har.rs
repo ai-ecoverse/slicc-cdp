@@ -310,8 +310,8 @@ impl Holder {
         let mut retry = Instant::now();
         loop {
             if self.absorb(cdp)? { return Ok("closed".into()) }
-            if let Err(mpsc::TryRecvError::Disconnected) = input() { return Ok("stdin".into()) }
-            if fs::read_to_string(&self.files.stop).is_ok_and(|id| id == self.id) { return Ok("stop".into()) }
+            if let Err(mpsc::TryRecvError::Disconnected) = input() { return self.finish_capture(cdp, "stdin") }
+            if fs::read_to_string(&self.files.stop).is_ok_and(|id| id == self.id) { return self.finish_capture(cdp, "stop") }
             if beat.elapsed() >= Duration::from_secs(1) { self.beat()?; beat = Instant::now(); }
             if self.session.as_deref().is_some_and(|session| cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) {
                 if self.absorb(cdp)? { return Ok("closed".into()) }
@@ -340,6 +340,14 @@ impl Holder {
             for notice in cdp.take_notices() { eprint!("{notice}"); }
             cdp.pump(Instant::now() + Duration::from_millis(50))?;
         }
+    }
+
+    fn finish_capture(&mut self, cdp: &mut Cdp, reason: &str) -> Result<String, String> {
+        drain(cdp);
+        while self.seen < cdp.events().len() {
+            if self.absorb(cdp)? { return Ok("closed".into()) }
+        }
+        Ok(reason.into())
     }
 
     fn reattach(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str) -> Result<(), String> {
