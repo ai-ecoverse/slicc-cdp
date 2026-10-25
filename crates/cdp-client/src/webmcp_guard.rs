@@ -26,6 +26,7 @@ struct Arm {
     admitted: usize,
     revoked: bool,
     revoked_at: Option<(&'static str, u32)>,
+    revoked_reason: Option<&'static str>,
     pending_contexts: BTreeMap<i64, Instant>,
     pending_install: Option<Instant>,
     pending_frames: BTreeMap<String, (String, Instant)>,
@@ -59,6 +60,7 @@ pub(super) struct Webmcp {
     trace_lifecycle: BTreeMap<(String, &'static str), u64>,
     trace_requests: BTreeMap<(String, String), (String, u64)>,
     trace_fetch: BTreeMap<String, Value>,
+    trace_roles: BTreeMap<String, &'static str>,
 }
 
 impl Webmcp {
@@ -167,7 +169,8 @@ impl Cdp {
         let now = Instant::now();
         let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
-            self.webmcp_revoke(&session);
+            let reason = self.webmcp.arms.get(&session).map(|arm| if arm.pending_install.is_some_and(|deadline| deadline <= now) { "installer deadline" } else if arm.pending_contexts.values().any(|deadline| *deadline <= now) { "context deadline" } else { "frame deadline" }).unwrap_or("missing holder");
+            self.webmcp_revoke_because(&session, reason);
             let _ = self.send("Debugger.resume", json!({}), Some(&session));
         }
     }
@@ -185,7 +188,7 @@ impl Cdp {
         let source = format!("const {bridge} = (function {GATE}() {{ 'use strict'; let {PERMIT} = false; debugger; if (!{PERMIT}) return; return {shim}; }})();");
         let mut loaders = BTreeMap::new();
         if let Some(tree) = seed { Self::webmcp_loaders(&tree["frameTree"], &mut loaders); }
-        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, revoked_at: None, pending_contexts: BTreeMap::new(), pending_install: pending.then(|| Instant::now() + Duration::from_secs(2)), pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source: source.clone(), bridge: bridge.clone(), identifier: None, admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: pending.then(|| Instant::now() + Duration::from_secs(2)), pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
         self.raw_call("Runtime.disable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.raw_call("Runtime.enable", json!({}), Some(session), OPTIONAL_STEP)?;
         self.worlds.enable(session);
@@ -226,14 +229,34 @@ impl Cdp {
 
     #[track_caller]
     pub(super) fn webmcp_revoke(&mut self, session: &str) {
+        self.webmcp_revoke_because(session, "guard or lifecycle refusal");
+    }
+
+    #[track_caller]
+    fn webmcp_revoke_because(&mut self, session: &str, reason: &'static str) {
         let location = std::panic::Location::caller();
         if let Some(arm) = self.webmcp.arms.get_mut(session) {
-            if !arm.revoked { arm.revoked_at = Some((location.file(), location.line())); }
+            if arm.revoked_at.is_none() { arm.revoked_at = Some((location.file(), location.line())); arm.revoked_reason = Some(reason); }
             arm.revoked = true;
             if let Some(identifier) = arm.identifier.take() {
                 let _ = self.send("Page.removeScriptToEvaluateOnNewDocument", json!({"identifier":identifier}), Some(session));
             }
         }
+        self.webmcp_trace_stage(session, "revoke", reason);
+    }
+
+    pub fn webmcp_trace_result<T>(&self, session: &str, stage: &str, result: Result<T, String>) -> Result<T, String> {
+        if result.is_err() { self.webmcp_trace_stage(session, "holder-wait-refused", stage); }
+        result
+    }
+
+    pub fn webmcp_trace_stage(&self, session: &str, event: &str, reason: &str) {
+        if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() != Some("1") { return; }
+        let arm = self.webmcp.arms.get(session);
+        let location = arm.and_then(|arm| arm.revoked_at).map(|(file, line)| format!("{}:{line}", file.rsplit('/').next().unwrap_or("guard")));
+        let child = self.webmcp.parents.contains_key(session);
+        let trace = json!({"event":event,"reason":reason,"sessionRole":if child {"child"} else {"root"},"frameRole":self.webmcp.trace_roles.get(session).copied().unwrap_or(if child {"OOPIF"} else {"unknown"}),"sequence":self.webmcp.trace_sequence,"firstReason":arm.and_then(|arm| arm.revoked_reason),"firstLocation":location,"revoked":arm.is_some_and(|arm| arm.revoked),"blocked":self.blocked.contains(session),"contentBlocked":self.content_blocked(session),"pendingInstall":arm.is_some_and(|arm| arm.pending_install.is_some()),"pendingContexts":arm.map(|arm| arm.pending_contexts.len()),"pendingFrames":arm.map(|arm| arm.pending_frames.len()),"page":self.webmcp_trace_page(session)});
+        eprintln!("webmcp-polyfill: {trace}");
     }
 
     fn webmcp_frame_refusal(&self, frame: &Value) -> Option<&'static str> {
@@ -354,10 +377,11 @@ impl Cdp {
             let removable = self.webmcp.arms.get(session).is_some_and(|arm| arm.identifier.is_some());
             let previous = self.webmcp.arms.get(session).filter(|arm| arm.revoked).and_then(|arm| arm.revoked_at)
                 .map(|(file, line)| format!(" installer revoked at {}:{line};", file.rsplit('/').next().unwrap_or("guard"))).unwrap_or_default();
-            self.webmcp_revoke(session);
+            self.webmcp_revoke_because(session, "gate not admitted");
             let rearmed = if removable { self.webmcp_rearm_blank_child(session, value, deadline) } else { Err(self.refusal()) };
             if let Err(message) = rearmed {
                 let stage = message.strip_prefix("slicc: refused: WebMCP blank-frame rearm ").map(str::trim).unwrap_or("unverified gate");
+                self.webmcp_trace_stage(session, "gate-refused", stage);
                 self.notices.push(format!("webmcp-polyfill: document gate refused;{previous} blank-frame rearm {stage}\n"));
             }
         }
@@ -602,6 +626,12 @@ impl Cdp {
         self.webmcp.trace_sequence += 1;
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        if method == "Page.frameNavigated" || method == "Debugger.paused" {
+            let frame = if method == "Page.frameNavigated" { value.pointer("/params/frame/id").and_then(Value::as_str) } else { value.pointer("/params/callFrames/0/location/scriptId").and_then(Value::as_str).and_then(|script| self.webmcp.scripts.get(&(session.to_string(), script.to_string()))).and_then(|id| self.webmcp.contexts.get(&(session.to_string(), *id))).map(|context| context.frame.as_str()) };
+            let top = self.session_target(session).and_then(|target| self.documents.get(&target)).map(|doc| doc.frame_id.as_str());
+            let role = if self.webmcp.parents.contains_key(session) { "OOPIF" } else if frame.is_none() { "unknown" } else if frame == top { "top" } else { "subframe" };
+            self.webmcp.trace_roles.insert(session.to_string(), role);
+        }
         let lifecycle = match method { "Target.attachedToTarget" => Some("attachedToTarget"), "Target.detachedFromTarget" => Some("detachedFromTarget"), "Target.targetInfoChanged" => Some("targetInfoChanged"), _ => None };
         if method == "Fetch.requestPaused" && value.pointer("/params/resourceType").and_then(Value::as_str) == Some("Document") {
             if let (Some(request), Some(frame)) = (value.pointer("/params/requestId").and_then(Value::as_str), value.pointer("/params/frameId").and_then(Value::as_str)) {
@@ -655,7 +685,7 @@ impl Cdp {
                 self.webmcp_trace_navigation(session, frame);
                 let role = if self.webmcp.parents.contains_key(session) { "OOPIF" } else if frame.get("parentId").is_some() { "subframe" } else { "top frame" };
                 self.notices.push(format!("webmcp-polyfill: frame navigation refused ({role}, {reason})\n"));
-                self.webmcp_revoke(session);
+                self.webmcp_revoke_because(session, "frame navigation refused");
             }
             self.webmcp_navigated(session, value);
         }
