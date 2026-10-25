@@ -686,12 +686,11 @@ fn blank_navigation_controls_do_not_require_document_probes() {
 }
 
 #[test]
-fn pinned_ordinary_results_are_received_before_guard_requested_detachment() {
+fn pinned_replies_require_current_document_evidence() {
     let (mut cdp, backend) = fixture();
     let session = attach(&mut cdp, "T");
     backend.borrow_mut().block_during_execution = true;
-    let result = cdp.call("Runtime.evaluate", json!({"expression":"location.href"}), Some(&session)).unwrap();
-    assert_eq!(result["result"]["value"], "document-value");
+    refused(cdp.call("Runtime.evaluate", json!({"expression":"location.href"}), Some(&session)));
     assert!(cdp.session_blocked(&session));
     assert!(backend.borrow().calls.iter().any(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == session));
     let from = backend.borrow().calls.len();

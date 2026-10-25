@@ -283,6 +283,7 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-read", json!({"budget_remaining":!left.is_zero()}));
         let mut tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.refusal())?;
+        self.verify_document_order(&tree, Some(&session))?;
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-versions", json!({}));
         if self.page_scope_versions(target, &tree)? {
@@ -300,6 +301,7 @@ impl Cdp {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(self.refusal()) }
             tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.refusal())?;
+            self.verify_document_order(&tree, Some(&session))?;
         }
         Ok(tree)
     }

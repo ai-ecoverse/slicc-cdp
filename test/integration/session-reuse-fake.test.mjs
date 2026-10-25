@@ -109,12 +109,11 @@ for (const attachEvents of [false, true]) {
     await assert.rejects(attach(), /slicc: refused/);
     assert.equal(fake.calls.filter((call) => touching.has(call.method)).length, 0);
     tab.url = AFTER;
+    tab.frame = { id: 'TAB', loaderId: 'A', url: AFTER, securityOrigin: new URL(AFTER).origin };
     emit({
       method: 'Page.frameNavigated',
       sessionId: 'TAB.1',
-      params: {
-        frame: { id: 'TAB', loaderId: 'A', url: AFTER, securityOrigin: new URL(AFTER).origin },
-      },
+      params: { frame: tab.frame },
     });
     const fresh = await attach();
     assert.equal(fresh.sessionId, sessionId);

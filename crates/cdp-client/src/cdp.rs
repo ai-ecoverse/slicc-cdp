@@ -1176,6 +1176,13 @@ impl Cdp {
                 }
             }
         }
+        for (target, state) in checks {
+            let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
+            if self.unchecked_document(owner) {
+                let guard = self.guards.get(owner).cloned().ok_or_else(|| self.refusal())?;
+                self.verify_page_scope_state(Some(&guard))?;
+            }
+        }
         let sealed = checks.iter().any(|(target, state)| {
             let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
             self.unchecked_document(owner) || self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
@@ -1897,6 +1904,7 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("private-document-read", json!({}));
         let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), DOCUMENT_CHECK).ok()?;
+        if content { self.verify_document_order(&tree, Some(&guard)).ok()?; }
         #[cfg(test)]
         self.runtime_prepare_probe("private-document-stability", json!({"guard_stable":self.guards.get(target) == Some(&guard)}));
         if self.guards.get(target) != Some(&guard) { return None }
@@ -2379,6 +2387,7 @@ impl Cdp {
                 }
             } else if method == "Page.frameDetached" {
                 let id = params.get("frameId").and_then(Value::as_str).unwrap_or("").to_string();
+                self.forget_frame_order(&target, session.as_deref().unwrap_or(""), &id, matches!(params.get("reason").and_then(Value::as_str), Some("remove" | "swap")));
                 if self.document_versions.remove(&(target.clone(), id)).is_some() {
                     *self.document_epochs.entry(target).or_default() += 1;
                 }
@@ -3149,9 +3158,10 @@ impl Cdp {
         let result = self.raw_reply(method, id, session_id, timeout, pinned);
         self.waiting_calls.remove(&id);
         self.call_replies.remove(&id);
-        let result = result?;
-        if method == "Page.getFrameTree" { self.verify_document_order(&result, session_id)?; }
-        Ok(result)
+        if method == "Page.getFrameTree" && session_id.is_some_and(|session| self.guard_sessions.contains(session)) {
+            if let Ok(tree) = &result { let _ = self.verify_document_order(tree, session_id); }
+        }
+        result
     }
 
     fn raw_reply(&mut self, method: &str, id: i64, session_id: Option<&str>, timeout: Duration, pinned: bool) -> Result<Value, String> {
@@ -3322,6 +3332,7 @@ impl Cdp {
         let target = self.session_target(session);
         if self.blocked.contains(session) {
             if let Some(target) = &target { self.protected_targets.insert(target.clone()); }
+            self.unchecked_documents.retain(|(_, owner, _), _| owner != session);
         }
         let guards: Vec<String> = self.guards.iter().filter(|(_, guard)| guard.as_str() == session).map(|(target, _)| target.clone()).collect();
         self.session_targets.remove(session);

@@ -365,21 +365,20 @@ export async function fakeCdp({
         case 'Page.navigate': {
           const complete = () => {
             const loaderId = `L${++loaders}`;
+            const frame = {
+              id: target?.frame?.id ?? target?.targetId ?? 'F',
+              loaderId,
+              url: params.url,
+              securityOrigin: new URL(params.url).origin,
+            };
             if (target) {
               target.url = params.url;
               target.loaderId = loaderId;
-              delete target.frame;
+              target.frame = frame;
               delete target.history;
             }
-            answer({ frameId: target?.targetId ?? 'F', loaderId });
-            const committed = {
-              frame: {
-                id: target?.targetId ?? 'F',
-                loaderId,
-                url: params.url,
-                securityOrigin: new URL(params.url).origin,
-              },
-            };
+            answer({ frameId: frame.id, loaderId });
+            const committed = { frame };
             for (const [peer, found] of sessions)
               if (target && found === target && peer !== sessionId && paged.has(peer))
                 sessionSends.get(peer)?.({
