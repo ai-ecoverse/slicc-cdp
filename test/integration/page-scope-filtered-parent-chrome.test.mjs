@@ -224,7 +224,10 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
               type: message.params?.resourceType,
             });
             wire.push({ connection, event: message.method, session, request });
-          } else if (message.method?.startsWith('Page.frame')) {
+          } else if (
+            message.method?.startsWith('Page.frame') ||
+            message.method?.startsWith('Runtime.')
+          ) {
             wire.push({ connection, event: message.method, session });
           }
           if (wire.length > 40) wire.shift();
@@ -278,6 +281,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
           )
         ).result.value === 'visible'
     );
+    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const beforeDrag = lifecycle();
     wire.length = 0;
     const dragged = await runner.playwright(
@@ -289,7 +293,6 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       0,
       `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, afterDrag: lifecycle(), wire })}`
     );
-    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const denied = await runner.playwright(['eval', '--tab', background, 'document.title'], cwd);
     assert.notEqual(denied.code, 0);
     assert.match(denied.stderr, /refused/);

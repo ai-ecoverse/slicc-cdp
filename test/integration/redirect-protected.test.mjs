@@ -8,7 +8,7 @@ import path from 'node:path';
 import { before } from 'node:test';
 import { launchBrowser } from './browser.mjs';
 import { chromeSkipReason, chromeTest as test } from './chrome-policy.mjs';
-import { guarded } from './guard-client.mjs';
+import { guarded, observer } from './guard-client.mjs';
 
 const marker = 'P0_REDIRECT_SECRET_7F9A';
 const ordinaryMarker = 'P0_ORDINARY_CONTROL_5D2B';
@@ -120,8 +120,10 @@ for (const transport of ['native', 'wasi']) {
     const tls = createTlsServer({ key: readFileSync(key), cert: readFileSync(cert) }, handler);
     let browser;
     let client;
+    let raw;
     const cleanup = () =>
       (cleanupPromise ??= (async () => {
+        await raw?.close();
         await browser?.close();
         await client?.close();
         server.closeAllConnections();
@@ -165,6 +167,7 @@ for (const transport of ['native', 'wasi']) {
         '--ignore-certificate-errors',
         '--no-proxy-server',
       ]);
+      raw = await observer(browser.wsUrl);
       process.env.SLICC_GUARD_TRANSPORT = transport;
       client = await guarded(browser.wsUrl, 'https://fixture-protected.invalid', {
         variant: 'prompt',
@@ -355,12 +358,14 @@ for (const transport of ['native', 'wasi']) {
           await call('IO.read', { handle: loaded.resource.stream }, sessionId);
         check(loaded === null, 'loadNetworkResource must be refused');
         await client.send('Runtime.enable', {}, sessionId);
-        await client.send(
+        const rawSession = (await raw.send('Target.attachToTarget', { targetId, flatten: true }))
+          .sessionId;
+        await raw.send(
           'Runtime.evaluate',
           {
-            expression: `document.body.innerHTML='<iframe src="http://127.0.0.1:${port}/redirect?host=${host}&kind=location"></iframe>'`,
+            expression: `document.body.innerHTML='<iframe id="redirect-frame" src="http://127.0.0.1:${port}/redirect?host=${host}&kind=location"></iframe>'`,
           },
-          sessionId
+          rawSession
         );
         await delay(300);
         for (const method of [
@@ -378,6 +383,22 @@ for (const transport of ['native', 'wasi']) {
           (await call('Page.captureSnapshot', { format: 'mhtml' }, sessionId)) === null,
           'iframe captureSnapshot must be refused'
         );
+        const present = await raw.send(
+          'Runtime.evaluate',
+          { expression: "document.getElementById('redirect-frame') !== null", returnByValue: true },
+          rawSession
+        );
+        assert.equal(present.result.value, true);
+        await assert.rejects(
+          client.send('Runtime.evaluate', { expression: 'document.title' }, sessionId),
+          /slicc: refused:/
+        );
+        await raw.send(
+          'Runtime.evaluate',
+          { expression: "document.getElementById('redirect-frame').remove()" },
+          rawSession
+        );
+        await raw.send('Target.detachFromTarget', { sessionId: rawSession });
         await client.send(
           'Fetch.enable',
           { patterns: [{ urlPattern: '*', requestStage: 'Request' }] },

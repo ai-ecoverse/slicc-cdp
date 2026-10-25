@@ -807,7 +807,7 @@ impl Cdp {
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
         let runtime = method.starts_with("Runtime.");
-        let page_scope = if page_scope::content(method) && !runtime { Some(self.verify_page_scope_state(session)?) } else { None };
+        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope_state(session)?) } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -842,8 +842,8 @@ impl Cdp {
                 let mut state = if self.document_paused(&target) {
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
-                } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, _)| proof.0 == target) {
-                    state.clone()
+                } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, state)| proof.0 == target && (!runtime || Self::runtime_page_reusable(state))) {
+                    if runtime { Self::scoped_page_state(state, scope.unwrap_or("")).ok_or_else(|| self.refusal())? } else { state.clone() }
                 } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
@@ -858,13 +858,33 @@ impl Cdp {
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
-                state.page_scope = if runtime { Some(self.verify_page_scope(Some(session))?) } else { page_scope.map(|(proof, _)| proof) };
+                state.page_scope = page_scope.map(|(proof, _)| proof);
                 state.runtime_scope_epoch = state.page_scope.as_ref().filter(|_| runtime).map(|proof| self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0));
                 checks.push((target, state));
             }
         }
         if checks.is_empty() { return Err(self.refusal()) }
         Ok(checks)
+    }
+
+    fn scoped_page_state(state: &DocumentState, scope: &str) -> Option<DocumentState> {
+        let mut current = if scope.is_empty() { state.frames.iter().find(|(_, frame)| frame[4].is_empty())?.0.as_str() } else { scope };
+        let mut selected = state.clone();
+        selected.frames.clear();
+        loop {
+            let frame = state.frames.get(current)?;
+            if selected.frames.insert(current.to_string(), frame.clone()).is_some() { return None }
+            if frame[4].is_empty() { break }
+            current = &frame[4];
+        }
+        selected.scope = Some(scope.to_string());
+        Some(selected)
+    }
+
+    fn runtime_page_reusable(state: &DocumentState) -> bool {
+        state.frames.values().find(|frame| frame[4].is_empty()).is_some_and(|frame| {
+            url::Url::parse(&frame[1]).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        })
     }
 
     fn document_paused(&self, target: &str) -> bool {
@@ -961,7 +981,9 @@ impl Cdp {
                 let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
                 let (current, state) = self.verify_page_scope_state(Some(&session))?;
                 if stable_page && &current != proof { return Err(self.refusal()) }
-                (current.0 == *target && expected.runtime_scope_epoch.is_none()).then_some(state)
+                if current.0 == *target && (expected.runtime_scope_epoch.is_none() || Self::runtime_page_reusable(&state)) {
+                    Some(if expected.runtime_scope_epoch.is_some() { Self::scoped_page_state(&state, expected.scope.as_deref().unwrap_or("")).ok_or_else(|| self.refusal())? } else { state })
+                } else { None }
             } else { None };
             let current = match current {
                 Some(state) => state,
