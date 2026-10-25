@@ -16,6 +16,71 @@ const event = (kind, sessionId) =>
 const options = (transport) => ({ variant: 'prompt', detachDelay: 0, transport });
 const page = (targetId) => ({ targetId, url: `https://${targetId.toLowerCase()}.example.test/` });
 
+test('a fresh client observes the crash replayed by Inspector after the previous guard retired', async () => {
+  const guards = new Set();
+  let previous;
+  let isCrashed = false;
+  const fake = await fakeCdp({
+    intercept(message, send) {
+      if (message.method === 'Fetch.enable') guards.add(message.sessionId);
+      if (message.method === 'Fetch.disable' && guards.has(message.sessionId) && !isCrashed) {
+        previous = message.sessionId;
+        isCrashed = true;
+        send({ id: message.id, sessionId: message.sessionId, result: {} });
+        send(event('Inspector.targetCrashed', message.sessionId));
+        return true;
+      }
+      if (message.method === 'Inspector.enable' && isCrashed) {
+        send(event('Inspector.targetCrashed', message.sessionId));
+        send({ id: message.id, sessionId: message.sessionId, result: {} });
+        return true;
+      }
+      return message.method === 'Network.enable' && isCrashed;
+    },
+  });
+  fake.targets.push(page('USER'));
+  let first;
+  let second;
+  let timer;
+  const controller = new AbortController();
+  try {
+    first = await guarded(fake.url, 'https://private.test', options('native'));
+    await first.send('Target.attachToTarget', { targetId: 'USER', flatten: true });
+    await first.close();
+    first = undefined;
+    assert.ok(previous);
+    const from = fake.calls.length;
+    second = await guarded(fake.url, 'https://private.test', {
+      ...options('native'),
+      signal: controller.signal,
+    });
+    timer = setTimeout(() => controller.abort(), 8000);
+    await assert.rejects(
+      second.send('Target.attachToTarget', {
+        targetId: 'USER',
+        flatten: true,
+      }),
+      (error) => error.message === crashed
+    );
+    clearTimeout(timer);
+    const fresh = fake.calls.slice(from);
+    const inspecting = fresh.find((call) => call.method === 'Inspector.enable');
+    assert.ok(inspecting);
+    assert.notEqual(inspecting.sessionId, previous);
+    assert.equal(inspecting.target, 'USER');
+    assert.equal(
+      fresh.some((call) => call.method === 'Network.enable'),
+      false
+    );
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+    await first?.close();
+    await second?.close();
+    await fake.close();
+  }
+});
+
 for (const transport of ['native', 'wasi']) {
   for (const stage of ['Network.enable', 'Page.enable', 'Runtime.enable']) {
     test(`${transport}: renderer crash aborts guard setup at ${stage} even if a reply follows`, async () => {

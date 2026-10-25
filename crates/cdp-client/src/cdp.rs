@@ -1680,6 +1680,12 @@ impl Cdp {
         };
         self.guard_sessions.insert(session.clone());
         self.guards.insert(target_id.to_string(), session.clone());
+        let left = budget.saturating_duration_since(Instant::now());
+        let inspected = if left.is_zero() { Err("Inspector.enable timed out\n".to_string()) }
+            else { self.raw_call("Inspector.enable", json!({}), Some(&session), left) };
+        if let Err(message) = inspected {
+            return Err(self.guard_failure(target_id, &session, message));
+        }
         let setup = [
             (
                 "Fetch.enable",
@@ -1724,15 +1730,7 @@ impl Cdp {
                 Err(message) => Some(message),
             };
             if let Some(message) = failed {
-                self.guards.remove(target_id);
-                self.abandon(target_id);
-                let _ = self.raw_call(
-                    "Target.detachFromTarget",
-                    json!({ "sessionId": session }),
-                    None,
-                    Duration::from_secs(5),
-                );
-                return Err(unguarded(message));
+                return Err(self.guard_failure(target_id, &session, message));
             }
         }
         if self.documents.get(target_id).is_none_or(|doc| doc.probed) {
@@ -1752,6 +1750,13 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    fn guard_failure(&mut self, target: &str, session: &str, message: String) -> String {
+        self.guards.remove(target);
+        self.abandon(target);
+        let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session }), None, Duration::from_secs(5));
+        unguarded(message)
     }
 
     fn abandon(&mut self, target_id: &str) {
@@ -3667,7 +3672,7 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
     }
     match method {
         "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
-        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" => None,
+        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable" => None,
         "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.awaitPromise" | "Runtime.compileScript" | "Runtime.runScript"
         | "Runtime.getProperties" | "Runtime.getExceptionDetails" | "Runtime.queryObjects" | "Runtime.globalLexicalScopeNames" | "Runtime.getHeapUsage" | "Runtime.discardConsoleEntries"
         | "DOM.collectClassNamesFromSubtree" | "DOM.copyTo" | "DOM.describeNode" | "DOM.focus" | "DOM.getAttributes" | "DOM.getBoxModel" | "DOM.getContentQuads"
