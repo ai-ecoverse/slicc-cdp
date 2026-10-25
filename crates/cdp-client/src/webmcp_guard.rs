@@ -363,7 +363,31 @@ impl Cdp {
         Ok((call_id, epoch, context_id, context))
     }
 
+    fn webmcp_keep_parent_installer(&mut self, session: &str, context: &Context, id: i64, deadline: Instant) -> bool {
+        let Some(target) = self.session_target(session) else { return false; };
+        let Some(guard) = self.guards.get(&target).cloned() else { return false; };
+        if self.content_blocked(session) || self.unobserved.contains(&target) || context.frame.is_empty() || context.unique.is_empty() { return false; }
+        let epoch = self.frame_epoch;
+        let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return false; };
+        let top = &tree["frameTree"]["frame"];
+        if self.webmcp.contexts.get(&(session.to_string(), id)) == Some(context) && Self::webmcp_frame(&tree["frameTree"], &context.frame).is_some_and(|frame| frame.get("url").and_then(Value::as_str) == Some("about:blank") || !self.webmcp_frame_verified(frame)) { return false; }
+        if top.get("id").and_then(Value::as_str) == Some(&context.frame) || !self.webmcp_tree_verified(&tree, None)
+            || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed || !document.unreachable_url.is_empty()) { return false; }
+        let Some(arm) = self.webmcp.arms.get(session) else { return false; };
+        if arm.revoked || arm.identifier.is_none() || !arm.accepted.iter().any(|(frame, loader, _)| top.get("id").and_then(Value::as_str) == Some(frame) && top.get("loaderId").and_then(Value::as_str) == Some(loader)) { return false; }
+        let Ok(fresh) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return false; };
+        if epoch != self.frame_epoch || Instant::now() >= deadline || fresh["frameTree"]["frame"] != *top || !self.webmcp_tree_verified(&fresh, None)
+            || self.content_blocked(session) || self.session_target(session).as_deref() != Some(&target) || self.guards.get(&target) != Some(&guard) { return false; }
+        let Some(arm) = self.webmcp.arms.get_mut(session).filter(|arm| !arm.revoked && arm.identifier.is_some()) else { return false; };
+        arm.pending_contexts.remove(&id);
+        arm.pending_frames.remove(&context.frame);
+        arm.accepted.retain(|(frame, _, _)| frame != &context.frame);
+        arm.documents.retain(|_, document| document.get("frameId").and_then(Value::as_str) != Some(&context.frame));
+        true
+    }
+
     fn webmcp_handle_pause(&mut self, value: &Value, session: &str) {
+        let child = value.pointer("/params/callFrames/0/location/scriptId").and_then(Value::as_str).and_then(|script| self.webmcp.scripts.get(&(session.to_string(), script.to_string()))).and_then(|id| self.webmcp.contexts.get(&(session.to_string(), *id)).cloned().map(|context| (*id, context)));
         let started = Instant::now();
         self.webmcp.paused.insert(session.to_string());
         let deadline = started + Duration::from_secs(2);
@@ -373,7 +397,8 @@ impl Cdp {
             let settled = admitted || epoch == self.frame_epoch || Instant::now() >= deadline || verified.as_ref().is_err_and(|message| transport_error(message));
             if settled || self.blocked.contains(session) || self.webmcp.arms.get(session).is_none_or(|arm| arm.revoked) { break (verified, admitted); }
         };
-        if !admitted {
+        let kept = !admitted && verified.as_ref().is_err_and(|message| !transport_error(message)) && child.as_ref().is_some_and(|(id, context)| self.webmcp_keep_parent_installer(session, context, *id, deadline));
+        if !admitted && !kept {
             let removable = self.webmcp.arms.get(session).is_some_and(|arm| arm.identifier.is_some());
             let previous = self.webmcp.arms.get(session).filter(|arm| arm.revoked).and_then(|arm| arm.revoked_at)
                 .map(|(file, line)| format!(" installer revoked at {}:{line};", file.rsplit('/').next().unwrap_or("guard"))).unwrap_or_default();

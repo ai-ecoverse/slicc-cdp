@@ -154,6 +154,52 @@ async function scenario(options, check, args) {
   }
 }
 
+await test('fake: an abandoned local child gate during an ordinary process swap preserves its parent installer', async () => {
+  let armed = false;
+  let swapped = false;
+  const resumed = Promise.withResolvers();
+  await scenario(
+    {
+      children: [{ id: 'SWAP', origin: 'https://ordinary.test' }],
+      onCommand(message, pages, send) {
+        if (
+          armed &&
+          !swapped &&
+          message.method === 'Debugger.getScriptSource' &&
+          message.params.scriptId.endsWith('-SWAP')
+        ) {
+          swapped = true;
+          pages.get('SWAP').blank = false;
+          pages.get('SWAP').origin = 'https://foreign.test';
+          send({
+            method: 'Runtime.executionContextDestroyed',
+            sessionId: message.sessionId,
+            params: { executionContextId: pages.get('SWAP').main },
+          });
+          send({
+            method: 'Page.frameDetached',
+            sessionId: message.sessionId,
+            params: { frameId: 'SWAP', reason: 'swap' },
+          });
+        }
+        if (swapped && message.method === 'Debugger.resume') resumed.resolve();
+      },
+    },
+    async ({ backend, held }) => {
+      armed = true;
+      pauseBlank(backend, 'SWAP');
+      await resumed.promise;
+      assert.equal(swapped, true);
+      const from = held.lines.length;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', from);
+      backend.page.document.modelContext.registerTool({ name: 'after_swap', execute: () => 'ok' });
+      const change = await held.next(changed('TAB'), from);
+      assert.deepEqual(names(change), ['after_swap']);
+    }
+  );
+});
+
 await test('fake: a tool registered after load produces one debounced tools-changed event', async () => {
   await scenario(
     { definitions: [{ name: 'first', description: 'First', execute: () => 'first' }] },
