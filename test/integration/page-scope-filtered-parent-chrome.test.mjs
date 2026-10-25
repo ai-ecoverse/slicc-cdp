@@ -52,6 +52,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
   let secure;
   let runner;
   let cwd;
+  let userSession;
   try {
     await writeFile(
       path.join(dir, 'manifest.json'),
@@ -180,6 +181,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
           peer.pending.delete(message.id);
           entry.elapsed = Date.now() - entry.sent;
           entry.reply = message.error ? 'error' : 'success';
+          if (message.error) entry.errorCode = message.error.code;
           if (!message.error) {
             if (entry.method === 'Target.attachToTarget') {
               const attached = identity(message.result?.sessionId);
@@ -224,8 +226,21 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
               type: message.params?.resourceType,
             });
             wire.push({ connection, event: message.method, session, request });
-          } else if (message.method?.startsWith('Page.frame')) {
+          } else if (
+            message.method?.startsWith('Page.frame') ||
+            message.method?.startsWith('Inspector.')
+          ) {
             wire.push({ connection, event: message.method, session });
+          } else if (message.method === 'Runtime.executionContextCreated') {
+            wire.push({
+              connection,
+              event: message.method,
+              session,
+              context: identity(message.params?.context?.uniqueId),
+              frame: identity(message.params?.context?.auxData?.frameId),
+              default: message.params?.context?.auxData?.isDefault,
+              extension: message.params?.context?.origin?.startsWith('chrome-extension:'),
+            });
           }
           if (wire.length > 40) wire.shift();
         }
@@ -240,9 +255,42 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     });
     runner = nativeRunner(exe('playwright-cli'), exe('curlwright'), proxy.url);
     cwd = await runner.fresh();
+    const diagnose = async () => {
+      const probe = async (method, params, session) => {
+        let timer;
+        try {
+          return await Promise.race([
+            raw.send(method, params, session).then(
+              () => ({ method, reply: 'success' }),
+              () => ({ method, reply: 'error' })
+            ),
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve({ method, reply: 'timeout' }), 1000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      return {
+        chrome: browser.died(),
+        probes: await Promise.all([
+          probe('Browser.getVersion', {}, undefined),
+          ...(userSession
+            ? [
+                probe('Runtime.evaluate', { expression: '0', returnByValue: true }, userSession),
+                probe('Network.enable', {}, userSession),
+              ]
+            : []),
+        ]),
+        lifecycle: lifecycle(),
+        wire,
+      };
+    };
     const run = async (...args) => {
       const result = await runner.playwright(args, cwd);
-      assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
+      const diagnostics = result.code === 0 ? '' : JSON.stringify(await diagnose());
+      assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr} ${diagnostics}`);
       return result.stdout;
     };
     const userUrl = `https://localhost:${secure.address().port}/ordinary`;
@@ -251,7 +299,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       (target) => target.type === 'page' && target.url === userUrl
     );
     assert.ok(user);
-    const userSession = (
+    userSession = (
       await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
     ).sessionId;
     await until(async () => {
@@ -284,10 +332,11 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       ['drag', ref(drag, 'Drag source'), ref(drag, 'Drop target')],
       cwd
     );
+    const diagnostics = dragged.code === 0 ? '' : JSON.stringify(await diagnose());
     assert.equal(
       dragged.code,
       0,
-      `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, afterDrag: lifecycle(), wire })}`
+      `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, afterDrag: lifecycle(), wire })} ${diagnostics}`
     );
     await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const denied = await runner.playwright(['eval', '--tab', background, 'document.title'], cwd);
