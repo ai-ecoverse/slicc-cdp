@@ -257,6 +257,7 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Browser.setPermission`
 - `Browser.grantPermissions`
 - `Network.setRequestInterception`
+- `Inspector.enable` (private guard only)
 - `Fetch.*`
 
 The guarded Rust client supports document-scoped operations, origin-scoped cookies and guarded interception. Persistent page capabilities that cannot be restricted to verified ordinary documents are refused before sending, including generic init scripts, bindings, page overrides and automatic debugger-waiting attachment. `Network.emulateNetworkConditions` is the one network override admitted, and only as Playwright's offline toggle on an ordinary page session. The dedicated WebMCP installer is the sole vetted-shim exception: it accepts a session, never client-provided source, and gates the pinned bytes on guard-owned document verification. The production method lifetime [inventory](crates/cdp-client/src/capability_inventory_test.rs) is checked against the CLI sources. The Node `CDPClient` is a raw CDP transport, not the guarded Rust client.
@@ -270,6 +271,9 @@ The guarded Rust client supports document-scoped operations, origin-scoped cooki
 - `Input`
 - `Network`
 - `Fetch`
+- `Inspector` (private guard only)
+
+Guard sessions enable Inspector before renderer-side domains. Chrome then reports an already-crashed target on the new session, rather than letting Network.enable consume the guard deadline. A reported renderer crash refuses the call; it is never retried silently.
 
 ## Crates
 
