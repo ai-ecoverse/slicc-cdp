@@ -80,9 +80,22 @@ fn live(value: &Value) -> bool {
     value["state"] == "recording" && value["beat"].as_u64().is_some_and(|beat| now_ms().saturating_sub(beat) <= 5000)
 }
 
-fn clear(files: &Files) {
-    let _ = fs::remove_file(&files.record);
-    let _ = fs::remove_file(&files.stop);
+fn completion(files: &Files, id: &str) -> PathBuf {
+    files.record.with_extension(format!("{}.done", cdp_client::hash::sha256_hex(id.as_bytes())))
+}
+
+fn completed(files: &Files, id: &str) -> Option<Value> {
+    read(&completion(files, id)).filter(|value| value["recordingId"] == id && value["state"] == "stopped")
+}
+
+fn recent(files: &Files, value: &Value) -> bool {
+    live(value) && completed(files, value["recordingId"].as_str().unwrap_or("")).is_none()
+}
+
+fn clear(files: &Files, id: &str) {
+    let _ = fs::remove_file(completion(files, id));
+    if read(&files.record).is_none_or(|value| value["recordingId"] == id) { let _ = fs::remove_file(&files.record); }
+    if fs::read_to_string(&files.stop).is_ok_and(|owner| owner == id) { let _ = fs::remove_file(&files.stop); }
 }
 
 pub fn stop(invocation: &Invocation) -> Output {
@@ -91,42 +104,28 @@ pub fn stop(invocation: &Invocation) -> Output {
     if invocation.positionals.first().is_some_and(|id| found["recordingId"].as_str() != Some(id)) {
         return Output::err("stop-recording: recordingId does not belong to this session\n");
     }
-    if found["state"] == "stopped" {
-        clear(&files);
-        return Output::ok(format!("{}\n", found));
+    let owner = found["recordingId"].as_str().unwrap_or("");
+    if let Some(stopped) = completed(&files, owner).or_else(|| (found["state"] == "stopped").then(|| found.clone())) {
+        clear(&files, owner);
+        return Output::ok(format!("{stopped}\n"));
     }
     if !live(&found) {
         let checked = inspect(&files.record);
         if !checked.alive {
             #[cfg(windows)]
             drop(checked);
-            clear(&files);
+            clear(&files, owner);
             let _ = fs::remove_dir_all(files.record.with_extension("lock"));
             return Output::err(NONE);
         }
     }
-    let owner = found["recordingId"].as_str().unwrap_or("");
     if let Err(message) = session::write_private(&files.stop, owner) { return Output::err(message) }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(50));
-        let observed = fs::read_to_string(&files.record);
-        match observed.as_ref().ok().and_then(|text| serde_json::from_str::<Value>(text).ok()) {
-            Some(value) if value["recordingId"] == owner && value["state"] == "stopped" => {
-                clear(&files);
-                return Output::ok(format!("{value}\n"));
-            }
-            Some(value) if value["recordingId"] == owner && value["state"] == "recording" => {
-                let checked = inspect(&files.record);
-                if !live(&value) && !checked.alive {
-                    eprintln!("HAR stop inactive expected={owner} raw={observed:?}");
-                    clear(&files); return Output::err(NONE)
-                }
-            }
-            _ => {
-                eprintln!("HAR stop missing completion expected={owner} raw={observed:?}");
-                return Output::err(NONE)
-            },
+        if let Some(value) = completed(&files, owner).or_else(|| read(&files.record).filter(|value| value["recordingId"] == owner && value["state"] == "stopped")) {
+            clear(&files, owner);
+            return Output::ok(format!("{value}\n"));
         }
         if Instant::now() >= deadline { return Output::err("har-stop: the HAR holder did not answer\n") }
     }
@@ -134,7 +133,7 @@ pub fn stop(invocation: &Invocation) -> Output {
 
 pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoint: &str) -> Output {
     let files = match files(invocation) { Ok(files) => files, Err(message) => return Output::err(message) };
-    if read(&files.record).is_some_and(|value| live(&value)) { return Output::err(ALREADY) }
+    if read(&files.record).is_some_and(|value| recent(&files, &value)) { return Output::err(ALREADY) }
     let alias = invocation.command.as_deref() == Some("record");
     let target = if alias {
         browser::create_target(cdp, state, "about:blank", true)
@@ -155,7 +154,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
         filter: invocation.flags.get("filter").or_else(|| invocation.flags.get("url-filter")).and_then(|pattern| Glob::parse(pattern).ok()),
     };
     holder.paused = holder.verify(cdp).is_none();
-    let _lease = match Lease::claim(&holder.files.record, read(&holder.files.record).is_some_and(|value| live(&value))) {
+    let _lease = match Lease::claim(&holder.files.record, read(&holder.files.record).is_some_and(|value| recent(&holder.files, &value))) {
         Ok(lease) => lease,
         Err(message) => {
             cdp.set_decider(holder.session.as_deref().unwrap(), None);
@@ -250,7 +249,7 @@ impl Holder {
 
     fn run(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str, url: Option<&str>) -> Result<(), String> {
         self.beat()?;
-        if let Err(message) = self.checkpoint(cdp) { clear(&self.files); return Err(message) }
+        if let Err(message) = self.checkpoint(cdp) { clear(&self.files, &self.id); return Err(message) }
         let mut input = crate::webmcp_polyfill::input()?;
         emit(self.status("ready"))?;
         if self.paused { emit(self.status("paused"))?; }
@@ -265,7 +264,7 @@ impl Holder {
         let mut stopped = self.status("stopped");
         stopped["reason"] = json!(reason);
         stopped["state"] = json!("stopped");
-        let stored = if reason == "stdin" { clear(&self.files); Ok(()) } else { atomic_session(&self.files.record, &stopped) };
+        let stored = if reason == "stdin" { clear(&self.files, &self.id); Ok(()) } else { atomic_session(&completion(&self.files, &self.id), &stopped) };
         let _ = fs::remove_file(&self.files.stop);
         let emitted = emit(stopped);
         watched.and(saved).and(stored).and(emitted).map(|_| ())
@@ -491,6 +490,34 @@ impl Holder {
 fn drain(cdp: &mut Cdp) {
     for _ in 0..64 {
         if !matches!(cdp.pump(Instant::now() + Duration::from_millis(1)), Ok(true)) { break }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn har_completion_is_an_immutable_generation_ack_not_a_heartbeat_replacement() {
+        let root = std::env::temp_dir().join(format!("slicc-har-completion-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let files = Files { record: root.join("record.har.json"), stop: root.join("record.har.stop") };
+        let id = "rec-test-generation";
+        let heartbeat = json!({"state":"recording","recordingId":id,"beat":now_ms()});
+        atomic_session(&files.record, &heartbeat).unwrap();
+        assert!(recent(&files, &heartbeat));
+        let torn = "{\"entries\":1,\"event\":\"stopped\",\"recordingId\":\"rec-test-generation\",\"state\"";
+        fs::write(&files.record, torn).unwrap();
+        let result = json!({"state":"stopped","event":"stopped","recordingId":id,"reason":"stop","entries":1});
+        atomic_session(&completion(&files, id), &result).unwrap();
+        assert_eq!(fs::read_to_string(&files.record).unwrap(), torn);
+        assert_eq!(completed(&files, id), Some(result));
+        assert!(!recent(&files, &heartbeat));
+        assert!(completed(&files, "another generation").is_none());
+        assert!(completion(&files, "../../outside").starts_with(&root));
+        clear(&files, id);
+        assert!(!files.record.exists());
+        assert!(!completion(&files, id).exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

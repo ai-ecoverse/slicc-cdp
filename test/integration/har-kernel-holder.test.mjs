@@ -102,16 +102,7 @@ test('a backgrounded har-start fed by a sleep loop records across bash calls unt
     await new Promise((resolve) => setTimeout(resolve, 12000));
     assert.ok(!(await log()).some((event) => event.event === 'stopped'));
     const second = await runner.run(['bash', '-c', 'playwright-cli -s har har-stop'], cwd);
-    let diagnostics = '';
-    if (second.code !== 0) {
-      const processes = await runner.processes();
-      const pid = processes.find((entry) => entry.argv.includes('har-start'))?.pid;
-      const process = Number.isInteger(pid)
-        ? await runner.run(['bash', '-c', `cat /proc/${pid}/stat /proc/stat`], cwd)
-        : undefined;
-      diagnostics = JSON.stringify({ afterLog: await log(), processes, process });
-    }
-    assert.equal(second.code, 0, `${second.stderr} ${diagnostics}`);
+    assert.equal(second.code, 0, second.stderr);
     const stopped = JSON.parse(second.stdout.trim());
     assert.equal(stopped.event, 'stopped');
     assert.equal(stopped.reason, 'stop');
