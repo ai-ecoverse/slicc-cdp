@@ -365,6 +365,14 @@ impl Cdp {
         Ok((call_id, epoch, context_id, context))
     }
 
+    fn webmcp_provisional_child(&self, top: &Value, frame: &Value, context: &Context) -> bool {
+        top.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty() && frame.get("parentId").and_then(Value::as_str) == Some(id))
+            && frame.get("url").and_then(Value::as_str).is_some_and(|url| url.is_empty() || url == "about:blank")
+            && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty())
+            && frame.get("securityOrigin").and_then(Value::as_str).is_some_and(|origin| origin != context.origin && !self.guard.url(origin))
+            && !self.guard.url(&context.origin)
+    }
+
     fn webmcp_keep_parent_installer(&mut self, session: &str, context: &Context, id: i64, deadline: Instant) -> bool {
         let skip = |cdp: &Cdp, reason: &str| { cdp.webmcp_trace_stage(session, "parent-retention-skipped", reason); false };
         let Some(target) = self.session_target(session) else { return skip(self, "missing target"); };
@@ -373,7 +381,7 @@ impl Cdp {
         let epoch = self.frame_epoch;
         let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return skip(self, "parent tree read failed"); };
         let top = &tree["frameTree"]["frame"];
-        if self.webmcp.contexts.get(&(session.to_string(), id)) == Some(context) && Self::webmcp_frame(&tree["frameTree"], &context.frame).is_some_and(|frame| frame.get("url").and_then(Value::as_str) == Some("about:blank") || !self.webmcp_frame_verified(frame)) { return skip(self, "live blank or unverified child"); }
+        if self.webmcp.contexts.get(&(session.to_string(), id)) == Some(context) && Self::webmcp_frame(&tree["frameTree"], &context.frame).is_some_and(|frame| (frame.get("url").and_then(Value::as_str) == Some("about:blank") || !self.webmcp_frame_verified(frame)) && !self.webmcp_provisional_child(top, frame, context)) { return skip(self, "live blank or unverified child"); }
         if top.get("id").and_then(Value::as_str) == Some(&context.frame) || !self.webmcp_tree_verified(&tree, None)
             || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed || !document.unreachable_url.is_empty()) { return skip(self, "parent document not verified or unsettled"); }
         let Some(arm) = self.webmcp.arms.get(session) else { return skip(self, "missing parent arm"); };

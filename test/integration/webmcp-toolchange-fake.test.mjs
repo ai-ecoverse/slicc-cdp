@@ -200,6 +200,87 @@ test('fake: an abandoned local child gate during an ordinary process swap preser
   );
 });
 
+test('fake: a live provisional child with opaque frame origin retains only its verified parent installer', async () => {
+  let opaque = false;
+  let liveBackend;
+  const resumed = Promise.withResolvers();
+  await scenario(
+    {
+      children: [{ id: 'PROVISIONAL', origin: 'https://ordinary.test' }],
+      onCommand(message, pages, send, sessions) {
+        if (
+          opaque &&
+          message.method === 'Page.getFrameTree' &&
+          sessions.get(message.sessionId) === 'TAB'
+        ) {
+          const frame = (page) => ({
+            id: page.id,
+            url: `${page.origin}/`,
+            securityOrigin: page.origin,
+            loaderId: page.loader,
+          });
+          send({
+            id: message.id,
+            result: {
+              frameTree: {
+                frame: frame(pages.get('TAB')),
+                childFrames: [
+                  {
+                    frame: {
+                      ...frame(pages.get('PROVISIONAL')),
+                      parentId: 'TAB',
+                      url: 'about:blank',
+                      securityOrigin: '://',
+                    },
+                  },
+                ],
+              },
+            },
+          });
+          return true;
+        }
+        if (opaque && message.method === 'Debugger.resume') {
+          opaque = false;
+          liveBackend.abandonLocalGate('PROVISIONAL');
+          resumed.resolve();
+        }
+      },
+    },
+    async ({ backend, held }) => {
+      liveBackend = backend;
+      const from = backend.calls.length;
+      opaque = true;
+      pauseBlank(backend, 'PROVISIONAL');
+      await resumed.promise;
+      assert.equal(
+        backend.calls
+          .slice(from)
+          .some(
+            (call) =>
+              call.method === 'Debugger.evaluateOnCallFrame' &&
+              call.params.expression.endsWith('true')
+          ),
+        false
+      );
+      assert.equal(
+        backend.calls
+          .slice(from)
+          .some((call) => call.method === 'Page.removeScriptToEvaluateOnNewDocument'),
+        false
+      );
+      const start = held.lines.length;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', start);
+      backend.page.document.modelContext.registerTool({
+        name: 'ordinary_recovered',
+        execute: () => 'ok',
+      });
+      assert.deepEqual(names(await held.next(changed('TAB'), start)), ['ordinary_recovered']);
+      assert.doesNotMatch(held.stderr(), /target closed/);
+    }
+  );
+});
+
 test('fake: a child gate abandoned while queued retains the parent document installer', async () => {
   let armed = false;
   let queued = false;
