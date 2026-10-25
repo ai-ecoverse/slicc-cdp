@@ -238,12 +238,22 @@ fn seen(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted: 
     if mode(cdp, scope, context, "arm", json!({ "types": types }))? != "armed" {
         return Err("Error: the input check could not start in the page.\n".to_string());
     }
-    if let Err(message) = trusted(cdp) {
-        if !message.ends_with(" timed out\n") {
-            return Err(message);
+    let failure = trusted(cdp).err();
+    if let Some(message) = &failure {
+        if !message.ends_with(" timed out\n") && message != "Input.dispatchMouseEvent: Internal error\n" {
+            return Err(message.clone());
         }
     }
-    match run(cdp, scope, context, "read", json!({}), READ_WAIT) {
+    let observed = run(cdp, scope, context, "read", json!({}), READ_WAIT);
+    if let Some(message) = failure.filter(|message| message == "Input.dispatchMouseEvent: Internal error\n") {
+        return match observed {
+            Ok(Value::Array(seen)) if types.iter().all(|kind| seen.iter().any(|event| event.as_str() == Some(kind))) =>
+                Ok(Some(seen.iter().filter_map(Value::as_str).map(str::to_string).collect())),
+            Err(refusal) if refusal.starts_with("slicc: refused:") => Err(refusal),
+            _ => Err(message),
+        };
+    }
+    match observed {
         Ok(Value::Array(seen)) => Ok(Some(seen.iter().filter_map(Value::as_str).map(str::to_string).collect())),
         _ => Ok(None),
     }

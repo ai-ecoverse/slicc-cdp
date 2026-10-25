@@ -946,7 +946,7 @@ impl Cdp {
         let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
         let owned_blank = proof.default && state.frames.get(&proof.frame).is_some_and(|evidence| evidence[1] == "about:blank"
             && self.owns_blank(&target, &proof.frame, &evidence[0]));
-        if unique.is_empty() || proof.origin == "null" || proof.origin.is_empty() && !owned_world && !owned_blank || self.guard.url(&proof.origin) { return Err(self.refusal()) }
+        if unique.is_empty() || proof.origin == "null" && !owned_blank || proof.origin.is_empty() && !owned_world && !owned_blank || self.guard.url(&proof.origin) { return Err(self.refusal()) }
         if state.worker.is_none() {
             let evidence = state.frames.get(&proof.frame).ok_or_else(|| self.refusal())?;
             if proof.loader.as_deref() != Some(evidence[0].as_str()) { return Err(self.refusal()) }

@@ -1527,7 +1527,12 @@ mod tests {
             json!({ "expression": expression, "returnByValue": true }),
             Some(session),
         )
-        .unwrap_or_else(|error| panic!("Runtime.evaluate {expression} failed: {error}"))
+        .unwrap_or_else(|error| {
+            let tree = cdp.call("Page.getFrameTree", json!({}), Some(session));
+            let history = cdp.call("Page.getNavigationHistory", json!({}), Some(session));
+            let contexts: Vec<Value> = cdp.events().iter().filter(|event| event["method"] == "Runtime.executionContextCreated" && event["sessionId"] == session).map(|event| event["params"]["context"].clone()).collect();
+            panic!("Runtime.evaluate {expression} failed: {error}; renderer={tree:?}; history={history:?}; contexts={contexts:?}")
+        })
         .pointer("/result/value")
         .cloned()
         .unwrap_or(Value::Null)
