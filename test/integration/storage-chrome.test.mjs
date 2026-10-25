@@ -5,6 +5,7 @@ import { launchBrowser, rawSocket } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
+import { openStoragePage } from './storage-page.mjs';
 import './watchdog.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -166,7 +167,7 @@ async function storageFlow(runner, site, raw, protectedTabs) {
   );
   assert.match(await run(['cookie-get', 'loaded']), /^loaded=fixture-loaded /);
   assert.equal(await run(['cookie-get', 'session']), "Cookie 'session' not found\n");
-  const otherTab = await raw.open(`${other}/page`);
+  const otherTab = await openStoragePage(raw, `${other}/page`);
   assert.equal(
     await run(['localstorage-get', 'elsewhere', '--tab', otherTab]),
     'elsewhere=fixture-elsewhere\n'
@@ -210,7 +211,7 @@ test('storage commands and state files stay away from seven and the vault in Chr
       ['http://seven.sliccy.ai', 'SEVENSTORAGESECRET'],
       ['http://vault.sliccy.ai', 'VAULTSTORAGESECRET'],
     ]) {
-      const target = await raw.open(`${origin}/landing`);
+      const target = await openStoragePage(raw, `${origin}/landing`);
       await pageEval(
         raw,
         target,
