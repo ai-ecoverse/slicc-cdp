@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 mod webmcp_guard;
 #[path = "page_scope.rs"]
 mod page_scope;
+#[path = "document_order.rs"]
+mod document_order;
 #[path = "issued.rs"]
 mod issued;
 pub(crate) use issued::target_refusal;
@@ -154,6 +156,8 @@ pub struct Cdp {
     held: BTreeMap<String, Vec<Value>>,
     streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
     document_epochs: BTreeMap<String, u64>,
+    unchecked_documents: BTreeMap<(String, String, String), document_order::ObservedDocument>,
+    removed_frames: BTreeMap<(String, String), (String, String)>,
     document_versions: BTreeMap<(String, String), String>,
     created_blanks: BTreeMap<String, (String, String, i64)>,
     navigated_blanks: BTreeMap<String, (String, String, String)>,
@@ -271,6 +275,8 @@ impl Cdp {
             held: BTreeMap::new(),
             streams: BTreeMap::new(),
             document_epochs: BTreeMap::new(),
+            unchecked_documents: BTreeMap::new(),
+            removed_frames: BTreeMap::new(),
             document_versions: BTreeMap::new(),
             created_blanks: BTreeMap::new(),
             navigated_blanks: BTreeMap::new(),
@@ -518,7 +524,12 @@ impl Cdp {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        self.call_for(method, params, session_id, Duration::from_secs(30))
+        let result = self.call_for(method, params, session_id, Duration::from_secs(30));
+        #[cfg(test)]
+        if result.is_err() && method == "Runtime.evaluate" && std::env::var_os("CI").is_some() {
+            eprintln!("document call refused: stages={:?}", self.runtime_diagnostics().iter().filter_map(|probe| probe.get("stage").and_then(Value::as_str)).collect::<Vec<_>>());
+        }
+        result
     }
 
     pub fn call_for(
@@ -1172,9 +1183,16 @@ impl Cdp {
                 }
             }
         }
+        for (target, state) in checks {
+            let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
+            if self.unchecked_document(owner) {
+                let guard = self.guards.get(owner).cloned().ok_or_else(|| self.refusal())?;
+                self.verify_page_scope_state(Some(&guard))?;
+            }
+        }
         let sealed = checks.iter().any(|(target, state)| {
             let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
-            self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
+            self.unchecked_document(owner) || self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
         });
         if sealed { Err(self.refusal()) } else { Ok(()) }
     }
@@ -1893,6 +1911,7 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("private-document-read", json!({}));
         let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), DOCUMENT_CHECK).ok()?;
+        if content { self.verify_document_order(&tree, Some(&guard)).ok()?; }
         #[cfg(test)]
         self.runtime_prepare_probe("private-document-stability", json!({"guard_stable":self.guards.get(target) == Some(&guard)}));
         if self.guards.get(target) != Some(&guard) { return None }
@@ -2362,6 +2381,7 @@ impl Cdp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        self.observe_document_order(&method, &params, session.as_deref());
         self.page_scope_changed(&method, &params, session.as_deref());
         if let Some(target) = session.as_deref().and_then(|session| self.session_target(session)) {
             if method == "Page.frameNavigated" {
@@ -2374,9 +2394,13 @@ impl Cdp {
                 }
             } else if method == "Page.frameDetached" {
                 let id = params.get("frameId").and_then(Value::as_str).unwrap_or("").to_string();
+                if params.get("reason").and_then(Value::as_str) == Some("remove") { self.note_frame_removal(&target, &id); }
+                self.forget_frame_order(&target, session.as_deref().unwrap_or(""), &id, matches!(params.get("reason").and_then(Value::as_str), Some("remove" | "swap")));
                 if self.document_versions.remove(&(target.clone(), id)).is_some() {
                     *self.document_epochs.entry(target).or_default() += 1;
                 }
+            } else if method == "Page.frameAttached" {
+                if let Some(id) = params.get("frameId").and_then(Value::as_str) { self.removed_frames.remove(&(target, id.to_string())); }
             }
         }
         if matches!(method.as_str(), "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared") {
@@ -2592,6 +2616,8 @@ impl Cdp {
                     self.created_blanks.remove(target);
                     self.navigated_blanks.remove(target);
                     self.documents.remove(target);
+                    self.unchecked_documents.retain(|(owner, _, _), _| owner != target);
+                    self.removed_frames.retain(|(owner, _), _| owner != target);
                     self.unobserved.remove(target);
                 }
             }
@@ -3143,6 +3169,9 @@ impl Cdp {
         let result = self.raw_reply(method, id, session_id, timeout, pinned);
         self.waiting_calls.remove(&id);
         self.call_replies.remove(&id);
+        if method == "Page.getFrameTree" && session_id.is_some_and(|session| self.guard_sessions.contains(session)) {
+            if let Ok(tree) = &result { let _ = self.verify_document_order(tree, session_id); }
+        }
         result
     }
 
@@ -3314,6 +3343,7 @@ impl Cdp {
         let target = self.session_target(session);
         if self.blocked.contains(session) {
             if let Some(target) = &target { self.protected_targets.insert(target.clone()); }
+            self.unchecked_documents.retain(|(_, owner, _), _| owner != session);
         }
         let guards: Vec<String> = self.guards.iter().filter(|(_, guard)| guard.as_str() == session).map(|(target, _)| target.clone()).collect();
         self.session_targets.remove(session);
