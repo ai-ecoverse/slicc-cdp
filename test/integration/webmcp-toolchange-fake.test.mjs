@@ -245,6 +245,36 @@ await test('fake: a child gate abandoned while queued retains the parent documen
   );
 });
 
+await test('fake: an OOPIF installer response waiting on its pause is resumed before page load completes', async () => {
+  await scenario(
+    {
+      installerWaitsForResume: true,
+      children: [
+        { id: 'LOAD_CHILD', origin: 'https://foreign.test', allow: 'tools *', oopif: true },
+      ],
+    },
+    async ({ backend, held }) => {
+      assert.equal(typeof backend.pages.get('LOAD_CHILD').document.modelContext, 'object');
+      const start = held.lines.length;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', start);
+      assert.ok(
+        backend.calls.some(
+          (call) =>
+            call.method === 'Debugger.resume' &&
+            backend.sessions.get(call.sessionId) === 'LOAD_CHILD'
+        )
+      );
+      backend.pages.get('LOAD_CHILD').document.modelContext.registerTool({
+        name: 'loaded_child',
+        exposedTo: ['https://ordinary.test'],
+        execute: () => 'ok',
+      });
+      assert.deepEqual(names(await held.next(changed('LOAD_CHILD'), start)), ['loaded_child']);
+    }
+  );
+});
+
 await test('fake: a tool registered after load produces one debounced tools-changed event', async () => {
   await scenario(
     { definitions: [{ name: 'first', description: 'First', execute: () => 'first' }] },

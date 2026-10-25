@@ -3017,6 +3017,7 @@ impl Cdp {
     }
 
     fn forget_session(&mut self, session: &str) {
+        self.webmcp_cancel_queued(session);
         if !self.blocked.contains(session) && !self.guard_sessions.contains(session) {
             self.detached_ordinary.insert(session.to_string());
         }

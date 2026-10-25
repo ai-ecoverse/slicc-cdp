@@ -8,6 +8,7 @@ export async function webmcpBackend({
   native = false,
   reentrantPauses = false,
   attachDuringRearm = false,
+  installerWaitsForResume = false,
   onCommand = () => {},
   beforeNavigateFrame = () => {},
 } = {}) {
@@ -21,6 +22,7 @@ export async function webmcpBackend({
   const permitted = new Map();
   const paused = new Map();
   const queues = new Map();
+  const pendingInstallers = new Map();
   const lateFrames = new Set();
   const autoAttached = new Set();
   const autoParents = new Set();
@@ -343,8 +345,17 @@ export async function webmcpBackend({
         if (attachDuringRearm && !params.runImmediately && autoParents.has(sessionId))
           attachOopifs(sessionId);
         scripts.set(sessionId, params.source);
-        answer({ identifier: sessionId });
-        if (params.runImmediately) begin(sessionId);
+        if (
+          installerWaitsForResume &&
+          params.runImmediately &&
+          pages.get(sessions.get(sessionId))?.oopif
+        ) {
+          pendingInstallers.set(sessionId, () => answer({ identifier: sessionId }));
+          begin(sessionId);
+        } else {
+          answer({ identifier: sessionId });
+          if (params.runImmediately) begin(sessionId);
+        }
         return true;
       }
       if (method === 'Page.removeScriptToEvaluateOnNewDocument') {
@@ -363,6 +374,7 @@ export async function webmcpBackend({
         return true;
       }
       const loadEverywhere = () => {
+        if (installerWaitsForResume && [...pages.values()].some((page) => !page.loaded)) return;
         loadFired = true;
         for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
       };
@@ -382,6 +394,9 @@ export async function webmcpBackend({
               page.document.modelContext?.registerTool?.(definition);
           }
         }
+        const installed = pendingInstallers.get(sessionId);
+        pendingInstallers.delete(sessionId);
+        installed?.();
         if (reentrantPauses && queues.get(sessionId)?.length) {
           pause(sessionId);
           answer({});

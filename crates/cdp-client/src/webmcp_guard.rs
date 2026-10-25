@@ -50,6 +50,7 @@ pub(super) struct Webmcp {
     scripts: BTreeMap<(String, String), i64>,
     paused: BTreeSet<String>,
     handling_gate: bool,
+    installing_children: BTreeSet<String>,
     pending_gates: VecDeque<(Value, Option<(i64, Context)>)>,
     pub(super) deferred: BTreeSet<String>,
     pub(super) quarantined: BTreeSet<String>,
@@ -69,6 +70,7 @@ impl Webmcp {
         self.contexts.retain(|(owner, _), _| owner != session);
         self.scripts.retain(|(owner, _), _| owner != session);
         self.paused.remove(session);
+        self.installing_children.remove(session);
         self.pending_gates.retain(|(value, _)| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
         self.deferred.remove(session);
         self.quarantined.remove(session);
@@ -548,7 +550,10 @@ impl Cdp {
                 && self.webmcp_alive(parent);
             if !verified && !future_only { return Err(self.refusal()); }
             stage = "pinned installer";
-            self.webmcp_install(child, true, verified.then_some(&seed))?;
+            self.webmcp.installing_children.insert(child.to_string());
+            let installed = self.webmcp_install(child, true, verified.then_some(&seed));
+            self.webmcp.installing_children.remove(child);
+            installed?;
             Ok(())
         })().is_ok();
         let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), Duration::from_secs(2));
@@ -560,12 +565,32 @@ impl Cdp {
         }
     }
 
+    pub(super) fn webmcp_cancel_queued(&mut self, session: &str) {
+        let cancelled = self.webmcp.pending_gates.iter().filter(|(value, _)| value.get("sessionId").and_then(Value::as_str) == Some(session) || value.pointer("/params/sessionId").and_then(Value::as_str) == Some(session)).map(|(value, _)| value.clone()).collect::<Vec<_>>();
+        self.webmcp.pending_gates.retain(|(value, _)| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
+        for value in cancelled {
+            let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
+                let _ = self.send("Debugger.resume", json!({}), Some(owner));
+            } else if let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str) {
+                self.webmcp_revoke(child);
+                let _ = self.send("Runtime.runIfWaitingForDebugger", json!({}), Some(child));
+                let _ = self.send("Debugger.resume", json!({}), Some(child));
+                let _ = self.send("Target.detachFromTarget", json!({"sessionId":child}), None);
+            }
+        }
+    }
+
     fn webmcp_gate_event(&mut self, value: &Value) {
         if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) { self.webmcp.paused.insert(session.to_string()); }
         }
         let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let context = value.pointer("/params/callFrames/0/location/scriptId").and_then(Value::as_str).and_then(|script| self.webmcp.scripts.get(&(owner.to_string(), script.to_string()))).and_then(|id| self.webmcp.contexts.get(&(owner.to_string(), *id)).cloned().map(|context| (*id, context)));
+        if self.webmcp.handling_gate && self.webmcp.installing_children.contains(owner) && value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
+            self.webmcp_handle_pause(value, owner, context);
+            return;
+        }
         self.webmcp.pending_gates.push_back((value.clone(), context));
         if self.webmcp.handling_gate { return; }
         self.webmcp.handling_gate = true;
