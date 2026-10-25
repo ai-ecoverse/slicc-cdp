@@ -50,7 +50,7 @@ pub(super) struct Webmcp {
     scripts: BTreeMap<(String, String), i64>,
     paused: BTreeSet<String>,
     handling_gate: bool,
-    pending_gates: VecDeque<Value>,
+    pending_gates: VecDeque<(Value, Option<(i64, Context)>)>,
     pub(super) deferred: BTreeSet<String>,
     pub(super) quarantined: BTreeSet<String>,
     parents: BTreeMap<String, String>,
@@ -69,7 +69,7 @@ impl Webmcp {
         self.contexts.retain(|(owner, _), _| owner != session);
         self.scripts.retain(|(owner, _), _| owner != session);
         self.paused.remove(session);
-        self.pending_gates.retain(|value| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
+        self.pending_gates.retain(|(value, _)| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
         self.deferred.remove(session);
         self.quarantined.remove(session);
         self.parents.retain(|child, parent| child != session && parent != session);
@@ -364,30 +364,31 @@ impl Cdp {
     }
 
     fn webmcp_keep_parent_installer(&mut self, session: &str, context: &Context, id: i64, deadline: Instant) -> bool {
-        let Some(target) = self.session_target(session) else { return false; };
-        let Some(guard) = self.guards.get(&target).cloned() else { return false; };
-        if self.content_blocked(session) || self.unobserved.contains(&target) || context.frame.is_empty() || context.unique.is_empty() { return false; }
+        let skip = |cdp: &Cdp, reason: &str| { cdp.webmcp_trace_stage(session, "parent-retention-skipped", reason); false };
+        let Some(target) = self.session_target(session) else { return skip(self, "missing target"); };
+        let Some(guard) = self.guards.get(&target).cloned() else { return skip(self, "missing guard"); };
+        if self.content_blocked(session) || self.unobserved.contains(&target) || context.frame.is_empty() || context.unique.is_empty() { return skip(self, "blocked or unknown child evidence"); }
         let epoch = self.frame_epoch;
-        let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return false; };
+        let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return skip(self, "parent tree read failed"); };
         let top = &tree["frameTree"]["frame"];
-        if self.webmcp.contexts.get(&(session.to_string(), id)) == Some(context) && Self::webmcp_frame(&tree["frameTree"], &context.frame).is_some_and(|frame| frame.get("url").and_then(Value::as_str) == Some("about:blank") || !self.webmcp_frame_verified(frame)) { return false; }
+        if self.webmcp.contexts.get(&(session.to_string(), id)) == Some(context) && Self::webmcp_frame(&tree["frameTree"], &context.frame).is_some_and(|frame| frame.get("url").and_then(Value::as_str) == Some("about:blank") || !self.webmcp_frame_verified(frame)) { return skip(self, "live blank or unverified child"); }
         if top.get("id").and_then(Value::as_str) == Some(&context.frame) || !self.webmcp_tree_verified(&tree, None)
-            || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed || !document.unreachable_url.is_empty()) { return false; }
-        let Some(arm) = self.webmcp.arms.get(session) else { return false; };
-        if arm.revoked || arm.identifier.is_none() || !arm.accepted.iter().any(|(frame, loader, _)| top.get("id").and_then(Value::as_str) == Some(frame) && top.get("loaderId").and_then(Value::as_str) == Some(loader)) { return false; }
-        let Ok(fresh) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return false; };
+            || self.documents.get(&target).is_none_or(|document| document.navigating || document.previous || document.probed || !document.unreachable_url.is_empty()) { return skip(self, "parent document not verified or unsettled"); }
+        let Some(arm) = self.webmcp.arms.get(session) else { return skip(self, "missing parent arm"); };
+        if arm.revoked || arm.identifier.is_none() || !arm.accepted.iter().any(|(frame, loader, _)| top.get("id").and_then(Value::as_str) == Some(frame) && top.get("loaderId").and_then(Value::as_str) == Some(loader)) { return skip(self, "parent current loader not admitted"); }
+        let Ok(fresh) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), deadline.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP)) else { return skip(self, "fresh parent tree read failed"); };
         if epoch != self.frame_epoch || Instant::now() >= deadline || fresh["frameTree"]["frame"] != *top || !self.webmcp_tree_verified(&fresh, None)
-            || self.content_blocked(session) || self.session_target(session).as_deref() != Some(&target) || self.guards.get(&target) != Some(&guard) { return false; }
-        let Some(arm) = self.webmcp.arms.get_mut(session).filter(|arm| !arm.revoked && arm.identifier.is_some()) else { return false; };
+            || self.content_blocked(session) || self.session_target(session).as_deref() != Some(&target) || self.guards.get(&target) != Some(&guard) { return skip(self, "parent changed or retention deadline"); }
+        let Some(arm) = self.webmcp.arms.get_mut(session).filter(|arm| !arm.revoked && arm.identifier.is_some()) else { return skip(self, "parent arm revoked during check"); };
         arm.pending_contexts.remove(&id);
         arm.pending_frames.remove(&context.frame);
         arm.accepted.retain(|(frame, _, _)| frame != &context.frame);
         arm.documents.retain(|_, document| document.get("frameId").and_then(Value::as_str) != Some(&context.frame));
+        self.webmcp_trace_stage(session, "parent-installer-retained", "abandoned local child gate");
         true
     }
 
-    fn webmcp_handle_pause(&mut self, value: &Value, session: &str) {
-        let child = value.pointer("/params/callFrames/0/location/scriptId").and_then(Value::as_str).and_then(|script| self.webmcp.scripts.get(&(session.to_string(), script.to_string()))).and_then(|id| self.webmcp.contexts.get(&(session.to_string(), *id)).cloned().map(|context| (*id, context)));
+    fn webmcp_handle_pause(&mut self, value: &Value, session: &str, child: Option<(i64, Context)>) {
         let started = Instant::now();
         self.webmcp.paused.insert(session.to_string());
         let deadline = started + Duration::from_secs(2);
@@ -563,15 +564,17 @@ impl Cdp {
         if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) { self.webmcp.paused.insert(session.to_string()); }
         }
-        self.webmcp.pending_gates.push_back(value.clone());
+        let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+        let context = value.pointer("/params/callFrames/0/location/scriptId").and_then(Value::as_str).and_then(|script| self.webmcp.scripts.get(&(owner.to_string(), script.to_string()))).and_then(|id| self.webmcp.contexts.get(&(owner.to_string(), *id)).cloned().map(|context| (*id, context)));
+        self.webmcp.pending_gates.push_back((value.clone(), context));
         if self.webmcp.handling_gate { return; }
         self.webmcp.handling_gate = true;
-        while let Some(gate) = self.webmcp.pending_gates.pop_front() {
+        while let Some((gate, context)) = self.webmcp.pending_gates.pop_front() {
             let owner = gate.get("sessionId").and_then(Value::as_str).unwrap_or("");
             if gate.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
                 self.webmcp_adopt_child(&gate, owner);
             } else {
-                self.webmcp_handle_pause(&gate, owner);
+                self.webmcp_handle_pause(&gate, owner, context);
             }
         }
         self.webmcp.handling_gate = false;

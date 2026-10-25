@@ -200,6 +200,51 @@ await test('fake: an abandoned local child gate during an ordinary process swap 
   );
 });
 
+await test('fake: a child gate abandoned while queued retains the parent document installer', async () => {
+  let armed = false;
+  let queued = false;
+  let liveBackend;
+  await scenario(
+    {
+      children: [{ id: 'QUEUED', origin: 'https://ordinary.test' }],
+      onCommand(message, pages, send) {
+        if (
+          armed &&
+          !queued &&
+          message.method === 'Debugger.getScriptSource' &&
+          message.params.scriptId.endsWith('-TAB')
+        ) {
+          queued = true;
+          pauseBlank(liveBackend, 'QUEUED');
+          liveBackend.abandonLocalGate('QUEUED');
+          pages.get('QUEUED').blank = false;
+          pages.get('QUEUED').origin = 'https://foreign.test';
+          send({
+            method: 'Runtime.executionContextDestroyed',
+            sessionId: message.sessionId,
+            params: { executionContextId: pages.get('QUEUED').main },
+          });
+          send({
+            method: 'Page.frameDetached',
+            sessionId: message.sessionId,
+            params: { frameId: 'QUEUED', reason: 'swap' },
+          });
+        }
+      },
+    },
+    async ({ backend, held }) => {
+      liveBackend = backend;
+      armed = true;
+      const start = held.lines.length;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', start);
+      assert.equal(queued, true);
+      backend.page.document.modelContext.registerTool({ name: 'queued_swap', execute: () => 'ok' });
+      assert.deepEqual(names(await held.next(changed('TAB'), start)), ['queued_swap']);
+    }
+  );
+});
+
 await test('fake: a tool registered after load produces one debounced tools-changed event', async () => {
   await scenario(
     { definitions: [{ name: 'first', description: 'First', execute: () => 'first' }] },

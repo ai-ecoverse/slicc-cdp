@@ -501,6 +501,13 @@ export async function webmcpBackend({
     reload() {
       navigateLatest();
     },
+    abandonLocalGate(frameId) {
+      for (const [peer, frames] of queues)
+        queues.set(
+          peer,
+          frames.filter((frame) => frame !== frameId)
+        );
+    },
     inject(message) {
       writers.get(message.sessionId)(message);
     },
