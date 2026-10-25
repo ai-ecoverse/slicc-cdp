@@ -66,7 +66,7 @@ fn renderer_crash_reasons_take_precedence_over_late_success_and_detach_refusals(
 }
 
 #[test]
-fn unrelated_crashes_and_noncrash_detaches_do_not_abort_healthy_calls() {
+fn renderer_crash_unrelated_targets_and_noncrash_detaches_do_not_abort_healthy_calls() {
     for crash in [
         json!({"method":"Inspector.targetCrashed","sessionId":"OTHER","params":{}}),
         json!({"method":"Inspector.targetCrashed","params":{}}),
@@ -81,7 +81,7 @@ fn unrelated_crashes_and_noncrash_detaches_do_not_abort_healthy_calls() {
 }
 
 #[test]
-fn queued_replies_and_navigation_replies_cannot_report_success_after_a_crash() {
+fn renderer_crash_queued_replies_and_navigation_replies_cannot_report_success() {
     let (mut cdp, _) = renderer_crash_client(Value::Null, true);
     cdp.absorb(json!({"method":"Inspector.targetCrashed","sessionId":"G","params":{}}));
     cdp.call_replies.insert(700, json!({"id":700,"result":{"value":"late success"}}));
