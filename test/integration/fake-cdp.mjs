@@ -130,6 +130,7 @@ export async function fakeCdp({
   discoverEvents = false,
   delayHistoryEvents = false,
   onUpgrade,
+  onDisconnect,
   onCommand,
   pauseNavigation = false,
   childFrames = [],
@@ -190,6 +191,7 @@ export async function fakeCdp({
     onUpgrade?.(req.headers);
     sockets.add(socket);
     socket.on('close', () => {
+      onDisconnect?.(send);
       sockets.delete(socket);
       for (const [session, owner] of sessionSends) {
         if (owner !== send) continue;
