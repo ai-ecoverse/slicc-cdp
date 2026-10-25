@@ -112,7 +112,9 @@ pub fn stop(invocation: &Invocation) -> Output {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(50));
-        match read(&files.record) {
+        let observed = fs::read_to_string(&files.record);
+        eprintln!("HAR stop observe expected={owner} raw={observed:?}");
+        match observed.ok().and_then(|text| serde_json::from_str::<Value>(&text).ok()) {
             Some(value) if value["recordingId"] == owner && value["state"] == "stopped" => {
                 clear(&files);
                 return Output::ok(format!("{value}\n"));
