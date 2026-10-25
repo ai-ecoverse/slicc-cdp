@@ -179,6 +179,8 @@ pub struct Cdp {
     waiter: Option<Waiter>,
     waiter_due: Instant,
     #[cfg(test)]
+    runtime_probe: Vec<Value>,
+    #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
@@ -289,6 +291,8 @@ impl Cdp {
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
+            #[cfg(test)]
+            runtime_probe: Vec::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -428,6 +432,36 @@ impl Cdp {
         self.deciders.contains_key(session_id)
     }
 
+    #[cfg(test)]
+    fn runtime_stage(&mut self, method: &str, stage: &str) {
+        if method == "Runtime.evaluate" { self.runtime_probe.push(json!({"stage":stage})); }
+    }
+
+    #[cfg(test)]
+    fn runtime_contexts(&mut self, method: &str, stage: &str, guard: &str, target: &str, state: &DocumentState, selected: Option<&str>) {
+        if method != "Runtime.evaluate" { return }
+        let contexts: Vec<Value> = self.context_proofs.iter().filter(|((owner, _), _)| owner == guard).map(|((_, unique), proof)| {
+            let frame = state.frames.get(&proof.frame);
+            json!({"default":proof.default,"frame_known":frame.is_some(),
+                "main_frame":frame.is_some_and(|frame| frame[4].is_empty()),
+                "origin_known":url::Url::parse(&proof.origin).is_ok(),
+                "origin_protected":self.guard.url(&proof.origin),
+                "origin_opaque":matches!(proof.origin.as_str(), "" | "://" | "null"),
+                "origin_matches_frame":frame.is_some_and(|frame| frame[2] == proof.origin),
+                "loader_known":proof.loader.as_ref().is_some_and(|loader| !loader.is_empty()),
+                "loader_matches_frame":proof.loader.as_ref().zip(frame).is_some_and(|(loader, frame)| loader == &frame[0]),
+                "selected":selected == Some(unique.as_str())})
+        }).collect();
+        self.runtime_probe.push(json!({"stage":stage,"private_contexts":contexts,
+            "frame_count":state.frames.len(),"scope_known":state.scope.is_some(),
+            "scope_default":state.scope.as_deref() == Some(""),
+            "page_scope_known":state.page_scope.is_some(),"worker":state.worker.is_some(),
+            "owned_blank":state.frames.iter().any(|(id, frame)| frame[1] == "about:blank" && self.owns_blank(target, id, &frame[0]))}));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_diagnostics(&self) -> &[Value] { &self.runtime_probe }
+
     pub fn take_fetch_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.fetch_errors)
     }
@@ -449,12 +483,20 @@ impl Cdp {
         timeout: Duration,
     ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
+        #[cfg(test)]
+        if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
+        #[cfg(test)]
+        self.runtime_stage(method, "admit");
         self.admit(method, &params, session_id)?;
         if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
         }
+        #[cfg(test)]
+        self.runtime_stage(method, "prepare");
         let mut checks = self.prepare(method, &params, session_id)?;
+        #[cfg(test)]
+        self.runtime_stage(method, "pin");
         let pinned = self.pin_execution(method, &params, session_id, &mut checks)?;
         let object_pin = method == "Runtime.callFunctionOn" && params.get("objectId").is_some() && !checks.is_empty();
         let executed = pinned.is_some() && method != "Runtime.compileScript" || object_pin;
@@ -476,13 +518,28 @@ impl Cdp {
             session_id.and_then(|session| self.session_target(session)).and_then(|target| self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target))).cloned()
         } else { None };
         let frame_epoch = self.frame_epoch;
+        #[cfg(test)]
+        self.runtime_stage(method, "forward");
         let result = match self.raw_call_execution(&forwarded, sent, compile_session.as_deref().or(session_id), timeout, executed) {
             Ok(result) => result,
             Err(message) => {
-                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false, true)?; }
+                #[cfg(test)]
+                if method == "Runtime.evaluate" {
+                    let text = message.to_lowercase();
+                    self.runtime_probe.push(json!({"stage":"backend-error","refusal":message.starts_with("slicc: refused:"),
+                        "context_missing":text.contains("cannot find context") || text.contains("cannot find execution context"),
+                        "context_destroyed":text.contains("context was destroyed"),"transport":transport_error(&message)}));
+                }
+                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) {
+                    #[cfg(test)]
+                    self.runtime_stage(method, "error-page-proof");
+                    self.verify_checks(&checks, false, true)?;
+                }
                 return Err(message);
             }
         };
+        #[cfg(test)]
+        self.runtime_stage(method, "reply-proof");
         if content_command(method, &params) == Some(true) && !executed {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"), !method.starts_with("Input."))?;
         }
@@ -510,8 +567,12 @@ impl Cdp {
         if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params)) && frame_epoch != self.frame_epoch {
             return Err(self.refusal());
         }
+        #[cfg(test)]
+        self.runtime_stage(method, "reply-admission");
         let result = self.after(method, &params, session_id, result)?;
         self.bind_streams(method, session_id, &result, &checks);
+        #[cfg(test)]
+        self.runtime_stage(method, "complete");
         Ok(result)
     }
 
@@ -920,6 +981,8 @@ impl Cdp {
             }).map(|((_, unique), proof)| (unique.clone(), proof.clone()))
         };
         let mut selected = choose(&self.context_proofs, &state);
+        #[cfg(test)]
+        self.runtime_contexts(method, "private-context-initial", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
         let paused = self.document_paused(&target);
         let stable_context = selected.as_ref().is_some_and(|(_, proof)| state.worker.is_some()
             || state.frames.get(&proof.frame).is_some_and(|evidence| proof.loader.as_deref() == Some(evidence[0].as_str())));
@@ -933,7 +996,11 @@ impl Cdp {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() { return Err(self.refusal()) }
                 self.raw_call("Runtime.enable", json!({}), Some(&guard), left)?;
+                #[cfg(test)]
+                self.runtime_contexts(method, "private-context-replayed", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
                 let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.refusal())?;
+                #[cfg(test)]
+                self.runtime_contexts(method, "private-context-current", &guard, &target, &current, selected.as_ref().map(|(unique, _)| unique.as_str()));
                 let same = if state.worker.is_some() { state.worker == current.worker } else {
                     state.frames.iter().filter(|(_, evidence)| evidence[4].is_empty()).all(|(id, evidence)| current.frames.get(id).is_some_and(|now| evidence[0] == now[0] && evidence[2] == now[2]))
                 };
@@ -945,6 +1012,8 @@ impl Cdp {
                         && state.frames.iter().all(|(id, before)| current.frames.get(id).is_some_and(|after| before[0] != after[0]
                             && Self::runtime_page_reusable(&current)));
                     if attempt != 0 || !ordinary_default_commit { return Err(self.refusal()) }
+                    #[cfg(test)]
+                    self.runtime_stage(method, "private-context-readmission");
                     *checks = self.prepare(method, params, Some(session))?;
                     state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
                     continue;
@@ -953,6 +1022,8 @@ impl Cdp {
                 if selected.is_some() { break }
             }
         }
+        #[cfg(test)]
+        self.runtime_contexts(method, "private-context-validation", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
         let (unique, proof) = selected.ok_or_else(|| self.refusal())?;
         let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
         let owned_blank = proof.default && state.frames.get(&proof.frame).is_some_and(|evidence| evidence[1] == "about:blank"
