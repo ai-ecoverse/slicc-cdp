@@ -179,6 +179,8 @@ pub struct Cdp {
     waiter: Option<Waiter>,
     waiter_due: Instant,
     #[cfg(test)]
+    runtime_preparing: bool,
+    #[cfg(test)]
     runtime_probe: Vec<Value>,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
@@ -291,6 +293,8 @@ impl Cdp {
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
+            #[cfg(test)]
+            runtime_preparing: false,
             #[cfg(test)]
             runtime_probe: Vec::new(),
             #[cfg(test)]
@@ -457,6 +461,43 @@ impl Cdp {
             "scope_default":state.scope.as_deref() == Some(""),
             "page_scope_known":state.page_scope.is_some(),"worker":state.worker.is_some(),
             "owned_blank":state.frames.iter().any(|(id, frame)| frame[1] == "about:blank" && self.owns_blank(target, id, &frame[0]))}));
+    }
+
+    #[cfg(test)]
+    fn runtime_prepare_probe(&mut self, category: &str, details: Value) {
+        if self.runtime_preparing { self.runtime_probe.push(json!({"stage":"prepare-check","category":category,"details":details})); }
+    }
+
+    #[cfg(test)]
+    fn runtime_prepare_frames(&mut self, tree: &Value, frames: &BTreeMap<String, Vec<String>>) {
+        let mut pending = vec![(tree, None)];
+        while let Some((node, parent)) = pending.pop() {
+            let Some(frame) = node.get("frame") else {
+                self.runtime_prepare_probe("frame-placement", json!({"frame_present":false}));
+                return;
+            };
+            let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+            if !frames.contains_key(id) {
+                let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+                let origin = self.page_scope_origin(frame).or_else(|| frame.get("securityOrigin").and_then(Value::as_str)).unwrap_or("");
+                self.runtime_prepare_probe("frame-evidence", json!({"id_known":frame_text_known(id),"url_known":frame_text_known(url),
+                    "parent_matches":frame.get("parentId").is_none_or(|id| id.as_str() == parent),
+                    "loader_known":frame.get("loaderId").and_then(Value::as_str).is_some_and(|id| frame_text_known(id)),
+                    "initial_blank":url == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some(""),
+                    "origin_empty":origin.is_empty(),"origin_null":origin == "null","origin_opaque":origin == "://",
+                    "origin_protected":self.guard.url(origin),"url_protected":self.guard.url(url),
+                    "error_unverified":self.unverified_error(url, frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or(""))}));
+                return;
+            }
+            if let Some(children) = node.get("childFrames") {
+                let Some(children) = children.as_array() else {
+                    self.runtime_prepare_probe("frame-placement", json!({"children_valid":false}));
+                    return;
+                };
+                for child in children.iter().rev() { pending.push((child, Some(id))); }
+            }
+        }
+        self.runtime_prepare_probe("frame-placement", json!({"collection_complete":false}));
     }
 
     #[cfg(test)]
@@ -864,6 +905,19 @@ impl Cdp {
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+        #[cfg(test)]
+        let previous = self.runtime_preparing;
+        #[cfg(test)]
+        { self.runtime_preparing = method == "Runtime.evaluate"; }
+        let result = self.prepare_state(method, params, session);
+        #[cfg(test)]
+        { self.runtime_preparing = previous; }
+        result
+    }
+
+    fn prepare_state(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+        #[cfg(test)]
+        self.runtime_prepare_probe("command-classification", json!({}));
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
@@ -889,6 +943,8 @@ impl Cdp {
             checks.push((target, current));
         }
         if let Some(session) = session {
+            #[cfg(test)]
+            self.runtime_prepare_probe("selected-session", json!({"target_known":self.session_target(session).is_some(),"blocked":self.blocked.contains(session)}));
             let target = self.session_target(session).ok_or_else(|| self.refusal())?;
             if !checks.iter().any(|(known, _)| known == &target) {
                 let selected_frame = params.get("frameId").and_then(Value::as_str).map(str::to_string).or_else(|| {
@@ -901,11 +957,23 @@ impl Cdp {
                 });
                 let scope = if crosses_frames(method, params) || page_scope::content(method) && !runtime { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
                 let mut state = if self.document_paused(&target) {
+                    #[cfg(test)]
+                    self.runtime_prepare_probe("paused-document-provenance", json!({"cached_state":self.cached_documents.contains_key(&target),
+                        "guard_present":self.guards.contains_key(&target),"document_known":self.documents.contains_key(&target),
+                        "previous_protected":self.documents.get(&target).is_some_and(|doc| doc.previous),"target_protected":self.protected_targets.contains(&target)}));
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
                 } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, state)| proof.0 == target && (!runtime || Self::runtime_page_reusable(state))) {
+                    #[cfg(test)]
+                    self.runtime_prepare_probe("selected-frame-placement", json!({"source":"fresh-page-proof","explicit_frame":selected_frame.is_some()}));
                     if runtime { Self::scoped_page_state(state, scope.unwrap_or("")).ok_or_else(|| self.refusal())? } else { state.clone() }
-                } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
+                } else {
+                    #[cfg(test)]
+                    self.runtime_prepare_probe("selected-document-state", json!({"source":"private-document-proof","guard_present":self.guards.contains_key(&target)}));
+                    self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())?
+                };
+                #[cfg(test)]
+                self.runtime_prepare_probe("blocking", json!({"blocked":self.blocked.contains(session)}));
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
                     if let Some(value) = params.get(key) {
@@ -916,6 +984,8 @@ impl Cdp {
                             let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
                             self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
                         };
+                        #[cfg(test)]
+                        self.runtime_prepare_probe("selector-placement", json!({"selector_known":frame.is_some(),"frame_present":frame.as_ref().is_some_and(|frame| state.frames.contains_key(frame))}));
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
@@ -924,6 +994,8 @@ impl Cdp {
                 checks.push((target, state));
             }
         }
+        #[cfg(test)]
+        self.runtime_prepare_probe("selected-state-complete", json!({"checks_present":!checks.is_empty()}));
         if checks.is_empty() { return Err(self.refusal()) }
         Ok(checks)
     }
@@ -1799,9 +1871,15 @@ impl Cdp {
             state.worker = Some((text("url").to_string(), owner.to_string()));
             return Some(state);
         };
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-document-read", json!({}));
         let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), DOCUMENT_CHECK).ok()?;
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-document-stability", json!({"guard_stable":self.guards.get(target) == Some(&guard)}));
         if self.guards.get(target) != Some(&guard) { return None }
         let epoch = self.document_epochs.get(target).copied().unwrap_or(0);
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-selected-placement", json!({"tree_present":tree.get("frameTree").is_some()}));
         let node = tree.get("frameTree")?;
         let scoped;
         let node = if let Some(id) = scope {
@@ -1811,6 +1889,8 @@ impl Cdp {
         let frame = node.get("frame")?;
         let parent = frame.get("parentId").and_then(Value::as_str);
         let mut frames = BTreeMap::new();
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-parent-placement", json!({"parent_present":parent.is_some()}));
         if let Some(parent) = parent {
             let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
             let info = info.get("targetInfo")?;
@@ -1824,13 +1904,21 @@ impl Cdp {
             if parent_frame.get("id").and_then(Value::as_str) != Some(parent) || parent_frame.get("parentId").is_some() { return None }
             frames = self.document_state_for(&owner, true, Some(parent))?.frames;
         }
-        if !self.collect_document_frames(node, &mut frames, content, parent) { return None }
+        if !self.collect_document_frames(node, &mut frames, content, parent) {
+            #[cfg(test)]
+            self.runtime_prepare_frames(node, &frames);
+            return None;
+        }
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-loader-provenance", json!({"loader_regressed":content && frames.iter().any(|(id, evidence)| evidence[0].is_empty() && self.document_versions.contains_key(&(target.to_string(), id.clone())))}));
         if content && frames.iter().any(|(id, evidence)| evidence[0].is_empty() && self.document_versions.contains_key(&(target.to_string(), id.clone()))) { return None }
         if content && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or(""))
             && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
         {
             let id = frame.get("id").and_then(Value::as_str)?;
             let loader = frame.get("loaderId").and_then(Value::as_str)?;
+            #[cfg(test)]
+            self.runtime_prepare_probe("private-blank-provenance", json!({"blank_url":frame.get("url").and_then(Value::as_str) == Some("about:blank"),"owned_blank":self.owns_blank(target, id, loader)}));
             if frame.get("url").and_then(Value::as_str) != Some("about:blank") || !self.owns_blank(target, id, loader) { return None }
             if self.navigated_blanks.contains_key(target) {
                 let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
@@ -1841,6 +1929,8 @@ impl Cdp {
             }
         }
         self.main_commit(&guard, frame);
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-document-origin", json!({"target_protected":self.protected_targets.contains(target)}));
         if self.protected_targets.contains(target) { return None }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
