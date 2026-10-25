@@ -159,3 +159,75 @@ for (const transport of ['native', 'kernel']) {
     });
   }
 }
+
+for (const ended of ['killed', 'stdin']) {
+  test(`native: har-stop promptly cleans a holder that ends on ${ended} before acknowledgement`, async () => {
+    let block = false;
+    let release;
+    let captured;
+    const blocked = new Promise((resolve) => {
+      captured = resolve;
+    });
+    const backend = await fakeCdp({
+      intercept(message, send) {
+        if (block && message.method === 'Page.getFrameTree') {
+          block = false;
+          release = () =>
+            send({
+              id: message.id,
+              sessionId: message.sessionId,
+              result: { frameTree: { frame } },
+            });
+          captured();
+          return true;
+        }
+        return false;
+      },
+    });
+    backend.targets.push({ targetId: 'TAB', url: frame.url, loaderId: 'L' });
+    const home = await mkdtemp(path.join(tmpdir(), 'slicc-ended-har-'));
+    let held;
+    let canceled = false;
+    try {
+      held = harHolder(
+        backend.url,
+        ['har-start', '--tab', 'TAB', path.join(home, 'capture.har')],
+        home
+      );
+      const ready = await held.event('ready');
+      const [record] = globSync(`${home}/**/*.har.json`);
+      block = true;
+      await blocked;
+      if (ended === 'stdin') await new Promise((resolve) => held.child.stdin.end(resolve));
+      const started = Date.now();
+      const stopping = harCommand(backend.url, ['har-stop'], home);
+      await until(
+        async () =>
+          (await readFile(record.replace(/\.json$/, '.stop'), 'utf8').catch(() => '')) ===
+          ready.recordingId,
+        () => canceled
+      );
+      if (ended === 'killed') held.child.kill('SIGKILL');
+      else release();
+      release = undefined;
+      const exit = await held.ended;
+      if (ended === 'stdin') assert.equal(exit.code, 0);
+      const result = await stopping;
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, 'har-stop: no HAR recording in progress\n');
+      assert.ok(
+        Date.now() - started < 2000,
+        'an ended holder must not consume the acknowledgement deadline'
+      );
+      assert.deepEqual(globSync(`${home}/**/*.har.json`), []);
+      assert.deepEqual(globSync(`${home}/**/*.har.stop`), []);
+      assert.deepEqual(globSync(`${home}/**/*.har.lock`), []);
+    } finally {
+      canceled = true;
+      release?.();
+      held?.child.kill('SIGKILL');
+      await backend.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}

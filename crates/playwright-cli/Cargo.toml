@@ -2,7 +2,7 @@
 name = "slicc-cdp"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "SLICC CDP client; installs the playwright-cli command"
 repository = "https://github.com/ai-ecoverse/slicc-cdp"
