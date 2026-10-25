@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
 import { observer } from './guard-client.mjs';
+import { webmcpWire } from './webmcp-wire.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const binary = path.join(
@@ -25,7 +26,7 @@ function environment(cwd) {
 function stream(endpoint, cwd, args) {
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
-    env: environment(cwd),
+    env: { ...environment(cwd), SLICC_WEBMCP_TRACE: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let pending = '';
@@ -44,15 +45,23 @@ function stream(endpoint, cwd, args) {
   child.stderr.on('data', (bytes) => {
     stderr += bytes;
   });
-  const ended = new Promise((resolve) => child.once('close', (code) => resolve(code)));
+  let closed = false;
+  const ended = new Promise((resolve) =>
+    child.once('close', (code) => {
+      closed = true;
+      resolve(code);
+      for (const waiter of [...waiters]) waiter();
+    })
+  );
   const next = (predicate, from, timeout = 20000) =>
     new Promise((resolve, reject) => {
       const check = () => {
         const found = lines.slice(from).find(predicate);
-        if (!found) return;
+        if (!found && !closed) return;
         clearTimeout(timer);
         waiters.delete(check);
-        resolve(found);
+        if (found) resolve(found);
+        else reject(new Error(`holder exited before event: ${JSON.stringify(lines)} ${stderr}`));
       };
       const timer = setTimeout(() => {
         waiters.delete(check);
@@ -86,8 +95,11 @@ async function navigate(raw, session, url) {
     (event) => event.method === 'Page.loadEventFired' && event.sessionId === session,
     15000
   );
-  await raw.send('Page.navigate', { url }, session);
-  await loaded;
+  await Promise.all([raw.send('Page.navigate', { url }, session), loaded]).catch((error) => {
+    throw new Error(`Page.loadEventFired did not arrive for ${new URL(url).pathname}`, {
+      cause: error,
+    });
+  });
 }
 
 async function evaluate(raw, session, expression) {
@@ -100,193 +112,288 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
-await test('Chrome: the WebMCP holder reports ordinary tool changes and excludes protected frames', {
-  timeout: 240000,
-}, async () => {
-  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-chrome-'));
-  let browser;
-  let raw;
-  let held;
-  let watcher;
-  let server;
-  try {
-    const keyPath = path.join(cwd, 'key.pem');
-    const certPath = path.join(cwd, 'cert.pem');
-    execFileSync(
-      'openssl',
-      [
-        'req',
-        '-x509',
-        '-newkey',
-        'rsa:2048',
-        '-nodes',
-        '-keyout',
-        keyPath,
-        '-out',
-        certPath,
-        '-days',
-        '1',
-        '-subj',
-        '/CN=localhost',
-        '-addext',
-        'subjectAltName=DNS:localhost,DNS:seven.sliccy.ai,DNS:foreign.test',
-      ],
-      { stdio: 'ignore' }
-    );
-    let port;
-    let ordinary;
-    server = createServer(
-      { key: await readFile(keyPath), cert: await readFile(certPath) },
-      (req, res) => {
-        res.writeHead(200, { 'content-type': 'text/html' });
-        const url = new URL(req.url, 'https://localhost');
-        const tool = (name) =>
-          `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
-        if (url.pathname === '/cross') {
-          res.end(
-            `<!doctype html><script>window.addCross = () => document.modelContext.registerTool(${tool('cross_late')});</script>`
-          );
-          return;
-        }
-        if (url.pathname === '/protected') {
-          res.end(
-            `<!doctype html><script>const tools = []; document.modelContext = {getTools: async () => tools, executeTool: async () => 'protected'}; window.addProtected = () => tools.push(${tool('protected_tool')});</script>`
-          );
-          return;
-        }
-        const frames =
-          url.pathname === '/frames'
-            ? `<iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe><iframe src="https://seven.sliccy.ai:${port}/protected"></iframe>`
+for (const protectedFrames of [true, false]) {
+  await test(protectedFrames
+    ? 'Chrome: the WebMCP holder reports ordinary tool changes, recovers cross-origin frames after navigation and excludes protected frames'
+    : 'Chrome: ordinary to ordinary navigation retains admitted cross-origin tool changes', {
+    timeout: 240000,
+  }, async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-chrome-'));
+    let browser;
+    let raw;
+    let held;
+    let watcher;
+    let server;
+    let wire;
+    try {
+      const keyPath = path.join(cwd, 'key.pem');
+      const certPath = path.join(cwd, 'cert.pem');
+      execFileSync(
+        'openssl',
+        [
+          'req',
+          '-x509',
+          '-newkey',
+          'rsa:2048',
+          '-nodes',
+          '-keyout',
+          keyPath,
+          '-out',
+          certPath,
+          '-days',
+          '1',
+          '-subj',
+          '/CN=localhost',
+          '-addext',
+          'subjectAltName=DNS:localhost,DNS:seven.sliccy.ai,DNS:foreign.test',
+        ],
+        { stdio: 'ignore' }
+      );
+      let port;
+      let ordinary;
+      server = createServer(
+        { key: await readFile(keyPath), cert: await readFile(certPath) },
+        (req, res) => {
+          res.writeHead(200, { 'content-type': 'text/html' });
+          const url = new URL(req.url, 'https://localhost');
+          const tool = (name) =>
+            `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
+          if (url.pathname === '/cross') {
+            res.end(
+              `<!doctype html><script>const crossController = new AbortController(); window.addCross = () => document.modelContext.registerTool(${tool('cross_late')}, { signal: crossController.signal }); window.removeCross = () => crossController.abort();</script>`
+            );
+            return;
+          }
+          if (url.pathname === '/protected') {
+            res.end(
+              `<!doctype html><script>const tools = []; document.modelContext = {getTools: async () => tools, executeTool: async () => 'protected'}; window.addProtected = () => tools.push(${tool('protected_tool')});</script>`
+            );
+            return;
+          }
+          const frames = ['/frames', '/ordinary-frames', '/ordinary-start'].includes(url.pathname)
+            ? `<iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${url.pathname === '/frames' ? `<iframe src="https://seven.sliccy.ai:${port}/protected"></iframe>` : ''}`
             : '';
-        res.end(`<!doctype html><title>toolchange</title>${frames}<script>
+          res.end(`<!doctype html><title>toolchange</title>${frames}<script>
 const controller = new AbortController();
 if (document.modelContext) document.modelContext.registerTool(${tool('initial')});
 window.addLate = () => document.modelContext.registerTool(${tool('late')}, { signal: controller.signal });
 window.removeLate = () => controller.abort();
 addEventListener('pagehide', () => document.modelContext.registerTool(${tool('stale')}));
 </script>`);
+        }
+      );
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      port = server.address().port;
+      ordinary = `https://localhost:${port}`;
+      browser = await launchBrowser([
+        '--ignore-certificate-errors',
+        '--no-proxy-server',
+        '--disable-features=WebMCP,WebMCPTesting',
+        '--site-per-process',
+        '--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1, MAP foreign.test 127.0.0.1',
+      ]);
+      wire = await webmcpWire(browser.wsUrl);
+      raw = await observer(browser.wsUrl);
+      const { targetId } = await raw.send('Target.createTarget', {
+        url: 'about:blank',
+        background: true,
+      });
+      const { sessionId } = await raw.send('Target.attachToTarget', { targetId, flatten: true });
+      await raw.send('Page.enable', {}, sessionId);
+      await navigate(raw, sessionId, `${ordinary}/${protectedFrames ? 'tools' : 'ordinary-start'}`);
+      held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+      const ready = await held.next((line) => line.event === 'ready', 0);
+      assert.equal(ready.mode, 'polyfill');
+      watcher = stream(browser.wsUrl, cwd, ['discover', '--json', '--no-probe']);
+      await sleep(3000);
+
+      let from = held.lines.length;
+      await evaluate(raw, sessionId, 'addLate()');
+      const added = await held.next(changed(targetId), from);
+      assert.equal(added.tab, targetId);
+      assert.equal(added.target, targetId);
+      assert.equal(added.loaderId, ready.loaderId);
+      assert.deepEqual(names(added), ['initial', 'late']);
+      assert.ok(added.tools.every((tool) => tool.polyfilled === true && tool.policy === 'allowed'));
+      const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.deepEqual(added.tools, JSON.parse(listed.stdout));
+      const reported = await watcher.next(
+        (line) => line.standard === 'webmcp' && line.summary?.event === 'tools-changed',
+        0
+      );
+      assert.equal(reported.targetId, targetId);
+      assert.equal(reported.summary.loaderId, added.loaderId);
+      assert.deepEqual(reported.summary.tools, added.tools);
+
+      from = held.lines.length;
+      await evaluate(raw, sessionId, 'removeLate()');
+      const removed = await held.next(changed(targetId), from);
+      assert.equal(removed.loaderId, ready.loaderId);
+      assert.deepEqual(names(removed), ['initial']);
+
+      if (!protectedFrames) {
+        const initial = (await raw.send('Target.getTargets', {})).targetInfos;
+        assert.equal(
+          initial.some(
+            (target) => target.type === 'iframe' && target.url.includes('seven.sliccy.ai')
+          ),
+          false
+        );
+        const foreign = initial.find(
+          (target) =>
+            target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
+        );
+        assert.ok(foreign);
+        const childSession = (
+          await raw.send('Target.attachToTarget', { targetId: foreign.targetId, flatten: true })
+        ).sessionId;
+        assert.equal(await evaluate(raw, childSession, 'typeof document.modelContext'), 'object');
+        await raw.send('Target.detachFromTarget', { sessionId: childSession });
       }
-    );
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-    port = server.address().port;
-    ordinary = `https://localhost:${port}`;
-    browser = await launchBrowser([
-      '--ignore-certificate-errors',
-      '--no-proxy-server',
-      '--disable-features=WebMCP,WebMCPTesting',
-      '--site-per-process',
-      '--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1, MAP foreign.test 127.0.0.1',
-    ]);
-    raw = await observer(browser.wsUrl);
-    const { targetId } = await raw.send('Target.createTarget', {
-      url: 'about:blank',
-      background: true,
-    });
-    const { sessionId } = await raw.send('Target.attachToTarget', { targetId, flatten: true });
-    await raw.send('Page.enable', {}, sessionId);
-    await navigate(raw, sessionId, `${ordinary}/tools`);
-    held = stream(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
-    const ready = await held.next((line) => line.event === 'ready', 0);
-    assert.equal(ready.mode, 'polyfill');
-    watcher = stream(browser.wsUrl, cwd, ['discover', '--json', '--no-probe']);
-    await sleep(3000);
+      const navigated = held.lines.length;
+      const framesReady = held.next(
+        (line) => line.event === 'document-ready' && line.loaderId !== ready.loaderId,
+        navigated
+      );
+      const [, document] = await Promise.all([
+        navigate(raw, sessionId, `${ordinary}/${protectedFrames ? 'frames' : 'ordinary-frames'}`),
+        framesReady,
+      ]);
+      await sleep(1500);
+      assert.equal(
+        held.lines
+          .slice(navigated)
+          .some(
+            (line) =>
+              line.event === 'tools-changed' &&
+              (line.loaderId === ready.loaderId || names(line).includes('stale'))
+          ),
+        false,
+        JSON.stringify(held.lines)
+      );
+      const targets = (await raw.send('Target.getTargets', {})).targetInfos;
+      const cross = targets.find(
+        (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
+      );
+      assert.ok(cross, 'cross-origin OOPIF was not created');
+      if (protectedFrames) {
+        const sealed = targets.find(
+          (target) =>
+            target.type === 'iframe' && target.url === `https://seven.sliccy.ai:${port}/protected`
+        );
+        assert.ok(sealed, 'protected OOPIF was not created');
+        const protectedSession = (
+          await raw.send('Target.attachToTarget', { targetId: sealed.targetId, flatten: true })
+        ).sessionId;
+        assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
+        await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
+        const crossSession = (
+          await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
+        ).sessionId;
+        await evaluate(raw, crossSession, 'addCross()');
+        const crossListed = await once(browser.wsUrl, cwd, [
+          'webmcp-list',
+          '--tab',
+          targetId,
+          '--json',
+          '--from-origin',
+          `https://foreign.test:${port}`,
+        ]);
+        assert.notEqual(crossListed.code, 0);
+        assert.equal(crossListed.stdout, '');
+        assert.match(crossListed.stderr, /slicc: refused:/);
+        await sleep(1500);
+        assert.deepEqual(held.lines.slice(navigated).filter(changed(cross.targetId)), []);
+        assert.equal(
+          (await raw.send('Target.getTargetInfo', { targetId: sealed.targetId })).targetInfo.url,
+          `https://seven.sliccy.ai:${port}/protected`
+        );
+        assert.equal(JSON.stringify(held.lines.slice(navigated)).includes('cross_late'), false);
+        assert.equal(JSON.stringify(watcher.lines).includes('cross_late'), false);
+        await raw.send('Target.detachFromTarget', { sessionId: crossSession });
+        assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+        assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
+        assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
+      }
+      assert.ok(document.loaderId);
 
-    let from = held.lines.length;
-    await evaluate(raw, sessionId, 'addLate()');
-    const added = await held.next(changed(targetId), from);
-    assert.equal(added.tab, targetId);
-    assert.equal(added.target, targetId);
-    assert.equal(added.loaderId, ready.loaderId);
-    assert.deepEqual(names(added), ['initial', 'late']);
-    assert.ok(added.tools.every((tool) => tool.polyfilled === true && tool.policy === 'allowed'));
-    const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
-    assert.equal(listed.code, 0, listed.stderr);
-    assert.deepEqual(added.tools, JSON.parse(listed.stdout));
-    const reported = await watcher.next(
-      (line) => line.standard === 'webmcp' && line.summary?.event === 'tools-changed',
-      0
-    );
-    assert.equal(reported.targetId, targetId);
-    assert.equal(reported.summary.loaderId, added.loaderId);
-    assert.deepEqual(reported.summary.tools, added.tools);
+      const crossControl = async (stale) => {
+        const child = (await raw.send('Target.getTargets', {})).targetInfos.find(
+          (target) =>
+            target.type === 'iframe' &&
+            target.url === `https://foreign.test:${port}/cross` &&
+            target.parentFrameId === targetId &&
+            !stale.includes(target.targetId)
+        );
+        assert.ok(child, 'ordinary OOPIF was not created');
+        const childSession = (
+          await raw.send('Target.attachToTarget', { targetId: child.targetId, flatten: true })
+        ).sessionId;
+        const fromOrigin = async () => {
+          const listed = await once(browser.wsUrl, cwd, [
+            'webmcp-list',
+            '--tab',
+            targetId,
+            '--json',
+            '--from-origin',
+            `https://foreign.test:${port}`,
+          ]);
+          assert.equal(listed.code, 0, listed.stderr);
+          return JSON.parse(listed.stdout).filter((tool) => tool.frameId === child.targetId);
+        };
+        let start = held.lines.length;
+        await evaluate(raw, childSession, 'addCross()');
+        const added = await held.next(changed(child.targetId), start);
+        assert.equal(added.tab, targetId);
+        assert.equal(added.target, child.targetId);
+        assert.equal(added.origin, `https://foreign.test:${port}`);
+        assert.deepEqual(names(added), ['cross_late']);
+        assert.deepEqual(added.tools, await fromOrigin());
+        start = held.lines.length;
+        await evaluate(raw, childSession, 'removeCross()');
+        const removed = await held.next(changed(child.targetId), start);
+        assert.equal(removed.target, child.targetId);
+        assert.equal(removed.loaderId, added.loaderId);
+        assert.deepEqual(removed.tools, []);
+        assert.deepEqual(await fromOrigin(), []);
+        await raw.send('Target.detachFromTarget', { sessionId: childSession });
+        return child.targetId;
+      };
 
-    from = held.lines.length;
-    await evaluate(raw, sessionId, 'removeLate()');
-    const removed = await held.next(changed(targetId), from);
-    assert.equal(removed.loaderId, ready.loaderId);
-    assert.deepEqual(names(removed), ['initial']);
+      const ordinaryReady = held.next(
+        (line) => line.event === 'document-ready' && line.loaderId !== document.loaderId,
+        held.lines.length
+      );
+      await Promise.all([navigate(raw, sessionId, `${ordinary}/ordinary-frames`), ordinaryReady]);
+      const navigatedCross = await crossControl([cross.targetId]);
+      assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+      assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
+      held.child.stdin.end();
+      assert.equal(await held.ended, 0, held.stderr());
 
-    const navigated = held.lines.length;
-    const framesReady = held.next(
-      (line) => line.event === 'document-ready' && line.loaderId !== ready.loaderId,
-      navigated
-    );
-    await navigate(raw, sessionId, `${ordinary}/frames`);
-    const document = await framesReady;
-    await sleep(1500);
-    assert.equal(
-      held.lines
-        .slice(navigated)
-        .some(
-          (line) =>
-            line.event === 'tools-changed' &&
-            (line.loaderId === ready.loaderId || names(line).includes('stale'))
-        ),
-      false,
-      JSON.stringify(held.lines)
-    );
-    const targets = (await raw.send('Target.getTargets', {})).targetInfos;
-    const cross = targets.find(
-      (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
-    );
-    assert.ok(cross, 'cross-origin OOPIF was not created');
-    const sealed = targets.find(
-      (target) =>
-        target.type === 'iframe' && target.url === `https://seven.sliccy.ai:${port}/protected`
-    );
-    assert.ok(sealed, 'protected OOPIF was not created');
-    const protectedSession = (
-      await raw.send('Target.attachToTarget', { targetId: sealed.targetId, flatten: true })
-    ).sessionId;
-    assert.equal(await evaluate(raw, protectedSession, 'typeof addProtected'), 'undefined');
-    await raw.send('Target.detachFromTarget', { sessionId: protectedSession });
-    const crossSession = (
-      await raw.send('Target.attachToTarget', { targetId: cross.targetId, flatten: true })
-    ).sessionId;
-    await evaluate(raw, crossSession, 'addCross()');
-    const crossListed = await once(browser.wsUrl, cwd, [
-      'webmcp-list',
-      '--tab',
-      targetId,
-      '--json',
-      '--from-origin',
-      `https://foreign.test:${port}`,
-    ]);
-    assert.notEqual(crossListed.code, 0);
-    assert.equal(crossListed.stdout, '');
-    assert.match(crossListed.stderr, /slicc: refused:/);
-    await sleep(1500);
-    assert.deepEqual(held.lines.slice(navigated).filter(changed(cross.targetId)), []);
-    assert.equal(
-      (await raw.send('Target.getTargetInfo', { targetId: sealed.targetId })).targetInfo.url,
-      `https://seven.sliccy.ai:${port}/protected`
-    );
-    assert.equal(JSON.stringify(held.lines.slice(navigated)).includes('cross_late'), false);
-    assert.equal(JSON.stringify(watcher.lines).includes('cross_late'), false);
-    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
-    assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
-    assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
-    assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
-    assert.ok(document.loaderId);
-    held.child.stdin.end();
-    assert.equal(await held.ended, 0, held.stderr());
-    held = undefined;
-  } finally {
-    held?.child.kill('SIGKILL');
-    watcher?.child.kill('SIGKILL');
-    await raw?.close();
-    await browser?.close();
-    await new Promise((resolve) => (server ? server.close(resolve) : resolve()));
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
+      held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+      const restarted = await held.next((line) => line.event === 'ready', 0);
+      assert.equal(restarted.mode, 'polyfill');
+      assert.equal(restarted.reloaded, true);
+      await crossControl([cross.targetId, navigatedCross]);
+      assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
+      held.child.stdin.end();
+      assert.equal(await held.ended, 0, held.stderr());
+      held = undefined;
+    } catch (error) {
+      throw new Error(
+        `${error.message}\nholder: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        { cause: error }
+      );
+    } finally {
+      held?.child.kill('SIGKILL');
+      watcher?.child.kill('SIGKILL');
+      await wire?.close();
+      await raw?.close();
+      await browser?.close();
+      await new Promise((resolve) => (server ? server.close(resolve) : resolve()));
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
