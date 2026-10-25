@@ -2,7 +2,7 @@ name: Upload path proof
 
 on:
   push:
-    branches: [fix/609-native-upload-paths]
+    branches: [proof/609-upload-original-row]
 
 permissions:
   contents: read
@@ -41,5 +41,10 @@ jobs:
           node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/upload-path-fake.test.mjs
           for round in $(seq 1 20); do
             echo "Absolute upload Chrome round $round"
+            node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/page-scope-filtered-parent-chrome.test.mjs
+          done
+          git show 13ab3a2:test/integration/page-scope-filtered-parent-chrome.test.mjs > test/integration/page-scope-filtered-parent-chrome.test.mjs
+          for round in $(seq 1 100); do
+            echo "Unchanged original Chrome row $round"
             node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/page-scope-filtered-parent-chrome.test.mjs
           done
