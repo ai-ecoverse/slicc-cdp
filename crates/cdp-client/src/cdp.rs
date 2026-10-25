@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 mod webmcp_guard;
 #[path = "page_scope.rs"]
 mod page_scope;
+#[path = "document_order.rs"]
+mod document_order;
 #[path = "issued.rs"]
 mod issued;
 pub(crate) use issued::target_refusal;
@@ -154,6 +156,7 @@ pub struct Cdp {
     held: BTreeMap<String, Vec<Value>>,
     streams: BTreeMap<String, (Option<String>, Option<DocumentState>)>,
     document_epochs: BTreeMap<String, u64>,
+    unchecked_documents: BTreeMap<(String, String, String), Value>,
     document_versions: BTreeMap<(String, String), String>,
     created_blanks: BTreeMap<String, (String, String, i64)>,
     navigated_blanks: BTreeMap<String, (String, String, String)>,
@@ -271,6 +274,7 @@ impl Cdp {
             held: BTreeMap::new(),
             streams: BTreeMap::new(),
             document_epochs: BTreeMap::new(),
+            unchecked_documents: BTreeMap::new(),
             document_versions: BTreeMap::new(),
             created_blanks: BTreeMap::new(),
             navigated_blanks: BTreeMap::new(),
@@ -1174,7 +1178,7 @@ impl Cdp {
         }
         let sealed = checks.iter().any(|(target, state)| {
             let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
-            self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
+            self.unchecked_document(owner) || self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
         });
         if sealed { Err(self.refusal()) } else { Ok(()) }
     }
@@ -2362,6 +2366,7 @@ impl Cdp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        self.observe_document_order(&method, &params, session.as_deref());
         self.page_scope_changed(&method, &params, session.as_deref());
         if let Some(target) = session.as_deref().and_then(|session| self.session_target(session)) {
             if method == "Page.frameNavigated" {
@@ -3120,6 +3125,7 @@ impl Cdp {
             .map(|page| (page.clone(), self.page_scope_epochs.get(&page).copied().unwrap_or(0), self.page_scope_unknown));
         let result = self.raw_exchange(method, params, session_id, timeout, pinned)?;
         if method == "Page.getFrameTree" {
+            self.verify_document_order(&result, session_id)?;
             let stable_page = page.is_some_and(|(page, epoch, unknown)| self.page_scope_epochs.get(&page).copied().unwrap_or(0) == epoch && self.page_scope_unknown == unknown);
             if !stable_page && !self.tree_current(&result, frame_epoch) {
                 return Err(self.refusal());
