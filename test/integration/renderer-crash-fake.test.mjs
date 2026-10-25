@@ -11,7 +11,7 @@ const event = (kind, sessionId) =>
     : {
         method: kind,
         sessionId,
-        params: kind === 'Inspector.detached' ? { reason: 'Render process gone.' } : {},
+        params: kind === 'Inspector.detached' ? { reason: 'renderer crashed' } : {},
       };
 const options = (transport) => ({ variant: 'prompt', detachDelay: 0, transport });
 const page = (targetId) => ({ targetId, url: `https://${targetId.toLowerCase()}.example.test/` });

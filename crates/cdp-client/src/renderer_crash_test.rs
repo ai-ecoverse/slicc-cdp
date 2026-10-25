@@ -46,8 +46,6 @@ fn renderer_crash_on_the_guard_fails_without_another_receive_or_an_ack() {
 fn renderer_crash_reasons_take_precedence_over_late_success_and_detach_refusals() {
     for crash in [
         json!({"method":"Inspector.targetCrashed","sessionId":"S","params":{}}),
-        json!({"method":"Inspector.detached","sessionId":"G","params":{"reason":"Render process gone."}}),
-        json!({"method":"Inspector.detached","sessionId":"G","params":{"reason":"render_process_gone"}}),
         json!({"method":"Inspector.detached","sessionId":"G","params":{"reason":"renderer crashed"}}),
         json!({"method":"Target.detachedFromTarget","params":{"sessionId":"G","reason":"target_crashed"}}),
         json!({"method":"Target.detachedFromTarget","params":{"sessionId":"S","reason":"crashed"}}),
@@ -71,6 +69,8 @@ fn renderer_crash_unrelated_targets_and_noncrash_detaches_do_not_abort_healthy_c
         json!({"method":"Inspector.targetCrashed","sessionId":"OTHER","params":{}}),
         json!({"method":"Inspector.targetCrashed","params":{}}),
         json!({"method":"Inspector.detached","sessionId":"G","params":{"reason":"replaced_with_devtools"}}),
+        json!({"method":"Inspector.detached","sessionId":"G","params":{"reason":"Render process gone."}}),
+        json!({"method":"Inspector.detached","sessionId":"G","params":{"reason":"render_process_gone"}}),
         json!({"method":"Runtime.executionContextsCleared","sessionId":"G","params":{"reason":"crashed"}}),
     ] {
         let (mut cdp, _) = renderer_crash_client(crash, true);

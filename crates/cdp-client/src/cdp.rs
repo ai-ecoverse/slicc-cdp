@@ -3062,7 +3062,7 @@ impl Cdp {
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         let reason = value.pointer("/params/reason").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
         if method != "Inspector.targetCrashed" && !(matches!(method, "Inspector.detached" | "Target.detachedFromTarget")
-            && (reason.contains("crash") || matches!(reason.as_str(), "render process gone." | "render_process_gone"))) { return }
+            && reason.contains("crash")) { return }
         let session = if method == "Target.detachedFromTarget" { value.pointer("/params/sessionId") } else { value.get("sessionId") }
             .and_then(Value::as_str).filter(|session| !session.is_empty());
         if let Some(session) = session {
