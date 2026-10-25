@@ -21,6 +21,12 @@ export async function webmcpWire(endpoint) {
     }
   };
   const proxy = await fakeCdp({
+    onDisconnect(send) {
+      const peer = peers.get(send);
+      if (!peer) return;
+      peers.delete(send);
+      peer.ws.close();
+    },
     intercept(message, send) {
       let peer = peers.get(send);
       if (!peer) {

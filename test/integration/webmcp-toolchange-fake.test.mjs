@@ -281,6 +281,108 @@ test('fake: a live provisional child with opaque frame origin retains only its v
   );
 });
 
+test('fake: a newer OOPIF response observed by its parent survives discarded local-child gate metadata', async () => {
+  let armed = false;
+  let swapped = false;
+  let liveBackend;
+  const provider = { id: 'POLICY_CHILD', origin: 'https://foreign.test', allow: 'tools *' };
+  await scenario(
+    {
+      children: [provider],
+      onCommand(message, pages, send) {
+        if (
+          !armed ||
+          swapped ||
+          message.method !== 'Debugger.getScriptSource' ||
+          !message.params.scriptId.endsWith('-POLICY_CHILD')
+        )
+          return;
+        swapped = true;
+        const child = pages.get('POLICY_CHILD');
+        child.loader = `FRESH-${child.loader}`;
+        child.oopif = true;
+        provider.oopif = true;
+        liveBackend.targets.push({
+          targetId: child.id,
+          type: 'iframe',
+          parentFrameId: 'TAB',
+          url: `${child.origin}/`,
+        });
+        liveBackend.sessions.set('FRESH_CHILD', child.id);
+        send({
+          method: 'Network.responseReceived',
+          sessionId: message.sessionId,
+          params: {
+            type: 'Document',
+            frameId: child.id,
+            loaderId: child.loader,
+            response: { url: `${child.origin}/`, status: 200, headers: {} },
+          },
+        });
+        send({
+          method: 'Runtime.executionContextDestroyed',
+          sessionId: message.sessionId,
+          params: { executionContextId: child.main },
+        });
+        send({
+          method: 'Page.frameDetached',
+          sessionId: message.sessionId,
+          params: { frameId: child.id, reason: 'swap' },
+        });
+        send({
+          method: 'Target.attachedToTarget',
+          sessionId: message.sessionId,
+          params: {
+            sessionId: 'FRESH_CHILD',
+            targetInfo: {
+              targetId: child.id,
+              type: 'iframe',
+              parentFrameId: 'TAB',
+              url: `${child.origin}/`,
+            },
+            waitingForDebugger: true,
+          },
+        });
+      },
+    },
+    async ({ backend, cwd, held }) => {
+      liveBackend = backend;
+      armed = true;
+      const start = held.lines.length;
+      backend.reload();
+      await held.next((line) => line.event === 'document-ready', start);
+      assert.equal(swapped, true);
+      const addedAt = held.lines.length;
+      const controller = new AbortController();
+      backend.pages
+        .get('POLICY_CHILD')
+        .document.modelContext.registerTool(
+          { name: 'policy_recovered', exposedTo: ['https://ordinary.test'], execute: () => 'ok' },
+          { signal: controller.signal }
+        );
+      const added = await held.next(changed('POLICY_CHILD'), addedAt);
+      assert.deepEqual(names(added), ['policy_recovered']);
+      const listed = await run(backend.url, cwd, [
+        'webmcp-list',
+        '--tab',
+        'TAB',
+        '--json',
+        '--from-origin',
+        'https://foreign.test',
+      ]);
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.deepEqual(
+        added.tools,
+        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'POLICY_CHILD')
+      );
+      const removedAt = held.lines.length;
+      controller.abort();
+      assert.deepEqual((await held.next(changed('POLICY_CHILD'), removedAt)).tools, []);
+      assert.doesNotMatch(held.stderr(), /target closed/);
+    }
+  );
+});
+
 test('fake: a child gate abandoned while queued retains the parent document installer', async () => {
   let armed = false;
   let queued = false;

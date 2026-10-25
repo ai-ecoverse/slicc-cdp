@@ -393,7 +393,7 @@ impl Cdp {
         arm.pending_contexts.remove(&id);
         arm.pending_frames.remove(&context.frame);
         arm.accepted.retain(|(frame, _, _)| frame != &context.frame);
-        arm.documents.retain(|_, document| document.get("frameId").and_then(Value::as_str) != Some(&context.frame));
+        arm.documents.retain(|_, document| document.get("frameId").and_then(Value::as_str) != Some(&context.frame) || document.get("loaderId").and_then(Value::as_str) != Some(&context.loader));
         self.webmcp_trace_stage(session, "parent-installer-retained", "abandoned local child gate");
         true
     }
