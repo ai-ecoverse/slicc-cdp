@@ -1,0 +1,48 @@
+name: State publication proof
+on:
+  push:
+    branches: [fix/639-atomic-state-writes]
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: cloud-run-job
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: |
+          cp crates/playwright-cli/src/session.rs /tmp/session-fixed.rs
+          git show b55c5d1:crates/playwright-cli/src/session.rs > crates/playwright-cli/src/session.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/playwright-cli/src/session.rs')
+          s = p.read_text()
+          s = s.replace('    static FAIL_PRIVATE_FILE:', '    static PRIVATE_OPEN: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };\n    static FAIL_PRIVATE_FILE:', 1)
+          s = s.replace('        file.write_all(body.as_bytes())', '        #[cfg(test)]\n        PRIVATE_OPEN.with(|hook| { if let Some(opened) = hook.borrow().as_ref() { opened(path); } });\n        file.write_all(body.as_bytes())', 1)
+          s = s.replace('    use cdp_client::hash::sha256_hex;\n', '    use cdp_client::hash::sha256_hex;\n    include!("session_atomic_test.rs");\n', 1)
+          p.write_text(s)
+          PY
+          if node --test --test-concurrency=1 test/integration/session-publication-fake.test.mjs > /tmp/state-base.log 2>&1; then exit 1; fi
+          python3 - <<'PY'
+          from pathlib import Path
+          log = Path('/tmp/state-base.log').read_text()
+          print(log)
+          assert 'test session::tests::session_atomic_publication_fake_keeps_generation_metadata_during_an_open_writer ... FAILED' in log
+          assert 'test session::tests::session_atomic_publication_preserves_the_old_generation_for_an_open_reader ... FAILED' in log
+          assert 'test result: FAILED. 1 passed; 2 failed' in log
+          PY
+          cp /tmp/session-fixed.rs crates/playwright-cli/src/session.rs
+          cargo build --locked -j 4 -p slicc-cdp -p curlwright
+          cargo build --locked -j 4 --target wasm32-wasip1 -p slicc-cdp -p curlwright
+          cargo test --locked -j 4 -p slicc-cdp session::tests -- --test-threads=1
+          cargo test --locked -j 4 -p slicc-cdp storage::tests -- --test-threads=1
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/session-publication-fake.test.mjs test/integration/webmcp-polyfill-fake.test.mjs test/integration/har-live-lease.test.mjs test/integration/har-kernel-holder.test.mjs test/integration/recording-fake.test.mjs
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-name-pattern='state-save writes' test/integration/storage.test.mjs

@@ -54,9 +54,7 @@ fn read(path: &Path) -> Option<Value> {
 }
 
 fn store(path: &Path, value: &Value) -> Result<(), String> {
-    let staged = path.with_extension("json.tmp");
-    session::write_private(&staged, &value.to_string())?;
-    fs::rename(&staged, path).map_err(|err| format!("session: {err}\n"))
+    session::write_private(path, &value.to_string())
 }
 
 fn now_ms() -> u64 {

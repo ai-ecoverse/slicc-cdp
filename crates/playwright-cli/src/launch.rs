@@ -1711,18 +1711,8 @@ impl ProfileFs for DiskFs {
     }
 
     fn write(&mut self, path: &str, body: &str) -> Result<(), String> {
-        let parent = std::path::Path::new(path).parent();
-        if let Some(parent) = parent {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!("playwright-cli: could not write preferences: {err}\n")
-            })?;
-        }
-        let tmp = format!("{path}.slicc-tmp");
-        std::fs::write(&tmp, body).map_err(|err| {
-            format!("playwright-cli: could not write preferences: {err}\n")
-        })?;
-        std::fs::rename(&tmp, path).map_err(|err| {
-            format!("playwright-cli: could not write preferences: {err}\n")
+        crate::session::write_private_file(std::path::Path::new(path), body).map_err(|err| {
+            format!("playwright-cli: could not write preferences: {}", err.trim_start_matches("session: "))
         })
     }
 }
