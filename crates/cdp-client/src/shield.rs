@@ -1895,7 +1895,7 @@ mod tests {
         let frame = format!("{seven}/code?n=frame");
         let frame_trigger = cdp.call(
             "Runtime.evaluate",
-            json!({ "expression": format!("const f = document.createElement('iframe'); f.src = {}; document.body.appendChild(f); true", json!(frame)) }),
+            json!({ "expression": format!("const f = document.createElement('iframe'); f.id = 'guard-window-frame'; f.src = {}; document.body.appendChild(f); true", json!(frame)) }),
             Some(&session),
         );
         let frame_seen = guard_failed(&mut cdp, &frame);
@@ -1904,7 +1904,7 @@ mod tests {
             "seven iframe not intercepted: {}",
             guard_evidence(&cdp, &mut raw, &app, &slow, "/code", &frame_trigger)
         );
-        frame_trigger.as_ref().unwrap();
+        assert!(frame_trigger.as_ref().is_err_and(|error| error.starts_with("slicc: refused:")));
         assert_eq!(
             fixture_hits(&app, "/code"),
             "0",
@@ -1912,6 +1912,7 @@ mod tests {
             guard_evidence(&cdp, &mut raw, &app, &slow, "/code", &frame_trigger)
         );
 
+        assert_eq!(raw.eval(&slow, "document.getElementById('guard-window-frame').remove(); true"), json!(true));
         let main = format!("{seven}/dump?n=main");
         let main_trigger = cdp.call(
             "Runtime.evaluate",

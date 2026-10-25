@@ -57,6 +57,7 @@ struct DocumentState {
     scope: Option<String>,
     epoch: u64,
     page_scope: Option<(String, u64, u64)>,
+    runtime_scope_epoch: Option<u64>,
 }
 
 impl PartialEq for DocumentState {
@@ -121,6 +122,8 @@ pub struct Cdp {
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
     checking_page_events: bool,
+    pending_page_events: VecDeque<Value>,
+    runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
     page_scope_epochs: BTreeMap<String, u64>,
     page_scope_unknown: u64,
@@ -176,6 +179,10 @@ pub struct Cdp {
     waiter: Option<Waiter>,
     waiter_due: Instant,
     #[cfg(test)]
+    runtime_preparing: bool,
+    #[cfg(test)]
+    runtime_probe: Vec<Value>,
+    #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
@@ -230,6 +237,8 @@ impl Cdp {
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
             checking_page_events: false,
+            pending_page_events: VecDeque::new(),
+            runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
             page_scope_epochs: BTreeMap::new(),
             page_scope_unknown: 0,
@@ -284,6 +293,10 @@ impl Cdp {
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
+            #[cfg(test)]
+            runtime_preparing: false,
+            #[cfg(test)]
+            runtime_probe: Vec::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -423,6 +436,73 @@ impl Cdp {
         self.deciders.contains_key(session_id)
     }
 
+    #[cfg(test)]
+    fn runtime_stage(&mut self, method: &str, stage: &str) {
+        if method == "Runtime.evaluate" { self.runtime_probe.push(json!({"stage":stage})); }
+    }
+
+    #[cfg(test)]
+    fn runtime_contexts(&mut self, method: &str, stage: &str, guard: &str, target: &str, state: &DocumentState, selected: Option<&str>) {
+        if method != "Runtime.evaluate" { return }
+        let contexts: Vec<Value> = self.context_proofs.iter().filter(|((owner, _), _)| owner == guard).map(|((_, unique), proof)| {
+            let frame = state.frames.get(&proof.frame);
+            json!({"default":proof.default,"frame_known":frame.is_some(),
+                "main_frame":frame.is_some_and(|frame| frame[4].is_empty()),
+                "origin_known":url::Url::parse(&proof.origin).is_ok(),
+                "origin_protected":self.guard.url(&proof.origin),
+                "origin_opaque":matches!(proof.origin.as_str(), "" | "://" | "null"),
+                "origin_matches_frame":frame.is_some_and(|frame| frame[2] == proof.origin),
+                "loader_known":proof.loader.as_ref().is_some_and(|loader| !loader.is_empty()),
+                "loader_matches_frame":proof.loader.as_ref().zip(frame).is_some_and(|(loader, frame)| loader == &frame[0]),
+                "selected":selected == Some(unique.as_str())})
+        }).collect();
+        self.runtime_probe.push(json!({"stage":stage,"private_contexts":contexts,
+            "frame_count":state.frames.len(),"scope_known":state.scope.is_some(),
+            "scope_default":state.scope.as_deref() == Some(""),
+            "page_scope_known":state.page_scope.is_some(),"worker":state.worker.is_some(),
+            "owned_blank":state.frames.iter().any(|(id, frame)| frame[1] == "about:blank" && self.owns_blank(target, id, &frame[0]))}));
+    }
+
+    #[cfg(test)]
+    fn runtime_prepare_probe(&mut self, category: &str, details: Value) {
+        if self.runtime_preparing { self.runtime_probe.push(json!({"stage":"prepare-check","category":category,"details":details})); }
+    }
+
+    #[cfg(test)]
+    fn runtime_prepare_frames(&mut self, tree: &Value, frames: &BTreeMap<String, Vec<String>>) {
+        let mut pending = vec![(tree, None)];
+        while let Some((node, parent)) = pending.pop() {
+            let Some(frame) = node.get("frame") else {
+                self.runtime_prepare_probe("frame-placement", json!({"frame_present":false}));
+                return;
+            };
+            let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+            if !frames.contains_key(id) {
+                let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+                let origin = self.page_scope_origin(frame).or_else(|| frame.get("securityOrigin").and_then(Value::as_str)).unwrap_or("");
+                self.runtime_prepare_probe("frame-evidence", json!({"id_known":frame_text_known(id),"url_known":frame_text_known(url),
+                    "parent_matches":frame.get("parentId").is_none_or(|id| id.as_str() == parent),
+                    "loader_known":frame.get("loaderId").and_then(Value::as_str).is_some_and(|id| frame_text_known(id)),
+                    "initial_blank":url == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some(""),
+                    "origin_empty":origin.is_empty(),"origin_null":origin == "null","origin_opaque":origin == "://",
+                    "origin_protected":self.guard.url(origin),"url_protected":self.guard.url(url),
+                    "error_unverified":self.unverified_error(url, frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or(""))}));
+                return;
+            }
+            if let Some(children) = node.get("childFrames") {
+                let Some(children) = children.as_array() else {
+                    self.runtime_prepare_probe("frame-placement", json!({"children_valid":false}));
+                    return;
+                };
+                for child in children.iter().rev() { pending.push((child, Some(id))); }
+            }
+        }
+        self.runtime_prepare_probe("frame-placement", json!({"collection_complete":false}));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_diagnostics(&self) -> &[Value] { &self.runtime_probe }
+
     pub fn take_fetch_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.fetch_errors)
     }
@@ -444,13 +524,21 @@ impl Cdp {
         timeout: Duration,
     ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
+        #[cfg(test)]
+        if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
+        #[cfg(test)]
+        self.runtime_stage(method, "admit");
         self.admit(method, &params, session_id)?;
         if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
         }
-        let checks = self.prepare(method, &params, session_id)?;
-        let pinned = self.pin_execution(method, &params, session_id, &checks)?;
+        #[cfg(test)]
+        self.runtime_stage(method, "prepare");
+        let mut checks = self.prepare(method, &params, session_id)?;
+        #[cfg(test)]
+        self.runtime_stage(method, "pin");
+        let pinned = self.pin_execution(method, &params, session_id, &mut checks)?;
         let object_pin = method == "Runtime.callFunctionOn" && params.get("objectId").is_some() && !checks.is_empty();
         let executed = pinned.is_some() && method != "Runtime.compileScript" || object_pin;
         let mut sent = params.clone();
@@ -471,13 +559,28 @@ impl Cdp {
             session_id.and_then(|session| self.session_target(session)).and_then(|target| self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target))).cloned()
         } else { None };
         let frame_epoch = self.frame_epoch;
+        #[cfg(test)]
+        self.runtime_stage(method, "forward");
         let result = match self.raw_call_execution(&forwarded, sent, compile_session.as_deref().or(session_id), timeout, executed) {
             Ok(result) => result,
             Err(message) => {
-                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) { self.verify_checks(&checks, false, true)?; }
+                #[cfg(test)]
+                if method == "Runtime.evaluate" {
+                    let text = message.to_lowercase();
+                    self.runtime_probe.push(json!({"stage":"backend-error","refusal":message.starts_with("slicc: refused:"),
+                        "context_missing":text.contains("cannot find context") || text.contains("cannot find execution context"),
+                        "context_destroyed":text.contains("context was destroyed"),"transport":transport_error(&message)}));
+                }
+                if executed && !message.starts_with("slicc: refused:") && !transport_error(&message) {
+                    #[cfg(test)]
+                    self.runtime_stage(method, "error-page-proof");
+                    self.verify_checks(&checks, false, true)?;
+                }
                 return Err(message);
             }
         };
+        #[cfg(test)]
+        self.runtime_stage(method, "reply-proof");
         if content_command(method, &params) == Some(true) && !executed {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"), !method.starts_with("Input."))?;
         }
@@ -505,8 +608,12 @@ impl Cdp {
         if (params.get("frameId").and_then(Value::as_str).is_some() || crosses_frames(method, &params)) && frame_epoch != self.frame_epoch {
             return Err(self.refusal());
         }
+        #[cfg(test)]
+        self.runtime_stage(method, "reply-admission");
         let result = self.after(method, &params, session_id, result)?;
         self.bind_streams(method, session_id, &result, &checks);
+        #[cfg(test)]
+        self.runtime_stage(method, "complete");
         Ok(result)
     }
 
@@ -798,10 +905,27 @@ impl Cdp {
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+        #[cfg(test)]
+        let previous = self.runtime_preparing;
+        #[cfg(test)]
+        { self.runtime_preparing = method == "Runtime.evaluate"; }
+        let result = self.prepare_state(method, params, session);
+        #[cfg(test)]
+        { self.runtime_preparing = previous; }
+        result
+    }
+
+    fn prepare_state(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+        #[cfg(test)]
+        self.runtime_prepare_probe("command-classification", json!({}));
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
         let mut checks = Vec::new();
         if !content { return Ok(checks) }
-        let page_scope = if page_scope::content(method) { Some(self.verify_page_scope_state(session)?) } else { None };
+        let runtime = method.starts_with("Runtime.");
+        let page_scope = if page_scope::content(method) {
+            Some(if method == "Runtime.evaluate" && !Worlds::selectors(params) { self.verify_runtime_page_scope_state(session)? }
+                else { self.verify_page_scope_state(session)? })
+        } else { None };
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -822,6 +946,8 @@ impl Cdp {
             checks.push((target, current));
         }
         if let Some(session) = session {
+            #[cfg(test)]
+            self.runtime_prepare_probe("selected-session", json!({"target_known":self.session_target(session).is_some(),"blocked":self.blocked.contains(session)}));
             let target = self.session_target(session).ok_or_else(|| self.refusal())?;
             if !checks.iter().any(|(known, _)| known == &target) {
                 let selected_frame = params.get("frameId").and_then(Value::as_str).map(str::to_string).or_else(|| {
@@ -832,13 +958,25 @@ impl Cdp {
                         self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
                     })
                 });
-                let scope = if crosses_frames(method, params) || page_scope::content(method) { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
+                let scope = if crosses_frames(method, params) || page_scope::content(method) && !runtime { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
                 let mut state = if self.document_paused(&target) {
+                    #[cfg(test)]
+                    self.runtime_prepare_probe("paused-document-provenance", json!({"cached_state":self.cached_documents.contains_key(&target),
+                        "guard_present":self.guards.contains_key(&target),"document_known":self.documents.contains_key(&target),
+                        "previous_protected":self.documents.get(&target).is_some_and(|doc| doc.previous),"target_protected":self.protected_targets.contains(&target)}));
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
                     self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
-                } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, _)| proof.0 == target) {
-                    state.clone()
-                } else { self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())? };
+                } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, state)| proof.0 == target && (!runtime || Self::runtime_page_reusable(state))) {
+                    #[cfg(test)]
+                    self.runtime_prepare_probe("selected-frame-placement", json!({"source":"fresh-page-proof","explicit_frame":selected_frame.is_some()}));
+                    if runtime { Self::scoped_page_state(state, scope.unwrap_or("")).ok_or_else(|| self.refusal())? } else { state.clone() }
+                } else {
+                    #[cfg(test)]
+                    self.runtime_prepare_probe("selected-document-state", json!({"source":"private-document-proof","guard_present":self.guards.contains_key(&target)}));
+                    self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())?
+                };
+                #[cfg(test)]
+                self.runtime_prepare_probe("blocking", json!({"blocked":self.blocked.contains(session)}));
                 if self.blocked.contains(session) { return Err(self.refusal()) }
                 for key in ["frameId", "contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"] {
                     if let Some(value) = params.get(key) {
@@ -849,27 +987,52 @@ impl Cdp {
                             let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
                             self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
                         };
+                        #[cfg(test)]
+                        self.runtime_prepare_probe("selector-placement", json!({"selector_known":frame.is_some(),"frame_present":frame.as_ref().is_some_and(|frame| state.frames.contains_key(frame))}));
                         if frame.is_none_or(|frame| !state.frames.contains_key(&frame)) { return Err(self.refusal()) }
                     }
                 }
                 state.page_scope = page_scope.map(|(proof, _)| proof);
+                state.runtime_scope_epoch = state.page_scope.as_ref().filter(|_| runtime).map(|proof| self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0));
                 checks.push((target, state));
             }
         }
+        #[cfg(test)]
+        self.runtime_prepare_probe("selected-state-complete", json!({"checks_present":!checks.is_empty()}));
         if checks.is_empty() { return Err(self.refusal()) }
         Ok(checks)
+    }
+
+    fn scoped_page_state(state: &DocumentState, scope: &str) -> Option<DocumentState> {
+        let mut current = if scope.is_empty() { state.frames.iter().find(|(_, frame)| frame[4].is_empty())?.0.as_str() } else { scope };
+        let mut selected = state.clone();
+        selected.frames.clear();
+        loop {
+            let frame = state.frames.get(current)?;
+            if selected.frames.insert(current.to_string(), frame.clone()).is_some() { return None }
+            if frame[4].is_empty() { break }
+            current = &frame[4];
+        }
+        selected.scope = Some(scope.to_string());
+        Some(selected)
+    }
+
+    fn runtime_page_reusable(state: &DocumentState) -> bool {
+        state.frames.values().find(|frame| frame[4].is_empty()).is_some_and(|frame| {
+            url::Url::parse(&frame[1]).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        })
     }
 
     fn document_paused(&self, target: &str) -> bool {
         self.paused_documents.iter().any(|(session, _)| self.session_target(session).as_deref() == Some(target))
     }
 
-    fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &[(String, DocumentState)]) -> Result<Option<String>, String> {
+    fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &mut Vec<(String, DocumentState)>) -> Result<Option<String>, String> {
         if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.compileScript") || checks.is_empty() { return Ok(None) }
         if method == "Runtime.callFunctionOn" && params.get("objectId").is_some() { return Ok(None) }
         let session = session.ok_or_else(|| self.refusal())?;
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
-        let state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+        let mut state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
         let guard = if let Some(guard) = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)) {
             guard.clone()
         } else {
@@ -881,7 +1044,7 @@ impl Cdp {
             self.runtime_sessions.insert(target.clone(), guard.clone());
             guard
         };
-        let choose = |proofs: &BTreeMap<(String, String), ContextProof>| {
+        let choose = |proofs: &BTreeMap<(String, String), ContextProof>, state: &DocumentState| {
             proofs.iter().find(|((owner, unique), proof)| {
                 owner == &guard && if let Some(id) = params.get("contextId").or_else(|| params.get("executionContextId")).and_then(Value::as_i64) {
                     proof.id == id
@@ -892,13 +1055,15 @@ impl Cdp {
                 } else { proof.default && (state.worker.is_some() || state.scope.as_deref() == Some(proof.frame.as_str()) || state.frames.get(&proof.frame).is_some_and(|evidence| evidence[4].is_empty())) }
             }).map(|((_, unique), proof)| (unique.clone(), proof.clone()))
         };
-        let mut selected = choose(&self.context_proofs);
+        let mut selected = choose(&self.context_proofs, &state);
+        #[cfg(test)]
+        self.runtime_contexts(method, "private-context-initial", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
         let paused = self.document_paused(&target);
         let stable_context = selected.as_ref().is_some_and(|(_, proof)| state.worker.is_some()
             || state.frames.get(&proof.frame).is_some_and(|evidence| proof.loader.as_deref() == Some(evidence[0].as_str())));
         if !paused && !stable_context {
             let deadline = Instant::now() + DOCUMENT_CHECK;
-            for _ in 0..2 {
+            for attempt in 0..2 {
                 self.context_proofs.retain(|(owner, _), _| owner != &guard);
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() { return Err(self.refusal()) }
@@ -906,20 +1071,39 @@ impl Cdp {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() { return Err(self.refusal()) }
                 self.raw_call("Runtime.enable", json!({}), Some(&guard), left)?;
+                #[cfg(test)]
+                self.runtime_contexts(method, "private-context-replayed", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
                 let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.refusal())?;
+                #[cfg(test)]
+                self.runtime_contexts(method, "private-context-current", &guard, &target, &current, selected.as_ref().map(|(unique, _)| unique.as_str()));
                 let same = if state.worker.is_some() { state.worker == current.worker } else {
                     state.frames.iter().filter(|(_, evidence)| evidence[4].is_empty()).all(|(id, evidence)| current.frames.get(id).is_some_and(|now| evidence[0] == now[0] && evidence[2] == now[2]))
                 };
-                if !same || self.blocked.contains(session) { return Err(self.refusal()) }
-                selected = choose(&self.context_proofs);
+                if self.blocked.contains(session) { return Err(self.refusal()) }
+                if !same {
+                    let ordinary_default_commit = state.worker.is_none() && state.scope.as_deref() == Some("") && state.frames.len() == 1
+                        && !Worlds::selectors(params) && self.guards.get(&target) == Some(&guard)
+                        && state.page_scope.as_ref().is_some_and(|proof| proof.0 == target)
+                        && state.frames.iter().all(|(id, before)| current.frames.get(id).is_some_and(|after| before[0] != after[0]
+                            && Self::runtime_page_reusable(&current)));
+                    if attempt != 0 || !ordinary_default_commit { return Err(self.refusal()) }
+                    #[cfg(test)]
+                    self.runtime_stage(method, "private-context-readmission");
+                    *checks = self.prepare(method, params, Some(session))?;
+                    state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+                    continue;
+                }
+                selected = choose(&self.context_proofs, &state);
                 if selected.is_some() { break }
             }
         }
+        #[cfg(test)]
+        self.runtime_contexts(method, "private-context-validation", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
         let (unique, proof) = selected.ok_or_else(|| self.refusal())?;
         let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
         let owned_blank = proof.default && state.frames.get(&proof.frame).is_some_and(|evidence| evidence[1] == "about:blank"
             && self.owns_blank(&target, &proof.frame, &evidence[0]));
-        if unique.is_empty() || proof.origin == "null" || proof.origin.is_empty() && !owned_world && !owned_blank || self.guard.url(&proof.origin) { return Err(self.refusal()) }
+        if unique.is_empty() || proof.origin == "null" && !owned_blank || proof.origin.is_empty() && !owned_world && !owned_blank || self.guard.url(&proof.origin) { return Err(self.refusal()) }
         if state.worker.is_none() {
             let evidence = state.frames.get(&proof.frame).ok_or_else(|| self.refusal())?;
             if proof.loader.as_deref() != Some(evidence[0].as_str()) { return Err(self.refusal()) }
@@ -951,10 +1135,12 @@ impl Cdp {
     fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool, stable_page: bool) -> Result<(), String> {
         for (target, expected) in checks {
             let current = if let Some(proof) = &expected.page_scope {
-                let session = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
+                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
                 let (current, state) = self.verify_page_scope_state(Some(&session))?;
                 if stable_page && &current != proof { return Err(self.refusal()) }
-                (current.0 == *target).then_some(state)
+                if current.0 == *target && (expected.runtime_scope_epoch.is_none() || Self::runtime_page_reusable(&state)) {
+                    Some(if expected.runtime_scope_epoch.is_some() { Self::scoped_page_state(&state, expected.scope.as_deref().unwrap_or("")).ok_or_else(|| self.refusal())? } else { state })
+                } else { None }
             } else { None };
             let current = match current {
                 Some(state) => state,
@@ -965,7 +1151,16 @@ impl Cdp {
         Ok(())
     }
 
-    fn verify_execution(&self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+    fn verify_execution(&mut self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+        for (_, state) in checks {
+            if let Some(proof) = &state.page_scope {
+                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
+                if self.session_target(&session).as_deref() != Some(&proof.0) { return Err(self.refusal()) }
+                if self.page_scope_unknown != proof.2 || state.runtime_scope_epoch != Some(self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0)) {
+                    if self.verify_page_scope(Some(&session))?.0 != proof.0 { return Err(self.refusal()) }
+                }
+            }
+        }
         let sealed = checks.iter().any(|(target, state)| {
             let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
             self.documents.get(owner).is_some_and(|doc| self.unverified_error(&doc.url, &doc.unreachable_url))
@@ -1679,9 +1874,15 @@ impl Cdp {
             state.worker = Some((text("url").to_string(), owner.to_string()));
             return Some(state);
         };
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-document-read", json!({}));
         let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), DOCUMENT_CHECK).ok()?;
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-document-stability", json!({"guard_stable":self.guards.get(target) == Some(&guard)}));
         if self.guards.get(target) != Some(&guard) { return None }
         let epoch = self.document_epochs.get(target).copied().unwrap_or(0);
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-selected-placement", json!({"tree_present":tree.get("frameTree").is_some()}));
         let node = tree.get("frameTree")?;
         let scoped;
         let node = if let Some(id) = scope {
@@ -1691,6 +1892,8 @@ impl Cdp {
         let frame = node.get("frame")?;
         let parent = frame.get("parentId").and_then(Value::as_str);
         let mut frames = BTreeMap::new();
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-parent-placement", json!({"parent_present":parent.is_some()}));
         if let Some(parent) = parent {
             let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
             let info = info.get("targetInfo")?;
@@ -1704,13 +1907,21 @@ impl Cdp {
             if parent_frame.get("id").and_then(Value::as_str) != Some(parent) || parent_frame.get("parentId").is_some() { return None }
             frames = self.document_state_for(&owner, true, Some(parent))?.frames;
         }
-        if !self.collect_document_frames(node, &mut frames, content, parent) { return None }
+        if !self.collect_document_frames(node, &mut frames, content, parent) {
+            #[cfg(test)]
+            self.runtime_prepare_frames(node, &frames);
+            return None;
+        }
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-loader-provenance", json!({"loader_regressed":content && frames.iter().any(|(id, evidence)| evidence[0].is_empty() && self.document_versions.contains_key(&(target.to_string(), id.clone())))}));
         if content && frames.iter().any(|(id, evidence)| evidence[0].is_empty() && self.document_versions.contains_key(&(target.to_string(), id.clone()))) { return None }
         if content && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or(""))
             && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
         {
             let id = frame.get("id").and_then(Value::as_str)?;
             let loader = frame.get("loaderId").and_then(Value::as_str)?;
+            #[cfg(test)]
+            self.runtime_prepare_probe("private-blank-provenance", json!({"blank_url":frame.get("url").and_then(Value::as_str) == Some("about:blank"),"owned_blank":self.owns_blank(target, id, loader)}));
             if frame.get("url").and_then(Value::as_str) != Some("about:blank") || !self.owns_blank(target, id, loader) { return None }
             if self.navigated_blanks.contains_key(target) {
                 let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
@@ -1721,6 +1932,8 @@ impl Cdp {
             }
         }
         self.main_commit(&guard, frame);
+        #[cfg(test)]
+        self.runtime_prepare_probe("private-document-origin", json!({"target_protected":self.protected_targets.contains(target)}));
         if self.protected_targets.contains(target) { return None }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
@@ -1731,7 +1944,7 @@ impl Cdp {
             }
         }
         let scope = if parent.is_some() && scope == Some("") { frame.get("id").and_then(Value::as_str) } else { scope };
-        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch, page_scope:None };
+        let state = DocumentState { frames, worker:None, scope:scope.map(str::to_string), epoch, page_scope:None, runtime_scope_epoch:None };
         if content { self.cached_documents.insert(target.to_string(), state.clone()); }
         Some(state)
     }
@@ -2732,7 +2945,14 @@ impl Cdp {
         true
     }
 
-    fn deliver(&mut self, mut value: Value) {
+    fn deliver(&mut self, value: Value) {
+        self.deliver_event(value);
+        if !self.checking_page_events {
+            while let Some(event) = self.pending_page_events.pop_front() { self.deliver_event(event); }
+        }
+    }
+
+    fn deliver_event(&mut self, mut value: Value) {
         self.watch(&mut value);
         if value.get("method").and_then(Value::as_str) == Some("Page.screencastFrame") {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) {
@@ -2740,9 +2960,10 @@ impl Cdp {
             }
             return;
         }
-        if value.get("method").and_then(Value::as_str).is_some_and(|method| page_scope::content(method) && method != "DOM.documentUpdated") {
+        if value.get("method").and_then(Value::as_str).is_some_and(page_scope::content_event) {
             let session = value.get("sessionId").and_then(Value::as_str);
-            if self.checking_page_events || session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
+            if session.is_some_and(|session| self.guard_sessions.contains(session)) { return }
+            if self.checking_page_events { self.pending_page_events.push_back(value); return }
             self.checking_page_events = true;
             let verified = self.verify_page_scope(session).is_ok();
             self.checking_page_events = false;
@@ -3903,7 +4124,10 @@ mod tests {
         impl Transport for Observed {
             fn send_text(&mut self, text: &str) -> Result<(), String> {
                 let call: Value = serde_json::from_str(text).unwrap();
-                if call["method"] == "Page.getFrameTree" {
+                if call["method"] == "Target.getTargets" {
+                    self.inbox.push_back(json!({"id":call["id"],"result":{"targetInfos":[{"targetId":"T","type":"page","url":self.frame["url"]}]}}).to_string());
+                    Ok(())
+                } else if call["method"] == "Page.getFrameTree" {
                     self.inbox.push_back(json!({"id":call["id"],"result":{"frameTree":{"frame":self.frame}}}).to_string());
                     Ok(())
                 } else if call["method"] == "Runtime.enable" {

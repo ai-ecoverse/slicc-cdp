@@ -48,6 +48,7 @@ impl Transport for Backend {
         let method = command["method"].as_str().unwrap();
         let params = &command["params"];
         let result = match method {
+            "Target.getTargets" => json!({"targetInfos":[{"targetId":"T","type":"page","url":state.tree["frameTree"]["frame"]["url"]}]}),
             "Page.getFrameTree" => {
                 if state.fail_tree && state.installed {
                     state.inbox.push_back(json!({"id":command["id"],"error":{"message":"verification failed"}}).to_string());

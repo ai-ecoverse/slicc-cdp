@@ -237,13 +237,26 @@ async function flow(runner, raw, port) {
   assert.equal(rejected.stderr, notAccepted);
 
   await run(['goto', `http://127.0.0.1:${port}/framed`]);
+  const framed = (await raw.send('Target.getTargets')).targetInfos.find(
+    (target) => target.type === 'page' && target.url === `http://127.0.0.1:${port}/framed`
+  );
+  assert.ok(framed);
+  const framedSession = (
+    await raw.send('Target.attachToTarget', { targetId: framed.targetId, flatten: true })
+  ).sessionId;
+  const framedValue = async (expression) =>
+    (await raw.send('Runtime.evaluate', { expression, returnByValue: true }, framedSession)).result
+      .value;
   await until(
-    () => value("document.querySelector('iframe').dataset.loaded || 'no'"),
+    () => framedValue("document.querySelector('iframe').dataset.loaded || 'no'"),
     (loaded) => loaded === 'yes',
     'protected frame loaded'
   );
   await until(sevenGone, (gone) => !gone, 'protected frame target listed');
-  assert.equal(await value('(scrollTo(0, 250), scrollY)'), 250);
+  assert.equal(await framedValue('(scrollTo(0, 250), scrollY)'), 250);
+  const framedEval = await pw(['eval', 'document.title']);
+  assert.equal(framedEval.code, 1);
+  assert.match(framedEval.stderr, /slicc: refused:/);
   const over = await pw(['mousemove', '600', '100']);
   assert.equal(over.code, 1);
   assert.match(over.stderr, /slicc: refused:/);
@@ -251,12 +264,7 @@ async function flow(runner, raw, port) {
   assert.equal(outside.code, 1);
   assert.match(outside.stderr, /slicc: refused:/);
   assert.equal(
-    (
-      await run([
-        'eval',
-        "document.querySelector('iframe').focus(); document.activeElement.localName",
-      ])
-    ).stdout.trim(),
+    await framedValue("document.querySelector('iframe').focus(); document.activeElement.localName"),
     'iframe'
   );
   const typed = await pw(['keydown', 'a']);
@@ -265,10 +273,12 @@ async function flow(runner, raw, port) {
   const framedResize = await pw(['resize', '900', '650']);
   assert.equal(framedResize.code, 1);
   assert.match(framedResize.stderr, /refused/);
-  for (const output of [over, outside, typed, framedResize])
+  for (const output of [framedEval, over, outside, typed, framedResize])
     assert.doesNotMatch(output.stdout + output.stderr, /FRAME_SECRET/);
   assert.ok(
-    (await drain()).every((event) => !(event.type === 'mousemove' && event.x === 600)),
+    (await framedValue('window.events.splice(0)')).every(
+      (event) => !(event.type === 'mousemove' && event.x === 600)
+    ),
     'refused input never reached the page'
   );
 

@@ -224,7 +224,10 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
               type: message.params?.resourceType,
             });
             wire.push({ connection, event: message.method, session, request });
-          } else if (message.method?.startsWith('Page.frame')) {
+          } else if (
+            message.method?.startsWith('Page.frame') ||
+            message.method?.startsWith('Runtime.')
+          ) {
             wire.push({ connection, event: message.method, session });
           }
           if (wire.length > 40) wire.shift();
@@ -242,7 +245,11 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     cwd = await runner.fresh();
     const run = async (...args) => {
       const result = await runner.playwright(args, cwd);
-      assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
+      assert.equal(
+        result.code,
+        0,
+        `${args.join(' ')}: ${result.stderr} ${JSON.stringify({ lifecycle: lifecycle(), wire })}`
+      );
       return result.stdout;
     };
     const userUrl = `https://localhost:${secure.address().port}/ordinary`;
@@ -251,9 +258,6 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       (target) => target.type === 'page' && target.url === userUrl
     );
     assert.ok(user);
-    const userSession = (
-      await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
-    ).sessionId;
     await until(async () => {
       const value = await run('eval', 'document.documentElement.dataset.extensionFixture');
       return /[a-p]{32}/.test(value);
@@ -267,6 +271,9 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     await runner.write(cwd, 'attachment.txt', 'fixture bytes');
     await run('upload', ref(await run('snapshot'), 'Attachment'), 'attachment.txt');
     const drag = await run('snapshot');
+    const userSession = (
+      await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
+    ).sessionId;
     await raw.send('Target.activateTarget', { targetId: user.targetId });
     await until(
       async () =>
@@ -278,6 +285,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
           )
         ).result.value === 'visible'
     );
+    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const beforeDrag = lifecycle();
     wire.length = 0;
     const dragged = await runner.playwright(
@@ -289,7 +297,6 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       0,
       `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, afterDrag: lifecycle(), wire })}`
     );
-    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const denied = await runner.playwright(['eval', '--tab', background, 'document.title'], cwd);
     assert.notEqual(denied.code, 0);
     assert.match(denied.stderr, /refused/);
