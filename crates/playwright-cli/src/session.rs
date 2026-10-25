@@ -760,13 +760,30 @@ pub fn write_private_file(path: &Path, body: &str) -> Result<(), String> {
 }
 
 fn write_with_dirs(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
+    #[cfg(all(not(target_os = "wasi"), unix))]
+    if path.is_file() { private_file(path)?; }
+    path.file_name().ok_or_else(|| "session: invalid state file path\n".to_string())?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    #[cfg(target_os = "wasi")]
+    let process = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    #[cfg(not(target_os = "wasi"))]
+    let process = std::process::id().to_string();
+    let token = cdp_client::hash::sha256_hex(format!("{process}:{clock}:{counter}").as_bytes());
+    let staged = path.with_file_name(format!(".slicc-state-{token}.tmp"));
+    stage_private(&staged, body, private_dirs)?;
+    let result = fs::rename(&staged, path).map_err(|err| format!("session: {err}\n"));
+    if result.is_err() { let _ = fs::remove_file(&staged); }
+    result
+}
+
+fn stage_private(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
     #[cfg(target_os = "wasi")]
     {
         let old = wasi_mode::set_umask(0o077);
         let written = wasi_write(path, body, private_dirs);
-        if let Some(old) = old {
-            wasi_mode::set_umask(old);
-        }
+        if let Some(old) = old { wasi_mode::set_umask(old); }
         written
     }
     #[cfg(not(target_os = "wasi"))]
@@ -778,7 +795,7 @@ fn write_with_dirs(path: &Path, body: &str, private_dirs: bool) -> Result<(), St
 #[cfg(target_os = "wasi")]
 fn wasi_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
     use std::os::fd::AsRawFd;
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
         if private_dirs {
             for item in [Some(dir), dir.parent()].into_iter().flatten() {
@@ -790,12 +807,17 @@ fn wasi_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String>
     }
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
         .map_err(|err| format!("session: {err}\n"))?;
-    wasi_mode::chmod(file.as_raw_fd(), 0o600)?;
-    std::io::Write::write_all(&mut file, body.as_bytes()).map_err(|err| format!("session: {err}\n"))
+    let written = wasi_mode::chmod(file.as_raw_fd(), 0o600).and_then(|()| {
+        #[cfg(test)]
+        PRIVATE_OPEN.with(|hook| { if let Some(opened) = hook.borrow().as_ref() { opened(path); } });
+        std::io::Write::write_all(&mut file, body.as_bytes()).map_err(|err| format!("session: {err}\n"))
+    });
+    drop(file);
+    if written.is_err() { let _ = fs::remove_file(path); }
+    written
 }
 
 #[cfg(target_os = "wasi")]
@@ -828,7 +850,7 @@ mod wasi_mode {
 
 #[cfg(not(target_os = "wasi"))]
 fn host_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(|err| format!("session: {err}\n"))?;
         #[cfg(unix)]
         if private_dirs {
@@ -843,30 +865,31 @@ fn host_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String>
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let existed = path.is_file();
-        if existed {
-            private_file(path)?;
-        }
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
             .map_err(|err| format!("session: {err}\n"))?;
-        if !existed {
-            if let Err(err) = private_file(path) {
-                let _ = fs::remove_file(path);
-                return Err(err);
-            }
-        }
-        file.write_all(body.as_bytes())
-            .map_err(|err| format!("session: {err}\n"))?;
-        return Ok(());
+        let written = private_file(path).and_then(|()| {
+            #[cfg(test)]
+            PRIVATE_OPEN.with(|hook| { if let Some(opened) = hook.borrow().as_ref() { opened(path); } });
+            file.write_all(body.as_bytes()).map_err(|err| format!("session: {err}\n"))
+        });
+        drop(file);
+        if written.is_err() { let _ = fs::remove_file(path); }
+        return written;
     }
     #[cfg(not(unix))]
     {
-        fs::write(path, body).map_err(|err| format!("session: {err}\n"))
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)
+            .map_err(|err| format!("session: {err}\n"))?;
+        #[cfg(test)]
+        PRIVATE_OPEN.with(|hook| { if let Some(opened) = hook.borrow().as_ref() { opened(path); } });
+        let written = file.write_all(body.as_bytes()).map_err(|err| format!("session: {err}\n"));
+        drop(file);
+        if written.is_err() { let _ = fs::remove_file(path); }
+        written
     }
 }
 
@@ -915,6 +938,7 @@ fn discovery_url(endpoint: &str) -> Option<&str> {
 #[cfg(test)]
 thread_local! {
     static FAIL_PRIVATE_FILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRIVATE_OPEN: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn private_file(path: &Path) -> Result<(), String> {
@@ -967,6 +991,8 @@ fn ipv4_loopback(host: &str) -> bool {
 mod tests {
     use super::*;
     use cdp_client::hash::sha256_hex;
+
+    include!("session_atomic_test.rs");
 
     #[test]
     fn an_old_session_without_label_still_loads() {

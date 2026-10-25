@@ -10,7 +10,6 @@ use cdp_client::shield;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -245,18 +244,9 @@ fn shown(path: &str) -> String {
 }
 
 fn write_private(path: &Path, contents: &str) -> Result<(), String> {
-    let fail = |err: std::io::Error| format!("Error: {}: {err}\n", path.display());
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(fail)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(path).map_err(fail)?;
-    #[cfg(unix)]
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600)).map_err(fail)?;
-    file.write_all(contents.as_bytes()).map_err(fail)
+    crate::session::write_private_file(path, contents).map_err(|message| {
+        format!("Error: {}: {}", path.display(), message.trim_start_matches("session: "))
+    })
 }
 
 fn now_millis() -> i64 {

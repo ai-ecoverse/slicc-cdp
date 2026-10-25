@@ -63,17 +63,11 @@ fn read(path: &Path) -> Option<Value> {
 }
 
 fn atomic(path: &Path, value: &Value) -> Result<(), String> {
-    atomic_with(path, value, session::write_private_file)
+    session::write_private_file(path, &value.to_string())
 }
 
 fn atomic_session(path: &Path, value: &Value) -> Result<(), String> {
-    atomic_with(path, value, session::write_private)
-}
-
-fn atomic_with(path: &Path, value: &Value, write: fn(&Path, &str) -> Result<(), String>) -> Result<(), String> {
-    let staged = path.with_extension(format!("{}.tmp", path.extension().and_then(|ext| ext.to_str()).unwrap_or("har")));
-    write(&staged, &value.to_string())?;
-    fs::rename(&staged, path).map_err(|err| format!("har: {err}\n"))
+    session::write_private(path, &value.to_string())
 }
 
 fn live(value: &Value) -> bool {

@@ -1977,34 +1977,12 @@ fn ensure_lick_dirs(slicc_dir: &str) {
 }
 
 fn atomic_write(path: &str, data: &[u8]) {
-    let dir = std::path::Path::new(path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if dir.is_empty() {
+    let Ok(body) = std::str::from_utf8(data) else {
+        eprintln!("discover: write {path}: state was not UTF-8");
         return;
-    }
-    let unique = format!(
-        "{dir}/.tmp.{}.{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    );
-    match std::fs::write(&unique, data) {
-        Ok(()) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&unique, std::fs::Permissions::from_mode(0o600));
-            }
-            if let Err(e) = std::fs::rename(&unique, path) {
-                eprintln!("discover: rename {unique} -> {path}: {e}");
-                let _ = std::fs::remove_file(&unique);
-            }
-        }
-        Err(e) => {
-            eprintln!("discover: write {unique}: {e}");
-            let _ = std::fs::remove_file(&unique);
-        }
+    };
+    if let Err(error) = crate::session::write_private_file(std::path::Path::new(path), body) {
+        eprintln!("discover: write {path}: {}", error.trim_end());
     }
 }
 
