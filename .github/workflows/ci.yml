@@ -21,10 +21,81 @@ concurrency:
 
 jobs:
   ci:
-    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.12.4
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.13.0
     secrets: inherit
     with:
       test-glob: test/integration/*.test.mjs
+      strict-tests: |
+        **/*guard*.test.*
+        **/*security*.test.*
+        **/browser-message.test.*
+        **/cargo.test.*
+        **/catalog-*.test.*
+        **/cdp-proxy.test.*
+        **/chrome-attribution.test.*
+        **/chrome-policy.test.*
+        **/chrome-proof.test.*
+        **/chromium.test.*
+        **/ci-file-manifest.test.*
+        **/client-id-boundary.test.*
+        **/client-issued-*.test.*
+        **/content-*.test.*
+        **/cookies.test.*
+        **/curlwright-redirect-*.test.*
+        **/current-document.test.*
+        **/data-document.test.*
+        **/dialog-*.test.*
+        **/dialog.test.*
+        **/discover-*.test.*
+        **/discover.test.*
+        **/document-*.test.*
+        **/error-*.test.*
+        **/extension-tabs.test.*
+        **/fetch.test.*
+        **/forward-ledger.test.*
+        **/frame-detach-order.test.*
+        **/har-chrome.test.*
+        **/har-fake.test.*
+        **/har-kernel.test.*
+        **/harness-ports.test.*
+        **/headed-*.test.*
+        **/inbound-gate.test.*
+        **/input-fake.test.*
+        **/input.test.*
+        **/install.test.*
+        **/internal-replies.test.*
+        **/kernel-session.test.*
+        **/launch.test.*
+        **/mandatory-restore.test.*
+        **/ordinary-session-order.test.*
+        **/page-scope-*.test.*
+        **/page-tools*.test.*
+        **/privileged-ui.test.*
+        **/proxy-upgrade.test.*
+        **/real-extension.test.*
+        **/recording*.test.*
+        **/redirect-*.test.*
+        **/refusal-starvation.test.*
+        **/release-checksums.test.*
+        **/renderer-crash-fake.test.*
+        **/restore-audit-contract.test.*
+        **/runtime-*.test.*
+        **/same-document-order.test.*
+        **/session-*.test.*
+        **/session.test.*
+        **/snapshot-error-pages.test.*
+        **/snapshot-format.test.*
+        **/snapshot-golden.test.*
+        **/snapshot-oopif*.test.*
+        **/snapshot-review.test.*
+        **/storage*.test.*
+        **/upgrade.test.*
+        **/webmcp-polyfill-*.test.*
+        **/webmcp-shim.test.*
+        **/webmcp-toolchange-*.test.*
+        **/webmcp-unavailable-fake.test.*
+        **/webmcp.test.*
+        **/x1-audit.test.*
       shards: 8
       timeout-minutes: 30
       review-timeout-minutes: 90
