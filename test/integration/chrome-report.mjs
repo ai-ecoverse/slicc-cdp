@@ -49,6 +49,7 @@ export const CHROME_FILES = new Set(
     'kernel-session',
     'launch',
     'page-tools',
+    'page-scope-background-navigation-chrome',
     'page-scope-chrome',
     'page-scope-filtered-parent-chrome',
     'plant',
