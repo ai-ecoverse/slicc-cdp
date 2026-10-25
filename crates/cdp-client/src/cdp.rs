@@ -4099,6 +4099,7 @@ mod tests {
     include!("window_test.rs");
     include!("settled_test.rs");
     include!("renderer_crash_test.rs");
+    include!("late_reply_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
