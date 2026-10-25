@@ -497,7 +497,9 @@ export async function runPartition(t, id) {
             startup.markRowStarted();
             return made;
           }
-          const trace = ['C5.document', 'C5.continue-request'].includes(vector.id)
+          const trace = ['C5.document', 'C5.continue-request', 'C9.page-drivable'].includes(
+            vector.id
+          )
             ? await guardDiagnostics(browser.wsUrl, { id: vector.id, target, variant, slot })
             : null;
           let client;

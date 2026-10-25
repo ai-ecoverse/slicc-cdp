@@ -50,7 +50,7 @@ impl Cdp {
             let url = info.get("url").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
             let iframe = info.get("type").and_then(Value::as_str) == Some("iframe");
             let error_probe = self.guard.error_page_url(url) && self.guards.contains_key(id) && self.documents.get(id).is_some_and(|doc| !doc.previous);
-            let protected = !frame_text_known(url) || !error_probe && self.info_protected(info, &[]) || self.protected_targets.contains(id);
+            let protected = (!frame_text_known(url) && !self.page_scope_pending_page(info)) || !error_probe && self.info_protected(info, &[]) || self.protected_targets.contains(id);
             if protected {
                 let parent = if iframe { Some(info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?) } else { None };
                 nodes.entry(id.to_string()).or_insert_with(|| json!({"id":id,"parentId":parent,"url":url,"securityOrigin":url,"loaderId":"protected"}));
@@ -122,13 +122,21 @@ impl Cdp {
         Ok((proof, state))
     }
 
+    fn page_scope_pending_page(&self, info: &Value) -> bool {
+        let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
+        info.get("type").and_then(Value::as_str) == Some("page") && info.get("url").and_then(Value::as_str) == Some("")
+            && self.guards.contains_key(id) && !self.protected_targets.contains(id)
+            && self.documents.get(id).is_some_and(|doc| !doc.previous && frame_text_known(&doc.url) && !self.guard.url(&doc.url))
+            && !self.info_protected(info, &[])
+    }
+
     fn page_scope_inventory(&mut self, selected: &str, selected_info: &Value, candidates: &[Value], deadline: Instant) -> Result<(Vec<Value>, BTreeMap<String, Value>), String> {
         let pages = candidates.iter().filter(|info| info.get("type").and_then(Value::as_str) == Some("page")
             && (selected_info.get("type").and_then(Value::as_str) == Some("iframe") || info.get("targetId").and_then(Value::as_str) == Some(selected)));
         let mut found = None;
         for page in pages {
             let id = page.get("targetId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
-            if page.get("url").and_then(Value::as_str).is_none_or(|url| !frame_text_known(url)) || self.info_protected(page, &[]) || self.protected_targets.contains(id) { continue }
+            if (page.get("url").and_then(Value::as_str).is_none_or(|url| !frame_text_known(url)) && !self.page_scope_pending_page(page)) || self.info_protected(page, &[]) || self.protected_targets.contains(id) { continue }
             let tree = self.page_scope_tree(id, deadline)?;
             let root = tree.get("frameTree").ok_or_else(|| self.refusal())?;
             if root.pointer("/frame/parentId").is_some() { return Err(self.refusal()) }
