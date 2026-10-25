@@ -454,8 +454,8 @@ impl Cdp {
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
         }
-        let checks = self.prepare(method, &params, session_id)?;
-        let pinned = self.pin_execution(method, &params, session_id, &checks)?;
+        let mut checks = self.prepare(method, &params, session_id)?;
+        let pinned = self.pin_execution(method, &params, session_id, &mut checks)?;
         let object_pin = method == "Runtime.callFunctionOn" && params.get("objectId").is_some() && !checks.is_empty();
         let executed = pinned.is_some() && method != "Runtime.compileScript" || object_pin;
         let mut sent = params.clone();
@@ -891,12 +891,12 @@ impl Cdp {
         self.paused_documents.iter().any(|(session, _)| self.session_target(session).as_deref() == Some(target))
     }
 
-    fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &[(String, DocumentState)]) -> Result<Option<String>, String> {
+    fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &mut Vec<(String, DocumentState)>) -> Result<Option<String>, String> {
         if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.compileScript") || checks.is_empty() { return Ok(None) }
         if method == "Runtime.callFunctionOn" && params.get("objectId").is_some() { return Ok(None) }
         let session = session.ok_or_else(|| self.refusal())?;
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
-        let state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+        let mut state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
         let guard = if let Some(guard) = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)) {
             guard.clone()
         } else {
@@ -908,7 +908,7 @@ impl Cdp {
             self.runtime_sessions.insert(target.clone(), guard.clone());
             guard
         };
-        let choose = |proofs: &BTreeMap<(String, String), ContextProof>| {
+        let choose = |proofs: &BTreeMap<(String, String), ContextProof>, state: &DocumentState| {
             proofs.iter().find(|((owner, unique), proof)| {
                 owner == &guard && if let Some(id) = params.get("contextId").or_else(|| params.get("executionContextId")).and_then(Value::as_i64) {
                     proof.id == id
@@ -919,13 +919,13 @@ impl Cdp {
                 } else { proof.default && (state.worker.is_some() || state.scope.as_deref() == Some(proof.frame.as_str()) || state.frames.get(&proof.frame).is_some_and(|evidence| evidence[4].is_empty())) }
             }).map(|((_, unique), proof)| (unique.clone(), proof.clone()))
         };
-        let mut selected = choose(&self.context_proofs);
+        let mut selected = choose(&self.context_proofs, &state);
         let paused = self.document_paused(&target);
         let stable_context = selected.as_ref().is_some_and(|(_, proof)| state.worker.is_some()
             || state.frames.get(&proof.frame).is_some_and(|evidence| proof.loader.as_deref() == Some(evidence[0].as_str())));
         if !paused && !stable_context {
             let deadline = Instant::now() + DOCUMENT_CHECK;
-            for _ in 0..2 {
+            for attempt in 0..2 {
                 self.context_proofs.retain(|(owner, _), _| owner != &guard);
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() { return Err(self.refusal()) }
@@ -937,8 +937,19 @@ impl Cdp {
                 let same = if state.worker.is_some() { state.worker == current.worker } else {
                     state.frames.iter().filter(|(_, evidence)| evidence[4].is_empty()).all(|(id, evidence)| current.frames.get(id).is_some_and(|now| evidence[0] == now[0] && evidence[2] == now[2]))
                 };
-                if !same || self.blocked.contains(session) { return Err(self.refusal()) }
-                selected = choose(&self.context_proofs);
+                if self.blocked.contains(session) { return Err(self.refusal()) }
+                if !same {
+                    let ordinary_loader_change = state.worker.is_none() && state.scope.as_deref() == Some("") && state.frames.len() == 1
+                        && !Worlds::selectors(params) && self.guards.get(&target) == Some(&guard)
+                        && state.page_scope.as_ref().is_some_and(|proof| proof.0 == target)
+                        && state.frames.iter().all(|(id, before)| current.frames.get(id).is_some_and(|after| before[0] != after[0]
+                            && before[2] == after[2] && Self::runtime_page_reusable(&current)));
+                    if attempt != 0 || !ordinary_loader_change { return Err(self.refusal()) }
+                    *checks = self.prepare(method, params, Some(session))?;
+                    state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+                    continue;
+                }
+                selected = choose(&self.context_proofs, &state);
                 if selected.is_some() { break }
             }
         }
