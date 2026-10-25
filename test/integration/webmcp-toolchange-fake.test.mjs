@@ -154,7 +154,7 @@ async function scenario(options, check, args) {
   }
 }
 
-await test('fake: an abandoned local child gate during an ordinary process swap preserves its parent installer', async () => {
+test('fake: an abandoned local child gate during an ordinary process swap preserves its parent installer', async () => {
   let armed = false;
   let swapped = false;
   const resumed = Promise.withResolvers();
@@ -200,7 +200,7 @@ await test('fake: an abandoned local child gate during an ordinary process swap 
   );
 });
 
-await test('fake: a child gate abandoned while queued retains the parent document installer', async () => {
+test('fake: a child gate abandoned while queued retains the parent document installer', async () => {
   let armed = false;
   let queued = false;
   let liveBackend;
@@ -245,7 +245,7 @@ await test('fake: a child gate abandoned while queued retains the parent documen
   );
 });
 
-await test('fake: an OOPIF installer response waiting on its pause is resumed before page load completes', async () => {
+test('fake: an OOPIF installer response waiting on its pause is resumed before page load completes', async () => {
   await scenario(
     {
       installerWaitsForResume: true,
@@ -275,7 +275,7 @@ await test('fake: an OOPIF installer response waiting on its pause is resumed be
   );
 });
 
-await test('fake: a tool registered after load produces one debounced tools-changed event', async () => {
+test('fake: a tool registered after load produces one debounced tools-changed event', async () => {
   await scenario(
     { definitions: [{ name: 'first', description: 'First', execute: () => 'first' }] },
     async ({ backend, cwd, held }) => {
@@ -298,7 +298,7 @@ await test('fake: a tool registered after load produces one debounced tools-chan
   );
 });
 
-await test('fake: an unregistered tool produces an updated list without it', async () => {
+test('fake: an unregistered tool produces an updated list without it', async () => {
   const controller = new AbortController();
   await scenario(
     {
@@ -324,7 +324,7 @@ await test('fake: an unregistered tool produces an updated list without it', asy
   );
 });
 
-await test('fake: a cross-origin iframe registering after load reports its frame and origin, never a protected child', async () => {
+test('fake: a cross-origin iframe registering after load reports its frame and origin, never a protected child', async () => {
   await scenario(
     {
       definitions: [{ name: 'top', execute: () => 'top' }],
@@ -386,7 +386,7 @@ await test('fake: a cross-origin iframe registering after load reports its frame
   );
 });
 
-await test('fake: a frame change while a frame document is gated is checked again, not refused', async () => {
+test('fake: a frame change while a frame document is gated is checked again, not refused', async () => {
   let reloaded = false;
   let gated = false;
   let raced = 0;
@@ -441,7 +441,7 @@ await test('fake: a frame change while a frame document is gated is checked agai
   );
 });
 
-await test('fake: a change held back by a protected frame is reported only after the frame leaves', async () => {
+test('fake: a change held back by a protected frame is reported only after the frame leaves', async () => {
   await scenario(
     {
       definitions: [{ name: 'top', execute: () => 'top' }],
@@ -485,7 +485,7 @@ await test('fake: a change held back by a protected frame is reported only after
 });
 
 for (const reload of [false, true]) {
-  await test(`fake: a preloaded OOPIF survives frame-tree churn with reload=${reload}`, async () => {
+  test(`fake: a preloaded OOPIF survives frame-tree churn with reload=${reload}`, async () => {
     let armed = false;
     let guard;
     let raced = 0;
@@ -573,7 +573,7 @@ for (const reload of [false, true]) {
   });
 }
 
-await test('fake: a blank child pause received before the parent resume reply can rearm for an ordinary document', async () => {
+test('fake: a blank child pause received before the parent resume reply can rearm for an ordinary document', async () => {
   const child = { id: 'CROSS', origin: 'https://ordinary.test', blank: true, allow: 'tools *' };
   await scenario(
     {
@@ -594,7 +594,7 @@ await test('fake: a blank child pause received before the parent resume reply ca
   );
 });
 
-await test('fake: an OOPIF attachment received inside blank-frame rearm waits for the parent installer', async () => {
+test('fake: an OOPIF attachment received inside blank-frame rearm waits for the parent installer', async () => {
   await scenario(
     {
       attachDuringRearm: true,
@@ -642,7 +642,7 @@ await test('fake: an OOPIF attachment received inside blank-frame rearm waits fo
   );
 });
 
-await test('fake: frame churn during blank-frame rearm preserves the holder and its next document installer', async () => {
+test('fake: frame churn during blank-frame rearm preserves the holder and its next document installer', async () => {
   let rearming = false;
   let raced = false;
   let backend;
@@ -690,7 +690,7 @@ await test('fake: frame churn during blank-frame rearm preserves the holder and 
   );
 });
 
-await test('fake: late protected frame evidence does not revoke a fresh ordinary frame navigation', async () => {
+test('fake: late protected frame evidence does not revoke a fresh ordinary frame navigation', async () => {
   let active = false;
   let raced = false;
   let backend;
@@ -756,7 +756,7 @@ await test('fake: late protected frame evidence does not revoke a fresh ordinary
 });
 
 for (const url of ['about:blank', '']) {
-  await test(`fake: a provisional OOPIF root navigation without parentId stays gated for ${url || 'empty URL'}`, async () => {
+  test(`fake: a provisional OOPIF root navigation without parentId stays gated for ${url || 'empty URL'}`, async () => {
     let provisional = false;
     await scenario(
       {
@@ -794,7 +794,7 @@ for (const url of ['about:blank', '']) {
   });
 }
 
-await test('fake: refused navigation traces contain only sanitized frame evidence and event order', async () => {
+test('fake: refused navigation traces contain only sanitized frame evidence and event order', async () => {
   await scenario(
     { children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }] },
     async ({ backend, held }) => {
@@ -884,7 +884,7 @@ await test('fake: refused navigation traces contain only sanitized frame evidenc
   );
 });
 
-await test('fake: a pending change is dropped when the document navigates, and the next document reports its own generation', async () => {
+test('fake: a pending change is dropped when the document navigates, and the next document reports its own generation', async () => {
   let pending = false;
   let backend;
   await scenario(
@@ -919,7 +919,7 @@ await test('fake: a pending change is dropped when the document navigates, and t
   );
 });
 
-await test('fake: native WebMCP changes are watched from the isolated world', async () => {
+test('fake: native WebMCP changes are watched from the isolated world', async () => {
   await scenario(
     { native: true, definitions: [{ name: 'native', execute: () => 'native' }] },
     async ({ backend, held }) => {
@@ -948,7 +948,7 @@ await test('fake: native WebMCP changes are watched from the isolated world', as
   );
 });
 
-await test('fake: the WASI holder reports a tool registered after load', async () => {
+test('fake: the WASI holder reports a tool registered after load', async () => {
   const backend = await webmcpBackend({ definitions: [{ name: 'first', execute: () => 'first' }] });
   let runner;
   try {
@@ -1022,7 +1022,7 @@ await test('fake: the WASI holder reports a tool registered after load', async (
   }
 });
 
-await test('fake: discover reports holder tool changes only while the holder runs', async () => {
+test('fake: discover reports holder tool changes only while the holder runs', async () => {
   await scenario(
     { definitions: [{ name: 'first', execute: () => 'first' }] },
     async ({ backend, cwd, held }) => {
