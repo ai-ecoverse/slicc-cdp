@@ -1,0 +1,39 @@
+name: HAR lease proof
+
+on:
+  push:
+    branches: [fix/619-har-holder-liveness]
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: cloud-run-job
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: |
+          git show 13ab3a2:crates/playwright-cli/src/har.rs > crates/playwright-cli/src/har.rs
+          cargo build --locked -j 4 -p slicc-cdp -p curlwright
+          cargo build --locked -j 4 --target wasm32-wasip1 -p slicc-cdp -p curlwright
+          set +e
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/har-live-lease.test.mjs
+          status=$?
+          set -e
+          test "$status" -ne 0
+          git restore crates/playwright-cli/src/har.rs
+          cargo build --locked -j 4 -p slicc-cdp -p curlwright
+          cargo build --locked -j 4 --target wasm32-wasip1 -p slicc-cdp -p curlwright
+          cargo test --locked -j 4 -p slicc-cdp har_lease -- --test-threads=1
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/har-live-lease.test.mjs test/integration/har-fake.test.mjs
+          for round in $(seq 1 20); do
+            echo "Background HAR kernel lease round $round"
+            node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/har-kernel-holder.test.mjs
+          done

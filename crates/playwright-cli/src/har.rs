@@ -2,6 +2,7 @@ use crate::args::{Invocation, Output};
 use crate::browser;
 use crate::cdp::{self, Cdp};
 use crate::commands::resolve_target;
+use crate::har_lease::{inspect, Lease};
 use crate::route::Glob;
 use crate::session::{self, Session};
 use serde_json::{json, Value};
@@ -95,9 +96,14 @@ pub fn stop(invocation: &Invocation) -> Output {
         return Output::ok(format!("{}\n", found));
     }
     if !live(&found) {
-        clear(&files);
-        let _ = fs::remove_dir_all(files.record.with_extension("lock"));
-        return Output::err(NONE);
+        let checked = inspect(&files.record);
+        if !checked.alive {
+            #[cfg(windows)]
+            drop(checked);
+            clear(&files);
+            let _ = fs::remove_dir_all(files.record.with_extension("lock"));
+            return Output::err(NONE);
+        }
     }
     let owner = found["recordingId"].as_str().unwrap_or("");
     if let Err(message) = session::write_private(&files.stop, owner) { return Output::err(message) }
@@ -109,49 +115,13 @@ pub fn stop(invocation: &Invocation) -> Output {
                 clear(&files);
                 return Output::ok(format!("{value}\n"));
             }
-            Some(value) if live(&value) => {}
-            _ => { clear(&files); return Output::err(NONE) }
+            Some(value) if value["recordingId"] == owner && value["state"] == "recording" => {
+                let checked = inspect(&files.record);
+                if !live(&value) && !checked.alive { clear(&files); return Output::err(NONE) }
+            }
+            _ => return Output::err(NONE),
         }
         if Instant::now() >= deadline { return Output::err("har-stop: the HAR holder did not answer\n") }
-    }
-}
-
-struct Lease {
-    path: PathBuf,
-    owner: String,
-}
-
-impl Lease {
-    fn claim(files: &Files) -> Result<Self, String> {
-        let path = files.record.with_extension("lock");
-        let parent = path.parent().ok_or_else(|| ALREADY.to_string())?;
-        fs::create_dir_all(parent).map_err(|err| format!("har: {err}\n"))?;
-        let stale = fs::metadata(&path).and_then(|metadata| metadata.modified()).ok()
-            .and_then(|modified| modified.elapsed().ok()).is_some_and(|age| age >= Duration::from_secs(5));
-        if stale && !read(&files.record).is_some_and(|value| live(&value)) {
-            fs::remove_dir_all(&path).map_err(|err| format!("har: {err}\n"))?;
-        }
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                let owner = cdp_client::hash::sha256_hex(format!("{:?}", SystemTime::now()).as_bytes());
-                let lease = Self { path, owner };
-                if let Err(message) = session::write_private(&lease.path.join("owner"), &lease.owner) {
-                    let _ = fs::remove_dir_all(&lease.path);
-                    return Err(message);
-                }
-                Ok(lease)
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(ALREADY.into()),
-            Err(err) => Err(format!("har: {err}\n")),
-        }
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        if fs::read_to_string(self.path.join("owner")).is_ok_and(|owner| owner == self.owner) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 }
 
@@ -178,7 +148,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
         filter: invocation.flags.get("filter").or_else(|| invocation.flags.get("url-filter")).and_then(|pattern| Glob::parse(pattern).ok()),
     };
     holder.paused = holder.verify(cdp).is_none();
-    let _lease = match Lease::claim(&holder.files) {
+    let _lease = match Lease::claim(&holder.files.record, read(&holder.files.record).is_some_and(|value| live(&value))) {
         Ok(lease) => lease,
         Err(message) => {
             cdp.set_decider(holder.session.as_deref().unwrap(), None);

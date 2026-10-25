@@ -13,6 +13,7 @@ mod dialog_holder;
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
 mod har;
+mod har_lease;
 mod help;
 mod input;
 mod keys;
