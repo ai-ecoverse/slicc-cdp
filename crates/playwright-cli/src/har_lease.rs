@@ -55,12 +55,8 @@ pub(crate) fn inspect(record: &Path) -> OwnerCheck {
         let owner: Value = serde_json::from_str(&fs::read_to_string(record.with_extension("lock").join("owner")).ok()?).ok()?;
         let expected = owner["process"].as_str()?;
         let pid: u32 = expected.split(':').next()?.parse().ok()?;
-        let own = identity(None);
-        let observed = identity(Some(pid));
-        eprintln!("HAR lease identity expected={expected} own={own:?} observed={observed:?}");
-        let same = own?.split(':').next()? == pid.to_string();
-        if same { return Some(false) }
-        Some(observed.as_deref() == Some(expected))
+        if identity(None)?.split(':').next()? == pid.to_string() { return Some(false) }
+        Some(identity(Some(pid)).as_deref() == Some(expected))
     })().unwrap_or(false);
     OwnerCheck { alive }
 }
