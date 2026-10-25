@@ -34,6 +34,7 @@ pub type Decider = Box<dyn FnMut(&Paused) -> Decision>;
 
 pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it could be seven's\n";
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
+pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
@@ -117,6 +118,8 @@ pub struct Cdp {
     decided: BTreeMap<i64, (String, String)>,
     fetch_errors: Vec<String>,
     blocked: BTreeSet<String>,
+    crashed_sessions: BTreeSet<String>,
+    crashed_targets: BTreeSet<String>,
     session_targets: BTreeMap<String, String>,
     protected_targets: BTreeSet<String>,
     guards: BTreeMap<String, String>,
@@ -232,6 +235,8 @@ impl Cdp {
             decided: BTreeMap::new(),
             fetch_errors: Vec::new(),
             blocked: BTreeSet::new(),
+            crashed_sessions: BTreeSet::new(),
+            crashed_targets: BTreeSet::new(),
             session_targets: BTreeMap::new(),
             protected_targets: BTreeSet::new(),
             guards: BTreeMap::new(),
@@ -628,6 +633,10 @@ impl Cdp {
 
     pub fn poll_navigation(&mut self, id: i64) -> Option<Result<Value, String>> {
         let navigation = self.navigations.get(&id)?;
+        if self.renderer_crashed(navigation.session.as_deref(), None) {
+            self.navigations.remove(&id);
+            return Some(Err(RENDERER_CRASHED.to_string()));
+        }
         let refused = navigation.detached || navigation.session.as_deref().is_some_and(|session| self.blocked.contains(session) && !harmless("Page.navigate", &navigation.params));
         if refused {
             self.navigations.remove(&id);
@@ -680,6 +689,7 @@ impl Cdp {
     }
 
     fn admit(&mut self, method: &str, params: &Value, session_id: Option<&str>) -> Result<(), String> {
+        if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Err(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" {
             if params.get("accept").and_then(Value::as_bool).is_none()
                 || params.get("promptText").is_some_and(|text| !text.is_string())
@@ -866,6 +876,7 @@ impl Cdp {
 
     pub fn settled_refusal(&self, method: &str, params: &Value, session_id: Option<&str>) -> Option<String> {
         let session_id = session_id.filter(|id| !id.is_empty());
+        if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Some(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" || harmless(method, params) { return None }
         if session_id.is_some_and(|session| self.blocked.contains(session)) { return Some(self.refusal()) }
         let reason = if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
@@ -1669,6 +1680,12 @@ impl Cdp {
         };
         self.guard_sessions.insert(session.clone());
         self.guards.insert(target_id.to_string(), session.clone());
+        let left = budget.saturating_duration_since(Instant::now());
+        let inspected = if left.is_zero() { Err("Inspector.enable timed out\n".to_string()) }
+            else { self.raw_call("Inspector.enable", json!({}), Some(&session), left) };
+        if let Err(message) = inspected {
+            return Err(self.guard_failure(target_id, &session, message));
+        }
         let setup = [
             (
                 "Fetch.enable",
@@ -1713,15 +1730,7 @@ impl Cdp {
                 Err(message) => Some(message),
             };
             if let Some(message) = failed {
-                self.guards.remove(target_id);
-                self.abandon(target_id);
-                let _ = self.raw_call(
-                    "Target.detachFromTarget",
-                    json!({ "sessionId": session }),
-                    None,
-                    Duration::from_secs(5),
-                );
-                return Err(unguarded(message));
+                return Err(self.guard_failure(target_id, &session, message));
             }
         }
         if self.documents.get(target_id).is_none_or(|doc| doc.probed) {
@@ -1741,6 +1750,13 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    fn guard_failure(&mut self, target: &str, session: &str, message: String) -> String {
+        self.guards.remove(target);
+        self.abandon(target);
+        let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session }), None, Duration::from_secs(5));
+        unguarded(message)
     }
 
     fn abandon(&mut self, target_id: &str) {
@@ -3041,6 +3057,28 @@ impl Cdp {
         }
     }
 
+    fn renderer_crashed(&self, session: Option<&str>, target: Option<&str>) -> bool {
+        target.is_some_and(|target| self.crashed_targets.contains(target))
+            || session.is_some_and(|session| self.crashed_sessions.contains(session)
+                || self.session_target(session).is_some_and(|target| self.crashed_targets.contains(&target)))
+    }
+
+    fn observe_renderer_crash(&mut self, value: &Value) {
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let reason = value.pointer("/params/reason").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+        if method != "Inspector.targetCrashed" && !(matches!(method, "Inspector.detached" | "Target.detachedFromTarget")
+            && reason.contains("crash")) { return }
+        let session = if method == "Target.detachedFromTarget" { value.pointer("/params/sessionId") } else { value.get("sessionId") }
+            .and_then(Value::as_str).filter(|session| !session.is_empty());
+        if let Some(session) = session {
+            self.crashed_sessions.insert(session.to_string());
+            if let Some(target) = self.session_target(session) {
+                self.crashed_targets.insert(target.clone());
+                self.crashed_sessions.extend(self.session_targets.iter().filter(|(_, owner)| *owner == &target).map(|(session, _)| session.clone()));
+            }
+        }
+    }
+
     fn raw_call(
         &mut self,
         method: &str,
@@ -3099,6 +3137,7 @@ impl Cdp {
         timeout: Duration,
         pinned: bool,
     ) -> Result<Value, String> {
+        if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
         let id = self.send(method, params, session_id)?;
         self.waiting_calls.insert(id);
         let result = self.raw_reply(method, id, session_id, timeout, pinned);
@@ -3111,6 +3150,7 @@ impl Cdp {
         let deadline = Instant::now() + timeout;
         let was_blocked = session_id.is_some_and(|session| self.blocked.contains(session));
         loop {
+            if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
             let value = match self.call_replies.remove(&id) {
                 Some(value) => value,
                 None => {
@@ -3145,6 +3185,7 @@ impl Cdp {
                 == Some("Target.detachedFromTarget")
                 && value.pointer("/params/sessionId").and_then(|v| v.as_str()) == session_id;
             self.absorb(value);
+            if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
             if let Some(session) = session_id {
                 if detached || (!pinned && !was_blocked && self.blocked.contains(session)) {
                     return Err(self.refusal());
@@ -3345,6 +3386,7 @@ impl Cdp {
             }
             return;
         }
+        self.observe_renderer_crash(&value);
         self.observe_dialog(&value);
         if value.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget") {
             let session = value.pointer("/params/sessionId").and_then(Value::as_str);
@@ -3585,7 +3627,7 @@ pub fn transport_error(message: &str) -> bool {
 }
 
 fn unguarded(message: String) -> String {
-    if transport_error(&message) {
+    if transport_error(&message) || message == RENDERER_CRASHED {
         message
     } else if let Some(step) = message.strip_suffix(" timed out\n") {
         format!("{}: {step} timed out\n", UNGUARDED.trim_end())
@@ -3630,7 +3672,7 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
     }
     match method {
         "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
-        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" => None,
+        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable" => None,
         "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.awaitPromise" | "Runtime.compileScript" | "Runtime.runScript"
         | "Runtime.getProperties" | "Runtime.getExceptionDetails" | "Runtime.queryObjects" | "Runtime.globalLexicalScopeNames" | "Runtime.getHeapUsage" | "Runtime.discardConsoleEntries"
         | "DOM.collectClassNamesFromSubtree" | "DOM.copyTo" | "DOM.describeNode" | "DOM.focus" | "DOM.getAttributes" | "DOM.getBoxModel" | "DOM.getContentQuads"
@@ -4026,6 +4068,7 @@ mod tests {
     include!("front_test.rs");
     include!("window_test.rs");
     include!("settled_test.rs");
+    include!("renderer_crash_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

@@ -1447,6 +1447,7 @@ mod tests {
                 "Target.attachToTarget",
                 "Target.setDiscoverTargets",
                 "Target.attachToTarget",
+                "Inspector.enable",
                 "Fetch.enable",
                 "Network.enable",
                 "Network.setBypassServiceWorker",

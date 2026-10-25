@@ -1608,6 +1608,14 @@ pub fn upload_files(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn upload_file_paths(files: &[String], mut absolute: impl FnMut(&str) -> std::io::Result<std::path::PathBuf>) -> Result<Vec<String>, String> {
+    files.iter().map(|file| {
+        absolute(file).map_err(|err| format!("upload: cannot resolve file path: {err}\n"))?
+            .into_os_string().into_string().map_err(|_| "upload: file path is not UTF-8\n".to_string())
+    }).collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn upload_files(
     cdp: &mut Cdp,
     session: &str,
@@ -1617,6 +1625,7 @@ pub fn upload_files(
     let backend = rec
         .backend_node_id
         .ok_or_else(|| "element has no backend node\n".to_string())?;
+    let files = upload_file_paths(files, |file| std::path::absolute(file))?;
     cdp.call(
         "DOM.setFileInputFiles",
         json!({
@@ -1692,6 +1701,31 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::upload_file_paths;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_upload_paths_are_absolute_without_changing_user_file_names() {
+        let absolute = std::env::temp_dir().join("absolute-upload.txt");
+        let files = vec!["attachment.txt".to_string(), "nested/file.txt".to_string(), absolute.to_str().unwrap().to_string()];
+        let paths = upload_file_paths(&files, |file| std::path::absolute(file)).unwrap();
+        assert!(paths.iter().all(|path| std::path::Path::new(path).is_absolute()));
+        assert!(paths[0].ends_with("attachment.txt"));
+        assert!(paths[1].ends_with(&format!("nested{}file.txt", std::path::MAIN_SEPARATOR)));
+        assert_eq!(paths[2], absolute.to_str().unwrap());
+        assert!(upload_file_paths(&[], |file| std::path::absolute(file)).unwrap().is_empty());
+        let failure = upload_file_paths(&files, |_| Err(std::io::Error::other("controlled resolution failure"))).unwrap_err();
+        assert_eq!(failure, "upload: cannot resolve file path: controlled resolution failure\n");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), unix))]
+    #[test]
+    fn native_upload_rejects_paths_that_cdp_cannot_represent() {
+        use std::os::unix::ffi::OsStringExt;
+        let failure = upload_file_paths(&["attachment.txt".to_string()], |_| Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 255])))).unwrap_err();
+        assert_eq!(failure, "upload: file path is not UTF-8\n");
+    }
 
     struct Scripted {
         incoming: VecDeque<String>,

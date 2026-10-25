@@ -396,6 +396,9 @@ impl Cdp {
             if info.is_some_and(|info| previous.is_some_and(|previous| ["url", "parentFrameId"].iter().all(|key| previous.get(*key) == info.get(*key)))) { return }
             if let Some(page) = self.page_scope_owner(id) { pages.insert(page); }
             if let Some(page) = info.and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).and_then(|parent| self.page_scope_owner(parent)) { pages.insert(page); }
+            if pages.is_empty() && method == "Target.targetInfoChanged" && info.is_some_and(|info| previous.is_some_and(|previous| {
+                info.get("parentFrameId").and_then(Value::as_str).is_some_and(frame_text_known) && previous.get("parentFrameId") == info.get("parentFrameId")
+            })) { return }
         } else { return }
         if pages.is_empty() { self.page_scope_unknown += 1; }
         for page in pages {

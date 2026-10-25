@@ -46,13 +46,22 @@ fn disabled_path() -> String {
     format!("{config}/slicc/discover.disabled")
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_DIR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn discover_config_dir() -> String {
     #[cfg(test)]
     {
-        std::env::temp_dir()
-            .join("slicc-cdp-discover-tests")
-            .to_string_lossy()
-            .into_owned()
+        TEST_CONFIG_DIR
+            .with(|dir| dir.borrow().clone())
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join(format!("slicc-cdp-discover-tests-{}", std::process::id()))
+                    .to_string_lossy()
+                    .into_owned()
+            })
     }
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
@@ -3100,25 +3109,111 @@ mod tests {
         assert!(output.stdout.is_empty());
     }
 
+    struct IsolatedConfigDir {
+        root: std::path::PathBuf,
+    }
+
+    impl IsolatedConfigDir {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "slicc-cdp-discover-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let config = root.to_string_lossy().into_owned();
+            TEST_CONFIG_DIR.with(|dir| *dir.borrow_mut() = Some(config));
+            IsolatedConfigDir { root }
+        }
+
+        fn disabled_file(&self) -> std::path::PathBuf {
+            self.root.join("slicc").join("discover.disabled")
+        }
+
+        fn disable(&self) {
+            let disabled = self.disabled_file();
+            std::fs::create_dir_all(disabled.parent().unwrap()).unwrap();
+            std::fs::write(&disabled, "").unwrap();
+        }
+    }
+
+    impl Drop for IsolatedConfigDir {
+        fn drop(&mut self) {
+            TEST_CONFIG_DIR.with(|dir| *dir.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn discover_invocation() -> Invocation {
+        Invocation {
+            command: Some("discover".to_string()),
+            positionals: vec![],
+            flags: BTreeMap::new(),
+            multi: BTreeMap::new(),
+            cdp: None,
+            runtime: None,
+            session: None,
+            full_urls: false,
+            help: false,
+            command_help: false,
+            version: false,
+            cwd: None,
+        }
+    }
+
     #[test]
     fn disabled_file_is_checked() {
-        let config = discover_config_dir();
-        let slicc = std::path::Path::new(&config).join("slicc");
-        std::fs::create_dir_all(&slicc).unwrap();
-        let disabled = slicc.join("discover.disabled");
-        std::fs::write(&disabled, "").unwrap();
-        let result = is_disabled();
-        let _ = std::fs::remove_file(&disabled);
-        assert!(result);
+        let config = IsolatedConfigDir::new("checked");
+        config.disable();
+        assert_eq!(disabled_path(), config.disabled_file().to_string_lossy());
+        assert!(is_disabled());
     }
 
     #[test]
     fn disabled_file_absent_means_enabled() {
-        let config = discover_config_dir();
-        let disabled = std::path::Path::new(&config).join("slicc").join("discover.disabled");
-        let _ = std::fs::remove_file(&disabled);
-        let result = is_disabled();
-        assert!(!result);
+        let config = IsolatedConfigDir::new("absent");
+        assert!(!config.disabled_file().exists());
+        assert!(!is_disabled());
+    }
+
+    #[test]
+    fn disabled_file_stops_run() {
+        let config = IsolatedConfigDir::new("run");
+        config.disable();
+        let output = run(&discover_invocation(), None);
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, "discover: disabled by discover.disabled\n");
+    }
+
+    #[test]
+    fn default_config_dir_is_per_process() {
+        assert!(TEST_CONFIG_DIR.with(|dir| dir.borrow().is_none()));
+        assert!(discover_config_dir().ends_with(&format!(
+            "slicc-cdp-discover-tests-{}",
+            std::process::id()
+        )));
+    }
+
+    #[test]
+    fn disabled_checks_ignore_concurrent_disabled_files() {
+        let config = IsolatedConfigDir::new("steady");
+        config.disable();
+        let toggler = std::thread::spawn(|| {
+            let other = IsolatedConfigDir::new("toggled");
+            for _ in 0..200 {
+                assert!(!is_disabled());
+                other.disable();
+                assert!(is_disabled());
+                std::fs::remove_file(other.disabled_file()).unwrap();
+            }
+            assert!(!is_disabled());
+        });
+        for _ in 0..200 {
+            assert!(is_disabled());
+        }
+        toggler.join().unwrap();
+        assert!(is_disabled());
     }
 
     #[test]

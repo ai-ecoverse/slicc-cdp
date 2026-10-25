@@ -17,6 +17,8 @@ const events = new Set([
   'Fetch.authRequired',
   'Fetch.requestPaused',
   'HeapProfiler.addHeapSnapshotChunk',
+  'Inspector.detached',
+  'Inspector.targetCrashed',
   'Log.entryAdded',
   'Network.loadingFailed',
   'Network.loadingFinished',

@@ -20,7 +20,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Target.activateTarget", "Target.attachToTarget", "Target.closeTarget", "Target.createTarget",
         "Target.detachFromTarget", "Target.getTargetInfo", "Target.getTargets",
     ]);
-    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker"]);
+    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable"]);
     let vetted_shim = set(&["Debugger.enable", "Debugger.getScriptSource", "Debugger.evaluateOnCallFrame", "Page.addScriptToEvaluateOnNewDocument", "Page.removeScriptToEvaluateOnNewDocument", "Runtime.runIfWaitingForDebugger", "Target.setAutoAttach"]);
     let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);
     let network_state = set(&["Network.emulateNetworkConditions"]);
