@@ -97,6 +97,40 @@ const RAW = [
 ];
 
 for (const [transport, runner] of Object.entries(runners)) {
+  for (const complete of [false, true]) {
+    test(`${transport}: Chrome mouse-release error requires complete trusted drag delivery ${complete}`, async () => {
+      const setup = scene({
+        reads: [complete ? ['mousemove', 'mousedown', 'mouseup'] : ['mousemove', 'mousedown']],
+      });
+      const intercept = setup.options.intercept;
+      setup.options.intercept = (message, send) => {
+        if (
+          message.method !== 'Input.dispatchMouseEvent' ||
+          message.params.type !== 'mouseReleased'
+        )
+          return intercept(message, send);
+        send({
+          id: message.id,
+          sessionId: message.sessionId,
+          error: { code: -32603, message: 'Internal error' },
+        });
+        return true;
+      };
+      await withScene(runner, setup, async (s) => {
+        s.state.front = s.tab;
+        const result = await s.run(['drag', 'e1', 'e2']);
+        assert.equal(result.code, complete ? 0 : 1, result.stderr);
+        if (!complete) assert.match(result.stderr, /Input.dispatchMouseEvent: Internal error/);
+        assert.deepEqual(
+          s.sent('Input.dispatchMouseEvent').map((call) => call.params.type),
+          ['mouseMoved', 'mousePressed', 'mouseMoved', 'mouseReleased']
+        );
+        assert.deepEqual(s.state.activated, []);
+        assert.equal(modes(s.state, 'mouse').length, 0);
+      });
+    });
+  }
+
   test(`${transport}: separate invocations preserve exactly one click across delivery mixes and no click after a native drag`, async () => {
     for (const [down, move, up, drag] of [
       [true, true, true, false],

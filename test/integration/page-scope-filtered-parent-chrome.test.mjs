@@ -52,7 +52,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
   let secure;
   let runner;
   let cwd;
-  let userSession;
+  let userTarget;
   try {
     await writeFile(
       path.join(dir, 'manifest.json'),
@@ -226,11 +226,6 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
               type: message.params?.resourceType,
             });
             wire.push({ connection, event: message.method, session, request });
-          } else if (
-            message.method?.startsWith('Page.frame') ||
-            message.method?.startsWith('Inspector.')
-          ) {
-            wire.push({ connection, event: message.method, session });
           } else if (message.method === 'Runtime.executionContextCreated') {
             wire.push({
               connection,
@@ -241,6 +236,12 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
               default: message.params?.context?.auxData?.isDefault,
               extension: message.params?.context?.origin?.startsWith('chrome-extension:'),
             });
+          } else if (
+            message.method?.startsWith('Page.frame') ||
+            message.method?.startsWith('Runtime.') ||
+            message.method?.startsWith('Inspector.')
+          ) {
+            wire.push({ connection, event: message.method, session });
           }
           if (wire.length > 40) wire.shift();
         }
@@ -256,12 +257,15 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     runner = nativeRunner(exe('playwright-cli'), exe('curlwright'), proxy.url);
     cwd = await runner.fresh();
     const diagnose = async () => {
-      const probe = async (method, params, session) => {
+      const probe = async (method, params, session, consume = () => {}) => {
         let timer;
         try {
           return await Promise.race([
             raw.send(method, params, session).then(
-              () => ({ method, reply: 'success' }),
+              (result) => {
+                consume(result);
+                return { method, reply: 'success' };
+              },
               () => ({ method, reply: 'error' })
             ),
             new Promise((resolve) => {
@@ -272,17 +276,34 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
           clearTimeout(timer);
         }
       };
+      let session;
+      const attachment = userTarget
+        ? await probe(
+            'Target.attachToTarget',
+            { targetId: userTarget, flatten: true },
+            undefined,
+            (result) => {
+              session = result.sessionId;
+            }
+          )
+        : undefined;
+      const probes = await Promise.all([
+        probe('Browser.getVersion', {}, undefined),
+        ...(session
+          ? [
+              probe('Runtime.evaluate', { expression: '0', returnByValue: true }, session),
+              probe('Network.enable', {}, session),
+            ]
+          : []),
+      ]);
+      const detachment = session
+        ? await probe('Target.detachFromTarget', { sessionId: session }, undefined)
+        : undefined;
       return {
         chrome: browser.died(),
-        probes: await Promise.all([
-          probe('Browser.getVersion', {}, undefined),
-          ...(userSession
-            ? [
-                probe('Runtime.evaluate', { expression: '0', returnByValue: true }, userSession),
-                probe('Network.enable', {}, userSession),
-              ]
-            : []),
-        ]),
+        attachment,
+        probes,
+        detachment,
         lifecycle: lifecycle(),
         wire,
       };
@@ -299,9 +320,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
       (target) => target.type === 'page' && target.url === userUrl
     );
     assert.ok(user);
-    userSession = (
-      await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
-    ).sessionId;
+    userTarget = user.targetId;
     await until(async () => {
       const value = await run('eval', 'document.documentElement.dataset.extensionFixture');
       return /[a-p]{32}/.test(value);
@@ -315,6 +334,9 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     await runner.write(cwd, 'attachment.txt', 'fixture bytes');
     await run('upload', ref(await run('snapshot'), 'Attachment'), 'attachment.txt');
     const drag = await run('snapshot');
+    const userSession = (
+      await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
+    ).sessionId;
     await raw.send('Target.activateTarget', { targetId: user.targetId });
     await until(
       async () =>
@@ -326,19 +348,19 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
           )
         ).result.value === 'visible'
     );
+    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const beforeDrag = lifecycle();
     wire.length = 0;
     const dragged = await runner.playwright(
       ['drag', ref(drag, 'Drag source'), ref(drag, 'Drop target')],
       cwd
     );
-    const diagnostics = dragged.code === 0 ? '' : JSON.stringify(await diagnose());
+    const diagnostics = dragged.code === 0 ? { lifecycle: lifecycle(), wire } : await diagnose();
     assert.equal(
       dragged.code,
       0,
-      `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, afterDrag: lifecycle(), wire })} ${diagnostics}`
+      `drag: ${dragged.stderr} ${JSON.stringify({ beforeDrag, ...diagnostics })}`
     );
-    await raw.send('Target.detachFromTarget', { sessionId: userSession });
     const denied = await runner.playwright(['eval', '--tab', background, 'document.title'], cwd);
     assert.notEqual(denied.code, 0);
     assert.match(denied.stderr, /refused/);
