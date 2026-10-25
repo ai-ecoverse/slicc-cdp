@@ -226,6 +226,14 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
               type: message.params?.resourceType,
             });
             wire.push({ connection, event: message.method, session, request });
+          } else if (message.method === 'Target.targetCrashed') {
+            wire.push({
+              connection,
+              event: message.method,
+              target: identity(message.params?.targetId),
+              status: message.params?.status,
+              errorCode: message.params?.errorCode,
+            });
           } else if (message.method === 'Runtime.executionContextCreated') {
             wire.push({
               connection,
@@ -301,6 +309,7 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
         : undefined;
       return {
         chrome: browser.died(),
+        chromeStderr: browser.stderrTail(),
         attachment,
         probes,
         detachment,
@@ -333,6 +342,10 @@ test('Chrome: ordinary controls retain isolated extension worlds with filtered b
     await run('select', ref(await run('snapshot'), 'Flavor'), 'b');
     await runner.write(cwd, 'attachment.txt', 'fixture bytes');
     await run('upload', ref(await run('snapshot'), 'Attachment'), 'attachment.txt');
+    assert.match(
+      await run('eval', "() => document.querySelector('input[type=file]').files[0].text()"),
+      /fixture bytes/
+    );
     const drag = await run('snapshot');
     const userSession = (
       await raw.send('Target.attachToTarget', { targetId: user.targetId, flatten: true })
