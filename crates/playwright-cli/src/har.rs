@@ -98,6 +98,16 @@ fn clear(files: &Files, id: &str) {
     if fs::read_to_string(&files.stop).is_ok_and(|owner| owner == id) { let _ = fs::remove_file(&files.stop); }
 }
 
+fn ended(files: &Files, owner: &str) -> Output {
+    if let Some(value) = completed(files, owner) {
+        clear(files, owner);
+        return Output::ok(format!("{value}\n"));
+    }
+    clear(files, owner);
+    let _ = fs::remove_dir_all(files.record.with_extension("lock"));
+    Output::err(NONE)
+}
+
 pub fn stop(invocation: &Invocation) -> Output {
     let files = match files(invocation) { Ok(files) => files, Err(message) => return Output::err(message) };
     let Some(found) = read(&files.record) else { return Output::err(NONE) };
@@ -126,6 +136,12 @@ pub fn stop(invocation: &Invocation) -> Output {
         if let Some(value) = completed(&files, owner).or_else(|| read(&files.record).filter(|value| value["recordingId"] == owner && value["state"] == "stopped")) {
             clear(&files, owner);
             return Output::ok(format!("{value}\n"));
+        }
+        let checked = inspect(&files.record);
+        if !checked.alive {
+            #[cfg(windows)]
+            drop(checked);
+            return ended(&files, owner);
         }
         if Instant::now() >= deadline { return Output::err("har-stop: the HAR holder did not answer\n") }
     }
@@ -496,6 +512,27 @@ fn drain(cdp: &mut Cdp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn har_completion_published_before_owner_exit_wins_the_final_liveness_check() {
+        let root = std::env::temp_dir().join(format!("slicc-har-ended-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let files = Files { record: root.join("record.har.json"), stop: root.join("record.har.stop") };
+        let id = "rec-ended-generation";
+        atomic_session(&files.record, &json!({"state":"recording","recordingId":id,"beat":now_ms()})).unwrap();
+        let lease = Lease::claim(&files.record, true).unwrap();
+        assert!(completed(&files, id).is_none());
+        let result = json!({"state":"stopped","recordingId":id,"reason":"stop","entries":1});
+        atomic_session(&completion(&files, id), &result).unwrap();
+        drop(lease);
+        let checked = inspect(&files.record);
+        assert!(!checked.alive);
+        let reply = ended(&files, id);
+        assert_eq!(reply.code, 0);
+        assert_eq!(serde_json::from_str::<Value>(&reply.stdout).unwrap(), result);
+        assert!(!files.record.exists());
+        assert!(!completion(&files, id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn har_completion_is_an_immutable_generation_ack_not_a_heartbeat_replacement() {
