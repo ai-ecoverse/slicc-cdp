@@ -6,6 +6,7 @@ mod profiles;
 mod request;
 mod response;
 mod sanitize;
+mod sign;
 mod tab;
 mod write_out;
 
@@ -117,11 +118,15 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     if let Err(stop) = validate_headers(&opts.headers) {
         return Output::from_stop(stop);
     }
+    let signer = match signer_for(&opts) {
+        Ok(signer) => signer,
+        Err(stop) => return Output::from_stop(stop),
+    };
     let body = match body::resolve_body(&opts) {
         Ok(body) => body,
         Err(stop) => return Output::from_stop(stop),
     };
-    let request = match prepare(&opts, body) {
+    let mut request = match prepare(&opts, body) {
         Ok(request) => request,
         Err(stop) => return Output::from_stop(stop),
     };
@@ -130,6 +135,9 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
             format!("curlwright: {}\n", cdp_client::protected::Protected::default().refusal_for_url(&destination(&request.url))),
             1,
         );
+    }
+    if let Some(Err(message)) = signer.as_ref().map(|signer| signer.apply(&mut request)) {
+        return Output::from_stop(Stop::usage(message.trim_end()));
     }
     let start = match connect_start(opts.cdp.as_deref(), cdp_env) {
         Ok(start) => start,
@@ -175,7 +183,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     };
     let trace = if opts.verbose { format_request_trace(&request, opts.full_urls, Some(&effective_base)) } else { String::new() };
     let started = Instant::now();
-    let fetched = page::run_fetch(&mut cdp, &session, &request, context, opts.full_urls);
+    let fetched = page::run_fetch(&mut cdp, &session, &request, context, opts.full_urls, signer.as_ref());
     let elapsed = started.elapsed().as_secs_f64();
     page::detach(&mut cdp, &session);
     let output = match fetched {
@@ -184,6 +192,22 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     };
     report.finish(&mut cdp, output.code, annotation_stderr(&output.stderr));
     noted(&mut cdp, output)
+}
+
+fn signer_for(opts: &Options) -> Result<Option<sign::Signer>, Stop> {
+    let Some(path) = opts.sign_key.as_deref() else {
+        if opts.signature_agent.is_some() || opts.signature_agent_legacy {
+            return Err(Stop::usage("curlwright: --signature-agent needs --sign-key"));
+        }
+        return Ok(None);
+    };
+    if opts.signature_agent_legacy && opts.signature_agent.is_none() {
+        return Err(Stop::usage("curlwright: --signature-agent-legacy needs --signature-agent"));
+    }
+    if let Some(header) = opts.headers.iter().find(|header| sign::HEADERS.iter().any(|name| name.eq_ignore_ascii_case(&header.name))) {
+        return Err(Stop::usage(format!("curlwright: -H {} cannot be combined with --sign-key, which sets it", header.name)));
+    }
+    sign::load(path, opts.signature_agent.as_deref(), opts.signature_agent_legacy).map(Some)
 }
 
 fn noted(cdp: &mut cdp_client::cdp::Cdp, mut output: Output) -> Output {
@@ -474,7 +498,8 @@ mod tests {
             "-u, --user", "-e, --referer", "-r, --range", "--no-credentials", "--tab",
             "--frame", "-o, --output", "-O, --remote-name", "-i, --include", "-I, --head",
             "-D, --dump-header", "-w, --write-out", "-s, --silent", "-S, --show-error",
-            "-v, --verbose", "-f, --fail", "-m, --max-time",
+            "-v, --verbose", "-f, --fail", "-m, --max-time", "--sign-key",
+            "--signature-agent <url>", "--signature-agent-legacy",
         ] {
             assert!(output.as_text().contains(flag), "{flag}");
         }
@@ -554,6 +579,40 @@ mod tests {
             profile_start(Err("HTTP 500\nno\n".to_string())).unwrap_err(),
             "HTTP 500\nno\n"
         );
+    }
+
+    #[test]
+    fn signing_flags_fail_before_connect_and_never_echo_the_key() {
+        let dir = std::env::temp_dir().join(format!("curlwright-sign-flags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = "n4Ni-HpISpVObnQMW0wOhCKROaIKqKtW_2ZYb2p9KcU";
+        let good = dir.join("good.jwk");
+        std::fs::write(&good, format!("{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"{secret}\"}}")).unwrap();
+        let rsa = dir.join("rsa.jwk");
+        std::fs::write(&rsa, format!("{{\"kty\":\"RSA\",\"d\":\"{secret}\"}}")).unwrap();
+        let good = good.to_str().unwrap();
+        let rsa = rsa.to_str().unwrap();
+        let cdp = "ws://127.0.0.1:1/devtools/browser/x";
+        let cases: [(Vec<&str>, i32, &str); 8] = [
+            (vec!["--signature-agent", "https://agent.test", "https://app.example/"], 2, "--signature-agent needs --sign-key"),
+            (vec!["--signature-agent-legacy", "https://app.example/"], 2, "--signature-agent needs --sign-key"),
+            (vec!["--sign-key", good, "--signature-agent-legacy", "https://app.example/"], 2, "--signature-agent-legacy needs --signature-agent"),
+            (vec!["--sign-key", good, "-H", "signature-input: x", "https://app.example/"], 2, "-H signature-input cannot be combined with --sign-key"),
+            (vec!["--sign-key", good, "--signature-agent", "http://agent.test", "https://app.example/"], 2, "--signature-agent must be an https URL"),
+            (vec!["--sign-key", rsa, "https://app.example/"], 2, "is not an Ed25519 key"),
+            (vec!["--sign-key", "/no/such/curlwright-key.jwk", "https://app.example/"], 26, "cannot read --sign-key /no/such/curlwright-key.jwk"),
+            (vec!["--sign-key", good, "/api/me"], 2, "cannot sign a request without an absolute http(s) URL"),
+        ];
+        for (args, code, message) in cases {
+            let mut argv = vec!["--cdp", cdp];
+            argv.extend(args);
+            let output = run(&argv);
+            assert_eq!(output.code, code, "{}", output.stderr);
+            assert!(output.stderr.contains(message), "{}", output.stderr);
+            assert!(!output.stderr.contains(secret), "{}", output.stderr);
+            assert!(output.stdout.is_empty());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

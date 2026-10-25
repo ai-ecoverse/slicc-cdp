@@ -31,6 +31,17 @@ Tab selection:
       --frame <frameId>      Run in a child frame of that tab
       --full-urls            Print URLs without redacting query strings (may expose login tokens)
 
+Web Bot Auth signing (off unless --sign-key is given):
+      --sign-key <file>      Sign every request and redirect hop with this
+                             Ed25519 private JWK (RFC 9421, tag "web-bot-auth",
+                             keyid = its JWK thumbprint, valid for 60 seconds)
+      --signature-agent <url>
+                             Send Signature-Agent with this https URL, the
+                             key directory, and cover it in the signature
+      --signature-agent-legacy
+                             Send Signature-Agent as a bare string, the form
+                             Cloudflare's verifier expects today
+
 Output:
   -o, --output <file>        Write the body to a VFS file, byte-exact ("-" = stdout)
   -O, --remote-name          Write to the URL's last path segment
@@ -63,6 +74,9 @@ Notes:
     1 — "at least one hop" — because the page context cannot count them.
   - Cross-origin responses expose only CORS-safelisted headers unless the server
     sends Access-Control-Expose-Headers. Same-origin requests see all of them.
+  - --sign-key adds Signature-Input and Signature (and Signature-Agent),
+    covering @authority, recomputed for each hop's authority. Cross-origin,
+    the server must allow those headers in a CORS preflight, which is unsigned.
   - Options a page cannot honor (--cert, --insecure, -x, --resolve, --compressed,
     -b, -A, ...) are rejected by name rather than ignored.
 

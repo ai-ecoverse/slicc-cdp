@@ -250,6 +250,16 @@ fn on_message(text: &str, pages: &[PageSpec], shared: &Shared) -> Vec<String> {
                 return vec![json!({"id": id, "error": {"message": "missing sessionId"}}).to_string()];
             }
             let expr = params.get("expression").and_then(|item| item.as_str()).unwrap_or("");
+            if expr.contains("https://app.example/hop") {
+                let session = session_id.unwrap_or_default();
+                let request = json!({"url": "https://app.example/hop", "method": "GET", "headers": {}});
+                let response = json!({"url": "https://app.example/hop", "status": 302, "headers": {"Location": "https://other.example:8443/land"}});
+                return vec![
+                    json!({"method": "Network.requestWillBeSent", "sessionId": session, "params": {"requestId": "H1", "request": request}}).to_string(),
+                    json!({"method": "Network.requestWillBeSent", "sessionId": session, "params": {"requestId": "H1", "request": {"url": "https://other.example:8443/land", "method": "GET", "headers": {}}, "redirectResponse": response}}).to_string(),
+                    wrap(id, json!({"result": {"type": "object", "value": {"manualRedirect": true, "requestUrl": "https://app.example/hop"}}})),
+                ];
+            }
             let context = params.get("contextId").and_then(|item| item.as_i64()).or_else(|| params.get("uniqueContextId").and_then(Value::as_str).and_then(|id| id.strip_prefix("ctx:")).and_then(|id| id.parse().ok()));
             vec![wrap(id, interpret(expr, context))]
         }
@@ -731,4 +741,96 @@ fn wait_actions(running: &Running, count: usize) -> Vec<Call> {
         .filter(|call| call.method == "Slicc.action")
         .cloned()
         .collect()
+}
+
+fn sent_headers(expr: &str) -> serde_json::Map<String, Value> {
+    let rest = &expr[expr.find("const __init = ").unwrap() + "const __init = ".len()..];
+    let init = serde_json::Deserializer::from_str(rest).into_iter::<Value>().next().unwrap().unwrap();
+    init["headers"].as_object().unwrap().clone()
+}
+
+fn verify_signed(headers: &serde_json::Map<String, Value>, covered: &str, agent_line: Option<String>) {
+    verify_signed_for(headers, "app.example", covered, agent_line);
+}
+
+fn verify_signed_for(headers: &serde_json::Map<String, Value>, authority: &str, covered: &str, agent_line: Option<String>) {
+    let input = headers["Signature-Input"].as_str().unwrap();
+    let params = input.strip_prefix("sig1=").unwrap();
+    assert!(params.starts_with(&format!("({covered});created=")), "{input}");
+    assert!(params.contains(";keyid=\"poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U\";alg=\"ed25519\";expires="), "{input}");
+    assert!(params.ends_with(";tag=\"web-bot-auth\""), "{input}");
+    let number = |name: &str| -> u64 {
+        let start = params.find(&format!(";{name}=")).unwrap() + name.len() + 2;
+        params[start..].split(';').next().unwrap().parse().unwrap()
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert!(number("created").abs_diff(now) < 30, "{input}");
+    assert_eq!(number("expires") - number("created"), 60);
+    let nonce = params.split(";nonce=\"").nth(1).unwrap().split('"').next().unwrap();
+    assert_eq!(cdp_client::net::base64_decode(nonce).unwrap().len(), 64);
+    let mut base = vec![format!("\"@authority\": {authority}")];
+    base.extend(agent_line);
+    base.push(format!("\"@signature-params\": {params}"));
+    let signature = headers["Signature"].as_str().unwrap().strip_prefix("sig1=:").unwrap().strip_suffix(':').unwrap();
+    let signature = ed25519_compact::Signature::from_slice(&cdp_client::net::base64_decode(signature).unwrap()).unwrap();
+    let public = ed25519_compact::PublicKey::from_slice(&crate::sign::base64url_decode("JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs").unwrap()).unwrap();
+    public.verify(base.join("\n").as_bytes(), &signature).unwrap();
+}
+
+#[test]
+fn only_a_sign_key_adds_web_bot_auth_headers_and_they_verify() {
+    let running = serve(one_page());
+    let dir = std::env::temp_dir().join(format!("curlwright-sign-harness-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("key.jwk");
+    std::fs::write(&key, r#"{"kty":"OKP","crv":"Ed25519","kid":"test-key-ed25519","d":"n4Ni-HpISpVObnQMW0wOhCKROaIKqKtW_2ZYb2p9KcU","x":"JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs"}"#).unwrap();
+    let key = key.to_str().unwrap();
+    let plain = run_at(running.port, &["-v", "https://app.example/api/me"]);
+    assert_eq!(plain.code, 0, "{}", plain.stderr);
+    assert!(sent_headers(&expr_of(&running.shared)).keys().all(|name| !name.to_ascii_lowercase().starts_with("signature")));
+    assert!(!plain.stderr.to_ascii_lowercase().contains("signature"), "{}", plain.stderr);
+    let bare = run_at(running.port, &["--sign-key", key, "https://app.example/api/me"]);
+    assert_eq!(bare.code, 0, "{}", bare.stderr);
+    let headers = sent_headers(&expr_of(&running.shared));
+    assert!(!headers.contains_key("Signature-Agent"));
+    verify_signed(&headers, "\"@authority\"", None);
+    let signed = run_at(running.port, &["-v", "--sign-key", key, "--signature-agent", "https://agent.test", "https://app.example/api/me"]);
+    assert_eq!(signed.code, 0, "{}", signed.stderr);
+    let headers = sent_headers(&expr_of(&running.shared));
+    assert_eq!(headers["Signature-Agent"], "sig1=\"https://agent.test\"");
+    verify_signed(&headers, "\"@authority\" \"signature-agent\";key=\"sig1\"", Some("\"signature-agent\";key=\"sig1\": \"https://agent.test\"".into()));
+    assert!(signed.stderr.contains(&format!("> Signature-Input: {}\n", headers["Signature-Input"].as_str().unwrap())), "{}", signed.stderr);
+    let legacy = run_at(running.port, &["--sign-key", key, "--signature-agent", "https://agent.test", "--signature-agent-legacy", "https://app.example/api/me"]);
+    assert_eq!(legacy.code, 0, "{}", legacy.stderr);
+    let headers = sent_headers(&expr_of(&running.shared));
+    assert_eq!(headers["Signature-Agent"], "\"https://agent.test\"");
+    verify_signed(&headers, "\"@authority\" \"signature-agent\"", Some("\"signature-agent\": \"https://agent.test\"".into()));
+    assert!(!format!("{}{}{}", bare.stderr, signed.stderr, legacy.stderr).contains("n4Ni-HpISpVObnQMW0wOhCKROaIKqKtW_2ZYb2p9KcU"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_redirect_hop_is_signed_again_for_its_own_authority() {
+    let running = serve(one_page());
+    let dir = std::env::temp_dir().join(format!("curlwright-sign-hop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("key.jwk");
+    std::fs::write(&key, r#"{"kty":"OKP","crv":"Ed25519","d":"n4Ni-HpISpVObnQMW0wOhCKROaIKqKtW_2ZYb2p9KcU"}"#).unwrap();
+    let output = run_at(running.port, &["--sign-key", key.to_str().unwrap(), "--signature-agent", "https://agent.test", "https://app.example/hop"]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let fetches: Vec<String> = running.shared.log.lock().unwrap().iter()
+        .filter(|call| call.method == "Runtime.evaluate")
+        .filter_map(|call| call.params["expression"].as_str().map(str::to_string))
+        .filter(|expr| expr.contains("const __init = "))
+        .collect();
+    assert_eq!(fetches.len(), 2);
+    assert!(fetches[1].contains("https://other.example:8443/land"));
+    let agent = || Some("\"signature-agent\";key=\"sig1\": \"https://agent.test\"".to_string());
+    let covered = "\"@authority\" \"signature-agent\";key=\"sig1\"";
+    let first = sent_headers(&fetches[0]);
+    let second = sent_headers(&fetches[1]);
+    verify_signed_for(&first, "app.example", covered, agent());
+    verify_signed_for(&second, "other.example:8443", covered, agent());
+    assert_ne!(first["Signature"], second["Signature"]);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
