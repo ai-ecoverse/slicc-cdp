@@ -200,6 +200,9 @@ export async function launchBrowser(extraArgs = [], options = {}) {
         return child.exitCode !== null || child.signalCode ? chromeStatus(child, chromeLog) : null;
       },
       headless,
+      stderrTail() {
+        return chromeLog.trim().slice(-2000);
+      },
       async close() {
         options.signal?.removeEventListener('abort', abort);
         try {
