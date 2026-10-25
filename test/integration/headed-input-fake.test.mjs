@@ -77,6 +77,33 @@ const modes = (state, name) => state.modes.filter(([mode]) => mode === name);
 const sevenTab = { targetId: 'SEVEN', url: SEVEN };
 
 for (const [transport, runner] of Object.entries(runners)) {
+  test(`${transport}: Tab waits for input focus after Chrome makes the tab visible`, async () => {
+    const setup = scene({ others: [sevenTab] });
+    const landing = setup.options.landing;
+    let ready = false;
+    let checks = 0;
+    setup.options.landing = (mode, args, target) => {
+      if (mode === 'visible' && setup.state.activated.length && args.focus) {
+        checks += 1;
+        ready = checks > 1;
+        return ready ? 'visible' : 'hidden';
+      }
+      if (mode === 'read') return ready ? ['keydown'] : [];
+      return landing(mode, args, target);
+    };
+    await withScene(runner, setup, async (s) => {
+      await s.ok(['press', 'Tab']);
+      assert.equal(checks, 2);
+      assert.deepEqual(s.state.activated, [own(s), 'SEVEN']);
+      assert.equal(
+        s.fake.calls.filter(
+          (call) => call.method === 'Input.dispatchKeyEvent' && call.params.type === 'keyDown'
+        ).length,
+        2
+      );
+    });
+  });
+
   test(`${transport}: input that Chrome delivers is not repeated`, async () => {
     await withScene(runner, scene({ reads: [['mousedown', 'mouseup', 'click']] }), async (s) => {
       const clicked = await s.ok(['click', s.ref]);

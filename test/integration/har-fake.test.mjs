@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { globSync, writeFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -91,6 +92,52 @@ export async function harFixture(body, options = {}) {
     await rm(home, { recursive: true, force: true });
   }
 }
+
+test('HAR stop retains traffic absorbed while finalizing another completed request', async () => {
+  let finish;
+  let inject = false;
+  await harFixture(
+    async ({ home, file, start, request, response, send }) => {
+      const held = await start(['--content', 'embed']);
+      const ready = await held.event('ready');
+      finish = () => {
+        const [record] = globSync(`${home}/**/*.har.json`);
+        assert.ok(record);
+        writeFileSync(record.replace(/\.json$/, '.stop'), ready.recordingId);
+        request('TAIL', 'https://example.test/tail');
+        response('TAIL', 'https://example.test/tail');
+        send('Network.requestWillBeSent', {
+          requestId: 'DENIED',
+          loaderId: 'L',
+          documentURL: 'https://vault.sliccy.ai/',
+          type: 'Fetch',
+          request: { url: 'https://example.test/protected-tail', method: 'GET', headers: {} },
+        });
+        response('DENIED', 'https://example.test/protected-tail');
+      };
+      request('FIRST', 'https://example.test/first');
+      inject = true;
+      response('FIRST', 'https://example.test/first');
+      const ended = await held.ended;
+      assert.equal(ended.code, 0, ended.stderr);
+      assert.equal(held.events().at(-1).reason, 'stop');
+      const har = JSON.parse(await readFile(file, 'utf8'));
+      assert.deepEqual(
+        har.log.entries.map((entry) => entry.request.url),
+        ['https://example.test/first', 'https://example.test/tail']
+      );
+    },
+    {
+      intercept(message) {
+        if (inject && message.method === 'Network.getResponseBody') {
+          inject = false;
+          finish();
+        }
+        return false;
+      },
+    }
+  );
+});
 
 test('HAR captures ordinary traffic, atomically checkpoints, strips credentials and omits bodies', async () => {
   await harFixture(async ({ home, backend, file, start, request, response, checkpoint }) => {
