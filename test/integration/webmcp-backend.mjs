@@ -6,7 +6,11 @@ export async function webmcpBackend({
   definitions = [],
   children = [],
   native = false,
+  reentrantPauses = false,
+  attachDuringRearm = false,
+  installerWaitsForResume = false,
   onCommand = () => {},
+  beforeNavigateFrame = () => {},
 } = {}) {
   let next = 0;
   let reloads = 0;
@@ -18,7 +22,10 @@ export async function webmcpBackend({
   const permitted = new Map();
   const paused = new Map();
   const queues = new Map();
+  const pendingInstallers = new Map();
   const lateFrames = new Set();
+  const autoAttached = new Set();
+  const autoParents = new Set();
   let held = null;
   let navigateLatest = () => {};
   let loadFired = false;
@@ -93,23 +100,54 @@ export async function webmcpBackend({
   const frame = (page) => ({
     id: page.id,
     loaderId: page.loader,
-    url: `${page.origin}/`,
+    url: page.blank ? 'about:blank' : `${page.origin}/`,
     securityOrigin: page.origin,
     ...(page.id === 'TAB' ? {} : { parentId: 'TAB' }),
   });
   const tree = () => ({
     frame: frame(pages.get('TAB')),
-    childFrames: children.map((child) => ({ frame: frame(pages.get(child.id)) })),
+    childFrames: children
+      .filter((child) => !child.oopif)
+      .map((child) => ({ frame: frame(pages.get(child.id)) })),
   });
   const fake = await fakeCdp({
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
-      if (onCommand(message, pages, send) === true) return true;
+      if (onCommand(message, pages, send, sessions) === true) return true;
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) =>
         (writers.get(peer) || send)({ method, params, sessionId: peer });
-      const created = (peer) => {
+      const localPages = (peer) => {
+        const target = sessions.get(peer) || 'TAB';
+        return target === 'TAB'
+          ? [...pages.values()].filter((page) => !page.oopif)
+          : [pages.get(target)].filter(Boolean);
+      };
+      const attachOopifs = (parent) => {
         for (const page of pages.values()) {
+          if (!page.oopif || autoAttached.has(`${parent}:${page.id}`)) continue;
+          autoAttached.add(`${parent}:${page.id}`);
+          const peer = `PEER${++next}`;
+          sessions.set(peer, page.id);
+          writers.set(peer, send);
+          event(
+            'Target.attachedToTarget',
+            {
+              sessionId: peer,
+              targetInfo: {
+                targetId: page.id,
+                type: 'iframe',
+                parentFrameId: 'TAB',
+                url: `${page.origin}/`,
+              },
+              waitingForDebugger: true,
+            },
+            parent
+          );
+        }
+      };
+      const created = (peer) => {
+        for (const page of localPages(peer)) {
           event(
             'Runtime.executionContextCreated',
             {
@@ -161,18 +199,23 @@ export async function webmcpBackend({
         return true;
       };
       const begin = (peer) => {
-        queues.set(peer, [...pages.keys()]);
+        queues.set(
+          peer,
+          localPages(peer).map((page) => page.id)
+        );
         pause(peer);
       };
       const navigate = () => {
         reset(`RELOAD${++reloads}`);
         loadFired = false;
         for (const peer of sessions.keys()) {
-          for (const page of pages.values())
+          for (const page of localPages(peer)) {
+            beforeNavigateFrame(peer, page, event, sessions);
             event('Page.frameNavigated', { frame: frame(page) }, peer);
+          }
           event('Runtime.executionContextsCleared', {}, peer);
           created(peer);
-          for (const page of pages.values())
+          for (const page of localPages(peer))
             event(
               'Network.responseReceived',
               {
@@ -212,7 +255,16 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.getFrameTree') {
-        answer({ frameTree: tree() });
+        const target = sessions.get(sessionId) || 'TAB';
+        answer({ frameTree: target === 'TAB' ? tree() : { frame: frame(pages.get(target)) } });
+        return true;
+      }
+      if (method === 'Target.setAutoAttach') {
+        if (params.autoAttach && sessions.get(sessionId) === 'TAB') {
+          autoParents.add(sessionId);
+          if (!attachDuringRearm) attachOopifs(sessionId);
+        }
+        answer({});
         return true;
       }
       if (method === 'Browser.getVersion') {
@@ -290,9 +342,20 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.addScriptToEvaluateOnNewDocument') {
+        if (attachDuringRearm && !params.runImmediately && autoParents.has(sessionId))
+          attachOopifs(sessionId);
         scripts.set(sessionId, params.source);
-        answer({ identifier: sessionId });
-        if (params.runImmediately) begin(sessionId);
+        if (
+          installerWaitsForResume &&
+          params.runImmediately &&
+          pages.get(sessions.get(sessionId))?.oopif
+        ) {
+          pendingInstallers.set(sessionId, () => answer({ identifier: sessionId }));
+          begin(sessionId);
+        } else {
+          answer({ identifier: sessionId });
+          if (params.runImmediately) begin(sessionId);
+        }
         return true;
       }
       if (method === 'Page.removeScriptToEvaluateOnNewDocument') {
@@ -311,6 +374,7 @@ export async function webmcpBackend({
         return true;
       }
       const loadEverywhere = () => {
+        if (installerWaitsForResume && [...pages.values()].some((page) => !page.loaded)) return;
         loadFired = true;
         for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
       };
@@ -330,6 +394,14 @@ export async function webmcpBackend({
               page.document.modelContext?.registerTool?.(definition);
           }
         }
+        const installed = pendingInstallers.get(sessionId);
+        pendingInstallers.delete(sessionId);
+        installed?.();
+        if (reentrantPauses && queues.get(sessionId)?.length) {
+          pause(sessionId);
+          answer({});
+          return true;
+        }
         answer({});
         if (page?.loaded && lateFrames.delete(queues.get(sessionId)?.[0])) {
           held = () => pause(sessionId);
@@ -346,6 +418,35 @@ export async function webmcpBackend({
           return true;
         }
         if (!pause(sessionId) && page?.loaded && !loadFired) loadEverywhere();
+        return true;
+      }
+      if (method === 'Runtime.runIfWaitingForDebugger') {
+        const page = pages.get(sessions.get(sessionId));
+        if (page?.blank && page.oopif && scripts.has(sessionId)) {
+          page.blank = false;
+          for (const peer of sessions.keys()) {
+            if (sessions.get(peer) !== page.id) continue;
+            event('Page.frameNavigated', { frame: frame(page) }, peer);
+            event('Runtime.executionContextsCleared', {}, peer);
+            created(peer);
+            event(
+              'Network.responseReceived',
+              {
+                frameId: page.id,
+                loaderId: page.loader,
+                type: 'Document',
+                response: {
+                  url: `${page.origin}/`,
+                  status: 200,
+                  headers: { 'permissions-policy': page.policy || '' },
+                },
+              },
+              peer
+            );
+          }
+          begin(sessionId);
+        }
+        answer({});
         return true;
       }
       if (method === 'Page.reload') {
@@ -392,6 +493,13 @@ export async function webmcpBackend({
     },
   });
   fake.targets.push({ targetId: 'TAB', url: 'https://ordinary.test/' });
+  for (const child of children.filter((child) => child.oopif))
+    fake.targets.push({
+      targetId: child.id,
+      type: 'iframe',
+      parentFrameId: 'TAB',
+      url: `${child.origin}/`,
+    });
   return {
     ...fake,
     get page() {
@@ -407,6 +515,13 @@ export async function webmcpBackend({
     },
     reload() {
       navigateLatest();
+    },
+    abandonLocalGate(frameId) {
+      for (const [peer, frames] of queues)
+        queues.set(
+          peer,
+          frames.filter((frame) => frame !== frameId)
+        );
     },
     inject(message) {
       writers.get(message.sessionId)(message);

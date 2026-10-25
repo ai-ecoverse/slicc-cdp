@@ -22,6 +22,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     };
     let previous_owner = state.webmcp.get(target).and_then(|entry| entry.get("owner")).and_then(Value::as_str).map(str::to_string);
     let result = run(cdp, state, target, &session, invocation.flags.contains_key("reload"));
+    let result = cdp.webmcp_trace_result(&session, "holder run", result);
     cdp.stop_webmcp(&session);
     let _ = browser::watch_detach(cdp, state, target, &session);
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
@@ -85,9 +86,11 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
             Err(mpsc::TryRecvError::Empty) | Ok(()) => {}
         }
         if !cdp.webmcp_alive(session) {
+            cdp.webmcp_trace_stage(session, "holder-exit", "root liveness check");
             return Err("webmcp-polyfill: target closed, changed or was refused by the guard\n".into());
         }
-        cdp.pump(Instant::now() + Duration::from_millis(50))?;
+        let pumped = cdp.pump(Instant::now() + Duration::from_millis(50));
+        cdp.webmcp_trace_result(session, "event pump", pumped)?;
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
         if current != saved {
@@ -95,16 +98,19 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
             saved = current;
         }
         for (_target, child, _bridge) in cdp.take_webmcp_children() {
-            cdp.webmcp_auto_attach(&child)?;
+            let attached = cdp.webmcp_auto_attach(&child);
+            cdp.webmcp_trace_result(&child, "child auto attach", attached)?;
         }
         if readiness.due(cdp.events(), session, cdp.webmcp_settled()) && cdp.webmcp_alive(session) {
-            let document = cdp.webmcp_document(session, frame)?;
+            let document = cdp.webmcp_document(session, frame);
+            let document = cdp.webmcp_trace_result(session, "document readiness", document)?;
             save(cdp, state, target, &owner, json!({}))?;
             watch.arm(cdp, state)?;
             println!("{}", json!({"event":"document-ready","tab":target,"loaderId":document["loaderId"]}));
             io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
         }
-        let events = watch.tick(cdp, state)?;
+        let events = watch.tick(cdp, state);
+        let events = cdp.webmcp_trace_result(session, "change verification", events)?;
         if !events.is_empty() {
             save(cdp, state, target, &owner, watch.changes())?;
             for event in events { println!("{}", crate::sanitize::json_c1(&event.to_string())); }

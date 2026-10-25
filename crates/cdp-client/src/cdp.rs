@@ -3154,6 +3154,7 @@ impl Cdp {
     }
 
     fn send(&mut self, method: &str, params: Value, session_id: Option<&str>) -> Result<i64, String> {
+        self.webmcp_trace_fetch_command(method, &params, session_id);
         self.next_id += 1;
         let id = self.next_id;
         let mut message = json!({
@@ -3265,6 +3266,7 @@ impl Cdp {
     }
 
     fn forget_session(&mut self, session: &str) {
+        self.webmcp_cancel_queued(session);
         if !self.blocked.contains(session) && !self.guard_sessions.contains(session) {
             self.detached_ordinary.insert(session.to_string());
         }
