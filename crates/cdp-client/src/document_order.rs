@@ -13,11 +13,17 @@ impl Cdp {
 
     pub(super) fn unchecked_document(&self, target: &str) -> bool {
         self.unchecked_documents.keys().any(|(owner, _, _)| owner == target)
+            || self.targets.get(target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url))
+                && self.documents.get(target).is_none_or(|doc| !self.guard.error_page_url(&doc.url) || self.unverified_error(&doc.url, &doc.unreachable_url))
     }
 
     pub(super) fn verify_document_order(&mut self, tree: &Value, session: Option<&str>) -> Result<(), String> {
         let Some(session) = session else { return Ok(()) };
         let Some(target) = self.session_target(session) else { return Ok(()) };
+        let reported_error = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url));
+        if reported_error && tree.pointer("/frameTree/frame/url").and_then(Value::as_str).is_none_or(|url| !self.guard.error_page_url(url)) {
+            return Err(self.refusal());
+        }
         if !self.unchecked_document(&target) { return Ok(()) }
         let mut frames = BTreeMap::new();
         let mut queue = vec![tree.get("frameTree").ok_or_else(|| self.refusal())?];

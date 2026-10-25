@@ -2597,6 +2597,7 @@ impl Cdp {
                     self.created_blanks.remove(target);
                     self.navigated_blanks.remove(target);
                     self.documents.remove(target);
+                    self.unchecked_documents.retain(|(owner, _, _), _| owner != target);
                     self.unobserved.remove(target);
                 }
             }
@@ -3125,7 +3126,6 @@ impl Cdp {
             .map(|page| (page.clone(), self.page_scope_epochs.get(&page).copied().unwrap_or(0), self.page_scope_unknown));
         let result = self.raw_exchange(method, params, session_id, timeout, pinned)?;
         if method == "Page.getFrameTree" {
-            self.verify_document_order(&result, session_id)?;
             let stable_page = page.is_some_and(|(page, epoch, unknown)| self.page_scope_epochs.get(&page).copied().unwrap_or(0) == epoch && self.page_scope_unknown == unknown);
             if !stable_page && !self.tree_current(&result, frame_epoch) {
                 return Err(self.refusal());
@@ -3149,7 +3149,9 @@ impl Cdp {
         let result = self.raw_reply(method, id, session_id, timeout, pinned);
         self.waiting_calls.remove(&id);
         self.call_replies.remove(&id);
-        result
+        let result = result?;
+        if method == "Page.getFrameTree" { self.verify_document_order(&result, session_id)?; }
+        Ok(result)
     }
 
     fn raw_reply(&mut self, method: &str, id: i64, session_id: Option<&str>, timeout: Duration, pinned: bool) -> Result<Value, String> {
