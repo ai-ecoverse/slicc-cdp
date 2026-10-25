@@ -1,0 +1,45 @@
+name: Inspector replay proof
+
+on:
+  push:
+    branches: [proof/617-inspector-replay]
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: cloud-run-job
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: |
+          git show d492326:crates/cdp-client/src/cdp.rs > crates/cdp-client/src/cdp.rs
+          cargo build --locked -j 4 -p slicc-cdp-client --example guard_bridge
+          set +e
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 --test-name-pattern='a fresh client' test/integration/renderer-crash-fake.test.mjs
+          status=$?
+          set -e
+          test "$status" -ne 0
+          git restore crates/cdp-client/src/cdp.rs
+      - run: |
+          DEPS=
+          if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then DEPS=1; fi
+          npx --yes --package @ai-ecoverse/slicc-cdp slicc-cdp install-browser ${DEPS:+--with-deps}
+          command -v Xvfb
+      - run: npm run pretest
+        env:
+          CARGO_BUILD_JOBS: '4'
+      - run: |
+          cargo test --locked -j 4 -p slicc-cdp-client --lib -- --test-threads=1
+          node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/renderer-crash-fake.test.mjs
+          for round in $(seq 1 20); do
+            echo "Inspector replay Chrome round $round"
+            node --import ./test/integration/ports.mjs --test --test-concurrency=1 test/integration/page-scope-filtered-parent-chrome.test.mjs
+          done
