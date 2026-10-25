@@ -13,14 +13,35 @@ fn ordinary_document(guard: &Protected, frame: &Value) -> bool {
         && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty())
 }
 
-fn document_matches(observed: &Value, fresh: &Value) -> bool {
-    ["id", "parentId", "loaderId", "url", "urlFragment", "securityOrigin", "unreachableUrl"].iter().all(|key| {
-        observed.get(*key).and_then(Value::as_str).unwrap_or("") == fresh.get(*key).and_then(Value::as_str).unwrap_or("")
-    })
+fn document_matches(guard: &Protected, observed: &Value, fresh: &Value) -> bool {
+    let text = |frame: &Value, key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    if !["id", "parentId", "loaderId", "securityOrigin", "unreachableUrl"].iter().all(|key| text(observed, key) == text(fresh, key)) { return false }
+    let origin = |frame: &Value| url::Url::parse(&text(frame, "url")).ok().filter(|url| matches!(url.scheme(), "http" | "https")).map(|url| url.origin());
+    for frame in [observed, fresh] {
+        if ordinary_document(guard, frame) && origin(frame).is_some_and(|origin| Some(origin) != url::Url::parse(&text(frame, "securityOrigin")).ok().map(|url| url.origin())) { return false }
+    }
+    if ["url", "urlFragment"].iter().all(|key| text(observed, key) == text(fresh, key)) { return true }
+    if !ordinary_document(guard, observed) || !ordinary_document(guard, fresh) { return false }
+    let old = origin(observed);
+    old.is_some() && old == origin(fresh) && old == url::Url::parse(&text(fresh, "securityOrigin")).ok().map(|url| url.origin())
 }
 
 impl Cdp {
     pub(super) fn observe_document_order(&mut self, method: &str, params: &Value, session: Option<&str>) {
+        if method == "Page.navigatedWithinDocument" {
+            let Some(target) = session.and_then(|session| self.session_target(session)) else { return };
+            let id = params.get("frameId").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() { return }
+            let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+            let (url, fragment) = url.split_once('#').map_or((url, String::new()), |(url, fragment)| (url, format!("#{fragment}")));
+            for ((owner, _, frame), observed) in &mut self.unchecked_documents {
+                if owner == &target && frame == id {
+                    observed.frame["url"] = json!(url);
+                    observed.frame["urlFragment"] = json!(fragment);
+                }
+            }
+            return;
+        }
         if method != "Page.frameNavigated" { return }
         let Some(session) = session else { return };
         let Some(target) = self.session_target(session) else { return };
@@ -83,7 +104,7 @@ impl Cdp {
         if self.guard_sessions.contains(session) {
             let mut matched = BTreeMap::<String, u64>::new();
             for ((owner, peer, id), observed) in &self.unchecked_documents {
-                if owner == &target && !self.guard_sessions.contains(peer) && frames.get(id.as_str()).is_some_and(|fresh| ordinary_document(&self.guard, fresh) && document_matches(&observed.frame, fresh)) {
+                if owner == &target && !self.guard_sessions.contains(peer) && frames.get(id.as_str()).is_some_and(|fresh| ordinary_document(&self.guard, fresh) && document_matches(&self.guard, &observed.frame, fresh)) {
                     matched.entry(id.clone()).and_modify(|epoch| *epoch = (*epoch).max(observed.epoch)).or_insert(observed.epoch);
                 }
             }
@@ -101,7 +122,7 @@ impl Cdp {
                     && main_epoch.is_some_and(|epoch| epoch > observed.epoch)
                     && observed.root.as_ref().is_some_and(|(root, loader)| root == main_id && loader != main_loader) { return false }
                 owner != &target || frames.get(id.as_str()).is_none_or(|fresh| {
-                    (!document_matches(&observed.frame, fresh) && !(sessions.contains(peer) && ordinary_document(guard, &observed.frame)
+                    (!document_matches(guard, &observed.frame, fresh) && !(sessions.contains(peer) && ordinary_document(guard, &observed.frame)
                         && matched.get(id).is_some_and(|epoch| *epoch > observed.epoch)))
                         || guard.error_page_url(fresh.get("url").and_then(Value::as_str).unwrap_or(""))
                         || fresh.get("unreachableUrl").and_then(Value::as_str).is_some_and(|url| !url.is_empty())
@@ -119,7 +140,7 @@ impl Cdp {
                 }
                 return Err(self.refusal());
             };
-            if !document_matches(&observed.frame, fresh) {
+            if !document_matches(&self.guard, &observed.frame, fresh) {
                 #[cfg(test)]
                 {
                     let fields = ["id","parentId","loaderId","url","urlFragment","securityOrigin","unreachableUrl"].iter().filter(|key| observed.frame.get(**key).and_then(Value::as_str).unwrap_or("") != fresh.get(**key).and_then(Value::as_str).unwrap_or("")).collect::<Vec<_>>();
