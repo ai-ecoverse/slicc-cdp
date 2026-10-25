@@ -4,7 +4,7 @@ mod forward_ledger;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 #[cfg(not(target_os = "wasi"))]
 use std::io::BufRead;
@@ -196,9 +196,14 @@ fn settled(cdp: &Cdp, message: &Value) -> Option<String> {
     cdp.settled_refusal(message["method"].as_str()?, &params, message["sessionId"].as_str())
 }
 
+fn rejected(message: &Value) -> Value {
+    json!({"rejected":{"id":message["id"],"sessionId":message["sessionId"],"error":{"message":"duplicate request id"}}})
+}
+
 struct Dispatcher {
     read: Box<dyn FnMut() -> Result<String, mpsc::TryRecvError>>,
     queue: VecDeque<Value>,
+    requests: BTreeSet<u64>,
     closed: bool,
     busy: bool,
 }
@@ -209,6 +214,11 @@ impl Dispatcher {
             match (self.read)() {
                 Ok(line) => {
                     let message: Value = serde_json::from_str(&line).unwrap();
+                    let id = message["id"].as_u64().unwrap();
+                    if !self.requests.insert(id) {
+                        emit(rejected(&message));
+                        continue;
+                    }
                     emit(json!({"audit":{"id":message["id"],"stage":"received","method":message["method"].as_str().unwrap()}}));
                     self.queue.push_back(message);
                 }
@@ -242,7 +252,7 @@ fn main() {
     let mut cdp = Cdp::from_transport(Box::new(transport));
     let origin = std::env::args().nth(2).unwrap();
     cdp.protect_origins(&[&origin]);
-    let dispatcher = Rc::new(RefCell::new(Dispatcher { read: input(), queue: VecDeque::new(), closed: false, busy: false }));
+    let dispatcher = Rc::new(RefCell::new(Dispatcher { read: input(), queue: VecDeque::new(), requests: BTreeSet::new(), closed: false, busy: false }));
     let waiting = dispatcher.clone();
     cdp.set_waiter(Some(Box::new(move |cdp: &Cdp| waiting.borrow_mut().settle(cdp))));
     let mut seen = 0;
@@ -353,3 +363,6 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+include!("guard_bridge/request_test.rs");
