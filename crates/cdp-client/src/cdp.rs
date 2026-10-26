@@ -185,6 +185,7 @@ pub struct Cdp {
     issued: issued::Issued,
     waiter: Option<Waiter>,
     waiter_due: Instant,
+    closed: Option<String>,
     #[cfg(test)]
     runtime_preparing: bool,
     #[cfg(test)]
@@ -304,6 +305,7 @@ impl Cdp {
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
+            closed: None,
             #[cfg(test)]
             runtime_preparing: false,
             #[cfg(test)]
@@ -696,7 +698,15 @@ impl Cdp {
     }
 
     fn refusal(&self) -> String {
-        format!("{}\n", self.guard.refusal())
+        self.closed.clone().unwrap_or_else(|| format!("{}\n", self.guard.refusal()))
+    }
+
+    fn closing(&mut self, message: String) -> String {
+        if crate::net::connection_closed(&message) { self.closed.get_or_insert(message).clone() } else { message }
+    }
+
+    fn connected(&self) -> Result<(), String> {
+        self.closed.clone().map_or(Ok(()), Err)
     }
 
     fn admit(&mut self, method: &str, params: &Value, session_id: Option<&str>) -> Result<(), String> {
@@ -717,8 +727,8 @@ impl Cdp {
             if self.guard_sessions.contains(session) {
                 return Err(self.refusal());
             }
-            if self.session_target(session).is_some_and(|target| !self.refresh(&target)) {
-                return Err(self.refusal());
+            if let Some(target) = self.session_target(session) {
+                if !self.refresh(&target)? { return Err(self.refusal()) }
             }
             if !recovery(method, params) && self.session_target(session).and_then(|target| self.documents.get(&target)).is_some_and(|doc| self.sealed(doc)) {
                 return Err(self.refusal());
@@ -1319,7 +1329,7 @@ impl Cdp {
                     .cloned()
                     .unwrap_or_default();
                 for info in &infos {
-                    self.probe_error(info);
+                    self.probe_error(info)?;
                 }
                 for info in &infos {
                     if let Some(id) = info.get("targetId").and_then(|v| v.as_str()) {
@@ -1341,7 +1351,7 @@ impl Cdp {
                 if let Some(info) = result.get("targetInfo").cloned() {
                     let target = info.get("targetId").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     self.targets.insert(target.clone(), info.clone());
-                    self.probe_error(&info);
+                    self.probe_error(&info)?;
                     let protected = self.info_protected(&info, &[]);
                     if protected && !self.documents.contains_key(&target) {
                         self.protect_target(&target);
@@ -1462,10 +1472,10 @@ impl Cdp {
             self.targets.insert(target_id.to_string(), info.clone());
             if self.documents.get(target_id).is_some_and(|doc| doc.probed) {
                 self.documents.remove(target_id);
-            } else if !self.refresh(target_id) {
+            } else if !self.refresh(target_id)? {
                 return Ok(true);
             }
-            self.probe_error(&info);
+            self.probe_error(&info)?;
         }
         let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let opener = match info
@@ -1767,6 +1777,9 @@ impl Cdp {
                 }
             }
         }
+        if let Err(message) = self.connected() {
+            return Err(self.guard_failure(target_id, &session, message));
+        }
         Ok(())
     }
 
@@ -2018,21 +2031,22 @@ impl Cdp {
         }
     }
 
-    fn refresh(&mut self, target: &str) -> bool {
-        let Some(doc) = self.documents.get(target) else { return true };
-        if self.document_paused(target) { return true }
+    fn refresh(&mut self, target: &str) -> Result<bool, String> {
+        let Some(doc) = self.documents.get(target) else { return Ok(true) };
+        if self.document_paused(target) { return Ok(true) }
         if doc.navigating || doc.probed || !(self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) {
-            return true;
+            return Ok(true);
         }
-        let Some(guard) = self.guards.get(target).cloned() else { return true };
+        let Some(guard) = self.guards.get(target).cloned() else { return Ok(true) };
         let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok().and_then(|tree| tree.pointer("/frameTree/frame").cloned());
-        match frame {
+        self.connected()?;
+        Ok(match frame {
             Some(frame) if self.guards.get(target) == Some(&guard) => {
                 self.main_commit(&guard, &frame);
                 true
             }
             _ => false,
-        }
+        })
     }
 
     fn probe_candidate(&self, info: &Value) -> bool {
@@ -2042,12 +2056,12 @@ impl Cdp {
             && !self.documents.contains_key(target) && !self.abandoned.contains(target) && !self.guards.contains_key(target)
     }
 
-    fn probe_error(&mut self, info: &Value) {
+    fn probe_error(&mut self, info: &Value) -> Result<(), String> {
         let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).unwrap_or("").to_string();
         let target = text(info, "targetId");
         let url = text(info, "url");
         if !self.probe_candidate(info) || self.protected_targets.contains(&target) {
-            return;
+            return Ok(());
         }
         self.probing.insert(target.clone());
         self.guarding.insert(target.clone());
@@ -2055,7 +2069,7 @@ impl Cdp {
         self.guarding.remove(&target);
         let Some(session) = attached.ok().map(|value| text(&value, "sessionId")).filter(|session| !session.is_empty()) else {
             self.probing.remove(&target);
-            return;
+            return self.connected();
         };
         self.guard_sessions.insert(session.clone());
         let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&session), OPTIONAL_STEP).ok()
@@ -2068,15 +2082,17 @@ impl Cdp {
         };
         let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session }), None, OPTIONAL_STEP);
         self.probing.remove(&target);
-        let (Some(frame), Some(history)) = (frame, history) else { return };
+        self.connected()?;
+        let (Some(frame), Some(history)) = (frame, history) else { return Ok(()) };
         let unreachable_url = text(&frame, "unreachableUrl");
         if self.documents.contains_key(&target) || !self.ordinary_history(&history, &unreachable_url) {
-            return;
+            return Ok(());
         }
         self.documents.insert(target, MainDocument {
             frame_id: text(&frame, "id"), url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
             navigating: false, navigation_url: String::new(), previous: false, probed: true,
         });
+        Ok(())
     }
 
     fn reported_unreachable(&self, unreachable: &str, reported: &str) -> bool {
@@ -3236,7 +3252,7 @@ impl Cdp {
         if let Some(session_id) = session_id {
             message["sessionId"] = json!(session_id);
         }
-        self.ws.send_text(&message.to_string())?;
+        self.ws.send_text(&message.to_string()).map_err(|error| self.closing(error))?;
         if method == "Target.detachFromTarget" {
             if let Some(session) = message.pointer("/params/sessionId").and_then(Value::as_str) {
                 self.detaching.insert(id, session.to_string());
@@ -3250,6 +3266,11 @@ impl Cdp {
     }
 
     fn recv(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        let received = self.receive(deadline);
+        received.map_err(|error| self.closing(error))
+    }
+
+    fn receive(&mut self, deadline: Instant) -> Result<Option<String>, String> {
         loop {
             let Some(mut waiter) = self.waiter.take() else { return self.ws.recv_text(deadline) };
             let now = Instant::now();
@@ -4102,6 +4123,7 @@ mod tests {
     include!("renderer_crash_test.rs");
     include!("client_id_test.rs");
     include!("late_reply_test.rs");
+    include!("close_latch_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
