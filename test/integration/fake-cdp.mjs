@@ -208,9 +208,20 @@ export async function fakeCdp({
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     let noise;
+    let closing = false;
     socket.on('close', () => clearInterval(noise));
     const send = (message) => {
-      if (!socket.destroyed) socket.write(encode(JSON.stringify(message)));
+      if (!socket.destroyed && !closing) socket.write(encode(JSON.stringify(message)));
+    };
+    const close = (code, reason) => {
+      if (closing || socket.destroyed) return;
+      closing = true;
+      const payload = Buffer.alloc(2 + Buffer.byteLength(reason));
+      payload.writeUInt16BE(code, 0);
+      payload.write(reason, 2);
+      socket.write(encode(payload, 8));
+      const timer = setTimeout(() => socket.end(), 1000);
+      socket.on('close', () => clearTimeout(timer));
     };
     const reply = (message) => {
       const { id, method, params = {}, sessionId } = message;
@@ -229,7 +240,7 @@ export async function fakeCdp({
         }
       };
       const target = sessionId ? sessions.get(sessionId) : undefined;
-      if (intercept?.(message, send)) return;
+      if (intercept?.(message, send, close)) return;
       if (method === 'Slicc.action') clearInterval(noise);
       if (refuse.includes(method) || refuseWhen?.(message, calls)) {
         send({ id, error: { code: -32000, message: refusalMessage ?? `${method} refused` } });
@@ -619,13 +630,14 @@ export async function fakeCdp({
       pending = Buffer.from(rest);
       for (const frame of out) {
         if (frame.opcode === 8) {
-          socket.end(encode('', 8));
+          if (closing) socket.end();
+          else socket.end(encode('', 8));
           continue;
         }
         if (frame.opcode !== 1) continue;
         const message = JSON.parse(frame.payload.toString('utf8'));
         calls.push({ ...message, target: sessions.get(message.sessionId)?.targetId });
-        reply(message);
+        if (!closing) reply(message);
       }
     });
   });

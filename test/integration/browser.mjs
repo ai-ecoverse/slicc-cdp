@@ -335,8 +335,8 @@ async function openSocket(wsUrl) {
     if (conn.onmessage) conn.onmessage(text);
     else queued.push(text);
   });
-  ws.addEventListener('close', () => {
-    conn.onclose?.('browser socket closed');
+  ws.addEventListener('close', (event) => {
+    conn.onclose?.(event.reason || 'browser socket closed');
   });
   return conn;
 }

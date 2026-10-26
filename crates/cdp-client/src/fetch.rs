@@ -1224,7 +1224,7 @@ mod tests {
             }),
         );
         assert_eq!(crate::cdp::attach(&mut cdp, "T").unwrap_err(), close);
-        assert!(cdp.call("Runtime.evaluate", json!({ "expression": "1" }), Some("S")).unwrap_err().starts_with("slicc: refused:"));
+        assert_eq!(cdp.call("Runtime.evaluate", json!({ "expression": "1" }), Some("S")).unwrap_err(), close);
         let (mut live, _log) = fake(
             Vec::new(),
             Box::new(|message| match message["method"].as_str().unwrap() {

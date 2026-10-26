@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use wasix_net::TcpStream;
 
 const READ_SLICE: Duration = Duration::from_millis(200);
+const CONNECTION_CLOSED: &str = "websocket connection closed\n";
 
 pub struct HttpResponse {
     pub body: Vec<u8>,
@@ -31,6 +32,7 @@ pub struct Ws {
     buf: Vec<u8>,
     fragments: Vec<u8>,
     kind: u8,
+    closed: Option<String>,
 }
 
 trait ReadWrite: Read + Write {
@@ -273,6 +275,7 @@ pub fn ws_connect(url: &str) -> Result<Ws, String> {
         buf: rest,
         fragments: Vec::new(),
         kind: 0,
+        closed: None,
     })
 }
 
@@ -289,7 +292,23 @@ impl Ws {
         Ok(())
     }
 
+    fn latch(&mut self, message: String) -> String {
+        if connection_closed(&message) {
+            self.closed.get_or_insert(message).clone()
+        } else {
+            message
+        }
+    }
+
     fn note_server_close(&mut self) -> Result<(), String> {
+        if let Some(closed) = &self.closed {
+            return Err(closed.clone());
+        }
+        let drained = self.drain_server_close();
+        drained.map_err(|message| self.latch(message))
+    }
+
+    fn drain_server_close(&mut self) -> Result<(), String> {
         if let Some(message) = buffered_close(&self.buf) {
             return Err(message);
         }
@@ -310,7 +329,7 @@ impl Ws {
                 Ok(0) => {
                     failed = Some(
                         buffered_close(&self.buf)
-                            .unwrap_or_else(|| "websocket connection closed\n".to_string()),
+                            .unwrap_or_else(|| CONNECTION_CLOSED.to_string()),
                     );
                     break;
                 }
@@ -352,6 +371,14 @@ impl Ws {
     }
 
     pub fn recv_text(&mut self, deadline: std::time::Instant) -> Result<Option<String>, String> {
+        if let Some(closed) = &self.closed {
+            return Err(closed.clone());
+        }
+        let received = self.receive_text(deadline);
+        received.map_err(|message| self.latch(message))
+    }
+
+    fn receive_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -418,7 +445,7 @@ fn next_frame(buf: &mut Vec<u8>, stream: &mut dyn ReadWrite) -> Result<Option<Fr
     }
     let mut tmp = [0u8; 8192];
     match stream.read(&mut tmp) {
-        Ok(0) => Err("websocket connection closed\n".to_string()),
+        Ok(0) => Err(CONNECTION_CLOSED.to_string()),
         Ok(n) => {
             buf.extend_from_slice(&tmp[..n]);
             if let Some((consumed, frame)) = try_decode(buf)? {
@@ -510,6 +537,10 @@ pub fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8>
         out.push(byte ^ mask[i % 4]);
     }
     out
+}
+
+pub(crate) fn connection_closed(message: &str) -> bool {
+    message == CONNECTION_CLOSED || message.starts_with("websocket closed")
 }
 
 fn buffered_close(buf: &[u8]) -> Option<String> {
@@ -1087,7 +1118,7 @@ mod tests {
     fn pre_send_draining_is_bounded_and_restores_socket_options() {
         for (slow, broken) in [(false, false), (true, false), (false, true)] {
             let state = std::rc::Rc::new(std::cell::RefCell::new((0, false, Some(Duration::from_millis(200)))));
-            let mut ws = Ws { stream: Box::new(ReadyStream { state: state.clone(), slow, broken }), buf: Vec::new(), fragments: Vec::new(), kind: 0 };
+            let mut ws = Ws { stream: Box::new(ReadyStream { state: state.clone(), slow, broken }), buf: Vec::new(), fragments: Vec::new(), kind: 0, closed: None };
             let result = ws.send_text("{}");
             assert_eq!(result.is_err(), broken);
             let state = state.borrow();
@@ -1128,7 +1159,7 @@ mod tests {
     #[test]
     fn short_receive_deadline_is_not_stretched_by_the_socket_timeout() {
         let stream = SilentStream { timeout: Some(READ_SLICE) };
-        let mut ws = Ws { stream: Box::new(stream), buf: Vec::new(), fragments: Vec::new(), kind: 0 };
+        let mut ws = Ws { stream: Box::new(stream), buf: Vec::new(), fragments: Vec::new(), kind: 0, closed: None };
         let started = Instant::now();
         assert_eq!(ws.recv_text(started + Duration::from_millis(5)).unwrap(), None);
         assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
@@ -1136,6 +1167,120 @@ mod tests {
         assert_eq!(ws.recv_text(started + Duration::from_millis(450)).unwrap(), None);
         let spent = started.elapsed();
         assert!(spent >= Duration::from_millis(450) && spent < Duration::from_millis(700), "{spent:?}");
+    }
+
+    struct Scripted {
+        reads: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+        written: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(err)) => Err(err),
+                None => Err(std::io::ErrorKind::WouldBlock.into()),
+            }
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl ReadWrite for Scripted {
+        fn set_nonblocking(&mut self, _on: bool) -> std::io::Result<()> { Ok(()) }
+        fn read_timeout(&self) -> std::io::Result<Option<Duration>> { Ok(Some(READ_SLICE)) }
+        fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> { Ok(()) }
+    }
+
+    fn scripted(reads: Vec<std::io::Result<Vec<u8>>>) -> (Ws, std::rc::Rc<std::cell::RefCell<Vec<u8>>>) {
+        let written = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let stream = Scripted { reads: reads.into(), written: written.clone() };
+        (Ws { stream: Box::new(stream), buf: Vec::new(), fragments: Vec::new(), kind: 0, closed: None }, written)
+    }
+
+    fn close_frame(code: u16, reason: &str) -> Vec<u8> {
+        let mut payload = code.to_be_bytes().to_vec();
+        payload.extend_from_slice(reason.as_bytes());
+        let mut frame = vec![0x88, payload.len() as u8];
+        frame.extend(payload);
+        frame
+    }
+
+    const GONE: &str = "websocket closed 1011 the CDP host is gone\n";
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_millis(20)
+    }
+
+    #[test]
+    fn a_close_frame_read_by_recv_is_latched_for_every_later_send_and_receive() {
+        let (mut ws, written) = scripted(vec![Ok(close_frame(1011, "the CDP host is gone")), Ok(Vec::new()), Ok(b"\x81\x02{}".to_vec())]);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), GONE);
+        assert_eq!(ws.send_text("{}").unwrap_err(), GONE);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), GONE);
+        assert_eq!(ws.send_text("{}").unwrap_err(), GONE);
+        assert!(written.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_close_drained_before_a_send_is_latched_ahead_of_frames_buffered_before_it() {
+        let mut bytes = b"\x81\x02{}".to_vec();
+        bytes.extend(close_frame(1011, "the CDP host is gone"));
+        let (mut ws, written) = scripted(vec![Ok(bytes), Ok(Vec::new())]);
+        assert_eq!(ws.send_text("{}").unwrap_err(), GONE);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), GONE);
+        assert_eq!(ws.send_text("{}").unwrap_err(), GONE);
+        assert!(written.borrow().is_empty());
+        let (mut ws, _) = scripted(Vec::new());
+        ws.buf = close_frame(1000, "");
+        assert_eq!(ws.send_text("{}").unwrap_err(), "websocket closed 1000\n");
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), "websocket closed 1000\n");
+    }
+
+    #[test]
+    fn an_end_of_stream_without_a_close_frame_is_latched_too() {
+        let (mut ws, written) = scripted(vec![Ok(Vec::new()), Ok(b"\x81\x02{}".to_vec())]);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), CONNECTION_CLOSED);
+        assert_eq!(ws.send_text("{}").unwrap_err(), CONNECTION_CLOSED);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), CONNECTION_CLOSED);
+        assert!(written.borrow().is_empty());
+        let (mut ws, written) = scripted(vec![Ok(Vec::new()), Ok(b"\x81\x02{}".to_vec())]);
+        assert_eq!(ws.send_text("{}").unwrap_err(), CONNECTION_CLOSED);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), CONNECTION_CLOSED);
+        assert!(written.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_ping_ahead_of_a_buffered_close_is_not_answered() {
+        let mut bytes = vec![0x89, 0x00];
+        bytes.extend(close_frame(1011, "the CDP host is gone"));
+        let (mut ws, written) = scripted(vec![Ok(bytes)]);
+        assert_eq!(ws.recv_text(soon()).unwrap_err(), GONE);
+        assert!(written.borrow().is_empty());
+        assert_eq!(ws.send_text("{}").unwrap_err(), GONE);
+    }
+
+    #[test]
+    fn errors_that_are_not_a_close_are_not_latched() {
+        let (mut ws, written) = scripted(vec![Err(std::io::ErrorKind::ConnectionReset.into()), Ok(b"\x81\x02{}".to_vec())]);
+        assert!(ws.recv_text(soon()).unwrap_err().starts_with("websocket read failed: "));
+        assert_eq!(ws.recv_text(soon()).unwrap().as_deref(), Some("{}"));
+        ws.send_text("{}").unwrap();
+        assert!(!written.borrow().is_empty());
+        assert!(ws.closed.is_none());
+        assert!(connection_closed("websocket closed\n"));
+        assert!(connection_closed(CONNECTION_CLOSED));
+        assert!(!connection_closed("websocket read failed: reset\n"));
+        assert!(!connection_closed("CDP response was not JSON: x\n"));
     }
 
     #[test]
