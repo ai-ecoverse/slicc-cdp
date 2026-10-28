@@ -44,7 +44,7 @@ rows.push({
 rows.push({
   name: 'invalid encoded bytes',
   title: '%FF' + layer(full(origins[0] + suffix)),
-  expected: '',
+  expected: '%FF' + origins[0],
 });
 rows.push({
   name: 'unicode tray host',
@@ -63,6 +63,29 @@ rows.push({
   name: 'literal nested query',
   title: 'https://ordinary.example/?next=' + origins[0] + suffix + '&second=fixture',
   expected: 'https://ordinary.example/?next=' + origins[0],
+});
+for (const title of [
+  ordinary + '?host=seven.sliccy.ai&path=visible',
+  ordinary + '?host=vault.sliccy.ai&path=visible',
+  '%cDownload',
+  '100%ff done',
+  'https://ordinary.example/caf%E9',
+])
+  rows.push({ name: 'ordinary text ' + title, title, expected: title });
+rows.push({
+  name: 'non-hex escape before unicode separator',
+  title: 'https://ordinary.example/?next=https%3A%2F%2Fvault.sliccy.ai%2Fs%+F%+F&éééé',
+  expected: 'https://ordinary.example/?next=' + origins[0] + '&éééé',
+});
+rows.push({
+  name: 'ordinary formatting beside a protected title',
+  title: 'before%cDownload ' + layer(full(origins[0] + suffix)) + ' after',
+  expected: 'before%cDownload ' + origins[0] + ' after',
+});
+rows.push({
+  name: 'encoded unicode tray host',
+  title: layer(full('é.tray-fixture.sliccy.ai' + suffix)),
+  expected: 'é.tray-fixture.sliccy.ai',
 });
 const prefix = 'https://ordinary.example/'.repeat(12000);
 rows.push({
@@ -83,6 +106,7 @@ for (const transport of ['native', 'wasi']) {
     let session;
     let burst = false;
     let refusing = false;
+    const queryUrl = ordinary + '?host=seven.sliccy.ai&path=visible';
     const info = (target) => ({ ...target, type: 'page', title: row.title });
     const frame = () => ({
       id: 'ORDINARY',
@@ -138,6 +162,16 @@ for (const transport of ['native', 'wasi']) {
               },
             });
           for (const [method, params] of [
+            [
+              'Network.requestWillBeSent',
+              {
+                requestId: 'QUERY',
+                loaderId: 'L',
+                frameId: 'ORDINARY',
+                type: 'XHR',
+                request: { url: queryUrl, method: 'GET', headers: {} },
+              },
+            ],
             ['Page.frameNavigated', { frame: frame() }],
             [
               'Runtime.consoleAPICalled',
@@ -213,6 +247,9 @@ for (const transport of ['native', 'wasi']) {
           await client.send('Browser.getVersion');
           await client.send('Browser.getVersion');
           const events = client.events.slice(from);
+          const request = events.find((event) => event.method === 'Network.requestWillBeSent');
+          assert.ok(request);
+          assert.equal(request.params.request.url, queryUrl);
           for (const method of [
             'Target.targetCreated',
             'Target.targetInfoChanged',

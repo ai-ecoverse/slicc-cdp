@@ -214,7 +214,7 @@ pub(crate) fn decode_percent(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() && bytes[index + 1].is_ascii_hexdigit() && bytes[index + 2].is_ascii_hexdigit() {
             if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
                 out.push(byte);
@@ -235,30 +235,38 @@ struct OutboundText {
 }
 
 impl OutboundText {
-    fn decode(&self) -> Option<Self> {
-        let text = decode_percent(&self.text);
+    fn decode(&self) -> Self {
         let bytes = self.text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
         let mut ampersands = Vec::new();
         let mut marks = self.ampersands.iter().peekable();
         let mut index = 0;
-        let mut output = 0;
-        let mut encoded = false;
         while index < bytes.len() {
-            if bytes[index] == b'%' && index + 2 < bytes.len() && bytes[index + 1].is_ascii_hexdigit() && bytes[index + 2].is_ascii_hexdigit() {
-                index += 3;
-                encoded = true;
-            } else {
-                while marks.peek().is_some_and(|mark| **mark < index) { marks.next(); }
-                if marks.peek().is_some_and(|mark| **mark == index) {
-                    ampersands.push(output);
-                    marks.next();
+            let byte = |at: usize| {
+                let escape = bytes.get(at..at + 3)?;
+                if escape[0] != b'%' || !escape[1].is_ascii_hexdigit() || !escape[2].is_ascii_hexdigit() { return None }
+                u8::from_str_radix(std::str::from_utf8(&escape[1..]).ok()?, 16).ok()
+            };
+            if let Some(first) = byte(index) {
+                let width = match first { 0..=127 => 1, 194..=223 => 2, 224..=239 => 3, 240..=244 => 4, _ => 0 };
+                let mut decoded = [first, 0, 0, 0];
+                let valid = width > 0 && (1..width).all(|at| byte(index + at * 3).is_some_and(|byte| { decoded[at] = byte; true }))
+                    && std::str::from_utf8(&decoded[..width]).is_ok();
+                if valid {
+                    out.extend_from_slice(&decoded[..width]);
+                    index += width * 3;
+                    continue;
                 }
-                index += 1;
             }
-            output += 1;
+            while marks.peek().is_some_and(|mark| **mark < index) { marks.next(); }
+            if marks.peek().is_some_and(|mark| **mark == index) {
+                ampersands.push(out.len());
+                marks.next();
+            }
+            out.push(bytes[index]);
+            index += 1;
         }
-        if encoded && text == self.text { return None }
-        Some(Self { text, ampersands })
+        Self { text: String::from_utf8(out).unwrap(), ampersands }
     }
 
     fn copy_span(&self, out: &mut Self, from: usize, end: usize, marks: &mut std::iter::Peekable<std::slice::Iter<'_, usize>>) {
@@ -283,7 +291,8 @@ pub fn redact_text(guard: &Protected, text: &str) -> (String, bool) {
         let (redacted, found) = redact_decoded(guard, &current, &prefixes, false, layer > 0);
         protected |= found;
         current = redacted;
-        let Some((decoded, checked)) = current.decode().zip(verified.decode()) else { return (String::new(), true) };
+        let decoded = current.decode();
+        let checked = verified.decode();
         if decoded.text == current.text && checked.text == verified.text {
             let (redacted, found) = redact_decoded(guard, &current, &prefixes, true, layer > 0);
             protected |= found;
@@ -356,7 +365,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                 continue;
             }
             let ch = text[index..].chars().next().unwrap();
-            if hosts && (host_character(ch) || ch == '[') {
+            if hosts && !web_seen && (host_character(ch) || ch == '[') {
                 let start = index;
                 let previous = text[..start].chars().next_back();
                 let boundary = previous.is_none_or(|ch| !ch.is_alphanumeric() && !matches!(ch, '.' | '-' | '_' | '@' | '/' | '\\'));
