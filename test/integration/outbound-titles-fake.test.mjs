@@ -133,6 +133,38 @@ rows.push({
   expected: repeated + 'vault.sliccy.ai' + control,
   bounded: true,
 });
+for (const prefix of [
+  'https://ordinary.example/?u=',
+  'ordinary.example/?u=',
+  'https://ordinary.example/a?b#',
+])
+  for (const host of ['vault.sliccy.ai', 'seven.sliccy.ai'])
+    for (const userinfo of ['a&b', 'a%26b&c', 'a&b%26c', 'a&b@', 'a&b@@'])
+      rows.push({
+        name: `userinfo authority ${prefix} ${userinfo} ${host}`,
+        title: prefix + 'https://' + userinfo + '@' + host + '/doc/SECRETX',
+        expected: prefix + 'https://' + host,
+      });
+for (const prefix of ['x?to=', 'ordinary.example/?to=', 'https://ordinary.example/?to='])
+  for (const separator of [';', ',', '!', '$', '%27', '('])
+    rows.push({
+      name: `bare host punctuation ${prefix} ${separator}`,
+      title: prefix + 'vault.sliccy.ai' + separator + 'SECRETX&tail=visible%252F',
+      expected: prefix + 'vault.sliccy.ai&tail=visible%252F',
+    });
+rows.push({
+  name: 'bare host literal quoted boundary',
+  title: "x?to=vault.sliccy.ai;SECRETX'ordinary",
+  expected: "x?to=vault.sliccy.ai'ordinary",
+});
+const authorityBudget =
+  'https://ordinary.example/?u=' + 'https:a&'.repeat(12000) + '@ordinary.example';
+rows.push({
+  name: 'overlapping authorities long crafted title',
+  title: authorityBudget,
+  expected: '',
+  bounded: true,
+});
 const prefix = 'https://ordinary.example/'.repeat(12000);
 rows.push({
   name: 'long crafted title',

@@ -391,6 +391,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
     let mut from = 0;
     let mut index = 0;
     let mut protected = false;
+    let mut budget = text.len().saturating_mul(4);
     while index < text.len() {
         let ch = text[index..].chars().next().unwrap();
         if current.source.get(index).map_or_else(|| text_boundary(ch), |span| span.boundary) { index += ch.len_utf8(); continue }
@@ -412,12 +413,21 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                     authority += inner.len();
                 }
                 while authority < run_end && matches!(text.as_bytes()[authority], b'/' | b'\\') { authority += 1; }
-                let mut end = text[authority..run_end].find(['/', '\\', '?', '#']).map_or(run_end, |at| authority + at);
+                let full_end = text[authority..run_end].find(['/', '\\', '?', '#']).map_or(run_end, |at| authority + at);
+                let Some(remaining) = budget.checked_sub(full_end - start) else { return (OutboundText::new(""), true) };
+                budget = remaining;
+                let full = &text[start..full_end];
+                let mut end = full_end;
                 while delimiters.peek().is_some_and(|mark| **mark < authority) { delimiters.next(); }
                 if web_seen || query { end = delimiters.peek().map_or(end, |mark| (**mark).min(end)); }
-                let raw = &text[start..end];
+                let mut raw = &text[start..end];
+                let full_protected = url_protected(guard, full);
+                let full_userinfo = full.contains('@') && !guard.unparseable(full);
+                let cut_protected = !full_userinfo && (url_protected(guard, raw) || guard.unparseable(raw) && guard.url(raw));
+                let full_unparseable = !cut_protected && guard.unparseable(full) && guard.url(full);
+                if full_protected || full_unparseable { raw = full; end = full_end; }
                 let mapped = web_socket_as_http(raw);
-                let hidden = url_protected(guard, raw) || guard.unparseable(raw) && guard.url(raw);
+                let hidden = full_protected || cut_protected || full_unparseable;
                 let nested = web_seen;
                 web_seen = true;
                 index = end;
@@ -452,9 +462,8 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                         index += 1;
                         while index < run_end && text.as_bytes()[index].is_ascii_digit() { index += 1; }
                     }
-                    let tail = text.as_bytes().get(index).is_some_and(|byte| matches!(*byte, b'/' | b'\\' | b'?' | b'#'));
-                    if (web_seen || query) && !tail { continue }
                     while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
+                    if web_seen && (index == run_end || delimiters.peek().is_some_and(|mark| **mark == index)) { continue }
                     let end = if query { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
                     current.copy_span(&mut out, from, start, &mut marks);
                     current.replace_span(&mut out, start, end, &text[start..index]);
