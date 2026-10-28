@@ -1,7 +1,6 @@
 # slicc-cdp
 
 The CLIs your agent already knows, where you need them and to the point.
-
 - `playwright-cli`: a playwright-cli-compatible command line. Not affiliated with Microsoft Playwright.
 - `curlwright`: curl, run as `fetch()` inside an open tab, with its cookies.
 - `@ai-ecoverse/slicc-cdp`: the Node `CDPClient` and the kernel builds of both commands.
@@ -75,7 +74,7 @@ The holder is a foreground process: keep stdin open, and close stdin to stop it.
 
 While the holder runs, a page that registers or unregisters tools after load, including in an admitted cross-origin iframe, produces a `tools-changed` JSON line:
 
-```json
+```jsonl
 {"event":"tools-changed","tab":"<targetId>","target":"<targetId>","frameId":"<frameId>","loaderId":"<loaderId>","origin":"https://shop.example","tools":[]}
 ```
 
@@ -105,7 +104,7 @@ Start `playwright-cli --cdp "$CDP" -s "$SESSION" dialog-hold --tab "$TAB"` befor
 
 The holder retains its observing CDP session. A `dialog-opened` event supplies `dialogId`; answer that observed dialog by writing one JSON line to the holder's stdin:
 
-```json
+```jsonl
 {"id":1,"dialogId":7,"command":"dialog-accept","promptText":"Lars"}
 {"id":2,"dialogId":8,"command":"dialog-dismiss"}
 ```
@@ -115,7 +114,6 @@ The holder retains its observing CDP session. A `dialog-opened` event supplies `
 `ready` contains `target`, `loaderId`, `loaderIdSource` and `status`. The initial `loaderId` can be null (`unavailable`, `observing`): the holder never invents one or queries a frozen renderer. A verified ordinary main-frame `frameNavigated` event supplies the loader ID in `document-ready` (`frame-navigated`, `document-verified`). Dialog ownership is independently reverified before every answer; a loader ID is not permission to handle a dialog. No dialog message, URL or prompt answer is echoed in events.
 
 `resize`, `keydown`, `keyup`, `mousemove`, `mousedown`, `mouseup`, `mousewheel` and `drop` take Microsoft's arguments, print its `### Ran Playwright code` lines and send Playwright's key definitions, buttons, coordinates and modifier masks. The deliberate differences:
-
 - Every command is its own process, so the pointer position, held buttons and held keys are saved per tab in the session, and the next command continues from them as Playwright's `page.mouse` and `page.keyboard` do. Modifiers held with `keydown` apply to later key and mouse events. On a macOS browser `keydown` sends Playwright's editing commands; `ControlOrMeta` follows the browser's platform rather than the CLI's.
 - Mouse commands first hit-test the whole pixels around the point with `DOM.getNodeForLocation` and refuse a point over an iframe, frame, object, embed or fenced frame, or inside a child frame. `keydown` and `keyup` refuse while focus is inside one of those or inside a closed shadow root. This keeps raw input out of protected and unverified frames.
 - A native HTML drag that `mousedown` and `mousemove` start is not intercepted. `Input.setInterceptDrags` is a persistent capability the guard refuses, and an intercepted drag could not span separate commands. `drag` and `drop` cover element-to-element and external drops.
@@ -136,7 +134,6 @@ Only when that can't work (another key, focus inside a frame, or nothing at the 
 ## Page tools
 
 `generate-locator`, `highlight` and `network-state-set` take Microsoft's arguments and options and print its output and exit codes. `eval-file` and `fetch` are SLICC-only. Where they differ from Microsoft's, or from SLICC's own handlers:
-
 - `generate-locator <ref>` runs Playwright's own selector generator and `asLocator` from the `playwright-core` 1.64 injected script (Apache-2.0, Copyright Microsoft Corporation), vendored in `crates/playwright-cli/vendor/playwright-injected.js.txt` with upstream's license header and its `LICENSE` and `NOTICE` beside it, in an isolated world of the element's frame, so it prints the same `getByRole(…)`, `getByTestId(…)` or `.nth(…)` locator. A ref in an iframe gets the iframe's locator and `.contentFrame()` in front. A frame nested inside an out-of-process iframe is refused instead.
 - `highlight <ref>` prints `Highlighted locator('aria-ref=e5')` like upstream. The overlay is SLICC's: an `x-slicc-highlight` element in the top layer, with an open shadow root and one box per element, that follows the element while its isolated world lives. It shows no locator tooltip. `--style` is appended to the box's inline style. `--hide <ref>` removes that element's box, and `--hide` alone removes every overlay in the tab's frames that the guard admits.
 - `network-state-set offline|online` is saved with the session, like routes, because each command runs in its own process. While offline, every later command that attaches to a tab first sends Playwright's `Network.emulateNetworkConditions` with `offline: true`, latency 0 and unlimited throughput, and the setting ends when that command detaches. Out-of-process iframes and workers keep their network. The guard admits only that exact shape, only on an ordinary page session, and never on seven's, the vault's or an unknown target. It does not change guard interception. Upstream's `--tab` is not accepted, as upstream has none.
@@ -173,7 +170,6 @@ The recorder writes Playwright code for trusted clicks, double clicks, right and
 The recorder runs in an isolated world that the guarded client installs only after the guard has verified the current main-frame document, and its events are read through guarded `Runtime.evaluate` calls pinned to that context. It uses no binding, init script, screencast or tracing. When the holder stops it removes the recorder's listeners, each start replaces any earlier recorder on that document, and a recorder that nobody drains for five seconds drops what it sees, so input between recordings is never captured. Nothing is installed in or read from seven's, the vault's, protected, unverified or unknown documents: capture pauses on an unverified document, and recording stops with `reason: "refused"` and exit 1 when the tab turns protected. Actions recorded before that stay available to `recording-stop`. Frames are not recorded, so a protected iframe is never read. A `goto` URL is redacted like every other URL unless `--full-urls` is given. The holder keeps the actions in memory; when it stops for `recording-stop`, a closed tab or a refusal, the result waits in a 0600 file next to the saved session until `recording-stop` reads and deletes it.
 
 Deliberate differences from Microsoft's recorder:
-
 - `recording-start` holds the terminal and prints JSON events instead of `### Result` and returning.
 - `recording-stop` prints no `### Page` or `### Snapshot` section, like the other commands here.
 - Only the selected tab's main frame is recorded: no iframes, popups (`page1`), dialog, download or popup signals, and no assertions.
