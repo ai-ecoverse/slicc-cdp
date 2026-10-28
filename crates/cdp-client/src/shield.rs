@@ -229,75 +229,15 @@ pub(crate) fn decode_percent(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
-#[derive(Clone, Copy)]
-struct SourceSpan {
-    start: usize,
-    end: usize,
-    redacted: bool,
-    boundary: bool,
-}
-
-#[derive(Clone)]
 struct OutboundText {
     text: String,
     ampersands: Vec<usize>,
-    source: Vec<SourceSpan>,
 }
 
 impl OutboundText {
-    fn new(text: &str) -> Self {
-        if !text.contains('%') && !text.contains("\\/") {
-            return Self { text: text.to_string(), ampersands: text.match_indices('&').map(|(at, _)| at).collect(), source: Vec::new() };
-        }
-        let mut out = Vec::with_capacity(text.len());
-        let mut source = Vec::with_capacity(text.len());
-        let mut index = 0;
-        while index < text.len() {
-            if text.as_bytes().get(index..index + 2) == Some(b"\\/") {
-                out.push(b'/');
-                source.push(SourceSpan { start: index, end: index + 2, redacted: false, boundary: false });
-                index += 2;
-            } else {
-                let ch = text[index..].chars().next().unwrap();
-                for at in 0..ch.len_utf8() {
-                    out.push(text.as_bytes()[index + at]);
-                    source.push(SourceSpan { start: index + at, end: index + at + 1, redacted: false, boundary: text_boundary(ch) });
-                }
-                index += ch.len_utf8();
-            }
-        }
-        let text = String::from_utf8(out).unwrap();
-        let ampersands = text.match_indices('&').map(|(at, _)| at).collect();
-        Self { text, ampersands, source }
-    }
-
-    fn finish(&self, original: &str) -> String {
-        if self.source.is_empty() { return self.text.clone() }
-        let mut out = String::new();
-        let mut index = 0;
-        while index < self.text.len() {
-            let start = index;
-            let redacted = self.source[index].redacted;
-            while index < self.text.len() && self.source[index].redacted == redacted { index += 1; }
-            if redacted { out.push_str(&self.text[start..index]); } else {
-                out.push_str(&original[self.source[start].start..self.source[index - 1].end]);
-            }
-        }
-        out
-    }
-
-    fn replace_span(&self, out: &mut Self, start: usize, end: usize, replacement: &str) {
-        if !self.source.is_empty() {
-            let source = SourceSpan { start: self.source[start].start, end: self.source[end - 1].end, redacted: true, boundary: false };
-            out.source.extend(std::iter::repeat_n(source, replacement.len()));
-        }
-        out.text.push_str(replacement);
-    }
-
     fn decode(&self) -> Self {
         let bytes = self.text.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
-        let mut source = Vec::with_capacity(if self.source.is_empty() { 0 } else { bytes.len() });
         let mut ampersands = Vec::new();
         let mut marks = self.ampersands.iter().peekable();
         let mut index = 0;
@@ -314,15 +254,6 @@ impl OutboundText {
                     && std::str::from_utf8(&decoded[..width]).is_ok();
                 if valid {
                     out.extend_from_slice(&decoded[..width]);
-                    if !self.source.is_empty() {
-                        let span = SourceSpan {
-                            start: self.source[index].start,
-                            end: self.source[index + width * 3 - 1].end,
-                            redacted: self.source[index..index + width * 3].iter().any(|span| span.redacted),
-                            boundary: self.source[index..index + width * 3].iter().any(|span| span.boundary),
-                        };
-                        source.extend(std::iter::repeat_n(span, width));
-                    }
                     index += width * 3;
                     continue;
                 }
@@ -333,10 +264,9 @@ impl OutboundText {
                 marks.next();
             }
             out.push(bytes[index]);
-            if let Some(span) = self.source.get(index) { source.push(*span); }
             index += 1;
         }
-        Self { text: String::from_utf8(out).unwrap(), ampersands, source }
+        Self { text: String::from_utf8(out).unwrap(), ampersands }
     }
 
     fn copy_span(&self, out: &mut Self, from: usize, end: usize, marks: &mut std::iter::Peekable<std::slice::Iter<'_, usize>>) {
@@ -345,15 +275,16 @@ impl OutboundText {
             out.ampersands.push(out.text.len() + *marks.next().unwrap() - from);
         }
         out.text.push_str(&self.text[from..end]);
-        if !self.source.is_empty() { out.source.extend_from_slice(&self.source[from..end]); }
     }
 }
 
 pub fn redact_text(guard: &Protected, text: &str) -> (String, bool) {
     let prefixes: Vec<String> = guard.redaction_schemes().chain(["ws", "wss", "about"])
         .map(|scheme| format!("{scheme}:")).collect();
-    let mut current = OutboundText::new(text);
-    let mut verified = current.clone();
+    let normalized = text.replace("\\/", "/");
+    let ampersands = normalized.match_indices('&').map(|(at, _)| at).collect();
+    let mut current = OutboundText { text: normalized, ampersands };
+    let mut verified = OutboundText { text: current.text.clone(), ampersands: current.ampersands.clone() };
     let mut protected = false;
     let mut layer = 0;
     loop {
@@ -365,7 +296,7 @@ pub fn redact_text(guard: &Protected, text: &str) -> (String, bool) {
         if decoded.text == current.text && checked.text == verified.text {
             let (redacted, found) = redact_decoded(guard, &current, &prefixes, true, layer > 0);
             protected |= found;
-            return (if protected { redacted.finish(text) } else { text.to_string() }, protected);
+            return (if protected { redacted.text } else { text.to_string() }, protected);
         }
         if layer == 5 { return (String::new(), true) }
         layer += 1;
@@ -385,17 +316,16 @@ fn host_character(ch: char) -> bool {
 fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String], hosts: bool, layered: bool) -> (OutboundText, bool) {
     let text = current.text.as_str();
     let lower = text.to_ascii_lowercase();
-    let mut out = OutboundText { text: String::with_capacity(text.len()), ampersands: Vec::new(), source: Vec::with_capacity(if current.source.is_empty() { 0 } else { text.len() }) };
+    let mut out = OutboundText { text: String::with_capacity(text.len()), ampersands: Vec::new() };
     let mut marks = current.ampersands.iter().peekable();
     let mut delimiters = current.ampersands.iter().peekable();
     let mut from = 0;
     let mut index = 0;
     let mut protected = false;
-    let mut budget = text.len().saturating_mul(4);
     while index < text.len() {
         let ch = text[index..].chars().next().unwrap();
-        if current.source.get(index).map_or_else(|| text_boundary(ch), |span| span.boundary) { index += ch.len_utf8(); continue }
-        let run_end = text[index..].char_indices().find_map(|(at, ch)| current.source.get(index + at).map_or_else(|| text_boundary(ch), |span| span.boundary).then_some(index + at)).unwrap_or(text.len());
+        if text_boundary(ch) { index += ch.len_utf8(); continue }
+        let run_end = text[index..].char_indices().find_map(|(at, ch)| text_boundary(ch).then_some(index + at)).unwrap_or(text.len());
         let mut web_seen = false;
         let mut query = false;
         while index < run_end {
@@ -413,21 +343,10 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                     authority += inner.len();
                 }
                 while authority < run_end && matches!(text.as_bytes()[authority], b'/' | b'\\') { authority += 1; }
-                let full_end = text[authority..run_end].find(['/', '\\', '?', '#']).map_or(run_end, |at| authority + at);
-                let Some(remaining) = budget.checked_sub(full_end - start) else { return (OutboundText::new(""), true) };
-                budget = remaining;
-                let full = &text[start..full_end];
-                let mut end = full_end;
-                while delimiters.peek().is_some_and(|mark| **mark < authority) { delimiters.next(); }
-                if web_seen || query { end = delimiters.peek().map_or(end, |mark| (**mark).min(end)); }
-                let mut raw = &text[start..end];
-                let full_protected = url_protected(guard, full);
-                let full_userinfo = full.contains('@') && !guard.unparseable(full);
-                let cut_protected = !full_userinfo && (url_protected(guard, raw) || guard.unparseable(raw) && guard.url(raw));
-                let full_unparseable = !cut_protected && guard.unparseable(full) && guard.url(full);
-                if full_protected || full_unparseable { raw = full; end = full_end; }
+                let end = text[authority..run_end].find(['/', '\\', '?', '#']).map_or(run_end, |at| authority + at);
+                let raw = &text[start..end];
                 let mapped = web_socket_as_http(raw);
-                let hidden = full_protected || cut_protected || full_unparseable;
+                let hidden = url_protected(guard, raw) || guard.unparseable(raw) && guard.url(raw);
                 let nested = web_seen;
                 web_seen = true;
                 index = end;
@@ -439,7 +358,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                     while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
                     let end = if nested && layered { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
                     current.copy_span(&mut out, from, start, &mut marks);
-                    current.replace_span(&mut out, start, end, &origin);
+                    out.text.push_str(&origin);
                     from = end;
                     index = end;
                     protected = true;
@@ -464,9 +383,9 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                     }
                     while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
                     if web_seen && (index == run_end || delimiters.peek().is_some_and(|mark| **mark == index)) { continue }
-                    let end = if query { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
+                    let end = if web_seen { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
                     current.copy_span(&mut out, from, start, &mut marks);
-                    current.replace_span(&mut out, start, end, &text[start..index]);
+                    out.text.push_str(&text[start..index]);
                     from = end;
                     index = end;
                     protected = true;

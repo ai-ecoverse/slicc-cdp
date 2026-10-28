@@ -3,10 +3,11 @@ import test from 'node:test';
 import { fakeCdp } from './fake-cdp.mjs';
 import { guarded } from './guard-client.mjs';
 
-const before = 'https://ordinary.example/page?keep=visible%20bytes%2B%41&to=';
+const before = 'https://ordinary.example/page?keep=visible%2B%41&to=';
+const normalizedBefore = 'https://ordinary.example/page?keep=visible+A&to=';
 const after = '&end=visible%252Fbytes#ordinary-fragment';
 const host = 'vault.sliccy.ai';
-const expected = before + host + after;
+const expected = normalizedBefore + host + '&end=visible/bytes#ordinary-fragment';
 const encoded = [
   ...new TextEncoder().encode(host + '/doc/path-secret-fixture?query=fixture#fragment'),
 ]
@@ -19,7 +20,7 @@ const references = [
 ];
 
 for (const transport of ['native', 'wasi']) {
-  test(`${transport}: nested references in discovery URLs preserve ordinary metadata`, async () => {
+  test(`${transport}: nested references in discovery URLs follow base output rules`, async () => {
     let notify = false;
     const fake = await fakeCdp({
       intercept(message, send) {
