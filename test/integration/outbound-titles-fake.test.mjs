@@ -67,7 +67,10 @@ rows.push({
 for (const title of [
   ordinary + '?host=seven.sliccy.ai&path=visible',
   ordinary + '?host=vault.sliccy.ai&path=visible',
+  '%cText',
   '%cDownload',
+  '100%ff',
+  'caf%E9',
   '100%ff done',
   'https://ordinary.example/caf%E9',
 ])
@@ -86,6 +89,49 @@ rows.push({
   name: 'encoded unicode tray host',
   title: layer(full('é.tray-fixture.sliccy.ai' + suffix)),
   expected: 'é.tray-fixture.sliccy.ai',
+});
+const outer = ordinary + '?keep=visible%20bytes%2B%41&to=';
+const control = '&tail=visible%252Fbytes#ordinary-fragment';
+for (const origin of origins) {
+  const host = origin.split('://')[1];
+  for (const reference of [
+    host + suffix,
+    host + '%2Fdoc%2Fpath-secret-fixture%3Fquery-secret%3Dfixture%23fragment-secret-fixture',
+    layer(full(host + suffix)),
+  ])
+    rows.push({
+      name: `nested unschemed ${origin} ${reference.startsWith('%') ? 'layered' : reference.includes('%') ? 'encoded path' : 'literal'}`,
+      title: outer + reference + control,
+      expected: outer + host + control,
+    });
+}
+rows.push({
+  name: 'nested unschemed outer host',
+  title: 'ordinary.example/page?to=vault.sliccy.ai/doc/path-secret-fixture&tail=visible',
+  expected: 'ordinary.example/page?to=vault.sliccy.ai&tail=visible',
+});
+rows.push({
+  name: 'nested unschemed unicode',
+  title: outer + layer(full('é.tray.sliccy.ai' + suffix)) + control,
+  expected: outer + 'é.tray.sliccy.ai' + control,
+});
+rows.push({
+  name: 'nested unschemed repeated references',
+  title: outer + 'vault.sliccy.ai/private&second=seven.sliccy.ai/private' + control,
+  expected: outer + 'vault.sliccy.ai&second=seven.sliccy.ai' + control,
+});
+rows.push({
+  name: 'schemed nested ordinary bytes',
+  title: outer + layer(full(origins[0] + suffix)) + control,
+  expected: outer + origins[0] + control,
+});
+const repeated =
+  ordinary + '?' + 'kept=vault.sliccy.ai&kept=seven.sliccy.ai&'.repeat(10000) + 'to=';
+rows.push({
+  name: 'nested unschemed long crafted title',
+  title: repeated + 'vault.sliccy.ai/doc/path-secret-fixture' + control,
+  expected: repeated + 'vault.sliccy.ai' + control,
+  bounded: true,
 });
 const prefix = 'https://ordinary.example/'.repeat(12000);
 rows.push({
@@ -178,7 +224,7 @@ for (const transport of ['native', 'wasi']) {
               {
                 type: 'log',
                 executionContextId: 1,
-                args: [{ type: 'object', description: row.title }],
+                args: [{ type: 'string', value: row.title, description: row.title }],
                 stackTrace: { description: row.title },
               },
             ],
@@ -266,6 +312,7 @@ for (const transport of ['native', 'wasi']) {
               'Runtime.consoleAPICalled',
               [
                 ['args', 0, 'description'],
+                ['args', 0, 'value'],
                 ['stackTrace', 'description'],
               ],
             ],
