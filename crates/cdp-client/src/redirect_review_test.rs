@@ -77,5 +77,5 @@ fn review_nine_level_percent_nesting_fails_closed() {
     let mut cdp = url_backend("about:blank");
     let result = cdp.after("Runtime.evaluate", &json!({}), Some("S"), json!({"text":format!("https://example.test/?next={encoded}")})).unwrap();
     assert!(!result.to_string().contains(REDIRECT_MARKER), "{result}");
-    assert!(result.to_string().contains("about"), "deep nesting must be replaced: {result}");
+    assert_eq!(result["text"], "", "deep nesting must be blanked: {result}");
 }

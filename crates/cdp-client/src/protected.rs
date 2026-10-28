@@ -95,6 +95,12 @@ impl Protected {
             .chain(self.extra.iter().filter_map(|origin| origin.split_once(':').map(|(scheme, _)| scheme)))
     }
 
+    pub(crate) fn redaction_host(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.rules.hosts.contains(&host) || self.extra_hosts.contains(&host)
+            || self.rules.domains.iter().any(|domain| under(&host, domain))
+    }
+
     pub fn url_read_only(&self, text: &str) -> bool {
         self.judge_url(text, true)
     }

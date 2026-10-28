@@ -214,7 +214,7 @@ pub(crate) fn decode_percent(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() && bytes[index + 1].is_ascii_hexdigit() && bytes[index + 2].is_ascii_hexdigit() {
             if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
                 out.push(byte);
@@ -229,100 +229,169 @@ pub(crate) fn decode_percent(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
-fn encode_origin(text: &str) -> String {
-    text.bytes().map(|byte| match byte {
-        b':' | b'/' => format!("%{byte:02X}"),
-        _ => char::from(byte).to_string(),
-    }).collect()
+struct OutboundText {
+    text: String,
+    ampersands: Vec<usize>,
+}
+
+impl OutboundText {
+    fn decode(&self) -> Self {
+        let bytes = self.text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut ampersands = Vec::new();
+        let mut marks = self.ampersands.iter().peekable();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = |at: usize| {
+                let escape = bytes.get(at..at + 3)?;
+                if escape[0] != b'%' || !escape[1].is_ascii_hexdigit() || !escape[2].is_ascii_hexdigit() { return None }
+                u8::from_str_radix(std::str::from_utf8(&escape[1..]).ok()?, 16).ok()
+            };
+            if let Some(first) = byte(index) {
+                let width = match first { 0..=127 => 1, 194..=223 => 2, 224..=239 => 3, 240..=244 => 4, _ => 0 };
+                let mut decoded = [first, 0, 0, 0];
+                let valid = width > 0 && (1..width).all(|at| byte(index + at * 3).is_some_and(|byte| { decoded[at] = byte; true }))
+                    && std::str::from_utf8(&decoded[..width]).is_ok();
+                if valid {
+                    out.extend_from_slice(&decoded[..width]);
+                    index += width * 3;
+                    continue;
+                }
+            }
+            while marks.peek().is_some_and(|mark| **mark < index) { marks.next(); }
+            if marks.peek().is_some_and(|mark| **mark == index) {
+                ampersands.push(out.len());
+                marks.next();
+            }
+            out.push(bytes[index]);
+            index += 1;
+        }
+        Self { text: String::from_utf8(out).unwrap(), ampersands }
+    }
+
+    fn copy_span(&self, out: &mut Self, from: usize, end: usize, marks: &mut std::iter::Peekable<std::slice::Iter<'_, usize>>) {
+        while marks.peek().is_some_and(|mark| **mark < from) { marks.next(); }
+        while marks.peek().is_some_and(|mark| **mark < end) {
+            out.ampersands.push(out.text.len() + *marks.next().unwrap() - from);
+        }
+        out.text.push_str(&self.text[from..end]);
+    }
 }
 
 pub fn redact_text(guard: &Protected, text: &str) -> (String, bool) {
-    redact_text_at(guard, text, 0)
+    let prefixes: Vec<String> = guard.redaction_schemes().chain(["ws", "wss", "about"])
+        .map(|scheme| format!("{scheme}:")).collect();
+    let normalized = text.replace("\\/", "/");
+    let ampersands = normalized.match_indices('&').map(|(at, _)| at).collect();
+    let mut current = OutboundText { text: normalized, ampersands };
+    let mut verified = OutboundText { text: current.text.clone(), ampersands: current.ampersands.clone() };
+    let mut protected = false;
+    let mut layer = 0;
+    loop {
+        let (redacted, found) = redact_decoded(guard, &current, &prefixes, false, layer > 0);
+        protected |= found;
+        current = redacted;
+        let decoded = current.decode();
+        let checked = verified.decode();
+        if decoded.text == current.text && checked.text == verified.text {
+            let (redacted, found) = redact_decoded(guard, &current, &prefixes, true, layer > 0);
+            protected |= found;
+            return (if protected { redacted.text } else { text.to_string() }, protected);
+        }
+        if layer == 5 { return (String::new(), true) }
+        layer += 1;
+        current = decoded;
+        verified = checked;
+    }
 }
 
-fn redact_text_at(guard: &Protected, text: &str, depth: usize) -> (String, bool) {
-    let bytes = text.as_bytes();
-    let mut normalized = String::new();
+fn text_boundary(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'')
+}
+
+fn host_character(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_')
+}
+
+fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String], hosts: bool, layered: bool) -> (OutboundText, bool) {
+    let text = current.text.as_str();
+    let lower = text.to_ascii_lowercase();
+    let mut out = OutboundText { text: String::with_capacity(text.len()), ampersands: Vec::new() };
+    let mut marks = current.ampersands.iter().peekable();
+    let mut delimiters = current.ampersands.iter().peekable();
     let mut from = 0;
     let mut index = 0;
-    let mut encoded_protected = false;
-    while index + 2 < bytes.len() {
-        if bytes[index] != b'%' || !bytes[index + 1].is_ascii_hexdigit() || !bytes[index + 2].is_ascii_hexdigit() {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index + 2 < bytes.len() && bytes[index] == b'%' && bytes[index + 1].is_ascii_hexdigit() && bytes[index + 2].is_ascii_hexdigit() {
-            index += 3;
-        }
-        let decoded = decode_percent(&text[start..index]);
-        let (redacted, protected) = if depth < 8 { redact_text_at(guard, &decoded, depth + 1) } else { ("about:blank".to_string(), true) };
-        if protected {
-            normalized.push_str(&text[from..start]);
-            normalized.extend(redacted.bytes().map(|byte| format!("%{byte:02X}")));
-            from = index;
-            encoded_protected = true;
-        }
-    }
-    normalized.push_str(&text[from..]);
-    let text = normalized.as_str();
-    let lower = text.to_ascii_lowercase();
-    let mut prefixes = Vec::new();
-    for scheme in guard.redaction_schemes().chain(["ws", "wss", "about"]) {
-        prefixes.push(format!("{scheme}:"));
-        prefixes.push(format!("{scheme}%"));
-    }
-    let mut out = String::new();
-    let mut from = 0;
-    let mut protected = encoded_protected;
-    while from < text.len() {
-        let next = prefixes.iter().flat_map(|prefix| {
-            lower[from..].match_indices(prefix).filter_map(|(at, _)| {
-                let start = from + at;
-                let after = start + prefix.len();
-                if prefix.ends_with(':') && text[after..].chars().next().is_none_or(char::is_whitespace) {
-                    return None;
+    let mut protected = false;
+    while index < text.len() {
+        let ch = text[index..].chars().next().unwrap();
+        if text_boundary(ch) { index += ch.len_utf8(); continue }
+        let run_end = text[index..].char_indices().find_map(|(at, ch)| text_boundary(ch).then_some(index + at)).unwrap_or(text.len());
+        let mut web_seen = false;
+        while index < run_end {
+            let prefix = prefixes.iter().find(|prefix| {
+                if !lower[index..run_end].starts_with(prefix.as_str()) { return false }
+                let web = matches!(prefix.as_str(), "http:" | "https:" | "ws:" | "wss:");
+                let previous = text[..index].chars().next_back();
+                (web || previous.is_none_or(|ch| !ch.is_alphanumeric() && !matches!(ch, '_' | '+' | '-' | '.')))
+                    && index + prefix.len() < run_end
+            });
+            if let Some(prefix) = prefix {
+                let start = index;
+                let mut authority = index + prefix.len();
+                while let Some(inner) = prefixes.iter().find(|prefix| lower[authority..run_end].starts_with(prefix.as_str())) {
+                    authority += inner.len();
                 }
-                let web = ["http:", "https:", "ws:", "wss:", "http%", "https%", "ws%", "wss%"].contains(&prefix.as_str());
-                if !web && text[..start].chars().next_back().is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '+' | '-' | '.')) {
-                    return None;
+                while authority < run_end && matches!(text.as_bytes()[authority], b'/' | b'\\') { authority += 1; }
+                let end = text[authority..run_end].find(['/', '\\', '?', '#']).map_or(run_end, |at| authority + at);
+                let raw = &text[start..end];
+                let mapped = web_socket_as_http(raw);
+                let hidden = url_protected(guard, raw) || guard.unparseable(raw) && guard.url(raw);
+                let nested = web_seen;
+                web_seen = true;
+                index = end;
+                if hidden {
+                    let origin = url::Url::parse(&mapped).ok().and_then(|url| {
+                        let origin = url.origin().ascii_serialization();
+                        if origin != "null" { Some(origin) } else { url.host_str().map(|host| format!("{}://{host}", url.scheme())) }
+                    }).unwrap_or_else(|| "about:blank".into());
+                    while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
+                    let end = if nested && layered { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
+                    current.copy_span(&mut out, from, start, &mut marks);
+                    out.text.push_str(&origin);
+                    from = end;
+                    index = end;
+                    protected = true;
                 }
-                Some((start, prefix.as_str()))
-            })
-        }).min_by_key(|(at, _)| *at);
-        let Some((start, prefix)) = next else { break };
-        out.push_str(&text[from..start]);
-        let encoded = prefix.contains('%');
-        let end = text[start..].char_indices().find_map(|(at, ch)| {
-            (ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') || encoded && ch == '&').then_some(start + at)
-        }).unwrap_or(text.len());
-        let raw = &text[start..end];
-        let mut levels = vec![raw.replace("\\/", "/")];
-        for _ in 0..8 {
-            let next = decode_percent(&levels[levels.len() - 1]);
-            if next == levels[levels.len() - 1] { break; }
-            levels.push(next);
-        }
-        let decoded = levels.pop().unwrap_or_default();
-        let found = levels.into_iter().find(|level| url_protected(guard, level)).or_else(|| (url_protected(guard, &decoded) || guard.unparseable(&decoded) && guard.url(&decoded)).then(|| decoded.clone()));
-        let overflow = encoded && decode_percent(&decoded) != decoded;
-        if overflow || found.is_some() {
-            protected = true;
-            let decoded = found.unwrap_or(decoded);
-            let origin = if overflow { "about:blank".to_string() } else {
-                url::Url::parse(&web_socket_as_http(&decoded)).ok().and_then(|url| {
-                    let origin = url.origin().ascii_serialization();
-                    if origin != "null" { Some(origin) } else { url.host_str().map(|host| format!("{}://{host}", url.scheme())) }
-                }).unwrap_or_else(|| "about:blank".into())
-            };
-            out.push_str(&if encoded { encode_origin(&origin) } else { origin });
-            from = end;
-        } else {
-            out.push_str(&text[start..start + prefix.len()]);
-            from = start + prefix.len();
+                continue;
+            }
+            let ch = text[index..].chars().next().unwrap();
+            if hosts && !web_seen && (host_character(ch) || ch == '[') {
+                let start = index;
+                let previous = text[..start].chars().next_back();
+                let boundary = previous.is_none_or(|ch| !ch.is_alphanumeric() && !matches!(ch, '.' | '-' | '_' | '@' | '/' | '\\'));
+                let host_end = if ch == '[' {
+                    text[start..run_end].find(']').map_or(run_end, |at| start + at + 1)
+                } else {
+                    text[start..run_end].char_indices().find_map(|(at, ch)| (!host_character(ch)).then_some(start + at)).unwrap_or(run_end)
+                };
+                index = host_end;
+                if boundary && guard.redaction_host(&text[start..host_end]) {
+                    if text.as_bytes().get(index) == Some(&b':') {
+                        index += 1;
+                        while index < run_end && text.as_bytes()[index].is_ascii_digit() { index += 1; }
+                    }
+                    current.copy_span(&mut out, from, start, &mut marks);
+                    out.text.push_str(&text[start..index]);
+                    from = run_end;
+                    index = run_end;
+                    protected = true;
+                }
+                continue;
+            }
+            index += ch.len_utf8();
         }
     }
-    out.push_str(&text[from..]);
+    current.copy_span(&mut out, from, text.len(), &mut marks);
     (out, protected)
 }
 
