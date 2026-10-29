@@ -213,12 +213,20 @@ pub fn close_target(cdp: &mut Cdp, target_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn navigate_away(cdp: &mut Cdp, state: &mut Session, target_id: &str, url: &str) -> Result<bool, String> {
+    if !cdp.navigate_away(target_id, url)? { return Ok(false) }
+    let session = watch_attach(cdp, state, target_id)?;
+    watch_detach(cdp, state, target_id, &session)?;
+    Ok(true)
+}
+
 pub fn navigate(
     cdp: &mut Cdp,
     state: &mut Session,
     target_id: &str,
     url: &str,
 ) -> Result<(), String> {
+    if navigate_away(cdp, state, target_id, url)? { return Ok(()) }
     let session = cdp::attach(cdp, target_id)?;
     let result = (|| {
         cdp.call("Page.enable", json!({}), Some(&session))?;

@@ -149,6 +149,8 @@ export async function fakeCdp({
   const calls = [];
   const navigationPauses = new Map();
   const fetchSessions = new Set();
+  const documentNavigationSessions = new Set();
+  const observingSessions = new Set();
   const jar = cookies.map((cookie) => ({ ...cookie }));
   let requests = 0;
   const targets = [];
@@ -315,6 +317,8 @@ export async function fakeCdp({
           sessions.delete(params.sessionId);
           sessionSends.delete(params.sessionId);
           paged.delete(params.sessionId);
+          documentNavigationSessions.delete(params.sessionId);
+          observingSessions.delete(params.sessionId);
           return answer({});
         case 'Target.closeTarget': {
           const index = targets.findIndex((item) => item.targetId === params.targetId);
@@ -344,9 +348,16 @@ export async function fakeCdp({
           });
         case 'Fetch.enable':
           fetchSessions.add(sessionId);
+          if (
+            params.patterns?.some(
+              (pattern) => pattern.resourceType === 'Document' && pattern.requestStage === 'Request'
+            )
+          )
+            documentNavigationSessions.add(sessionId);
           return answer({});
         case 'Fetch.disable':
           fetchSessions.delete(sessionId);
+          documentNavigationSessions.delete(sessionId);
           return answer({});
         case 'Fetch.fulfillRequest':
         case 'Fetch.continueRequest': {
@@ -389,7 +400,7 @@ export async function fakeCdp({
               delete target.history;
             }
             answer({ frameId: frame.id, loaderId });
-            const committed = { frame };
+            const committed = { frame, type: 'Navigation' };
             for (const [peer, found] of sessions)
               if (target && found === target && peer !== sessionId && paged.has(peer))
                 sessionSends.get(peer)?.({
@@ -441,13 +452,15 @@ export async function fakeCdp({
             event('Page.domContentEventFired', { timestamp: 1 });
             event('Page.loadEventFired', { timestamp: 1 });
           };
-          if (pauseNavigation && fetchSessions.has(sessionId)) {
+          const navigationOnly =
+            documentNavigationSessions.has(sessionId) && !observingSessions.has(sessionId);
+          if ((pauseNavigation || navigationOnly) && fetchSessions.has(sessionId)) {
             const requestId = `NAV-${sessionId}`;
             navigationPauses.set(requestId, complete);
             event('Fetch.requestPaused', {
               requestId,
               networkId: `NET-${sessionId}`,
-              frameId: target?.targetId ?? 'F',
+              frameId: target?.frame?.id ?? target?.targetId ?? 'F',
               resourceType: 'Document',
               request: { url: params.url, method: 'GET', headers: {} },
             });
@@ -456,7 +469,11 @@ export async function fakeCdp({
         }
         case 'Page.printToPDF':
           return answer({ stream: 'H' });
+        case 'Network.enable':
+          observingSessions.add(sessionId);
+          return answer({});
         case 'Runtime.enable': {
+          observingSessions.add(sessionId);
           const frame = target?.frame ?? {
             id: target?.targetId ?? 'F',
             loaderId: target?.loaderId ?? 'L',

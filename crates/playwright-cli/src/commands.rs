@@ -46,6 +46,14 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             }
         }
     }
+    if matches!(command, "goto" | "navigate") {
+        if let Some(destination) = invocation.positionals.first() {
+            let guard = cdp_client::protected::Protected::default();
+            if guard.url(destination) {
+                return Output::err(format!("{}\n", guard.refusal_for_url(destination)));
+            }
+        }
+    }
     if command == "tab-close" {
         if let Some(index) = invocation.positionals.first() {
             if close_index(index).is_none() {
@@ -193,6 +201,25 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if crate::page_tools::is_command(command) => crate::page_tools::run(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
+    if cdp.navigation_away_pending() {
+        let mut result = result;
+        for notice in cdp.take_notices() { result.stderr.push_str(&notice); }
+        report.finish(&mut cdp, &result);
+        let result = match cdp.finish_navigation_away() {
+            Ok(target) if result.code == 0 => {
+                state.current = Some(target);
+                state.snapshots.clear();
+                result
+            }
+            Err(message) => Output::err(message),
+            _ => result,
+        };
+        return match session::save(&state) {
+            Err(message) if cfg!(target_arch = "wasm32") => session::without_state(result, &message),
+            Err(message) if result.code == 0 => Output::err(message),
+            _ => result,
+        };
+    }
     let result = match session::save(&state) {
         Err(message) if cfg!(target_arch = "wasm32") => session::without_state(result, &message),
         Err(message) if result.code == 0 => Output::err(message),
@@ -360,6 +387,18 @@ fn cmd_goto(
         return Output::err(format!("{command} requires a URL\n"));
     };
     report.url(url.as_str());
+    if cdp.guard().url(url) { return Output::err(format!("{}\n", cdp.guard().refusal_for_url(url))) }
+    let selected = invocation.flags.get("tab").cloned().or_else(|| state.current.clone());
+    let escaped = selected.as_deref().map(|target| browser::navigate_away(cdp, state, target, url)).transpose();
+    match escaped {
+        Ok(Some(true)) => {
+            report.tab(selected.as_deref().unwrap());
+            report.begin(cdp);
+            return Output::ok(format!("Navigated to {}\n", sanitize::display_url(url)));
+        }
+        Err(message) => return Output::err(message),
+        _ => {}
+    }
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
@@ -378,8 +417,10 @@ fn cmd_goto(
     };
     match result {
         Ok(()) => {
-            state.current = Some(target);
-            state.snapshots.clear();
+            if !cdp.navigation_away_pending() {
+                state.current = Some(target);
+                state.snapshots.clear();
+            }
             Output::ok(format!("Navigated to {}\n", sanitize::display_url(url)))
         }
         Err(message) => Output::err(message),

@@ -71,9 +71,11 @@ test('a fresh playwright-cli can recover an opened about:blank tab whose blocked
     tab.frame = { id: tab.targetId, loaderId: 'LERR', url: ERROR_PAGE, securityOrigin: '://' };
 
     const blank = await pw(['goto', 'about:blank']);
+    assert.notEqual(blank.code, 0);
     assert.doesNotMatch(blank.stderr, new RegExp(SEVEN), blank.stderr);
     assert.match(blank.stderr, /a browser-side navigation to about:/, blank.stderr);
     const spaced = await pw(['goto', ' about:blank']);
+    assert.notEqual(spaced.code, 0);
     assert.doesNotMatch(spaced.stderr, new RegExp(SEVEN), spaced.stderr);
     const from = fake.calls.length;
     const content = await pw(['eval', 'document.documentElement.innerHTML']);
@@ -152,7 +154,7 @@ test('a caller-observed recovery from an error page stays drivable when the guar
 });
 
 for (const attachEvents of [false, true]) {
-  test(`a fresh playwright-cli recovers an ordinary tab from a protected error page and still refuses one with protected history${attachEvents ? ', with attach events' : ''}`, {
+  test(`a fresh playwright-cli navigates away from an unreadable error tab regardless of its history${attachEvents ? ', with attach events' : ''}`, {
     timeout: 60_000,
   }, async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-error-page-'));
@@ -197,10 +199,14 @@ for (const attachEvents of [false, true]) {
         [entry(1, start), entry(2, failed, 'reload')],
       ]) {
         errored(tab, entries);
-        const refused = await pw(['goto', destination, '--tab', tab.targetId]);
-        assert.notEqual(refused.code, 0, JSON.stringify(entries));
-        assert.match(refused.stderr, new RegExp(SEVEN), refused.stderr);
-        assert.equal(tab.url, failed);
+        const read = await pw(['eval', 'document.body.textContent', '--tab', tab.targetId]);
+        assert.notEqual(read.code, 0);
+        assert.match(read.stderr, new RegExp(SEVEN), read.stderr);
+        assert.doesNotMatch(`${read.stdout}${read.stderr}`, /MARK/);
+        const recovered = await pw(['goto', destination, '--tab', tab.targetId]);
+        assert.equal(recovered.code, 0, recovered.stderr);
+        assert.doesNotMatch(`${recovered.stdout}${recovered.stderr}`, /MARK/);
+        assert.equal(tab.url, destination);
       }
     } finally {
       await fake.close();
@@ -351,9 +357,14 @@ test('a fresh playwright-cli recovers a blocked tab whose target info an upstrea
       securityOrigin: origin,
     };
     tab.history = { currentIndex: 1, entries: [visit(1, start), visit(2, `${origin}/landing`)] };
-    const refused = await pw(['goto', 'http://ordinary.example/never', '--tab', tab.targetId]);
+    const refused = await pw(['eval', 'document.body.textContent', '--tab', tab.targetId]);
     assert.notEqual(refused.code, 0);
     assert.match(refused.stderr, new RegExp(SEVEN), refused.stderr);
+    assert.equal(tab.url, origin);
+    const destination = 'http://ordinary.example/next';
+    const recovered = await pw(['goto', destination, '--tab', tab.targetId]);
+    assert.notEqual(recovered.code, 0);
+    assert.match(recovered.stderr, new RegExp(SEVEN), recovered.stderr);
     assert.equal(tab.url, origin);
   } finally {
     await fake.close();

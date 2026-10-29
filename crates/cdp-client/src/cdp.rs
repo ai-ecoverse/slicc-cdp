@@ -13,6 +13,8 @@ mod webmcp_guard;
 mod page_scope;
 #[path = "document_order.rs"]
 mod document_order;
+#[path = "navigation_away.rs"]
+mod navigation_away;
 #[path = "issued.rs"]
 mod issued;
 pub(crate) use issued::target_refusal;
@@ -107,6 +109,9 @@ pub struct Cdp {
     next_id: i64,
     detaching: BTreeMap<i64, String>,
     detached_ordinary: BTreeSet<String>,
+    away_target: Option<String>,
+    away_sessions: BTreeMap<String, navigation_away::Away>,
+    away_operation: Option<navigation_away::Operation>,
     navigations: BTreeMap<i64, Navigation>,
     events: Vec<Value>,
     dialog_sessions: BTreeSet<String>,
@@ -227,6 +232,9 @@ impl Cdp {
             next_id: 0,
             detaching: BTreeMap::new(),
             detached_ordinary: BTreeSet::new(),
+            away_target: None,
+            away_sessions: BTreeMap::new(),
+            away_operation: None,
             navigations: BTreeMap::new(),
             events: Vec::new(),
             dialog_sessions: BTreeSet::new(),
@@ -3222,6 +3230,7 @@ impl Cdp {
                     if let Some(session) = value.pointer("/result/sessionId").and_then(Value::as_str) {
                         self.blocked.remove(session);
                         self.detached_ordinary.remove(session);
+                        self.away_sessions.remove(session);
                     }
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
@@ -3439,6 +3448,7 @@ impl Cdp {
             return;
         }
         self.observe_renderer_crash(&value);
+        if self.away_event(&value) { return }
         self.observe_dialog(&value);
         if value.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget") {
             let session = value.pointer("/params/sessionId").and_then(Value::as_str);

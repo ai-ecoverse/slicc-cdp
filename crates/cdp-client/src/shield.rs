@@ -494,6 +494,15 @@ pub fn redact_strings(guard: &Protected, value: &mut Value) -> bool {
             });
             if named_protected {
                 map.retain(|key, _| !key.to_ascii_lowercase().ends_with("fragment") && key != "documentURL");
+                let protected_title = |item: &Value| item.as_str().is_some_and(|text| guard.url(text) || guard.url(&web_socket_as_http(text)));
+                if map.contains_key("title") && map.iter().any(|(key, item)| {
+                    key.to_ascii_lowercase().ends_with("url") && protected_title(item)
+                        || matches!(key.as_str(), "request" | "response" | "redirectResponse") && item.get("url").is_some_and(protected_title)
+                }) {
+                    let origin = map.get("url").and_then(Value::as_str).and_then(|text| url::Url::parse(text).ok())
+                        .map(|url| url.origin().ascii_serialization()).filter(|origin| origin != "null").unwrap_or_default();
+                    map.insert("title".to_string(), Value::String(origin));
+                }
             }
             let link_value = map.get("name").and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("link"));
             let mut found = named_protected;
