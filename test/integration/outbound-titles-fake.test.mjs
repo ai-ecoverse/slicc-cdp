@@ -67,7 +67,10 @@ rows.push({
 for (const title of [
   ordinary + '?host=seven.sliccy.ai&path=visible',
   ordinary + '?host=vault.sliccy.ai&path=visible',
+  '%cText',
   '%cDownload',
+  '100%ff',
+  'caf%E9',
   '100%ff done',
   'https://ordinary.example/caf%E9',
 ])
@@ -87,6 +90,111 @@ rows.push({
   title: layer(full('é.tray-fixture.sliccy.ai' + suffix)),
   expected: 'é.tray-fixture.sliccy.ai',
 });
+const outer = ordinary + '?keep=visible%20bytes%2B%41&to=';
+const control = '&tail=visible%252Fbytes#ordinary-fragment';
+const normalizedOuter = ordinary + '?keep=visible bytes+A&to=';
+const normalizedControl = '&tail=visible/bytes#ordinary-fragment';
+for (const origin of origins) {
+  const host = origin.split('://')[1];
+  for (const reference of [
+    host + suffix,
+    host + '%2Fdoc%2Fpath-secret-fixture%3Fquery-secret%3Dfixture%23fragment-secret-fixture',
+    layer(full(host + suffix)),
+  ])
+    rows.push({
+      name: `nested unschemed ${origin} ${reference.startsWith('%') ? 'layered' : reference.includes('%') ? 'encoded path' : 'literal'}`,
+      title: outer + reference + control,
+      expected: normalizedOuter + host,
+    });
+}
+rows.push({
+  name: 'nested unschemed outer host',
+  title: 'ordinary.example/page?to=vault.sliccy.ai/doc/path-secret-fixture&tail=visible',
+  expected: 'ordinary.example/page?to=vault.sliccy.ai',
+});
+rows.push({
+  name: 'nested unschemed unicode',
+  title: outer + layer(full('é.tray.sliccy.ai' + suffix)) + control,
+  expected: normalizedOuter + 'é.tray.sliccy.ai',
+});
+rows.push({
+  name: 'nested unschemed repeated references',
+  title: outer + 'vault.sliccy.ai/private&second=seven.sliccy.ai/private' + control,
+  expected: normalizedOuter + 'vault.sliccy.ai',
+});
+rows.push({
+  name: 'schemed nested ordinary bytes',
+  title: outer + layer(full(origins[0] + suffix)) + control,
+  expected: normalizedOuter + origins[0],
+});
+const repeated =
+  ordinary + '?' + 'kept=vault.sliccy.ai&kept=seven.sliccy.ai&'.repeat(10000) + 'to=';
+rows.push({
+  name: 'nested unschemed long crafted title',
+  title: repeated + 'vault.sliccy.ai/doc/path-secret-fixture' + control,
+  expected: repeated + 'vault.sliccy.ai' + normalizedControl,
+  bounded: true,
+});
+for (const prefix of [
+  'https://ordinary.example/?u=',
+  'ordinary.example/?u=',
+  'https://ordinary.example/a?b#',
+])
+  for (const host of ['vault.sliccy.ai', 'seven.sliccy.ai'])
+    for (const userinfo of ['a&b', 'a%26b&c', 'a&b%26c', 'a&b@', 'a&b@@'])
+      rows.push({
+        name: `userinfo authority ${prefix} ${userinfo} ${host}`,
+        title: prefix + 'https://' + userinfo + '@' + host + '/doc/SECRETX',
+        expected: prefix + 'https://' + host,
+      });
+for (const prefix of ['x?to=', 'ordinary.example/?to=', 'https://ordinary.example/?to='])
+  for (const separator of [';', ',', '!', '$', '%27', '('])
+    rows.push({
+      name: `bare host punctuation ${prefix} ${separator}`,
+      title: prefix + 'vault.sliccy.ai' + separator + 'SECRETX&tail=visible%252F',
+      expected:
+        separator === '%27'
+          ? prefix.startsWith('https:')
+            ? prefix + 'vault.sliccy.ai%27SECRETX&tail=visible%252F'
+            : prefix + "vault.sliccy.ai'SECRETX&tail=visible/"
+          : prefix + 'vault.sliccy.ai' + (prefix.startsWith('https:') ? '&tail=visible/' : ''),
+    });
+rows.push({
+  name: 'bare host literal quoted boundary',
+  title: "x?to=vault.sliccy.ai;SECRETX'ordinary",
+  expected: "x?to=vault.sliccy.ai'ordinary",
+});
+const authorityBudget =
+  'https://ordinary.example/?u=' + 'https:a&'.repeat(12000) + '@ordinary.example';
+rows.push({
+  name: 'overlapping authorities long crafted title',
+  title: authorityBudget,
+  expected: authorityBudget,
+  bounded: true,
+});
+for (const [boundary, decoded] of [
+  ['%20', ' '],
+  ['%27', "'"],
+  ['%22', '"'],
+  ['%3C', '<'],
+  ['%2520', ' '],
+])
+  for (const prefix of ['https://ordinary.example/path', 'https://ordinary.example/#x'])
+    for (const host of ['vault.sliccy.ai', 'seven.sliccy.ai'])
+      rows.push({
+        name: `decoded boundary ${prefix} ${boundary} ${host}`,
+        title: prefix + boundary + host + '/doc/SECRETX',
+        expected: prefix + decoded + host,
+      });
+for (const origin of origins) {
+  const host = origin.split('://')[1];
+  for (const reference of [host + suffix, host + '%2Fdoc%2FSECRETX', layer(full(host + suffix))])
+    rows.push({
+      name: 'query-only nested reference ' + origin + ' ' + reference.slice(0, 12),
+      title: ordinary + '?to=' + reference + control,
+      expected: ordinary + '?to=' + host + normalizedControl,
+    });
+}
 const prefix = 'https://ordinary.example/'.repeat(12000);
 rows.push({
   name: 'long crafted title',
@@ -178,7 +286,7 @@ for (const transport of ['native', 'wasi']) {
               {
                 type: 'log',
                 executionContextId: 1,
-                args: [{ type: 'object', description: row.title }],
+                args: [{ type: 'string', value: row.title, description: row.title }],
                 stackTrace: { description: row.title },
               },
             ],
@@ -266,6 +374,7 @@ for (const transport of ['native', 'wasi']) {
               'Runtime.consoleAPICalled',
               [
                 ['args', 0, 'description'],
+                ['args', 0, 'value'],
                 ['stackTrace', 'description'],
               ],
             ],

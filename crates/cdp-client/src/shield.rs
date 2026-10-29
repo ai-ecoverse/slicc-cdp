@@ -327,6 +327,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
         if text_boundary(ch) { index += ch.len_utf8(); continue }
         let run_end = text[index..].char_indices().find_map(|(at, ch)| text_boundary(ch).then_some(index + at)).unwrap_or(text.len());
         let mut web_seen = false;
+        let mut query = false;
         while index < run_end {
             let prefix = prefixes.iter().find(|prefix| {
                 if !lower[index..run_end].starts_with(prefix.as_str()) { return false }
@@ -365,7 +366,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                 continue;
             }
             let ch = text[index..].chars().next().unwrap();
-            if hosts && !web_seen && (host_character(ch) || ch == '[') {
+            if hosts && (!web_seen || query) && (host_character(ch) || ch == '[') {
                 let start = index;
                 let previous = text[..start].chars().next_back();
                 let boundary = previous.is_none_or(|ch| !ch.is_alphanumeric() && !matches!(ch, '.' | '-' | '_' | '@' | '/' | '\\'));
@@ -380,14 +381,18 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                         index += 1;
                         while index < run_end && text.as_bytes()[index].is_ascii_digit() { index += 1; }
                     }
+                    while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
+                    if web_seen && (index == run_end || delimiters.peek().is_some_and(|mark| **mark == index)) { continue }
+                    let end = if web_seen { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
                     current.copy_span(&mut out, from, start, &mut marks);
                     out.text.push_str(&text[start..index]);
-                    from = run_end;
-                    index = run_end;
+                    from = end;
+                    index = end;
                     protected = true;
                 }
                 continue;
             }
+            if ch == '?' { query = true; } else if ch == '#' { query = false; }
             index += ch.len_utf8();
         }
     }
