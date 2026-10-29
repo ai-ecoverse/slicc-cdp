@@ -12,6 +12,7 @@ pub(super) struct Away {
     loaded: bool,
     detached: bool,
     tainted: bool,
+    accepted: bool,
     delegated: bool,
     destination: String,
     requested_frames: BTreeSet<String>,
@@ -22,9 +23,9 @@ impl Cdp {
     pub fn navigate_away(&mut self, target: &str, destination: &str) -> Result<bool, String> {
         self.connected()?;
         if self.guard.url(destination) { return Err(self.refusal()) }
-        let parsed = url::Url::parse(destination).map_err(|_| self.away_failure())?;
+        let Ok(parsed) = url::Url::parse(destination) else { return Ok(false) };
         let url = parsed.to_string();
-        if !self.away_url(&url) { return Err(self.away_failure()) }
+        if !self.away_url(&url) { return Ok(false) }
         let result = match self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK) {
             Ok(result) => result,
             Err(message) if super::transport_error(&message) => return Err(message),
@@ -85,7 +86,9 @@ impl Cdp {
                     if committed.get("id").and_then(Value::as_str) == Some(frame)
                         && committed.get("loaderId").and_then(Value::as_str) == Some(loader) && away.loaded {
                         if !self.away_ordinary(committed) || !away.delegated && !away.requested_frames.contains(frame) { return Err(self.away_failure()) }
-                        return Ok(committed.clone());
+                        let frame = committed.clone();
+                        self.away_sessions.get_mut(&session).unwrap().accepted = true;
+                        return Ok(frame);
                     }
                 }
                 if Instant::now() >= deadline || !self.pump(deadline)? { return Err(self.refusal()) }
@@ -96,6 +99,7 @@ impl Cdp {
         self.blocked.insert(session.clone());
         let frame = navigated?;
         detached?;
+        if self.away_sessions[&session].tainted || self.away_sessions[&session].frame.as_ref() != Some(&frame) { return Err(self.away_failure()) }
         let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK)?;
         let info = result.get("targetInfo").ok_or_else(|| self.refusal())?;
         if info.get("targetId").and_then(Value::as_str) != Some(target) || info.get("type").and_then(Value::as_str) != Some("page")
@@ -113,6 +117,7 @@ impl Cdp {
         }
         let guard = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
         self.verify_page_scope(Some(&guard))?;
+        if self.away_sessions.get(&session).is_some_and(|away| away.tainted || away.frame.as_ref() != Some(&frame)) { return Err(self.away_failure()) }
         Ok(())
     }
 
@@ -160,7 +165,7 @@ impl Cdp {
                             away.old_loaders.insert(loader.to_string());
                             away.tainted |= !error_frame;
                         } else {
-                            away.tainted |= !ordinary_frame || event.pointer("/params/type").and_then(Value::as_str) != Some("Navigation") || away.old_loaders.contains(loader);
+                            away.tainted |= away.accepted || !ordinary_frame || event.pointer("/params/type").and_then(Value::as_str) != Some("Navigation") || away.old_loaders.contains(loader);
                             away.frame = Some(frame.clone());
                             away.loaded = false;
                         }

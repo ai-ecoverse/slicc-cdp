@@ -72,10 +72,11 @@ test('a fresh playwright-cli can recover an opened about:blank tab whose blocked
 
     const blank = await pw(['goto', 'about:blank']);
     assert.notEqual(blank.code, 0);
-    assert.match(blank.stderr, new RegExp(SEVEN), blank.stderr);
+    assert.doesNotMatch(blank.stderr, new RegExp(SEVEN), blank.stderr);
+    assert.match(blank.stderr, /a browser-side navigation to about:/, blank.stderr);
     const spaced = await pw(['goto', ' about:blank']);
     assert.notEqual(spaced.code, 0);
-    assert.match(spaced.stderr, new RegExp(SEVEN), spaced.stderr);
+    assert.doesNotMatch(spaced.stderr, new RegExp(SEVEN), spaced.stderr);
     const from = fake.calls.length;
     const content = await pw(['eval', 'document.documentElement.innerHTML']);
     assert.notEqual(content.code, 0);

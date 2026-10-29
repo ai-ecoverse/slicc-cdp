@@ -220,10 +220,25 @@ for (const transport of ['native', 'kernel']) {
   }, async () => {
     const { backend, runner, cwd } = await setup(transport);
     try {
+      for (const url of [failed, ' \thttps://SEVEN.sliccy.ai./private', 'https://']) {
+        const from = backend.calls.length;
+        const result = await runner.playwright(['navigate', url, '--tab', 'T'], cwd);
+        assert.notEqual(result.code, 0, url);
+        clean(result);
+        assert.equal(backend.calls.length, from, url);
+      }
+    } finally {
+      await runner.close();
+      await backend.close();
+    }
+  });
+
+  test(`navigate away leaves non-HTTP destinations on the refused base path (${transport})`, {
+    timeout: 60_000,
+  }, async () => {
+    const { backend, runner, cwd } = await setup(transport);
+    try {
       for (const url of [
-        failed,
-        ' \thttps://SEVEN.sliccy.ai./private',
-        'https://',
         'null',
         'javascript:document.title',
         'data:text/html,new',
@@ -233,8 +248,14 @@ for (const transport of ['native', 'kernel']) {
         const result = await runner.playwright(['navigate', url, '--tab', 'T'], cwd);
         assert.notEqual(result.code, 0, url);
         clean(result);
-        assert.equal(backend.calls.length, from, url);
+        assert.ok(
+          !backend.calls
+            .slice(from)
+            .some((call) => ['Page.navigate', 'Page.enable', 'Fetch.enable'].includes(call.method)),
+          url
+        );
       }
+      unobserved(backend.calls);
     } finally {
       await runner.close();
       await backend.close();
@@ -496,6 +517,82 @@ for (const transport of ['native', 'kernel']) {
               (call) => call.method === 'Fetch.failRequest' && call.params.requestId === 'SECOND'
             )
           );
+      } finally {
+        await runner.close();
+        await backend.close();
+      }
+    });
+  }
+
+  for (const late of ['protected-restore', 'restore', 'redirect', 'request', 'commit']) {
+    test(`navigate away rejects a late ${late} during detach (${transport})`, {
+      timeout: 60_000,
+    }, async () => {
+      let navigationSession;
+      const fixture = await setup(transport, {
+        gate: 'direct',
+        intercept(message, send) {
+          if (message.method === 'Page.navigate') {
+            navigationSession = message.sessionId;
+            documentRequest(send, navigationSession, ordinary);
+            const frame = committedFrame();
+            Object.assign(fixture.backend.targets[0], { url: ordinary, frame });
+            delete fixture.backend.targets[0].history;
+            finish(send, message);
+            return true;
+          }
+          if (
+            message.method !== 'Target.detachFromTarget' ||
+            message.params.sessionId !== navigationSession
+          )
+            return false;
+          if (late === 'request') documentRequest(send, navigationSession, failed, 'LATE');
+          else if (late === 'redirect')
+            send({
+              sessionId: navigationSession,
+              method: 'Network.requestWillBeSent',
+              params: {
+                type: 'Document',
+                frameId: 'T',
+                request: { url: ordinary },
+                redirectResponse: { url: failed },
+              },
+            });
+          else {
+            if (late === 'protected-restore')
+              send({
+                sessionId: navigationSession,
+                method: 'Page.frameNavigated',
+                params: { frame: committedFrame(failed, 'HOP'), type: 'BackForwardCacheRestore' },
+              });
+            send({
+              sessionId: navigationSession,
+              method: 'Page.frameNavigated',
+              params: {
+                frame: committedFrame(),
+                type: late === 'commit' ? 'Navigation' : 'BackForwardCacheRestore',
+              },
+            });
+          }
+          return false;
+        },
+      });
+      const { backend, runner, cwd } = fixture;
+      try {
+        const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+        assert.notEqual(result.code, 0);
+        clean(result);
+        unobserved(backend.calls);
+        if (late === 'request')
+          assert.ok(
+            backend.calls.some(
+              (call) => call.method === 'Fetch.failRequest' && call.params.requestId === 'LATE'
+            )
+          );
+        assert.equal(
+          backend.calls.filter((call) => call.method === 'Target.attachToTarget').length,
+          1
+        );
       } finally {
         await runner.close();
         await backend.close();

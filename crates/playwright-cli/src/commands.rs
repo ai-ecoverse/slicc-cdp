@@ -49,7 +49,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     if matches!(command, "goto" | "navigate") {
         if let Some(destination) = invocation.positionals.first() {
             let guard = cdp_client::protected::Protected::default();
-            if guard.url(destination) || !url::Url::parse(destination).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host()) {
+            if guard.url(destination) {
                 return Output::err(format!("{}\n", guard.refusal_for_url(destination)));
             }
         }
