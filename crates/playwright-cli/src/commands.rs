@@ -201,6 +201,25 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if crate::page_tools::is_command(command) => crate::page_tools::run(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
+    if cdp.navigation_away_pending() {
+        let mut result = result;
+        for notice in cdp.take_notices() { result.stderr.push_str(&notice); }
+        report.finish(&mut cdp, &result);
+        let result = match cdp.finish_navigation_away() {
+            Ok(target) if result.code == 0 => {
+                state.current = Some(target);
+                state.snapshots.clear();
+                result
+            }
+            Err(message) => Output::err(message),
+            _ => result,
+        };
+        return match session::save(&state) {
+            Err(message) if cfg!(target_arch = "wasm32") => session::without_state(result, &message),
+            Err(message) if result.code == 0 => Output::err(message),
+            _ => result,
+        };
+    }
     let result = match session::save(&state) {
         Err(message) if cfg!(target_arch = "wasm32") => session::without_state(result, &message),
         Err(message) if result.code == 0 => Output::err(message),
@@ -375,8 +394,6 @@ fn cmd_goto(
         Ok(Some(true)) => {
             report.tab(selected.as_deref().unwrap());
             report.begin(cdp);
-            state.current = selected;
-            state.snapshots.clear();
             return Output::ok(format!("Navigated to {}\n", sanitize::display_url(url)));
         }
         Err(message) => return Output::err(message),
@@ -400,8 +417,10 @@ fn cmd_goto(
     };
     match result {
         Ok(()) => {
-            state.current = Some(target);
-            state.snapshots.clear();
+            if !cdp.navigation_away_pending() {
+                state.current = Some(target);
+                state.snapshots.clear();
+            }
             Output::ok(format!("Navigated to {}\n", sanitize::display_url(url)))
         }
         Err(message) => Output::err(message),

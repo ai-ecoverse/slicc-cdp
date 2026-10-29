@@ -600,6 +600,157 @@ for (const transport of ['native', 'kernel']) {
     });
   }
 
+  for (const late of [
+    'protected-restore',
+    'restore',
+    'redirect',
+    'request',
+    'commit',
+    'ordinary-event',
+  ]) {
+    test(`navigation verdict rejects ${late} after the scope proof (${transport})`, {
+      timeout: 60_000,
+    }, async () => {
+      let navigationSession;
+      let scopeInventory = false;
+      let injected = false;
+      const fixture = await setup(transport, {
+        gate: 'direct',
+        onCommand(message) {
+          if (message.method === 'Target.getTargets' && message.params.filter)
+            scopeInventory = true;
+        },
+        intercept(message, send) {
+          if (message.method === 'Page.navigate') {
+            navigationSession = message.sessionId;
+            documentRequest(send, navigationSession, ordinary);
+            Object.assign(fixture.backend.targets[0], { url: ordinary, frame: committedFrame() });
+            delete fixture.backend.targets[0].history;
+            finish(send, message);
+            return true;
+          }
+          if (message.method !== 'Page.getFrameTree' || !scopeInventory || injected) return false;
+          injected = true;
+          send({ id: message.id, result: { frameTree: { frame: committedFrame() } } });
+          if (late === 'request') documentRequest(send, navigationSession, failed, 'LATE');
+          else if (late === 'redirect')
+            send({
+              sessionId: navigationSession,
+              method: 'Network.requestWillBeSent',
+              params: {
+                type: 'Document',
+                frameId: 'T',
+                request: { url: ordinary },
+                redirectResponse: { url: failed },
+              },
+            });
+          else if (late === 'ordinary-event')
+            send({ sessionId: navigationSession, method: 'Page.loadEventFired', params: {} });
+          else {
+            if (late === 'protected-restore')
+              send({
+                sessionId: navigationSession,
+                method: 'Page.frameNavigated',
+                params: { frame: committedFrame(failed, 'HOP'), type: 'BackForwardCacheRestore' },
+              });
+            send({
+              sessionId: navigationSession,
+              method: 'Page.frameNavigated',
+              params: {
+                frame: committedFrame(),
+                type: late === 'commit' ? 'Navigation' : 'BackForwardCacheRestore',
+              },
+            });
+          }
+          return true;
+        },
+      });
+      const { backend, runner, cwd } = fixture;
+      try {
+        const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+        assert.ok(injected);
+        assert.notEqual(result.code, 0);
+        assert.equal(result.stdout, '');
+        clean(result);
+        assert.match(result.stderr, /^slicc: refused:/);
+        if (late === 'request')
+          assert.ok(
+            backend.calls.some(
+              (call) => call.method === 'Fetch.failRequest' && call.params.requestId === 'LATE'
+            )
+          );
+        const listed = await runner.playwright(['tab-list'], cwd);
+        assert.equal(listed.code, 0, listed.stderr);
+        assert.doesNotMatch(listed.stdout, /\(active\)/);
+      } finally {
+        await runner.close();
+        await backend.close();
+      }
+    });
+  }
+
+  for (const late of ['away-event', 'normal-commit']) {
+    test(`shutdown verdict rejects ${late} before output (${transport})`, {
+      timeout: 60_000,
+    }, async () => {
+      let navigationSession;
+      let proofSession;
+      let scopeInventory = false;
+      let injected = false;
+      const fixture = await setup(transport, {
+        gate: 'direct',
+        onCommand(message) {
+          if (message.method === 'Target.getTargets' && message.params.filter)
+            scopeInventory = true;
+          if (scopeInventory && message.method === 'Page.getFrameTree')
+            proofSession = message.sessionId;
+        },
+        intercept(message, send) {
+          if (message.method === 'Page.navigate') {
+            navigationSession = message.sessionId;
+            documentRequest(send, navigationSession, ordinary);
+            Object.assign(fixture.backend.targets[0], { url: ordinary, frame: committedFrame() });
+            delete fixture.backend.targets[0].history;
+            finish(send, message);
+            return true;
+          }
+          if (
+            message.method === 'Fetch.disable' &&
+            message.sessionId === proofSession &&
+            !injected
+          ) {
+            injected = true;
+            send(
+              late === 'away-event'
+                ? { sessionId: navigationSession, method: 'Page.loadEventFired', params: {} }
+                : {
+                    sessionId: proofSession,
+                    method: 'Page.frameNavigated',
+                    params: { frame: committedFrame(), type: 'Navigation' },
+                  }
+            );
+          }
+          return false;
+        },
+      });
+      const { runner, cwd } = fixture;
+      try {
+        const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+        assert.ok(injected);
+        assert.notEqual(result.code, 0);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, /^slicc: refused:/);
+        clean(result);
+        const listed = await runner.playwright(['tab-list'], cwd);
+        assert.equal(listed.code, 0, listed.stderr);
+        assert.doesNotMatch(listed.stdout, /\(active\)/);
+      } finally {
+        await runner.close();
+        await fixture.backend.close();
+      }
+    });
+  }
+
   test(`history after recovery does not expose an old protected title (${transport})`, {
     timeout: 60_000,
   }, async () => {

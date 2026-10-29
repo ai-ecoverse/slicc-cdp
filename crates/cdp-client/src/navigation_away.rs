@@ -13,13 +13,33 @@ pub(super) struct Away {
     detached: bool,
     tainted: bool,
     accepted: bool,
+    cutover: bool,
     delegated: bool,
     destination: String,
     requested_frames: BTreeSet<String>,
     old_loaders: BTreeSet<String>,
 }
 
+pub(super) struct Operation {
+    target: String,
+    ready: bool,
+    tainted: bool,
+}
+
 impl Cdp {
+    pub fn navigation_away_pending(&self) -> bool { self.away_operation.is_some() }
+
+    pub fn finish_navigation_away(mut self) -> Result<String, String> {
+        self.retire_private_sessions(Instant::now() + DOCUMENT_CHECK);
+        self.guard_sessions.clear();
+        let operation = self.away_operation.take().ok_or_else(|| self.away_failure())?;
+        if !operation.ready || operation.tainted || self.connected().is_err() {
+            self.protect_target(&operation.target);
+            return Err(self.away_failure());
+        }
+        Ok(operation.target)
+    }
+
     pub fn navigate_away(&mut self, target: &str, destination: &str) -> Result<bool, String> {
         self.connected()?;
         if self.guard.url(destination) { return Err(self.refusal()) }
@@ -40,9 +60,13 @@ impl Cdp {
             && !self.documents.get(target).is_some_and(|doc| self.sealed(doc)) { return Ok(false) }
         self.targets.insert(target.to_string(), info.clone());
         self.protect_target(target);
+        self.away_operation = Some(Operation { target: target.to_string(), ready: false, tainted: false });
         self.away_target = Some(target.to_string());
         let result = self.navigate_away_locked(target, &url);
         self.away_target = None;
+        let operation = self.away_operation.as_mut().unwrap();
+        operation.ready = result.is_ok();
+        operation.tainted |= result.is_err();
         if result.is_err() { self.protect_target(target); }
         result.map(|_| true).map_err(|_| self.away_failure())
     }
@@ -99,6 +123,7 @@ impl Cdp {
         self.blocked.insert(session.clone());
         let frame = navigated?;
         detached?;
+        self.away_sessions.get_mut(&session).unwrap().cutover = true;
         if self.away_sessions[&session].tainted || self.away_sessions[&session].frame.as_ref() != Some(&frame) { return Err(self.away_failure()) }
         let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK)?;
         let info = result.get("targetInfo").ok_or_else(|| self.refusal())?;
@@ -144,6 +169,9 @@ impl Cdp {
     pub(super) fn away_event(&mut self, event: &Value) -> bool {
         let method = event.get("method").and_then(Value::as_str).unwrap_or("");
         let session = event.get("sessionId").and_then(Value::as_str).unwrap_or("");
+        let later_commit = method == "Page.frameNavigated" && event.pointer("/params/frame/parentId").is_none()
+            && self.away_operation.as_ref().is_some_and(|operation| operation.ready && self.session_target(session).as_deref() == Some(&operation.target));
+        if later_commit { self.away_operation.as_mut().unwrap().tainted = true; }
         if self.away_sessions.contains_key(session) {
             let root = event.pointer("/params/frame").filter(|frame| frame.get("parentId").is_none());
             let ordinary_frame = root.is_some_and(|frame| self.away_ordinary(frame));
@@ -158,6 +186,7 @@ impl Cdp {
             let mut command = None;
             {
                 let away = self.away_sessions.get_mut(session).unwrap();
+                away.tainted |= away.cutover;
                 if method == "Page.frameNavigated" {
                     if let Some(frame) = root {
                         let loader = frame.get("loaderId").and_then(Value::as_str).unwrap_or("");
@@ -194,11 +223,13 @@ impl Cdp {
             if let Some((method, params)) = command {
                 if self.raw_call(method, params, Some(session), DOCUMENT_CHECK).is_err() { self.away_sessions.get_mut(session).unwrap().tainted = true; }
             }
+            if let Some(operation) = &mut self.away_operation { operation.tainted |= self.away_sessions[session].tainted; }
             return true;
         }
         if method == "Target.detachedFromTarget" {
             if let Some(away) = event.pointer("/params/sessionId").and_then(Value::as_str).and_then(|session| self.away_sessions.get_mut(session)) {
                 away.detached = true;
+                if let Some(operation) = &mut self.away_operation { operation.tainted |= away.cutover; }
                 return true;
             }
         }
