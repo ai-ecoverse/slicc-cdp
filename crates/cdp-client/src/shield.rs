@@ -328,6 +328,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
         let run_end = text[index..].char_indices().find_map(|(at, ch)| text_boundary(ch).then_some(index + at)).unwrap_or(text.len());
         let mut web_seen = false;
         let mut query = false;
+        let mut fragment = false;
         while index < run_end {
             let prefix = prefixes.iter().find(|prefix| {
                 if !lower[index..run_end].starts_with(prefix.as_str()) { return false }
@@ -382,8 +383,8 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                         while index < run_end && text.as_bytes()[index].is_ascii_digit() { index += 1; }
                     }
                     while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
-                    if web_seen && (index == run_end || delimiters.peek().is_some_and(|mark| **mark == index)) { continue }
-                    let end = if web_seen { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
+                    if web_seen && !fragment && (index == run_end || delimiters.peek().is_some_and(|mark| **mark == index)) { continue }
+                    let end = if web_seen && !fragment { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
                     current.copy_span(&mut out, from, start, &mut marks);
                     out.text.push_str(&text[start..index]);
                     from = end;
@@ -392,7 +393,7 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                 }
                 continue;
             }
-            if ch == '?' { query = true; } else if ch == '#' { query = false; }
+            if ch == '?' { query = true; } else if ch == '#' { query = true; fragment = true; }
             index += ch.len_utf8();
         }
     }
