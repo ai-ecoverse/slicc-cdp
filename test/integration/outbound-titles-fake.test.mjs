@@ -195,6 +195,39 @@ for (const origin of origins) {
       expected: ordinary + '?to=' + host + normalizedControl,
     });
 }
+for (const prefix of [
+  ordinary + '#',
+  ordinary + '?a=https://x.example/#',
+  ordinary + '?a=https://x.example/?b=visible#',
+])
+  for (const origin of origins) {
+    const host = origin.split('://')[1];
+    for (const reference of [
+      host + '/controller/id-secret-fixture?query=fixture&sig=SECRETX',
+      host + '%2Fjoin%2Fid-secret-fixture',
+      layer(full(host + '/join/id-secret-fixture')),
+    ])
+      rows.push({
+        name: `fragment reference ${prefix} ${origin} ${reference.startsWith('%') ? 'layered' : reference.includes('%') ? 'encoded path' : 'literal'}`,
+        title: prefix + reference,
+        expected: prefix + host,
+      });
+  }
+rows.push({
+  name: 'fragment search policy retained',
+  title: 'https://www.google.com/search?q=sliccy.ai+docs&hl=en',
+  expected: 'https://www.google.com/search?q=sliccy.ai&hl=en',
+});
+const fragmentLong =
+  ordinary +
+  '#a=https://x.example/'.repeat(12000) +
+  '#vault.sliccy.ai/controller/id-secret-fixture';
+rows.push({
+  name: 'fragment long crafted title',
+  title: fragmentLong,
+  expected: ordinary + '#a=https://x.example/'.repeat(12000) + '#vault.sliccy.ai',
+  bounded: true,
+});
 const prefix = 'https://ordinary.example/'.repeat(12000);
 rows.push({
   name: 'long crafted title',
