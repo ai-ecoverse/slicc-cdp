@@ -3228,6 +3228,7 @@ impl Cdp {
                     if let Some(session) = value.pointer("/result/sessionId").and_then(Value::as_str) {
                         self.blocked.remove(session);
                         self.detached_ordinary.remove(session);
+                        self.away_sessions.remove(session);
                     }
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));

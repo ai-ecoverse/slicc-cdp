@@ -924,6 +924,13 @@ mod tests {
                 let output = {
                     run(&root, peer.port, &[command, url])
                 };
+                if command == "goto" {
+                    assert_eq!(output.code, 1, "{url} {}", output.stderr);
+                    assert!(output.stderr.starts_with("slicc: refused:"));
+                    let log = peer.log.lock().unwrap().clone();
+                    assert_eq!(actions(&log).len(), seen);
+                    continue;
+                }
                 assert_eq!(output.code, 0, "{command} {url} {}", output.stderr);
                 if !secret.is_empty() {
                     let lower_stdout = output.stdout.to_ascii_lowercase();

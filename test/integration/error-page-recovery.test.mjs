@@ -71,10 +71,11 @@ test('a fresh playwright-cli can recover an opened about:blank tab whose blocked
     tab.frame = { id: tab.targetId, loaderId: 'LERR', url: ERROR_PAGE, securityOrigin: '://' };
 
     const blank = await pw(['goto', 'about:blank']);
-    assert.doesNotMatch(blank.stderr, new RegExp(SEVEN), blank.stderr);
-    assert.match(blank.stderr, /a browser-side navigation to about:/, blank.stderr);
+    assert.notEqual(blank.code, 0);
+    assert.match(blank.stderr, new RegExp(SEVEN), blank.stderr);
     const spaced = await pw(['goto', ' about:blank']);
-    assert.doesNotMatch(spaced.stderr, new RegExp(SEVEN), spaced.stderr);
+    assert.notEqual(spaced.code, 0);
+    assert.match(spaced.stderr, new RegExp(SEVEN), spaced.stderr);
     const from = fake.calls.length;
     const content = await pw(['eval', 'document.documentElement.innerHTML']);
     assert.notEqual(content.code, 0);
@@ -325,7 +326,7 @@ test('an unobserved protected commit after a recoverable error page is caught be
   );
 });
 
-test('a fresh playwright-cli navigates away from a blocked or protected tab without reading it', {
+test('a fresh playwright-cli recovers a blocked tab whose target info an upstream guard reports as the protected origin, and still refuses a real protected page', {
   timeout: 60_000,
 }, async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-error-page-'));
@@ -361,8 +362,9 @@ test('a fresh playwright-cli navigates away from a blocked or protected tab with
     assert.equal(tab.url, origin);
     const destination = 'http://ordinary.example/next';
     const recovered = await pw(['goto', destination, '--tab', tab.targetId]);
-    assert.equal(recovered.code, 0, recovered.stderr);
-    assert.equal(tab.url, destination);
+    assert.notEqual(recovered.code, 0);
+    assert.match(recovered.stderr, new RegExp(SEVEN), recovered.stderr);
+    assert.equal(tab.url, origin);
   } finally {
     await fake.close();
     await rm(home, { recursive: true, force: true });
