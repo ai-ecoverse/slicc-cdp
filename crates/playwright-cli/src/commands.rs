@@ -360,6 +360,20 @@ fn cmd_goto(
         return Output::err(format!("{command} requires a URL\n"));
     };
     report.url(url.as_str());
+    if cdp.guard().url(url) { return Output::err(format!("{}\n", cdp.guard().refusal_for_url(url))) }
+    let selected = invocation.flags.get("tab").cloned().or_else(|| state.current.clone());
+    let escaped = selected.as_deref().map(|target| browser::navigate_away(cdp, state, target, url)).transpose();
+    match escaped {
+        Ok(Some(true)) => {
+            report.tab(selected.as_deref().unwrap());
+            report.begin(cdp);
+            state.current = selected;
+            state.snapshots.clear();
+            return Output::ok(format!("Navigated to {}\n", sanitize::display_url(url)));
+        }
+        Err(message) => return Output::err(message),
+        _ => {}
+    }
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
         Err(message) => return Output::err(message),
