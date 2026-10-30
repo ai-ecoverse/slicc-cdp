@@ -46,7 +46,7 @@ fn scheme_positions(text: &str, scheme: &str) -> Vec<(bool, usize)> {
     let mut search_from = 0;
     while let Some(pos) = text[search_from..].find(scheme) {
         let abs = search_from + pos;
-        let blob = abs >= 5 && &text[abs - 5..abs] == "blob:";
+        let blob = text[..abs].ends_with("blob:");
         let start = if blob { abs - 5 } else { abs };
         hits.push((blob, start));
         search_from = abs + scheme.len();
@@ -172,8 +172,9 @@ fn extract_refresh_url(value: &str) -> Option<(&str, bool)> {
     if lower.starts_with("url=") {
         let url_part = &after[4..];
         let trimmed = url_part.trim();
-        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        if trimmed.len() >= 2
+            && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
         {
             Some((&trimmed[1..trimmed.len() - 1], true))
         } else {
@@ -449,6 +450,12 @@ mod tests {
     }
 
     #[test]
+    fn redact_header_url_refresh_with_a_lone_quote() {
+        assert_eq!(redact_header_url("0; url=\"", None), "0; url=\"");
+        assert_eq!(redact_header_url("0; url='", None), "0; url='");
+    }
+
+    #[test]
     fn redact_header_url_link() {
         let result = redact_header_url(
             "<https://example.com/next?token=SECRET>; rel=next",
@@ -554,6 +561,24 @@ mod tests {
     fn redact_urls_in_text_no_scheme_untouched() {
         let input = "user:pass@host.com/path";
         assert_eq!(redact_urls_in_text(input), input);
+    }
+
+    #[test]
+    fn redact_urls_in_text_survives_multibyte_text_before_a_url() {
+        for prefix in ["é1234", "日本語", "日本語 ", "tést—", "🎉", "“"] {
+            let input = format!("{prefix}https://u:PW@host.com/x?token=SECRET");
+            let result = redact_urls_in_text(&input);
+            assert!(result.starts_with(prefix), "{result}");
+            assert!(!result.contains("PW"), "{result}");
+            assert!(!result.contains("SECRET"), "{result}");
+        }
+    }
+
+    #[test]
+    fn redact_urls_in_text_keeps_blob_after_multibyte_text() {
+        let result = redact_urls_in_text("日本語blob:https://u:p@host.com/abc end");
+        assert!(result.starts_with("日本語blob:"), "{result}");
+        assert!(!result.contains("u:p"), "{result}");
     }
 
     #[test]
