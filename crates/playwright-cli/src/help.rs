@@ -186,7 +186,7 @@ pub fn command_help(spec: &Spec) -> String {
 
 fn implemented_page(name: &str) -> Option<String> {
     let page = match name {
-        "upgrade" | "update" => crate::upgrade::usage(name),
+        "upgrade" | "update" => cdp_client::upgrade::usage(&crate::upgrade::TOOL, name),
         "generate-locator" => page(
             "generate-locator <target>",
             &["Generate a Playwright locator for the given element"],

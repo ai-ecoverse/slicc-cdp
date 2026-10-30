@@ -8,6 +8,7 @@ mod response;
 mod sanitize;
 mod sign;
 mod tab;
+mod upgrade;
 mod write_out;
 
 use body::resolve_path;
@@ -19,6 +20,11 @@ use std::time::Instant;
 use write_out::{format_write_out, WriteOut};
 
 const HELP: &str = include_str!("help.txt");
+
+#[cfg(windows)]
+pub fn remove_parked_binary() {
+    cdp_client::upgrade::remove_parked();
+}
 
 fn connect_start(
     cdp: Option<&str>,
@@ -101,6 +107,9 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         return Output::from_stop(Stop::usage(
             "curlwright: no URL specified\nRun 'curlwright --help' for usage.",
         ));
+    }
+    if upgrade::is_command(argv) {
+        return upgrade::run(argv);
     }
     let opts = match parse(argv) {
         Ok(opts) => opts,
@@ -516,6 +525,25 @@ mod tests {
         assert_eq!(long.as_text(), expected);
         assert_eq!(short.as_text(), expected);
         assert_eq!(short.code, 0);
+    }
+
+    #[test]
+    fn upgrade_is_a_command_only_as_the_first_argument() {
+        for name in ["upgrade", "update"] {
+            let help = run(&[name, "--help"]);
+            assert_eq!(help.code, 0);
+            assert!(help.as_text().starts_with(&format!("curlwright {name} [--check] [--force]\n")));
+            let option = run(&[name, "--nope"]);
+            assert_eq!(option.code, 2);
+            assert!(option.stderr.starts_with("curlwright: unknown option --nope\n"), "{}", option.stderr);
+            let argument = run(&[name, "now"]);
+            assert_eq!(argument.code, 2);
+            assert_eq!(argument.stderr, format!("curlwright {name}: unexpected argument now\n"));
+        }
+        for args in [&["./update"][..], &["--", "update"][..], &["-s", "update"][..]] {
+            let output = run(args);
+            assert_eq!(output.stderr, "curlwright: no debugger is connected\n");
+        }
     }
 
     #[test]

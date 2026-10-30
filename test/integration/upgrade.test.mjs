@@ -25,12 +25,18 @@ const os = { darwin: 'darwin', linux: 'linux' }[process.platform];
 const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch];
 const asset = `playwright-cli-${os}-${arch}`;
 const built = path.join(root, 'target/debug/playwright-cli');
+const curlAsset = `curlwright-${os}-${arch}`;
+const curlBuilt = path.join(root, 'target/debug/curlwright');
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 const refusal =
   'releases are fetched over https, or plain http only from 127.0.0.1, ::1 or localhost';
-const script = (reported) => Buffer.from(`#!/bin/sh\necho "playwright-cli ${reported}"\n`);
+const script = (reported, name = 'playwright-cli') =>
+  Buffer.from(`#!/bin/sh\necho "${name} ${reported}"\n`);
 
-function fakeGitHub() {
+function fakeGitHub(asset = `playwright-cli-${os}-${arch}`) {
+  const decoy = asset.startsWith('playwright-cli-')
+    ? `curlwright-${os}-${arch}`
+    : `playwright-cli-${os}-${arch}`;
   const state = {
     tag: 'v9.9.9',
     payload: script('9.9.9'),
@@ -54,7 +60,7 @@ function fakeGitHub() {
         JSON.stringify({
           tag_name: state.tag,
           assets: [
-            { name: `curlwright-${os}-${arch}`, browser_download_url: `${base}/dl/curlwright` },
+            { name: decoy, browser_download_url: `${base}/dl/decoy` },
             { name: asset, browser_download_url: state.assetUrl ?? `${base}/dl/${asset}` },
             {
               name: 'SHA256SUMS',
@@ -77,8 +83,7 @@ function fakeGitHub() {
     }
     if (req.url === '/dl/SHA256SUMS') {
       const sums =
-        state.sums ??
-        `${'0'.repeat(64)}  curlwright-${os}-${arch}\n${sha256(state.payload)}  ${asset}\n`;
+        state.sums ?? `${'0'.repeat(64)}  ${decoy}\n${sha256(state.payload)}  ${asset}\n`;
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end(sums);
       return;
@@ -400,4 +405,141 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       untouched(bin);
     }
   );
+});
+
+test('curlwright upgrade replaces its own binary with the verified latest release', {
+  skip: !os || !arch ? `no release asset for ${process.platform} ${process.arch}` : false,
+}, async (t) => {
+  const scratch = mkdtempSync(path.join(tmpdir(), 'slicc-cdp-upgrade-'));
+  const fake = await fakeGitHub(curlAsset);
+  t.after(() => {
+    fake.server.close();
+    rmSync(scratch, { recursive: true, force: true });
+  });
+  let n = 0;
+  const install = () => {
+    const dir = path.join(scratch, `bin-${++n}`);
+    mkdirSync(dir);
+    const bin = path.join(dir, 'curlwright');
+    copyFileSync(curlBuilt, bin);
+    chmodSync(bin, 0o755);
+    return bin;
+  };
+  const reset = () => {
+    Object.assign(fake.state, {
+      tag: 'v9.9.9',
+      payload: script('9.9.9', 'curlwright'),
+      sums: null,
+      status: 200,
+      downloads: 0,
+      requests: [],
+    });
+  };
+  const notice = (command = 'upgrade') =>
+    `curlwright ${command}: SLICC_UPDATE_API_BASE overrides the GitHub API with ${fake.base}\n`;
+  const untouched = (bin) => {
+    assert.equal(sha256(readFileSync(bin)), sha256(readFileSync(curlBuilt)));
+    assert.deepEqual(readdirSync(path.dirname(bin)), ['curlwright']);
+  };
+
+  await t.test('--check reports the latest release and changes nothing', async () => {
+    reset();
+    const bin = install();
+    const result = await run(bin, ['upgrade', '--check'], fake.base);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr, notice());
+    assert.equal(
+      result.stdout,
+      development
+        ? `latest release: 9.9.9 (this is a development build, ${version})\n`
+        : `curlwright 9.9.9 is available (you have ${version}); run \`curlwright upgrade\`\n`
+    );
+    assert.equal(fake.state.downloads, 0);
+    assert.match(fake.state.requests[0].agent, /^curlwright\//);
+    untouched(bin);
+  });
+
+  await t.test('update is an alias that takes the curlwright asset', async () => {
+    reset();
+    const bin = install();
+    const result = await run(bin, ['update', '--force'], fake.base);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr, notice('update'));
+    assert.equal(
+      result.stdout,
+      `upgrading curlwright ${version} to 9.9.9\nupgraded ${realpathSync(bin)} to curlwright 9.9.9 (SHA256SUMS verified)\n`
+    );
+    assert.equal(fake.state.downloads, 1);
+    const swapped = await run(bin, ['--version'], fake.base);
+    assert.equal(swapped.stdout, 'curlwright 9.9.9\n');
+    assert.deepEqual(readdirSync(path.dirname(bin)), ['curlwright']);
+  });
+
+  await t.test('a real release binary passes the version gate', async () => {
+    reset();
+    fake.state.tag = `v${version}`;
+    fake.state.payload = readFileSync(curlBuilt);
+    const bin = install();
+    const before = statSync(bin).ino;
+    const upgraded = await run(bin, ['upgrade', '--force'], fake.base);
+    assert.equal(upgraded.code, 0, upgraded.stderr);
+    assert.notEqual(statSync(bin).ino, before);
+    untouched(bin);
+  });
+
+  await t.test('a playwright-cli binary is refused', async () => {
+    reset();
+    fake.state.payload = script('9.9.9');
+    const bin = install();
+    const result = await run(bin, ['upgrade', '--force'], fake.base);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      `${notice()}curlwright upgrade: the downloaded binary reports "playwright-cli 9.9.9", expected "curlwright 9.9.9"\n`
+    );
+    untouched(bin);
+  });
+
+  await t.test('a checksum mismatch replaces nothing', async () => {
+    reset();
+    fake.state.sums = `${'ab'.repeat(32)}  ${curlAsset}\n`;
+    const bin = install();
+    const result = await run(bin, ['upgrade', '--force'], fake.base);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      `${notice()}curlwright upgrade: ${curlAsset} does not match its SHA-256 in SHA256SUMS\n`
+    );
+    untouched(bin);
+  });
+
+  await t.test('a cargo install is left to cargo', async () => {
+    reset();
+    const home = path.join(scratch, 'cargo-home');
+    mkdirSync(path.join(home, 'bin'), { recursive: true });
+    const bin = path.join(home, 'bin', 'curlwright');
+    copyFileSync(curlBuilt, bin);
+    const result = await run(bin, ['upgrade'], null, { CARGO_HOME: home });
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      'curlwright upgrade: curlwright was installed with cargo; upgrade it with `cargo install curlwright`\n'
+    );
+    assert.equal(fake.state.requests.length, 0);
+  });
+
+  await t.test('help and option errors never reach the network', async () => {
+    reset();
+    const bin = install();
+    const help = await run(bin, ['update', '--help'], fake.base);
+    assert.equal(help.code, 0);
+    assert.match(help.stdout, /^curlwright update \[--check\] \[--force\]\n/);
+    const global = await run(bin, ['--help'], fake.base);
+    assert.match(global.stdout, /curlwright upgrade \[--check\] \[--force\]/);
+    const option = await run(bin, ['upgrade', '--nope'], fake.base);
+    assert.equal(option.code, 2);
+    assert.match(option.stderr, /^curlwright: unknown option --nope\n/);
+    assert.equal(fake.state.requests.length, 0);
+    untouched(bin);
+  });
 });

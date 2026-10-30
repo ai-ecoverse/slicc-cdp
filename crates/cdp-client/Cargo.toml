@@ -31,6 +31,7 @@ url = "2.5"
 wasix-net = "0.1.2"
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
+libc = "0.2"
 native-tls = "0.2"
 
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
