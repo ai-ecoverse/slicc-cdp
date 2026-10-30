@@ -216,6 +216,8 @@ Real-Chrome integration cases run only on CI by default; set `SLICC_LOCAL_CHROME
 
 On `main`, semantic-release publishes `@ai-ecoverse/slicc-cdp` to npm with provenance from `ci.yml`, tags `v<version>` and opens a draft GitHub release. When it released, `ci.yml` then publishes the four crates to crates.io, builds the binaries for macOS, Linux and Windows (the macOS ones signed and notarised), and uploads them with `install.sh`, `LICENSE`, `THIRD-PARTY-NOTICES` and `SHA256SUMS` before it publishes the release as latest. `@ai-ecoverse/sliccy-browser` is published from the same workflow whenever its `package.json` names a version npm doesn't have yet.
 
+`sliccy-browser` has no dependencies, on purpose. The kernel's pnpm hoists a dependency next to the package, and the kernel reads `slicc.commands` from everything in a global `node_modules`, so a dependency on `@ai-ecoverse/slicc-cdp` would give the user that copy's `playwright-cli` and `curlwright` ahead of the base set's. It carries its own copies of `src/connect.js` and `src/cdp-client.js` instead. When a change to those two files lands, `test/integration/sliccy-browser-install.test.mjs` fails until the same pull request copies them and raises `sliccy-browser`'s version, which publishes them. It fails on any other change to what `sliccy-browser` ships that doesn't raise the version, too. A slicc-cdp release that leaves those files alone needs nothing here.
+
 ## Backend contract
 
 What the clients need from a CDP backend, checked against the code by `crates/cdp-client/src/contract.rs`.

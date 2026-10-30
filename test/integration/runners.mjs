@@ -105,9 +105,9 @@ export function nativeRunner(playwright, curlwright, wsUrl) {
   };
 }
 
-export async function kernelRunner(playwrightWasm, curlWasm, wsUrl) {
+export async function kernelRunner(playwrightWasm, curlWasm, wsUrl, options = {}) {
   if (!wsUrl) requireChrome();
-  const kernel = await createNodeKernel({ cdp: bridge(wsUrl) });
+  const kernel = await createNodeKernel({ cdp: bridge(wsUrl), ...options });
   const pkg = '/node_modules/@ai-ecoverse/slicc-cdp';
   await kernel.writeFile(`${pkg}/package.json`, manifest);
   await kernel.writeFile(`${pkg}/bin/playwright-cli.wasm`, await readFile(playwrightWasm));

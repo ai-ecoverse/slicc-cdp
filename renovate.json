@@ -10,8 +10,8 @@
       "rangeStrategy": "bump"
     },
     {
-      "description": "sliccy-browser pins slicc-cdp by hand, in the pull request that bumps its own version for ci.yml to publish.",
-      "matchFileNames": ["packages/sliccy-browser/package.json"],
+      "description": "The pipeline's npx --package @ai-ecoverse/slicc-cdp finds this package by name and needs its bin in node_modules, for install-browser. Any release will do, so a release opens no pull request against itself.",
+      "matchFileNames": ["package.json"],
       "matchPackageNames": ["@ai-ecoverse/slicc-cdp"],
       "enabled": false
     },
