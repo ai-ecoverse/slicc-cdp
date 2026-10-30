@@ -14,10 +14,9 @@ import './watchdog.mjs';
 
 const PACKAGE = path.resolve('packages/sliccy-browser');
 const NAME = '@ai-ecoverse/sliccy-browser';
-const SHADOWING = '0.1.34';
+const PUBLISHED = '0.1.34';
 const COMMANDS = ['playwright-cli', 'curlwright'];
 const BASE = COMMANDS.map((name) => `/usr/bin/${name}`);
-const OWN = COMMANDS.map((name) => `/home/cone/.local/share/pnpm/bin/${name}`);
 const ROOTS = '$PNPM_HOME/global/v11/[0-9]-*/node_modules';
 const TARBALL = 'file:/srv/sliccy-browser.tgz';
 const wasm = (name) => path.resolve('target/wasm32-wasip1/debug', `${name}.wasm`);
@@ -149,12 +148,15 @@ test('on a real kernel and pnpm, a fresh pnpm add -g leaves a user the base set�
   assert.deepEqual(await work(user, 'https://example.test/', FAKE_STEPS), FAKE_WORK);
 });
 
-test(`on a real kernel and pnpm, updating from the published ${SHADOWING}, which shadows both commands, gives the user the base set’s back, and sliccy:browser works`, async (t) => {
+test(`on a real kernel and pnpm, updating from the published ${PUBLISHED}, whose closure provides both commands, leaves none that does and the user the base set’s, and sliccy:browser works`, async (t) => {
   const fake = await fakeCdp();
   t.after(() => fake.close());
   const user = await cone(t, fake.url);
-  await added(user, `${NAME}@${SHADOWING}`);
-  assert.deepEqual(await found(user), { commands: OWN, version: 'playwright-cli 1.30.18' });
+  await added(user, `${NAME}@${PUBLISHED}`);
+  assert.deepEqual(
+    await provided(user),
+    COMMANDS.map((command) => `@ai-ecoverse/slicc-cdp provides ${command}`)
+  );
   await added(user, TARBALL);
   assert.deepEqual(await provided(user), []);
   const after = await found(user);
