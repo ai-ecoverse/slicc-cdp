@@ -24,6 +24,7 @@ pub(super) struct Operation {
     target: String,
     ready: bool,
     tainted: bool,
+    step: Option<&'static str>,
 }
 
 impl Cdp {
@@ -35,7 +36,8 @@ impl Cdp {
         let operation = self.away_operation.take().ok_or_else(|| self.away_failure())?;
         if !operation.ready || operation.tainted || self.connected().is_err() {
             self.protect_target(&operation.target);
-            return Err(self.away_failure());
+            let step = operation.step.map(|step| format!("slicc: navigate away stopped at: {step}\n")).unwrap_or_default();
+            return Err(format!("{}{step}", self.away_failure()));
         }
         Ok(operation.target)
     }
@@ -60,7 +62,7 @@ impl Cdp {
             && !self.documents.get(target).is_some_and(|doc| self.sealed(doc)) { return Ok(false) }
         self.targets.insert(target.to_string(), info.clone());
         self.protect_target(target);
-        self.away_operation = Some(Operation { target: target.to_string(), ready: false, tainted: false });
+        self.away_operation = Some(Operation { target: target.to_string(), ready: false, tainted: false, step: Some("target") });
         self.away_target = Some(target.to_string());
         let result = self.navigate_away_locked(target, &url);
         self.away_target = None;
@@ -92,16 +94,19 @@ impl Cdp {
                 Err(_) => return Err(self.away_failure()),
             };
             self.away_sessions.get_mut(&session).unwrap().delegated = delegated;
+            self.away_operation.as_mut().unwrap().step = Some("enable");
             self.raw_call("Page.enable", json!({}), Some(&session), DOCUMENT_CHECK)?;
             if self.away_sessions[&session].tainted { return Err(self.away_failure()) }
             if !delegated {
                 self.raw_call("Fetch.enable", json!({"patterns":[{"urlPattern":"*","resourceType":"Document","requestStage":"Request"}]}), Some(&session), DOCUMENT_CHECK)?;
             }
             self.away_sessions.get_mut(&session).unwrap().started = true;
+            self.away_operation.as_mut().unwrap().step = Some("navigate");
             let result = self.raw_call("Page.navigate", json!({"url":url}), Some(&session), Duration::from_secs(30))?;
             if result.get("errorText").is_some() || result.get("isDownload").and_then(Value::as_bool) == Some(true) { return Err(self.refusal()) }
             let frame = result.get("frameId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?;
             let loader = result.get("loaderId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?;
+            self.away_operation.as_mut().unwrap().step = None;
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
                 let away = &self.away_sessions[&session];

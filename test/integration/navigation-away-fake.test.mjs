@@ -14,6 +14,9 @@ const ordinary = 'https://ordinary.example/recovered';
 const errorPage = 'chrome-error://chromewebdata/';
 const biosRefusal =
   'slicc: refused: seven’s own pages and the vault are out of reach of browser automation';
+const sevenRefusal = "slicc: refused: target is on seven's origin\n";
+const stopped = (step) => `${sevenRefusal}slicc: navigate away stopped at: ${step}\n`;
+const failure = { error: { message: 'AWAY_SECRET' } };
 const standIn = { frameTree: { frame: { id: '0', url: errorPage, securityOrigin: '://' } } };
 const errorFrame = {
   id: 'T',
@@ -396,6 +399,135 @@ for (const transport of ['native', 'kernel']) {
       assert.notEqual(result.code, 0);
       clean(result);
       assert.ok(!backend.calls.some((call) => call.method === 'Page.navigate'));
+    } finally {
+      await runner.close();
+      await backend.close();
+    }
+  });
+
+  for (const [miss, step, gate, method, answer] of [
+    ['attach failure', 'target', 'direct', 'Target.attachToTarget', failure],
+    ['session', 'target', 'direct', 'Target.attachToTarget', { result: {} }],
+    ['tree failure', 'target', 'direct', 'Page.getFrameTree', failure],
+    [
+      'readable tree',
+      'target',
+      'direct',
+      'Page.getFrameTree',
+      { result: { frameTree: { frame: committedFrame(failed, 'OLD') } } },
+    ],
+    ['page enable', 'enable', 'bios-tree', 'Page.enable', failure],
+    ['fetch enable', 'enable', 'direct', 'Fetch.enable', failure],
+    ['navigate failure', 'navigate', 'bios-tree', 'Page.navigate', failure],
+    ['error text', 'navigate', 'bios-tree', 'Page.navigate', { result: { errorText: 'x' } }],
+    ['download', 'navigate', 'bios-tree', 'Page.navigate', { result: { isDownload: true } }],
+    ['frame', 'navigate', 'bios-tree', 'Page.navigate', { result: { loaderId: 'NEW' } }],
+    ['loader', 'navigate', 'bios-tree', 'Page.navigate', { result: { frameId: 'T' } }],
+  ]) {
+    test(`navigate away names ${step} on ${miss} (${transport})`, {
+      timeout: 60_000,
+    }, async () => {
+      const { backend, runner, cwd } = await setup(transport, {
+        gate,
+        intercept(message, send) {
+          if (message.method !== method) return false;
+          send({ id: message.id, ...answer });
+          return true;
+        },
+      });
+      try {
+        const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+        assert.notEqual(result.code, 0);
+        assert.equal(result.stdout, '');
+        assert.equal(result.stderr, stopped(step));
+        clean(result);
+      } finally {
+        await runner.close();
+        await backend.close();
+      }
+    });
+  }
+
+  test(`navigate away names enable on a commit during enable (${transport})`, {
+    timeout: 60_000,
+  }, async () => {
+    const { backend, runner, cwd } = await setup(transport, {
+      gate: 'direct',
+      onCommand(message, event) {
+        if (message.method === 'Page.enable')
+          event('Page.frameNavigated', {
+            frame: committedFrame(ordinary, 'LATE'),
+            type: 'Navigation',
+          });
+      },
+    });
+    try {
+      const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+      assert.notEqual(result.code, 0);
+      assert.equal(result.stderr, stopped('enable'));
+    } finally {
+      await runner.close();
+      await backend.close();
+    }
+  });
+
+  for (const [state, step] of [
+    ['live', 'target'],
+    ['error', 'enable'],
+  ]) {
+    for (const [owner, url, securityOrigin] of [
+      ['seven', failed, 'https://seven.sliccy.ai'],
+      ['the vault', 'https://vault.sliccy.ai/private', 'https://vault.sliccy.ai'],
+      ['unknown', 'https://', 'null'],
+    ]) {
+      test(`navigate away says the same for a ${state} tab of ${owner} (${transport})`, {
+        timeout: 60_000,
+      }, async () => {
+        const { backend, runner, cwd } = await setup(transport, {
+          gate: 'direct',
+          intercept(message, send) {
+            if (message.method !== 'Page.enable') return false;
+            send({ id: message.id, ...failure });
+            return true;
+          },
+        });
+        Object.assign(backend.targets[0], {
+          url,
+          frame:
+            state === 'live'
+              ? { id: 'T', loaderId: 'OLD', url, securityOrigin }
+              : { ...errorFrame, unreachableUrl: url },
+        });
+        try {
+          const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+          assert.notEqual(result.code, 0);
+          assert.equal(result.stderr, stopped(step));
+          clean(result);
+        } finally {
+          await runner.close();
+          await backend.close();
+        }
+      });
+    }
+  }
+
+  test(`navigate away names no step after the navigate reply (${transport})`, {
+    timeout: 60_000,
+  }, async () => {
+    const { backend, runner, cwd } = await setup(transport, {
+      intercept(message, send) {
+        if (message.method !== 'Page.navigate') return false;
+        const frame = committedFrame(failed);
+        Object.assign(backend.targets[0], { frame });
+        delete backend.targets[0].history;
+        finish(send, message, frame);
+        return true;
+      },
+    });
+    try {
+      const result = await runner.playwright(['goto', ordinary, '--tab', 'T'], cwd);
+      assert.notEqual(result.code, 0);
+      assert.equal(result.stderr, sevenRefusal);
     } finally {
       await runner.close();
       await backend.close();
