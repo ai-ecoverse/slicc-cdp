@@ -70,6 +70,12 @@ mod tests {
     }
 
     #[test]
+    fn browser_message_survives_multibyte_text_before_a_url() {
+        let result = browser_message("Error: 日本語 https://u:PW@host.com/x", false);
+        assert_eq!(result, "Error: 日本語 https://…:…@host.com/x");
+    }
+
+    #[test]
     fn browser_message_no_urls_unchanged() {
         assert_eq!(browser_message("plain text", false), "plain text");
     }

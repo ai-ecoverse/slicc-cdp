@@ -5,6 +5,7 @@ cookies, origin, TLS session and service-worker routing. Use it for an app's
 own backend, where sandbox curl gets a 401/403/421.
 
 Usage: curlwright [options] <url>
+       curlwright upgrade [--check] [--force]
 
 Request:
   -X, --request <method>     HTTP method (default GET, or POST with a body)
@@ -77,6 +78,9 @@ Notes:
   - --sign-key adds Signature-Input and Signature (and Signature-Agent),
     covering @authority, recomputed for each hop's authority. Cross-origin,
     the server must allow those headers in a CORS preflight, which is unsigned.
+  - upgrade (alias: update) replaces this binary with the latest release; see
+    curlwright upgrade --help. As the first argument the word is always that
+    command, so write ./update for a relative URL.
   - Options a page cannot honor (--cert, --insecure, -x, --resolve, --compressed,
     -b, -A, ...) are rejected by name rather than ignored.
 

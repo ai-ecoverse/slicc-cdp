@@ -323,6 +323,8 @@ curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 
 Without `--tab` it uses the tab `playwright-cli` last selected, else the one open tab on the URL's origin.
 
+`curlwright upgrade`, or `curlwright update`, replaces a prebuilt `curlwright` with the latest release, under the same rules as `playwright-cli upgrade`. A copy installed with Cargo is left to `cargo install curlwright`. As the first argument the word is always that command, so write `./update` for a relative URL.
+
 #### Web Bot Auth signing
 
 `--sign-key <file>` signs every request curlwright sends in that run, redirect hops included, with [Web Bot Auth](https://datatracker.ietf.org/doc/draft-ietf-webbotauth-httpsig-protocol/) (RFC 9421 HTTP Message Signatures). The file is an Ed25519 private JWK (`kty` `OKP`, `crv` `Ed25519`, `d`, and `x` if you like); any other key exits 2 without printing it. Each hop gets `Signature-Input` and `Signature` under the label `sig1`, covering that hop's `@authority`, with `created`, `expires` 60 seconds later, `keyid` (the key's RFC 7638 JWK thumbprint), `alg="ed25519"`, a random `nonce` and `tag="web-bot-auth"`.

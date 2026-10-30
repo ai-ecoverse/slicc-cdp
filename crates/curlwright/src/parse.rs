@@ -253,7 +253,7 @@ fn rejection(flag: &str, canonical: &str) -> Stop {
     ))
 }
 
-fn unknown(flag: &str) -> Stop {
+pub fn unknown(flag: &str) -> Stop {
     Stop::usage(format!(
         "curlwright: unknown option {flag}\nRun 'curlwright --help' for the supported flags."
     ))
