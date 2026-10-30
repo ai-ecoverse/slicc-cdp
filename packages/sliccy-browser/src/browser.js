@@ -1,6 +1,6 @@
 import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
-import { connect } from '@ai-ecoverse/slicc-cdp';
+import { connect } from './connect.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
 
 const LOAD_TIMEOUT_MS = 15000;
