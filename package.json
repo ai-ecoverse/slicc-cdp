@@ -68,7 +68,7 @@
     "chrome": "156.0.8078.4"
   },
   "devDependencies": {
-    "@ai-ecoverse/slicc-browsers": "1.18.21",
+    "@ai-ecoverse/slicc-browsers": "git+https://github.com/ai-ecoverse/slicc-browsers.git#3205de5fbc2845c57585e52a23c9d1958de94342",
     "@ai-ecoverse/slicc-cdp": "1.43.0",
     "@ai-ecoverse/slicc-jsh": "0.63.30",
     "@ai-ecoverse/slicc-kernel": "1.170.3",
