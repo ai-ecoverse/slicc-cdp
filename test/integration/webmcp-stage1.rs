@@ -16,6 +16,10 @@ struct State {
     published: bool,
     refusal: Option<&'static str>,
     dom_refusal: bool,
+    tree_refusal: bool,
+    pending_child: bool,
+    pending_reads: usize,
+    load_sent: bool,
     incomplete: bool,
     protected_world: bool,
     missing_instrumentation: bool,
@@ -45,6 +49,7 @@ impl Transport for Backend {
         let refusal = match method {
             "Debugger.enable" => state.refusal,
             "DOM.getDocument" if state.dom_refusal => Some("slicc: refused: protected frame"),
+            "Page.getFrameTree" if state.tree_refusal => Some("slicc: refused: protected frame"),
             _ => None,
         };
         if let Some(message) = refusal {
@@ -75,7 +80,14 @@ impl Transport for Backend {
                         }
                     }
                 }
-                state.tree.clone().unwrap_or_else(|| tree("L"))
+                let mut current = state.tree.clone().unwrap_or_else(|| tree("L"));
+                if state.incomplete { current["frameTree"]["childFrames"] = json!({}); }
+                if state.pending_child && current["frameTree"]["frame"]["loaderId"] == "R" {
+                    assert!(state.load_sent);
+                    state.pending_reads += 1;
+                    current["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","loaderId":"CHILD","url":if state.pending_reads == 1 { "" } else { "https://ordinary.test/child" },"securityOrigin":"https://ordinary.test"}}]);
+                }
+                current
             }
             "Runtime.enable" => {
                 let loader = state
@@ -135,7 +147,9 @@ impl Transport for Backend {
                     state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":tree("R")["frameTree"]["frame"]}}).to_string());
                     state.incoming.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":owner,"params":{}}).to_string());
                     state.incoming.push_back(context(&owner, "R").to_string());
+                    state.incoming.push_back(json!({"method":"Page.loadEventFired","sessionId":owner,"params":{"timestamp":1}}).to_string());
                 }
+                state.load_sent = true;
                 if let Some(owner) = state.armed.clone() {
                     state.incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":owner,"params":{"scriptId":"SCRIPT","executionContextId":1,"url":"https://ordinary.test/first.js"}}).to_string());
                     let reason = if state.raw_instrumentation {
@@ -395,13 +409,34 @@ fn plain_fallback_uses_complete_guarded_reads_and_only_the_requested_reload() {
         let state = state.borrow();
         assert_eq!(count(&state, "Page.reload"), usize::from(reload));
         assert_eq!(count(&state, "Runtime.evaluate"), 1);
-        assert!(count(&state, "DOM.getDocument") >= 1);
+        assert_eq!(count(&state, "DOM.getDocument"), 0);
         assert!(state
             .calls
             .iter()
             .filter(|call| call["method"].as_str().unwrap().starts_with("Debugger."))
             .all(|call| call["method"] == "Debugger.enable"));
     }
+}
+
+#[test]
+fn plain_fallback_waits_for_loaded_children_without_a_pierced_dom_read() {
+    let (mut cdp, state, session) = fixture();
+    {
+        let mut state = state.borrow_mut();
+        state.refusal = Some("slicc: refused: that execution context belongs to a browser extension");
+        state.dom_refusal = true;
+        state.pending_child = true;
+    }
+    let started = Instant::now();
+    cdp.start_webmcp_for(&session, true).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(cdp.webmcp_plain(&session));
+    let state = state.borrow();
+    assert!(state.load_sent);
+    assert!(state.pending_reads >= 2);
+    assert_eq!(count(&state, "Page.reload"), 1);
+    assert_eq!(count(&state, "DOM.getDocument"), 0);
+    assert_eq!(count(&state, "Runtime.evaluate"), 1);
 }
 
 #[test]
@@ -463,7 +498,7 @@ fn protected_incomplete_and_version_refusals_never_fall_back() {
             } else {
                 Some("slicc: refused: that execution context belongs to a browser extension")
             };
-            state.dom_refusal = mode == "protected-read";
+            state.tree_refusal = mode == "protected-read";
             state.incomplete = mode == "incomplete";
             state.protected_world = mode == "protected-world";
             state.missing_instrumentation = mode == "instrumentation-version";

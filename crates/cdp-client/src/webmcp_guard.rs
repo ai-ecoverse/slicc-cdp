@@ -102,8 +102,15 @@ impl Cdp {
         })?;
         let bridge = self.webmcp_install(session, &tree)?;
         if reload {
+            let from = self.events.len();
             self.call_for("Page.reload", json!({}), Some(session), DOCUMENT_CHECK)?;
-            if self.webmcp_plain(session) { self.webmcp_install_current(session)?; }
+            if self.webmcp_plain(session) {
+                let until = Instant::now() + DOCUMENT_CHECK;
+                while !self.events.iter().skip(from).any(|event| event.get("sessionId").and_then(Value::as_str) == Some(session) && event.get("method").and_then(Value::as_str) == Some("Page.loadEventFired")) {
+                    if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
+                }
+                self.webmcp_install_current(session)?;
+            }
             let until = Instant::now() + DOCUMENT_CHECK;
             while self.webmcp.arms.get(session).is_some_and(|arm| arm.admitted == 0 && !arm.revoked) && Instant::now() < until {
                 if !self.pump(until)? { break; }
@@ -259,31 +266,28 @@ impl Cdp {
 
     fn webmcp_plain_proof(&mut self, session: &str) -> Result<(), String> {
         let until = Instant::now() + DOCUMENT_CHECK;
-        if !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
-        let tree = self.call_for("Page.getFrameTree", json!({}), Some(session), until.saturating_duration_since(Instant::now()))?;
-        fn tree_complete(node: &Value) -> bool {
-            let Some(frame) = node.get("frame").and_then(Value::as_object) else { return false; };
-            if ["id", "loaderId", "url", "securityOrigin"].iter().any(|key| frame.get(*key).and_then(Value::as_str).is_none_or(str::is_empty)) { return false; }
-            node.get("childFrames").is_none_or(|children| children.as_array().is_some_and(|children| children.iter().all(tree_complete)))
-        }
-        if !self.webmcp_tree_verified(&tree, None) || tree.get("frameTree").is_none_or(|node| !tree_complete(node)) { return Err(self.refusal()); }
-        let epoch = self.frame_epoch;
-        let dom = self.call_for("DOM.getDocument", json!({"depth":-1,"pierce":true}), Some(session), until.saturating_duration_since(Instant::now()))?;
-        fn complete(node: &Value) -> bool {
-            if !node.is_object() || node.get("nodeId").and_then(Value::as_i64).is_none() || node.get("nodeType").and_then(Value::as_i64).is_none() { return false; }
-            let children = node.get("children").and_then(Value::as_array);
-            if node.get("childNodeCount").is_some_and(|count| count.as_u64().is_none_or(|count| count as usize != children.map_or(0, Vec::len))) { return false; }
-            for field in ["children", "shadowRoots", "pseudoElements"] {
-                if node.get(field).is_some_and(|items| items.as_array().is_none_or(|items| !items.iter().all(complete))) { return false; }
+        fn tree_complete(cdp: &Cdp, node: &Value, child: bool) -> Option<bool> {
+            let frame = node.get("frame")?.as_object()?;
+            if ["id", "loaderId", "securityOrigin"].iter().any(|key| frame.get(*key).and_then(Value::as_str).is_none_or(str::is_empty)) { return None; }
+            let url = frame.get("url")?.as_str()?;
+            if cdp.frame_protected(frame.get("id")?.as_str()?) || (!child && url.is_empty()) { return None; }
+            let mut complete = !url.is_empty();
+            if let Some(children) = node.get("childFrames") {
+                for child in children.as_array()? { complete &= tree_complete(cdp, child, true)?; }
             }
-            for field in ["contentDocument", "templateContent", "importedDocument"] {
-                if node.get(field).is_some_and(|node| !complete(node)) { return false; }
-            }
-            true
+            Some(complete)
         }
-        if dom.get("root").is_none_or(|node| node.get("nodeType").and_then(Value::as_i64) != Some(9) || !complete(node))
-            || epoch != self.frame_epoch || Instant::now() >= until || !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
-        Ok(())
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() || !self.worlds.fallback_safe(session) || self.content_blocked(session) { return Err(self.refusal()); }
+            let tree = self.call_for("Page.getFrameTree", json!({}), Some(session), left)?;
+            if Instant::now() >= until || !self.worlds.fallback_safe(session) || self.content_blocked(session) { return Err(self.refusal()); }
+            match tree.get("frameTree").and_then(|node| tree_complete(self, node, false)) {
+                Some(true) if self.webmcp_tree_verified(&tree, None) => return Ok(()),
+                Some(false) => { let _ = self.pump(until.min(Instant::now() + Duration::from_millis(25)))?; }
+                _ => return Err(self.refusal()),
+            }
+        }
     }
 
     fn webmcp_arm(&mut self, session: &str) -> Result<(), String> {
