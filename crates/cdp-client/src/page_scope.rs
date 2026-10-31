@@ -28,19 +28,19 @@ impl Cdp {
     pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
         #[cfg(test)]
         self.runtime_prepare_probe("scope-selected-session", json!({"target_known":session.and_then(|session| self.session_target(session)).is_some()}));
-        let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
+        let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.unverified())?;
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-read", json!({}));
         let left = saved_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(DOCUMENT_CHECK);
         if left.is_zero() { return Err(self.refusal()) }
-        let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, left).map_err(|_| self.refusal())?;
+        let listed = self.raw_call("Target.getTargets", json!({"filter":[{}]}), None, left).map_err(|_| self.unverified())?;
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-selected-presence", json!({"inventory_valid":listed.get("targetInfos").is_some_and(Value::is_array),"selected_present":listed.get("targetInfos").and_then(Value::as_array).is_some_and(|infos| infos.iter().any(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)))}));
-        let infos = listed.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.refusal())?;
-        let mut selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
+        let infos = listed.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.unverified())?;
+        let mut selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.unverified())?;
         if matches!(selected.get("type").and_then(Value::as_str), Some("worker" | "service_worker" | "shared_worker")) {
-            target = selected.get("openerId").and_then(Value::as_str).filter(|owner| self.guards.contains_key(*owner)).ok_or_else(|| self.refusal())?.to_string();
-            selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.refusal())?;
+            target = selected.get("openerId").and_then(Value::as_str).filter(|owner| self.guards.contains_key(*owner)).ok_or_else(|| self.unverified())?.to_string();
+            selected = infos.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(&target)).ok_or_else(|| self.unverified())?;
         }
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-selected-type", json!({"page":selected.get("type").and_then(Value::as_str) == Some("page"),"iframe":selected.get("type").and_then(Value::as_str) == Some("iframe")}));
@@ -72,26 +72,26 @@ impl Cdp {
         for info in &infos {
             #[cfg(test)]
             self.runtime_prepare_probe("target-frame-placement", json!({"id_known":info.get("targetId").and_then(Value::as_str).is_some_and(frame_text_known),"url_present":info.get("url").is_some()}));
-            let id = info.get("targetId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?;
-            let url = info.get("url").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+            let id = info.get("targetId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.unverified())?;
+            let url = info.get("url").and_then(Value::as_str).ok_or_else(|| self.unverified())?;
             let iframe = info.get("type").and_then(Value::as_str) == Some("iframe");
             let error_probe = self.guard.error_page_url(url) && self.guards.contains_key(id) && self.documents.get(id).is_some_and(|doc| !doc.previous);
             let protected = (!frame_text_known(url) && !self.page_scope_pending_page(info)) || !error_probe && self.info_protected(info, &[]) || self.protected_targets.contains(id);
             #[cfg(test)]
             self.runtime_prepare_probe("target-origin", json!({"protected":protected,"iframe":iframe}));
             if protected {
-                let parent = if iframe { Some(info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?) } else { None };
+                let parent = if iframe { Some(info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.unverified())?) } else { None };
                 nodes.entry(id.to_string()).or_insert_with(|| json!({"id":id,"parentId":parent,"url":url,"securityOrigin":url,"loaderId":"protected"}));
                 if iframe { iframe_roots.push(id.to_string()); protected_iframes.push(id.to_string()); } else { roots.insert(id.to_string(), id.to_string()); }
                 continue;
             }
             #[cfg(test)]
             self.runtime_prepare_probe("renderer-frame-placement", json!({"tree_present":trees.contains_key(id),"iframe":iframe}));
-            let mut tree = trees.remove(id).ok_or_else(|| self.refusal())?;
-            let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.refusal())?;
-            let root = frame.get("id").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?.to_string();
+            let mut tree = trees.remove(id).ok_or_else(|| self.unverified())?;
+            let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.unverified())?;
+            let root = frame.get("id").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.unverified())?.to_string();
             if iframe {
-                let parent = info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.refusal())?;
+                let parent = info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.unverified())?;
                 if frame.get("parentId").is_some_and(|id| id.as_str() != Some(parent)) { return Err(self.refusal()) }
                 frame["parentId"] = json!(parent);
                 iframe_roots.push(root.clone());
@@ -102,7 +102,7 @@ impl Cdp {
             target_roots.insert(id.to_string(), root);
             #[cfg(test)]
             self.runtime_prepare_probe("renderer-nodes", json!({}));
-            Self::page_scope_nodes(tree.get("frameTree").unwrap(), None, &mut nodes).ok_or_else(|| self.refusal())?;
+            Self::page_scope_nodes(tree.get("frameTree").unwrap(), None, &mut nodes).ok_or_else(|| self.unverified())?;
         }
         let owner = |id: &str| -> Option<String> {
             let mut current = id;
@@ -115,7 +115,7 @@ impl Cdp {
         };
         #[cfg(test)]
         self.runtime_prepare_probe("iframe-ancestry", json!({}));
-        for id in &iframe_roots { owner(id).ok_or_else(|| self.refusal())?; }
+        for id in &iframe_roots { owner(id).ok_or_else(|| self.unverified())?; }
         for id in nodes.keys() {
             if let Some(page) = owner(id) { self.page_scope_owners.insert(id.clone(), page); }
         }
@@ -126,16 +126,16 @@ impl Cdp {
             let id = info.get("targetId").and_then(Value::as_str).unwrap();
             if info.get("type").and_then(Value::as_str) == Some("page") { self.page_scope_owners.insert(id.to_string(), id.to_string()); }
         }
-        let page = if selected.get("type").and_then(Value::as_str) == Some("page") { target.clone() } else { owner(target_roots.get(&target).map(String::as_str).unwrap_or(&target)).ok_or_else(|| self.refusal())? };
+        let page = if selected.get("type").and_then(Value::as_str) == Some("page") { target.clone() } else { owner(target_roots.get(&target).map(String::as_str).unwrap_or(&target)).ok_or_else(|| self.unverified())? };
         #[cfg(test)]
         self.runtime_prepare_probe("protected-frame-placement", json!({"protected_present":protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page))}));
         if protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page)) { return Err(self.refusal()) }
         #[cfg(test)]
         self.runtime_prepare_probe("root-placement", json!({}));
-        let root = roots.iter().find(|(_, owner)| *owner == &page).map(|(id, _)| id).ok_or_else(|| self.refusal())?;
+        let root = roots.iter().find(|(_, owner)| *owner == &page).map(|(id, _)| id).ok_or_else(|| self.unverified())?;
         #[cfg(test)]
         self.runtime_prepare_probe("frame-tree-join", json!({}));
-        let tree = Self::page_scope_join(root, &nodes, &mut BTreeSet::new()).ok_or_else(|| self.refusal())?;
+        let tree = Self::page_scope_join(root, &nodes, &mut BTreeSet::new()).ok_or_else(|| self.unverified())?;
         let mut frames = BTreeMap::new();
         let epoch = epochs.get(&page).copied().unwrap_or(0);
         #[cfg(test)]
@@ -194,7 +194,7 @@ impl Cdp {
             && (selected_info.get("type").and_then(Value::as_str) == Some("iframe") || info.get("targetId").and_then(Value::as_str) == Some(selected)));
         let mut found = None;
         for page in pages {
-            let id = page.get("targetId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+            let id = page.get("targetId").and_then(Value::as_str).ok_or_else(|| self.unverified())?;
             #[cfg(test)]
             self.runtime_prepare_probe("inventory-page-admission", json!({
                 "url_known":page.get("url").and_then(Value::as_str).is_some_and(frame_text_known),
@@ -203,14 +203,14 @@ impl Cdp {
                 "document_known":self.documents.contains_key(id),"previous_protected":self.documents.get(id).is_some_and(|doc| doc.previous)}));
             if (page.get("url").and_then(Value::as_str).is_none_or(|url| !frame_text_known(url)) && !self.page_scope_pending_page(page)) || self.info_protected(page, &[]) || self.protected_targets.contains(id) { continue }
             let tree = self.page_scope_tree(id, deadline)?;
-            let root = tree.get("frameTree").ok_or_else(|| self.refusal())?;
+            let root = tree.get("frameTree").ok_or_else(|| self.unverified())?;
             #[cfg(test)]
             self.runtime_prepare_probe("inventory-root-placement", json!({"parent_present":root.pointer("/frame/parentId").is_some()}));
             if root.pointer("/frame/parentId").is_some() { return Err(self.refusal()) }
             let mut nodes = BTreeMap::new();
             #[cfg(test)]
             self.runtime_prepare_probe("inventory-nodes", json!({}));
-            Self::page_scope_nodes(root, None, &mut nodes).ok_or_else(|| self.refusal())?;
+            Self::page_scope_nodes(root, None, &mut nodes).ok_or_else(|| self.unverified())?;
             let mut infos = vec![page.clone()];
             let mut trees = BTreeMap::from([(id.to_string(), tree)]);
             let mut pending = candidates.iter().filter(|info| info.get("type").and_then(Value::as_str) == Some("iframe")).cloned().collect::<Vec<_>>();
@@ -218,7 +218,7 @@ impl Cdp {
                 let from = infos.len();
                 let mut remaining = Vec::new();
                 for info in pending {
-                    let target = info.get("targetId").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+                    let target = info.get("targetId").and_then(Value::as_str).ok_or_else(|| self.unverified())?;
                     let parent = info.get("parentFrameId").and_then(Value::as_str);
                     if parent.is_none_or(|parent| !nodes.contains_key(parent)) { remaining.push(info); continue }
                     let parent = parent.unwrap();
@@ -226,10 +226,10 @@ impl Cdp {
                         nodes.entry(target.to_string()).or_insert_with(|| json!({"id":target,"parentId":parent}));
                     } else {
                         let mut tree = self.page_scope_tree(target, deadline)?;
-                        let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.refusal())?;
+                        let frame = tree.pointer_mut("/frameTree/frame").ok_or_else(|| self.unverified())?;
                         if frame.get("parentId").is_some_and(|id| id.as_str() != Some(parent)) { return Err(self.refusal()) }
                         frame["parentId"] = json!(parent);
-                        Self::page_scope_nodes(&tree["frameTree"], Some(parent), &mut nodes).ok_or_else(|| self.refusal())?;
+                        Self::page_scope_nodes(&tree["frameTree"], Some(parent), &mut nodes).ok_or_else(|| self.unverified())?;
                         trees.insert(target.to_string(), tree);
                     }
                     infos.push(info);
@@ -248,7 +248,7 @@ impl Cdp {
         }
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-complete", json!({"selected_found":found.is_some()}));
-        found.ok_or_else(|| self.refusal())
+        found.ok_or_else(|| self.unverified())
     }
 
     fn page_scope_tree(&mut self, target: &str, deadline: Instant) -> Result<Value, String> {
@@ -262,8 +262,8 @@ impl Cdp {
                 self.guarding.insert(target.to_string());
                 let attached = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, left);
                 self.guarding.remove(target);
-                let result = attached.map_err(|_| self.refusal())?;
-                let session = result.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?.to_string();
+                let result = attached.map_err(|_| self.unverified())?;
+                let session = result.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.unverified())?.to_string();
                 self.guard_sessions.insert(session.clone());
                 self.session_targets.insert(session.clone(), target.to_string());
                 self.page_scope_sessions.insert(target.to_string(), session.clone());
@@ -282,7 +282,7 @@ impl Cdp {
         if left.is_zero() { return Err(self.refusal()) }
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-read", json!({"budget_remaining":!left.is_zero()}));
-        let mut tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.refusal())?;
+        let mut tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.unverified())?;
         self.verify_document_order(&tree, Some(&session))?;
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-versions", json!({}));
@@ -300,7 +300,7 @@ impl Cdp {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(self.refusal()) }
-            tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.refusal())?;
+            tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.unverified())?;
             self.verify_document_order(&tree, Some(&session))?;
         }
         Ok(tree)
@@ -333,22 +333,22 @@ impl Cdp {
     }
 
     fn page_scope_versions(&mut self, target: &str, tree: &Value) -> Result<bool, String> {
-        let root = tree.get("frameTree").ok_or_else(|| self.refusal())?;
+        let root = tree.get("frameTree").ok_or_else(|| self.unverified())?;
         let mut queue = vec![(root, false)];
         let mut inherited = false;
         let mut count = 0;
         while let Some((node, child)) = queue.pop() {
             count += 1;
             if count > MAX_FRAMES { return Err(self.refusal()) }
-            let frame = node.get("frame").ok_or_else(|| self.refusal())?;
-            let id = frame.get("id").and_then(Value::as_str).ok_or_else(|| self.refusal())?;
+            let frame = node.get("frame").ok_or_else(|| self.unverified())?;
+            let id = frame.get("id").and_then(Value::as_str).ok_or_else(|| self.unverified())?;
             if let Some(loader) = frame.get("loaderId").and_then(Value::as_str) {
                 self.document_versions.insert((target.to_string(), id.to_string()), loader.to_string());
             }
             inherited |= (child || frame.get("parentId").is_some()) && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
                 && self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or("")) && self.page_scope_origin(frame).is_none();
             if let Some(children) = node.get("childFrames") {
-                for child in children.as_array().ok_or_else(|| self.refusal())? { queue.push((child, true)); }
+                for child in children.as_array().ok_or_else(|| self.unverified())? { queue.push((child, true)); }
             }
         }
         Ok(inherited)

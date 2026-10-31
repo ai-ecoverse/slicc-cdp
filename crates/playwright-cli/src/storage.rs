@@ -125,9 +125,9 @@ fn web(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command: &st
 fn evaluate(cdp: &mut Cdp, session: &str, expression: &str) -> Result<Value, String> {
     let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
     let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).map(str::to_string);
-    let frame = frame.ok_or_else(|| format!("{}\n", cdp.guard().refusal()))?;
+    let frame = frame.ok_or_else(|| cdp.unverified())?;
     let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame, "worldName": WORLD }), Some(session))?;
-    let context = world.get("executionContextId").cloned().ok_or_else(|| format!("{}\n", cdp.guard().refusal()))?;
+    let context = world.get("executionContextId").cloned().ok_or_else(|| cdp.unverified())?;
     let result = cdp.call(
         "Runtime.evaluate",
         json!({ "expression": expression, "contextId": context, "returnByValue": true, "awaitPromise": true }),

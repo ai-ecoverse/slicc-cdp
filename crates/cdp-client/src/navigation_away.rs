@@ -75,7 +75,7 @@ impl Cdp {
 
     fn navigate_away_locked(&mut self, target: &str, url: &str) -> Result<(), String> {
         let attached = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, DOCUMENT_CHECK)?;
-        let session = attached.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?.to_string();
+        let session = attached.get("sessionId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.unverified())?.to_string();
         self.guard_sessions.insert(session.clone());
         let old_loaders = self.document_versions.iter().filter(|((owner, _), _)| owner == target).map(|(_, loader)| loader.clone()).collect();
         self.away_sessions.insert(session.clone(), Away { destination: self.guard.resource_key(url).unwrap(), old_loaders, ..Away::default() });
@@ -104,8 +104,8 @@ impl Cdp {
             self.away_operation.as_mut().unwrap().step = Some("navigate");
             let result = self.raw_call("Page.navigate", json!({"url":url}), Some(&session), Duration::from_secs(30))?;
             if result.get("errorText").is_some() || result.get("isDownload").and_then(Value::as_bool) == Some(true) { return Err(self.refusal()) }
-            let frame = result.get("frameId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?;
-            let loader = result.get("loaderId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?;
+            let frame = result.get("frameId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.unverified())?;
+            let loader = result.get("loaderId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.unverified())?;
             self.away_operation.as_mut().unwrap().step = None;
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
@@ -131,7 +131,7 @@ impl Cdp {
         self.away_sessions.get_mut(&session).unwrap().cutover = true;
         if self.away_sessions[&session].tainted || self.away_sessions[&session].frame.as_ref() != Some(&frame) { return Err(self.away_failure()) }
         let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK)?;
-        let info = result.get("targetInfo").ok_or_else(|| self.refusal())?;
+        let info = result.get("targetInfo").ok_or_else(|| self.unverified())?;
         if info.get("targetId").and_then(Value::as_str) != Some(target) || info.get("type").and_then(Value::as_str) != Some("page")
             || !self.away_url(info.get("url").and_then(Value::as_str).unwrap_or("")) { return Err(self.refusal()) }
         self.targets.insert(target.to_string(), info.clone());
@@ -139,13 +139,13 @@ impl Cdp {
             self.raw_call("Target.detachFromTarget", json!({"sessionId":guard}), None, DOCUMENT_CHECK)?;
         }
         self.touch(target)?;
-        let document = self.document_state(target, true).ok_or_else(|| self.refusal())?;
-        let evidence = document.frames.get(frame.get("id").and_then(Value::as_str).unwrap_or("")).ok_or_else(|| self.refusal())?;
+        let document = self.document_state(target, true).ok_or_else(|| self.unverified())?;
+        let evidence = document.frames.get(frame.get("id").and_then(Value::as_str).unwrap_or("")).ok_or_else(|| self.unverified())?;
         if evidence[0] != frame.get("loaderId").and_then(Value::as_str).unwrap_or("")
             || evidence[1] != format!("{}{}", frame.get("url").and_then(Value::as_str).unwrap_or(""), frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")) {
             return Err(self.refusal());
         }
-        let guard = self.guards.get(target).cloned().ok_or_else(|| self.refusal())?;
+        let guard = self.guards.get(target).cloned().ok_or_else(|| self.unverified())?;
         self.verify_page_scope(Some(&guard))?;
         if self.away_sessions.get(&session).is_some_and(|away| away.tainted || away.frame.as_ref() != Some(&frame)) { return Err(self.away_failure()) }
         Ok(())
