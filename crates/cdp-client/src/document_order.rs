@@ -83,22 +83,22 @@ impl Cdp {
         let Some(target) = self.session_target(session) else { return Ok(()) };
         let reported_error = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url));
         if reported_error && tree.pointer("/frameTree/frame/url").and_then(Value::as_str).is_none_or(|url| !self.guard.error_page_url(url)) {
-            let current = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).map_err(|_| self.unverified())?;
-            let info = current.get("targetInfo").ok_or_else(|| self.unverified())?;
+            let current = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).map_err(|_| self.refusal())?;
+            let info = current.get("targetInfo").ok_or_else(|| self.refusal())?;
             if info.get("targetId").and_then(Value::as_str) != Some(target.as_str())
                 || info.get("url").and_then(Value::as_str).is_none_or(|url| self.guard.error_page_url(url) || self.guard.url(url)) { return Err(self.refusal()) }
             self.targets.insert(target.clone(), info.clone());
         }
         if !self.unchecked_document(&target) { return Ok(()) }
         let mut frames = BTreeMap::new();
-        let mut queue = vec![tree.get("frameTree").ok_or_else(|| self.unverified())?];
+        let mut queue = vec![tree.get("frameTree").ok_or_else(|| self.refusal())?];
         while let Some(node) = queue.pop() {
             if frames.len() >= 4096 { return Err(self.refusal()) }
-            let frame = node.get("frame").ok_or_else(|| self.unverified())?;
-            let id = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.unverified())?;
+            let frame = node.get("frame").ok_or_else(|| self.refusal())?;
+            let id = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| self.refusal())?;
             if frames.insert(id, frame).is_some() { return Err(self.refusal()) }
             if let Some(children) = node.get("childFrames") {
-                queue.extend(children.as_array().ok_or_else(|| self.unverified())?);
+                queue.extend(children.as_array().ok_or_else(|| self.refusal())?);
             }
         }
         if self.guard_sessions.contains(session) {

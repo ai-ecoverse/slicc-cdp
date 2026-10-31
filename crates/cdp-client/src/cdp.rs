@@ -38,7 +38,7 @@ pub type Decider = Box<dyn FnMut(&Paused) -> Decision>;
 
 pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it could be seven's\n";
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
-pub const UNANSWERED: &str = "slicc: refused: this page isn't answering, so slicc can't keep seven's origin out of it (a dialog may be waiting in the browser)";
+pub const UNANSWERED: &str = "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser)";
 pub const UNVERIFIED: &str = "slicc: refused: slicc could not finish checking this target, so it left it alone; the browser may not answer the check\n";
 pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
@@ -712,8 +712,7 @@ impl Cdp {
     }
 
     pub fn unverified(&self) -> String {
-        let seen = !self.protected_targets.is_empty() || !self.blocked.is_empty() || self.documents.values().any(|doc| doc.previous);
-        if seen { self.refusal() } else { self.closed.clone().unwrap_or_else(|| UNVERIFIED.to_string()) }
+        self.closed.clone().unwrap_or_else(|| UNVERIFIED.to_string())
     }
 
     fn closing(&mut self, message: String) -> String {
@@ -4884,7 +4883,7 @@ mod tests {
     fn cleanup_waits_for_the_refused_targets_late_destruction() {
         let mut cdp = cleanup(Some(Duration::from_millis(40)), cleanup_answer);
         let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
-        assert_eq!(error, "slicc: refused: this page isn't answering, so slicc can't keep seven's origin out of it (a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
         assert!(cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == "T"));
         assert!(cdp.is_protected_target("T"));
     }
@@ -4900,7 +4899,7 @@ mod tests {
             cleanup_answer(message).into_iter().filter(|reply| reply.get("method").is_none()).collect()
         });
         let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
-        assert_eq!(error, "slicc: refused: this page isn't answering, so slicc can't keep seven's origin out of it (a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
         assert!(!cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed"));
         assert!(cdp.is_protected_target("T"));
     }

@@ -145,7 +145,7 @@ test('the guard setup shares one budget, tolerates slow optional steps and fails
               assert.equal(opened.stdout, '');
               assert.equal(
                 opened.stderr,
-                `${unguarded}: Network.setBypassServiceWorker timed out\n`,
+                `${unguarded} (the page isn't answering, and a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n`,
                 opened.stderr
               );
               const after = await pages(browser.wsUrl);

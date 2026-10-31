@@ -47,8 +47,26 @@ test('a page that stops answering is named, not blamed on seven', async () => {
     fake.targets.push({ targetId: 'TAB', url: 'http://example.test/' });
     const result = await run(['eval', '1']);
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /this page isn't answering/);
-    assert.match(result.stderr, /a dialog may be waiting in the browser/);
+    assert.match(result.stderr, /the page isn't answering/);
+    assert.match(
+      result.stderr,
+      /^slicc: refused: slicc can't keep seven's origin out of this target/
+    );
     assert.match(result.stderr, /Network\.setBypassServiceWorker timed out\n$/);
   });
+});
+
+test('a failed check reads the same whether or not a protected tab is open', async () => {
+  const read = async (extra) => {
+    let text;
+    await withFake({ refuse: ['Page.getFrameTree'] }, async (run, fake) => {
+      fake.targets.push({ targetId: 'TAB', url: 'http://example.test/' });
+      if (extra) fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+      const listed = await run(['tab-list']);
+      assert.ok(!listed.stdout.includes('seven.sliccy.ai'));
+      text = (await run(['eval', '1', '--tab', 'TAB'])).stderr;
+    });
+    return text;
+  };
+  assert.equal(await read(true), await read(false));
 });
