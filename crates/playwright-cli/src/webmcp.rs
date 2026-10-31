@@ -22,6 +22,12 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
     let _ = browser::watch_detach(cdp, state, &target, &session);
     match result {
         Ok(tools) => {
+            let plain = state.webmcp.get(&target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection))
+                .and_then(|entry| entry.get("sessions")).and_then(Value::as_array)
+                .is_some_and(|sessions| sessions.iter().any(|session| session.get("target").and_then(Value::as_str) == Some(&target) && session.get("plain").and_then(Value::as_bool) == Some(true)));
+            if plain && (tools.as_array().is_some_and(Vec::is_empty) || tools.is_null() || tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent")) {
+                return Output::err(crate::webmcp_polyfill::FALLBACK_EMPTY);
+            }
             state.current = Some(target);
             if tools.is_null() || tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent") {
                 return unavailable("webmcp-list");

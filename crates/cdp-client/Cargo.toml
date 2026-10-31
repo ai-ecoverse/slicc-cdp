@@ -24,6 +24,10 @@ name = "document-validation"
 path = "../../test/integration/document-validation.rs"
 
 [[test]]
+name = "webmcp-stage1"
+path = "../../test/integration/webmcp-stage1.rs"
+
+[[test]]
 name = "guard-domain-premise"
 path = "../../test/integration/guard-domain-premise.rs"
 

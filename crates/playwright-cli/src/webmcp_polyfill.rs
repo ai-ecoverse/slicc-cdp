@@ -8,6 +8,8 @@ use std::io::{self, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+pub(crate) const FALLBACK_EMPTY: &str = "webmcp: no tools are available through the other-extension fallback; page startup or parse-time checks may have happened before installation\n";
+
 pub fn bridge_name(value: &str) -> bool {
     value.len() == 39 && value.starts_with("__wmcp_") && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -35,6 +37,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     *state = latest;
     match result {
         Ok(()) => Output::ok(""),
+        Err(message) if message.starts_with("slicc: refused:") => Output::err(format!("webmcp-polyfill: Runtime.evaluate: {message}")),
         Err(message) => Output::err(message),
     }
 }
@@ -56,18 +59,10 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: 
 }
 
 fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool, make_input: impl FnOnce() -> Result<Input, String>) -> Result<(), String> {
-    let owner = cdp.start_webmcp(session)?;
+    let owner = cdp.start_webmcp_for(session, reload)?;
     cdp.webmcp_auto_attach(session)?;
     save(cdp, state, target, &owner, json!({}))?;
     let mut input = make_input()?;
-    if reload {
-        let from = cdp.events().len();
-        cdp.call("Page.reload", json!({}), Some(session))?;
-        if cdp.wait_event(from, Duration::from_secs(15), |event| event.get("method").and_then(Value::as_str) == Some("Page.loadEventFired") && event.get("sessionId").and_then(Value::as_str) == Some(session))?.is_none() {
-            return Err("webmcp-polyfill: reload did not complete\n".into());
-        }
-        save(cdp, state, target, &owner, json!({}))?;
-    }
     let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
     let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).ok_or_else(|| "webmcp-polyfill: unverified document\n".to_string())?;
     let world = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame,"worldName":"slicc-webmcp"}), Some(session))?;
@@ -75,6 +70,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
     let mode = if native { json!("native") } else { browser::evaluate(cdp, session, &format!("(() => {{ 'use strict'; if (typeof {owner} !== 'undefined' && {owner}) return 'polyfill'; return document.modelContext ? 'page' : 'unavailable'; }})()"), false)?.value };
     let mut watch = Watch::new(target, session, frame);
     watch.arm(cdp, state)?;
+    if cdp.webmcp_plain(session) && watch.empty() { eprint!("{FALLBACK_EMPTY}"); }
     let status = json!({"event":"ready","loaderId":tree["frameTree"]["frame"]["loaderId"],"mode":mode,"tab":target,"late":!reload,"reloaded":reload,"pauseMicros":cdp.webmcp_pause_micros()});
     println!("{status}");
     io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
@@ -87,7 +83,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         }
         if !cdp.webmcp_alive(session) {
             cdp.webmcp_trace_stage(session, "holder-exit", "root liveness check");
-            return Err("webmcp-polyfill: target closed, changed or was refused by the guard\n".into());
+            return Err("slicc: refused: WebMCP target closed, changed or was refused by the guard; tools cannot be verified\n".into());
         }
         let pumped = cdp.pump(Instant::now() + Duration::from_millis(50));
         cdp.webmcp_trace_result(session, "event pump", pumped)?;
@@ -106,12 +102,14 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
             let document = cdp.webmcp_trace_result(session, "document readiness", document)?;
             save(cdp, state, target, &owner, json!({}))?;
             watch.arm(cdp, state)?;
+            if cdp.webmcp_plain(session) && watch.empty() { eprint!("{FALLBACK_EMPTY}"); }
             println!("{}", json!({"event":"document-ready","tab":target,"loaderId":document["loaderId"]}));
             io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
         }
         let events = watch.tick(cdp, state);
         let events = cdp.webmcp_trace_result(session, "change verification", events)?;
         if !events.is_empty() {
+            if cdp.webmcp_plain(session) && events.iter().any(|event| event.get("tools").and_then(Value::as_array).is_some_and(Vec::is_empty)) { eprint!("{FALLBACK_EMPTY}"); }
             save(cdp, state, target, &owner, watch.changes())?;
             for event in events { println!("{}", crate::sanitize::json_c1(&event.to_string())); }
             io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
