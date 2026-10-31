@@ -27,6 +27,9 @@ struct State {
     raw_instrumentation: bool,
     conversion_pending: bool,
     child_churn: bool,
+    replay_only: bool,
+    load_after_install: bool,
+    pause_during_install: bool,
 }
 
 struct Backend(Rc<RefCell<State>>);
@@ -146,8 +149,8 @@ impl Transport for Backend {
                 for owner in state.sessions.keys().cloned().collect::<Vec<_>>() {
                     state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":tree("R")["frameTree"]["frame"]}}).to_string());
                     state.incoming.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":owner,"params":{}}).to_string());
-                    state.incoming.push_back(context(&owner, "R").to_string());
-                    state.incoming.push_back(json!({"method":"Page.loadEventFired","sessionId":owner,"params":{"timestamp":1}}).to_string());
+                    if !state.replay_only { state.incoming.push_back(context(&owner, "R").to_string()); }
+                    if !state.load_after_install { state.incoming.push_back(json!({"method":"Page.loadEventFired","sessionId":owner,"params":{"timestamp":1}}).to_string()); }
                 }
                 state.load_sent = true;
                 if let Some(owner) = state.armed.clone() {
@@ -169,6 +172,17 @@ impl Transport for Backend {
                     .and_then(Value::as_str)
                     .unwrap_or("L");
                 assert_eq!(call["params"]["uniqueContextId"], format!("main-{loader}"));
+                if state.pause_during_install {
+                    state.pause_during_install = false;
+                    state.incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":session,"params":{"scriptId":"INSTALL","executionContextId":1,"url":""}}).to_string());
+                    state.incoming.push_back(json!({"method":"Debugger.paused","sessionId":session,"params":{"reason":"other","callFrames":[{"callFrameId":"INSTALL-CALL","location":{"scriptId":"INSTALL","lineNumber":0,"columnNumber":0}}]}}).to_string());
+                }
+                if state.load_after_install {
+                    state.load_after_install = false;
+                    for owner in state.sessions.keys().cloned().collect::<Vec<_>>() {
+                        state.incoming.push_back(json!({"method":"Page.loadEventFired","sessionId":owner,"params":{"timestamp":1}}).to_string());
+                    }
+                }
                 if state.child_churn {
                     let child = json!({"id":"C","parentId":"F","loaderId":"CHURNED","url":"https://child.test/","securityOrigin":"https://child.test"});
                     state.tree.as_mut().unwrap()["frameTree"]["childFrames"][0]["frame"] =
@@ -477,6 +491,40 @@ fn a_world_arriving_after_enable_switches_once_without_a_second_reload() {
             .iter()
             .all(|call| !call["method"].as_str().unwrap().starts_with("Debugger.")));
     }
+}
+
+#[test]
+fn plain_reload_replays_the_committed_root_before_loading_children() {
+    let (mut cdp, state, session) = fixture();
+    {
+        let mut wire = state.borrow_mut();
+        wire.refusal = Some("slicc: refused: a browser extension runs scripts in this page, and profiling it would expose them");
+        wire.replay_only = true;
+        wire.load_after_install = true;
+        wire.pending_child = true;
+    }
+    cdp.start_webmcp_for(&session, true).unwrap();
+    let wire = state.borrow();
+    let reload = wire.calls.iter().position(|call| call["method"] == "Page.reload").unwrap();
+    let after = &wire.calls[reload + 1..];
+    assert_eq!(after.iter().filter(|call| call["method"] == "Runtime.disable" && call["sessionId"] == session).count(), 1);
+    assert!(after.iter().any(|call| call["method"] == "Runtime.enable"));
+    assert_eq!(count(&wire, "Runtime.evaluate"), 1);
+    assert_eq!(count(&wire, "Page.reload"), 1);
+    assert!(wire.pending_reads >= 2);
+    assert!(after.iter().all(|call| !call["method"].as_str().unwrap().starts_with("Debugger.")));
+}
+
+#[test]
+fn a_pause_inside_the_plain_evaluate_of_an_armed_realm_never_installs_twice() {
+    let (mut cdp, state, session) = fixture();
+    state.borrow_mut().pause_during_install = true;
+    cdp.start_webmcp_for(&session, false).unwrap();
+    assert!(cdp.webmcp_alive(&session));
+    let wire = state.borrow();
+    assert_eq!(count(&wire, "Runtime.evaluate"), 1);
+    assert_eq!(count(&wire, "Page.reload"), 0);
+    assert_eq!(count(&wire, "Debugger.resume"), 1);
 }
 
 #[test]

@@ -31,6 +31,7 @@ struct Arm {
     pending_install: Option<Instant>,
     pending_frames: BTreeMap<String, (String, Instant)>,
     accepted: BTreeSet<(String, String, String)>,
+    installing: BTreeSet<(String, String, String)>,
     loaders: BTreeMap<String, String>,
     documents: BTreeMap<String, Value>,
 }
@@ -105,11 +106,7 @@ impl Cdp {
             let from = self.events.len();
             self.call_for("Page.reload", json!({}), Some(session), DOCUMENT_CHECK)?;
             if self.webmcp_plain(session) {
-                let until = Instant::now() + DOCUMENT_CHECK;
-                while !self.events.iter().skip(from).any(|event| event.get("sessionId").and_then(Value::as_str) == Some(session) && event.get("method").and_then(Value::as_str) == Some("Page.loadEventFired")) {
-                    if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
-                }
-                self.webmcp_install_current(session)?;
+                self.webmcp_plain_reload(session, &tree, from).map_err(|message| format!("{message}webmcp-polyfill: other-extension fallback could not verify the reloaded document; tools are unavailable\n"))?;
             }
             let until = Instant::now() + DOCUMENT_CHECK;
             while self.webmcp.arms.get(session).is_some_and(|arm| arm.admitted == 0 && !arm.revoked) && Instant::now() < until {
@@ -125,6 +122,22 @@ impl Cdp {
 
     pub fn webmcp_plain(&self, session: &str) -> bool {
         self.webmcp.arms.get(session).is_some_and(|arm| arm.plain)
+    }
+
+    fn webmcp_plain_reload(&mut self, session: &str, previous: &Value, from: usize) -> Result<(), String> {
+        let until = Instant::now() + DOCUMENT_CHECK;
+        let root = &previous["frameTree"]["frame"];
+        while !self.events.iter().skip(from).any(|event| event["sessionId"] == session && event["method"] == "Page.frameNavigated"
+            && event["params"]["frame"]["id"] == root["id"] && event["params"]["frame"]["loaderId"] != root["loaderId"] && event["params"]["frame"].get("parentId").is_none()) {
+            if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
+        }
+        self.call_for("Runtime.disable", json!({}), Some(session), until.saturating_duration_since(Instant::now()))?;
+        self.call_for("Runtime.enable", json!({}), Some(session), until.saturating_duration_since(Instant::now()))?;
+        self.webmcp_install_root(session)?;
+        while !self.events.iter().skip(from).any(|event| event["sessionId"] == session && event["method"] == "Page.loadEventFired") {
+            if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
+        }
+        self.webmcp_plain_proof(session)
     }
 
     fn webmcp_stable<T>(&mut self, session: &str, deadline: Instant, mut attempt: impl FnMut(&mut Self, Duration) -> Result<T, String>) -> Result<T, String> {
@@ -231,7 +244,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new() });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -301,6 +314,10 @@ impl Cdp {
 
     fn webmcp_install_current(&mut self, session: &str) -> Result<(), String> {
         if self.webmcp_plain(session) { self.webmcp_plain_proof(session)?; }
+        self.webmcp_install_root(session)
+    }
+
+    fn webmcp_install_root(&mut self, session: &str) -> Result<(), String> {
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
         let until = Instant::now() + DOCUMENT_CHECK;
@@ -320,7 +337,11 @@ impl Cdp {
         let source = arm.source.clone();
         if self.webmcp_root_document(session, until)? != root || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context) { return Err(self.refusal()); }
         self.webmcp_check_context(session, id, context, until)?;
-        let result = self.call_for("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()))?;
+        let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
+        self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?.installing.insert(realm.clone());
+        let result = self.call_for("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()));
+        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.installing.remove(&realm); }
+        let result = result?;
         if result.get("exceptionDetails").is_some() || self.webmcp_root_document(session, until)? != root { return Err(self.refusal()); }
         self.webmcp_check_context(session, id, context, until)
     }
@@ -541,6 +562,13 @@ impl Cdp {
 
     fn webmcp_handle_pause(&mut self, value: &Value, session: &str) {
         self.webmcp.paused.insert(session.to_string());
+        let installing = self.webmcp_pause_context(value, session).map(|(_, context)| context).or_else(|| self.webmcp_known_root(session).ok().map(|(_, context)| context))
+            .is_some_and(|context| self.webmcp.arms.get(session).is_some_and(|arm| arm.installing.contains(&(context.frame, context.loader, context.unique))));
+        if installing {
+            let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
+            self.webmcp.paused.remove(session);
+            return;
+        }
         if self.webmcp_handle_instrumentation(value, session) { return; }
         let conversion = self.webmcp.arms.get_mut(session).and_then(|arm| arm.conversion.take());
         let started = conversion.as_ref().map_or_else(Instant::now, |(_, started, _)| *started);
