@@ -34,7 +34,7 @@ path = "../../test/integration/guard-domain-premise.rs"
 [dependencies]
 getrandom = "0.4"
 serde_json = "1"
-slicc-browsers = { git = "https://github.com/ai-ecoverse/slicc-browsers", rev = "3205de5fbc2845c57585e52a23c9d1958de94342", features = ["serde"] }
+slicc-browsers = { git = "https://github.com/ai-ecoverse/slicc-browsers", rev = "195f7d371bc3add40efb6007c819c1ca65955a06", features = ["serde"] }
 url = "2.5"
 wasix-net = "0.1.2"
 
@@ -46,4 +46,4 @@ native-tls = "0.2"
 openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
-slicc-browsers = { git = "https://github.com/ai-ecoverse/slicc-browsers", rev = "3205de5fbc2845c57585e52a23c9d1958de94342", features = ["corpus"] }
+slicc-browsers = { git = "https://github.com/ai-ecoverse/slicc-browsers", rev = "195f7d371bc3add40efb6007c819c1ca65955a06", features = ["corpus"] }
