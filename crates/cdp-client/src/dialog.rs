@@ -11,6 +11,7 @@ struct DialogDocument {
     loader: String,
 }
 
+pub const DIALOG_PERSON: &str = "Error: this browser shows a page's dialogs to the person and never reports them, so slicc can't answer one. If the page stopped responding, the dialog needs answering in the browser.\n";
 pub const DIALOG_UNOBSERVED: &str = "Error: No dialog visible to this session. Dialogs already open before attachment require the foreground dialog holder (follow-up #529); arm dialog-accept or dialog-dismiss before triggering a dialog.\n";
 
 impl Cdp {
@@ -82,9 +83,15 @@ impl Cdp {
                 return Ok(());
             }
             if Instant::now() >= deadline || !self.pump(deadline)? {
-                return Err(DIALOG_UNOBSERVED.into());
+                return Err(self.dialog_absence());
             }
         }
+    }
+
+    fn dialog_absence(&mut self) -> String {
+        let version = self.raw_call("Browser.getVersion", json!({}), None, DOCUMENT_CHECK).unwrap_or_default();
+        let webkit = version.get("product").and_then(Value::as_str).is_some_and(|product| product.contains("WebKit"));
+        if webkit { DIALOG_PERSON.to_string() } else { DIALOG_UNOBSERVED.to_string() }
     }
 
     fn dialog_url(&self, text: &str) -> bool {

@@ -144,6 +144,7 @@ export async function fakeCdp({
   location,
   frameTree,
   listen = '127.0.0.1',
+  product = 'Chrome/140.0.0.0',
   tls,
   version = false,
 } = {}) {
@@ -331,7 +332,7 @@ export async function fakeCdp({
         case 'Browser.getWindowForTarget':
           return answer(windows(params.targetId ?? target?.targetId));
         case 'Browser.getVersion':
-          return answer({ product: 'Chrome/140.0.0.0', protocolVersion: '1.3' });
+          return answer({ product, protocolVersion: '1.3' });
         case 'Page.getFrameTree':
           if (target?.tree) return answer({ frameTree: target.tree });
           if (frameTree) return answer({ frameTree });

@@ -625,13 +625,19 @@ pub fn render_requests(
     Ok(format!("### Result\n{}", lines.join("\n")))
 }
 
+fn status_unknown(request: &NetRequest) -> bool {
+    request.status == Some(0) && request.status_text.is_empty() && request.response_headers.is_empty()
+}
+
 fn render_request_line(request: &NetRequest) -> String {
     let mut line = format!(
         "[{}] {}",
         request.method.to_ascii_uppercase(),
         sanitize::display_url(&truncate_data_url(&request.url))
     );
-    if let Some(status) = request.status {
+    if status_unknown(request) {
+        line.push_str(" => [status unknown]");
+    } else if let Some(status) = request.status {
         if request.status_text.is_empty() {
             line.push_str(&format!(" => [{status}]"));
         } else {
@@ -661,7 +667,9 @@ fn render_details(index: usize, request: &NetRequest) -> String {
         String::new(),
         "  General".to_string(),
     ];
-    if let Some(status) = request.status {
+    if status_unknown(request) {
+        lines.push(general("status", "unknown: this browser doesn't report it"));
+    } else if let Some(status) = request.status {
         let text = if request.status_text.is_empty() {
             format!("[{status}]")
         } else {
@@ -1344,6 +1352,33 @@ mod tests {
         let listed = render_requests(&items, false, None).unwrap();
         assert!(listed.contains("[FAILED] net::ERR_FAILED"));
         assert!(!listed.contains("static request"));
+    }
+
+    #[test]
+    fn a_status_the_browser_never_reported_is_called_unknown() {
+        let mut request = NetRequest { method: "GET".into(), url: "http://example.test/a".into(), status: Some(0), ..sample_request() };
+        assert!(render_request_line(&request).ends_with(" => [status unknown]"));
+        assert!(render_details(1, &request).contains("unknown: this browser doesn't report it"));
+        request.response_headers = vec![("a".into(), "b".into())];
+        assert!(render_request_line(&request).ends_with(" => [0]"));
+    }
+
+    fn sample_request() -> NetRequest {
+        NetRequest {
+            method: String::new(),
+            url: String::new(),
+            resource_type: "fetch".into(),
+            status: None,
+            status_text: String::new(),
+            failed: None,
+            mime: String::new(),
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            request_body: None,
+            response_body: None,
+            response_base64: false,
+            cookie_scopes: Vec::new(),
+        }
     }
 
     #[test]

@@ -125,12 +125,17 @@ pub fn decide(routes: &[Route], paused: &Paused) -> Decision {
         .unwrap_or_default()
 }
 
+const UNROUTABLE: &str = "playwright-cli route: this browser can't pause requests, so a route would never run\n";
+
 pub fn is_route_command(command: &str) -> bool {
     matches!(command, "route" | "route-list" | "unroute")
 }
 
-pub fn run(invocation: &Invocation) -> Output {
+pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let command = invocation.command.as_deref().unwrap_or("");
+    if command == "route" && crate::page_tools::webkit_browser(invocation, cdp_env) {
+        return Output::err(UNROUTABLE);
+    }
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
     let output = match command {
         "route" => add(&mut state, invocation),
@@ -297,7 +302,7 @@ pub fn arm(
             patterns.push(pattern);
         }
     }
-    fetch::enable(cdp, session_id, &patterns)?;
+    fetch::enable(cdp, session_id, &patterns).map_err(crate::page_tools::with_remedy("unroute"))?;
     let owned = routes.to_vec();
     cdp.set_decider(
         session_id,

@@ -27,6 +27,7 @@ const BACKGROUND: &str = "Error: mousewheel could not scroll the background tab 
 const SYNTHETIC_WHEEL: &str = "function(x, y, dx, dy, alt, ctrl, meta, shift, buttons) { let target = document.elementFromPoint(x, y); while (target && target.shadowRoot) { const inner = target.shadowRoot.elementFromPoint(x, y); if (!inner || inner === target) break; target = inner; } const root = document.scrollingElement || document.documentElement; if (!target) target = root; if (/^(iframe|frame|object|embed|fencedframe|portal)$/i.test(target.localName)) return 'frame'; const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, screenX: x, screenY: y, deltaX: dx, deltaY: dy, deltaMode: 0, altKey: alt, ctrlKey: ctrl, metaKey: meta, shiftKey: shift, buttons }); if (!target.dispatchEvent(event)) return 'prevented'; const parent = (node) => node.assignedSlot || node.parentElement || (node.getRootNode() instanceof ShadowRoot ? node.getRootNode().host : null); const room = (node, axis, delta) => { const style = getComputedStyle(node); if (!/(auto|scroll|overlay)/.test(axis === 'x' ? style.overflowX : style.overflowY)) return false; const at = axis === 'x' ? node.scrollLeft : node.scrollTop; const end = axis === 'x' ? node.scrollWidth - node.clientWidth : node.scrollHeight - node.clientHeight; return delta > 0 ? at < end - 0.5 : at > 0.5; }; const scroller = (axis, delta) => { if (!delta) return root; for (let node = target; node && node !== root; node = parent(node)) if (room(node, axis, delta)) return node; return root; }; const sx = scroller('x', dx); const sy = scroller('y', dy); if (sx === sy) sx.scrollBy({ left: dx, top: dy, behavior: 'instant' }); else { sx.scrollBy({ left: dx, top: 0, behavior: 'instant' }); sy.scrollBy({ left: 0, top: dy, behavior: 'instant' }); } return 'scrolled'; }";
 const FOREGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const WHEEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const UNSIZED: &str = "Error: this browser sets its own window size, so resize can't change it\n";
 const NO_PAYLOAD: &str = "Error: At least one of \"paths\" or \"data\" must be provided.\n";
 
 pub fn is_command(command: &str) -> bool {
@@ -517,7 +518,9 @@ fn resize(cdp: &mut Cdp, session: &str, width: u64, height: u64) -> Result<(), S
         _ => 0,
     };
     let bounds = json!({ "width": width + inset(outer("width"), viewport(0)), "height": height + inset(outer("height"), viewport(1)) });
-    cdp.call("Browser.setWindowBounds", json!({ "windowId": id, "bounds": bounds }), Some(session))?;
+    cdp.call("Browser.setWindowBounds", json!({ "windowId": id, "bounds": bounds }), Some(session)).map_err(|message| {
+        if message.ends_with("wasn't found\n") { UNSIZED.to_string() } else { message }
+    })?;
     Ok(())
 }
 
