@@ -83,6 +83,24 @@ pub struct EndpointUrl {
     pub port: u16,
 }
 
+pub const CERT_PIN_ENV: &str = "SLICC_CDP_CERT_SHA256";
+
+fn certificate_pin(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    let pin = raw.replace(':', "").to_ascii_lowercase();
+    if pin.len() == 64 && pin.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(Some(pin))
+    } else {
+        Err(format!("{CERT_PIN_ENV} must be the 64 hex digits of a SHA-256 certificate fingerprint\n"))
+    }
+}
+
+fn dial_pin(host: &str, raw: Option<&str>) -> Result<Option<String>, String> {
+    Ok(certificate_pin(raw)?.filter(|_| loopback_alias(host)))
+}
+
 pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, String> {
     let parts = parse_url(url)?;
     Ok(EndpointUrl {
@@ -203,7 +221,7 @@ fn exchange(spec: Exchange<'_>, url: &str) -> Result<ProbeResponse, String> {
         .map_err(|err| format!("{label} timeout setup failed: {err}\n"))?;
     tcp.set_nodelay(true).ok();
     let mut stream: Box<dyn ReadWrite> = if parts.scheme == "https" {
-        wrap_tls(&parts.host, tcp)?
+        wrap_tls(&parts.host, tcp, None)?
     } else {
         Box::new(tcp)
     };
@@ -756,7 +774,8 @@ fn dial(parts: &Parts) -> Result<Box<dyn ReadWrite>, String> {
         .map_err(|err| connect_error(parts, &err.to_string()))?;
     tcp.set_nodelay(true).ok();
     if parts.scheme == "https" || parts.scheme == "wss" {
-        wrap_tls(&parts.host, tcp)
+        let pin = dial_pin(&parts.host, std::env::var(CERT_PIN_ENV).ok().as_deref())?;
+        wrap_tls(&parts.host, tcp, pin.as_deref())
     } else {
         Ok(Box::new(tcp))
     }
@@ -846,18 +865,37 @@ fn connect_any(
 }
 
 #[cfg(not(target_os = "wasi"))]
-fn wrap_tls(host: &str, tcp: TcpStream) -> Result<Box<dyn ReadWrite>, String> {
-    let connector = native_tls::TlsConnector::new()
-        .map_err(|err| format!("TLS setup failed: {err}\n"))?;
+fn wrap_tls(host: &str, tcp: TcpStream, pin: Option<&str>) -> Result<Box<dyn ReadWrite>, String> {
+    let mut builder = native_tls::TlsConnector::builder();
+    if pin.is_some() {
+        builder.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
+    }
+    let connector = builder.build().map_err(|err| format!("TLS setup failed: {err}\n"))?;
     let stream = connector
         .connect(host, tcp)
         .map_err(|err| format!("TLS handshake with {host} failed: {err}\n"))?;
+    if let Some(pin) = pin {
+        let found = presented_fingerprint(&stream, host)?;
+        if found != pin {
+            return Err(format!("TLS certificate of {host} doesn't match {CERT_PIN_ENV}: it presented {found}\n"));
+        }
+    }
     Ok(Box::new(stream))
 }
 
+#[cfg(not(target_os = "wasi"))]
+fn presented_fingerprint(stream: &native_tls::TlsStream<TcpStream>, host: &str) -> Result<String, String> {
+    let certificate = stream
+        .peer_certificate()
+        .map_err(|err| format!("TLS certificate of {host} couldn't be read: {err}\n"))?
+        .ok_or_else(|| format!("{host} presented no TLS certificate\n"))?;
+    let der = certificate.to_der().map_err(|err| format!("TLS certificate of {host} couldn't be read: {err}\n"))?;
+    Ok(crate::hash::sha256_hex(&der))
+}
+
 #[cfg(target_os = "wasi")]
-fn wrap_tls(_host: &str, _tcp: TcpStream) -> Result<Box<dyn ReadWrite>, String> {
-    Err("wss and https are not available in this build\n".to_string())
+fn wrap_tls(_host: &str, _tcp: TcpStream, _pin: Option<&str>) -> Result<Box<dyn ReadWrite>, String> {
+    Err("wss and https are not available in this build; a program in the kernel reaches the browser through the ws:// URL the kernel puts in SLICC_CDP_URL\n".to_string())
 }
 
 fn read_http(stream: &mut dyn ReadWrite) -> Result<(u16, Vec<(String, String)>, Vec<u8>, Vec<u8>), String> {
@@ -1281,6 +1319,31 @@ mod tests {
         assert!(connection_closed(CONNECTION_CLOSED));
         assert!(!connection_closed("websocket read failed: reset\n"));
         assert!(!connection_closed("CDP response was not JSON: x\n"));
+    }
+
+    #[test]
+    fn a_pin_is_a_sha256_fingerprint_in_either_spelling() {
+        let hex = "ab".repeat(32);
+        assert_eq!(certificate_pin(None).unwrap(), None);
+        assert_eq!(certificate_pin(Some("  ")).unwrap(), None);
+        assert_eq!(certificate_pin(Some(&hex)).unwrap().as_deref(), Some(hex.as_str()));
+        let colons = vec!["AB"; 32].join(":");
+        assert_eq!(certificate_pin(Some(&colons)).unwrap().as_deref(), Some(hex.as_str()));
+        for bad in ["abcd", "not hex", &"zz".repeat(32), &"ab".repeat(33)] {
+            assert!(certificate_pin(Some(bad)).unwrap_err().starts_with(CERT_PIN_ENV), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_pin_only_loosens_verification_on_this_machine() {
+        let hex = "ab".repeat(32);
+        for host in ["127.0.0.1", "localhost", "[::1]"] {
+            assert_eq!(dial_pin(host, Some(&hex)).unwrap().as_deref(), Some(hex.as_str()), "{host}");
+        }
+        for host in ["example.com", "seven.sliccy.ai", "127.0.0.1.example"] {
+            assert_eq!(dial_pin(host, Some(&hex)).unwrap(), None, "{host}");
+        }
+        assert!(dial_pin("example.com", Some("bad")).is_err());
     }
 
     #[test]

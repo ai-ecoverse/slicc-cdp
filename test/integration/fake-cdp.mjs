@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import { createServer as createSecureServer } from 'node:https';
 
 function decode(buffer) {
   const out = [];
@@ -143,6 +144,7 @@ export async function fakeCdp({
   location,
   frameTree,
   listen = '127.0.0.1',
+  tls,
   version = false,
 } = {}) {
   let lastAria = defaultAria;
@@ -173,14 +175,15 @@ export async function fakeCdp({
     browserContextId: 'CTX',
     ...(target.parentFrameId ? { parentFrameId: target.parentFrameId } : {}),
   });
-  const server = createServer((req, res) => {
+  const serve = (handler) => (tls ? createSecureServer(tls, handler) : createServer(handler));
+  const server = serve((req, res) => {
     if (version && req.url === '/json/version') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
           Browser: 'Chrome/140.0.0.0',
           'Protocol-Version': '1.3',
-          webSocketDebuggerUrl: `ws://${req.headers.host}/devtools/browser/fake`,
+          webSocketDebuggerUrl: `${tls ? 'wss' : 'ws'}://${req.headers.host}/devtools/browser/fake`,
         })
       );
       return;
@@ -664,7 +667,7 @@ export async function fakeCdp({
   });
   const host = listen.includes(':') ? `[${listen}]` : listen;
   return {
-    url: `ws://${host}:${server.address().port}/devtools/browser/fake`,
+    url: `${tls ? 'wss' : 'ws'}://${host}:${server.address().port}/devtools/browser/fake`,
     port: server.address().port,
     calls,
     jar,
