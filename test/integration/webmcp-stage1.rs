@@ -30,6 +30,8 @@ struct State {
     replay_only: bool,
     load_after_install: bool,
     pause_during_install: bool,
+    disable_after_reload_refused: bool,
+    fresh_replay_missing: bool,
 }
 
 struct Backend(Rc<RefCell<State>>);
@@ -51,6 +53,7 @@ impl Transport for Backend {
         let method = call["method"].as_str().unwrap();
         let refusal = match method {
             "Debugger.enable" => state.refusal,
+            "Runtime.disable" if state.disable_after_reload_refused && state.sessions.keys().next().is_some_and(|holder| holder == &session) && state.tree.as_ref().is_some_and(|tree| tree["frameTree"]["frame"]["loaderId"] == "R") => Some("slicc: refused: Runtime.disable is unavailable"),
             "DOM.getDocument" if state.dom_refusal => Some("slicc: refused: protected frame"),
             "Page.getFrameTree" if state.tree_refusal => Some("slicc: refused: protected frame"),
             _ => None,
@@ -100,9 +103,9 @@ impl Transport for Backend {
                     .and_then(Value::as_str)
                     .unwrap_or("L")
                     .to_string();
-                state
-                    .incoming
-                    .push_back(context(&session, &loader).to_string());
+                if !state.fresh_replay_missing || state.tree.as_ref().is_none_or(|tree| tree["frameTree"]["frame"]["loaderId"] != "R") {
+                    state.incoming.push_back(context(&session, &loader).to_string());
+                }
                 if state.protected_world {
                     state.incoming.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":2,"uniqueId":"protected-world","origin":"https://seven.sliccy.ai","auxData":{"frameId":"F","isDefault":false}}}}).to_string());
                 }
@@ -502,17 +505,45 @@ fn plain_reload_replays_the_committed_root_before_loading_children() {
         wire.replay_only = true;
         wire.load_after_install = true;
         wire.pending_child = true;
+        wire.disable_after_reload_refused = true;
     }
     cdp.start_webmcp_for(&session, true).unwrap();
+    assert!(cdp.webmcp_alive(&session));
     let wire = state.borrow();
     let reload = wire.calls.iter().position(|call| call["method"] == "Page.reload").unwrap();
     let after = &wire.calls[reload + 1..];
-    assert_eq!(after.iter().filter(|call| call["method"] == "Runtime.disable" && call["sessionId"] == session).count(), 1);
-    assert!(after.iter().any(|call| call["method"] == "Runtime.enable"));
+    assert_eq!(after.iter().filter(|call| call["method"] == "Runtime.disable" && call["sessionId"] == session).count(), 0);
+    let fresh = after.iter().find(|call| call["method"] == "Runtime.enable").unwrap()["sessionId"].as_str().unwrap();
+    assert_ne!(fresh, session);
+    assert!(after.iter().any(|call| call["method"] == "Target.attachToTarget" && call["params"]["flatten"] == true));
+    assert!(after.iter().any(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == fresh));
+    assert!(after.iter().any(|call| call["method"] == "Runtime.evaluate" && call["sessionId"] == fresh));
     assert_eq!(count(&wire, "Runtime.evaluate"), 1);
     assert_eq!(count(&wire, "Page.reload"), 1);
     assert!(wire.pending_reads >= 2);
     assert!(after.iter().all(|call| !call["method"].as_str().unwrap().starts_with("Debugger.")));
+}
+
+#[test]
+fn missing_fresh_replay_stops_without_another_install_approach() {
+    let (mut cdp, state, session) = fixture();
+    {
+        let mut wire = state.borrow_mut();
+        wire.refusal = Some("slicc: refused: a browser extension runs scripts in this page, and profiling it would expose them");
+        wire.replay_only = true;
+        wire.fresh_replay_missing = true;
+    }
+    let message = cdp.start_webmcp_for(&session, true).unwrap_err();
+    assert!(message.contains("other-extension fallback"));
+    assert!(!cdp.webmcp_alive(&session));
+    let wire = state.borrow();
+    assert_eq!(count(&wire, "Runtime.evaluate"), 0);
+    assert_eq!(count(&wire, "Page.reload"), 1);
+    let reload = wire.calls.iter().position(|call| call["method"] == "Page.reload").unwrap();
+    let after = &wire.calls[reload + 1..];
+    assert_eq!(after.iter().filter(|call| call["method"] == "Target.attachToTarget").count(), 1);
+    assert_eq!(after.iter().filter(|call| call["method"] == "Target.detachFromTarget").count(), 1);
+    assert_eq!(after.iter().filter(|call| call["method"] == "Runtime.disable" && call["sessionId"] == session).count(), 0);
 }
 
 #[test]

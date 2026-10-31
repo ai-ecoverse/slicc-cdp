@@ -131,13 +131,31 @@ impl Cdp {
             && event["params"]["frame"]["id"] == root["id"] && event["params"]["frame"]["loaderId"] != root["loaderId"] && event["params"]["frame"].get("parentId").is_none()) {
             if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
         }
-        self.call_for("Runtime.disable", json!({}), Some(session), until.saturating_duration_since(Instant::now()))?;
-        self.call_for("Runtime.enable", json!({}), Some(session), until.saturating_duration_since(Instant::now()))?;
-        self.webmcp_install_root(session)?;
+        self.webmcp_plain_replay(session, until)?;
         while !self.events.iter().skip(from).any(|event| event["sessionId"] == session && event["method"] == "Page.loadEventFired") {
             if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
         }
         self.webmcp_plain_proof(session)
+    }
+
+    fn webmcp_plain_replay(&mut self, session: &str, until: Instant) -> Result<(), String> {
+        let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+        let attached = self.call_for("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, until.saturating_duration_since(Instant::now()))?;
+        let fresh = attached.get("sessionId").and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or_else(|| self.refusal())?.to_string();
+        let result = (|| {
+            let arm = self.webmcp.arms.remove(session).ok_or_else(|| self.refusal())?;
+            self.webmcp.arms.insert(fresh.clone(), arm);
+            self.call_for("Runtime.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
+            self.webmcp_install_root(&fresh)
+        })();
+        if let Some(arm) = self.webmcp.arms.remove(&fresh) {
+            self.webmcp.arms.insert(session.to_string(), arm);
+            self.webmcp.contexts.retain(|(owner, _), _| owner != session);
+            let contexts = self.webmcp.contexts.iter().filter(|((owner, _), _)| owner == &fresh).map(|((_, id), context)| (*id, context.clone())).collect::<Vec<_>>();
+            for (id, context) in contexts { self.webmcp.contexts.insert((session.to_string(), id), context); }
+        }
+        let detached = self.call_for("Target.detachFromTarget", json!({"sessionId":fresh}), None, until.saturating_duration_since(Instant::now()));
+        result.and(detached.map(|_| ()))
     }
 
     fn webmcp_stable<T>(&mut self, session: &str, deadline: Instant, mut attempt: impl FnMut(&mut Self, Duration) -> Result<T, String>) -> Result<T, String> {
