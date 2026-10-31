@@ -20,6 +20,8 @@ struct State {
     protected_world: bool,
     missing_instrumentation: bool,
     late_world: bool,
+    raw_instrumentation: bool,
+    conversion_pending: bool,
 }
 
 struct Backend(Rc<RefCell<State>>);
@@ -109,6 +111,16 @@ impl Transport for Backend {
                     json!({"breakpointId":"INSTRUMENT"})
                 }
             }
+            "Debugger.pause" => {
+                assert!(state.raw_instrumentation && state.armed.as_deref() == Some(&session));
+                state.conversion_pending = true;
+                json!({})
+            }
+            "Debugger.resume" if state.conversion_pending => {
+                state.conversion_pending = false;
+                state.incoming.push_back(json!({"method":"Debugger.paused","sessionId":session,"params":{"reason":"other","callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}}).to_string());
+                json!({})
+            }
             "Debugger.disable" => {
                 state.armed = None;
                 json!({})
@@ -122,7 +134,12 @@ impl Transport for Backend {
                 }
                 if let Some(owner) = state.armed.clone() {
                     state.incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":owner,"params":{"scriptId":"SCRIPT","executionContextId":1,"url":"https://ordinary.test/first.js"}}).to_string());
-                    state.incoming.push_back(json!({"method":"Debugger.paused","sessionId":owner,"params":{"reason":"other","callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}}).to_string());
+                    let reason = if state.raw_instrumentation {
+                        "instrumentation"
+                    } else {
+                        "other"
+                    };
+                    state.incoming.push_back(json!({"method":"Debugger.paused","sessionId":owner,"params":{"reason":reason,"callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}}).to_string());
                 }
                 json!({})
             }
@@ -219,6 +236,44 @@ fn installer_uses_only_instrumentation_and_main_world_evaluation() {
         .position(|call| call["method"] == "Debugger.resume")
         .unwrap();
     assert!(install < remove && remove < resume);
+}
+
+#[test]
+fn direct_chrome_instrumentation_is_converted_by_the_owned_installer_not_the_client() {
+    let (mut cdp, state, session) = fixture();
+    state.borrow_mut().raw_instrumentation = true;
+    assert!(cdp
+        .call("Debugger.pause", json!({}), Some(&session))
+        .is_err());
+    assert_eq!(count(&state.borrow(), "Debugger.pause"), 0);
+    let bridge = cdp.start_webmcp_for(&session, true).unwrap();
+    let state = state.borrow();
+    assert_eq!(count(&state, "Debugger.pause"), 1);
+    assert_eq!(count(&state, "Debugger.resume"), 2);
+    let pause = state
+        .calls
+        .iter()
+        .position(|call| call["method"] == "Debugger.pause")
+        .unwrap();
+    let resumed = state
+        .calls
+        .iter()
+        .position(|call| call["method"] == "Debugger.resume")
+        .unwrap();
+    let installed = state
+        .calls
+        .iter()
+        .position(|call| {
+            call["method"] == "Runtime.evaluate"
+                && call["params"]["expression"]
+                    .as_str()
+                    .is_some_and(|source| source.starts_with(&format!("const {bridge} = ")))
+        })
+        .unwrap();
+    assert!(pause < resumed && resumed < installed);
+    assert_eq!(count(&state, "Page.addScriptToEvaluateOnNewDocument"), 0);
+    assert_eq!(count(&state, "Debugger.getScriptSource"), 0);
+    assert_eq!(count(&state, "Debugger.evaluateOnCallFrame"), 0);
 }
 
 #[test]

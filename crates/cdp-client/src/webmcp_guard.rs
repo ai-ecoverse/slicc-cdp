@@ -21,6 +21,7 @@ struct Arm {
     source: String,
     bridge: String,
     identifier: Option<String>,
+    conversion: Option<(u64, Instant, Instant)>,
     plain: bool,
     admitted: usize,
     revoked: bool,
@@ -229,7 +230,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, plain: false, admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), loaders, documents: BTreeMap::new() });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -340,6 +341,7 @@ impl Cdp {
         if let Some(arm) = self.webmcp.arms.get_mut(session) {
             if arm.revoked_at.is_none() { arm.revoked_at = Some((location.file(), location.line())); arm.revoked_reason = Some(reason); }
             arm.revoked = true;
+            arm.conversion = None;
             if let Some(identifier) = arm.identifier.take() {
                 let _ = self.send("Debugger.removeBreakpoint", json!({"breakpointId":identifier}), Some(session));
             }
@@ -463,11 +465,39 @@ impl Cdp {
         Ok((call_id, epoch, context_id, context))
     }
 
-    fn webmcp_handle_pause(&mut self, value: &Value, session: &str) {
+    fn webmcp_handle_instrumentation(&mut self, value: &Value, session: &str) -> bool {
+        if value.pointer("/params/reason").and_then(Value::as_str) != Some("instrumentation") { return false; }
         let started = Instant::now();
-        self.webmcp.paused.insert(session.to_string());
         let until = started + DOCUMENT_CHECK;
-        let admitted = self.webmcp_verify_pause(session, value, until).and_then(|(_, epoch, id, context)| {
+        let generation = self.frame_epoch;
+        let owned = self.webmcp_alive(session) && self.webmcp.arms.get(session).is_some_and(|arm| !arm.plain && arm.identifier.is_some() && arm.conversion.is_none())
+            && self.worlds.reason(session, "Debugger.enable", &json!({})).is_none();
+        let converted = if owned {
+            let arm = self.webmcp.arms.get_mut(session).unwrap();
+            arm.conversion = Some((generation, started, until));
+            arm.pending_install = Some(until);
+            self.raw_call("Debugger.pause", json!({}), Some(session), until.saturating_duration_since(Instant::now())).and_then(|_| {
+                if generation != self.frame_epoch || !self.webmcp_alive(session) || self.worlds.reason(session, "Debugger.enable", &json!({})).is_some() || Instant::now() >= until { return Err(self.refusal()); }
+                self.raw_call("Debugger.resume", json!({}), Some(session), until.saturating_duration_since(Instant::now()))
+            })
+        } else { Err(self.refusal()) };
+        if converted.is_err() {
+            self.webmcp_revoke_because(session, "instrumentation conversion refused");
+            let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
+            self.webmcp.paused.remove(session);
+        }
+        true
+    }
+
+    fn webmcp_handle_pause(&mut self, value: &Value, session: &str) {
+        self.webmcp.paused.insert(session.to_string());
+        if self.webmcp_handle_instrumentation(value, session) { return; }
+        let conversion = self.webmcp.arms.get_mut(session).and_then(|arm| arm.conversion.take());
+        let started = conversion.map_or_else(Instant::now, |(_, started, _)| started);
+        let until = conversion.map_or(started + DOCUMENT_CHECK, |(_, _, until)| until);
+        let verified = if Instant::now() >= until || conversion.is_some_and(|(generation, _, _)| generation != self.frame_epoch) { Err(self.refusal()) }
+            else { self.webmcp_verify_pause(session, value, until) };
+        let admitted = verified.and_then(|(_, epoch, id, context)| {
             self.webmcp_evaluate(session, id, &context, epoch, until)?;
             Ok((id, context))
         });

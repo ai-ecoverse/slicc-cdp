@@ -21,10 +21,11 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Target.detachFromTarget", "Target.getTargetInfo", "Target.getTargets",
     ]);
     let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable", "Runtime.runIfWaitingForDebugger"]);
+    let debugger_control = set(&["Debugger.pause"]);
     let debugger_persistent = set(&["Debugger.enable", "Debugger.setInstrumentationBreakpoint"]);
     let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);
     let network_state = set(&["Network.emulateNetworkConditions"]);
-    let inventory = [&document, &observation, &request, &origin, &target, &internal, &debugger_persistent, &window, &network_state];
+    let inventory = [&document, &observation, &request, &origin, &target, &internal, &debugger_control, &debugger_persistent, &window, &network_state];
     let mut methods: BTreeSet<String> = sent().into_iter()
         .filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs"))
         .map(|(method, _, _)| method)
@@ -34,6 +35,12 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     }
     for method in &methods {
         assert_eq!(inventory.iter().filter(|class| class.contains(method)).count(), 1, "unclassified or ambiguous method: {method}");
+        if debugger_control.contains(method) {
+            let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();
+            assert!(source.contains("fn webmcp_handle_instrumentation"));
+            assert!(source.contains("arm.identifier.is_some() && arm.conversion.is_none()"));
+            assert!(!source.contains("call_for(\"Debugger.pause\""));
+        }
         if method == "Runtime.compileScript" {
             let source = fs::read_to_string(root().join("crates/playwright-cli/src/browser.rs")).unwrap();
             let compile = source.split("let mut compile =").nth(1).unwrap().split("let parsed =").next().unwrap();
