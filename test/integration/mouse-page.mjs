@@ -1,6 +1,6 @@
 import { createContext, runInContext } from 'node:vm';
 
-export function mousePage() {
+export function mousePage(vendor = 'Google Inc.') {
   const events = [];
   const listeners = new Map();
   const tasks = [];
@@ -45,6 +45,7 @@ export function mousePage() {
   };
   const context = createContext({
     document,
+    navigator: { vendor },
     window: {},
     Element,
     ShadowRoot,

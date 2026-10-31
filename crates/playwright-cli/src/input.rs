@@ -276,8 +276,8 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
         }
         "mousewheel" => {
             let (dx, dy) = numbers(invocation, ["dx", "dy"])?;
-            admit_point(cdp, session, pointer.x, pointer.y)?;
-            wheel(cdp, session, pointer, (dx, dy))?;
+            let untrusted = admit_point(cdp, session, pointer.x, pointer.y)?;
+            wheel(cdp, session, pointer, (dx, dy), untrusted)?;
             Ok(code(&format!("// Scroll mouse wheel\nawait page.mouse.wheel({}, {});", js(dx), js(dy))))
         }
         _ => {
@@ -326,8 +326,8 @@ fn trusted_wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, (dx, dy): (f64
     Ok(())
 }
 
-fn wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, delta: (f64, f64)) -> Result<(), String> {
-    if visible(cdp, session, std::time::Duration::ZERO)? {
+fn wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, delta: (f64, f64), untrusted: bool) -> Result<(), String> {
+    if !untrusted && visible(cdp, session, std::time::Duration::ZERO)? {
         return trusted_wheel(cdp, session, pointer, delta);
     }
     if synthetic_wheel(cdp, session, pointer, delta)? {
@@ -447,7 +447,7 @@ fn frame_owner(node: &Value) -> bool {
     FRAME_OWNERS.contains(&name.as_str())
 }
 
-fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<(), String> {
+fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<bool, String> {
     let refused = || format!("slicc: refused: mouse input at ({}, {}) would reach an embedded frame\n", js(x), js(y));
     let frame = main_frame(cdp, session)?;
     let metrics = cdp.call("Page.getLayoutMetrics", json!({}), Some(session))?;
@@ -467,6 +467,7 @@ fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<(), Strin
         let hit = match cdp.call("DOM.getNodeForLocation", json!({ "x": px, "y": py, "includeUserAgentShadowDOM": false, "ignorePointerEventsNone": false }), Some(session)) {
             Ok(hit) => hit,
             Err(message) if message.contains("No node found at given location") && !message.contains("slicc:") => continue,
+            Err(message) if message.ends_with("wasn't found\n") && landing::untrusted(cdp, session)? => return Ok(true),
             Err(message) => return Err(message),
         };
         let backend = hit.get("backendNodeId").and_then(Value::as_u64).ok_or_else(refused)?;
@@ -478,7 +479,7 @@ fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<(), Strin
             return Err(refused());
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn admit_focus(cdp: &mut Cdp, session: &str) -> Result<(), String> {

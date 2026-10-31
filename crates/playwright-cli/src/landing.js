@@ -27,7 +27,9 @@
     metaKey: !!(mask & 4),
     shiftKey: !!(mask & 8),
   });
+  const untrusted = () => navigator.vendor.startsWith('Apple');
   const arm = () => {
+    if (untrusted()) return 'untrusted';
     globalThis[key]?.stop();
     const seen = [];
     const record = (event) => {
@@ -124,12 +126,24 @@
     return owner(node) ? 'frame' : run(node);
   };
   const modes = {
-    visible: () => (args.focus && !document.hasFocus() ? 'hidden' : document.visibilityState),
+    visible: () => {
+      if (untrusted()) return 'untrusted';
+      return args.focus && !document.hasFocus() ? 'hidden' : document.visibilityState;
+    },
     arm,
     read,
     focus: near((node) => (editable(node) ? 'editable' : 'none')),
     insert: near((node) => (edit(node, 'insertText', args.text) ? 'inserted' : 'unchanged')),
-    key: near((node) => raw.keys(args, node ?? document.body, { edit, editable, held })),
+    key: near((node) =>
+      raw.keys(args, node ?? document.body, {
+        edit,
+        editable,
+        held,
+        owner,
+        focusable,
+        untrusted: untrusted(),
+      })
+    ),
     pointer: point,
     mouse: () => raw.mouse(args, { up, deepest, owner, held, focusable }),
   };

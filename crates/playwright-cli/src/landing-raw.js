@@ -74,7 +74,24 @@
     channel.port2.postMessage(0);
     return 'done';
   },
-  keys(args, target, { edit, editable, held }) {
+  unplain(args, target, send, button, reach) {
+    if (send('keydown')) {
+      if (args.key === 'Tab') this.tab(args, target, reach);
+      else if (args.key === 'Enter' && button) target.click();
+    }
+    if (args.phase === 'down') return;
+    send('keyup');
+    if (args.key === ' ' && button) target.click();
+  },
+  tab(args, target, { owner, focusable }) {
+    const stops = [...document.querySelectorAll(focusable)].filter(
+      (node) => !owner(node) && !node.disabled && node.tabIndex >= 0 && node.getClientRects().length
+    );
+    const step = args.modifiers & 8 ? -1 : 1;
+    const next = (stops.indexOf(target) + step + stops.length) % stops.length;
+    stops[next]?.focus();
+  },
+  keys(args, target, { edit, editable, held, owner, focusable, untrusted }) {
     const activatable = 'a[href],area[href],button,input,select,summary,[role=button]';
     const erasers = { Backspace: 'delete', Delete: 'forwardDelete' };
     const enter = args.key === 'Enter';
@@ -105,14 +122,20 @@
       else if (go && !/^(Escape|Alt|Control|Meta|Shift)$/.test(args.key) && send('keypress'))
         fallback();
     };
+    const space = args.key === ' ' && button;
     if (args.phase === 'up') {
-      if (args.key === ' ' && button) return 'unsupported';
+      if (space && !untrusted) return 'unsupported';
       send('keyup');
+      if (space) target.click();
       return 'pressed';
     }
     const plain =
       typed || enter || /^(Backspace|Delete|Escape|Alt|Control|Meta|Shift)$/.test(args.key);
-    if (((enter || args.key === ' ') && button) || !plain) return 'unsupported';
+    if ((enter && button) || space || !plain) {
+      if (!untrusted) return 'unsupported';
+      this.unplain(args, target, send, button, { owner, focusable });
+      return 'pressed';
+    }
     down();
     if (args.phase !== 'down') send('keyup');
     return 'pressed';

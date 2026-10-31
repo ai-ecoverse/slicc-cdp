@@ -177,6 +177,10 @@ pub fn dropped(verb: &str) -> String {
     format!("Error: {verb} did not reach the page: Chrome dropped the input even with the tab in front.\n")
 }
 
+pub fn undelivered(verb: &str) -> String {
+    format!("Error: {verb} did not reach the page: this browser can't make trusted input, and the page didn't take the events slicc dispatched itself.\n")
+}
+
 fn context(cdp: &mut Cdp, scope: &Scope) -> Result<Value, String> {
     let frame = match scope.frame {
         Some(frame) => frame.to_string(),
@@ -235,8 +239,10 @@ fn landed(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted
 }
 
 fn seen(cdp: &mut Cdp, scope: &Scope, context: &Value, types: &[&str], trusted: Trusted) -> Result<Option<Vec<String>>, String> {
-    if mode(cdp, scope, context, "arm", json!({ "types": types }))? != "armed" {
-        return Err("Error: the input check could not start in the page.\n".to_string());
+    match mode(cdp, scope, context, "arm", json!({ "types": types }))?.as_str() {
+        "armed" => {}
+        "untrusted" => return Ok(Some(Vec::new())),
+        _ => return Err("Error: the input check could not start in the page.\n".to_string()),
     }
     let failure = trusted(cdp).err();
     if let Some(message) = &failure {
@@ -273,8 +279,10 @@ fn visible(cdp: &mut Cdp, scope: &Scope, context: &Value, waited: Duration) -> b
 }
 
 fn forward(cdp: &mut Cdp, scope: &Scope, context: &Value, verb: &str, types: Option<&[&str]>, trusted: Trusted) -> Result<(), String> {
-    if visible(cdp, scope, context, Duration::ZERO) {
-        return if types.is_none() { trusted(cdp) } else { Err(dropped(verb)) };
+    match mode(cdp, scope, context, "visible", json!({ "focus": false })).as_deref() {
+        Ok("untrusted") => return Err(undelivered(verb)),
+        Ok("visible") => return if types.is_none() { trusted(cdp) } else { Err(dropped(verb)) },
+        _ => {}
     }
     let front = cdp.bring_forward(scope.input).map_err(|_| background(verb))?;
     let result = if !visible(cdp, scope, context, FOREGROUND_WAIT) {
@@ -296,6 +304,12 @@ fn types(steps: &[(&'static str, i64)]) -> Vec<&'static str> {
         }
     }
     types
+}
+
+pub fn untrusted(cdp: &mut Cdp, session: &str) -> Result<bool, String> {
+    let scope = Scope::page(session);
+    let context = context(cdp, &scope)?;
+    Ok(mode(cdp, &scope, &context, "visible", json!({ "focus": false }))? == "untrusted")
 }
 
 pub fn pointer(cdp: &mut Cdp, scope: &Scope, anchor: &Anchor, point: (f64, f64), gesture: Gesture, trusted: Trusted) -> Result<(), String> {
