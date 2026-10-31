@@ -133,6 +133,11 @@ fn enter_document(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, tree: Value,
         backend.api = false;
         backend.current_frame = frame.to_string();
     }
+    let changed = {
+        let backend = state.borrow();
+        Cdp::webmcp_frame(&backend.tree["frameTree"], frame).cloned()
+    };
+    if let Some(changed) = changed { cdp.absorb(event("Page.frameNavigated", json!({"frame":changed}))); }
     cdp.absorb(context(frame, "https://ordinary.test"));
     cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":"SCRIPT","executionContextId":7})));
     cdp.absorb(paused());
@@ -321,6 +326,8 @@ fn changed_loader_and_context_destroyed_before_pause_are_denied() {
         state.borrow_mut().tree["frameTree"]["frame"]["loaderId"] = json!("NEXT");
         if destroyed { cdp.absorb(event("Runtime.executionContextDestroyed", json!({"executionContextId":7}))); }
         cdp.absorb(paused());
+        assert!(!state.borrow().api, "stale root context must not get another install");
+        cdp.stop_webmcp("H");
         no_protected_api(&mut cdp, &state);
     }
 }

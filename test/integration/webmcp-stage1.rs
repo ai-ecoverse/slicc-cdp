@@ -22,6 +22,7 @@ struct State {
     late_world: bool,
     raw_instrumentation: bool,
     conversion_pending: bool,
+    child_churn: bool,
 }
 
 struct Backend(Rc<RefCell<State>>);
@@ -127,6 +128,9 @@ impl Transport for Backend {
             }
             "Page.reload" => {
                 state.tree = Some(tree("R"));
+                if state.child_churn {
+                    state.tree.as_mut().unwrap()["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://child.test/","securityOrigin":"https://child.test"}}]);
+                }
                 for owner in state.sessions.keys().cloned().collect::<Vec<_>>() {
                     state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":tree("R")["frameTree"]["frame"]}}).to_string());
                     state.incoming.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":owner,"params":{}}).to_string());
@@ -151,6 +155,14 @@ impl Transport for Backend {
                     .and_then(Value::as_str)
                     .unwrap_or("L");
                 assert_eq!(call["params"]["uniqueContextId"], format!("main-{loader}"));
+                if state.child_churn {
+                    let child = json!({"id":"C","parentId":"F","loaderId":"CHURNED","url":"https://child.test/","securityOrigin":"https://child.test"});
+                    state.tree.as_mut().unwrap()["frameTree"]["childFrames"][0]["frame"] =
+                        child.clone();
+                    for owner in state.sessions.keys().cloned().collect::<Vec<_>>() {
+                        state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":child}}).to_string());
+                    }
+                }
                 json!({"result":{"type":"undefined"}})
             }
             _ => json!({}),
@@ -225,17 +237,14 @@ fn installer_uses_only_instrumentation_and_main_world_evaluation() {
                     .is_some_and(|source| source.starts_with(&format!("const {bridge} = ")))
         })
         .unwrap();
-    let remove = state
-        .calls
-        .iter()
-        .position(|call| call["method"] == "Debugger.removeBreakpoint")
-        .unwrap();
+    assert_eq!(count(&state, "Debugger.removeBreakpoint"), 0);
+    assert_eq!(count(&state, "Debugger.setInstrumentationBreakpoint"), 1);
     let resume = state
         .calls
         .iter()
         .position(|call| call["method"] == "Debugger.resume")
         .unwrap();
-    assert!(install < remove && remove < resume);
+    assert!(install < resume);
 }
 
 #[test]
@@ -274,6 +283,44 @@ fn direct_chrome_instrumentation_is_converted_by_the_owned_installer_not_the_cli
     assert_eq!(count(&state, "Page.addScriptToEvaluateOnNewDocument"), 0);
     assert_eq!(count(&state, "Debugger.getScriptSource"), 0);
     assert_eq!(count(&state, "Debugger.evaluateOnCallFrame"), 0);
+}
+
+#[test]
+fn root_install_survives_child_churn_and_unknown_scripts_while_instrumentation_stays_armed() {
+    let (mut cdp, state, session) = fixture();
+    {
+        let mut backend = state.borrow_mut();
+        backend.raw_instrumentation = true;
+        backend.child_churn = true;
+    }
+    cdp.start_webmcp_for(&session, true).unwrap();
+    assert!(cdp.webmcp_alive(&session));
+    assert_eq!(count(&state.borrow(), "Runtime.evaluate"), 1);
+    assert_eq!(
+        count(&state.borrow(), "Debugger.setInstrumentationBreakpoint"),
+        1
+    );
+    assert_eq!(count(&state.borrow(), "Debugger.removeBreakpoint"), 0);
+    let pauses = count(&state.borrow(), "Debugger.pause");
+    for reason in ["instrumentation", "other"] {
+        state.borrow_mut().incoming.push_back(json!({"method":"Debugger.paused","sessionId":session,"params":{"reason":reason,"data":{"scriptId":"OTHER-PROCESS-EVALUATE"},"callFrames":[{"callFrameId":"UNKNOWN","location":{"scriptId":"OTHER-PROCESS-EVALUATE","lineNumber":0,"columnNumber":0}}]}}).to_string());
+        assert!(cdp.pump(Instant::now() + Duration::from_secs(1)).unwrap());
+        assert!(cdp.webmcp_alive(&session));
+        assert_eq!(count(&state.borrow(), "Runtime.evaluate"), 1);
+        assert_eq!(count(&state.borrow(), "Debugger.pause"), pauses);
+        assert_eq!(
+            count(&state.borrow(), "Debugger.setInstrumentationBreakpoint"),
+            1
+        );
+        assert_eq!(count(&state.borrow(), "Debugger.removeBreakpoint"), 0);
+        assert!(!cdp
+            .events()
+            .iter()
+            .any(|event| event["method"] == "Debugger.paused"));
+    }
+    cdp.stop_webmcp(&session);
+    assert_eq!(count(&state.borrow(), "Debugger.removeBreakpoint"), 1);
+    assert_eq!(count(&state.borrow(), "Debugger.disable"), 1);
 }
 
 #[test]
