@@ -18,6 +18,7 @@ pub(crate) struct Worlds {
     scripts: BTreeMap<Key, bool>,
     calls: BTreeMap<Key, bool>,
     hidden_sessions: BTreeSet<String>,
+    protected_sessions: BTreeSet<String>,
     enabled: BTreeSet<String>,
 }
 
@@ -30,6 +31,10 @@ impl Worlds {
     }
     pub fn disable(&mut self, session: &str) {
         self.enabled.remove(session);
+    }
+
+    pub fn fallback_safe(&self, session: &str) -> bool {
+        !self.protected_sessions.contains(session)
     }
 
     pub fn sensitive(method: &str) -> bool {
@@ -137,6 +142,9 @@ impl Worlds {
                 .and_then(Value::as_bool)
                 == Some(false)
                 && (extension || guard.url(origin));
+            if !extension && guard.url(origin) {
+                self.protected_sessions.insert(session.to_string());
+            }
             if hidden {
                 self.hidden_sessions.insert(session.to_string());
             }
@@ -219,6 +227,7 @@ impl Worlds {
             if let Some(child) = params.get("sessionId").and_then(Value::as_str) {
                 self.clear(child);
                 self.hidden_sessions.remove(child);
+                self.protected_sessions.remove(child);
                 self.enabled.remove(child);
             }
         }

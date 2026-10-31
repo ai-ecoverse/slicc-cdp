@@ -88,7 +88,13 @@ export async function webmcpBackend({
                   (provider) =>
                     provider.origin === page.origin || fromOrigins.includes(provider.origin)
                 )
-                .flatMap((provider) => provider.nativeTools),
+                .flatMap((provider) => provider.nativeTools)
+                .filter(
+                  (tool) =>
+                    tool.origin === page.origin ||
+                    !tool.exposedTo ||
+                    tool.exposedTo.includes(page.origin)
+                ),
             executeTool: async (tool, input) =>
               tool.execute(input, { signal: new AbortController().signal }),
           },
@@ -189,7 +195,7 @@ export async function webmcpBackend({
             callFrames: [
               {
                 callFrameId: scriptId,
-                functionName: '__slicc_webmcp_gate',
+                functionName: '',
                 location: { scriptId, lineNumber: 0, columnNumber: 0 },
               },
             ],
@@ -201,7 +207,9 @@ export async function webmcpBackend({
       const begin = (peer) => {
         queues.set(
           peer,
-          localPages(peer).map((page) => page.id)
+          localPages(peer)
+            .filter((page) => page.id === (sessions.get(peer) || 'TAB'))
+            .map((page) => page.id)
         );
         pause(peer);
       };
@@ -310,7 +318,20 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'DOM.getDocument') {
-        answer({ root: { nodeId: 100 } });
+        answer({
+          root: {
+            nodeId: 100,
+            nodeType: 9,
+            childNodeCount: children.length,
+            children: children.map((child, index) => ({
+              nodeId: index + 1,
+              nodeType: 1,
+              nodeName: 'IFRAME',
+              frameId: child.id,
+              childNodeCount: 0,
+            })),
+          },
+        });
         return true;
       }
       if (method === 'DOM.querySelectorAll') {
@@ -339,6 +360,16 @@ export async function webmcpBackend({
             value: { index, allow: child.allow || '', srcOrigin: child.origin },
           },
         });
+        return true;
+      }
+      if (method === 'Debugger.setInstrumentationBreakpoint') {
+        scripts.set(sessionId, `instrument-${sessionId}`);
+        answer({ breakpointId: `instrument-${sessionId}` });
+        return true;
+      }
+      if (method === 'Debugger.removeBreakpoint' || method === 'Debugger.disable') {
+        scripts.delete(sessionId);
+        answer({});
         return true;
       }
       if (method === 'Page.addScriptToEvaluateOnNewDocument') {
@@ -393,6 +424,11 @@ export async function webmcpBackend({
             for (const definition of page.definitions || [])
               page.document.modelContext?.registerTool?.(definition);
           }
+        }
+        if (page?.document.modelContext && !page.loader.startsWith('L-') && !page.loaded) {
+          page.loaded = true;
+          for (const definition of page.definitions || [])
+            page.document.modelContext?.registerTool?.(definition);
         }
         const installed = pendingInstallers.get(sessionId);
         pendingInstallers.delete(sessionId);

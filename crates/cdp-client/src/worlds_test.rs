@@ -257,7 +257,7 @@ fn extension_context_selectors_and_objects_never_reach_the_backend() {
         let count = sent.borrow().len();
         assert_eq!(
             cdp.call(method, params, Some("S")).unwrap_err(),
-            REFUSAL,
+            if method.starts_with("Debugger.") { "slicc: refused: persistent page capabilities are not supported by slicc-cdp\n" } else { REFUSAL },
             "{method}"
         );
         assert_eq!(sent.borrow().len(), count, "{method} reached backend");

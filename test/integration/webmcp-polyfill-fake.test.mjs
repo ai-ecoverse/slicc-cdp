@@ -68,12 +68,13 @@ async function run(args, cwd, endpoint) {
   return process.ended;
 }
 
-async function fixture(policy, check, children = [], onCommand = () => {}) {
+async function fixture(policy, check, children = [], onCommand = () => {}, native = false) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-fake-'));
   const backend = await webmcpBackend({
     policy,
     children,
     onCommand,
+    native,
     definitions: [
       {
         name: 'greet',
@@ -107,16 +108,24 @@ async function fixture(policy, check, children = [], onCommand = () => {}) {
         .join(', ')}`;
       throw error;
     }
-    assert.equal(status.mode, 'polyfill');
+    assert.equal(status.mode, native ? 'native' : 'polyfill');
     assert.equal(status.reloaded, true);
     assert.equal(JSON.stringify(status).includes('__wmcp_'), false);
     await check(backend, cwd, status);
     holder.child.stdin.end();
     assert.equal((await holder.ended).code, 0);
-    assert.ok(
-      backend.calls.some((call) => call.method === 'Page.removeScriptToEvaluateOnNewDocument')
-    );
-    assert.ok(backend.calls.every((call) => call.method !== 'Runtime.addBinding'));
+    assert.ok(backend.calls.some((call) => call.method === 'Debugger.removeBreakpoint'));
+    for (const method of [
+      'Page.addScriptToEvaluateOnNewDocument',
+      'Runtime.addBinding',
+      'Debugger.pause',
+      'Debugger.getScriptSource',
+      'Debugger.evaluateOnCallFrame',
+    ])
+      assert.ok(
+        backend.calls.every((call) => call.method !== method),
+        method
+      );
     assert.equal(backend.scripts.size, 0);
   } finally {
     holder?.child.kill('SIGKILL');
@@ -127,7 +136,7 @@ async function fixture(policy, check, children = [], onCommand = () => {}) {
 
 await test('fake: holder reload, private bridge listing/calling, consequential gate and output cap', async () => {
   await fixture('', async (backend, cwd, status) => {
-    assert.ok(status.pauseMicros.length >= 2);
+    assert.ok(status.pauseMicros.length >= 1);
     const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
     assert.equal(listed.code, 0, listed.stderr);
     const tools = JSON.parse(listed.stdout);
@@ -200,7 +209,7 @@ await test('fake: document readiness follows generation metadata persistence', a
   }
 });
 
-await test('fake: document readiness waits for a child frame admitted after the top load event', async () => {
+await test('fake: document readiness reports only the guarded main-document installation', async () => {
   const backend = await webmcpBackend({
     definitions: [{ name: 'top', execute: () => 'top' }],
     children: [
@@ -239,16 +248,13 @@ await test('fake: document readiness waits for a child frame admitted after the 
     assert.equal(reload.code, 0, reload.stderr);
     const ready = await complete;
     assert.equal(ready.value.tab, 'TAB');
-    assert.equal(ready.childLoaded, true, 'document-ready preceded the child frame admission');
-    assert.match(holder.stderr(), /webmcp-polyfill: child refused at target/);
+    assert.equal(ready.childLoaded, false);
+    assert.equal(backend.pages.get('CHILD').document.modelContext, undefined);
     const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
     assert.equal(listed.code, 0, listed.stderr);
     assert.deepEqual(
       JSON.parse(listed.stdout).map((tool) => [tool.name, tool.frameId]),
-      [
-        ['late_child', 'CHILD'],
-        ['top', 'TAB'],
-      ]
+      [['top', 'TAB']]
     );
     holder.child.stdin.end();
     assert.equal((await holder.ended).code, 0);
@@ -378,7 +384,9 @@ await test('fake: same-origin aggregation and explicit foreign exposure/delegati
           },
         ],
       },
-    ]
+    ],
+    undefined,
+    true
   );
 });
 
@@ -422,7 +430,9 @@ await test('fake: parent policy, child policy and absent iframe delegation each 
             },
           ],
         },
-      ]
+      ],
+      undefined,
+      true
     );
   }
 });

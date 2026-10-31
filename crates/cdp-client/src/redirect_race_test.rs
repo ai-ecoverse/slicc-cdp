@@ -11,14 +11,14 @@ fn response_body_is_rechecked_after_late_redirect_metadata() {
 }
 
 #[test]
-fn ordinary_source_reads_remain_readable() {
+fn ordinary_css_and_resource_reads_remain_readable_but_debugger_source_is_refused() {
     let mut cdp = redirect_body_backend("ordinary source".into());
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":"https://example.test","auxData":{"isDefault":true}}}}));
     cdp.absorb(json!({"method":"Debugger.scriptParsed","sessionId":"S","params":{"scriptId":"JS","url":"https://example.test/source","executionContextId":1}}));
     cdp.absorb(json!({"method":"CSS.styleSheetAdded","sessionId":"S","params":{"header":{"styleSheetId":"CSS","sourceURL":"https://example.test/source"}}}));
+    assert!(cdp.call("Debugger.getScriptSource", json!({"scriptId":"JS"}), Some("S")).is_err());
     for (method, params) in [
         ("CSS.getStyleSheetText", json!({"styleSheetId":"CSS"})),
-        ("Debugger.getScriptSource", json!({"scriptId":"JS"})),
         ("Page.getResourceContent", json!({"frameId":"F","url":"https://example.test/source"})),
     ] {
         let result = cdp.call(method, params, Some("S")).unwrap();

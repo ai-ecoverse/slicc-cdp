@@ -80,6 +80,10 @@ impl Watch {
         Watch { tab: tab.into(), session: session.into(), frame: frame.into(), armed: None, generations: BTreeMap::new(), next: Instant::now(), sequence: 0, changes: serde_json::Map::new() }
     }
 
+    pub(crate) fn empty(&self) -> bool {
+        self.generations.values().all(|generation| generation.emitted.as_ref().and_then(Value::as_array).is_none_or(Vec::is_empty))
+    }
+
     pub(crate) fn changes(&self) -> Value {
         Value::Object(self.changes.clone())
     }
