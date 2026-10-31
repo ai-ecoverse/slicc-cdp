@@ -64,9 +64,12 @@ test('a failed check reads the same whether or not a protected tab is open', asy
       if (extra) fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
       const listed = await run(['tab-list']);
       assert.ok(!listed.stdout.includes('seven.sliccy.ai'));
-      text = (await run(['eval', '1', '--tab', 'TAB'])).stderr;
+      const result = await run(['eval', '1', '--tab', 'TAB']);
+      assert.equal(result.code, 1);
+      text = result.stderr;
     });
     return text;
   };
-  assert.equal(await read(true), await read(false));
+  assert.equal(await read(true), UNVERIFIED);
+  assert.equal(await read(false), UNVERIFIED);
 });
