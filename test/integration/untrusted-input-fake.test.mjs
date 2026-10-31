@@ -143,3 +143,63 @@ test('the page itself says it cannot be trusted, and takes one press and release
     await fake.close();
   }
 });
+
+async function withKeys(body) {
+  const view = mousePage('Apple Computer, Inc.');
+  const landing = (message, send) => {
+    if (!message.params?.expression?.includes("Symbol.for('slicc-landing')")) {
+      return unknownLocation(message, send);
+    }
+    const value = view.evaluate(message.params.expression);
+    send({ id: message.id, sessionId: message.sessionId, result: { result: { value } } });
+    return true;
+  };
+  const fake = await fakeCdp({ intercept: landing });
+  const pw = await runners.native(fake.url);
+  try {
+    const cwd = await pw.fresh();
+    assert.equal((await pw.playwright(['open', 'http://example.test/page'], cwd)).code, 0);
+    const press = async (key) => {
+      const result = await pw.playwright(['press', key], cwd);
+      assert.equal(result.code, 0, `${key}: ${result.stderr}`);
+    };
+    await body(view, press);
+    assert.deepEqual(input(fake), []);
+  } finally {
+    await pw.close();
+    await fake.close();
+  }
+}
+
+const count = (view, type) => view.events.filter((event) => event.type === type).length;
+
+test('the page walks Tab itself, from nothing focused and back again', async () => {
+  await withKeys(async (view, press) => {
+    await press('Tab');
+    assert.equal(view.document.activeElement, view.src);
+    await press('Tab');
+    assert.equal(view.document.activeElement, view.dst);
+    view.document.activeElement = view.pad;
+    await press('Shift+Tab');
+    assert.equal(view.document.activeElement, view.dst);
+    assert.deepEqual([count(view, 'keydown'), count(view, 'keyup')], [3, 3]);
+  });
+});
+
+test('Enter and Space activate a focused button once, unless the page cancels them', async () => {
+  await withKeys(async (view, press) => {
+    view.src.activates = true;
+    view.document.activeElement = view.src;
+    await press('Enter');
+    assert.equal(view.activated.length, 1);
+    await press('Space');
+    assert.equal(view.activated.length, 2);
+    view.cancelled.add('keydown');
+    await press('Enter');
+    await press('Space');
+    view.cancelled.clear();
+    view.cancelled.add('keyup');
+    await press('Space');
+    assert.equal(view.activated.length, 2);
+  });
+});

@@ -75,21 +75,23 @@
     return 'done';
   },
   unplain(args, target, send, button, reach) {
-    if (send('keydown')) {
+    const down = send('keydown');
+    if (down) {
       if (args.key === 'Tab') this.tab(args, target, reach);
       else if (args.key === 'Enter' && button) target.click();
     }
     if (args.phase === 'down') return;
-    send('keyup');
-    if (args.key === ' ' && button) target.click();
+    const up = send('keyup');
+    if (down && up && args.key === ' ' && button) target.click();
   },
   tab(args, target, { owner, focusable }) {
     const stops = [...document.querySelectorAll(focusable)].filter(
       (node) => !owner(node) && !node.disabled && node.tabIndex >= 0 && node.getClientRects().length
     );
-    const step = args.modifiers & 8 ? -1 : 1;
-    const next = (stops.indexOf(target) + step + stops.length) % stops.length;
-    stops[next]?.focus();
+    const back = args.modifiers & 8;
+    const at = stops.indexOf(target);
+    const from = at < 0 && back ? 0 : at;
+    stops[(from + (back ? -1 : 1) + stops.length) % stops.length]?.focus();
   },
   keys(args, target, { edit, editable, held, owner, focusable, untrusted }) {
     const activatable = 'a[href],area[href],button,input,select,summary,[role=button]';
@@ -125,8 +127,7 @@
     const space = args.key === ' ' && button;
     if (args.phase === 'up') {
       if (space && !untrusted) return 'unsupported';
-      send('keyup');
-      if (space) target.click();
+      if (send('keyup') && space) target.click();
       return 'pressed';
     }
     const plain =

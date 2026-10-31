@@ -4,6 +4,8 @@ export function mousePage(vendor = 'Google Inc.') {
   const events = [];
   const listeners = new Map();
   const tasks = [];
+  const cancelled = new Set();
+  const activated = [];
   class Event {
     constructor(type, init) {
       Object.assign(this, { isTrusted: false }, init, { type });
@@ -11,18 +13,27 @@ export function mousePage(vendor = 'Google Inc.') {
   }
   class Element {
     constructor(id, parentNode = null) {
-      Object.assign(this, { id, parentNode, isConnected: true });
+      Object.assign(this, { id, parentNode, isConnected: true, tabIndex: 0 });
     }
     dispatchEvent(event) {
       event.target = this;
       events.push(event);
       for (const listener of listeners.get(event.type) ?? []) listener(event);
-      return true;
+      return !cancelled.has(event.type);
     }
     closest() {
-      return null;
+      return this.activates ? this : null;
     }
     blur() {}
+    focus() {
+      document.activeElement = this;
+    }
+    click() {
+      activated.push(this);
+    }
+    getClientRects() {
+      return [{}];
+    }
   }
   class ShadowRoot {}
   class Owner extends Element {}
@@ -42,6 +53,7 @@ export function mousePage(vendor = 'Google Inc.') {
     documentElement: pad,
     visibilityState: 'hidden',
     elementFromPoint: (x) => (x < 200 ? src : dst),
+    querySelectorAll: () => [src, dst],
   };
   const context = createContext({
     document,
@@ -57,6 +69,7 @@ export function mousePage(vendor = 'Google Inc.') {
     HTMLTextAreaElement: Field,
     MouseEvent: Event,
     PointerEvent: Event,
+    KeyboardEvent: Event,
     MessageChannel: Channel,
     addEventListener: (type, listener) => {
       if (!listeners.has(type)) listeners.set(type, new Set());
@@ -72,5 +85,5 @@ export function mousePage(vendor = 'Google Inc.') {
   const send = (type, params, target = document.elementFromPoint(params.x, params.y)) => {
     target.dispatchEvent(new Event(type, { ...params, isTrusted: true }));
   };
-  return { events, evaluate, send, pad, src, dst };
+  return { events, evaluate, send, pad, src, dst, document, cancelled, activated };
 }
