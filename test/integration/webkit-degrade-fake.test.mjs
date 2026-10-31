@@ -32,7 +32,7 @@ for (const [transport, runner] of Object.entries(runners)) {
     await withBrowser(runner, { product: WEBKIT }, async (run) => {
       const added = await run(['route', '**/data.json', '--status=500']);
       assert.equal(added.code, 1);
-      assert.match(added.stderr, /this browser can't pause requests/);
+      assert.match(added.stderr, /this browser pauses document navigations only/);
       assert.match((await run(['route-list'])).stdout, /No active routes/);
       assert.equal((await run(['eval', '1'])).code, 0);
     });

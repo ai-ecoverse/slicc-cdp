@@ -125,7 +125,7 @@ pub fn decide(routes: &[Route], paused: &Paused) -> Decision {
         .unwrap_or_default()
 }
 
-const UNROUTABLE: &str = "playwright-cli route: this browser can't pause requests, so a route would never run\n";
+const UNROUTABLE: &str = "playwright-cli route: this browser pauses document navigations only, so a route would never run\n";
 
 pub fn is_route_command(command: &str) -> bool {
     matches!(command, "route" | "route-list" | "unroute")
