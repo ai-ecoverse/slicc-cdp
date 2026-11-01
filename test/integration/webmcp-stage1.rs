@@ -32,6 +32,7 @@ struct State {
     pause_during_install: bool,
     disable_after_reload_refused: bool,
     fresh_replay_missing: bool,
+    status_original_refused: bool,
 }
 
 struct Backend(Rc<RefCell<State>>);
@@ -54,6 +55,7 @@ impl Transport for Backend {
         let refusal = match method {
             "Debugger.enable" => state.refusal,
             "Runtime.disable" if state.disable_after_reload_refused && state.sessions.keys().next().is_some_and(|holder| holder == &session) && state.tree.as_ref().is_some_and(|tree| tree["frameTree"]["frame"]["loaderId"] == "R") => Some("slicc: refused: Runtime.disable is unavailable"),
+            "Runtime.evaluate" if state.status_original_refused && call["params"]["expression"] == "typeof document.modelContext" && state.sessions.keys().next().is_some_and(|holder| holder == &session) => Some("slicc: refused: that execution context belongs to a browser extension"),
             "DOM.getDocument" if state.dom_refusal => Some("slicc: refused: protected frame"),
             "Page.getFrameTree" if state.tree_refusal => Some("slicc: refused: protected frame"),
             _ => None,
@@ -574,12 +576,34 @@ fn plain_reload_replays_the_committed_root_before_loading_children() {
     let fresh = after.iter().find(|call| call["method"] == "Runtime.enable").unwrap()["sessionId"].as_str().unwrap();
     assert_ne!(fresh, session);
     assert!(after.iter().any(|call| call["method"] == "Target.attachToTarget" && call["params"]["flatten"] == true));
-    assert!(after.iter().any(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == fresh));
+    assert!(!after.iter().any(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == fresh));
     assert!(after.iter().any(|call| call["method"] == "Runtime.evaluate" && call["sessionId"] == fresh));
     assert_eq!(count(&wire, "Runtime.evaluate"), 1);
     assert_eq!(count(&wire, "Page.reload"), 1);
     assert!(wire.pending_reads >= 2);
     assert!(after.iter().all(|call| !call["method"].as_str().unwrap().starts_with("Debugger.")));
+}
+
+#[test]
+fn plain_fallback_retains_the_installed_session_for_status_and_owner_cleanup() {
+    let (mut cdp, state, original) = fixture();
+    {
+        let mut wire = state.borrow_mut();
+        wire.refusal = Some("slicc: refused: a browser extension runs scripts in this page, and profiling it would expose them");
+        wire.replay_only = true;
+        wire.status_original_refused = true;
+    }
+    let bridge = cdp.start_webmcp_for(&original, true).unwrap();
+    let fresh = state.borrow().calls.iter().find(|call| call["method"] == "Runtime.evaluate").unwrap()["sessionId"].as_str().unwrap().to_string();
+    assert_ne!(fresh, original);
+    assert_eq!(cdp.webmcp_snapshot()[0]["session"], fresh);
+    assert!(!state.borrow().calls.iter().any(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == fresh));
+    cdp.call("Runtime.evaluate", json!({"expression":"typeof document.modelContext","uniqueContextId":"main-R","returnByValue":true}), Some(&fresh)).unwrap();
+    assert_eq!(cdp.start_webmcp_for(&original, true).unwrap(), bridge);
+    assert_eq!(count(&state.borrow(), "Page.reload"), 1);
+    cdp.stop_webmcp(&original);
+    assert!(cdp.webmcp_snapshot().is_empty());
+    assert_eq!(state.borrow().calls.iter().filter(|call| call["method"] == "Target.detachFromTarget" && call["params"]["sessionId"] == fresh).count(), 1);
 }
 
 #[test]

@@ -60,6 +60,8 @@ fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: 
 
 fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool, make_input: impl FnOnce() -> Result<Input, String>) -> Result<(), String> {
     let owner = cdp.start_webmcp_for(session, reload)?;
+    let holder = cdp.webmcp_session(session).to_string();
+    let session = holder.as_str();
     cdp.webmcp_auto_attach(session)?;
     save(cdp, state, target, &owner, json!({}))?;
     let mut input = make_input()?;

@@ -68,6 +68,72 @@ async function run(args, cwd, endpoint) {
   return process.ended;
 }
 
+test('675 fallback holder keeps the installed session for status, changes and cleanup', async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'thr_uzh6iuph2q-fresh-holder-'));
+  let original;
+  let installed;
+  const backend = await webmcpBackend({
+    onCommand(command, _pages, send, sessions) {
+      if (command.method === 'Debugger.enable') {
+        original = command.sessionId;
+        send({
+          id: command.id,
+          error: {
+            message:
+              'slicc: refused: a browser extension runs scripts in this page, and profiling it would expose them',
+          },
+        });
+        return true;
+      }
+      if (
+        command.method === 'Runtime.evaluate' &&
+        command.params.expression.startsWith('const __wmcp_')
+      ) {
+        installed = command.sessionId;
+        setImmediate(() => {
+          for (const sessionId of sessions.keys())
+            send({ method: 'Page.loadEventFired', sessionId, params: { timestamp: 1 } });
+        });
+      }
+      if (installed && command.method === 'Runtime.evaluate' && command.sessionId === original) {
+        send({
+          id: command.id,
+          error: {
+            message: 'slicc: refused: that execution context belongs to a browser extension',
+          },
+        });
+        return true;
+      }
+    },
+  });
+  const holder = launch(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, backend.url);
+  try {
+    assert.equal((await holder.ready).mode, 'polyfill');
+    assert.ok(installed);
+    assert.notEqual(installed, original);
+    assert.equal(
+      backend.calls.some(
+        (call) => call.method === 'Target.detachFromTarget' && call.params.sessionId === installed
+      ),
+      false
+    );
+    holder.child.stdin.end();
+    assert.equal((await holder.ended).code, 0);
+    assert.equal(
+      backend.calls.filter(
+        (call) => call.method === 'Target.detachFromTarget' && call.params.sessionId === installed
+      ).length,
+      1
+    );
+    assert.equal(backend.calls.filter((call) => call.method === 'Page.reload').length, 1);
+  } finally {
+    if (holder.child.exitCode === null) holder.child.kill('SIGKILL');
+    await holder.ended;
+    await backend.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 async function fixture(policy, check, children = [], onCommand = () => {}, native = false) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-fake-'));
   const backend = await webmcpBackend({

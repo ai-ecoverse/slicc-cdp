@@ -47,6 +47,7 @@ struct Context {
 #[derive(Default)]
 pub(super) struct Webmcp {
     arms: BTreeMap<String, Arm>,
+    holders: BTreeMap<String, String>,
     contexts: BTreeMap<(String, i64), Context>,
     scripts: BTreeMap<(String, String), i64>,
     evaluations: BTreeSet<(String, String)>,
@@ -68,6 +69,7 @@ pub(super) struct Webmcp {
 impl Webmcp {
     pub(super) fn forget(&mut self, session: &str) {
         self.arms.remove(session);
+        self.holders.retain(|_, owner| owner != session);
         self.contexts.retain(|(owner, _), _| owner != session);
         self.scripts.retain(|(owner, _), _| owner != session);
         self.evaluations.retain(|(owner, _)| owner != session);
@@ -86,8 +88,9 @@ impl Cdp {
     }
 
     pub fn start_webmcp_for(&mut self, session: &str, reload: bool) -> Result<String, String> {
-        let result = self.webmcp_start_once(session, reload);
-        if result.is_err() { self.stop_webmcp(session); }
+        let session = self.webmcp_session(session).to_string();
+        let result = self.webmcp_start_once(&session, reload);
+        if result.is_err() { self.stop_webmcp(&session); }
         result
     }
 
@@ -110,11 +113,15 @@ impl Cdp {
             if self.webmcp_plain(session) {
                 self.webmcp_plain_reload(session, &tree, from).map_err(|message| format!("{message}webmcp-polyfill: other-extension fallback could not verify the reloaded document; tools are unavailable\n"))?;
             }
+            let holder = self.webmcp_session(session).to_string();
+            let session = holder.as_str();
             let until = Instant::now() + DOCUMENT_CHECK;
             while self.webmcp.arms.get(session).is_some_and(|arm| arm.admitted == 0 && !arm.revoked) && Instant::now() < until {
                 if !self.pump(until)? { break; }
             }
         } else { self.webmcp_install_current(session)?; }
+        let holder = self.webmcp_session(session).to_string();
+        let session = holder.as_str();
         if self.webmcp.arms.get(session).is_none_or(|arm| arm.revoked || arm.admitted == 0 || !arm.pending_contexts.is_empty()) {
             self.webmcp_revoke(session);
             return Err("slicc: refused: WebMCP installation could not verify the document; update the browser guard and client\n".into());
@@ -122,8 +129,12 @@ impl Cdp {
         Ok(bridge)
     }
 
+    pub fn webmcp_session<'a>(&'a self, session: &'a str) -> &'a str {
+        self.webmcp.holders.get(session).map(String::as_str).unwrap_or(session)
+    }
+
     pub fn webmcp_plain(&self, session: &str) -> bool {
-        self.webmcp.arms.get(session).is_some_and(|arm| arm.plain)
+        self.webmcp.arms.get(self.webmcp_session(session)).is_some_and(|arm| arm.plain)
     }
 
     fn webmcp_plain_reload(&mut self, session: &str, previous: &Value, from: usize) -> Result<(), String> {
@@ -137,7 +148,8 @@ impl Cdp {
         while !self.events.iter().skip(from).any(|event| event["sessionId"] == session && event["method"] == "Page.loadEventFired") {
             if Instant::now() >= until || self.content_blocked(session) || !self.pump(until)? { return Err(self.refusal()); }
         }
-        self.webmcp_plain_proof(session)
+        let holder = self.webmcp_session(session).to_string();
+        self.webmcp_plain_proof(&holder)
     }
 
     fn webmcp_plain_replay(&mut self, session: &str, until: Instant) -> Result<(), String> {
@@ -148,16 +160,18 @@ impl Cdp {
             let arm = self.webmcp.arms.remove(session).ok_or_else(|| self.refusal())?;
             self.webmcp.arms.insert(fresh.clone(), arm);
             self.call_for("Runtime.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
+            self.call_for("Page.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
             self.webmcp_install_root(&fresh)
         })();
+        if result.is_ok() {
+            self.webmcp.holders.insert(session.to_string(), fresh);
+            return result;
+        }
         if let Some(arm) = self.webmcp.arms.remove(&fresh) {
             self.webmcp.arms.insert(session.to_string(), arm);
-            self.webmcp.contexts.retain(|(owner, _), _| owner != session);
-            let contexts = self.webmcp.contexts.iter().filter(|((owner, _), _)| owner == &fresh).map(|((_, id), context)| (*id, context.clone())).collect::<Vec<_>>();
-            for (id, context) in contexts { self.webmcp.contexts.insert((session.to_string(), id), context); }
         }
-        let detached = self.call_for("Target.detachFromTarget", json!({"sessionId":fresh}), None, until.saturating_duration_since(Instant::now()));
-        result.and(detached.map(|_| ()))
+        let _ = self.call_for("Target.detachFromTarget", json!({"sessionId":fresh}), None, until.saturating_duration_since(Instant::now()));
+        result
     }
 
     fn webmcp_stable<T>(&mut self, session: &str, deadline: Instant, mut attempt: impl FnMut(&mut Self, Duration) -> Result<T, String>) -> Result<T, String> {
@@ -206,6 +220,7 @@ impl Cdp {
     }
 
     pub fn webmcp_alive(&self, session: &str) -> bool {
+        let session = self.webmcp_session(session);
         self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked) && !self.content_blocked(session)
     }
 
@@ -249,6 +264,9 @@ impl Cdp {
     }
 
     pub fn stop_webmcp(&mut self, session: &str) {
+        let owner = self.webmcp_session(session).to_string();
+        let session = owner.as_str();
+        let attached = self.webmcp.holders.values().any(|holder| holder == session);
         let debug = self.webmcp.arms.get(session).is_some_and(|arm| !arm.plain);
         self.webmcp_revoke(session);
         if debug {
@@ -256,6 +274,10 @@ impl Cdp {
             let _ = self.raw_call("Debugger.disable", json!({}), Some(session), DOCUMENT_CHECK);
         }
         self.webmcp.arms.remove(session);
+        if attached {
+            let _ = self.call_for("Target.detachFromTarget", json!({"sessionId":session}), None, DOCUMENT_CHECK);
+            self.webmcp.holders.retain(|_, holder| holder != session);
+        }
     }
 
     fn webmcp_install(&mut self, session: &str, seed: &Value) -> Result<String, String> {
