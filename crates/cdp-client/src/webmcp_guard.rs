@@ -160,8 +160,9 @@ impl Cdp {
             let arm = self.webmcp.arms.remove(session).ok_or_else(|| self.refusal())?;
             self.webmcp.arms.insert(fresh.clone(), arm);
             self.call_for("Runtime.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
+            self.webmcp_install_root(&fresh)?;
             self.call_for("Page.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
-            self.webmcp_install_root(&fresh)
+            Ok(())
         })();
         if result.is_ok() {
             self.webmcp.holders.insert(session.to_string(), fresh);
@@ -360,6 +361,7 @@ impl Cdp {
     }
 
     fn webmcp_install_root(&mut self, session: &str) -> Result<(), String> {
+        if self.webmcp_plain(session) { return self.webmcp_install_plain_root(session); }
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
         let until = Instant::now() + DOCUMENT_CHECK;
@@ -370,6 +372,27 @@ impl Cdp {
             && frame.get("loaderId").and_then(Value::as_str) == Some(&context.loader)).map(|((_, id), context)| (*id, context.clone())).ok_or_else(|| self.refusal())?;
         let root = self.webmcp_root_document(session, until)?;
         self.webmcp_evaluate(session, id, &context, root, until)?;
+        self.webmcp_mark_admitted(session, id, &context, Instant::now())
+    }
+
+    fn webmcp_install_plain_root(&mut self, session: &str) -> Result<(), String> {
+        let until = Instant::now() + DOCUMENT_CHECK;
+        let root = self.webmcp_root_document(session, until)?;
+        let context = root.1.clone();
+        let id = self.webmcp.contexts.iter().find(|((owner, _), current)| owner == session && *current == &context).map(|((_, id), _)| *id).ok_or_else(|| self.refusal())?;
+        if !self.worlds.fallback_safe(session) || self.document_paused(&root.0) { return Err(self.refusal()); }
+        let arm = self.webmcp.arms.get(session).filter(|arm| !arm.revoked).ok_or_else(|| self.refusal())?;
+        let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
+        if arm.accepted.contains(&realm) { return Ok(()); }
+        let params = json!({"expression":arm.source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true});
+        self.admit("Runtime.evaluate", &params, Some(session))?;
+        self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?.installing.insert(realm.clone());
+        let result = self.raw_call_execution("Runtime.evaluate", params, Some(session), until.saturating_duration_since(Instant::now()), true);
+        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.installing.remove(&realm); }
+        let result = result?;
+        if result.get("exceptionDetails").is_some() || !self.worlds.fallback_safe(session) || self.webmcp_root_document(session, until)? != root { return Err(self.refusal()); }
+        self.webmcp_check_context(session, id, &context, until)?;
+        if !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
         self.webmcp_mark_admitted(session, id, &context, Instant::now())
     }
 

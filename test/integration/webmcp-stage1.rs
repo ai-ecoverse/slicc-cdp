@@ -585,6 +585,31 @@ fn plain_reload_replays_the_committed_root_before_loading_children() {
 }
 
 #[test]
+fn plain_replayed_root_installs_with_one_identity_read_and_no_execution_replay() {
+    let (mut cdp, state, session) = fixture();
+    {
+        let mut wire = state.borrow_mut();
+        wire.refusal = Some("slicc: refused: a browser extension runs scripts in this page, and profiling it would expose them");
+        wire.replay_only = true;
+        wire.load_after_install = true;
+    }
+    cdp.start_webmcp_for(&session, true).unwrap();
+    let wire = state.borrow();
+    let reload = wire.calls.iter().position(|call| call["method"] == "Page.reload").unwrap();
+    let install = wire.calls.iter().position(|call| call["method"] == "Runtime.evaluate" && call["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).unwrap();
+    let before = &wire.calls[reload + 1..install];
+    let methods = before.iter().map(|call| call["method"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(before.iter().filter(|call| call["method"] == "Runtime.enable").count(), 1, "{methods:?}");
+    assert_eq!(before.iter().filter(|call| call["method"] == "Page.getFrameTree").count(), 1, "{methods:?}");
+    assert_eq!(before.iter().filter(|call| call["method"] == "Runtime.disable").count(), 0, "{methods:?}");
+    assert_eq!(before.iter().filter(|call| call["method"] == "Target.getTargets").count(), 0, "{methods:?}");
+    assert_eq!(count(&wire, "Runtime.evaluate"), 1);
+    assert_eq!(count(&wire, "Page.reload"), 1);
+    assert!(wire.calls[install + 1..].iter().any(|call| call["method"] == "Page.getFrameTree"));
+    assert!(cdp.webmcp_alive(&session));
+}
+
+#[test]
 fn plain_fallback_retains_the_installed_session_for_status_and_owner_cleanup() {
     let (mut cdp, state, original) = fixture();
     {
