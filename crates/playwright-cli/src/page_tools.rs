@@ -48,7 +48,31 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, report: 
     done.unwrap_or_else(Output::err)
 }
 
-pub fn network_state_set(invocation: &Invocation) -> Output {
+pub fn webkit_browser(invocation: &Invocation, cdp_env: Option<&str>) -> bool {
+    if !crate::launch::endpoint_is_explicit(invocation.cdp.as_deref(), cdp_env) {
+        return false;
+    }
+    let Ok(start) = crate::launch::start_after_explicit(invocation.cdp.as_deref(), cdp_env, None) else {
+        return false;
+    };
+    let Ok(mut cdp) = crate::cdp::open(start, invocation.runtime.as_deref()) else {
+        return false;
+    };
+    let version = cdp.call("Browser.getVersion", json!({}), None).unwrap_or_default();
+    version.get("product").and_then(Value::as_str).is_some_and(|product| product.contains("WebKit"))
+}
+
+pub fn with_remedy(command: &'static str) -> impl FnOnce(String) -> String {
+    move |message| {
+        if message.contains("isn't available") || message.contains("wasn't found") {
+            format!("{}: this tab can't do that, and every command on it fails until you run {command}\n", message.trim_end())
+        } else {
+            message
+        }
+    }
+}
+
+pub fn network_state_set(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
     let offline = match invocation.positionals.first().map(String::as_str) {
         Some("offline") => true,
         Some("online") => false,
@@ -58,6 +82,9 @@ pub fn network_state_set(invocation: &Invocation) -> Output {
             )
         }
     };
+    if offline && webkit_browser(invocation, cdp_env) {
+        return Output::err("playwright-cli network-state-set: this browser can't take a tab offline\n");
+    }
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
     state.offline = offline;
     let name = if offline { "offline" } else { "online" };
@@ -71,7 +98,7 @@ pub fn arm_network(cdp: &mut Cdp, session: &str, state: &Session) -> Result<(), 
         return Ok(());
     }
     let conditions = json!({ "offline": true, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1 });
-    cdp.call("Network.emulateNetworkConditions", conditions, Some(session)).map(|_| ())
+    cdp.call("Network.emulateNetworkConditions", conditions, Some(session)).map(|_| ()).map_err(with_remedy("network-state-set online"))
 }
 
 fn hide(invocation: &Invocation) -> bool {

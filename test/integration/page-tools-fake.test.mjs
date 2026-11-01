@@ -224,7 +224,10 @@ test('network-state-set matches upstream output and arms offline on later attach
         offline.stdout,
         '### Result\nNetwork is now offline\n### Ran Playwright code\n```js\nawait page.context().setOffline(true);\n```\n'
       );
-      assert.equal(fake.calls.length, 0);
+      assert.deepEqual(
+        fake.calls.map((call) => call.method),
+        ['Browser.getVersion']
+      );
       const evaluated = await pw(['eval', '1']);
       assert.equal(evaluated.code, 0, evaluated.stderr);
       const emulated = sent(fake, 'Network.emulateNetworkConditions');

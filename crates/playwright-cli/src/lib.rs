@@ -108,10 +108,10 @@ pub fn execute_in(
         return Output::err(format!("playwright-cli {command}: not implemented yet\n"));
     }
     if route::is_route_command(&command) {
-        return route::run(&invocation);
+        return route::run(&invocation, cdp_env);
     }
     if command == "network-state-set" {
-        return page_tools::network_state_set(&invocation);
+        return page_tools::network_state_set(&invocation, cdp_env);
     }
     if let Some(message) = har::precheck(&invocation) {
         return Output::err(message);
