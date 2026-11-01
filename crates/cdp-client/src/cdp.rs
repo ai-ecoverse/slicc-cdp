@@ -38,6 +38,8 @@ pub type Decider = Box<dyn FnMut(&Paused) -> Decision>;
 
 pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it could be seven's\n";
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
+pub const UNANSWERED: &str = "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser)";
+pub const UNVERIFIED: &str = "slicc: refused: slicc could not finish checking this target, so it left it alone; the browser may not answer the check\n";
 pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
@@ -574,9 +576,9 @@ impl Cdp {
             sent.as_object_mut().unwrap().remove("executionContextUniqueId");
             sent.as_object_mut().unwrap().remove("executionContextName");
             if method == "Runtime.compileScript" {
-                let target = session_id.and_then(|session| self.session_target(session)).ok_or_else(|| self.refusal())?;
-                let guard = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)).ok_or_else(|| self.refusal())?;
-                let proof = self.context_proofs.get(&(guard.clone(), unique.clone())).ok_or_else(|| self.refusal())?;
+                let target = session_id.and_then(|session| self.session_target(session)).ok_or_else(|| self.unverified())?;
+                let guard = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)).ok_or_else(|| self.unverified())?;
+                let proof = self.context_proofs.get(&(guard.clone(), unique.clone())).ok_or_else(|| self.unverified())?;
                 sent["executionContextId"] = json!(proof.id);
             } else { sent["uniqueContextId"] = json!(unique); }
         }
@@ -709,6 +711,10 @@ impl Cdp {
         self.closed.clone().unwrap_or_else(|| format!("{}\n", self.guard.refusal()))
     }
 
+    pub fn unverified(&self) -> String {
+        self.closed.clone().unwrap_or_else(|| UNVERIFIED.to_string())
+    }
+
     fn closing(&mut self, message: String) -> String {
         if crate::net::connection_closed(&message) { self.closed.get_or_insert(message).clone() } else { message }
     }
@@ -827,7 +833,7 @@ impl Cdp {
                 json!({}),
                 session_id,
                 DOCUMENT_CHECK,
-            ).map_err(|_| self.refusal())?;
+            ).map_err(|_| self.unverified())?;
             let url = history
                 .get("entries")
                 .and_then(|v| v.as_array())
@@ -838,7 +844,7 @@ impl Cdp {
                 })
                 .and_then(|item| item.get("url").and_then(|v| v.as_str()))
                 .filter(|url| !url.is_empty())
-                .ok_or_else(|| self.refusal())?
+                .ok_or_else(|| self.unverified())?
                 .to_string();
             if self.guard.url(&url) {
                 return Err(format!("{}\n", self.guard.refusal_for_url(&url)));
@@ -976,9 +982,9 @@ impl Cdp {
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
-            let mut current = self.document_state_for(&target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?;
+            let mut current = self.document_state_for(&target, true, expected.scope.as_deref()).ok_or_else(|| self.unverified())?;
             if let Some(proof) = &expected.page_scope {
-                let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
+                let guard = self.guards.get(&target).cloned().ok_or_else(|| self.unverified())?;
                 if &self.verify_page_scope(Some(&guard))? != proof { return Err(self.refusal()) }
                 current.page_scope = Some(proof.clone());
             }
@@ -988,7 +994,7 @@ impl Cdp {
         if let Some(session) = session {
             #[cfg(test)]
             self.runtime_prepare_probe("selected-session", json!({"target_known":self.session_target(session).is_some(),"blocked":self.blocked.contains(session)}));
-            let target = self.session_target(session).ok_or_else(|| self.refusal())?;
+            let target = self.session_target(session).ok_or_else(|| self.unverified())?;
             if !checks.iter().any(|(known, _)| known == &target) {
                 let selected_frame = params.get("frameId").and_then(Value::as_str).map(str::to_string).or_else(|| {
                     ["contextId", "executionContextId", "uniqueContextId", "executionContextUniqueId", "executionContextName"].into_iter().find_map(|key| {
@@ -1005,15 +1011,15 @@ impl Cdp {
                         "guard_present":self.guards.contains_key(&target),"document_known":self.documents.contains_key(&target),
                         "previous_protected":self.documents.get(&target).is_some_and(|doc| doc.previous),"target_protected":self.protected_targets.contains(&target)}));
                     if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn") { return Err(self.refusal()) }
-                    self.cached_documents.get(&target).cloned().ok_or_else(|| self.refusal())?
+                    self.cached_documents.get(&target).cloned().ok_or_else(|| self.unverified())?
                 } else if let Some((_, state)) = page_scope.as_ref().filter(|(proof, state)| proof.0 == target && (!runtime || Self::runtime_page_reusable(state))) {
                     #[cfg(test)]
                     self.runtime_prepare_probe("selected-frame-placement", json!({"source":"fresh-page-proof","explicit_frame":selected_frame.is_some()}));
-                    if runtime { Self::scoped_page_state(state, scope.unwrap_or("")).ok_or_else(|| self.refusal())? } else { state.clone() }
+                    if runtime { Self::scoped_page_state(state, scope.unwrap_or("")).ok_or_else(|| self.unverified())? } else { state.clone() }
                 } else {
                     #[cfg(test)]
                     self.runtime_prepare_probe("selected-document-state", json!({"source":"private-document-proof","guard_present":self.guards.contains_key(&target)}));
-                    self.document_state_for(&target, true, scope).ok_or_else(|| self.refusal())?
+                    self.document_state_for(&target, true, scope).ok_or_else(|| self.unverified())?
                 };
                 #[cfg(test)]
                 self.runtime_prepare_probe("blocking", json!({"blocked":self.blocked.contains(session)}));
@@ -1070,15 +1076,15 @@ impl Cdp {
     fn pin_execution(&mut self, method: &str, params: &Value, session: Option<&str>, checks: &mut Vec<(String, DocumentState)>) -> Result<Option<String>, String> {
         if !matches!(method, "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.compileScript") || checks.is_empty() { return Ok(None) }
         if method == "Runtime.callFunctionOn" && params.get("objectId").is_some() { return Ok(None) }
-        let session = session.ok_or_else(|| self.refusal())?;
-        let target = self.session_target(session).ok_or_else(|| self.refusal())?;
-        let mut state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+        let session = session.ok_or_else(|| self.unverified())?;
+        let target = self.session_target(session).ok_or_else(|| self.unverified())?;
+        let mut state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.unverified())?;
         let guard = if let Some(guard) = self.guards.get(&target).or_else(|| self.runtime_sessions.get(&target)) {
             guard.clone()
         } else {
             if state.worker.is_none() { return Err(self.refusal()) }
             let result = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, DOCUMENT_CHECK)?;
-            let guard = result.get("sessionId").and_then(Value::as_str).ok_or_else(|| self.refusal())?.to_string();
+            let guard = result.get("sessionId").and_then(Value::as_str).ok_or_else(|| self.unverified())?.to_string();
             self.guard_sessions.insert(guard.clone());
             self.session_targets.insert(guard.clone(), target.clone());
             self.runtime_sessions.insert(target.clone(), guard.clone());
@@ -1113,7 +1119,7 @@ impl Cdp {
                 self.raw_call("Runtime.enable", json!({}), Some(&guard), left)?;
                 #[cfg(test)]
                 self.runtime_contexts(method, "private-context-replayed", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
-                let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.refusal())?;
+                let current = self.document_state_for(&target, true, state.scope.as_deref()).ok_or_else(|| self.unverified())?;
                 #[cfg(test)]
                 self.runtime_contexts(method, "private-context-current", &guard, &target, &current, selected.as_ref().map(|(unique, _)| unique.as_str()));
                 let same = if state.worker.is_some() { state.worker == current.worker } else {
@@ -1130,7 +1136,7 @@ impl Cdp {
                     #[cfg(test)]
                     self.runtime_stage(method, "private-context-readmission");
                     *checks = self.prepare(method, params, Some(session))?;
-                    state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.refusal())?;
+                    state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.unverified())?;
                     continue;
                 }
                 selected = choose(&self.context_proofs, &state);
@@ -1139,13 +1145,13 @@ impl Cdp {
         }
         #[cfg(test)]
         self.runtime_contexts(method, "private-context-validation", &guard, &target, &state, selected.as_ref().map(|(unique, _)| unique.as_str()));
-        let (unique, proof) = selected.ok_or_else(|| self.refusal())?;
+        let (unique, proof) = selected.ok_or_else(|| self.unverified())?;
         let owned_world = !proof.default && self.created_contexts.contains(&(session.to_string(), proof.id));
         let owned_blank = proof.default && state.frames.get(&proof.frame).is_some_and(|evidence| evidence[1] == "about:blank"
             && self.owns_blank(&target, &proof.frame, &evidence[0]));
         if unique.is_empty() || proof.origin == "null" && !owned_blank || proof.origin.is_empty() && !owned_world && !owned_blank || self.guard.url(&proof.origin) { return Err(self.refusal()) }
         if state.worker.is_none() {
-            let evidence = state.frames.get(&proof.frame).ok_or_else(|| self.refusal())?;
+            let evidence = state.frames.get(&proof.frame).ok_or_else(|| self.unverified())?;
             if proof.loader.as_deref() != Some(evidence[0].as_str()) { return Err(self.refusal()) }
         }
         Ok(Some(unique))
@@ -1175,16 +1181,16 @@ impl Cdp {
     fn verify_checks(&mut self, checks: &[(String, DocumentState)], same_document: bool, stable_page: bool) -> Result<(), String> {
         for (target, expected) in checks {
             let current = if let Some(proof) = &expected.page_scope {
-                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
+                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.unverified())?;
                 let (current, state) = self.verify_page_scope_state(Some(&session))?;
                 if stable_page && &current != proof { return Err(self.refusal()) }
                 if current.0 == *target && (expected.runtime_scope_epoch.is_none() || Self::runtime_page_reusable(&state)) {
-                    Some(if expected.runtime_scope_epoch.is_some() { Self::scoped_page_state(&state, expected.scope.as_deref().unwrap_or("")).ok_or_else(|| self.refusal())? } else { state })
+                    Some(if expected.runtime_scope_epoch.is_some() { Self::scoped_page_state(&state, expected.scope.as_deref().unwrap_or("")).ok_or_else(|| self.unverified())? } else { state })
                 } else { None }
             } else { None };
             let current = match current {
                 Some(state) => state,
-                None => self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.refusal())?,
+                None => self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.unverified())?,
             };
             if same_document && &current != expected { return Err(self.refusal()) }
         }
@@ -1194,7 +1200,7 @@ impl Cdp {
     fn verify_execution(&mut self, checks: &[(String, DocumentState)]) -> Result<(), String> {
         for (_, state) in checks {
             if let Some(proof) = &state.page_scope {
-                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.refusal())?;
+                let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.unverified())?;
                 if self.session_target(&session).as_deref() != Some(&proof.0) { return Err(self.refusal()) }
                 if self.page_scope_unknown != proof.2 || state.runtime_scope_epoch != Some(self.runtime_scope_epochs.get(&proof.0).copied().unwrap_or(0)) {
                     if self.verify_page_scope(Some(&session))?.0 != proof.0 { return Err(self.refusal()) }
@@ -1204,7 +1210,7 @@ impl Cdp {
         for (target, state) in checks {
             let owner = state.worker.as_ref().map_or(target.as_str(), |(_, owner)| owner.as_str());
             if self.unchecked_document(owner) {
-                let guard = self.guards.get(owner).cloned().ok_or_else(|| self.refusal())?;
+                let guard = self.guards.get(owner).cloned().ok_or_else(|| self.unverified())?;
                 self.verify_page_scope_state(Some(&guard))?;
             }
         }
@@ -3692,7 +3698,7 @@ fn unguarded(message: String) -> String {
     if transport_error(&message) || message == RENDERER_CRASHED {
         message
     } else if let Some(step) = message.strip_suffix(" timed out\n") {
-        format!("{}: {step} timed out\n", UNGUARDED.trim_end())
+        format!("{UNANSWERED}: {step} timed out\n")
     } else {
         UNGUARDED.to_string()
     }
@@ -4877,7 +4883,7 @@ mod tests {
     fn cleanup_waits_for_the_refused_targets_late_destruction() {
         let mut cdp = cleanup(Some(Duration::from_millis(40)), cleanup_answer);
         let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
-        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target: Network.setBypassServiceWorker timed out\n");
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
         assert!(cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == "T"));
         assert!(cdp.is_protected_target("T"));
     }
@@ -4893,7 +4899,7 @@ mod tests {
             cleanup_answer(message).into_iter().filter(|reply| reply.get("method").is_none()).collect()
         });
         let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
-        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target: Network.setBypassServiceWorker timed out\n");
+        assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
         assert!(!cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed"));
         assert!(cdp.is_protected_target("T"));
     }

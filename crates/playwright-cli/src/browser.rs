@@ -459,7 +459,7 @@ pub fn ref_session(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(RefRec
         return Ok((rec.clone(), None));
     };
     let child = frame_session(cdp, session, target)?
-        .ok_or_else(|| format!("{}\n", cdp.guard().refusal()))?;
+        .ok_or_else(|| cdp.unverified())?;
     Ok((RefRec { page: Some(session.to_string()), ..rec.clone() }, Some(child)))
 }
 

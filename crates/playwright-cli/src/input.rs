@@ -439,7 +439,7 @@ fn dispatch_key(cdp: &mut Cdp, session: &str, params: &Value) -> Result<(), Stri
 fn main_frame(cdp: &mut Cdp, session: &str) -> Result<String, String> {
     let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
     tree.pointer("/frameTree/frame/id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)
-        .ok_or_else(|| format!("{}\n", cdp.guard().refusal()))
+        .ok_or_else(|| cdp.unverified())
 }
 
 fn frame_owner(node: &Value) -> bool {

@@ -297,7 +297,7 @@ impl Holder {
             return Err(format!("{}\n", cdp.guard().refusal()));
         };
         let world = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame_id,"worldName":"slicc-recorder"}), Some(&self.session))?;
-        let id = world["executionContextId"].as_i64().ok_or_else(|| format!("{}\n", cdp.guard().refusal()))?;
+        let id = world["executionContextId"].as_i64().ok_or_else(|| cdp.unverified())?;
         let installed = cdp.call("Runtime.evaluate", json!({"expression":install_expression()?,"contextId":id,"returnByValue":true}), Some(&self.session))?;
         if installed.get("exceptionDetails").is_some() {
             return Err(format!("{}\n", cdp.guard().refusal()));
