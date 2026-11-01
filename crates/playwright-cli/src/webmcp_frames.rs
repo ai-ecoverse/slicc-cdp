@@ -179,7 +179,6 @@ try {{
 
 fn with_tools(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Collected) -> Result<Value, String>) -> Result<Value, String> {
     if from.iter().any(|origin| cdp.guard().url(origin)) { return Err(format!("{}\n", cdp.guard().refusal())); }
-    if !from.is_empty() { eprintln!("cross-origin child tools are unavailable on this guarded route"); }
     let from: &[String] = &[];
     let mut opened = Vec::new();
     let result = collect(cdp, state, target, session, from, &mut opened).and_then(|collected| invoke(cdp, collected));

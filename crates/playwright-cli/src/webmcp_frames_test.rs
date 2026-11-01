@@ -84,6 +84,23 @@ fn requested_cross_origin_tools_warn_but_preserve_root_listing_and_calling() {
 }
 
 #[test]
+fn only_explicit_client_origin_requests_return_the_warning_with_root_tools() {
+    for from in [Vec::new(), vec!["https://ordinary-child.test".to_string()]] {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false }));
+        let mut state = Session::default();
+        let listed = crate::webmcp::list_from(&mut cdp, &mut state, Some("ROOT"), true, &from);
+        assert_eq!(listed.code, 0, "{}", listed.stderr);
+        assert!(listed.stdout.contains("add"));
+        assert_eq!(listed.stderr.contains("cross-origin child tools are unavailable"), !from.is_empty());
+        let called = crate::webmcp::call_from(&mut cdp, &mut state, "add", "{\"a\":2,\"b\":3}", Some("ROOT"), false, &from, None);
+        assert_eq!(called.code, 0, "{}", called.stderr);
+        assert_eq!(called.stdout.trim(), "5");
+        assert_eq!(called.stderr.contains("cross-origin child tools are unavailable"), !from.is_empty());
+    }
+}
+
+#[test]
 fn newly_attached_frame_requires_default_context_observation_before_scope_selection() {
     let calls = Rc::new(RefCell::new(Vec::new()));
     let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:true, isolated:false }));
