@@ -216,6 +216,64 @@ impl Transport for Backend {
     }
 }
 
+struct EvaluateReadWire {
+    base: Backend,
+    waiting_read: bool,
+    read_conversions: Rc<RefCell<usize>>,
+}
+
+impl Transport for EvaluateReadWire {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let call: Value = serde_json::from_str(text).unwrap();
+        if call["method"] == "Page.reload" {
+            let mut state = self.base.0.borrow_mut();
+            state.calls.push(call.clone());
+            state.tree = Some(tree("R"));
+            for session in state.sessions.keys().cloned().collect::<Vec<_>>() {
+                state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":tree("R")["frameTree"]["frame"]}}).to_string());
+                state.incoming.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":session,"params":{}}).to_string());
+                state.incoming.push_back(context(&session, "R").to_string());
+            }
+            let owner = state.armed.clone().unwrap();
+            state.incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":owner,"params":{"scriptId":"READ","executionContextId":1,"url":"","embedderName":""}}).to_string());
+            state.incoming.push_back(json!({"method":"Debugger.paused","sessionId":owner,"params":{"reason":"instrumentation","data":{"scriptId":"READ"},"callFrames":[{"callFrameId":"READ-CALL","location":{"scriptId":"READ","lineNumber":0,"columnNumber":0}}]}}).to_string());
+            state.incoming.push_back(json!({"id":call["id"],"result":{}}).to_string());
+            self.waiting_read = true;
+            return Ok(());
+        }
+        if call["method"] == "Debugger.pause" && self.waiting_read { *self.read_conversions.borrow_mut() += 1; }
+        let page_script = call["method"] == "Debugger.resume" && self.waiting_read && !self.base.0.borrow().conversion_pending;
+        self.base.send_text(text)?;
+        if page_script {
+            self.waiting_read = false;
+            let mut state = self.base.0.borrow_mut();
+            let owner = state.armed.clone().unwrap();
+            state.incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":owner,"params":{"scriptId":"SCRIPT","executionContextId":1,"url":"https://ordinary.test/first.js","embedderName":"https://ordinary.test/first.js"}}).to_string());
+            state.incoming.push_back(json!({"method":"Debugger.paused","sessionId":owner,"params":{"reason":"instrumentation","data":{"scriptId":"SCRIPT"},"callFrames":[{"callFrameId":"CALL","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}}).to_string());
+        }
+        Ok(())
+    }
+
+    fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        self.base.recv_text(deadline)
+    }
+}
+
+#[test]
+fn direct_owned_evaluate_pause_does_not_convert_before_the_page_script() {
+    let state = Rc::new(RefCell::new(State { raw_instrumentation: true, ..Default::default() }));
+    let read_conversions = Rc::new(RefCell::new(0));
+    let mut cdp = Cdp::from_transport(Box::new(EvaluateReadWire { base: Backend(state.clone()), waiting_read: false, read_conversions: read_conversions.clone() }));
+    let session = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap()["sessionId"].as_str().unwrap().to_string();
+    cdp.start_webmcp_for(&session, true).unwrap();
+    assert_eq!(*read_conversions.borrow(), 0);
+    let wire = state.borrow();
+    assert_eq!(count(&wire, "Debugger.pause"), 1);
+    assert_eq!(count(&wire, "Runtime.evaluate"), 1);
+    assert_eq!(count(&wire, "Page.reload"), 1);
+    assert_eq!(count(&wire, "Debugger.removeBreakpoint"), 0);
+}
+
 fn fixture() -> (Cdp, Rc<RefCell<State>>, String) {
     let state = Rc::new(RefCell::new(State::default()));
     let mut cdp = Cdp::from_transport(Box::new(Backend(state.clone())));

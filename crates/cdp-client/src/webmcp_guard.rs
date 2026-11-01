@@ -49,6 +49,7 @@ pub(super) struct Webmcp {
     arms: BTreeMap<String, Arm>,
     contexts: BTreeMap<(String, i64), Context>,
     scripts: BTreeMap<(String, String), i64>,
+    evaluations: BTreeSet<(String, String)>,
     paused: BTreeSet<String>,
     handling_gate: bool,
     pending_gates: VecDeque<Value>,
@@ -69,6 +70,7 @@ impl Webmcp {
         self.arms.remove(session);
         self.contexts.retain(|(owner, _), _| owner != session);
         self.scripts.retain(|(owner, _), _| owner != session);
+        self.evaluations.retain(|(owner, _)| owner != session);
         self.paused.remove(session);
         self.pending_gates.retain(|value| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
         self.deferred.remove(session);
@@ -554,6 +556,14 @@ impl Cdp {
         if value.pointer("/params/reason").and_then(Value::as_str) != Some("instrumentation") { return false; }
         let started = Instant::now();
         let until = started + DOCUMENT_CHECK;
+        let script = value.pointer("/params/data/scriptId").or_else(|| value.pointer("/params/callFrames/0/location/scriptId")).and_then(Value::as_str);
+        let evaluate = script.is_some_and(|script| self.webmcp.evaluations.contains(&(session.to_string(), script.to_string())));
+        let accepted = self.webmcp_pause_context(value, session).is_some_and(|(_, context)| self.webmcp.arms.get(session).is_some_and(|arm| arm.accepted.contains(&(context.frame, context.loader, context.unique))));
+        if evaluate || accepted {
+            let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
+            self.webmcp.paused.remove(session);
+            return true;
+        }
         let root_proof = self.webmcp_known_root(session);
         let converted = root_proof.and_then(|root| {
             let context = self.webmcp_pause_context(value, session).map(|(_, context)| context).unwrap_or_else(|| root.1.clone());
@@ -871,10 +881,15 @@ impl Cdp {
             arm.pending_contexts.clear();
             self.webmcp.contexts.retain(|(owner, _), _| owner != session);
             self.webmcp.scripts.retain(|(owner, _), _| owner != session);
+            self.webmcp.evaluations.retain(|(owner, _)| owner != session);
         }
         if method == "Debugger.scriptParsed" {
             if let (Some(script), Some(context)) = (value.pointer("/params/scriptId").and_then(Value::as_str), value.pointer("/params/executionContextId").and_then(Value::as_i64)) {
                 self.webmcp.scripts.insert((session.to_string(), script.to_string()), context);
+                self.webmcp.evaluations.remove(&(session.to_string(), script.to_string()));
+                if value.pointer("/params/url").and_then(Value::as_str) == Some("") && value.pointer("/params/embedderName").and_then(Value::as_str) == Some("") {
+                    self.webmcp.evaluations.insert((session.to_string(), script.to_string()));
+                }
             }
         }
     }
