@@ -20,6 +20,62 @@ struct BackendState {
 
 struct Backend(Rc<RefCell<BackendState>>);
 
+struct SettlingBackend {
+    inner: Backend,
+    due: Option<Instant>,
+    refuse: bool,
+}
+
+impl Transport for SettlingBackend {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let command: Value = serde_json::from_str(text).unwrap();
+        self.inner.send_text(text)?;
+        if command["method"] == "Runtime.enable" && command["sessionId"] == "H" {
+            self.due = Some(Instant::now() + Duration::from_secs(1));
+            if self.refuse {
+                let mut state = self.inner.0.borrow_mut();
+                state.inbox.clear();
+                state.inbox.push_back(json!({"id":command["id"],"error":{"code":-32000,"message":"slicc: refused: seven’s own pages and the vault are out of reach of browser automation"}}).to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        if let Some(due) = self.due.take() {
+            std::thread::sleep(due.min(deadline).saturating_duration_since(Instant::now()));
+            if Instant::now() < due {
+                self.due = Some(due);
+                return Ok(None);
+            }
+        }
+        self.inner.recv_text(deadline)
+    }
+}
+
+#[test]
+fn one_second_settling_reply_preserves_rust_document_check_and_terminal_refusal() {
+    for refuse in [false, true] {
+        let (mut cdp, state) = client();
+        cdp.ws = Box::new(SettlingBackend { inner: Backend(state.clone()), due: None, refuse });
+        let start = Instant::now();
+        let result = cdp.start_webmcp_for("H", true);
+        let spent = start.elapsed();
+        assert!(spent >= Duration::from_secs(1) && spent < Duration::from_millis(1800), "{spent:?} {result:?}");
+        if refuse {
+            let error = result.unwrap_err();
+            assert!(error.contains("out of reach"), "{error}");
+            assert!(!error.contains("timed out"), "{error}");
+            assert!(!state.borrow().api);
+            assert!(!state.borrow().sent.iter().any(|command| matches!(command["method"].as_str(), Some("Debugger.enable" | "Debugger.setInstrumentationBreakpoint" | "Page.reload"))));
+            assert!(state.borrow().sent.iter().filter_map(|command| command["method"].as_str()).filter(|method| method.starts_with("Debugger.")).all(|method| matches!(method, "Debugger.resume" | "Debugger.disable")));
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(state.borrow().api);
+        }
+    }
+}
+
 fn event(method: &str, params: Value) -> Value {
     json!({"method":method,"sessionId":"H","params":params})
 }
