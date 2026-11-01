@@ -238,7 +238,7 @@ fn holder_protected_oopif_is_detached_without_injection_or_tool_access() {
     assert!(cdp.take_webmcp_children().is_empty());
     assert!(cdp.session_blocked("CHILD"));
     assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && matches!(command["method"].as_str(), Some("Runtime.evaluate" | "Page.addScriptToEvaluateOnNewDocument"))));
-    assert!(cdp.take_notices().iter().any(|notice| notice.contains("child tools are unavailable")));
+    assert!(!cdp.take_notices().iter().any(|notice| notice.contains("child tools are unavailable")));
     for expression in ["document.modelContext.getTools()", "document.modelContext.executeTool('secret', {})"] {
         assert!(cdp.call("Runtime.evaluate", json!({"expression":expression}), Some("CHILD")).is_err());
     }

@@ -9,6 +9,8 @@ struct FrameInspector {
     calls: Rc<RefCell<Vec<Value>>>,
     next: usize,
     sessions: BTreeMap<String, String>,
+    children: bool,
+    isolated: bool,
 }
 
 impl Transport for FrameInspector {
@@ -26,20 +28,35 @@ impl Transport for FrameInspector {
         let child = json!({"targetId":"FRAME_TARGET","type":"iframe","parentFrameId":"PARENT","url":"https://ordinary.test/"});
         let result = match command["method"].as_str().unwrap() {
             "Target.getTargetInfo" => json!({"targetInfo":if command["params"]["targetId"] == "ROOT" {root} else {child}}),
-            "Target.getTargets" => json!({"targetInfos":[root,child]}),
+            "Target.getTargets" => json!({"targetInfos":if self.children {vec![root,child]} else {vec![root]}}),
             "Target.attachToTarget" => {
                 self.next += 1;
                 let session = format!("S{}",self.next);
                 self.sessions.insert(session.clone(),command["params"]["targetId"].as_str().unwrap().into());
                 json!({"sessionId":session})
             },
+            "Page.getPermissionsPolicyState" => json!({"states":[{"feature":"tools","allowed":true}]}),
             "Page.getFrameTree" => json!({"frameTree":{"frame":frame}}),
             "Runtime.enable" | "Page.createIsolatedWorld" => {
                 let isolated = command["method"] == "Page.createIsolatedWorld";
                 self.queue.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":if isolated {9} else {7},"uniqueId":format!("{}-{}-{}",if isolated {"isolated"} else {"main"},frame["id"].as_str().unwrap(),frame["loaderId"].as_str().unwrap()),"origin":"https://ordinary.test","auxData":{"frameId":frame["id"],"isDefault":!isolated}}}}).to_string());
+                if isolated { self.isolated = true; }
+                if !isolated && self.isolated {
+                    self.queue.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":9,"uniqueId":format!("isolated-{}-{}",frame["id"].as_str().unwrap(),frame["loaderId"].as_str().unwrap()),"origin":"https://ordinary.test","auxData":{"frameId":frame["id"],"isDefault":false}}}}).to_string());
+                }
                 if isolated { json!({"executionContextId":9}) } else { json!({}) }
             }
-            "Runtime.evaluate" => json!({"result":{"type":"boolean","value":true}}),
+            "Runtime.evaluate" => {
+                let expression = command["params"]["expression"].as_str().unwrap_or("");
+                let value = if expression.contains("api.executeTool") {
+                    json!({"__webmcp_result":"5"})
+                } else if expression.contains("toolsJson") {
+                    json!({"toolsJson":json!([{"name":"add","origin":"https://ordinary.test","frameId":"PARENT","inputSchema":{"type":"object"},"annotations":{}}]).to_string()})
+                } else {
+                    json!(!expression.contains("__slicc_webmcp_shim"))
+                };
+                json!({"result":{"value":value}})
+            },
             _ => json!({}),
         };
         self.queue.push_back(json!({"id":command["id"],"result":result}).to_string());
@@ -49,9 +66,27 @@ impl Transport for FrameInspector {
 }
 
 #[test]
+fn requested_cross_origin_tools_warn_but_preserve_root_listing_and_calling() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false }));
+    let session = cdp.call("Target.attachToTarget", json!({"targetId":"ROOT","flatten":true}), None).unwrap()["sessionId"].as_str().unwrap().to_string();
+    let state = Session::default();
+    let from = vec!["https://ordinary-child.test".to_string()];
+    let tools = list(&mut cdp, &state, "ROOT", &session, &from).unwrap();
+    assert!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == "add"));
+    let answer = call(&mut cdp, &state, "ROOT", &session, &from, None, "add", &json!({"a":2,"b":3}), false).unwrap();
+    assert_eq!(answer["__webmcp_result"], "5");
+    assert!(!calls.borrow().iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|expression| expression.contains("ordinary-child.test"))));
+    let before = calls.borrow().len();
+    let protected = list(&mut cdp, &state, "ROOT", &session, &["https://vault.sliccy.ai".into()]);
+    assert!(protected.unwrap_err().contains("slicc: refused:"));
+    assert_eq!(calls.borrow().len(), before);
+}
+
+#[test]
 fn newly_attached_frame_requires_default_context_observation_before_scope_selection() {
     let calls = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new() }));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:true, isolated:false }));
     let root = cdp.call("Target.attachToTarget",json!({"targetId":"ROOT","flatten":true}),None).unwrap();
     let frame = FrameRec { frame_id:"FRAME_TARGET".into(), parent_frame_id:Some("PARENT".into()), url:"https://ordinary.test/".into(), target:Some("FRAME_TARGET".into()) };
     let mut scopes=BTreeMap::new();

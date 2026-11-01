@@ -690,7 +690,6 @@ impl Cdp {
     fn webmcp_adopt_child(&mut self, value: &Value) {
         let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str) else { return; };
         self.blocked.insert(child.to_string());
-        self.notices.push("webmcp-polyfill: cross-origin child tools are unavailable on this guarded route\n".into());
         let _ = self.send("Runtime.runIfWaitingForDebugger", json!({}), Some(child));
         let _ = self.send("Target.detachFromTarget", json!({"sessionId":child}), None);
     }
