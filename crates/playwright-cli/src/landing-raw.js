@@ -74,7 +74,26 @@
     channel.port2.postMessage(0);
     return 'done';
   },
-  keys(args, target, { edit, editable, held }) {
+  unplain(args, target, send, button, reach) {
+    const down = send('keydown');
+    if (down) {
+      if (args.key === 'Tab') this.tab(args, target, reach);
+      else if (args.key === 'Enter' && button) target.click();
+    }
+    if (args.phase === 'down') return;
+    const up = send('keyup');
+    if (down && up && args.key === ' ' && button) target.click();
+  },
+  tab(args, target, { owner, focusable }) {
+    const stops = [...document.querySelectorAll(focusable)].filter(
+      (node) => !owner(node) && !node.disabled && node.tabIndex >= 0 && node.getClientRects().length
+    );
+    const back = args.modifiers & 8;
+    const at = stops.indexOf(target);
+    const from = at < 0 && back ? 0 : at;
+    stops[(from + (back ? -1 : 1) + stops.length) % stops.length]?.focus();
+  },
+  keys(args, target, { edit, editable, held, owner, focusable, untrusted }) {
     const activatable = 'a[href],area[href],button,input,select,summary,[role=button]';
     const erasers = { Backspace: 'delete', Delete: 'forwardDelete' };
     const enter = args.key === 'Enter';
@@ -105,14 +124,19 @@
       else if (go && !/^(Escape|Alt|Control|Meta|Shift)$/.test(args.key) && send('keypress'))
         fallback();
     };
+    const space = args.key === ' ' && button;
     if (args.phase === 'up') {
-      if (args.key === ' ' && button) return 'unsupported';
-      send('keyup');
+      if (space && !untrusted) return 'unsupported';
+      if (send('keyup') && space) target.click();
       return 'pressed';
     }
     const plain =
       typed || enter || /^(Backspace|Delete|Escape|Alt|Control|Meta|Shift)$/.test(args.key);
-    if (((enter || args.key === ' ') && button) || !plain) return 'unsupported';
+    if ((enter && button) || space || !plain) {
+      if (!untrusted) return 'unsupported';
+      this.unplain(args, target, send, button, { owner, focusable });
+      return 'pressed';
+    }
     down();
     if (args.phase !== 'down') send('keyup');
     return 'pressed';
