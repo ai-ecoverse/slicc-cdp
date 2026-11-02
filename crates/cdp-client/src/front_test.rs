@@ -146,7 +146,6 @@ fn bringing_a_tab_forward_is_refused_when_the_front_tab_is_not_provably_seven_or
         (vec![front_page("SETTINGS", "chrome://settings/")], "SETTINGS", vec![]),
         (vec![seven()], "SEVEN", vec![("T", Value::Null)]),
         (vec![seven()], "SEVEN", vec![("T", json!({}))]),
-        (vec![front_page("WWW", "https://www.sliccy.ai/")], "WWW", vec![]),
         (vec![front_page("PLAIN", "http://seven.sliccy.ai/")], "PLAIN", vec![]),
         (vec![front_page("PORT", "https://seven.sliccy.ai:8443/")], "PORT", vec![]),
         (vec![front_page("USER", "https://u@seven.sliccy.ai/")], "USER", vec![]),
@@ -159,6 +158,15 @@ fn bringing_a_tab_forward_is_refused_when_the_front_tab_is_not_provably_seven_or
         assert!(refused.starts_with("slicc: refused:"), "{label}: {refused}");
         assert!(front_activated(&browser).is_empty(), "{label}");
     }
+}
+
+#[test]
+fn bringing_a_tab_forward_restores_www_when_it_is_proven_seven() {
+    let (mut cdp, session, browser) = front_client(vec![front_page("WWW", "https://www.sliccy.ai/")], "WWW", vec![]);
+    let front = cdp.bring_forward(&session).unwrap();
+    cdp.restore_front(front).unwrap();
+    assert_eq!(front_activated(&browser), ["T", "WWW"]);
+    assert_eq!(browser.borrow().front, "WWW");
 }
 
 #[test]
