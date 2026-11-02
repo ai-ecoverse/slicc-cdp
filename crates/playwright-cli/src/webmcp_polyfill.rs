@@ -49,7 +49,6 @@ fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str, changes: Valu
     latest.webmcp.insert(target.to_string(), data.clone());
     session::save_webmcp(&latest)?;
     state.webmcp.insert(target.to_string(), data);
-    crate::webmcp_namespace::record(state, target, "holder-save", json!({}));
     Ok(())
 }
 

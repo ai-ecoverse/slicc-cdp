@@ -137,9 +137,6 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let mut cdp = connected;
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
     state.webmcp_connection = cdp_client::hash::sha256_hex(endpoint.as_bytes());
-    if command.starts_with("webmcp-") {
-        crate::webmcp_namespace::record(&state, invocation.flags.get("tab").map(String::as_str).unwrap_or(""), command, serde_json::json!({}));
-    }
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
