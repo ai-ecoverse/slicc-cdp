@@ -159,7 +159,7 @@ impl Cdp {
         let result = (|| {
             let arm = self.webmcp.arms.remove(session).ok_or_else(|| self.refusal())?;
             self.webmcp.arms.insert(fresh.clone(), arm);
-            self.call_for("Runtime.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
+            self.webmcp_plain_enable(&fresh, until)?;
             self.webmcp_install_root(&fresh)?;
             self.call_for("Page.enable", json!({}), Some(&fresh), until.saturating_duration_since(Instant::now()))?;
             Ok(())
@@ -173,6 +173,19 @@ impl Cdp {
         }
         let _ = self.call_for("Target.detachFromTarget", json!({"sessionId":fresh}), None, until.saturating_duration_since(Instant::now()));
         result
+    }
+
+    fn webmcp_plain_enable(&mut self, session: &str, deadline: Instant) -> Result<(), String> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(1));
+        loop {
+            let result = self.call_for("Runtime.enable", json!({}), Some(session), deadline.saturating_duration_since(Instant::now()));
+            let Err(message) = result else { return Ok(()); };
+            let refusal = message.strip_prefix("Runtime.enable: ").unwrap_or(&message).starts_with("slicc: refused:");
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !refusal || left.is_zero() { return Err(message); }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+            if Instant::now() >= deadline { return Err(message); }
+        }
     }
 
     fn webmcp_stable<T>(&mut self, session: &str, deadline: Instant, mut attempt: impl FnMut(&mut Self, Duration) -> Result<T, String>) -> Result<T, String> {
@@ -942,4 +955,5 @@ impl Cdp {
 #[cfg(test)]
 mod tests {
     include!("webmcp_guard_test.rs");
+    include!("webmcp_plain_retry_test.rs");
 }
