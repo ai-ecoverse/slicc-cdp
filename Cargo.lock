@@ -635,23 +635,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "slicc-browsers"
-version = "1.18.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c397046249a6a498f693a0423bfe0f8271107831b93dd6fa827d909ec2120c08"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "slicc-cdp"
 version = "0.0.0"
 dependencies = [
  "image",
  "libc",
  "serde_json",
- "slicc-browsers 1.18.21",
+ "slicc-browsers",
  "slicc-cdp-client",
  "slicc-discovery",
  "url",
@@ -666,7 +656,7 @@ dependencies = [
  "native-tls",
  "openssl",
  "serde_json",
- "slicc-browsers 0.0.0",
+ "slicc-browsers",
  "url",
  "wasix-net",
 ]
