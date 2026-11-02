@@ -149,10 +149,10 @@ impl Cdp {
             }
             return Err(self.refusal());
         }
-        if !self.collect_document_frames(&tree, &mut frames, true, None) {
+        if !self.placed_frames(&tree, &mut frames, true, None) {
             #[cfg(test)]
             self.runtime_prepare_frames(&tree, &frames);
-            return Err(self.refusal());
+            return Err(self.document_refusal());
         }
         #[cfg(test)]
         self.runtime_prepare_probe("frame-origin", json!({}));

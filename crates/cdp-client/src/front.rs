@@ -74,7 +74,7 @@ impl Cdp {
         if self.guard_sessions.contains(session) || self.blocked.contains(session) || self.protected_targets.contains(&own) {
             return Err(self.refusal());
         }
-        self.document_state_for(&own, true, None).ok_or_else(|| self.refusal())?;
+        self.document_state_for(&own, true, None).ok_or_else(|| self.document_refusal())?;
         if self.blocked.contains(session) { return Err(self.refusal()) }
         Ok(own)
     }
