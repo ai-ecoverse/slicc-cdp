@@ -37,7 +37,10 @@ for (const available of [true, false])
 
 test('root tool count remains eight while the passive trace names normal instruction location and listing policy', () => {
   assert.match(chrome, /assert\.equal\(JSON\.parse\(listed\.stdout\)\.length, 8\)/);
-  assert.match(chrome, /const listed = await once\(wire\.url/);
+  assert.match(chrome, /const listed = await once\(browser\.wsUrl/);
+  assert.match(chrome, /holder = command\(browser\.wsUrl, cwd/);
+  assert.match(chrome, /conversionHolder = command\(wire\.url, cwd/);
+  assert.match(chrome, /mainPolicy/);
   assert.match(chrome, /webmcp-root-tools-tap/);
   assert.match(wire, /location: params\.callFrames\?\.\[0\]\?\.location/);
   assert.match(wire, /command\.method === 'Page\.getPermissionsPolicyState'/);

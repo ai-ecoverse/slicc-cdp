@@ -125,6 +125,7 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
   let wire;
   let ordinaryGuard;
   let holder;
+  let conversionHolder;
   let server;
   try {
     const keyPath = path.join(cwd, 'key.pem');
@@ -217,11 +218,26 @@ if (document.modelContext) {
       baselineSamples.push(performance.now() - started);
     }
     assert.equal((await hasShim(raw, sessionId)).api, false);
+    const { targetId: conversionTarget } = await raw.send('Target.createTarget', {
+      url: 'about:blank',
+      background: true,
+    });
+    const { sessionId: conversionSession } = await raw.send('Target.attachToTarget', {
+      targetId: conversionTarget,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, conversionSession);
+    await navigate(raw, conversionSession, `${ordinary}/tools?conversion-control`);
     wire = await webmcpWire(browser.wsUrl);
-    holder = command(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
-    const status = await holder.ready;
-    assert.equal(status.mode, 'polyfill');
-    assert.equal(status.pauseMicros.length, 1);
+    conversionHolder = command(wire.url, cwd, [
+      'webmcp-polyfill',
+      '--tab',
+      conversionTarget,
+      '--reload',
+    ]);
+    const conversionStatus = await conversionHolder.ready;
+    assert.equal(conversionStatus.mode, 'polyfill');
+    assert.equal(conversionStatus.pauseMicros.length, 1);
     const conversion = wire.snapshot().gates;
     const ownedPause = conversion.find(({ method }) => method === 'Debugger.pause');
     assert.ok(ownedPause, 'direct holder must convert with its owned private pause');
@@ -239,6 +255,15 @@ if (document.modelContext) {
           event === 'Debugger.paused' && session === ownedPause.session && reason === 'other'
       )
     );
+    conversionHolder.child.stdin.end();
+    const conversionEnded = await conversionHolder.ended;
+    assert.equal(conversionEnded.code, 0, conversionEnded.stderr);
+    conversionHolder = undefined;
+    await raw.send('Target.closeTarget', { targetId: conversionTarget });
+    holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    const status = await holder.ready;
+    assert.equal(status.mode, 'polyfill');
+    assert.equal(status.pauseMicros.length, 1);
     ordinaryGuard = await guarded(browser.wsUrl, 'https://own.invalid', {
       variant: 'prompt',
       detachDelay: 0,
@@ -277,9 +302,15 @@ if (document.modelContext) {
         sessionId
       )
     ).result.value;
-    const listed = await once(wire.url, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+    const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+    const mainTree = await raw.send('Page.getFrameTree', {}, sessionId);
+    const mainPolicy = await raw.send(
+      'Page.getPermissionsPolicyState',
+      { frameId: mainTree.frameTree.frame.id },
+      sessionId
+    );
     t.diagnostic(
-      `webmcp-root-tools-tap ${JSON.stringify({ registration, listCode: listed.code, listStderr: listed.stderr, listStdout: listed.stdout, wire: wire.snapshot() })}`
+      `webmcp-root-tools-tap ${JSON.stringify({ registration, listCode: listed.code, listStderr: listed.stderr, listStdout: listed.stdout, mainPolicy, conversionWire: wire.snapshot() })}`
     );
     assert.equal(listed.code, 0, listed.stderr);
     assert.equal(JSON.parse(listed.stdout).length, 8);
@@ -385,6 +416,7 @@ if (document.modelContext) {
   } finally {
     holder?.child.kill('SIGKILL');
     await ordinaryGuard?.close();
+    conversionHolder?.child.kill('SIGKILL');
     await wire?.close();
     await raw?.close();
     await browser?.close();

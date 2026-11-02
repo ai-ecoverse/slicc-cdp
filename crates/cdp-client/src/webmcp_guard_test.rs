@@ -303,10 +303,10 @@ fn a_same_origin_child_created_after_the_root_was_accepted_installs_on_placement
     state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"}}]);
     cdp.absorb(event("Page.frameNavigated", json!({"frame":state.borrow().tree["frameTree"]["childFrames"][0]["frame"]})));
     child_context(&mut cdp, &state, 8, "CHILD-CONTEXT");
-    cdp.webmcp_sweep();
+    cdp.webmcp_install_children();
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
     assert_eq!(cdp.webmcp_generations().len(), 2);
-    cdp.webmcp_sweep();
+    cdp.webmcp_install_children();
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
 }
 
@@ -350,8 +350,8 @@ fn direct_child_runtime_path_is_a_noop_after_the_owned_pause_path_installed_the_
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
     let samples = cdp.webmcp_pause_micros().len();
     cdp.webmcp.handling_children = false;
-    cdp.webmcp_sweep();
-    cdp.webmcp_sweep();
+    cdp.webmcp_install_children();
+    cdp.webmcp_install_children();
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
     assert_eq!(cdp.webmcp_pause_micros().len(), samples);
     assert_eq!(cdp.webmcp_generations().iter().filter(|entry| entry["frameId"] == "C").count(), 1);
@@ -365,17 +365,17 @@ fn child_about_blank_context_is_replaced_and_only_the_final_document_receives_th
     state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":blank}]);
     cdp.absorb(event("Page.frameNavigated", json!({"frame":blank})));
     child_context(&mut cdp, &state, 8, "BLANK-CONTEXT");
-    cdp.webmcp_sweep();
+    cdp.webmcp_install_children();
     assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "BLANK-CONTEXT"));
     let placed = json!({"id":"C","parentId":"F","loaderId":"FINAL","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"});
     state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":placed}]);
     cdp.absorb(event("Runtime.executionContextDestroyed", json!({"executionContextId":8})));
     cdp.absorb(event("Page.frameNavigated", json!({"frame":placed})));
     child_context(&mut cdp, &state, 9, "FINAL-CONTEXT");
-    cdp.webmcp_sweep();
+    cdp.webmcp_install_children();
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "FINAL-CONTEXT").count(), 1);
     assert!(cdp.webmcp_generations().iter().any(|entry| entry["frameId"] == "C" && entry["loaderId"] == "FINAL" && entry["uniqueId"] == "FINAL-CONTEXT"));
-    cdp.webmcp_sweep();
+    cdp.webmcp_install_children();
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "FINAL-CONTEXT").count(), 1);
 }
 
@@ -388,13 +388,13 @@ fn child_context_created_before_live_placement_waits_and_never_installs_in_unpla
         let announced = json!({"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"});
         cdp.absorb(event("Page.frameNavigated", json!({"frame":announced})));
         child_context(&mut cdp, &state, 8, "PENDING-CHILD");
-        cdp.webmcp_sweep();
+        cdp.webmcp_install_children();
         assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "PENDING-CHILD"));
         assert!(cdp.webmcp.arms["H"].pending_children.contains_key(&8));
         let final_frame = if protected { json!({"id":"C","parentId":"F","loaderId":"PROTECTED","url":"https://seven.sliccy.ai/child","securityOrigin":"https://seven.sliccy.ai"}) } else { announced };
         state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":final_frame}]);
         cdp.absorb(event("Page.frameNavigated", json!({"frame":final_frame})));
-        cdp.webmcp_sweep();
+        cdp.webmcp_install_children();
         assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "PENDING-CHILD").count(), usize::from(!protected));
         if protected { assert!(!cdp.webmcp_alive("H")); }
     }

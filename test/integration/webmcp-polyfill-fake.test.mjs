@@ -275,7 +275,7 @@ await test('fake: document readiness follows generation metadata persistence', a
   }
 });
 
-await test('fake: document readiness reports only the guarded main-document installation', async () => {
+await test('fake: document readiness reports the root installation before a placed same-origin child executes', async () => {
   const backend = await webmcpBackend({
     definitions: [{ name: 'top', execute: () => 'top' }],
     children: [
@@ -315,7 +315,7 @@ await test('fake: document readiness reports only the guarded main-document inst
     const ready = await complete;
     assert.equal(ready.value.tab, 'TAB');
     assert.equal(ready.childLoaded, false);
-    assert.equal(backend.pages.get('CHILD').document.modelContext, undefined);
+    assert.equal(backend.pages.get('CHILD').document.modelContext?.__slicc_webmcp_shim, true);
     const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
     assert.equal(listed.code, 0, listed.stderr);
     assert.deepEqual(

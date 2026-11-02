@@ -3362,6 +3362,7 @@ impl Cdp {
             None => Ok(false),
         };
         self.webmcp_sweep();
+        self.webmcp_install_children();
         result
     }
 

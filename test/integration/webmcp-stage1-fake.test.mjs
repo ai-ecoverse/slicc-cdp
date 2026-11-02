@@ -164,7 +164,8 @@ await test('fake: shipped plain fallback retains ordinary iframes and lists and 
       }
       if (
         command.method === 'Runtime.evaluate' &&
-        command.params.expression.startsWith('const __wmcp_')
+        command.params.expression.startsWith('const __wmcp_') &&
+        command.params.uniqueContextId === `main-${pages.get('TAB').loader}`
       ) {
         setImmediate(() => {
           pages
