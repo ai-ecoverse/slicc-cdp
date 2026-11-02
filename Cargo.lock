@@ -628,7 +628,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 [[package]]
 name = "slicc-browsers"
 version = "0.0.0"
-source = "git+https://github.com/ai-ecoverse/slicc-browsers?rev=195f7d371bc3add40efb6007c819c1ca65955a06#195f7d371bc3add40efb6007c819c1ca65955a06"
+source = "git+https://github.com/ai-ecoverse/slicc-browsers?rev=11b09f5d17f32eabf404873f9172ae595ecf3c7f#11b09f5d17f32eabf404873f9172ae595ecf3c7f"
 dependencies = [
  "serde",
  "serde_json",
