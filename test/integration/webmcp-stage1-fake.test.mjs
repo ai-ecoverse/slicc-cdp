@@ -128,11 +128,9 @@ await test('fake: shipped other-extension fallback has a clear zero-tools messag
       assert.ok(
         backend.calls.slice(refusal + 1).every((call) => !call.method.startsWith('Debugger.'))
       );
+      assert.ok(backend.calls.some((call) => call.method === 'Page.getFrameTree'));
       assert.ok(
-        backend.calls.some(
-          (call) =>
-            call.method === 'DOM.getDocument' && call.params.depth === -1 && call.params.pierce
-        )
+        backend.calls.every((call) => call.method !== 'DOM.getDocument' || !call.params.pierce)
       );
       assert.ok(
         backend.calls.some(

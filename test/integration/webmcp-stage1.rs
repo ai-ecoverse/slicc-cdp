@@ -444,24 +444,43 @@ fn document_change_after_publication_never_installs_in_the_new_document() {
 }
 
 #[test]
-fn source_and_call_frame_methods_remain_refused_at_a_published_pause() {
+fn generic_debugger_clients_refuse_persistent_calls_and_never_publish_unplaced_events() {
     let (mut cdp, state, session) = fixture();
-    cdp.call("Debugger.enable", json!({}), Some(&session))
-        .unwrap();
-    cdp.call(
-        "Debugger.setInstrumentationBreakpoint",
-        json!({"instrumentation":"beforeScriptExecution"}),
-        Some(&session),
-    )
-    .unwrap();
-    cdp.call("Page.reload", json!({}), Some(&session)).unwrap();
-    while !cdp
-        .events()
-        .iter()
-        .any(|event| event["method"] == "Debugger.paused")
-    {
-        assert!(cdp.pump(Instant::now() + Duration::from_secs(1)).unwrap());
+    let before = state.borrow().calls.len();
+    for (method, params) in [
+        ("Debugger.enable", json!({})),
+        ("Debugger.disable", json!({})),
+        ("Debugger.resume", json!({})),
+        ("Debugger.setInstrumentationBreakpoint", json!({"instrumentation":"beforeScriptExecution"})),
+        ("Debugger.removeBreakpoint", json!({"breakpointId":"UNOWNED"})),
+    ] {
+        assert_eq!(cdp.call(method, params, Some(&session)).unwrap_err(), "slicc: refused: persistent page capabilities are not supported by slicc-cdp\n");
     }
+    assert_eq!(state.borrow().calls.len(), before);
+    state.borrow_mut().incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":session,"params":{"scriptId":"NEVER-PLACED","executionContextId":404,"url":"","embedderName":"","hash":"reader-a-private-marker"}}).to_string());
+    state.borrow_mut().incoming.push_back(json!({"method":"Debugger.paused","sessionId":session,"params":{"reason":"instrumentation","data":{"scriptId":"NEVER-PLACED"},"callFrames":[{"callFrameId":"1.404.1","location":{"scriptId":"NEVER-PLACED"},"scopeChain":[{"object":{"objectId":"1.404.2"}}],"this":{"objectId":"1.404.3"}}]}}).to_string());
+    for _ in 0..2 { assert!(cdp.pump(Instant::now() + Duration::from_secs(1)).unwrap()); }
+    assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")));
+}
+
+#[test]
+fn holder_debugger_events_remain_private_while_installation_still_works() {
+    let (mut cdp, state, session) = fixture();
+    cdp.start_webmcp_for(&session, true).unwrap();
+    assert!(state.borrow().published);
+    assert_eq!(count(&state.borrow(), "Debugger.enable"), 1);
+    assert_eq!(count(&state.borrow(), "Debugger.setInstrumentationBreakpoint"), 1);
+    assert_eq!(count(&state.borrow(), "Runtime.evaluate"), 1);
+    assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")));
+    assert!(cdp.call("Debugger.resume", json!({}), Some(&session)).is_err());
+}
+
+#[test]
+fn source_and_call_frame_methods_remain_refused_after_a_holder_pause() {
+    let (mut cdp, state, session) = fixture();
+    cdp.start_webmcp_for(&session, true).unwrap();
+    assert!(state.borrow().published);
+    assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")));
     for (method, params) in [
         ("Debugger.getScriptSource", json!({"scriptId":"SCRIPT"})),
         (

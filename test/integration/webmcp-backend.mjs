@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import vm from 'node:vm';
 import { fakeCdp } from './fake-cdp.mjs';
 
@@ -116,9 +117,11 @@ export async function webmcpBackend({
       .filter((child) => !child.oopif)
       .map((child) => ({ frame: frame(pages.get(child.id)) })),
   });
+  const commands = new EventEmitter();
   const fake = await fakeCdp({
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
+      commands.emit('command', message);
       if (onCommand(message, pages, send, sessions) === true) return true;
       const answer = (result) => send({ id, result });
       const event = (method, params, peer = sessionId) =>
@@ -239,6 +242,10 @@ export async function webmcpBackend({
               peer
             );
           if (scripts.has(peer)) begin(peer);
+        }
+        if (scripts.size === 0) {
+          loadFired = true;
+          for (const peer of sessions.keys()) event('Page.loadEventFired', { timestamp: 1 }, peer);
         }
       };
       navigateLatest = navigate;
@@ -538,6 +545,21 @@ export async function webmcpBackend({
     });
   return {
     ...fake,
+    waitForCommand(predicate) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          commands.off('command', check);
+          reject(new Error('child release command did not arrive'));
+        }, 5000);
+        const check = (command) => {
+          if (!predicate(command)) return;
+          clearTimeout(timer);
+          commands.off('command', check);
+          resolve(command);
+        };
+        commands.on('command', check);
+      });
+    },
     get page() {
       return pages.get('TAB');
     },

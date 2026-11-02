@@ -557,12 +557,23 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.call_guarded_for(method, params, session_id, timeout, false)
+    }
+
+    fn call_guarded_for(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        holder_debugger: bool,
+    ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
         #[cfg(test)]
         if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
         #[cfg(test)]
         self.runtime_stage(method, "admit");
-        self.admit(method, &params, session_id)?;
+        self.admit_for(method, &params, session_id, holder_debugger)?;
         if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
@@ -748,7 +759,11 @@ impl Cdp {
     }
 
     fn admit(&mut self, method: &str, params: &Value, session_id: Option<&str>) -> Result<(), String> {
-        if debugger_domain(method) && !matches!(debugger_lifetime(method), Some(DebuggerLifetime::Persistent | DebuggerLifetime::Cleanup | DebuggerLifetime::Control)) { return Err(PERSISTENT.into()); }
+        self.admit_for(method, params, session_id, false)
+    }
+
+    fn admit_for(&mut self, method: &str, params: &Value, session_id: Option<&str>, holder_debugger: bool) -> Result<(), String> {
+        if debugger_domain(method) && (!holder_debugger || !matches!(debugger_lifetime(method), Some(DebuggerLifetime::Persistent | DebuggerLifetime::Cleanup | DebuggerLifetime::Control))) { return Err(PERSISTENT.into()); }
         if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Err(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" {
             if params.get("accept").and_then(Value::as_bool).is_none()
@@ -938,7 +953,7 @@ impl Cdp {
     }
 
     pub fn settled_refusal(&self, method: &str, params: &Value, session_id: Option<&str>) -> Option<String> {
-        if debugger_domain(method) && !matches!(debugger_lifetime(method), Some(DebuggerLifetime::Persistent | DebuggerLifetime::Cleanup | DebuggerLifetime::Control)) { return Some(PERSISTENT.into()); }
+        if debugger_domain(method) { return Some(PERSISTENT.into()); }
         let session_id = session_id.filter(|id| !id.is_empty());
         if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Some(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" || harmless(method, params) { return None }
@@ -3093,6 +3108,7 @@ impl Cdp {
             }
             return;
         }
+        if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Debugger.")) { return; }
         if guarded && !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") {
             self.fail_seen_network(&value);
             return;

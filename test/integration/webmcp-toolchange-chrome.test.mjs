@@ -160,7 +160,7 @@ for (const protectedFrames of [true, false]) {
             `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
           if (url.pathname === '/cross') {
             res.end(
-              `<!doctype html><script>const crossController = new AbortController(); window.addCross = () => document.modelContext.registerTool(${tool('cross_late')}, { signal: crossController.signal }); window.removeCross = () => crossController.abort();</script>`
+              `<!doctype html><script>const crossController = new AbortController(); window.addCross = () => document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); window.removeCross = () => crossController.abort();</script>`
             );
             return;
           }
@@ -248,14 +248,19 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         const childSession = (
           await raw.send('Target.attachToTarget', { targetId: foreign.targetId, flatten: true })
         ).sessionId;
-        assert.equal(await evaluate(raw, childSession, 'typeof document.modelContext'), 'object');
+        assert.equal(
+          await evaluate(raw, childSession, 'typeof document.modelContext'),
+          'undefined'
+        );
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
       }
       const navigated = held.lines.length;
-      const framesReady = held.next(
-        (line) => line.event === 'document-ready' && line.loaderId !== ready.loaderId,
-        navigated
-      );
+      const framesReady = protectedFrames
+        ? held.ended
+        : held.next(
+            (line) => line.event === 'document-ready' && line.loaderId !== ready.loaderId,
+            navigated
+          );
       const [, document] = await Promise.all([
         navigate(raw, sessionId, `${ordinary}/${protectedFrames ? 'frames' : 'ordinary-frames'}`),
         framesReady,
@@ -316,7 +321,8 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
         assert.equal(JSON.stringify(watcher.lines).includes('protected_tool'), false);
       }
-      assert.ok(document.loaderId);
+      if (protectedFrames) assert.notEqual(document, 0);
+      else assert.ok(document.loaderId);
 
       const crossControl = async (stale) => {
         const child = (await raw.send('Target.getTargets', {})).targetInfos.find(
@@ -330,42 +336,50 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         const childSession = (
           await raw.send('Target.attachToTarget', { targetId: child.targetId, flatten: true })
         ).sessionId;
-        const fromOrigin = async () => {
-          const listed = await once(wire.url, cwd, [
-            'webmcp-list',
-            '--tab',
-            targetId,
-            '--json',
-            '--from-origin',
-            `https://foreign.test:${port}`,
-          ]);
-          assert.equal(listed.code, 0, listed.stderr);
-          return JSON.parse(listed.stdout).filter((tool) => tool.frameId === child.targetId);
-        };
-        let start = held.lines.length;
-        await evaluate(raw, childSession, 'addCross()');
-        const added = await held.next(changed(child.targetId), start);
-        assert.equal(added.tab, targetId);
-        assert.equal(added.target, child.targetId);
-        assert.equal(added.origin, `https://foreign.test:${port}`);
-        assert.deepEqual(names(added), ['cross_late']);
-        assert.deepEqual(added.tools, await fromOrigin());
-        start = held.lines.length;
-        await evaluate(raw, childSession, 'removeCross()');
-        const removed = await held.next(changed(child.targetId), start);
-        assert.equal(removed.target, child.targetId);
-        assert.equal(removed.loaderId, added.loaderId);
-        assert.deepEqual(removed.tools, []);
-        assert.deepEqual(await fromOrigin(), []);
+        assert.equal(
+          await evaluate(raw, childSession, 'typeof document.modelContext'),
+          'undefined'
+        );
+        const listed = await once(wire.url, cwd, [
+          'webmcp-list',
+          '--tab',
+          targetId,
+          '--json',
+          '--from-origin',
+          `https://foreign.test:${port}`,
+        ]);
+        assert.equal(listed.code, 0, listed.stderr);
+        assert.match(listed.stderr, /cross-origin child tools are unavailable/);
+        const tools = JSON.parse(listed.stdout);
+        assert.ok(tools.some((tool) => tool.name === 'initial'));
+        assert.equal(
+          tools.some((tool) => tool.frameId === child.targetId),
+          false
+        );
+        const called = await once(wire.url, cwd, [
+          'webmcp-call',
+          'initial',
+          '{}',
+          '--tab',
+          targetId,
+        ]);
+        assert.equal(called.code, 0, called.stderr);
+        assert.equal(called.stdout.trim(), 'initial');
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
         return child.targetId;
       };
 
-      const ordinaryReady = held.next(
-        (line) => line.event === 'document-ready' && line.loaderId !== document.loaderId,
-        held.lines.length
-      );
-      await Promise.all([navigate(raw, sessionId, `${ordinary}/ordinary-frames`), ordinaryReady]);
+      if (protectedFrames) {
+        await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
+        held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+        assert.equal((await held.next((line) => line.event === 'ready', 0)).mode, 'polyfill');
+      } else {
+        const ordinaryReady = held.next(
+          (line) => line.event === 'document-ready' && line.loaderId !== document.loaderId,
+          held.lines.length
+        );
+        await Promise.all([navigate(raw, sessionId, `${ordinary}/ordinary-frames`), ordinaryReady]);
+      }
       const navigatedCross = await crossControl([cross.targetId]);
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);

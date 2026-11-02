@@ -220,6 +220,27 @@ fn numeric_context_reuse_during_installation_or_resume_revokes_the_installer() {
 }
 
 #[test]
+fn source_and_call_frame_methods_remain_refused_at_a_holder_held_pause() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp.handling_gate = true;
+    cdp.absorb(paused());
+    assert!(cdp.webmcp_is_paused("H"));
+    assert_eq!(cdp.webmcp.pending_gates.len(), 1);
+    let count = state.borrow().sent.len();
+    for (method, params) in [
+        ("Debugger.getScriptSource", json!({"scriptId":"SCRIPT"})),
+        ("Debugger.evaluateOnCallFrame", json!({"callFrameId":"CALL","expression":"1"})),
+    ] {
+        assert!(cdp.call(method, params, Some("H")).is_err());
+        assert_eq!(state.borrow().sent.len(), count);
+    }
+    assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")));
+    cdp.webmcp.handling_gate = false;
+    cdp.stop_webmcp("H");
+}
+
+#[test]
 fn vetted_webmcp_installer_admits_only_guard_verified_documents() {
     let (mut cdp, state) = client();
     let bridge = cdp.start_webmcp_for("H", true).unwrap();
@@ -274,6 +295,29 @@ fn holder_navigation_history_and_protected_bfcache_cannot_inject_protected_docum
 }
 
 #[test]
+fn holder_protected_bfcache_restore_has_no_shim_and_no_tool_access() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp("H").unwrap();
+    state.borrow_mut().api = false;
+    let tree = frame("https://seven.sliccy.ai/");
+    cdp.absorb(event("Page.frameNavigated", json!({"type":"BackForwardCacheRestore","frame":tree["frameTree"]["frame"]})));
+    no_protected_api(&mut cdp, &state);
+}
+
+#[test]
+fn refused_blank_installer_never_arms_for_a_future_protected_document() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().tree = frame("about:blank");
+    assert!(cdp.start_webmcp("H").is_err());
+    assert!(!state.borrow().api);
+    assert!(cdp.webmcp_snapshot().is_empty());
+    assert!(!state.borrow().sent.iter().any(|call| call["method"] == "Page.addScriptToEvaluateOnNewDocument"));
+    enter_document(&mut cdp, &state, frame("https://seven.sliccy.ai/"), "F");
+    no_protected_api(&mut cdp, &state);
+    assert!(cdp.webmcp_snapshot().is_empty());
+}
+
+#[test]
 fn holder_protected_child_frame_never_installs() {
     let (mut cdp, state) = client();
     cdp.start_webmcp("H").unwrap();
@@ -293,11 +337,11 @@ fn holder_protected_oopif_is_detached_without_injection_or_tool_access() {
     cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://seven.sliccy.ai/"},"waitingForDebugger":true})));
     assert!(cdp.take_webmcp_children().is_empty());
     assert!(cdp.session_blocked("CHILD"));
-    assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && matches!(command["method"].as_str(), Some("Runtime.evaluate" | "Page.addScriptToEvaluateOnNewDocument"))));
+    assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Page.addScriptToEvaluateOnNewDocument"));
+    assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.modelContext.getTools()"}), Some("CHILD")).is_err());
+    assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.modelContext.executeTool('secret', {})"}), Some("CHILD")).is_err());
+    assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate"));
     assert!(!cdp.take_notices().iter().any(|notice| notice.contains("child tools are unavailable")));
-    for expression in ["document.modelContext.getTools()", "document.modelContext.executeTool('secret', {})"] {
-        assert!(cdp.call("Runtime.evaluate", json!({"expression":expression}), Some("CHILD")).is_err());
-    }
 }
 
 #[test]
@@ -318,6 +362,7 @@ fn holder_commit_before_attach_refuses_installation() {
     let (mut cdp, state) = client();
     state.borrow_mut().tree = frame("https://seven.sliccy.ai/");
     assert!(cdp.start_webmcp("H").is_err());
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Page.addScriptToEvaluateOnNewDocument"));
     assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate"));
     no_protected_api(&mut cdp, &state);
 }

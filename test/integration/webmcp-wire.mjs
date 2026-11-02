@@ -12,7 +12,7 @@ export async function webmcpWire(endpoint) {
     if (recent.length > 120) recent.shift();
     if (
       entry.event ||
-      /Debugger\.(resume|evaluateOnCallFrame)|Page\.(addScript|removeScript)|Runtime\.runIfWaiting|Fetch\./.test(
+      /Debugger\.(pause|resume|evaluateOnCallFrame)|Page\.(addScript|removeScript)|Runtime\.runIfWaiting|Fetch\./.test(
         entry.method || entry.reply
       )
     ) {

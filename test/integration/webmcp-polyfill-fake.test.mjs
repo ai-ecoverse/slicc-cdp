@@ -383,7 +383,7 @@ await test('fake: verified response policy can be observed on the parent holder 
   });
 });
 
-await test('fake: same-origin aggregation and explicit foreign exposure/delegation with ambiguous tool selection', async () => {
+await test('fake: same-origin aggregation keeps ambiguous selection and cross-origin requests refuse child tools', async () => {
   await fixture(
     '',
     async (backend, cwd) => {
@@ -405,8 +405,11 @@ await test('fake: same-origin aggregation and explicit foreign exposure/delegati
         '--from-origin',
         'https://foreign.test/',
       ]);
-      assert.equal(cross.length, 5);
-      assert.equal(cross.find((tool) => tool.name === 'foreign').origin, 'https://foreign.test');
+      assert.equal(cross.length, 4);
+      assert.equal(
+        cross.some((tool) => tool.name === 'foreign'),
+        false
+      );
       assert.equal(
         cross.some((tool) => tool.name === 'hidden'),
         false
@@ -428,8 +431,8 @@ await test('fake: same-origin aggregation and explicit foreign exposure/delegati
         cwd,
         backend.url
       );
-      assert.equal(called.code, 0, called.stderr);
-      assert.equal(called.stdout.trim(), 'foreign child');
+      assert.equal(called.code, 2, called.stderr);
+      assert.equal(called.stdout, '');
     },
     [
       {
@@ -629,7 +632,7 @@ await test('fake: frame owners use bounded parent DOM metadata rather than frame
       children: [
         {
           id: 'CROSS',
-          origin: 'https://cross.test',
+          origin: 'https://ordinary.test',
           allow: 'tools *',
           definitions: [
             { name: 'child', exposedTo: ['https://ordinary.test'], execute: () => 'child' },
@@ -650,7 +653,7 @@ await test('fake: frame owners use bounded parent DOM metadata rather than frame
     });
     try {
       const result = await run(
-        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://cross.test'],
+        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://ordinary.test'],
         cwd,
         backend.url
       );
@@ -678,7 +681,7 @@ await test('fake: native child calls recheck loader, policy and delegation and p
     const children = [
       {
         id: 'CROSS',
-        origin: 'https://cross.test',
+        origin: 'https://ordinary.test',
         allow: 'tools *',
         definitions: [
           {
@@ -706,7 +709,7 @@ await test('fake: native child calls recheck loader, policy and delegation and p
         },
       });
       const called = await run(
-        ['webmcp-call', 'child', '{}', '--tab', 'TAB', '--from-origin', 'https://cross.test'],
+        ['webmcp-call', 'child', '{}', '--tab', 'TAB', '--from-origin', 'https://ordinary.test'],
         cwd,
         backend.url
       );

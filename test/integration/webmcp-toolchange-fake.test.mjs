@@ -89,26 +89,16 @@ async function unavailableChild(backend, held, targetInfo) {
   const peer = [...backend.scripts.keys()].find(
     (session) => backend.sessions.get(session) === 'TAB'
   );
-  const refused = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      held.child.stderr.off('data', check);
-      reject(new Error('child unavailable error did not arrive'));
-    }, 5000);
-    const check = () => {
-      if (!held.stderr().includes('cross-origin child tools are unavailable')) return;
-      clearTimeout(timer);
-      held.child.stderr.off('data', check);
-      resolve();
-    };
-    held.child.stderr.on('data', check);
-    check();
-  });
+  const released = backend.waitForCommand(
+    (call) =>
+      call.method === 'Target.detachFromTarget' && call.params.sessionId === targetInfo.targetId
+  );
   backend.inject({
     method: 'Target.attachedToTarget',
     sessionId: peer,
     params: { sessionId: targetInfo.targetId, targetInfo, waitingForDebugger: true },
   });
-  await refused;
+  await released;
 }
 
 async function scenario(options, check, args) {
@@ -221,7 +211,10 @@ test('fake: a cross-origin iframe registering after load reports its frame and o
         type: 'iframe',
         url: 'https://seven.sliccy.ai/',
       });
-      assert.match(held.stderr(), /webmcp-polyfill: cross-origin child tools are unavailable/);
+      assert.doesNotMatch(
+        held.stderr(),
+        /webmcp-polyfill: cross-origin child tools are unavailable/
+      );
       await unavailableChild(backend, held, {
         targetId: 'CROSS',
         type: 'iframe',
