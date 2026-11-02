@@ -5,6 +5,7 @@ export async function webmcpWire(endpoint) {
   const recent = [];
   const gates = [];
   const responses = [];
+  const permissions = [];
   const probes = new Map();
   const record = (entry) => {
     entry.at = Date.now();
@@ -12,6 +13,7 @@ export async function webmcpWire(endpoint) {
     if (recent.length > 120) recent.shift();
     if (
       entry.event ||
+      entry.pinnedShim ||
       /Debugger\.(pause|resume|evaluateOnCallFrame)|Page\.(addScript|removeScript)|Runtime\.runIfWaiting|Fetch\./.test(
         entry.method || entry.reply
       )
@@ -54,6 +56,17 @@ export async function webmcpWire(endpoint) {
               peer.sessions.set(value.result.sessionId, command.target);
             }
             record({ reply: command.method, session: command.session, error: !!value.error });
+            if (command.method === 'Page.getPermissionsPolicyState') {
+              const tools = value.result?.states?.find(({ feature }) => feature === 'tools');
+              permissions.push({
+                session: command.session,
+                frame: command.frame,
+                toolsPresent: !!tools,
+                allowed: tools?.allowed,
+                error: value.error?.message,
+              });
+              if (permissions.length > 80) permissions.shift();
+            }
             if (command.counter) {
               const answer = value.result?.result?.value;
               probes.set(command.session, {
@@ -84,6 +97,10 @@ export async function webmcpWire(endpoint) {
               frame: params.frameId,
               loader: params.loaderId,
               policyObserved: true,
+              policy:
+                Object.entries(headers).find(
+                  ([name]) => name.toLowerCase() === 'permissions-policy'
+                )?.[1] ?? null,
               explicitTools: Object.entries(headers).some(
                 ([name, value]) =>
                   name.toLowerCase() === 'permissions-policy' && String(value).includes('tools')
@@ -101,7 +118,14 @@ export async function webmcpWire(endpoint) {
             const script = params.callFrames?.[0]?.location?.scriptId;
             const frame = peer.contexts.get(key(peer.scripts.get(key(script))));
             const target = peer.sessions.get(session);
-            const pause = { event: value.method, session, target, frame, reason: params.reason };
+            const pause = {
+              event: value.method,
+              session,
+              target,
+              frame,
+              reason: params.reason,
+              location: params.callFrames?.[0]?.location,
+            };
             peer.pauses.set(session, pause);
             record(pause);
           }
@@ -143,6 +167,9 @@ export async function webmcpWire(endpoint) {
         method: message.method,
         session: message.sessionId,
         target: message.params?.targetId,
+        frame: message.params?.frameId,
+        uniqueContextId: message.params?.uniqueContextId,
+        pinnedShim: message.params?.expression?.startsWith('const __wmcp_') || undefined,
         immediate: message.params?.runImmediately,
         counter: message.params?.expression?.includes('listed.changes') || undefined,
       };
@@ -161,6 +188,7 @@ export async function webmcpWire(endpoint) {
       recent,
       gates,
       responses,
+      permissions,
       probes: [...probes.values()],
       pending: [...peers.values()].flatMap((peer) => [...peer.commands.values()]),
       pauses: [...peers.values()].flatMap((peer) => [...peer.pauses.values()]),

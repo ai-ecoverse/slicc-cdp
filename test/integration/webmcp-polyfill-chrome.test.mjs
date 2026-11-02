@@ -177,8 +177,13 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
           : '';
         res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
 if (document.modelContext) {
-  for (const name of ${JSON.stringify(names)}) document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
-}
+  globalThis.cdp675Registration = { branch: true, attempted: 0, registered: 0 };
+  for (const name of ${JSON.stringify(names)}) {
+    globalThis.cdp675Registration.attempted += 1;
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+    globalThis.cdp675Registration.registered += 1;
+  }
+} else globalThis.cdp675Registration = { branch: false, attempted: 0, registered: 0 };
 </script>`);
       }
     );
@@ -265,7 +270,17 @@ if (document.modelContext) {
       `webmcp-gate-measurement ${JSON.stringify({ baselineNavigationMs: baselineSamples, holderNavigationMs: holderSamples, medianNavigationOverheadMs: median(holderSamples) - median(baselineSamples), pauseMicros: status.pauseMicros })}`
     );
     assert.deepEqual(await hasShim(raw, sessionId), { secure: true, api: true, alias: true });
-    const listed = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+    const registration = (
+      await raw.send(
+        'Runtime.evaluate',
+        { expression: 'globalThis.cdp675Registration', returnByValue: true },
+        sessionId
+      )
+    ).result.value;
+    const listed = await once(wire.url, cwd, ['webmcp-list', '--tab', targetId, '--json']);
+    t.diagnostic(
+      `webmcp-root-tools-tap ${JSON.stringify({ registration, listCode: listed.code, listStderr: listed.stderr, listStdout: listed.stdout, wire: wire.snapshot() })}`
+    );
     assert.equal(listed.code, 0, listed.stderr);
     assert.equal(JSON.parse(listed.stdout).length, 8);
     const called = await once(browser.wsUrl, cwd, [

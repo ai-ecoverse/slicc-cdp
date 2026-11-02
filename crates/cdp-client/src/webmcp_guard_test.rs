@@ -16,6 +16,9 @@ struct BackendState {
     unconverted: bool,
     fail_tree: bool,
     context_race: String,
+    initial_child: bool,
+    child_loader_race: bool,
+    runtime_child: Option<Value>,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -112,6 +115,10 @@ impl Transport for Backend {
                 let mut created = context(&state.current_frame, "https://ordinary.test");
                 created["sessionId"] = command["sessionId"].clone();
                 state.inbox.push_back(created.to_string());
+                let child = state.runtime_child.clone().or_else(|| state.initial_child.then(|| json!({"id":8,"uniqueId":"CHILD-CONTEXT","origin":state.tree["frameTree"]["childFrames"][0]["frame"]["securityOrigin"],"auxData":{"frameId":"C","isDefault":true}})));
+                if let Some(child) = child {
+                    state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":command["sessionId"],"params":{"context":child}}).to_string());
+                }
                 json!({})
             }
             "Debugger.setInstrumentationBreakpoint" => {
@@ -136,6 +143,12 @@ impl Transport for Backend {
                     return Ok(());
                 }
                 state.api = true;
+                if state.child_loader_race && command["params"]["uniqueContextId"] == "CONTEXT" {
+                    state.tree["frameTree"]["childFrames"][0]["frame"]["loaderId"] = json!("REPLACED-CHILD");
+                }
+                if state.context_race == "child-evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT" {
+                    state.inbox.push_back(event("Runtime.executionContextCreated", json!({"context":{"id":8,"uniqueId":"REPLACED-CHILD-CONTEXT","origin":"https://ordinary.test","auxData":{"frameId":"C","isDefault":true}}})).to_string());
+                }
                 if state.context_race == "evaluate" {
                     let mut changed = context("F", "https://ordinary.test");
                     changed["params"]["context"]["uniqueId"] = json!("REUSED_CONTEXT");
@@ -238,6 +251,153 @@ fn source_and_call_frame_methods_remain_refused_at_a_holder_held_pause() {
     assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")));
     cdp.webmcp.handling_gate = false;
     cdp.stop_webmcp("H");
+}
+
+fn child_context(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, id: i64, unique: &str) {
+    let context = json!({"id":id,"uniqueId":unique,"origin":"https://ordinary.test","auxData":{"frameId":"C","isDefault":true}});
+    state.borrow_mut().runtime_child = Some(context.clone());
+    cdp.absorb(event("Runtime.executionContextCreated", json!({"context":context})));
+}
+
+#[test]
+fn initial_same_origin_child_installs_on_a_guarded_root_pause_once_without_child_debugger_publication() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().initial_child = true;
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"}}]);
+    cdp.start_webmcp_for("H", true).unwrap();
+    let installed = || state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).cloned().collect::<Vec<_>>();
+    assert_eq!(installed().len(), 2);
+    assert!(installed().iter().any(|command| command["params"]["uniqueContextId"] == "CHILD-CONTEXT"));
+    assert_eq!(cdp.webmcp_generations().len(), 2);
+    cdp.absorb(paused());
+    assert_eq!(installed().len(), 2, "a second pause never redeclares either realm's bridge");
+    assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")));
+    assert!(!state.borrow().sent.iter().any(|command| matches!(command["method"].as_str(), Some("Debugger.pause" | "Debugger.evaluateOnCallFrame"))));
+}
+
+#[test]
+fn initial_child_installation_rejects_foreign_unplaced_protected_and_replaced_child_or_root_identity() {
+    for mode in ["foreign", "unplaced", "protected", "child-loader", "child-unique", "root"] {
+        let (mut cdp, state) = client();
+        state.borrow_mut().initial_child = true;
+        let origin = match mode { "foreign" => "https://foreign.test", "protected" => "https://seven.sliccy.ai", "unplaced" => "null", _ => "https://ordinary.test" };
+        let url = if mode == "unplaced" { "about:blank".into() } else { format!("{origin}/child") };
+        state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":if mode == "unplaced" { "" } else { "CHILD" },"url":url,"securityOrigin":origin}}]);
+        state.borrow_mut().child_loader_race = mode == "child-loader";
+        state.borrow_mut().race = mode == "root";
+        if mode == "child-unique" { state.borrow_mut().context_race = "child-evaluate".into(); }
+        let result = cdp.start_webmcp_for("H", true);
+        if matches!(mode, "foreign" | "child-loader" | "child-unique") { assert!(result.is_ok(), "{mode}: {result:?}"); }
+        else { assert!(result.is_err(), "{mode}"); }
+        let child_installs = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count();
+        assert_eq!(child_installs, usize::from(mode == "child-unique"), "{mode}");
+        assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "REPLACED-CHILD-CONTEXT"));
+        assert!(!cdp.webmcp_generations().iter().any(|entry| entry["frameId"] == "C"), "{mode}");
+    }
+}
+
+#[test]
+fn a_same_origin_child_created_after_the_root_was_accepted_installs_on_placement() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"}}]);
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":state.borrow().tree["frameTree"]["childFrames"][0]["frame"]})));
+    child_context(&mut cdp, &state, 8, "CHILD-CONTEXT");
+    cdp.webmcp_sweep();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
+    assert_eq!(cdp.webmcp_generations().len(), 2);
+    cdp.webmcp_sweep();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
+}
+
+struct DirectChildPauseWire {
+    inner: Backend,
+    converting: bool,
+}
+
+impl Transport for DirectChildPauseWire {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let command: Value = serde_json::from_str(text).unwrap();
+        self.inner.send_text(text)?;
+        if command["method"] == "Debugger.pause" { self.converting = true; }
+        else if command["method"] == "Debugger.resume" && self.converting {
+            self.converting = false;
+            let mut state = self.inner.0.borrow_mut();
+            let reply = state.inbox.pop_back().unwrap();
+            let mut normal = paused();
+            normal["params"]["callFrames"][0]["location"]["scriptId"] = json!("CHILD-SCRIPT");
+            state.inbox.push_back(normal.to_string());
+            state.inbox.push_back(reply);
+        }
+        Ok(())
+    }
+    fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> { self.inner.recv_text(deadline) }
+}
+
+#[test]
+fn direct_child_runtime_path_is_a_noop_after_the_owned_pause_path_installed_the_realm() {
+    let (mut cdp, state) = client();
+    let child = json!({"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"});
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":child}]);
+    state.borrow_mut().initial_child = true;
+    cdp.webmcp.handling_children = true;
+    cdp.start_webmcp_for("H", false).unwrap();
+    cdp.call_for("Page.getFrameTree", json!({}), Some("H"), DOCUMENT_CHECK).unwrap();
+    cdp.ws = Box::new(DirectChildPauseWire { inner: Backend(state.clone()), converting: false });
+    cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":"CHILD-SCRIPT","executionContextId":8,"url":"https://ordinary.test/child.js"})));
+    cdp.absorb(event("Debugger.paused", json!({"reason":"instrumentation","data":{"scriptId":"CHILD-SCRIPT"},"callFrames":[{"callFrameId":"CHILD-CALL","location":{"scriptId":"CHILD-SCRIPT","lineNumber":0,"columnNumber":0}}]})));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Debugger.pause"));
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
+    let samples = cdp.webmcp_pause_micros().len();
+    cdp.webmcp.handling_children = false;
+    cdp.webmcp_sweep();
+    cdp.webmcp_sweep();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
+    assert_eq!(cdp.webmcp_pause_micros().len(), samples);
+    assert_eq!(cdp.webmcp_generations().iter().filter(|entry| entry["frameId"] == "C").count(), 1);
+}
+
+#[test]
+fn child_about_blank_context_is_replaced_and_only_the_final_document_receives_the_shim() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    let blank = json!({"id":"C","parentId":"F","loaderId":"BLANK","url":"about:blank","securityOrigin":"https://ordinary.test"});
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":blank}]);
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":blank})));
+    child_context(&mut cdp, &state, 8, "BLANK-CONTEXT");
+    cdp.webmcp_sweep();
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "BLANK-CONTEXT"));
+    let placed = json!({"id":"C","parentId":"F","loaderId":"FINAL","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"});
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":placed}]);
+    cdp.absorb(event("Runtime.executionContextDestroyed", json!({"executionContextId":8})));
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":placed})));
+    child_context(&mut cdp, &state, 9, "FINAL-CONTEXT");
+    cdp.webmcp_sweep();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "FINAL-CONTEXT").count(), 1);
+    assert!(cdp.webmcp_generations().iter().any(|entry| entry["frameId"] == "C" && entry["loaderId"] == "FINAL" && entry["uniqueId"] == "FINAL-CONTEXT"));
+    cdp.webmcp_sweep();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "FINAL-CONTEXT").count(), 1);
+}
+
+#[test]
+fn child_context_created_before_live_placement_waits_and_never_installs_in_unplaced_or_protected_content() {
+    for protected in [false, true] {
+        let (mut cdp, state) = client();
+        cdp.start_webmcp_for("H", true).unwrap();
+        state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"","url":"","securityOrigin":"null"}}]);
+        let announced = json!({"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"});
+        cdp.absorb(event("Page.frameNavigated", json!({"frame":announced})));
+        child_context(&mut cdp, &state, 8, "PENDING-CHILD");
+        cdp.webmcp_sweep();
+        assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "PENDING-CHILD"));
+        assert!(cdp.webmcp.arms["H"].pending_children.contains_key(&8));
+        let final_frame = if protected { json!({"id":"C","parentId":"F","loaderId":"PROTECTED","url":"https://seven.sliccy.ai/child","securityOrigin":"https://seven.sliccy.ai"}) } else { announced };
+        state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":final_frame}]);
+        cdp.absorb(event("Page.frameNavigated", json!({"frame":final_frame})));
+        cdp.webmcp_sweep();
+        assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "PENDING-CHILD").count(), usize::from(!protected));
+        if protected { assert!(!cdp.webmcp_alive("H")); }
+    }
 }
 
 #[test]

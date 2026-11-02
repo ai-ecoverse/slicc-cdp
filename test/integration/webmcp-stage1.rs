@@ -684,6 +684,155 @@ fn a_pause_inside_the_plain_evaluate_of_an_armed_realm_never_installs_twice() {
     assert_eq!(count(&wire, "Debugger.resume"), 1);
 }
 
+struct PendingPlacementWire {
+    backend: Backend,
+    next_child: Value,
+    settle_at: Option<Instant>,
+    held_since: Option<Instant>,
+    awaiting: bool,
+    delay: Duration,
+    storm: bool,
+    root_change: bool,
+    foreign_world: bool,
+    resumed_early: Rc<RefCell<bool>>,
+}
+
+fn pending_placement_child() -> Value {
+    json!({"frame":{"id":"C","parentId":"F","loaderId":"","url":"","securityOrigin":"null"}})
+}
+
+impl Transport for PendingPlacementWire {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let command: Value = serde_json::from_str(text).unwrap();
+        let conversion_resume = command["method"] == "Debugger.resume" && self.backend.0.borrow().conversion_pending;
+        if command["method"] == "Debugger.resume" && !conversion_resume && self.awaiting {
+            *self.resumed_early.borrow_mut() = true;
+        }
+        self.backend.send_text(text)?;
+        if command["method"] == "Debugger.resume" && !conversion_resume {
+            if let Some(started) = self.held_since {
+                self.backend.0.borrow_mut().calls.last_mut().unwrap()["fixtureHeldMicros"] = json!(started.elapsed().as_micros());
+            }
+        }
+        if command["method"] == "Page.reload" {
+            self.backend.0.borrow_mut().tree.as_mut().unwrap()["frameTree"]["childFrames"] = json!([pending_placement_child()]);
+        }
+        if conversion_resume {
+            self.awaiting = true;
+            self.held_since = Some(Instant::now());
+            self.settle_at = Some(Instant::now() + self.delay);
+        }
+        Ok(())
+    }
+
+    fn recv_text(&mut self, until: Instant) -> Result<Option<String>, String> {
+        if let Some(message) = self.backend.recv_text(until)? { return Ok(Some(message)); }
+        if self.awaiting {
+            let at = self.settle_at.unwrap();
+            let wake = if self.storm { (Instant::now() + Duration::from_millis(20)).min(at).min(until) } else { at.min(until) };
+            std::thread::sleep(wake.saturating_duration_since(Instant::now()));
+            if Instant::now() >= at {
+                self.awaiting = false;
+                let mut state = self.backend.0.borrow_mut();
+                state.tree.as_mut().unwrap()["frameTree"]["childFrames"] = json!([self.next_child]);
+                if self.root_change { state.tree.as_mut().unwrap()["frameTree"]["frame"]["loaderId"] = json!("REPLACED"); }
+                for owner in state.sessions.keys().cloned().collect::<Vec<_>>() {
+                    if self.root_change {
+                        state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":tree("REPLACED")["frameTree"]["frame"]}}).to_string());
+                    }
+                    if self.foreign_world {
+                        state.incoming.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":owner,"params":{"context":{"id":19,"uniqueId":"protected-world","origin":"https://seven.sliccy.ai","auxData":{"frameId":"F","isDefault":false,"type":"isolated"}}}}).to_string());
+                    }
+                    state.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":self.next_child["frame"]}}).to_string());
+                }
+                drop(state);
+                return self.backend.recv_text(until);
+            }
+            if self.storm && Instant::now() < until {
+                let owner = self.backend.0.borrow().armed.clone().unwrap();
+                return Ok(Some(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":pending_placement_child()["frame"]}}).to_string()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn pending_placement_client() -> (Cdp, Rc<RefCell<State>>, String, Rc<RefCell<bool>>) {
+    pending_placement_client_with("ordinary")
+}
+
+fn pending_placement_client_with(mode: &str) -> (Cdp, Rc<RefCell<State>>, String, Rc<RefCell<bool>>) {
+    let state = Rc::new(RefCell::new(State { raw_instrumentation: true, ..Default::default() }));
+    let resumed = Rc::new(RefCell::new(false));
+    let wire = PendingPlacementWire {
+        backend: Backend(state.clone()),
+        next_child: if mode == "protected" { json!({"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://seven.sliccy.ai/child","securityOrigin":"https://seven.sliccy.ai"}}) } else { json!({"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"}}) },
+        settle_at: None,
+        held_since: None,
+        awaiting: false,
+        delay: Duration::from_millis(if mode == "expiry" { 1400 } else { 20 }),
+        storm: mode == "expiry",
+        root_change: mode == "root-change",
+        foreign_world: mode == "foreign",
+        resumed_early: resumed.clone(),
+    };
+    let mut cdp = Cdp::from_transport(Box::new(wire));
+    cdp.call("Target.getTargets", json!({}), None).unwrap();
+    let attached = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    (cdp, state, attached["sessionId"].as_str().unwrap().to_string(), resumed)
+}
+
+#[test]
+fn converted_root_pause_waits_for_pending_child_placement_before_startup_install() {
+    let (mut cdp, state, session, resumed) = pending_placement_client();
+    cdp.start_webmcp_for(&session, true).unwrap();
+    assert!(!*resumed.borrow(), "the normal root pause is not lost before the child placement event");
+    assert_eq!(count(&state.borrow(), "Runtime.evaluate"), 1);
+    assert_eq!(count(&state.borrow(), "Debugger.pause"), 1);
+    assert!(cdp.webmcp_alive(&session));
+}
+
+#[test]
+fn converted_root_pause_preserves_a_live_holder_across_pending_child_placement() {
+    let (mut cdp, state, session, resumed) = pending_placement_client();
+    cdp.start_webmcp_for(&session, false).unwrap();
+    {
+        let mut wire = state.borrow_mut();
+        wire.tree = Some(tree("FUTURE"));
+        wire.tree.as_mut().unwrap()["frameTree"]["childFrames"] = json!([pending_placement_child()]);
+        for owner in wire.sessions.keys().cloned().collect::<Vec<_>>() {
+            wire.incoming.push_back(json!({"method":"Page.frameNavigated","sessionId":owner,"params":{"frame":tree("FUTURE")["frameTree"]["frame"]}}).to_string());
+            wire.incoming.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":owner,"params":{}}).to_string());
+            wire.incoming.push_back(context(&owner, "FUTURE").to_string());
+        }
+        wire.incoming.push_back(json!({"method":"Debugger.scriptParsed","sessionId":session,"params":{"scriptId":"SCRIPT","executionContextId":1,"url":"https://ordinary.test/first.js"}}).to_string());
+        wire.incoming.push_back(json!({"method":"Debugger.paused","sessionId":session,"params":{"reason":"instrumentation","callFrames":[{"callFrameId":"CALL","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}}).to_string());
+    }
+    while cdp.pump(Instant::now() + Duration::from_millis(50)).unwrap() {}
+    assert!(!*resumed.borrow());
+    assert_eq!(count(&state.borrow(), "Runtime.evaluate"), 2);
+    assert!(cdp.webmcp_alive(&session));
+}
+
+#[test]
+fn converted_root_pause_rescues_protected_foreign_replaced_and_expired_pending_children() {
+    for mode in ["protected", "foreign", "root-change", "expiry"] {
+        let (mut cdp, state, session, resumed) = pending_placement_client_with(mode);
+        let start = Instant::now();
+        assert!(cdp.start_webmcp_for(&session, true).is_err(), "{mode}");
+        let spent = start.elapsed();
+        assert_eq!(count(&state.borrow(), "Runtime.evaluate"), 0, "{mode}");
+        assert!(!cdp.webmcp_alive(&session), "{mode}");
+        assert!(count(&state.borrow(), "Debugger.resume") >= 2, "{mode}");
+        if mode == "expiry" {
+            assert!(*resumed.borrow(), "expiry resumes before the eventual ordinary child");
+            let held = state.borrow().calls.iter().filter_map(|command| command["fixtureHeldMicros"].as_u64()).next().unwrap();
+            assert!(held >= 900_000 && held < 1_200_000, "nonreset private-resume cap: {held}us");
+            assert!(spent < Duration::from_millis(1800), "{spent:?}");
+        } else { assert!(spent < Duration::from_millis(500), "{mode}: {spent:?}"); }
+    }
+}
+
 #[test]
 fn protected_incomplete_and_version_refusals_never_fall_back() {
     for mode in [
