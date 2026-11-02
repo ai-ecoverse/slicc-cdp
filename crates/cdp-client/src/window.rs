@@ -23,7 +23,7 @@ impl Cdp {
         if self.guard_sessions.contains(session) || self.blocked.contains(session) || self.protected_targets.contains(&target) {
             return Err(self.refusal());
         }
-        self.document_state_for(&target, true, None).ok_or_else(|| self.refusal())?;
+        self.document_state_for(&target, true, None).ok_or_else(|| self.document_refusal())?;
         let listed = self.raw_call("Target.getTargets", json!({}), None, DOCUMENT_CHECK)?;
         let infos = listed.get("targetInfos").and_then(Value::as_array).cloned().ok_or_else(|| self.refusal())?;
         let text = |info: &Value, key: &str| info.get(key).and_then(Value::as_str).unwrap_or("").to_string();

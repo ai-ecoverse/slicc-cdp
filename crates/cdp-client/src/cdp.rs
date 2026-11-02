@@ -17,6 +17,9 @@ mod document_order;
 mod navigation_away;
 #[path = "issued.rs"]
 mod issued;
+#[cfg(test)]
+#[path = "unplaceable_test.rs"]
+mod unplaceable_test;
 pub(crate) use issued::target_refusal;
 
 pub trait Transport {
@@ -49,6 +52,7 @@ const AUTO_ATTACH: &str = "slicc: refused: auto-attach is not supported by slicc
 const FLATTEN: &str = "slicc: refused: attach with flatten: true\n";
 const PERSISTENT: &str = "slicc: refused: persistent page capabilities are not supported by slicc-cdp\n";
 pub const COOKIES: &str = "slicc: refused: cookies on seven's origin\n";
+pub const UNPLACEABLE: &str = "slicc: refused: a frame on this page is on an origin slicc can't place\n";
 pub const STREAM: &str = "slicc: refused: slicc didn't hand out this stream, so it could be seven's\n";
 
 struct CarrierTarget {
@@ -193,6 +197,7 @@ pub struct Cdp {
     waiter: Option<Waiter>,
     waiter_due: Instant,
     closed: Option<String>,
+    unplaceable: std::cell::Cell<bool>,
     #[cfg(test)]
     runtime_preparing: bool,
     #[cfg(test)]
@@ -316,6 +321,7 @@ impl Cdp {
             waiter: None,
             waiter_due: Instant::now(),
             closed: None,
+            unplaceable: std::cell::Cell::new(false),
             #[cfg(test)]
             runtime_preparing: false,
             #[cfg(test)]
@@ -709,6 +715,24 @@ impl Cdp {
 
     fn refusal(&self) -> String {
         self.closed.clone().unwrap_or_else(|| format!("{}\n", self.guard.refusal()))
+    }
+
+    fn document_refusal(&self) -> String {
+        if self.unplaceable.get() && self.closed.is_none() { UNPLACEABLE.to_string() } else { self.refusal() }
+    }
+
+    fn placed_frames(&self, node: &Value, frames: &mut BTreeMap<String, Vec<String>>, content: bool, parent: Option<&str>) -> bool {
+        self.unplaceable.set(false);
+        if self.collect_document_frames(node, frames, content, parent) { return true }
+        self.unplaceable.set(self.unplaceable.get() && !self.seven_frames(node) && !frames.values().any(|evidence| self.guard.url(&evidence[1]) || self.guard.url(&evidence[2])));
+        false
+    }
+
+    fn seven_frames(&self, node: &Value) -> bool {
+        let frame = node.get("frame");
+        let text = |key| frame.and_then(|frame| frame.get(key)).and_then(Value::as_str).unwrap_or("");
+        self.guard.url(text("url")) || self.guard.url(text("securityOrigin")) || frame.and_then(|frame| self.page_scope_origin(frame)).is_some_and(|origin| self.guard.url(origin))
+            || node.get("childFrames").and_then(Value::as_array).is_some_and(|children| children.iter().any(|child| self.seven_frames(child)))
     }
 
     pub fn unverified(&self) -> String {
@@ -1922,6 +1946,7 @@ impl Cdp {
     }
 
     fn document_state_for(&mut self, target: &str, content: bool, scope: Option<&str>) -> Option<DocumentState> {
+        self.unplaceable.set(false);
         let Some(guard) = self.guards.get(target).cloned() else {
             if self.protected_targets.contains(target) { return None }
             let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
@@ -1969,7 +1994,7 @@ impl Cdp {
             if parent_frame.get("id").and_then(Value::as_str) != Some(parent) || parent_frame.get("parentId").is_some() { return None }
             frames = self.document_state_for(&owner, true, Some(parent))?.frames;
         }
-        if !self.collect_document_frames(node, &mut frames, content, parent) {
+        if !self.placed_frames(node, &mut frames, content, parent) {
             #[cfg(test)]
             self.runtime_prepare_frames(node, &frames);
             return None;
@@ -2033,10 +2058,14 @@ impl Cdp {
             && !text("unreachableUrl").is_empty() && self.frame_decisions.get(text("id")) == Some(&false);
         let data = (root || parent_allowed) && self.guard.data_document(text("url"));
         let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error || data;
+        let unplaceable = matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque;
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
-            || matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque
+            || unplaceable
             || !root && !allowed_error && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))
-            || self.unverified_error(text("url"), text("unreachableUrl"))) { return false }
+            || self.unverified_error(text("url"), text("unreachableUrl"))) {
+            if unplaceable { self.unplaceable.set(true) }
+            return false;
+        }
         let evidence = vec![text("loaderId").to_string(), format!("{}{}", text("url"), text("urlFragment")), text("securityOrigin").to_string(), text("unreachableUrl").to_string(), parent.unwrap_or("").to_string()];
         if frames.insert(text("id").to_string(), evidence).is_some() { return false }
         match node.get("childFrames") {
