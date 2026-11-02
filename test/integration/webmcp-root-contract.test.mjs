@@ -18,7 +18,7 @@ const script = chrome
   .replace('${JSON.stringify(ordinary)}', JSON.stringify('https://ordinary.invalid'));
 
 for (const available of [true, false])
-  test(`CI-only root registration tap records the original conditional outcome (${available})`, () => {
+  test(`root fixture preserves conditional registration without a diagnostic tap (${available})`, () => {
     const registered = [];
     const context = vm.createContext({
       document: {
@@ -28,24 +28,17 @@ for (const available of [true, false])
       },
     });
     vm.runInContext(script, context);
-    assert.equal(context.cdp675Registration.branch, available);
-    assert.equal(context.cdp675Registration.attempted, available ? 8 : 0);
-    assert.equal(context.cdp675Registration.registered, available ? 8 : 0);
     assert.deepEqual(registered, available ? names : []);
     assert.doesNotMatch(script, /setTimeout|setInterval|await|while\s*\(/);
   });
 
-test('root tool count remains eight while the passive trace names normal instruction location and listing policy', () => {
+test('root tool count, raw endpoint and real conversion witness remain while diagnostics are removed', () => {
   assert.match(chrome, /assert\.equal\(JSON\.parse\(listed\.stdout\)\.length, 8\)/);
   assert.match(chrome, /const listed = await once\(browser\.wsUrl/);
   assert.match(chrome, /holder = command\(browser\.wsUrl, cwd/);
   assert.match(chrome, /conversionHolder = command\(wire\.url, cwd/);
-  assert.match(chrome, /mainPolicy/);
-  assert.match(chrome, /webmcp-root-tools-tap/);
-  assert.match(wire, /location: params\.callFrames\?\.\[0\]\?\.location/);
-  assert.match(wire, /command\.method === 'Page\.getPermissionsPolicyState'/);
-  assert.match(wire, /toolsPresent: !!tools,\s*allowed: tools\?\.allowed/);
-  assert.match(wire, /policy:\s*Object\.entries\(headers\)/);
+  assert.doesNotMatch(chrome, /cdp675Registration|webmcp-root-tools-tap|mainPolicy/);
+  assert.doesNotMatch(wire, /responses|permissions|probes|policyObserved|toolsPresent|location:/);
   assert.match(wire, /send\(value\)/);
   assert.match(wire, /peer\.ws\.send\(JSON\.stringify\(message\)\)/);
 });

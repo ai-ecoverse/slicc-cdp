@@ -22,6 +22,7 @@ test('WebMCP namespace diagnostics and every Rust call site are removed', () => 
     existsSync(new URL('../../crates/playwright-cli/src/webmcp_namespace.rs', import.meta.url)),
     false
   );
+  assert.doesNotMatch(read('cdp-client/src/webmcp_guard.rs'), /root-pause-held/);
   for (const name of ['lib.rs', 'commands.rs', 'webmcp_polyfill.rs', 'webmcp_frames.rs']) {
     assert.doesNotMatch(
       read(`playwright-cli/src/${name}`),

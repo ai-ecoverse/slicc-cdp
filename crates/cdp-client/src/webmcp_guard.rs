@@ -769,7 +769,6 @@ impl Cdp {
         let verified = loop {
             let pending = conversion.as_ref().is_some_and(|(root, _, _)| self.webmcp_pending_child_pause(session, value, root, until));
             if pending {
-                self.webmcp_trace_stage(session, "root-pause-held", "pending child placement");
                 if self.pump(until).ok() != Some(true) { break Err(self.refusal()); }
                 continue;
             }
