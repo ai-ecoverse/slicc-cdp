@@ -2,6 +2,9 @@ import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { connect } from './connect.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
+import { version } from './version.js';
+
+export { version };
 
 const LOAD_TIMEOUT_MS = 15000;
 const HELD_FRAMES = 100;
@@ -673,6 +676,7 @@ export const websocket = {
 };
 
 const browser = {
+  version,
   findTab,
   ensureTab,
   eval: evalSource,
