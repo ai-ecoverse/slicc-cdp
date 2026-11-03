@@ -7,7 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
-import { observer } from './guard-client.mjs';
+import { guarded, observer } from './guard-client.mjs';
+import { webmcpWire } from './webmcp-wire.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const binary = path.join(
@@ -121,7 +122,10 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-chrome-'));
   let browser;
   let raw;
+  let wire;
+  let ordinaryGuard;
   let holder;
+  let conversionHolder;
   let server;
   try {
     const keyPath = path.join(cwd, 'key.pem');
@@ -174,7 +178,9 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
           : '';
         res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
 if (document.modelContext) {
-  for (const name of ${JSON.stringify(names)}) document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  for (const name of ${JSON.stringify(names)}) {
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  }
 }
 </script>`);
       }
@@ -209,10 +215,69 @@ if (document.modelContext) {
       baselineSamples.push(performance.now() - started);
     }
     assert.equal((await hasShim(raw, sessionId)).api, false);
+    const { targetId: conversionTarget } = await raw.send('Target.createTarget', {
+      url: 'about:blank',
+      background: true,
+    });
+    const { sessionId: conversionSession } = await raw.send('Target.attachToTarget', {
+      targetId: conversionTarget,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, conversionSession);
+    await navigate(raw, conversionSession, `${ordinary}/tools?conversion-control`);
+    wire = await webmcpWire(browser.wsUrl);
+    conversionHolder = command(wire.url, cwd, [
+      'webmcp-polyfill',
+      '--tab',
+      conversionTarget,
+      '--reload',
+    ]);
+    const conversionStatus = await conversionHolder.ready;
+    assert.equal(conversionStatus.mode, 'polyfill');
+    assert.equal(conversionStatus.pauseMicros.length, 1);
+    const conversion = wire.snapshot().gates;
+    const ownedPause = conversion.find(({ method }) => method === 'Debugger.pause');
+    assert.ok(ownedPause, 'direct holder must convert with its owned private pause');
+    assert.ok(
+      conversion.some(
+        ({ event, session, reason }) =>
+          event === 'Debugger.paused' &&
+          session === ownedPause.session &&
+          reason === 'instrumentation'
+      )
+    );
+    assert.ok(
+      conversion.some(
+        ({ event, session, reason }) =>
+          event === 'Debugger.paused' && session === ownedPause.session && reason === 'other'
+      )
+    );
+    conversionHolder.child.stdin.end();
+    const conversionEnded = await conversionHolder.ended;
+    assert.equal(conversionEnded.code, 0, conversionEnded.stderr);
+    conversionHolder = undefined;
+    await raw.send('Target.closeTarget', { targetId: conversionTarget });
     holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
     const status = await holder.ready;
     assert.equal(status.mode, 'polyfill');
-    assert.ok(status.pauseMicros.length >= 2);
+    assert.equal(status.pauseMicros.length, 1);
+    ordinaryGuard = await guarded(browser.wsUrl, 'https://own.invalid', {
+      variant: 'prompt',
+      detachDelay: 0,
+      transport: 'native',
+    });
+    const attached = await ordinaryGuard.send('Target.attachToTarget', { targetId, flatten: true });
+    for (const [method, params] of [
+      ['Debugger.setBreakpointByUrl', { urlRegex: '.*', lineNumber: 0, condition: 'true' }],
+      ['DOMDebugger.setEventListenerBreakpoint', { eventName: 'load' }],
+    ]) {
+      await assert.rejects(
+        ordinaryGuard.send(method, params, attached.sessionId),
+        /persistent page capabilities/
+      );
+    }
+    await ordinaryGuard.close();
+    ordinaryGuard = undefined;
     assert.equal(JSON.stringify(status).includes('__wmcp_'), false);
     const holderSamples = [];
     for (let sample = 0; sample < 5; sample++) {
@@ -253,9 +318,10 @@ if (document.modelContext) {
     const denied = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(denied.code, 0, denied.stderr);
     assert.deepEqual(JSON.parse(denied.stdout), []);
-    const framesReady = holder.documentReady();
     await navigate(raw, sessionId, `${ordinary}/frames`);
-    await framesReady;
+    const protectedStop = await holder.ended;
+    assert.notEqual(protectedStop.code, 0);
+    assert.match(protectedStop.stderr, /slicc: refused:|refused by the guard/);
     const targetInfos = (await raw.send('Target.getTargets', {})).targetInfos;
     const protectedChild = targetInfos.find(
       (target) => target.type === 'iframe' && target.url === protectedUrl
@@ -266,9 +332,9 @@ if (document.modelContext) {
     ).sessionId;
     assert.equal((await hasShim(raw, childSession)).api, false);
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
-    const ordinaryFramesReady = holder.documentReady();
     await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    await ordinaryFramesReady;
+    holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    assert.equal((await holder.ready).mode, 'polyfill');
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);
     assert.equal(JSON.parse(same.stdout).length, 9);
@@ -281,7 +347,8 @@ if (document.modelContext) {
       `https://foreign.test:${port}`,
     ]);
     assert.equal(cross.code, 0, cross.stderr);
-    assert.equal(JSON.parse(cross.stdout).length, 10, holder.stderr());
+    assert.equal(JSON.parse(cross.stdout).length, 9, holder.stderr());
+    assert.match(cross.stderr, /cross-origin child tools are unavailable/);
     const crossCall = await once(browser.wsUrl, cwd, [
       'webmcp-call',
       'cross_child',
@@ -291,8 +358,8 @@ if (document.modelContext) {
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.equal(crossCall.code, 0, crossCall.stderr);
-    assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
+    assert.notEqual(crossCall.code, 0, crossCall.stderr);
+    assert.equal(crossCall.stdout, '');
 
     const restored = raw.waitEvent(
       (event) => event.method === 'Page.frameNavigated' && event.sessionId === sessionId,
@@ -329,6 +396,9 @@ if (document.modelContext) {
     }
   } finally {
     holder?.child.kill('SIGKILL');
+    await ordinaryGuard?.close();
+    conversionHolder?.child.kill('SIGKILL');
+    await wire?.close();
     await raw?.close();
     await browser?.close();
     await new Promise((resolve) => (server ? server.close(resolve) : resolve()));

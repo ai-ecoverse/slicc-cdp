@@ -5,6 +5,13 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
+fn requested_origin(mut output: Output, from: &[String]) -> Output {
+    if output.code == 0 && !from.is_empty() {
+        output.stderr.insert_str(0, "cross-origin child tools are unavailable on this guarded route\n");
+    }
+    output
+}
+
 pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bool, from: &[String]) -> Output {
     let pages = match browser::list_pages(cdp) {
         Ok(pages) => pages,
@@ -20,8 +27,14 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
     };
     let result = crate::webmcp_frames::list(cdp, state, &target, &session, from);
     let _ = browser::watch_detach(cdp, state, &target, &session);
-    match result {
+    requested_origin(match result {
         Ok(tools) => {
+            let plain = state.webmcp.get(&target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection))
+                .and_then(|entry| entry.get("sessions")).and_then(Value::as_array)
+                .is_some_and(|sessions| sessions.iter().any(|session| session.get("target").and_then(Value::as_str) == Some(&target) && session.get("plain").and_then(Value::as_bool) == Some(true)));
+            if plain && (tools.as_array().is_some_and(Vec::is_empty) || tools.is_null() || tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent")) {
+                return Output::err(crate::webmcp_polyfill::FALLBACK_EMPTY);
+            }
             state.current = Some(target);
             if tools.is_null() || tools.get("__webmcp_error").and_then(Value::as_str) == Some("absent") {
                 return unavailable("webmcp-list");
@@ -35,7 +48,7 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
             }
         }
         Err(message) => Output::err(message),
-    }
+    }, from)
 }
 
 fn unavailable(command: &str) -> Output {
@@ -132,7 +145,7 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
     };
     let outcome = crate::webmcp_frames::call(cdp, state, &target, &session, from, frame, name, &parsed, allow_consequential).and_then(parse_value);
     let _ = browser::watch_detach(cdp, state, &target, &session);
-    match outcome {
+    requested_origin(match outcome {
         Ok(outcome) => {
             state.current = Some(target);
             match outcome {
@@ -171,7 +184,7 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
             }
         }
         Err(message) => Output::err(message),
-    }
+    }, from)
 }
 
 pub fn read_stdin() -> Result<String, String> {

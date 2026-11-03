@@ -40,7 +40,7 @@ mod tests {
 
     include!("capability_inventory_test.rs");
 
-    const CALLS: &[&str] = &["call(", "call_for(", "raw_call(", "send(", "notify("];
+    const CALLS: &[&str] = &["call(", "call_for(", "call_guarded_for(", "raw_call(", "send(", "notify("];
     const BROWSER_DOMAINS: &[&str] = &["Target", "Browser", "Slicc"];
 
     fn root() -> PathBuf {

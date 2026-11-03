@@ -139,7 +139,7 @@ try {{
   const result = await api.executeTool(tool, {input});
   return pack({{__webmcp_result:cap(typeof result === 'string' ? result : JSON.stringify(result ?? null))}});
 }} catch (error) {{ try {{ return pack({{__webmcp_error:'threw',message:cap(String(error))}}); }} catch {{ return '{{"__webmcp_error":"threw","message":"Tool invocation failed"}}'; }} }}
-}})()"#, path=json!(tool.scope.path), from=json!(from), name=json!(name), origin=json!(tool.scope.origin), allow=json!(allow), input=input_expression)
+}})()"#, path=json!(tool.scope.path), from=json!([]), name=json!(name), origin=json!(tool.scope.origin), allow=json!(allow), input=input_expression)
         } else {
             format!(r#"(async () => {{ 'use strict'; {CAP}
 try {{
@@ -179,6 +179,7 @@ try {{
 
 fn with_tools(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Collected) -> Result<Value, String>) -> Result<Value, String> {
     if from.iter().any(|origin| cdp.guard().url(origin)) { return Err(format!("{}\n", cdp.guard().refusal())); }
+    let from: &[String] = &[];
     let mut opened = Vec::new();
     let result = collect(cdp, state, target, session, from, &mut opened).and_then(|collected| invoke(cdp, collected));
     for child in opened { cdp::detach(cdp, &child); }

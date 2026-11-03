@@ -68,12 +68,79 @@ async function run(args, cwd, endpoint) {
   return process.ended;
 }
 
-async function fixture(policy, check, children = [], onCommand = () => {}) {
+test('675 fallback holder keeps the installed session for status, changes and cleanup', async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'thr_uzh6iuph2q-fresh-holder-'));
+  let original;
+  let installed;
+  const backend = await webmcpBackend({
+    onCommand(command, _pages, send, sessions) {
+      if (command.method === 'Debugger.enable') {
+        original = command.sessionId;
+        send({
+          id: command.id,
+          error: {
+            message:
+              'slicc: refused: a browser extension runs scripts in this page, and profiling it would expose them',
+          },
+        });
+        return true;
+      }
+      if (
+        command.method === 'Runtime.evaluate' &&
+        command.params.expression.startsWith('const __wmcp_')
+      ) {
+        installed = command.sessionId;
+        setImmediate(() => {
+          for (const sessionId of sessions.keys())
+            send({ method: 'Page.loadEventFired', sessionId, params: { timestamp: 1 } });
+        });
+      }
+      if (installed && command.method === 'Runtime.evaluate' && command.sessionId === original) {
+        send({
+          id: command.id,
+          error: {
+            message: 'slicc: refused: that execution context belongs to a browser extension',
+          },
+        });
+        return true;
+      }
+    },
+  });
+  const holder = launch(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, backend.url);
+  try {
+    assert.equal((await holder.ready).mode, 'polyfill');
+    assert.ok(installed);
+    assert.notEqual(installed, original);
+    assert.equal(
+      backend.calls.some(
+        (call) => call.method === 'Target.detachFromTarget' && call.params.sessionId === installed
+      ),
+      false
+    );
+    holder.child.stdin.end();
+    assert.equal((await holder.ended).code, 0);
+    assert.equal(
+      backend.calls.filter(
+        (call) => call.method === 'Target.detachFromTarget' && call.params.sessionId === installed
+      ).length,
+      1
+    );
+    assert.equal(backend.calls.filter((call) => call.method === 'Page.reload').length, 1);
+  } finally {
+    if (holder.child.exitCode === null) holder.child.kill('SIGKILL');
+    await holder.ended;
+    await backend.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+async function fixture(policy, check, children = [], onCommand = () => {}, native = false) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-fake-'));
   const backend = await webmcpBackend({
     policy,
     children,
     onCommand,
+    native,
     definitions: [
       {
         name: 'greet',
@@ -107,16 +174,24 @@ async function fixture(policy, check, children = [], onCommand = () => {}) {
         .join(', ')}`;
       throw error;
     }
-    assert.equal(status.mode, 'polyfill');
+    assert.equal(status.mode, native ? 'native' : 'polyfill');
     assert.equal(status.reloaded, true);
     assert.equal(JSON.stringify(status).includes('__wmcp_'), false);
     await check(backend, cwd, status);
     holder.child.stdin.end();
     assert.equal((await holder.ended).code, 0);
-    assert.ok(
-      backend.calls.some((call) => call.method === 'Page.removeScriptToEvaluateOnNewDocument')
-    );
-    assert.ok(backend.calls.every((call) => call.method !== 'Runtime.addBinding'));
+    assert.ok(backend.calls.some((call) => call.method === 'Debugger.removeBreakpoint'));
+    for (const method of [
+      'Page.addScriptToEvaluateOnNewDocument',
+      'Runtime.addBinding',
+      'Debugger.pause',
+      'Debugger.getScriptSource',
+      'Debugger.evaluateOnCallFrame',
+    ])
+      assert.ok(
+        backend.calls.every((call) => call.method !== method),
+        method
+      );
     assert.equal(backend.scripts.size, 0);
   } finally {
     holder?.child.kill('SIGKILL');
@@ -127,7 +202,7 @@ async function fixture(policy, check, children = [], onCommand = () => {}) {
 
 await test('fake: holder reload, private bridge listing/calling, consequential gate and output cap', async () => {
   await fixture('', async (backend, cwd, status) => {
-    assert.ok(status.pauseMicros.length >= 2);
+    assert.ok(status.pauseMicros.length >= 1);
     const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
     assert.equal(listed.code, 0, listed.stderr);
     const tools = JSON.parse(listed.stdout);
@@ -200,7 +275,7 @@ await test('fake: document readiness follows generation metadata persistence', a
   }
 });
 
-await test('fake: document readiness waits for a child frame admitted after the top load event', async () => {
+await test('fake: document readiness reports the root installation before a placed same-origin child executes', async () => {
   const backend = await webmcpBackend({
     definitions: [{ name: 'top', execute: () => 'top' }],
     children: [
@@ -239,16 +314,13 @@ await test('fake: document readiness waits for a child frame admitted after the 
     assert.equal(reload.code, 0, reload.stderr);
     const ready = await complete;
     assert.equal(ready.value.tab, 'TAB');
-    assert.equal(ready.childLoaded, true, 'document-ready preceded the child frame admission');
-    assert.match(holder.stderr(), /webmcp-polyfill: child refused at target/);
+    assert.equal(ready.childLoaded, false);
+    assert.equal(backend.pages.get('CHILD').document.modelContext?.__slicc_webmcp_shim, true);
     const listed = await run(['webmcp-list', '--tab', 'TAB', '--json'], cwd, backend.url);
     assert.equal(listed.code, 0, listed.stderr);
     assert.deepEqual(
       JSON.parse(listed.stdout).map((tool) => [tool.name, tool.frameId]),
-      [
-        ['late_child', 'CHILD'],
-        ['top', 'TAB'],
-      ]
+      [['top', 'TAB']]
     );
     holder.child.stdin.end();
     assert.equal((await holder.ended).code, 0);
@@ -311,7 +383,7 @@ await test('fake: verified response policy can be observed on the parent holder 
   });
 });
 
-await test('fake: same-origin aggregation and explicit foreign exposure/delegation with ambiguous tool selection', async () => {
+await test('fake: same-origin aggregation keeps ambiguous selection and cross-origin requests refuse child tools', async () => {
   await fixture(
     '',
     async (backend, cwd) => {
@@ -333,8 +405,11 @@ await test('fake: same-origin aggregation and explicit foreign exposure/delegati
         '--from-origin',
         'https://foreign.test/',
       ]);
-      assert.equal(cross.length, 5);
-      assert.equal(cross.find((tool) => tool.name === 'foreign').origin, 'https://foreign.test');
+      assert.equal(cross.length, 4);
+      assert.equal(
+        cross.some((tool) => tool.name === 'foreign'),
+        false
+      );
       assert.equal(
         cross.some((tool) => tool.name === 'hidden'),
         false
@@ -356,8 +431,8 @@ await test('fake: same-origin aggregation and explicit foreign exposure/delegati
         cwd,
         backend.url
       );
-      assert.equal(called.code, 0, called.stderr);
-      assert.equal(called.stdout.trim(), 'foreign child');
+      assert.equal(called.code, 2, called.stderr);
+      assert.equal(called.stdout, '');
     },
     [
       {
@@ -378,7 +453,9 @@ await test('fake: same-origin aggregation and explicit foreign exposure/delegati
           },
         ],
       },
-    ]
+    ],
+    undefined,
+    true
   );
 });
 
@@ -422,7 +499,9 @@ await test('fake: parent policy, child policy and absent iframe delegation each 
             },
           ],
         },
-      ]
+      ],
+      undefined,
+      true
     );
   }
 });
@@ -553,7 +632,7 @@ await test('fake: frame owners use bounded parent DOM metadata rather than frame
       children: [
         {
           id: 'CROSS',
-          origin: 'https://cross.test',
+          origin: 'https://ordinary.test',
           allow: 'tools *',
           definitions: [
             { name: 'child', exposedTo: ['https://ordinary.test'], execute: () => 'child' },
@@ -574,7 +653,7 @@ await test('fake: frame owners use bounded parent DOM metadata rather than frame
     });
     try {
       const result = await run(
-        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://cross.test'],
+        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://ordinary.test'],
         cwd,
         backend.url
       );
@@ -602,7 +681,7 @@ await test('fake: native child calls recheck loader, policy and delegation and p
     const children = [
       {
         id: 'CROSS',
-        origin: 'https://cross.test',
+        origin: 'https://ordinary.test',
         allow: 'tools *',
         definitions: [
           {
@@ -630,7 +709,7 @@ await test('fake: native child calls recheck loader, policy and delegation and p
         },
       });
       const called = await run(
-        ['webmcp-call', 'child', '{}', '--tab', 'TAB', '--from-origin', 'https://cross.test'],
+        ['webmcp-call', 'child', '{}', '--tab', 'TAB', '--from-origin', 'https://ordinary.test'],
         cwd,
         backend.url
       );

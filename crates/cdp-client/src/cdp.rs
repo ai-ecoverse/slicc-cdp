@@ -557,12 +557,23 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.call_guarded_for(method, params, session_id, timeout, false)
+    }
+
+    fn call_guarded_for(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        holder_debugger: bool,
+    ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
         #[cfg(test)]
         if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
         #[cfg(test)]
         self.runtime_stage(method, "admit");
-        self.admit(method, &params, session_id)?;
+        self.admit_for(method, &params, session_id, holder_debugger)?;
         if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
         if method == "Target.createTarget" {
             return self.create_target(params, timeout);
@@ -748,6 +759,11 @@ impl Cdp {
     }
 
     fn admit(&mut self, method: &str, params: &Value, session_id: Option<&str>) -> Result<(), String> {
+        self.admit_for(method, params, session_id, false)
+    }
+
+    fn admit_for(&mut self, method: &str, params: &Value, session_id: Option<&str>, holder_debugger: bool) -> Result<(), String> {
+        if debugger_domain(method) && (!holder_debugger || !matches!(debugger_lifetime(method), Some(DebuggerLifetime::Persistent | DebuggerLifetime::Cleanup | DebuggerLifetime::Control))) { return Err(PERSISTENT.into()); }
         if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Err(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" {
             if params.get("accept").and_then(Value::as_bool).is_none()
@@ -804,6 +820,9 @@ impl Cdp {
                 return Err(reason.into());
             }
         }
+        if debugger_domain(method) {
+            self.verify_page_scope(session_id)?;
+        }
         if params
             .get("targetId")
             .and_then(|v| v.as_str())
@@ -816,7 +835,7 @@ impl Cdp {
         }
         if method == "Browser.setWindowBounds" {
             self.admit_window(params, session_id)?;
-        } else if shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id) {
+        } else if shield::persistent_capability(method) && debugger_lifetime(method) != Some(DebuggerLifetime::Persistent) && !self.network_state_admitted(method, params, session_id) {
             return Err(PERSISTENT.into());
         }
         if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach"
@@ -934,13 +953,14 @@ impl Cdp {
     }
 
     pub fn settled_refusal(&self, method: &str, params: &Value, session_id: Option<&str>) -> Option<String> {
+        if debugger_domain(method) { return Some(PERSISTENT.into()); }
         let session_id = session_id.filter(|id| !id.is_empty());
         if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Some(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" || harmless(method, params) { return None }
         if session_id.is_some_and(|session| self.blocked.contains(session)) { return Some(self.refusal()) }
         let reason = if matches!(method, "Network.loadNetworkResource" | "Page.captureSnapshot") {
             self.refusal()
-        } else if shield::persistent_capability(method) && method != "Browser.setWindowBounds" && (session_id.is_none() || !shield::network_state(method, params)) {
+        } else if shield::persistent_capability(method) && debugger_lifetime(method) != Some(DebuggerLifetime::Persistent) && method != "Browser.setWindowBounds" && (session_id.is_none() || !shield::network_state(method, params)) {
             PERSISTENT.to_string()
         } else if method == "Target.autoAttachRelated" || method == "Target.setAutoAttach" && params.get("autoAttach").and_then(Value::as_bool) == Some(true) {
             AUTO_ATTACH.to_string()
@@ -1028,8 +1048,8 @@ impl Cdp {
                         self.context_frames.get(&(session.to_string(), format!("{label}:{value}"))).cloned()
                     })
                 });
-                let scope = if crosses_frames(method, params) || page_scope::content(method) && !runtime { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
-                let mut state = if self.document_paused(&target) {
+                let scope = if debugger_domain(method) || crosses_frames(method, params) || page_scope::content(method) && !runtime { None } else { Some(selected_frame.as_deref().unwrap_or("")) };
+                let mut state = if self.document_paused(&target) && !debugger_domain(method) {
                     #[cfg(test)]
                     self.runtime_prepare_probe("paused-document-provenance", json!({"cached_state":self.cached_documents.contains_key(&target),
                         "guard_present":self.guards.contains_key(&target),"document_known":self.documents.contains_key(&target),
@@ -3088,6 +3108,7 @@ impl Cdp {
             }
             return;
         }
+        if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Debugger.")) { return; }
         if guarded && !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") {
             self.fail_seen_network(&value);
             return;
@@ -3341,6 +3362,7 @@ impl Cdp {
             None => Ok(false),
         };
         self.webmcp_sweep();
+        self.webmcp_install_children();
         result
     }
 
@@ -3758,7 +3780,32 @@ fn recovery(method: &str, params: &Value) -> bool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum DebuggerLifetime {
+    Persistent,
+    Document,
+    Cleanup,
+    Control,
+}
+
+fn debugger_lifetime(method: &str) -> Option<DebuggerLifetime> {
+    match method {
+        "Debugger.enable" | "Debugger.setInstrumentationBreakpoint" => Some(DebuggerLifetime::Persistent),
+        "Debugger.getScriptSource" | "Debugger.evaluateOnCallFrame" => Some(DebuggerLifetime::Document),
+        "Debugger.disable" | "Debugger.removeBreakpoint" => Some(DebuggerLifetime::Cleanup),
+        "Debugger.resume" => Some(DebuggerLifetime::Control),
+        _ => None,
+    }
+}
+
+fn debugger_domain(method: &str) -> bool {
+    ["Debugger.", "DOMDebugger.", "EventBreakpoints."].iter().any(|prefix| method.starts_with(prefix))
+}
+
 fn content_command(method: &str, params: &Value) -> Option<bool> {
+    if debugger_domain(method) {
+        return debugger_lifetime(method).filter(|class| *class != DebuggerLifetime::Document).map(|_| true);
+    }
     if method == "Runtime.evaluate"
         && matches!(params.get("expression").and_then(Value::as_str), Some("document.readyState" | "0" | "document.readyState === 'complete' ? location.href : ''"))
         && params.as_object().is_some_and(|object| object.keys().all(|key| matches!(key.as_str(), "expression" | "returnByValue")))

@@ -6,7 +6,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.getFrameTree", "Page.getLayoutMetrics",
         "Page.getNavigationHistory", "Page.handleJavaScriptDialog", "Page.getPermissionsPolicyState", "Page.navigate", "Page.printToPDF", "Page.reload", "Page.stopScreencast",
         "Runtime.callFunctionOn", "Runtime.compileScript", "Runtime.evaluate", "Runtime.getProperties", "Runtime.releaseObjectGroup",
-        "Debugger.resume",
+        "Debugger.resume", "Debugger.disable", "Debugger.removeBreakpoint",
     ]);
     let observation = set(&[
         "DOM.enable", "Network.enable", "Page.enable", "Runtime.enable", "Runtime.disable", "Target.setDiscoverTargets",
@@ -20,11 +20,12 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Target.activateTarget", "Target.attachToTarget", "Target.closeTarget", "Target.createTarget",
         "Target.detachFromTarget", "Target.getTargetInfo", "Target.getTargets",
     ]);
-    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable"]);
-    let vetted_shim = set(&["Debugger.enable", "Debugger.getScriptSource", "Debugger.evaluateOnCallFrame", "Page.addScriptToEvaluateOnNewDocument", "Page.removeScriptToEvaluateOnNewDocument", "Runtime.runIfWaitingForDebugger", "Target.setAutoAttach"]);
+    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable", "Runtime.runIfWaitingForDebugger"]);
+    let debugger_control = set(&["Debugger.pause"]);
+    let debugger_persistent = set(&["Debugger.enable", "Debugger.setInstrumentationBreakpoint"]);
     let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);
     let network_state = set(&["Network.emulateNetworkConditions"]);
-    let inventory = [&document, &observation, &request, &origin, &target, &internal, &vetted_shim, &window, &network_state];
+    let inventory = [&document, &observation, &request, &origin, &target, &internal, &debugger_control, &debugger_persistent, &window, &network_state];
     let mut methods: BTreeSet<String> = sent().into_iter()
         .filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs"))
         .map(|(method, _, _)| method)
@@ -34,6 +35,12 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     }
     for method in &methods {
         assert_eq!(inventory.iter().filter(|class| class.contains(method)).count(), 1, "unclassified or ambiguous method: {method}");
+        if debugger_control.contains(method) {
+            let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();
+            assert!(source.contains("fn webmcp_handle_instrumentation"));
+            assert!(source.contains("arm.identifier.is_some() && arm.conversion.is_none()"));
+            assert!(!source.contains("call_for(\"Debugger.pause\""));
+        }
         if method == "Runtime.compileScript" {
             let source = fs::read_to_string(root().join("crates/playwright-cli/src/browser.rs")).unwrap();
             let compile = source.split("let mut compile =").nth(1).unwrap().split("let parsed =").next().unwrap();
@@ -41,11 +48,15 @@ fn production_cdp_methods_have_a_lifetime_classification() {
             assert!(!compile.contains("\"persistScript\": true"));
         }
         if crate::shield::persistent_capability(method) {
-            if vetted_shim.contains(method) {
+            if debugger_persistent.contains(method) {
                 let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();
                 assert!(source.contains("vetted_source(SHIM)?"));
                 assert!(source.contains("sha256_hex(source.as_bytes()) != SHIM_HASH"));
-                assert!(source.contains("__slicc_webmcp_admitted"));
+                assert!(source.contains("webmcp_verify_pause") && source.contains("uniqueContextId"));
+                assert!(!source.contains("Page.addScriptToEvaluateOnNewDocument") && !source.contains("Debugger.evaluateOnCallFrame") && !source.contains("Debugger.getScriptSource"));
+                let guard = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
+                assert!(guard.contains("self.verify_page_scope(session_id)?;"));
+                assert!(guard.contains("debugger_lifetime(method) != Some(DebuggerLifetime::Persistent)"));
                 continue;
             }
             if window.contains(method) {
@@ -62,7 +73,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
                     assert!(shape.contains(part), "{part}");
                 }
                 let source = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
-                assert!(source.contains("shield::persistent_capability(method) && !self.network_state_admitted(method, params, session_id)"));
+                assert!(source.contains("shield::persistent_capability(method)") && source.contains("!self.network_state_admitted(method, params, session_id)"));
                 let admitted = source.split("fn network_state_admitted(").nth(1).unwrap().split("fn prepare(").next().unwrap();
                 for part in ["!self.guard_sessions.contains(session)", "!self.blocked.contains(session)", "Some(\"page\")", "!self.info_protected(info, &[])"] {
                     assert!(admitted.contains(part), "{part}");
