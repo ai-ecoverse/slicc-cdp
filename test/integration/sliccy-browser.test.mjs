@@ -80,7 +80,7 @@ test('sliccy:browser over CDP', async () => {
       domain: '127.0.0.1',
       urlMatch: 'this-does-not-match',
     });
-    assert.equal(byDomain?.targetId, tab.targetId);
+    assert.equal(byDomain, null);
     const byUrl = await browser.findTab({ urlMatch: '/page$' });
     assert.equal(byUrl?.targetId, tab.targetId);
     assert.equal(await browser.findTab({ domain: 'no-such-host.invalid' }), null);
