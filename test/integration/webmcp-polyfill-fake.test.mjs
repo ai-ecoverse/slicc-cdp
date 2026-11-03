@@ -383,81 +383,102 @@ await test('fake: verified response policy can be observed on the parent holder 
   });
 });
 
-await test('fake: same-origin aggregation keeps ambiguous selection and cross-origin requests refuse child tools', async () => {
-  await fixture(
-    '',
-    async (backend, cwd) => {
-      const list = async (extra = []) => {
-        const result = await run(
-          ['webmcp-list', '--tab', 'TAB', '--json', ...extra],
+for (const native of [true, false]) {
+  await test(`fake: same-origin aggregation keeps ambiguous selection and ${native ? 'native requests admit' : 'polyfill requests refuse'} foreign child tools`, async () => {
+    await fixture(
+      '',
+      async (backend, cwd) => {
+        const list = async (extra = []) => {
+          const result = await run(
+            ['webmcp-list', '--tab', 'TAB', '--json', ...extra],
+            cwd,
+            backend.url
+          );
+          assert.equal(result.code, 0, result.stderr);
+          if (extra.length) {
+            assert.equal(
+              result.stderr.includes('cross-origin child tools are unavailable'),
+              !native
+            );
+          }
+          return JSON.parse(result.stdout);
+        };
+        const ordinary = await list();
+        assert.equal(ordinary.length, 4);
+        assert.equal(ordinary.filter((tool) => tool.name === 'greet').length, 2);
+        const cross = await list([
+          '--from-origin',
+          'https://foreign.test',
+          '--from-origin',
+          'https://foreign.test/',
+        ]);
+        assert.equal(cross.length, native ? 5 : 4);
+        assert.equal(
+          cross.some((tool) => tool.name === 'foreign'),
+          native
+        );
+        assert.equal(
+          cross.some((tool) => tool.name === 'hidden'),
+          false
+        );
+        const ambiguous = await run(
+          ['webmcp-call', 'greet', '{}', '--tab', 'TAB'],
           cwd,
           backend.url
         );
-        assert.equal(result.code, 0, result.stderr);
-        return JSON.parse(result.stdout);
-      };
-      const ordinary = await list();
-      assert.equal(ordinary.length, 4);
-      assert.equal(ordinary.filter((tool) => tool.name === 'greet').length, 2);
-      const cross = await list([
-        '--from-origin',
-        'https://foreign.test',
-        '--from-origin',
-        'https://foreign.test/',
-      ]);
-      assert.equal(cross.length, 4);
-      assert.equal(
-        cross.some((tool) => tool.name === 'foreign'),
-        false
-      );
-      assert.equal(
-        cross.some((tool) => tool.name === 'hidden'),
-        false
-      );
-      const ambiguous = await run(['webmcp-call', 'greet', '{}', '--tab', 'TAB'], cwd, backend.url);
-      assert.notEqual(ambiguous.code, 0);
-      assert.match(ambiguous.stderr, /ambiguous/);
-      const selected = await run(
-        ['webmcp-call', 'greet', '{}', '--tab', 'TAB', '--frame', 'SAME'],
-        cwd,
-        backend.url
-      );
-      assert.equal(selected.code, 0, selected.stderr);
-      assert.equal(selected.stdout.trim(), 'same-origin child');
-      const denied = await run(['webmcp-call', 'foreign', '{}', '--tab', 'TAB'], cwd, backend.url);
-      assert.equal(denied.code, 2);
-      const called = await run(
-        ['webmcp-call', 'foreign', '{}', '--tab', 'TAB', '--from-origin', 'https://foreign.test'],
-        cwd,
-        backend.url
-      );
-      assert.equal(called.code, 2, called.stderr);
-      assert.equal(called.stdout, '');
-    },
-    [
-      {
-        id: 'SAME',
-        origin: 'https://ordinary.test',
-        definitions: [{ name: 'greet', execute: () => 'same-origin child' }],
+        assert.notEqual(ambiguous.code, 0);
+        assert.match(ambiguous.stderr, /ambiguous/);
+        const selected = await run(
+          ['webmcp-call', 'greet', '{}', '--tab', 'TAB', '--frame', 'SAME'],
+          cwd,
+          backend.url
+        );
+        assert.equal(selected.code, 0, selected.stderr);
+        assert.equal(selected.stdout.trim(), 'same-origin child');
+        const denied = await run(
+          ['webmcp-call', 'foreign', '{}', '--tab', 'TAB'],
+          cwd,
+          backend.url
+        );
+        assert.equal(denied.code, 2);
+        const called = await run(
+          ['webmcp-call', 'foreign', '{}', '--tab', 'TAB', '--from-origin', 'https://foreign.test'],
+          cwd,
+          backend.url
+        );
+        assert.equal(called.code, native ? 0 : 2, called.stderr);
+        assert.equal(called.stdout.trim(), native ? 'foreign child' : '');
+        assert.equal(called.stderr.includes('cross-origin child tools are unavailable'), !native);
       },
-      {
-        id: 'CROSS',
-        origin: 'https://foreign.test',
-        allow: 'tools *',
-        definitions: [
-          { name: 'foreign', exposedTo: ['https://ordinary.test'], execute: () => 'foreign child' },
-          {
-            name: 'hidden',
-            exposedTo: ['https://other.test'],
-            execute: () => assert.fail('unexposed tool invoked'),
-          },
-        ],
-      },
-    ],
-    undefined,
-    true
-  );
-});
+      [
+        {
+          id: 'SAME',
+          origin: 'https://ordinary.test',
+          definitions: [{ name: 'greet', execute: () => 'same-origin child' }],
+        },
+        {
+          id: 'CROSS',
+          origin: 'https://foreign.test',
+          allow: 'tools *',
+          definitions: [
+            {
+              name: 'foreign',
+              exposedTo: ['https://ordinary.test'],
+              execute: () => 'foreign child',
+            },
+            {
+              name: 'hidden',
+              exposedTo: ['https://other.test'],
+              execute: () => assert.fail('unexposed tool invoked'),
+            },
+          ],
+        },
+      ],
+      undefined,
+      native
+    );
+  });
+}
 
 await test('fake: parent policy, child policy and absent iframe delegation each deny exposed foreign tools', async () => {
   for (const [parentPolicy, childPolicy, allow] of [
