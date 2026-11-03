@@ -385,9 +385,26 @@ await test('fake: verified response policy can be observed on the parent holder 
 
 for (const native of [true, false]) {
   await test(`fake: same-origin aggregation keeps ambiguous selection and ${native ? 'native requests admit' : 'polyfill requests refuse'} foreign child tools`, async () => {
+    const registration = Promise.withResolvers();
     await fixture(
       '',
       async (backend, cwd) => {
+        if (!native) {
+          let timer;
+          try {
+            await Promise.race([
+              registration.promise,
+              new Promise((_, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error('same-origin child did not register after installation')),
+                  5000
+                );
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
         const list = async (extra = []) => {
           const result = await run(
             ['webmcp-list', '--tab', 'TAB', '--json', ...extra],
@@ -454,7 +471,7 @@ for (const native of [true, false]) {
         {
           id: 'SAME',
           origin: 'https://ordinary.test',
-          definitions: [{ name: 'greet', execute: () => 'same-origin child' }],
+          definitions: native ? [{ name: 'greet', execute: () => 'same-origin child' }] : [],
         },
         {
           id: 'CROSS',
@@ -474,7 +491,26 @@ for (const native of [true, false]) {
           ],
         },
       ],
-      undefined,
+      native
+        ? undefined
+        : (command, pages) => {
+            const child = pages.get('SAME');
+            if (
+              command.method === 'Runtime.evaluate' &&
+              command.params.expression.startsWith('const __wmcp_') &&
+              command.params.uniqueContextId === `main-${child.loader}`
+            ) {
+              void (async () => {
+                await new Promise((resolve) => setImmediate(resolve));
+                assert.equal(child.document.modelContext?.__slicc_webmcp_shim, true);
+                child.document.modelContext.registerTool({
+                  name: 'greet',
+                  execute: () => 'same-origin child',
+                });
+                registration.resolve();
+              })().catch(registration.reject);
+            }
+          },
       native
     );
   });
