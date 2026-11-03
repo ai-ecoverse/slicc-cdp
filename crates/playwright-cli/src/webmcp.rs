@@ -5,8 +5,8 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
-fn requested_origin(mut output: Output, from: &[String]) -> Output {
-    if output.code == 0 && !from.is_empty() {
+fn requested_origin(mut output: Output, from: &[String], native: bool) -> Output {
+    if output.code == 0 && !from.is_empty() && !native {
         output.stderr.insert_str(0, "cross-origin child tools are unavailable on this guarded route\n");
     }
     output
@@ -26,9 +26,10 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
         Err(message) => return Output::err(message),
     };
     let result = crate::webmcp_frames::list(cdp, state, &target, &session, from);
+    let native = result.as_ref().is_ok_and(|(_, native)| *native);
     let _ = browser::watch_detach(cdp, state, &target, &session);
     requested_origin(match result {
-        Ok(tools) => {
+        Ok((tools, _)) => {
             let plain = state.webmcp.get(&target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection))
                 .and_then(|entry| entry.get("sessions")).and_then(Value::as_array)
                 .is_some_and(|sessions| sessions.iter().any(|session| session.get("target").and_then(Value::as_str) == Some(&target) && session.get("plain").and_then(Value::as_bool) == Some(true)));
@@ -48,7 +49,7 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
             }
         }
         Err(message) => Output::err(message),
-    }, from)
+    }, from, native)
 }
 
 fn unavailable(command: &str) -> Output {
@@ -143,7 +144,9 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
-    let outcome = crate::webmcp_frames::call(cdp, state, &target, &session, from, frame, name, &parsed, allow_consequential).and_then(parse_value);
+    let outcome = crate::webmcp_frames::call(cdp, state, &target, &session, from, frame, name, &parsed, allow_consequential);
+    let native = outcome.as_ref().is_ok_and(|(_, native)| *native);
+    let outcome = outcome.and_then(|(value, _)| parse_value(value));
     let _ = browser::watch_detach(cdp, state, &target, &session);
     requested_origin(match outcome {
         Ok(outcome) => {
@@ -184,7 +187,7 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
             }
         }
         Err(message) => Output::err(message),
-    }, from)
+    }, from, native)
 }
 
 pub fn read_stdin() -> Result<String, String> {

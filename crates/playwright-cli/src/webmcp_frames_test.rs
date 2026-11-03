@@ -11,6 +11,7 @@ struct FrameInspector {
     sessions: BTreeMap<String, String>,
     children: bool,
     isolated: bool,
+    native: bool,
 }
 
 impl Transport for FrameInspector {
@@ -52,6 +53,8 @@ impl Transport for FrameInspector {
                     json!({"__webmcp_result":"5"})
                 } else if expression.contains("toolsJson") {
                     json!({"toolsJson":json!([{"name":"add","origin":"https://ordinary.test","frameId":"PARENT","inputSchema":{"type":"object"},"annotations":{}}]).to_string()})
+                } else if expression == "'modelContext' in Document.prototype" {
+                    json!(self.native)
                 } else {
                     json!(!expression.contains("__slicc_webmcp_shim"))
                 };
@@ -68,13 +71,15 @@ impl Transport for FrameInspector {
 #[test]
 fn requested_cross_origin_tools_warn_but_preserve_root_listing_and_calling() {
     let calls = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false }));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false, native:false }));
     let session = cdp.call("Target.attachToTarget", json!({"targetId":"ROOT","flatten":true}), None).unwrap()["sessionId"].as_str().unwrap().to_string();
     let state = Session::default();
     let from = vec!["https://ordinary-child.test".to_string()];
-    let tools = list(&mut cdp, &state, "ROOT", &session, &from).unwrap();
+    let (tools, native) = list(&mut cdp, &state, "ROOT", &session, &from).unwrap();
+    assert!(!native);
     assert!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == "add"));
-    let answer = call(&mut cdp, &state, "ROOT", &session, &from, None, "add", &json!({"a":2,"b":3}), false).unwrap();
+    let (answer, native) = call(&mut cdp, &state, "ROOT", &session, &from, None, "add", &json!({"a":2,"b":3}), false).unwrap();
+    assert!(!native);
     assert_eq!(answer["__webmcp_result"], "5");
     assert!(!calls.borrow().iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|expression| expression.contains("ordinary-child.test"))));
     let before = calls.borrow().len();
@@ -87,7 +92,7 @@ fn requested_cross_origin_tools_warn_but_preserve_root_listing_and_calling() {
 fn only_explicit_client_origin_requests_return_the_warning_with_root_tools() {
     for from in [Vec::new(), vec!["https://ordinary-child.test".to_string()]] {
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false }));
+        let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false, native:false }));
         let mut state = Session::default();
         let listed = crate::webmcp::list_from(&mut cdp, &mut state, Some("ROOT"), true, &from);
         assert_eq!(listed.code, 0, "{}", listed.stderr);
@@ -103,7 +108,7 @@ fn only_explicit_client_origin_requests_return_the_warning_with_root_tools() {
 #[test]
 fn newly_attached_frame_requires_default_context_observation_before_scope_selection() {
     let calls = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:true, isolated:false }));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:true, isolated:false, native:false }));
     let root = cdp.call("Target.attachToTarget",json!({"targetId":"ROOT","flatten":true}),None).unwrap();
     let frame = FrameRec { frame_id:"FRAME_TARGET".into(), parent_frame_id:Some("PARENT".into()), url:"https://ordinary.test/".into(), target:Some("FRAME_TARGET".into()) };
     let mut scopes=BTreeMap::new();
