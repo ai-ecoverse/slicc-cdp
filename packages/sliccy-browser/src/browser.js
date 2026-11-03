@@ -304,12 +304,15 @@ async function findTabNow(query = {}) {
     throw new Error('browser.findTab: query requires `domain` or `urlMatch`');
   }
   const tabs = await listTabs();
-  if (domain !== undefined) {
-    const wanted = domain.toLowerCase();
-    return tabs.find((tab) => hostnameOf(tab.url)?.toLowerCase() === wanted) ?? null;
-  }
-  const re = compilePattern(urlMatch, 'browser.findTab');
-  return tabs.find((tab) => re.test(tab.url)) ?? null;
+  const wanted = domain?.toLowerCase();
+  const re = urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.findTab');
+  return (
+    tabs.find(
+      (tab) =>
+        (wanted === undefined || hostnameOf(tab.url)?.toLowerCase() === wanted) &&
+        (re === undefined || re.test(tab.url))
+    ) ?? null
+  );
 }
 
 export async function ensureTab(url, options) {
