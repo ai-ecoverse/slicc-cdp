@@ -30,6 +30,7 @@ fn settled_commands() -> Vec<(&'static str, Value, Option<&'static str>)> {
         ("Network.setRequestInterception", json!({"patterns":[]}), Some("S")),
         ("Runtime.addBinding", json!({"name":"x"}), Some("S")),
         ("Debugger.setBreakpointsActive", json!({"active":true}), Some("S")),
+        ("Debugger.setInstrumentationBreakpoint", json!({"instrumentation":"beforeScriptExecution"}), Some("S")),
         ("Browser.setWindowBounds", json!({"windowId":1,"bounds":{}}), None),
         ("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}), None),
         ("Target.autoAttachRelated", json!({"targetId":"T","waitForDebuggerOnStart":false}), None),
@@ -66,7 +67,6 @@ fn settled_refusals_leave_undecidable_commands_to_admission() {
     for (method, params, session) in [
         ("Network.emulateNetworkConditions", network, Some("S")),
         ("Runtime.addBinding", json!({"name":"x"}), Some("S")),
-        ("Debugger.setBreakpointsActive", json!({"active":true}), Some("S")),
         ("Browser.setWindowBounds", json!({"windowId":1,"bounds":{}}), None),
         ("Target.setAutoAttach", json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}), None),
         ("Browser.getVersion", json!({}), None),
@@ -74,6 +74,8 @@ fn settled_refusals_leave_undecidable_commands_to_admission() {
     ] {
         assert_eq!(cdp.settled_refusal(method, &params, session), None, "{method}");
     }
+    assert_eq!(cdp.settled_refusal("Debugger.setInstrumentationBreakpoint", &json!({"instrumentation":"beforeScriptExecution"}), Some("S")).as_deref(), Some(super::PERSISTENT));
+    assert_eq!(cdp.settled_refusal("Debugger.setBreakpointsActive", &json!({"active":true}), Some("S")).as_deref(), Some(super::PERSISTENT));
     let blocked = settled_client("blocked");
     assert_eq!(blocked.settled_refusal("Fetch.continueRequest", &json!({"requestId":"R"}), Some("S")), None);
     assert_eq!(blocked.settled_refusal("Page.handleJavaScriptDialog", &json!({"accept":true}), Some("S")), None);

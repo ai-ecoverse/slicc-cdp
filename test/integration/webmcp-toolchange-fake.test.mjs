@@ -85,56 +85,20 @@ const changed = (frameId) => (value) =>
   value.event === 'tools-changed' && value.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
-function pauseBlank(backend, frameId) {
+async function unavailableChild(backend, held, targetInfo) {
   const peer = [...backend.scripts.keys()].find(
     (session) => backend.sessions.get(session) === 'TAB'
   );
-  const frame = backend.pages.get(frameId);
-  frame.blank = true;
-  frame.loader = `PENDING-${frameId}`;
+  const released = backend.waitForCommand(
+    (call) =>
+      call.method === 'Target.detachFromTarget' && call.params.sessionId === targetInfo.targetId
+  );
   backend.inject({
-    method: 'Page.frameNavigated',
+    method: 'Target.attachedToTarget',
     sessionId: peer,
-    params: {
-      frame: {
-        id: frame.id,
-        parentId: 'TAB',
-        loaderId: frame.loader,
-        url: 'about:blank',
-        securityOrigin: frame.origin,
-      },
-    },
+    params: { sessionId: targetInfo.targetId, targetInfo, waitingForDebugger: true },
   });
-  backend.inject({
-    method: 'Runtime.executionContextCreated',
-    sessionId: peer,
-    params: {
-      context: {
-        id: frame.main,
-        uniqueId: `main-${frame.loader}`,
-        origin: frame.origin,
-        auxData: { frameId: frame.id, isDefault: true },
-      },
-    },
-  });
-  backend.inject({
-    method: 'Debugger.scriptParsed',
-    sessionId: peer,
-    params: { scriptId: `${peer}-${frameId}`, executionContextId: frame.main },
-  });
-  backend.inject({
-    method: 'Debugger.paused',
-    sessionId: peer,
-    params: {
-      callFrames: [
-        {
-          callFrameId: `${peer}-${frameId}`,
-          functionName: '__slicc_webmcp_gate',
-          location: { scriptId: `${peer}-${frameId}`, lineNumber: 0, columnNumber: 0 },
-        },
-      ],
-    },
-  });
+  await released;
 }
 
 async function scenario(options, check, args) {
@@ -154,104 +118,16 @@ async function scenario(options, check, args) {
   }
 }
 
-test('fake: an abandoned local child gate during an ordinary process swap preserves its parent installer', async () => {
-  let armed = false;
-  let swapped = false;
-  const resumed = Promise.withResolvers();
-  await scenario(
-    {
-      children: [{ id: 'SWAP', origin: 'https://ordinary.test' }],
-      onCommand(message, pages, send) {
-        if (
-          armed &&
-          !swapped &&
-          message.method === 'Debugger.getScriptSource' &&
-          message.params.scriptId.endsWith('-SWAP')
-        ) {
-          swapped = true;
-          pages.get('SWAP').blank = false;
-          pages.get('SWAP').origin = 'https://foreign.test';
-          send({
-            method: 'Runtime.executionContextDestroyed',
-            sessionId: message.sessionId,
-            params: { executionContextId: pages.get('SWAP').main },
-          });
-          send({
-            method: 'Page.frameDetached',
-            sessionId: message.sessionId,
-            params: { frameId: 'SWAP', reason: 'swap' },
-          });
-        }
-        if (swapped && message.method === 'Debugger.resume') resumed.resolve();
-      },
-    },
-    async ({ backend, held }) => {
-      armed = true;
-      pauseBlank(backend, 'SWAP');
-      await resumed.promise;
-      assert.equal(swapped, true);
-      const from = held.lines.length;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', from);
-      backend.page.document.modelContext.registerTool({ name: 'after_swap', execute: () => 'ok' });
-      const change = await held.next(changed('TAB'), from);
-      assert.deepEqual(names(change), ['after_swap']);
-    }
-  );
-});
-
 test('fake: a live provisional child with opaque frame origin retains only its verified parent installer', async () => {
-  let opaque = false;
-  let liveBackend;
-  const resumed = Promise.withResolvers();
   await scenario(
-    {
-      children: [{ id: 'PROVISIONAL', origin: 'https://ordinary.test' }],
-      onCommand(message, pages, send, sessions) {
-        if (
-          opaque &&
-          message.method === 'Page.getFrameTree' &&
-          sessions.get(message.sessionId) === 'TAB'
-        ) {
-          const frame = (page) => ({
-            id: page.id,
-            url: `${page.origin}/`,
-            securityOrigin: page.origin,
-            loaderId: page.loader,
-          });
-          send({
-            id: message.id,
-            result: {
-              frameTree: {
-                frame: frame(pages.get('TAB')),
-                childFrames: [
-                  {
-                    frame: {
-                      ...frame(pages.get('PROVISIONAL')),
-                      parentId: 'TAB',
-                      url: 'about:blank',
-                      securityOrigin: '://',
-                    },
-                  },
-                ],
-              },
-            },
-          });
-          return true;
-        }
-        if (opaque && message.method === 'Debugger.resume') {
-          opaque = false;
-          liveBackend.abandonLocalGate('PROVISIONAL');
-          resumed.resolve();
-        }
-      },
-    },
+    { children: [{ id: 'PROVISIONAL', origin: 'https://foreign.test', oopif: true }] },
     async ({ backend, held }) => {
-      liveBackend = backend;
       const from = backend.calls.length;
-      opaque = true;
-      pauseBlank(backend, 'PROVISIONAL');
-      await resumed.promise;
+      await unavailableChild(backend, held, {
+        targetId: 'PROVISIONAL',
+        type: 'iframe',
+        url: 'about:blank',
+      });
       assert.equal(
         backend.calls
           .slice(from)
@@ -268,192 +144,8 @@ test('fake: a live provisional child with opaque frame origin retains only its v
           .some((call) => call.method === 'Page.removeScriptToEvaluateOnNewDocument'),
         false
       );
-      const start = held.lines.length;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', start);
-      backend.page.document.modelContext.registerTool({
-        name: 'ordinary_recovered',
-        execute: () => 'ok',
-      });
-      assert.deepEqual(names(await held.next(changed('TAB'), start)), ['ordinary_recovered']);
+      assert.equal(backend.pages.get('PROVISIONAL').document.modelContext, undefined);
       assert.doesNotMatch(held.stderr(), /target closed/);
-    }
-  );
-});
-
-test('fake: a newer OOPIF response observed by its parent survives discarded local-child gate metadata', async () => {
-  let armed = false;
-  let swapped = false;
-  let liveBackend;
-  const provider = { id: 'POLICY_CHILD', origin: 'https://foreign.test', allow: 'tools *' };
-  await scenario(
-    {
-      children: [provider],
-      onCommand(message, pages, send) {
-        if (
-          !armed ||
-          swapped ||
-          message.method !== 'Debugger.getScriptSource' ||
-          !message.params.scriptId.endsWith('-POLICY_CHILD')
-        )
-          return;
-        swapped = true;
-        const child = pages.get('POLICY_CHILD');
-        child.loader = `FRESH-${child.loader}`;
-        child.oopif = true;
-        provider.oopif = true;
-        liveBackend.targets.push({
-          targetId: child.id,
-          type: 'iframe',
-          parentFrameId: 'TAB',
-          url: `${child.origin}/`,
-        });
-        liveBackend.sessions.set('FRESH_CHILD', child.id);
-        send({
-          method: 'Network.responseReceived',
-          sessionId: message.sessionId,
-          params: {
-            type: 'Document',
-            frameId: child.id,
-            loaderId: child.loader,
-            response: { url: `${child.origin}/`, status: 200, headers: {} },
-          },
-        });
-        send({
-          method: 'Runtime.executionContextDestroyed',
-          sessionId: message.sessionId,
-          params: { executionContextId: child.main },
-        });
-        send({
-          method: 'Page.frameDetached',
-          sessionId: message.sessionId,
-          params: { frameId: child.id, reason: 'swap' },
-        });
-        send({
-          method: 'Target.attachedToTarget',
-          sessionId: message.sessionId,
-          params: {
-            sessionId: 'FRESH_CHILD',
-            targetInfo: {
-              targetId: child.id,
-              type: 'iframe',
-              parentFrameId: 'TAB',
-              url: `${child.origin}/`,
-            },
-            waitingForDebugger: true,
-          },
-        });
-      },
-    },
-    async ({ backend, cwd, held }) => {
-      liveBackend = backend;
-      armed = true;
-      const start = held.lines.length;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', start);
-      assert.equal(swapped, true);
-      const addedAt = held.lines.length;
-      const controller = new AbortController();
-      backend.pages
-        .get('POLICY_CHILD')
-        .document.modelContext.registerTool(
-          { name: 'policy_recovered', exposedTo: ['https://ordinary.test'], execute: () => 'ok' },
-          { signal: controller.signal }
-        );
-      const added = await held.next(changed('POLICY_CHILD'), addedAt);
-      assert.deepEqual(names(added), ['policy_recovered']);
-      const listed = await run(backend.url, cwd, [
-        'webmcp-list',
-        '--tab',
-        'TAB',
-        '--json',
-        '--from-origin',
-        'https://foreign.test',
-      ]);
-      assert.equal(listed.code, 0, listed.stderr);
-      assert.deepEqual(
-        added.tools,
-        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'POLICY_CHILD')
-      );
-      const removedAt = held.lines.length;
-      controller.abort();
-      assert.deepEqual((await held.next(changed('POLICY_CHILD'), removedAt)).tools, []);
-      assert.doesNotMatch(held.stderr(), /target closed/);
-    }
-  );
-});
-
-test('fake: a child gate abandoned while queued retains the parent document installer', async () => {
-  let armed = false;
-  let queued = false;
-  let liveBackend;
-  await scenario(
-    {
-      children: [{ id: 'QUEUED', origin: 'https://ordinary.test' }],
-      onCommand(message, pages, send) {
-        if (
-          armed &&
-          !queued &&
-          message.method === 'Debugger.getScriptSource' &&
-          message.params.scriptId.endsWith('-TAB')
-        ) {
-          queued = true;
-          pauseBlank(liveBackend, 'QUEUED');
-          liveBackend.abandonLocalGate('QUEUED');
-          pages.get('QUEUED').blank = false;
-          pages.get('QUEUED').origin = 'https://foreign.test';
-          send({
-            method: 'Runtime.executionContextDestroyed',
-            sessionId: message.sessionId,
-            params: { executionContextId: pages.get('QUEUED').main },
-          });
-          send({
-            method: 'Page.frameDetached',
-            sessionId: message.sessionId,
-            params: { frameId: 'QUEUED', reason: 'swap' },
-          });
-        }
-      },
-    },
-    async ({ backend, held }) => {
-      liveBackend = backend;
-      armed = true;
-      const start = held.lines.length;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', start);
-      assert.equal(queued, true);
-      backend.page.document.modelContext.registerTool({ name: 'queued_swap', execute: () => 'ok' });
-      assert.deepEqual(names(await held.next(changed('TAB'), start)), ['queued_swap']);
-    }
-  );
-});
-
-test('fake: an OOPIF installer response waiting on its pause is resumed before page load completes', async () => {
-  await scenario(
-    {
-      installerWaitsForResume: true,
-      children: [
-        { id: 'LOAD_CHILD', origin: 'https://foreign.test', allow: 'tools *', oopif: true },
-      ],
-    },
-    async ({ backend, held }) => {
-      assert.equal(typeof backend.pages.get('LOAD_CHILD').document.modelContext, 'object');
-      const start = held.lines.length;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', start);
-      assert.ok(
-        backend.calls.some(
-          (call) =>
-            call.method === 'Debugger.resume' &&
-            backend.sessions.get(call.sessionId) === 'LOAD_CHILD'
-        )
-      );
-      backend.pages.get('LOAD_CHILD').document.modelContext.registerTool({
-        name: 'loaded_child',
-        exposedTo: ['https://ordinary.test'],
-        execute: () => 'ok',
-      });
-      assert.deepEqual(names(await held.next(changed('LOAD_CHILD'), start)), ['loaded_child']);
     }
   );
 });
@@ -511,50 +203,24 @@ test('fake: a cross-origin iframe registering after load reports its frame and o
   await scenario(
     {
       definitions: [{ name: 'top', execute: () => 'top' }],
-      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
+      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
     },
-    async ({ backend, cwd, held }) => {
-      const peer = [...backend.sessions].find(([, target]) => target === 'TAB')[0];
-      backend.inject({
-        method: 'Target.attachedToTarget',
-        sessionId: peer,
-        params: {
-          sessionId: 'SEVEN_CHILD',
-          targetInfo: { targetId: 'SEVEN_CHILD', type: 'iframe', url: 'https://seven.sliccy.ai/' },
-          waitingForDebugger: true,
-        },
+    async ({ backend, held }) => {
+      await unavailableChild(backend, held, {
+        targetId: 'SEVEN_CHILD',
+        type: 'iframe',
+        url: 'https://seven.sliccy.ai/',
       });
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      assert.match(held.stderr(), /webmcp-polyfill: child refused at target/);
-      const from = held.lines.length;
-      backend.pages.get('CROSS').document.modelContext.registerTool({
-        name: 'foreign',
-        description: 'Foreign',
-        exposedTo: ['https://ordinary.test'],
-        execute: () => 'foreign',
-      });
-      backend.pages.get('CROSS').document.modelContext.registerTool({
-        name: 'hidden',
-        exposedTo: ['https://other.test'],
-        execute: () => 'hidden',
-      });
-      const event = await held.next(changed('CROSS'), from);
-      assert.equal(event.origin, 'https://foreign.test');
-      assert.equal(event.loaderId, backend.pages.get('CROSS').loader);
-      assert.deepEqual(names(event), ['foreign']);
-      const listed = await run(backend.url, cwd, [
-        'webmcp-list',
-        '--tab',
-        'TAB',
-        '--json',
-        '--from-origin',
-        'https://foreign.test',
-      ]);
-      assert.equal(listed.code, 0, listed.stderr);
-      assert.deepEqual(
-        event.tools,
-        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'CROSS')
+      assert.doesNotMatch(
+        held.stderr(),
+        /webmcp-polyfill: cross-origin child tools are unavailable/
       );
+      await unavailableChild(backend, held, {
+        targetId: 'CROSS',
+        type: 'iframe',
+        url: 'https://foreign.test/',
+      });
+      assert.equal(backend.pages.get('CROSS').document.modelContext, undefined);
       await new Promise((resolve) => setTimeout(resolve, 1500));
       assert.equal(
         held.lines.some(
@@ -569,68 +235,18 @@ test('fake: a cross-origin iframe registering after load reports its frame and o
   );
 });
 
-test('fake: a frame change while a frame document is gated is checked again, not refused', async () => {
-  let reloaded = false;
-  let gated = false;
-  let raced = 0;
-  await scenario(
-    {
-      definitions: [{ name: 'top', execute: () => 'top' }],
-      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
-      onCommand(message, _pages, send) {
-        if (message.method === 'Page.reload') reloaded = true;
-        if (
-          reloaded &&
-          message.method === 'Debugger.getScriptSource' &&
-          message.params.scriptId.endsWith('-CROSS')
-        )
-          gated = raced === 0;
-        if (!gated || message.method !== 'Page.getFrameTree') return;
-        gated = false;
-        raced += 1;
-        send({
-          method: 'Page.frameDetached',
-          params: { frameId: 'SWAPPED', reason: 'swap' },
-          sessionId: message.sessionId,
-        });
-      },
-    },
-    async ({ backend, cwd, held }) => {
-      assert.equal(raced, 1);
-      const from = held.lines.length;
-      backend.pages.get('CROSS').document.modelContext.registerTool({
-        name: 'foreign',
-        exposedTo: ['https://ordinary.test'],
-        execute: () => 'foreign',
-      });
-      const event = await held.next(changed('CROSS'), from);
-      assert.equal(event.loaderId, backend.pages.get('CROSS').loader);
-      assert.deepEqual(names(event), ['foreign']);
-      const listed = await run(backend.url, cwd, [
-        'webmcp-list',
-        '--tab',
-        'TAB',
-        '--json',
-        '--from-origin',
-        'https://foreign.test',
-      ]);
-      assert.equal(listed.code, 0, listed.stderr);
-      assert.deepEqual(
-        event.tools,
-        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'CROSS')
-      );
-      assert.doesNotMatch(held.stderr(), /refused|target closed/);
-    }
-  );
-});
-
 test('fake: a change held back by a protected frame is reported only after the frame leaves', async () => {
   await scenario(
     {
       definitions: [{ name: 'top', execute: () => 'top' }],
-      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
+      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
     },
     async ({ backend, cwd, held }) => {
+      await unavailableChild(backend, held, {
+        targetId: 'CROSS',
+        type: 'iframe',
+        url: 'https://foreign.test/',
+      });
       const sealed = {
         targetId: 'SEALED',
         type: 'iframe',
@@ -639,9 +255,8 @@ test('fake: a change held back by a protected frame is reported only after the f
       };
       backend.targets.push(sealed);
       const from = held.lines.length;
-      backend.pages.get('CROSS').document.modelContext.registerTool({
+      backend.page.document.modelContext.registerTool({
         name: 'foreign',
-        exposedTo: ['https://ordinary.test'],
         execute: () => 'foreign',
       });
       await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -660,331 +275,58 @@ test('fake: a change held back by a protected frame is reported only after the f
       assert.notEqual(locked.code, 0);
       assert.equal(locked.stdout, '');
       backend.targets.splice(backend.targets.indexOf(sealed), 1);
-      const event = await held.next(changed('CROSS'), from);
-      assert.deepEqual(names(event), ['foreign']);
+      assert.equal(backend.pages.get('CROSS').document.modelContext, undefined);
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
-    }
-  );
-});
-
-for (const reload of [false, true]) {
-  test(`fake: a preloaded OOPIF survives frame-tree churn with reload=${reload}`, async () => {
-    let armed = false;
-    let guard;
-    let raced = 0;
-    await scenario(
-      {
-        children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
-        onCommand(message, _pages, send, sessions) {
-          if (message.method === 'Target.setAutoAttach') armed = true;
-          if (
-            message.method === 'Runtime.enable' &&
-            sessions.get(message.sessionId) === 'CROSS' &&
-            !guard
-          )
-            guard = message.sessionId;
-          if (
-            !armed ||
-            raced >= 2 ||
-            message.method !== 'Page.getFrameTree' ||
-            message.sessionId !== guard
-          )
-            return;
-          raced += 1;
-          send({
-            method: 'Page.frameDetached',
-            params: { frameId: `SWAPPED${raced}`, reason: 'swap' },
-            sessionId: message.sessionId,
-          });
-        },
-      },
-      async ({ backend, cwd, held }) => {
-        assert.ok(
-          backend.calls.some(
-            (call) =>
-              call.method === 'Page.addScriptToEvaluateOnNewDocument' &&
-              backend.sessions.get(call.sessionId) === 'CROSS'
-          ),
-          held.stderr()
-        );
-        assert.equal(raced, 2);
-        const check = async () => {
-          const controller = new AbortController();
-          let from = held.lines.length;
-          backend.pages
-            .get('CROSS')
-            .document.modelContext.registerTool(
-              { name: 'foreign', exposedTo: ['https://ordinary.test'], execute: () => 'foreign' },
-              { signal: controller.signal }
-            );
-          const added = await held.next(changed('CROSS'), from);
-          const list = async () => {
-            const result = await run(backend.url, cwd, [
-              'webmcp-list',
-              '--tab',
-              'TAB',
-              '--json',
-              '--from-origin',
-              'https://foreign.test',
-            ]);
-            assert.equal(result.code, 0, result.stderr);
-            return JSON.parse(result.stdout).filter((tool) => tool.frameId === 'CROSS');
-          };
-          assert.deepEqual(names(added), ['foreign']);
-          assert.equal(added.target, 'CROSS');
-          assert.equal(added.loaderId, backend.pages.get('CROSS').loader);
-          assert.deepEqual(added.tools, await list());
-          from = held.lines.length;
-          controller.abort();
-          const removed = await held.next(changed('CROSS'), from);
-          assert.deepEqual(removed.tools, []);
-          assert.deepEqual(await list(), []);
-        };
-        assert.equal(
-          typeof backend.pages.get('CROSS').document.modelContext.registerTool,
-          'function'
-        );
-        if (reload) await check();
-        const from = held.lines.length;
-        backend.reload();
-        await held.next((line) => line.event === 'document-ready', from);
-        await check();
-        assert.doesNotMatch(held.stderr(), /child refused|target closed/);
-      },
-      ['webmcp-polyfill', '--tab', 'TAB', ...(reload ? ['--reload'] : [])]
-    );
-  });
-}
-
-test('fake: a blank child pause received before the parent resume reply can rearm for an ordinary document', async () => {
-  const child = { id: 'CROSS', origin: 'https://ordinary.test', blank: true, allow: 'tools *' };
-  await scenario(
-    {
-      children: [child],
-      reentrantPauses: true,
-      onCommand(message) {
-        if (message.method === 'Page.reload') child.blank = false;
-      },
-    },
-    async ({ backend, held }) => {
-      const from = held.lines.length;
-      backend.pages
-        .get('CROSS')
-        .document.modelContext.registerTool({ name: 'child', execute: () => 'child' });
-      assert.deepEqual(names(await held.next(changed('CROSS'), from)), ['child']);
-      assert.doesNotMatch(held.stderr(), /refused|target closed/);
-    }
-  );
-});
-
-test('fake: an OOPIF attachment received inside blank-frame rearm waits for the parent installer', async () => {
-  await scenario(
-    {
-      attachDuringRearm: true,
-      children: [
-        { id: 'BLANK', origin: 'https://ordinary.test', allow: 'tools *' },
-        {
-          id: 'CROSS',
-          origin: 'https://foreign.test',
-          allow: 'tools *',
-          oopif: true,
-          definitions: [
-            { name: 'resumed', exposedTo: ['https://ordinary.test'], execute: () => 'resumed' },
-          ],
-        },
-      ],
-    },
-    async ({ backend, cwd, held }) => {
-      backend.pages.get('CROSS').blank = true;
-      pauseBlank(backend, 'BLANK');
-      await held
-        .next(
-          (line) => line.event === 'tools-changed' && line.frameId === 'CROSS',
-          held.lines.length
-        )
-        .catch((error) => {
-          assert.fail(`child gate did not run: ${error.message}`);
-        });
-      const listed = await run(backend.url, cwd, [
-        'webmcp-list',
-        '--tab',
-        'TAB',
-        '--json',
-        '--from-origin',
-        'https://foreign.test',
-      ]);
-      assert.equal(listed.code, 0, listed.stderr);
-      assert.deepEqual(
-        JSON.parse(listed.stdout)
-          .filter((tool) => tool.frameId === 'CROSS')
-          .map((tool) => tool.name),
-        ['resumed']
-      );
-      assert.doesNotMatch(held.stderr(), /child refused|target closed/);
-    }
-  );
-});
-
-test('fake: frame churn during blank-frame rearm preserves the holder and its next document installer', async () => {
-  let rearming = false;
-  let raced = false;
-  let backend;
-  await scenario(
-    {
-      children: [{ id: 'BLANK', origin: 'https://ordinary.test', allow: 'tools *' }],
-      onCommand(message, _pages, send) {
-        if (message.method === 'Page.removeScriptToEvaluateOnNewDocument') rearming = true;
-        if (rearming && !raced && message.method === 'Page.getFrameTree') {
-          raced = true;
-          send({
-            method: 'Page.frameDetached',
-            params: { frameId: 'SWAPPED', reason: 'swap' },
-            sessionId: message.sessionId,
-          });
-        }
-        if (
-          rearming &&
-          message.method === 'Page.addScriptToEvaluateOnNewDocument' &&
-          !message.params.runImmediately
-        )
-          backend.page.document.modelContext.registerTool({
-            name: 'recovered',
-            execute: () => 'recovered',
-          });
-      },
-    },
-    async (context) => {
-      backend = context.backend;
-      const { held } = context;
-      const from = held.lines.length;
-      pauseBlank(backend, 'BLANK');
-      assert.deepEqual(names(await held.next(changed('TAB'), from)), ['recovered']);
-      assert.equal(raced, true);
-      const generation = held.lines.length;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', generation);
-      const changedFrom = held.lines.length;
-      backend.pages
-        .get('BLANK')
-        .document.modelContext.registerTool({ name: 'next_child', execute: () => 'next_child' });
-      assert.deepEqual(names(await held.next(changed('BLANK'), changedFrom)), ['next_child']);
-      assert.doesNotMatch(held.stderr(), /refused|target closed/);
     }
   );
 });
 
 test('fake: late protected frame evidence does not revoke a fresh ordinary frame navigation', async () => {
-  let active = false;
-  let raced = false;
-  let backend;
   await scenario(
-    {
-      children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *' }],
-      beforeNavigateFrame(peer, page, event, sessions) {
-        if (!active || raced || page.id !== 'CROSS' || !backend.scripts.has(peer)) return;
-        const guard = [...sessions.keys()].find(
-          (session) => sessions.get(session) === 'TAB' && !backend.scripts.has(session)
-        );
-        assert.ok(guard);
-        raced = true;
-        event(
-          'Page.frameNavigated',
-          {
-            frame: {
-              id: page.id,
-              parentId: 'TAB',
-              loaderId: 'STALE',
-              url: 'https://seven.sliccy.ai/',
-              securityOrigin: 'https://seven.sliccy.ai',
-            },
-          },
-          guard
-        );
-      },
-    },
-    async (context) => {
-      backend = context.backend;
-      const { held, cwd } = context;
-      const from = held.lines.length;
-      active = true;
-      backend.reload();
-      await held.next((line) => line.event === 'document-ready', from);
-      assert.equal(raced, true);
-      const start = held.lines.length;
-      backend.pages.get('CROSS').document.modelContext.registerTool({
-        name: 'fresh_cross',
-        exposedTo: ['https://ordinary.test'],
-        execute: () => 'fresh_cross',
+    { children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }] },
+    async ({ backend, held }) => {
+      await unavailableChild(backend, held, {
+        targetId: 'CROSS',
+        type: 'iframe',
+        url: 'https://foreign.test/',
       });
-      const event = await held.next(changed('CROSS'), start);
-      assert.equal(event.loaderId, backend.pages.get('CROSS').loader);
-      assert.deepEqual(names(event), ['fresh_cross']);
-      const listed = await run(backend.url, cwd, [
-        'webmcp-list',
-        '--tab',
-        'TAB',
-        '--json',
-        '--from-origin',
-        'https://foreign.test',
-      ]);
-      assert.equal(listed.code, 0, listed.stderr);
-      assert.deepEqual(
-        event.tools,
-        JSON.parse(listed.stdout).filter((tool) => tool.frameId === 'CROSS')
+      const guard = [...backend.sessions.keys()].find(
+        (session) => backend.sessions.get(session) === 'TAB' && !backend.scripts.has(session)
       );
-      assert.doesNotMatch(held.stderr(), /refused|target closed/);
+      assert.ok(guard);
+      backend.inject({
+        method: 'Page.frameNavigated',
+        sessionId: guard,
+        params: {
+          frame: {
+            id: 'CROSS',
+            parentId: 'TAB',
+            loaderId: 'STALE',
+            url: 'https://seven.sliccy.ai/',
+            securityOrigin: 'https://seven.sliccy.ai',
+          },
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.equal(backend.pages.get('CROSS').document.modelContext, undefined);
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
     }
   );
 });
 
-for (const url of ['about:blank', '']) {
-  test(`fake: a provisional OOPIF root navigation without parentId stays gated for ${url || 'empty URL'}`, async () => {
-    let provisional = false;
-    await scenario(
-      {
-        children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }],
-        onCommand(message, pages, send, sessions) {
-          if (
-            provisional ||
-            message.method !== 'Page.addScriptToEvaluateOnNewDocument' ||
-            sessions.get(message.sessionId) !== 'CROSS'
-          )
-            return;
-          provisional = true;
-          const page = pages.get('CROSS');
-          send({
-            method: 'Page.frameNavigated',
-            sessionId: message.sessionId,
-            params: {
-              frame: { id: page.id, loaderId: page.loader, url, securityOrigin: page.origin },
-            },
-          });
-        },
-      },
-      async ({ backend, held }) => {
-        assert.equal(provisional, true);
-        const from = held.lines.length;
-        backend.pages.get('CROSS').document.modelContext.registerTool({
-          name: 'after_provisional',
-          exposedTo: ['https://ordinary.test'],
-          execute: () => 'after_provisional',
-        });
-        assert.deepEqual(names(await held.next(changed('CROSS'), from)), ['after_provisional']);
-        assert.doesNotMatch(held.stderr(), /refused|target closed/);
-      }
-    );
-  });
-}
-
 test('fake: refused navigation traces contain only sanitized frame evidence and event order', async () => {
   await scenario(
     { children: [{ id: 'CROSS', origin: 'https://foreign.test', allow: 'tools *', oopif: true }] },
     async ({ backend, held }) => {
+      await unavailableChild(backend, held, {
+        targetId: 'CROSS',
+        type: 'iframe',
+        url: 'https://foreign.test/',
+      });
       const peer = [...backend.scripts.keys()].find(
-        (session) => backend.sessions.get(session) === 'CROSS'
+        (session) => backend.sessions.get(session) === 'TAB'
       );
-      const page = backend.pages.get('CROSS');
+      const page = backend.pages.get('TAB');
       const trace = new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           held.child.stderr.off('data', check);
@@ -1007,7 +349,7 @@ test('fake: refused navigation traces contain only sanitized frame evidence and 
         check();
       });
       const guard = [...backend.sessions.keys()].find(
-        (session) => backend.sessions.get(session) === 'CROSS' && !backend.scripts.has(session)
+        (session) => backend.sessions.get(session) === 'TAB' && !backend.scripts.has(session)
       );
       backend.inject({
         method: 'Fetch.requestPaused',
@@ -1025,8 +367,7 @@ test('fake: refused navigation traces contain only sanitized frame evidence and 
         params: {
           targetInfo: {
             targetId: page.id,
-            type: 'iframe',
-            parentFrameId: 'TAB',
+            type: 'page',
             url: `${page.origin}/`,
           },
         },
@@ -1051,7 +392,7 @@ test('fake: refused navigation traces contain only sanitized frame evidence and 
       assert.equal(reported.frameInGuardTree, true);
       assert.equal(reported.guardFrame.scheme, 'https');
       assert.equal(reported.loaderEqual, true);
-      assert.equal(reported.targetType, 'iframe');
+      assert.equal(reported.targetType, 'page');
       assert.equal(reported.documentFetch.decision, 'continue');
       assert.equal(reported.documentFetch.errorReason, null);
       assert.equal(reported.documentFetch.destinationProtected, false);

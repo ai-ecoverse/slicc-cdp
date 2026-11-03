@@ -80,6 +80,7 @@ struct Collected {
     available: bool,
     frames: Vec<FrameRec>,
     scopes: BTreeMap<String, Scope>,
+    native: bool,
 }
 
 pub fn origins(values: &[&str]) -> Result<Vec<String>, String> {
@@ -94,8 +95,12 @@ pub fn origins(values: &[&str]) -> Result<Vec<String>, String> {
     Ok(result.into_iter().collect())
 }
 
-pub fn list(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String]) -> Result<Value, String> {
-    with_tools(cdp, state, target, session, from, |_, collected| if collected.available { Ok(Value::Array(collected.tools.into_iter().map(|tool| tool.value).collect())) } else { Ok(Value::Null) })
+pub fn list(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String]) -> Result<(Value, bool), String> {
+    with_tools(cdp, state, target, session, from, |_, collected| {
+        let native = collected.native;
+        let tools = if collected.available { Value::Array(collected.tools.into_iter().map(|tool| tool.value).collect()) } else { Value::Null };
+        Ok((tools, native))
+    })
 }
 
 pub fn frames(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String]) -> Result<Value, String> {
@@ -109,8 +114,10 @@ pub fn frames(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from:
     })
 }
 
-pub fn call(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], frame: Option<&str>, name: &str, input: &Value, allow: bool) -> Result<Value, String> {
-    with_tools(cdp, state, target, session, from, |cdp, collected| {
+pub fn call(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], frame: Option<&str>, name: &str, input: &Value, allow: bool) -> Result<(Value, bool), String> {
+    let mut native_mode = false;
+    let result = with_tools(cdp, state, target, session, from, |cdp, collected| {
+        native_mode = collected.native;
         if !collected.available { return Ok(json!({"__webmcp_error":"absent"})); }
         let tools = &collected.tools;
         let matches = tools.iter().filter(|tool| tool.value.get("name").and_then(Value::as_str) == Some(name) && frame.is_none_or(|frame| frame == tool.scope.frame)).collect::<Vec<_>>();
@@ -121,6 +128,7 @@ pub fn call(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &
             return Ok(json!({"__webmcp_error":"consequential","description":tool.value["description"]}));
         }
         let native = tool.kind == "native";
+        native_mode = native;
         let object_input = crate::webmcp::chrome_major_version(cdp).is_some_and(|major| major >= 155);
         revalidate(cdp, &tool.scope, &collected, tool.kind != "native")?;
         let input_expression = if object_input { input.to_string() } else { format!("JSON.stringify({input})") };
@@ -174,10 +182,11 @@ try {{
             Err(message) if message == "webmcp: document changed\n" || message.starts_with("Runtime.evaluate:") && (message.contains("Execution context was destroyed") || message.contains("Cannot find context with specified id")) => Ok(json!({"__webmcp_result":"null"})),
             other => other,
         }
-    })
+    });
+    result.map(|value| (value, native_mode))
 }
 
-fn with_tools(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Collected) -> Result<Value, String>) -> Result<Value, String> {
+fn with_tools<T>(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Collected) -> Result<T, String>) -> Result<T, String> {
     if from.iter().any(|origin| cdp.guard().url(origin)) { return Err(format!("{}\n", cdp.guard().refusal())); }
     let mut opened = Vec::new();
     let result = collect(cdp, state, target, session, from, &mut opened).and_then(|collected| invoke(cdp, collected));
@@ -192,6 +201,11 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     let mut owners = BTreeMap::new();
     build_scope(cdp, state, target, session, root, &mut scopes, opened)?;
     let top = scopes[&root.frame_id].origin.clone();
+    let root_scope = scopes[&root.frame_id].clone();
+    let native = evaluate(cdp, &root_scope, "'modelContext' in Document.prototype", true)?.as_bool() == Some(true);
+    let available = evaluate(cdp, &root_scope, "document.modelContext != null", false)?.as_bool() == Some(true);
+    let native = native && available;
+    let from: &[String] = if native { from } else { &[] };
     for frame in &frames {
         if frame.frame_id == root.frame_id { continue; }
         let origin = url::Url::parse(&frame.url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
@@ -205,11 +219,8 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
             owners.extend(link_owner(cdp, &mut scopes, item)?.map(|owner| (item.frame_id.clone(), owner)));
         }
     }
-    let root_scope = scopes[&root.frame_id].clone();
-    let native = evaluate(cdp, &root_scope, "'modelContext' in Document.prototype", true)?.as_bool() == Some(true);
-    let available = evaluate(cdp, &root_scope, "document.modelContext != null", false)?.as_bool() == Some(true);
     let mut result = Vec::new();
-    if native && available {
+    if native {
         let mut selected = Vec::new();
         for scope in scopes.values() {
             if (scope.origin == top || from.contains(&scope.origin)) && allowed(cdp, scope, &frames, &scopes, &owners, false)? {
@@ -243,7 +254,7 @@ try {{
     {
         for scope in scopes.values() {
             if result.iter().any(|tool| tool.scope.frame == scope.frame) { continue; }
-            if scope.origin != top && !from.contains(&scope.origin) { continue; }
+            if scope.origin != top { continue; }
             if !allowed(cdp, scope, &frames, &scopes, &owners, true)? { continue; }
             let unknown = scope.page_defined && scope.policy.is_none() && scope.path.is_empty() && native_policy(cdp, scope)?.is_none();
             let bridge = scope.bridge.as_deref().unwrap_or("undefined");
@@ -279,7 +290,7 @@ try {{
     }
     result.sort_by(|a, b| a.value["name"].as_str().cmp(&b.value["name"].as_str()).then(a.scope.frame.cmp(&b.scope.frame)));
     let available = available || !result.is_empty();
-    Ok(Collected { tools: result, available, frames, scopes })
+    Ok(Collected { tools: result, available, frames, scopes, native })
 }
 
 fn revalidate(cdp: &mut Cdp, scope: &Scope, collected: &Collected, compatibility: bool) -> Result<(), String> {
@@ -500,6 +511,7 @@ fn iframe_allows(allow: &str, parent: &str, child: &str, src: &str) -> bool {
 mod tests {
     use super::*;
     include!("webmcp_frames_test.rs");
+    include!("../../../test/integration/webmcp-native-origins.rs");
 
     #[test]
     fn permissions_policy_headers_and_iframe_delegation_fail_closed() {
