@@ -3196,8 +3196,9 @@ mod tests {
         assert!(entries[0]["endpoint"].get("browser").is_none());
         assert_eq!(entries[0]["endpoint"]["profile"], "chrome");
         assert_eq!(entries[0]["endpoint"]["sevenOpen"], true);
-        assert_eq!(entries[0]["endpoint"]["sevenTabs"].as_array().unwrap().len(), 1);
+        assert_eq!(entries[0]["endpoint"]["sevenTabs"].as_array().unwrap().len(), 2);
         assert_eq!(entries[0]["endpoint"]["sevenTabs"][0]["id"], "T1");
+        assert_eq!(entries[0]["endpoint"]["sevenTabs"][1]["id"], "W");
         assert_eq!(entries[0]["endpoint"]["name"], "Chrome");
         assert_eq!(entries[0]["name"], "Chrome");
         assert_eq!(entries[0]["version"], "120.0.0.0");
@@ -4003,8 +4004,12 @@ mod tests {
         assert!(!seven_origin("https://vault-preview.sliccy.ai/"));
         assert!(!seven_origin("https://get.sliccy.ai/"));
         assert!(!seven_origin("https://mcpcat.sliccy.ai/"));
-        assert!(!seven_origin("https://www.sliccy.ai/"));
         assert!(!seven_origin("https://vault-x.sliccy.ai/"));
+    }
+
+    #[test]
+    fn seven_origin_www_is_seven() {
+        assert!(seven_origin("https://www.sliccy.ai/"));
     }
 
     #[test]
