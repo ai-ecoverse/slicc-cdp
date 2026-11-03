@@ -362,11 +362,11 @@ function evalSourceAsync(tab, source) {
 
 export { evalSource as eval, evalSourceAsync as evalAsync };
 
-function evaluate(tab, source, awaitPromise) {
-  return using(() => evaluateNow(tab, source, awaitPromise));
+function evaluate(tab, source, awaitPromise, decodeJson = true) {
+  return using(() => evaluateNow(tab, source, awaitPromise, decodeJson));
 }
 
-async function evaluateNow(tab, source, awaitPromise) {
+async function evaluateNow(tab, source, awaitPromise, decodeJson) {
   const { client, sessionId } = await sessionFor(targetIdOf(tab));
   const result = await client.send(
     'Runtime.evaluate',
@@ -380,7 +380,8 @@ async function evaluateNow(tab, source, awaitPromise) {
   if (result?.exceptionDetails) {
     throw new Error(exceptionMessage(result.exceptionDetails));
   }
-  return unwrapEvalResult(result?.result?.value);
+  const value = result?.result?.value;
+  return decodeJson ? unwrapEvalResult(value) : value;
 }
 
 export async function cookie(tab, name) {
@@ -401,6 +402,7 @@ export async function localStorage(tab, key) {
   const raw = await evaluate(
     tab,
     `(function(){try{var v=window.localStorage.getItem(${JSON.stringify(key)});return v===null?null:String(v);}catch(e){return null;}})()`,
+    false,
     false
   );
   if (raw === null || raw === undefined) return null;
