@@ -109,11 +109,17 @@ browser.ensureTab(process.argv[2]).then(async (tab) => {
 }
 
 const FAKE_STEPS = `
+  version: browser.version,
   found: (await browser.findTab({ domain: 'example.test' }))?.targetId,
   value: await browser.eval(tab, 'document.title'),
   tab: tab.targetId,
 `;
-const FAKE_WORK = { found: 'TAB1', value: 'fake-eval', tab: 'TAB1' };
+const FAKE_WORK = {
+  version: JSON.parse(await readFile(path.join(PACKAGE, 'package.json'), 'utf8')).version,
+  found: 'TAB1',
+  value: 'fake-eval',
+  tab: 'TAB1',
+};
 
 test('sliccy-browser’s copies of the CDP client are the same bytes as src/', async () => {
   for (const file of ['connect.js', 'cdp-client.js'])
