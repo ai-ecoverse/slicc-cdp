@@ -51,6 +51,41 @@ mod native_origins_contract {
     }
 
     #[test]
+    fn missing_requested_tool_reports_the_limit_only_after_polyfill_mode_detection() {
+        for native in [false, true] {
+            let (mut cdp, calls) = inspector(native);
+            let mut state = Session::default();
+            let from = vec!["https://ordinary-child.test".to_string()];
+            let called = crate::webmcp::call_from(&mut cdp, &mut state, "foreign", "{}", Some("ROOT"), false, &from, None);
+            assert_eq!(called.code, 2, "{}", called.stderr);
+            assert_eq!(called.stdout, "");
+            assert!(called.stderr.contains("unknown tool \"foreign\""));
+            assert_eq!(called.stderr.contains("cross-origin child tools are unavailable"), !native);
+            if !native {
+                assert!(sent_origins(&calls.borrow()).is_empty());
+                assert!(!calls.borrow().iter().any(|command| command["params"]["expression"].as_str().is_some_and(|expression| expression.contains(&from[0]))));
+            }
+        }
+    }
+
+    #[test]
+    fn protected_origin_cli_refusal_has_no_polyfill_limit_message() {
+        for native in [false, true] {
+            let (mut cdp, calls) = inspector(native);
+            let mut state = Session::default();
+            let from = vec!["https://vault.sliccy.ai".to_string()];
+            let listed = crate::webmcp::list_from(&mut cdp, &mut state, Some("ROOT"), true, &from);
+            let called = crate::webmcp::call_from(&mut cdp, &mut state, "foreign", "{}", Some("ROOT"), false, &from, None);
+            for output in [listed, called] {
+                assert_ne!(output.code, 0);
+                assert!(output.stderr.starts_with("slicc: refused:"), "{}", output.stderr);
+                assert!(!output.stderr.contains("cross-origin child tools are unavailable"));
+            }
+            assert!(!calls.borrow().iter().any(|command| command["params"]["expression"] == "'modelContext' in Document.prototype"));
+        }
+    }
+
+    #[test]
     fn protected_requested_origin_refuses_before_mode_detection_on_both_paths() {
         for native in [false, true] {
             let (mut cdp, calls) = inspector(native);
