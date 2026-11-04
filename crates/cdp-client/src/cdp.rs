@@ -4176,7 +4176,16 @@ pub fn resolve_websocket(start: crate::connect::Start, runtime: Option<&str>) ->
 }
 
 pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, String> {
-    Cdp::connect(&resolve_websocket(start, runtime)?)
+    Ok(open_dialed(start, runtime)?.1)
+}
+
+pub fn open_dialed(
+    start: crate::connect::Start,
+    runtime: Option<&str>,
+) -> Result<(String, Cdp), String> {
+    let dialed = resolve_websocket(start, runtime)?;
+    let cdp = Cdp::connect(&dialed)?;
+    Ok((dialed, cdp))
 }
 
 include!("dialog.rs");
