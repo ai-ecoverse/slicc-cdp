@@ -148,6 +148,14 @@ impl Protected {
         self.rules.extension_frames.while_present.iter().any(|item| item == method)
     }
 
+    pub fn extension_input_method(&self, method: &str) -> bool {
+        self.rules.extension_frames.input_while_present.iter().any(|item| item == method)
+    }
+
+    pub fn extension_input_refusal(&self) -> &str {
+        &self.rules.extension_frames.input_refusal
+    }
+
     pub fn extension_shown_refusal(&self) -> &str {
         &self.rules.extension_frames.shown_refusal
     }
@@ -488,7 +496,13 @@ mod tests {
         assert!(!guard.extension_frame("not a url"));
         assert!(guard.url("chrome-extension://pejdijmoenmkgeppbflobdenhhabjlaj/completion_list.html"));
         assert!(guard.extension_shown_method("Page.captureScreenshot"));
-        assert!(guard.extension_shown_method("Input.dispatchMouseEvent"));
+        assert!(!guard.extension_shown_method("Input.dispatchMouseEvent"));
+        assert!(guard.extension_input_method("Input.dispatchMouseEvent"));
+        assert!(guard.extension_input_method("Input.dispatchKeyEvent"));
+        assert!(guard.extension_input_method("Input.insertText"));
+        assert!(guard.extension_input_method("Input.imeSetComposition"));
+        assert!(!guard.extension_input_method("Runtime.evaluate"));
+        assert!(guard.extension_input_refusal().contains("chrome-extension://"));
         assert!(!guard.extension_shown_method("Runtime.evaluate"));
         assert!(guard.extension_present_method("Page.startScreencast"));
         assert!(guard.extension_shown_refusal().contains("chrome-extension://"));

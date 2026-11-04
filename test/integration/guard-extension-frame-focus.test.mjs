@@ -1,0 +1,155 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
+import { launchBrowser } from './browser.mjs';
+import { chromeTest } from './chrome-policy.mjs';
+import { cleanup } from './cleanup.mjs';
+import { guarded, observer } from './guard-client.mjs';
+import { browserArgs, origins } from './guard-fixture.mjs';
+
+async function value(client, session, expression) {
+  const answer = await client.send(
+    'Runtime.evaluate',
+    {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    },
+    session
+  );
+  assert.equal(answer.exceptionDetails, undefined, JSON.stringify(answer));
+  return answer.result?.value;
+}
+
+chromeTest(
+  'hidden extension input requires no deep focus, including closed shadow roots',
+  { timeout: 120000 },
+  async () => {
+    execFileSync(
+      'cargo',
+      ['build', '--locked', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'],
+      { stdio: 'inherit' }
+    );
+    const fixture = await fixtureServer();
+    let browser;
+    let raw;
+    let client;
+    try {
+      browser = await launchBrowser([
+        ...browserArgs({ privileged: true }),
+        '--enable-unsafe-extension-debugging',
+      ]);
+      raw = await observer(browser.wsUrl);
+      const path = fileURLToPath(
+        new URL(
+          './harness/extension',
+          import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json')
+        )
+      );
+      const extension = await raw.send('Extensions.loadUnpacked', { path });
+      const { targetId } = await raw.send('Target.createTarget', { url: 'about:blank' });
+      const page = (await raw.send('Target.attachToTarget', { targetId, flatten: true })).sessionId;
+      await raw.send('Page.enable', {}, page);
+      const loaded = raw.waitEvent(
+        (event) => event.method === 'Page.loadEventFired' && event.sessionId === page,
+        10000
+      );
+      await raw.send('Page.navigate', { url: `${origins(fixture).ordinary}/blank` }, page);
+      await loaded;
+      await raw.send('Page.bringToFront', {}, page);
+      assert.equal(
+        await value(
+          raw,
+          page,
+          `new Promise(resolve => {
+      document.body.innerHTML = '<input id="ordinary"><div id="host"></div>';
+      const root = document.getElementById('host').attachShadow({mode:'closed'});
+      const frame = document.createElement('iframe');
+      frame.style.cssText = 'position:fixed;left:-999999px;visibility:hidden;opacity:0';
+      frame.onload = () => resolve(true);
+      frame.src = ${JSON.stringify(`chrome-extension://${extension.id}/frame.html`)};
+      globalThis.focusExtension = () => frame.contentWindow.focus();
+      globalThis.showExtension = () => { frame.style.cssText = 'position:fixed;left:0;top:0;width:300px;height:200px'; };
+      root.append(frame);
+    })`
+        ),
+        true
+      );
+      const { targetInfos } = await raw.send('Target.getTargets');
+      const frame = targetInfos.find(
+        (info) =>
+          info.type === 'iframe' && info.url.startsWith(`chrome-extension://${extension.id}/`)
+      );
+      assert.ok(frame);
+      const privateSession = (
+        await raw.send('Target.attachToTarget', { targetId: frame.targetId, flatten: true })
+      ).sessionId;
+      await value(
+        raw,
+        privateSession,
+        `(() => {
+      document.body.innerHTML = '<input id="private">';
+      globalThis.keys = [];
+      document.addEventListener('keydown', event => keys.push(event.key));
+      return true;
+    })()`
+      );
+      client = await guarded(browser.wsUrl, origins(fixture).client, {
+        variant: 'prompt',
+        detachDelay: 0,
+      });
+      const session = (await client.send('Target.attachToTarget', { targetId, flatten: true }))
+        .sessionId;
+      await value(client, session, 'document.getElementById("ordinary").focus()');
+      await client.send('Input.insertText', { text: 'page' }, session);
+      assert.equal(await value(raw, page, 'document.getElementById("ordinary").value'), 'page');
+      await value(raw, privateSession, 'document.getElementById("private").focus()');
+      await value(client, session, 'focusExtension()');
+      assert.equal(await value(raw, page, 'document.activeElement.id'), 'host');
+      assert.equal(await value(raw, privateSession, 'document.hasFocus()'), true);
+      for (const [method, params] of [
+        ['Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowDown', code: 'ArrowDown' }],
+        ['Input.insertText', { text: 'private' }],
+        ['Input.imeSetComposition', { text: 'private', selectionStart: 7, selectionEnd: 7 }],
+        [
+          'Input.dispatchMouseEvent',
+          { type: 'mousePressed', x: 20, y: 20, button: 'left', clickCount: 1 },
+        ],
+      ]) {
+        await assert.rejects(
+          client.send(method, params, session),
+          /slicc: refused:.*chrome-extension:\/\//
+        );
+      }
+      assert.deepEqual(await value(raw, privateSession, 'keys'), []);
+      assert.equal(
+        await value(raw, privateSession, 'document.getElementById("private").value'),
+        ''
+      );
+      assert.ok((await client.send('Page.captureScreenshot', { format: 'png' }, session)).data);
+      await value(client, session, 'document.getElementById("ordinary").focus()');
+      await client.send('Input.insertText', { text: '-again' }, session);
+      assert.equal(
+        await value(raw, page, 'document.getElementById("ordinary").value'),
+        'page-again'
+      );
+      await value(client, session, 'showExtension()');
+      await assert.rejects(
+        client.send('Input.insertText', { text: 'blocked' }, session),
+        /slicc: refused:.*chrome-extension:\/\//
+      );
+      await assert.rejects(
+        client.send('Page.captureScreenshot', { format: 'png' }, session),
+        /slicc: refused:.*chrome-extension:\/\//
+      );
+    } finally {
+      await cleanup([
+        () => client?.close(),
+        () => raw?.close(),
+        () => browser?.close(),
+        () => fixture.close(),
+      ]);
+    }
+  }
+);
