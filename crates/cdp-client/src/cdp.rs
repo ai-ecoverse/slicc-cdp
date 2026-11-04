@@ -4153,7 +4153,7 @@ pub fn slicc_agent() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, String> {
+pub fn resolve_websocket(start: crate::connect::Start, runtime: Option<&str>) -> Result<String, String> {
     let socket = match start {
         crate::connect::Start::Direct(url) => url,
         crate::connect::Start::Discover(url) => {
@@ -4172,8 +4172,20 @@ pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, 
             crate::connect::websocket_url_from_version(&body)?
         }
     };
-    let socket = crate::connect::append_runtime(&socket, runtime);
-    Cdp::connect(&socket)
+    Ok(crate::connect::append_runtime(&socket, runtime))
+}
+
+pub fn open(start: crate::connect::Start, runtime: Option<&str>) -> Result<Cdp, String> {
+    Ok(open_dialed(start, runtime)?.1)
+}
+
+pub fn open_dialed(
+    start: crate::connect::Start,
+    runtime: Option<&str>,
+) -> Result<(String, Cdp), String> {
+    let dialed = resolve_websocket(start, runtime)?;
+    let cdp = Cdp::connect(&dialed)?;
+    Ok((dialed, cdp))
 }
 
 include!("dialog.rs");

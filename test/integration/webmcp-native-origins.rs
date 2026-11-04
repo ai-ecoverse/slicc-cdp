@@ -3,7 +3,7 @@ mod native_origins_contract {
 
     fn inspector(native: bool) -> (Cdp, Rc<RefCell<Vec<Value>>>) {
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let cdp = Cdp::from_transport(Box::new(FrameInspector { queue: VecDeque::new(), calls: calls.clone(), next: 0, sessions: BTreeMap::new(), children: false, isolated: false, native }));
+        let cdp = Cdp::from_transport(Box::new(FrameInspector { queue: VecDeque::new(), calls: calls.clone(), next: 0, sessions: BTreeMap::new(), children: false, isolated: false, native, permissions: true }));
         (cdp, calls)
     }
 

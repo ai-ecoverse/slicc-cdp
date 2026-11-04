@@ -113,7 +113,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             Err(message) => return Output::err(message),
         }
     };
-    let mut opened = cdp::open(start.clone(), runtime.as_deref());
+    let mut opened = cdp::open_dialed(start.clone(), runtime.as_deref());
     if let Err(message) = &opened {
         if from_memory && launch::retry_open_without_endpoint(command, message) {
             from_memory = false;
@@ -121,14 +121,14 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
                 Ok((next, probed)) => {
                     from_probe = probed;
                     start = next;
-                    opened = cdp::open(start.clone(), runtime.as_deref());
+                    opened = cdp::open_dialed(start.clone(), runtime.as_deref());
                 }
                 Err(next) => return Output::err(next),
             }
         }
     }
-    let connected = match opened {
-        Ok(cdp) => cdp,
+    let (dialed, connected) = match opened {
+        Ok(pair) => pair,
         Err(message) => return Output::err(message),
     };
     let endpoint = match &start {
@@ -136,7 +136,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
-    state.webmcp_connection = cdp_client::hash::sha256_hex(endpoint.as_bytes());
+    state.webmcp_connection = connect::webmcp_connection_key(&dialed);
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
@@ -1830,5 +1830,53 @@ fn cmd_pdf(
             Output::ok(format!("Saved PDF to {}\n", path.display()))
         }
         Err(message) => Output::err(message),
+    }
+}
+
+#[cfg(test)]
+mod open_recovery_tests {
+    use crate::launch;
+
+    fn after_unreachable_saved(
+        from_memory: bool,
+        command: &str,
+        open_error: Result<(), String>,
+        relaunched: Result<(), String>,
+    ) -> Result<(), String> {
+        match open_error {
+            Err(message) if from_memory && launch::retry_open_without_endpoint(command, &message) => {
+                relaunched
+            }
+            Ok(()) => Ok(()),
+            Err(message) => Err(message),
+        }
+    }
+
+    #[test]
+    fn unreachable_saved_http_discovery_endpoint_relaunches_for_open() {
+        let discovery = "CDP discovery failed for http://127.0.0.1:9306/json/version: Connection refused\nThis CLI does not launch Chrome. Pass --cdp or set SLICC_CDP_URL.\n";
+        assert_eq!(
+            after_unreachable_saved(true, "open", Err(discovery.into()), Ok(())),
+            Ok(())
+        );
+        assert_eq!(
+            after_unreachable_saved(true, "tab-new", Err(discovery.into()), Ok(())),
+            Ok(())
+        );
+        assert!(
+            after_unreachable_saved(false, "open", Err(discovery.into()), Ok(())).is_err()
+        );
+        assert!(
+            after_unreachable_saved(true, "tab-list", Err(discovery.into()), Ok(())).is_err()
+        );
+        assert_eq!(
+            after_unreachable_saved(
+                true,
+                "open",
+                Err(discovery.into()),
+                Err("launched".into())
+            ),
+            Err("launched".into())
+        );
     }
 }

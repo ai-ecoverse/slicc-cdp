@@ -3767,6 +3767,7 @@ mod tests {
         let dead = "CDP connection to 127.0.0.1:9333 failed: connection refused. This CLI does not launch Chrome. Pass --cdp or set SLICC_CDP_URL.\n";
         let http = "HTTP 500\nnope\n";
         let discovery = "CDP discovery failed for http://127.0.0.1:9333/json/version: broken pipe\n";
+        let resolve_discovery = "CDP discovery failed for http://127.0.0.1:9306/json/version: Connection refused\nThis CLI does not launch Chrome. Pass --cdp or set SLICC_CDP_URL.\n";
         let missing = "could not resolve browser.example: no such host\n";
         let body = "json/version returned no webSocketDebuggerUrl\n";
         #[cfg(not(target_arch = "wasm32"))]
@@ -3774,6 +3775,7 @@ mod tests {
             assert!(retry_open_without_endpoint("open", dead));
             assert!(retry_open_without_endpoint("tab-new", dead));
             assert!(retry_open_without_endpoint("open", discovery));
+            assert!(retry_open_without_endpoint("open", resolve_discovery));
             assert!(retry_open_without_endpoint("open", missing));
             assert!(!retry_open_without_endpoint("snapshot", dead));
             assert!(!retry_open_without_endpoint("tab-list", dead));
