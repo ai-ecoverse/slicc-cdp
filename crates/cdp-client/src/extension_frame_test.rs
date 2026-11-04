@@ -141,6 +141,27 @@ fn extension_frame_visibility_failure_refuses_before_capture() {
 }
 
 #[test]
+fn extension_frame_screencasts_are_refused_and_late_frames_are_stopped() {
+    let (mut cdp, session, browser) = extension_frame_client(false, false);
+    assert!(cdp.call("Page.startScreencast", json!({"format":"png"}), Some(&session)).unwrap_err().starts_with("slicc: refused:"));
+    assert!(!browser.borrow().calls.iter().any(|call| call["method"] == "Page.startScreencast"));
+    for (index, (present, shown)) in [(false, false), (true, false), (true, true)].into_iter().enumerate() {
+        browser.borrow_mut().present = present;
+        browser.borrow_mut().shown = shown;
+        if index == 1 {
+            cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":extension_frame_target()}}));
+        }
+        let before = browser.borrow().calls.iter().filter(|call| call["method"] == "Page.stopScreencast").count();
+        let marker = format!("late-screencast-pixels-{index}");
+        cdp.absorb(json!({"method":"Page.screencastFrame","sessionId":session,"params":{"sessionId":index,"data":marker,"metadata":{"deviceWidth":800,"deviceHeight":600}}}));
+        assert!(!cdp.events().iter().any(|event| event["method"] == "Page.screencastFrame"));
+        assert!(!format!("{:?}", cdp.events()).contains(&marker));
+        let stopped = browser.borrow().calls.iter().filter(|call| call["method"] == "Page.stopScreencast" && call["sessionId"] == session).count();
+        assert_eq!(stopped, before + 1);
+    }
+}
+
+#[test]
 fn extension_frame_stays_unattachable_and_redacted() {
     let (mut cdp, session, _) = extension_frame_client(true, false);
     assert!(cdp.call("Target.attachToTarget", json!({"targetId":"EXT","flatten":true}), None).is_err());
