@@ -633,7 +633,11 @@ impl Cdp {
         }
         if executed { self.verify_execution(&checks)?; }
         if method == "Page.captureScreenshot" {
-            if let Some(page) = session_id.and_then(|session| self.session_target(session)).and_then(|target| self.page_scope_owners.get(&target).cloned()) {
+            if let Some(session) = session_id {
+                let page = match self.verify_page_scope_state(Some(session)) {
+                    Ok(((page, _, _), _)) => page,
+                    Err(_) => return Err(self.guard.extension_shown_refusal().to_string()),
+                };
                 if let Some(frames) = self.extension_frames.get(&page).cloned() {
                     if self.extension_frames_shown(&page, &frames) { return Err(self.guard.extension_shown_refusal().to_string()) }
                 }

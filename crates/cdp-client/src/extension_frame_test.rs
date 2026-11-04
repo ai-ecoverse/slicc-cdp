@@ -3,6 +3,8 @@ struct ExtensionFrameBrowser {
     shown: bool,
     focused: bool,
     reveal_on_capture: bool,
+    attach_on_capture: Option<bool>,
+    defer_attach_probes: usize,
     visibility_error: bool,
     calls: Vec<Value>,
     attached: usize,
@@ -36,6 +38,10 @@ impl Transport for ExtensionFrameTransport {
             "Target.getTargets" => {
                 let mut targets = vec![extension_frame_page()];
                 if browser.present { targets.push(extension_frame_target()); }
+                if browser.defer_attach_probes > 0 {
+                    browser.defer_attach_probes -= 1;
+                    if browser.defer_attach_probes == 0 { browser.present = true; }
+                }
                 json!({"targetInfos":targets})
             }
             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"T","loaderId":"L","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test"}}}),
@@ -49,6 +55,11 @@ impl Transport for ExtensionFrameTransport {
                 if browser.reveal_on_capture {
                     browser.present = true;
                     browser.shown = true;
+                }
+                if let Some(shown) = browser.attach_on_capture {
+                    browser.shown = shown;
+                    browser.focused = false;
+                    browser.defer_attach_probes = 1;
                 }
                 json!({"data":"private-pixels"})
             }
@@ -65,7 +76,7 @@ impl Transport for ExtensionFrameTransport {
 
 fn extension_frame_client(present: bool, shown: bool) -> (Cdp, String, Rc<RefCell<ExtensionFrameBrowser>>) {
     let browser = Rc::new(RefCell::new(ExtensionFrameBrowser {
-        present, shown, focused:false, reveal_on_capture:false, visibility_error:false, calls:Vec::new(), attached:0,
+        present, shown, focused:false, reveal_on_capture:false, attach_on_capture:None, defer_attach_probes:0, visibility_error:false, calls:Vec::new(), attached:0,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ExtensionFrameTransport { browser:browser.clone(), inbox:VecDeque::new() }));
     let session = super::attach(&mut cdp, "T").unwrap();
@@ -110,6 +121,25 @@ fn extension_frame_added_or_revealed_during_capture_discards_the_pixels() {
         browser.borrow_mut().reveal_on_capture = false;
         assert!(cdp.call("Page.captureScreenshot", json!({}), Some(&session)).is_ok());
     }
+}
+
+#[test]
+fn extension_frame_attaching_shown_during_capture_is_refused_after_reply() {
+    let (mut cdp, session, browser) = extension_frame_client(false, false);
+    browser.borrow_mut().attach_on_capture = Some(true);
+    let message = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap_err();
+    assert_eq!(message, cdp.guard.extension_shown_refusal());
+    assert!(browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
+    assert_eq!(cdp.extension_frames["T"], ["EXT"]);
+}
+
+#[test]
+fn extension_frame_attaching_hidden_during_capture_keeps_the_pixels() {
+    let (mut cdp, session, browser) = extension_frame_client(false, false);
+    browser.borrow_mut().attach_on_capture = Some(false);
+    let picture = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap();
+    assert_eq!(picture["data"], "private-pixels");
+    assert_eq!(cdp.extension_frames["T"], ["EXT"]);
 }
 
 #[test]
