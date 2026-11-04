@@ -91,7 +91,7 @@ fn extension_frame_visibility_gates_capture_without_locking_page_reads() {
         ] {
             let answer = cdp.call(method, json!({}), Some(&session));
             assert_eq!(answer.is_ok(), !shown);
-            if shown { assert_eq!(answer.unwrap_err(), cdp.guard.extension_input_refusal()); }
+            if shown { assert_eq!(answer.unwrap_err(), cdp.guard.extension_shown_refusal()); }
             assert_eq!(browser.borrow().calls.iter().any(|call| call["method"] == method), !shown);
         }
     }
@@ -121,10 +121,12 @@ fn extension_frame_focus_is_rechecked_before_each_input() {
         for method in ["Input.dispatchKeyEvent", "Input.insertText", "Input.imeSetComposition", "Input.dispatchMouseEvent"] {
             let answer = cdp.call(method, json!({}), Some(&session));
             assert_eq!(answer.is_ok(), !focused);
-            if focused { assert_eq!(answer.unwrap_err(), cdp.guard.extension_input_refusal()); }
+            if focused { assert_eq!(answer.unwrap_err(), cdp.guard.extension_shown_refusal()); }
             assert_eq!(browser.borrow().calls.iter().any(|call| call["method"] == method), !focused);
         }
-        assert!(cdp.call("Page.captureScreenshot", json!({}), Some(&session)).is_ok());
+        let picture = cdp.call("Page.captureScreenshot", json!({}), Some(&session));
+        assert_eq!(picture.is_ok(), !focused);
+        if focused { assert_eq!(picture.unwrap_err(), cdp.guard.extension_shown_refusal()); }
     }
 }
 
@@ -134,7 +136,7 @@ fn extension_frame_visibility_failure_refuses_before_capture() {
     browser.borrow_mut().visibility_error = true;
     assert_eq!(cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap_err(), cdp.guard.extension_shown_refusal());
     assert!(!browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
-    assert_eq!(cdp.call("Input.insertText", json!({"text":"blocked"}), Some(&session)).unwrap_err(), cdp.guard.extension_input_refusal());
+    assert_eq!(cdp.call("Input.insertText", json!({"text":"blocked"}), Some(&session)).unwrap_err(), cdp.guard.extension_shown_refusal());
     assert!(!browser.borrow().calls.iter().any(|call| call["method"] == "Input.insertText"));
 }
 

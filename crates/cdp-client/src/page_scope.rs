@@ -15,9 +15,6 @@ pub(super) fn content_event(method: &str) -> bool {
 impl Cdp {
     pub(super) fn extension_gate(&mut self, method: &str, page: &str) -> Result<(), String> {
         let Some(frames) = self.extension_frames.get(page).cloned() else { return Ok(()) };
-        if self.guard.extension_input_method(method) && self.extension_frames_unsafe(page, &frames, true) {
-            return Err(self.guard.extension_input_refusal().to_string());
-        }
         if self.guard.extension_present_method(method) { return Err(self.guard.extension_present_refusal().to_string()) }
         if self.guard.extension_shown_method(method) && self.extension_frames_shown(page, &frames) {
             return Err(self.guard.extension_shown_refusal().to_string());
@@ -26,10 +23,6 @@ impl Cdp {
     }
 
     pub(super) fn extension_frames_shown(&mut self, page: &str, frames: &[String]) -> bool {
-        self.extension_frames_unsafe(page, frames, false)
-    }
-
-    fn extension_frames_unsafe(&mut self, page: &str, frames: &[String], input: bool) -> bool {
         frames.iter().any(|frame| {
             let Some(parent) = self.targets.get(frame).and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).map(str::to_string) else { return true };
             let guard = self.guards.get(&parent).or_else(|| self.page_scope_sessions.get(&parent)).or_else(|| self.guards.get(page)).cloned();
@@ -42,9 +35,7 @@ impl Cdp {
             let object = self.raw_call("DOM.resolveNode", json!({"backendNodeId":node,"executionContextId":context,"objectGroup":"slicc-extension-frames"}), Some(&guard), DOCUMENT_CHECK).ok()
                 .and_then(|resolved| resolved.pointer("/object/objectId").and_then(Value::as_str).map(str::to_string));
             let Some(object) = object else { return true };
-            let probe = if input {
-                "function(){if(!this.isConnected||this.checkVisibility({visibilityProperty:true}))return true;let node=this;for(let depth=0;depth<64;depth++){const root=node.getRootNode();if(root.activeElement!==node)return false;if(!root.host)return true;node=root.host;}return true;}"
-            } else { "function(){return this.checkVisibility({visibilityProperty:true})}" };
+            let probe = "function(){if(!this.isConnected||this.checkVisibility({visibilityProperty:true}))return true;let node=this;for(let depth=0;depth<64;depth++){const root=node.getRootNode();if(root.activeElement!==node)return false;if(!root.host)return true;node=root.host;}return true;}";
             let shown = self.raw_call("Runtime.callFunctionOn", json!({"objectId":object,"functionDeclaration":probe,"returnByValue":true}), Some(&guard), DOCUMENT_CHECK).ok()
                 .and_then(|answer| answer.pointer("/result/value").and_then(Value::as_bool));
             let _ = self.raw_call("Runtime.releaseObjectGroup", json!({"objectGroup":"slicc-extension-frames"}), Some(&guard), DOCUMENT_CHECK);
