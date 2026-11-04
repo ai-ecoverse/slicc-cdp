@@ -65,7 +65,7 @@
     "browser": "node src/cli.js install-browser --version \"$npm_package_config_chrome\""
   },
   "config": {
-    "chrome": "156.0.8078.4"
+    "chrome": "157.0.8103.38"
   },
   "devDependencies": {
     "@ai-ecoverse/slicc-browsers": "1.19.0",
