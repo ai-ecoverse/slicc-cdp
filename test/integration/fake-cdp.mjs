@@ -144,6 +144,7 @@ export async function fakeCdp({
   location,
   frameTree,
   listen = '127.0.0.1',
+  port = 0,
   product = 'Chrome/140.0.0.0',
   tls,
   version = false,
@@ -664,7 +665,7 @@ export async function fakeCdp({
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, listen, resolve);
+    server.listen(port, listen, resolve);
   });
   const host = listen.includes(':') ? `[${listen}]` : listen;
   return {

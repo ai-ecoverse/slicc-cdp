@@ -119,6 +119,7 @@ export async function webmcpBackend({
   });
   const commands = new EventEmitter();
   const fake = await fakeCdp({
+    version: true,
     intercept(message, send) {
       const { id, method, params = {}, sessionId } = message;
       commands.emit('command', message);
