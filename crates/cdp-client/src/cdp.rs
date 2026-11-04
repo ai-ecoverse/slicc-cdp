@@ -141,6 +141,7 @@ pub struct Cdp {
     pending_page_events: VecDeque<Value>,
     runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
+    extension_frames: BTreeMap<String, Vec<String>>,
     page_scope_epochs: BTreeMap<String, u64>,
     page_scope_unknown: u64,
     guard_sessions: BTreeSet<String>,
@@ -265,6 +266,7 @@ impl Cdp {
             pending_page_events: VecDeque::new(),
             runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
+            extension_frames: BTreeMap::new(),
             page_scope_epochs: BTreeMap::new(),
             page_scope_unknown: 0,
             guard_sessions: BTreeSet::new(),
@@ -630,6 +632,13 @@ impl Cdp {
             self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"), !method.starts_with("Input."))?;
         }
         if executed { self.verify_execution(&checks)?; }
+        if method == "Page.captureScreenshot" {
+            if let Some(page) = session_id.and_then(|session| self.session_target(session)).and_then(|target| self.page_scope_owners.get(&target).cloned()) {
+                if let Some(frames) = self.extension_frames.get(&page).cloned() {
+                    if self.extension_frames_shown(&page, &frames) { return Err(self.guard.extension_shown_refusal().to_string()) }
+                }
+            }
+        }
         if let (true, Some(session), Some(id)) = (
             shield::answers_interception(method),
             session_id,
@@ -1016,6 +1025,10 @@ impl Cdp {
             Some(if method == "Runtime.evaluate" && !Worlds::selectors(params) { self.verify_runtime_page_scope_state(session)? }
                 else { self.verify_page_scope_state(session)? })
         } else { None };
+        if let Some(((page, _, _), _)) = &page_scope {
+            let page = page.clone();
+            self.extension_gate(method, &page)?;
+        }
         if storage_content(method) && method != "Storage.getStorageKeyForFrame" {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
@@ -4221,6 +4234,7 @@ mod tests {
     include!("redirect_relation_test.rs");
     include!("redirect_userinfo_test.rs");
     include!("guard_attach_tree_test.rs");
+    include!("extension_frame_test.rs");
     include!("front_test.rs");
     include!("window_test.rs");
     include!("settled_test.rs");

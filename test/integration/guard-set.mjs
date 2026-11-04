@@ -442,6 +442,7 @@ export async function runPartition(t, id) {
           browserSession: true,
           chromeUrlsAttach: true,
           extensionWorld: true,
+          extensionFrame: true,
           browserContexts: true,
           discovery: true,
           clientExit: true,

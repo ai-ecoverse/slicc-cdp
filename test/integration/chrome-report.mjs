@@ -39,6 +39,7 @@ export const CHROME_FILES = new Set(
     'guard-c',
     'guard-c2-redirect',
     'guard-d',
+    'guard-extension-frame-focus',
     'guard-fail-fast',
     'guard-native',
     'guard-persistent',

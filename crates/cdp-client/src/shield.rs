@@ -352,10 +352,10 @@ fn redact_decoded(guard: &Protected, current: &OutboundText, prefixes: &[String]
                 web_seen = true;
                 index = end;
                 if hidden {
-                    let origin = url::Url::parse(&mapped).ok().and_then(|url| {
-                        let origin = url.origin().ascii_serialization();
-                        if origin != "null" { Some(origin) } else { url.host_str().map(|host| format!("{}://{host}", url.scheme())) }
-                    }).unwrap_or_else(|| "about:blank".into());
+                    let origin = url::Url::parse(&mapped).ok()
+                        .map(|url| url.origin().ascii_serialization())
+                        .filter(|origin| origin != "null")
+                        .unwrap_or_else(|| "about:blank".into());
                     while delimiters.peek().is_some_and(|mark| **mark < index) { delimiters.next(); }
                     let end = if nested && layered { delimiters.peek().map_or(run_end, |mark| (**mark).min(run_end)) } else { run_end };
                     current.copy_span(&mut out, from, start, &mut marks);
@@ -756,6 +756,41 @@ pub fn redacted(info: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn opaque_protected_urls_do_not_retain_their_authority() {
+        let guard = Protected::default();
+        let origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+        let address = format!("{origin}/frame.html?username=private#fragment");
+        let encoded = address.replace(':', "%3A").replace('/', "%2F");
+        for text in [origin.to_string(), address.clone(), address.to_uppercase(), address.replace('/', "\\/"), encoded.clone(), encoded.replace('%', "%25")] {
+            assert_eq!(redact_text(&guard, &text), ("about:blank".to_string(), true), "{text}");
+        }
+        assert_eq!(redact_text(&guard, &format!("<iframe src='{address}'>")).0, "<iframe src='about:blank'>");
+        assert_eq!(redact_text(&guard, "chrome://settings/passwords"), ("about:blank".to_string(), true));
+        assert_eq!(redact_text(&guard, "https://seven.sliccy.ai/private?secret=yes").0, "https://seven.sliccy.ai");
+        let ordinary = "https://ordinary.test/page?public=yes";
+        assert_eq!(redact_text(&guard, ordinary), (ordinary.to_string(), false));
+    }
+
+    #[test]
+    fn extension_origins_are_removed_from_dom_snapshot_and_evaluate_shapes() {
+        let guard = Protected::default();
+        let origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+        let address = format!("{origin}/frame.html?username=private");
+        let mut answer = json!({
+            "documents":[{"documentURL":0}],
+            "strings":[origin, address],
+            "root":{"attributes":["src",address],"children":[]},
+            "result":{"type":"string","value":address},
+        });
+        assert!(redact_strings(&guard, &mut answer));
+        assert_eq!(answer["documents"][0]["documentURL"], 0);
+        assert_eq!(answer["strings"], json!(["about:blank", "about:blank"]));
+        assert_eq!(answer["root"]["attributes"], json!(["src", "about:blank"]));
+        assert_eq!(answer["result"]["value"], "about:blank");
+        assert!(!answer.to_string().contains("abcdefghijklmnop") && !answer.to_string().contains("private"));
+    }
 
     #[test]
     fn origins_and_storage_keys_are_found_outside_free_form_fields() {
