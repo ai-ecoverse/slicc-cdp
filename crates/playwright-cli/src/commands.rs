@@ -113,7 +113,11 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             Err(message) => return Output::err(message),
         }
     };
-    let mut opened = cdp::open(start.clone(), runtime.as_deref());
+    let mut dialed = match cdp::resolve_websocket(start.clone(), runtime.as_deref()) {
+        Ok(socket) => socket,
+        Err(message) => return Output::err(message),
+    };
+    let mut opened = Cdp::connect(&dialed);
     if let Err(message) = &opened {
         if from_memory && launch::retry_open_without_endpoint(command, message) {
             from_memory = false;
@@ -121,7 +125,11 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
                 Ok((next, probed)) => {
                     from_probe = probed;
                     start = next;
-                    opened = cdp::open(start.clone(), runtime.as_deref());
+                    dialed = match cdp::resolve_websocket(start.clone(), runtime.as_deref()) {
+                        Ok(socket) => socket,
+                        Err(next) => return Output::err(next),
+                    };
+                    opened = Cdp::connect(&dialed);
                 }
                 Err(next) => return Output::err(next),
             }
@@ -136,7 +144,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
-    state.webmcp_connection = cdp_client::hash::sha256_hex(endpoint.as_bytes());
+    state.webmcp_connection = connect::webmcp_connection_key(&dialed);
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,

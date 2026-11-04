@@ -12,6 +12,7 @@ struct FrameInspector {
     children: bool,
     isolated: bool,
     native: bool,
+    permissions: bool,
 }
 
 impl Transport for FrameInspector {
@@ -36,7 +37,11 @@ impl Transport for FrameInspector {
                 self.sessions.insert(session.clone(),command["params"]["targetId"].as_str().unwrap().into());
                 json!({"sessionId":session})
             },
-            "Page.getPermissionsPolicyState" => json!({"states":[{"feature":"tools","allowed":true}]}),
+            "Page.getPermissionsPolicyState" if self.permissions => json!({"states":[{"feature":"tools","allowed":true}]}),
+            "Page.getPermissionsPolicyState" => {
+                self.queue.push_back(json!({"id":command["id"],"error":{"message":"Page.getPermissionsPolicyState wasn't found"}}).to_string());
+                return Ok(());
+            }
             "Page.getFrameTree" => json!({"frameTree":{"frame":frame}}),
             "Runtime.enable" | "Page.createIsolatedWorld" => {
                 let isolated = command["method"] == "Page.createIsolatedWorld";
@@ -71,7 +76,7 @@ impl Transport for FrameInspector {
 #[test]
 fn requested_cross_origin_tools_warn_but_preserve_root_listing_and_calling() {
     let calls = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false, native:false }));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false, native:false, permissions:true }));
     let session = cdp.call("Target.attachToTarget", json!({"targetId":"ROOT","flatten":true}), None).unwrap()["sessionId"].as_str().unwrap().to_string();
     let state = Session::default();
     let from = vec!["https://ordinary-child.test".to_string()];
@@ -92,7 +97,7 @@ fn requested_cross_origin_tools_warn_but_preserve_root_listing_and_calling() {
 fn only_explicit_client_origin_requests_return_the_warning_with_root_tools() {
     for from in [Vec::new(), vec!["https://ordinary-child.test".to_string()]] {
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false, native:false }));
+        let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:false, isolated:false, native:false, permissions:true }));
         let mut state = Session::default();
         let listed = crate::webmcp::list_from(&mut cdp, &mut state, Some("ROOT"), true, &from);
         assert_eq!(listed.code, 0, "{}", listed.stderr);
@@ -108,7 +113,7 @@ fn only_explicit_client_origin_requests_return_the_warning_with_root_tools() {
 #[test]
 fn newly_attached_frame_requires_default_context_observation_before_scope_selection() {
     let calls = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:true, isolated:false, native:false }));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector { queue:VecDeque::new(), calls:calls.clone(), next:0, sessions:BTreeMap::new(), children:true, isolated:false, native:false, permissions:true }));
     let root = cdp.call("Target.attachToTarget",json!({"targetId":"ROOT","flatten":true}),None).unwrap();
     let frame = FrameRec { frame_id:"FRAME_TARGET".into(), parent_frame_id:Some("PARENT".into()), url:"https://ordinary.test/".into(), target:Some("FRAME_TARGET".into()) };
     let mut scopes=BTreeMap::new();
@@ -120,4 +125,72 @@ fn newly_attached_frame_requires_default_context_observation_before_scope_select
     let runtime=calls.iter().position(|call| call["method"] == "Runtime.enable" && call["sessionId"] == scope.session).unwrap();
     let isolated=calls.iter().position(|call| call["method"] == "Page.createIsolatedWorld" && call["sessionId"] == scope.session).unwrap();
     assert!(runtime<isolated);
+}
+
+fn plant_route_evidence(cwd: &std::path::Path, connection: &str, documents: Value) {
+    let path = crate::session::path_named(None, Some(cwd)).unwrap();
+    let mut planted = Session::default();
+    planted.cwd = Some(cwd.to_path_buf());
+    planted.webmcp.insert(
+        "ROOT".into(),
+        json!({
+            "owner":"__wmcp_0123456789abcdef0123456789abcdef",
+            "connection":connection,
+            "sessions":[{"target":"ROOT","bridge":"__wmcp_0123456789abcdef0123456789abcdef","documents":documents,"plain":false}]
+        }),
+    );
+    crate::session::write_at(&path, &planted).unwrap();
+}
+
+fn list_with_route_evidence(holder_connection: &str, documents: Value, list_connection: &str) -> Vec<String> {
+    let cwd = std::env::temp_dir().join(format!(
+        "webmcp-route-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&cwd).unwrap();
+    plant_route_evidence(&cwd, holder_connection, documents);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let mut cdp = Cdp::from_transport(Box::new(FrameInspector {
+        queue: VecDeque::new(),
+        calls: calls.clone(),
+        next: 0,
+        sessions: BTreeMap::new(),
+        children: false,
+        isolated: false,
+        native: false,
+        permissions: false,
+    }));
+    let _ = cdp
+        .call("Target.attachToTarget", json!({"targetId":"ROOT","flatten":true}), None)
+        .unwrap();
+    let mut state = Session::default();
+    state.cwd = Some(cwd.clone());
+    state.webmcp_connection = list_connection.to_string();
+    let listed = crate::webmcp::list_from(&mut cdp, &mut state, Some("ROOT"), true, &[]);
+    let _ = std::fs::remove_dir_all(&cwd);
+    assert_eq!(listed.code, 0, "{}", listed.stderr);
+    serde_json::from_str::<Value>(&listed.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_second_process_on_the_same_route_socket_lists_root_tools_from_holder_evidence() {
+    let dialed = "ws://127.0.0.1:9222/devtools/browser/hosts-uuid";
+    let discover = "http://127.0.0.1:9222/json/version";
+    let same = crate::connect::webmcp_connection_key(dialed);
+    let other = crate::connect::webmcp_connection_key("ws://127.0.0.1:9222/devtools/browser/other");
+    assert_ne!(same, crate::connect::webmcp_connection_key(discover));
+    assert_ne!(same, other);
+    let documents = json!({"PARENT:PARENT_LOADER":{"origin":"https://ordinary.test","policy":""}});
+    assert_eq!(list_with_route_evidence(&same, documents.clone(), &same), vec!["add".to_string()]);
+    assert!(list_with_route_evidence(&same, documents.clone(), &other).is_empty());
+    assert!(list_with_route_evidence(&same, json!({"PARENT:OTHER_LOADER":{"origin":"https://ordinary.test","policy":""}}), &same).is_empty());
+    assert!(list_with_route_evidence(&same, json!({"PARENT:PARENT_LOADER":{"origin":"https://ordinary.test","policy":"tools=()"}}), &same).is_empty());
+    assert!(list_with_route_evidence(&same, json!({}), &same).is_empty());
 }

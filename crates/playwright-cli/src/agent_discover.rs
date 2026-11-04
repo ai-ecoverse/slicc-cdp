@@ -193,8 +193,12 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         Ok(start) => start,
         Err(message) => return Output::err(message),
     };
-    let mut feed = HolderFeed::new(&start, invocation);
-    let mut cdp = match cdp::open(start, invocation.runtime.as_deref()) {
+    let dialed = match cdp::resolve_websocket(start, invocation.runtime.as_deref()) {
+        Ok(socket) => socket,
+        Err(message) => return Output::err(message),
+    };
+    let mut feed = HolderFeed::new(&dialed, invocation);
+    let mut cdp = match Cdp::connect(&dialed) {
         Ok(cdp) => cdp,
         Err(message) => return Output::err(message),
     };
@@ -565,9 +569,8 @@ struct HolderFeed {
 }
 
 impl HolderFeed {
-    fn new(start: &crate::connect::Start, invocation: &Invocation) -> Self {
-        let (crate::connect::Start::Direct(endpoint) | crate::connect::Start::Discover(endpoint)) = start;
-        HolderFeed { connection: cdp_client::hash::sha256_hex(endpoint.as_bytes()), session: invocation.session.clone(), cwd: invocation.cwd.clone(), seen: BTreeMap::new(), primed: false, next: Instant::now() }
+    fn new(dialed: &str, invocation: &Invocation) -> Self {
+        HolderFeed { connection: crate::connect::webmcp_connection_key(dialed), session: invocation.session.clone(), cwd: invocation.cwd.clone(), seen: BTreeMap::new(), primed: false, next: Instant::now() }
     }
 
     fn poll(&mut self, cdp: &mut Cdp, state: &mut WatcherState) -> String {

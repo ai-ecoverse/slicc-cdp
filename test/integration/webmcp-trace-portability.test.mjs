@@ -33,6 +33,8 @@ test('WebMCP namespace diagnostics and every Rust call site are removed', () => 
 
 test('namespace removal retains endpoint and document policy selection', () => {
   const frames = read('playwright-cli/src/webmcp_frames.rs');
+  const commands = read('playwright-cli/src/commands.rs');
+  const connect = read('cdp-client/src/connect.rs');
   assert.ok(
     frames.includes(
       'entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)'
@@ -41,6 +43,8 @@ test('namespace removal retains endpoint and document policy selection', () => {
   assert.ok(frames.includes('entry.get("origin").and_then(Value::as_str) == Some(&origin)'));
   assert.ok(frames.includes('unwrap_or("tools=()")'));
   assert.ok(frames.includes('if first == next { first } else { "tools=()".to_string() }'));
+  assert.ok(connect.includes('fn webmcp_connection_key(dialed_socket: &str)'));
+  assert.ok(commands.includes('webmcp_connection_key(&dialed)'));
 });
 
 test('remaining optional Rust diagnostics use no WASI filesystem or process path APIs', () => {
