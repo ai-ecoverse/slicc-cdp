@@ -80,6 +80,7 @@ for (const nested of [false, true]) {
       frame.onload = () => resolve(true);
       frame.src = ${JSON.stringify(`chrome-extension://${extension.id}/frame.html`)};
       globalThis.focusExtension = () => frame.contentWindow.focus();
+      globalThis.extensionAddress = () => frame.src;
       globalThis.showExtension = () => { frame.style.cssText = 'position:fixed;left:0;top:0;width:300px;height:200px'; };
       root.append(frame);
     })`
@@ -111,6 +112,18 @@ for (const nested of [false, true]) {
         });
         const session = (await client.send('Target.attachToTarget', { targetId, flatten: true }))
           .sessionId;
+        for (const [method, params] of [
+          ['DOM.getDocument', { depth: -1, pierce: true }],
+          ['DOMSnapshot.captureSnapshot', { computedStyles: [] }],
+          ['Runtime.evaluate', { expression: 'extensionAddress()', returnByValue: true }],
+        ]) {
+          const answer = await client.send(method, params, session);
+          assert.equal(
+            JSON.stringify(answer).includes(`chrome-extension://${extension.id}`),
+            false,
+            `${method} exposed the extension origin`
+          );
+        }
         await value(client, session, 'document.getElementById("ordinary").focus()');
         await client.send('Input.insertText', { text: 'page' }, session);
         assert.equal(await value(raw, page, 'document.getElementById("ordinary").value'), 'page');
