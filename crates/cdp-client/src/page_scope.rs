@@ -13,6 +13,33 @@ pub(super) fn content_event(method: &str) -> bool {
 }
 
 impl Cdp {
+    pub(super) fn extension_gate(&mut self, method: &str, page: &str) -> Result<(), String> {
+        let Some(frames) = self.extension_frames.get(page).cloned() else { return Ok(()) };
+        if self.guard.extension_present_method(method) { return Err(self.guard.extension_present_refusal().to_string()) }
+        if self.guard.extension_shown_method(method) && self.extension_frames_shown(page, &frames) {
+            return Err(self.guard.extension_shown_refusal().to_string());
+        }
+        Ok(())
+    }
+
+    pub(super) fn extension_frames_shown(&mut self, page: &str, frames: &[String]) -> bool {
+        let Some(guard) = self.guards.get(page).cloned() else { return true };
+        let Ok(world) = self.raw_call("Page.createIsolatedWorld", json!({"frameId":page,"worldName":"slicc-extension-frames"}), Some(&guard), DOCUMENT_CHECK) else { return true };
+        let Some(context) = world.get("executionContextId").and_then(Value::as_i64) else { return true };
+        frames.iter().any(|frame| {
+            let owner = self.raw_call("DOM.getFrameOwner", json!({"frameId":frame}), Some(&guard), DOCUMENT_CHECK).ok()
+                .and_then(|owner| owner.get("backendNodeId").and_then(Value::as_i64));
+            let Some(node) = owner else { return true };
+            let object = self.raw_call("DOM.resolveNode", json!({"backendNodeId":node,"executionContextId":context,"objectGroup":"slicc-extension-frames"}), Some(&guard), DOCUMENT_CHECK).ok()
+                .and_then(|resolved| resolved.pointer("/object/objectId").and_then(Value::as_str).map(str::to_string));
+            let Some(object) = object else { return true };
+            let shown = self.raw_call("Runtime.callFunctionOn", json!({"objectId":object,"functionDeclaration":"function(){return this.checkVisibility({visibilityProperty:true})}","returnByValue":true}), Some(&guard), DOCUMENT_CHECK).ok()
+                .and_then(|answer| answer.pointer("/result/value").and_then(Value::as_bool));
+            let _ = self.raw_call("Runtime.releaseObjectGroup", json!({"objectGroup":"slicc-extension-frames"}), Some(&guard), DOCUMENT_CHECK);
+            shown != Some(false)
+        })
+    }
+
     pub(super) fn verify_page_scope(&mut self, session: Option<&str>) -> Result<(String, u64, u64), String> {
         self.verify_page_scope_state(session).map(|(proof, _)| proof)
     }
@@ -69,6 +96,7 @@ impl Cdp {
         let mut target_roots = BTreeMap::new();
         let mut iframe_roots = Vec::new();
         let mut protected_iframes = Vec::new();
+        let mut extension_iframes = BTreeMap::new();
         for info in &infos {
             #[cfg(test)]
             self.runtime_prepare_probe("target-frame-placement", json!({"id_known":info.get("targetId").and_then(Value::as_str).is_some_and(frame_text_known),"url_present":info.get("url").is_some()}));
@@ -79,6 +107,11 @@ impl Cdp {
             let protected = (!frame_text_known(url) && !self.page_scope_pending_page(info)) || !error_probe && self.info_protected(info, &[]) || self.protected_targets.contains(id);
             #[cfg(test)]
             self.runtime_prepare_probe("target-origin", json!({"protected":protected,"iframe":iframe}));
+            if protected && iframe && frame_text_known(url) && self.guard.extension_frame(url) {
+                let parent = info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.unverified())?;
+                extension_iframes.insert(id.to_string(), parent.to_string());
+                continue;
+            }
             if protected {
                 let parent = if iframe { Some(info.get("parentFrameId").and_then(Value::as_str).filter(|id| frame_text_known(id)).ok_or_else(|| self.unverified())?) } else { None };
                 nodes.entry(id.to_string()).or_insert_with(|| json!({"id":id,"parentId":parent,"url":url,"securityOrigin":url,"loaderId":"protected"}));
@@ -109,9 +142,21 @@ impl Cdp {
             let mut visited = BTreeSet::new();
             while visited.insert(current.to_string()) {
                 if let Some(owner) = roots.get(current) { return Some(owner.clone()) }
-                current = nodes.get(current)?.get("parentId")?.as_str()?;
+                current = match extension_iframes.get(current) {
+                    Some(parent) => parent.as_str(),
+                    None => nodes.get(current)?.get("parentId")?.as_str()?,
+                };
             }
             None
+        };
+        let inside_extension = |id: &str| -> bool {
+            let mut current = nodes.get(id).and_then(|node| node.get("parentId")).and_then(Value::as_str);
+            let mut visited = BTreeSet::new();
+            while let Some(parent) = current {
+                if extension_iframes.contains_key(parent) || !visited.insert(parent.to_string()) { return true }
+                current = nodes.get(parent).and_then(|node| node.get("parentId")).and_then(Value::as_str);
+            }
+            false
         };
         #[cfg(test)]
         self.runtime_prepare_probe("iframe-ancestry", json!({}));
@@ -130,6 +175,9 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("protected-frame-placement", json!({"protected_present":protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page))}));
         if protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page)) { return Err(self.refusal()) }
+        if nodes.keys().any(|id| owner(id).as_deref() == Some(&page) && inside_extension(id)) { return Err(self.refusal()) }
+        let held: Vec<String> = extension_iframes.iter().filter(|(_, parent)| owner(parent).as_deref() == Some(&page)).map(|(id, _)| id.clone()).collect();
+        if held.is_empty() { self.extension_frames.remove(&page); } else { self.extension_frames.insert(page.clone(), held); }
         #[cfg(test)]
         self.runtime_prepare_probe("root-placement", json!({}));
         let root = roots.iter().find(|(_, owner)| *owner == &page).map(|(id, _)| id).ok_or_else(|| self.unverified())?;

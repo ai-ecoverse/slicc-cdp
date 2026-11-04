@@ -651,7 +651,9 @@ impl Walk<'_> {
             };
             let local = scope.frames.iter().find(|frame| frame.frame_id == content && frame.target.is_none());
             let remote = local.is_none() && self.frames.iter().any(|frame| frame.frame_id == content && frame.target.is_some());
-            if local.is_some_and(|frame| self.guard.url(&frame.url)) {
+            if local.is_some_and(|frame| self.guard.url(&frame.url))
+                || remote && self.frames.iter().any(|frame| frame.frame_id == content && self.guard.url(&frame.url))
+            {
                 continue;
             }
             let Some(node) = snapshot::find_mut(&mut nodes, &rec.id) else {

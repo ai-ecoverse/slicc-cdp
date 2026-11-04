@@ -134,6 +134,28 @@ impl Protected {
         origin_of(&url).is_some_and(|origin| self.extra.contains(&origin))
     }
 
+    pub fn extension_frame(&self, text: &str) -> bool {
+        let Some(url) = parse(text) else { return false };
+        self.rules.extension_frames.schemes.iter().any(|item| item == url.scheme())
+            && origin_of(&url).is_none_or(|origin| !self.extra.contains(&origin))
+    }
+
+    pub fn extension_shown_method(&self, method: &str) -> bool {
+        self.rules.extension_frames.when_shown.iter().any(|item| item == method)
+    }
+
+    pub fn extension_present_method(&self, method: &str) -> bool {
+        self.rules.extension_frames.while_present.iter().any(|item| item == method)
+    }
+
+    pub fn extension_shown_refusal(&self) -> &str {
+        &self.rules.extension_frames.shown_refusal
+    }
+
+    pub fn extension_present_refusal(&self) -> &str {
+        &self.rules.extension_frames.present_refusal
+    }
+
     pub fn target_type(&self, kind: &str) -> bool {
         self.rules.target_types.iter().any(|item| item == kind)
     }
@@ -453,6 +475,24 @@ mod tests {
         let vectors = vectors();
         let origins: Vec<&str> = vectors.origins.iter().map(String::as_str).collect();
         Protected::new(&origins)
+    }
+
+    #[test]
+    fn extension_frames_are_foreign_extension_scheme_urls() {
+        let own = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+        let guard = Protected::new(&[own]);
+        assert!(guard.extension_frame("chrome-extension://pejdijmoenmkgeppbflobdenhhabjlaj/completion_list.html?username=a"));
+        assert!(!guard.extension_frame(&format!("{own}/frame.html")));
+        assert!(!guard.extension_frame("https://vault.sliccy.ai/"));
+        assert!(!guard.extension_frame("chrome://settings/"));
+        assert!(!guard.extension_frame("not a url"));
+        assert!(guard.url("chrome-extension://pejdijmoenmkgeppbflobdenhhabjlaj/completion_list.html"));
+        assert!(guard.extension_shown_method("Page.captureScreenshot"));
+        assert!(guard.extension_shown_method("Input.dispatchMouseEvent"));
+        assert!(!guard.extension_shown_method("Runtime.evaluate"));
+        assert!(guard.extension_present_method("Page.startScreencast"));
+        assert!(guard.extension_shown_refusal().contains("chrome-extension://"));
+        assert!(guard.extension_present_refusal().contains("chrome-extension://"));
     }
 
     #[test]
