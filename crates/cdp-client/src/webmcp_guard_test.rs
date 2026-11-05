@@ -80,7 +80,11 @@ fn one_second_settling_reply_preserves_rust_document_check_and_terminal_refusal(
 }
 
 fn event(method: &str, params: Value) -> Value {
-    json!({"method":method,"sessionId":"H","params":params})
+    event_on("H", method, params)
+}
+
+fn event_on(session: &str, method: &str, params: Value) -> Value {
+    json!({"method":method,"sessionId":session,"params":params})
 }
 
 fn paused() -> Value {
@@ -103,7 +107,10 @@ impl Transport for Backend {
         state.sent.push(command.clone());
         let method = command["method"].as_str().unwrap();
         let result = match method {
-            "Target.getTargets" => json!({"targetInfos":[{"targetId":"T","type":"page","url":state.tree["frameTree"]["frame"]["url"]}]}),
+            "Target.getTargets" => {
+                let url = state.tree["frameTree"]["frame"]["url"].clone();
+                json!({"targetInfos":[{"targetId":"T","type":"page","url":url},{"targetId":"T2","type":"page","url":url}]})
+            }
             "Page.getFrameTree" => {
                 if state.fail_tree && state.installed {
                     state.inbox.push_back(json!({"id":command["id"],"error":{"message":"verification failed"}}).to_string());
@@ -127,8 +134,9 @@ impl Transport for Backend {
             }
             "Page.reload" => {
                 if state.pause {
-                    state.inbox.push_back(event("Debugger.scriptParsed", json!({"scriptId":"SCRIPT","executionContextId":7})).to_string());
-                    let mut pause = paused();
+                    let session = command["sessionId"].as_str().unwrap_or("H");
+                    state.inbox.push_back(event_on(session, "Debugger.scriptParsed", json!({"scriptId":"SCRIPT","executionContextId":7})).to_string());
+                    let mut pause = event_on(session, "Debugger.paused", json!({"reason":"other","callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}));
                     if state.unconverted { pause["params"]["reason"] = json!("instrumentation"); }
                     state.inbox.push_back(pause.to_string());
                 }
@@ -637,12 +645,12 @@ fn script_id_cap_refuses_new_ids_resumes_nothing_published_and_stays_bounded() {
     for i in 0..8 {
         cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":format!("S{i}"),"executionContextId":7,"url":format!("https://ordinary.test/{i}.js")})));
     }
-    assert!(cdp.webmcp.scripts.len() <= 3, "{}", cdp.webmcp.scripts.len());
-    assert!(cdp.webmcp.evaluations.len() <= 3, "{}", cdp.webmcp.evaluations.len());
+    assert!(cdp.webmcp.session_script_count("H") <= 3, "{}", cdp.webmcp.session_script_count("H"));
+    assert!(cdp.webmcp.session_evaluation_count("H") <= 3, "{}", cdp.webmcp.session_evaluation_count("H"));
     let events = cdp.events().len();
     cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":"OVERFLOW","executionContextId":7,"url":"https://ordinary.test/overflow.js"})));
     cdp.absorb(paused_with("OVERFLOW"));
-    assert!(cdp.webmcp.scripts.len() <= 3, "{}", cdp.webmcp.scripts.len());
+    assert!(cdp.webmcp.session_script_count("H") <= 3, "{}", cdp.webmcp.session_script_count("H"));
     assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count() > before);
     assert_eq!(cdp.events().len(), events);
     no_debugger_published(&cdp);
@@ -709,7 +717,7 @@ fn saturated_id_cap_instrumentation_for_unknown_script_resumes_without_install_o
     for i in 0..6 {
         cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":format!("FLOOD-{i}"),"executionContextId":7,"url":format!("https://ordinary.test/flood-{i}.js")})));
     }
-    assert_eq!(cdp.webmcp.scripts.len(), 2);
+    assert_eq!(cdp.webmcp.session_script_count("H"), 2);
     assert!(!cdp.webmcp.scripts.contains_key(&("H".into(), "UNRECORDED".into())));
     let resumes = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count();
     let pauses = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.pause").count();
@@ -729,6 +737,49 @@ fn saturated_id_cap_instrumentation_for_unknown_script_resumes_without_install_o
     assert_eq!(cdp.events().len(), events);
     no_debugger_published(&cdp);
     assert!(!cdp.webmcp_is_paused("H"));
+}
+
+#[test]
+fn flooding_session_does_not_starve_another_holders_root_install() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp.id_cap_override = 2;
+    for i in 0..8 {
+        cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":format!("FLOOD-{i}"),"executionContextId":7,"url":format!("https://ordinary.test/flood-{i}.js")})));
+    }
+    assert_eq!(cdp.webmcp.session_script_count("H"), 2);
+    assert!(cdp.webmcp.scripts.len() >= 2);
+    cdp.session_targets.insert("H2".into(), "T2".into());
+    cdp.guards.insert("T2".into(), "G2".into());
+    cdp.guard_sessions.insert("G2".into());
+    cdp.targets.insert("T2".into(), json!({"targetId":"T2","type":"page","url":"https://ordinary.test/"}));
+    cdp.main_commit("G2", &state.borrow().tree["frameTree"]["frame"]);
+    let installs_before = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count();
+    assert!(cdp.start_webmcp_for("H2", true).is_ok());
+    assert!(cdp.webmcp.arms.get("H2").is_some_and(|arm| !arm.revoked && arm.admitted > 0 && !arm.accepted.is_empty()));
+    assert!(cdp.webmcp.session_script_count("H2") > 0);
+    assert!(cdp.webmcp.session_script_count("H2") <= 2);
+    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["sessionId"] == "H2" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count() > 0 || state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count() > installs_before);
+    assert!(!cdp.webmcp.arms["H2"].accepted.is_empty());
+}
+
+#[test]
+fn destroying_a_context_frees_its_script_ids_for_later_records() {
+    let (mut cdp, _) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp.id_cap_override = 2;
+    for i in 0..6 {
+        cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":format!("OLD-{i}"),"executionContextId":7,"url":format!("https://ordinary.test/old-{i}.js")})));
+    }
+    assert_eq!(cdp.webmcp.session_script_count("H"), 2);
+    assert!(!cdp.webmcp.scripts.contains_key(&("H".into(), "FRESH".into())));
+    cdp.absorb(event("Runtime.executionContextDestroyed", json!({"executionContextId":7})));
+    assert_eq!(cdp.webmcp.session_script_count("H"), 0);
+    assert!(cdp.webmcp.evaluations.iter().all(|(owner, _)| owner != "H"));
+    cdp.absorb(event("Runtime.executionContextCreated", json!({"context":{"id":9,"uniqueId":"NEXT","origin":"https://ordinary.test","auxData":{"frameId":"F","isDefault":true}}})));
+    cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":"FRESH","executionContextId":9,"url":"https://ordinary.test/fresh.js"})));
+    assert_eq!(cdp.webmcp.scripts.get(&("H".into(), "FRESH".into())), Some(&9));
+    assert_eq!(cdp.webmcp.session_script_count("H"), 1);
 }
 
 #[test]

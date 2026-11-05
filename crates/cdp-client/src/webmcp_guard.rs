@@ -114,6 +114,22 @@ impl Webmcp {
         self.pending_gate_bytes = self.pending_gate_bytes.saturating_sub(gate_bytes(value));
     }
 
+    fn session_script_count(&self, session: &str) -> usize {
+        self.scripts.keys().filter(|(owner, _)| owner == session).count()
+    }
+
+    fn session_evaluation_count(&self, session: &str) -> usize {
+        self.evaluations.iter().filter(|(owner, _)| owner == session).count()
+    }
+
+    fn forget_context_ids(scripts: &mut BTreeMap<(String, String), i64>, evaluations: &mut BTreeSet<(String, String)>, session: &str, context: i64) {
+        let doomed = scripts.iter().filter(|((owner, _), id)| owner == session && **id == context).map(|((_, script), _)| script.clone()).collect::<Vec<_>>();
+        for script in doomed {
+            scripts.remove(&(session.to_string(), script.clone()));
+            evaluations.remove(&(session.to_string(), script));
+        }
+    }
+
     pub(super) fn forget(&mut self, session: &str) {
         self.arms.remove(session);
         self.holders.retain(|_, owner| owner != session);
@@ -1134,6 +1150,7 @@ impl Cdp {
             if let Some(id) = value.pointer("/params/executionContextId").and_then(Value::as_i64) {
                 self.webmcp.contexts.remove(&(session.to_string(), id));
                 arm.pending_contexts.remove(&id);
+                Webmcp::forget_context_ids(&mut self.webmcp.scripts, &mut self.webmcp.evaluations, session, id);
             }
         }
         if method == "Runtime.executionContextsCleared" {
@@ -1149,7 +1166,7 @@ impl Cdp {
                 let id_cap = self.webmcp.id_cap();
                 let new_script = !self.webmcp.scripts.contains_key(&key);
                 let new_evaluate = evaluate && !self.webmcp.evaluations.contains(&key);
-                if (new_script && self.webmcp.scripts.len() >= id_cap) || (new_evaluate && self.webmcp.evaluations.len() >= id_cap) {
+                if (new_script && self.webmcp.session_script_count(session) >= id_cap) || (new_evaluate && self.webmcp.session_evaluation_count(session) >= id_cap) {
                     return;
                 }
                 self.webmcp.scripts.insert(key.clone(), context);
