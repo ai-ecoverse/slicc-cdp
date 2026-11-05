@@ -2,9 +2,10 @@ struct ExtensionFrameBrowser {
     present: bool,
     shown: bool,
     focused: bool,
+    seven: bool,
     reveal_on_capture: bool,
     attach_on_capture: Option<bool>,
-    defer_attach_probes: usize,
+    attach_seven_on_capture: bool,
     visibility_error: bool,
     calls: Vec<Value>,
     attached: usize,
@@ -23,6 +24,10 @@ fn extension_frame_target() -> Value {
     json!({"targetId":"EXT","type":"iframe","parentFrameId":"T","url":"chrome-extension://fixture/frame.html?username=private","title":"private","browserContextId":"CTX"})
 }
 
+fn seven_frame_target() -> Value {
+    json!({"targetId":"SEVEN","type":"iframe","parentFrameId":"T","url":"https://seven.sliccy.ai/app","title":"","browserContextId":"CTX"})
+}
+
 impl Transport for ExtensionFrameTransport {
     fn send_text(&mut self, text: &str) -> Result<(), String> {
         let call: Value = serde_json::from_str(text).unwrap();
@@ -34,14 +39,15 @@ impl Transport for ExtensionFrameTransport {
                 browser.attached += 1;
                 json!({"sessionId":format!("S{}", browser.attached)})
             }
-            "Target.getTargetInfo" => json!({"targetInfo":if call["params"]["targetId"] == "EXT" { extension_frame_target() } else { extension_frame_page() }}),
+            "Target.getTargetInfo" => json!({"targetInfo":match call["params"]["targetId"].as_str() {
+                Some("EXT") => extension_frame_target(),
+                Some("SEVEN") => seven_frame_target(),
+                _ => extension_frame_page(),
+            }}),
             "Target.getTargets" => {
                 let mut targets = vec![extension_frame_page()];
                 if browser.present { targets.push(extension_frame_target()); }
-                if browser.defer_attach_probes > 0 {
-                    browser.defer_attach_probes -= 1;
-                    if browser.defer_attach_probes == 0 { browser.present = true; }
-                }
+                if browser.seven { targets.push(seven_frame_target()); }
                 json!({"targetInfos":targets})
             }
             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"T","loaderId":"L","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test"}}}),
@@ -53,13 +59,22 @@ impl Transport for ExtensionFrameTransport {
             "Runtime.evaluate" => json!({"result":{"type":"string","value":"complete"}}),
             "Page.captureScreenshot" => {
                 if browser.reveal_on_capture {
+                    let added = !browser.present;
                     browser.present = true;
                     browser.shown = true;
+                    if added {
+                        self.inbox.push_back(json!({"method":"Target.targetCreated","params":{"targetInfo":extension_frame_target()}}).to_string());
+                    }
                 }
                 if let Some(shown) = browser.attach_on_capture {
+                    browser.present = true;
                     browser.shown = shown;
                     browser.focused = false;
-                    browser.defer_attach_probes = 1;
+                    self.inbox.push_back(json!({"method":"Target.targetCreated","params":{"targetInfo":extension_frame_target()}}).to_string());
+                }
+                if browser.attach_seven_on_capture {
+                    browser.seven = true;
+                    self.inbox.push_back(json!({"method":"Target.targetCreated","params":{"targetInfo":seven_frame_target()}}).to_string());
                 }
                 json!({"data":"private-pixels"})
             }
@@ -76,7 +91,8 @@ impl Transport for ExtensionFrameTransport {
 
 fn extension_frame_client(present: bool, shown: bool) -> (Cdp, String, Rc<RefCell<ExtensionFrameBrowser>>) {
     let browser = Rc::new(RefCell::new(ExtensionFrameBrowser {
-        present, shown, focused:false, reveal_on_capture:false, attach_on_capture:None, defer_attach_probes:0, visibility_error:false, calls:Vec::new(), attached:0,
+        present, shown, focused:false, seven:false, reveal_on_capture:false, attach_on_capture:None, attach_seven_on_capture:false,
+        visibility_error:false, calls:Vec::new(), attached:0,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ExtensionFrameTransport { browser:browser.clone(), inbox:VecDeque::new() }));
     let session = super::attach(&mut cdp, "T").unwrap();
@@ -140,6 +156,16 @@ fn extension_frame_attaching_hidden_during_capture_keeps_the_pixels() {
     let picture = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap();
     assert_eq!(picture["data"], "private-pixels");
     assert_eq!(cdp.extension_frames["T"], ["EXT"]);
+}
+
+#[test]
+fn protected_frame_attaching_during_capture_keeps_protected_refusal() {
+    let (mut cdp, session, browser) = extension_frame_client(false, false);
+    browser.borrow_mut().attach_seven_on_capture = true;
+    let message = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap_err();
+    assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
+    assert!(!message.contains("chrome-extension://"));
+    assert!(browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
 }
 
 #[test]
