@@ -1259,12 +1259,12 @@ impl Cdp {
                 continue;
             };
             let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.unverified())?;
+            let before_ext = self.extension_frames.get(&proof.0).cloned().unwrap_or_default();
             let (current, state) = self.verify_page_scope_state(Some(&session))?;
             if current.0 != proof.0 { return Err(self.refusal()) }
-            if let Some(frames) = self.extension_frames.get(&current.0).cloned() {
-                if self.extension_frames_shown(&current.0, &frames) {
-                    return Err(self.guard.extension_shown_refusal().to_string());
-                }
+            let after_ext = self.extension_frames.get(&current.0).cloned().unwrap_or_default();
+            if self.extension_frames_shown(&current.0, &after_ext) {
+                return Err(self.guard.extension_shown_refusal().to_string());
             }
             if &current != proof {
                 let ordinary = |frames: &BTreeMap<String, Vec<String>>| {
@@ -1272,7 +1272,7 @@ impl Cdp {
                         .map(|(id, evidence)| (id.clone(), evidence.clone())).collect::<BTreeMap<_, _>>()
                 };
                 if state.scope == expected.scope && state.worker == expected.worker && ordinary(&state.frames) == ordinary(&expected.frames)
-                    && state.frames != expected.frames
+                    && before_ext != after_ext
                 {
                     return Err(self.guard.extension_shown_refusal().to_string());
                 }
