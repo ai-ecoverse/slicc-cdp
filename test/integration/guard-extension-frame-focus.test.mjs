@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { launchBrowser } from './browser.mjs';
+import { cdpProxy } from './cdp-proxy.mjs';
 import { chromeTest } from './chrome-policy.mjs';
 import { cleanup } from './cleanup.mjs';
 import { guarded, observer } from './guard-client.mjs';
@@ -183,3 +184,129 @@ for (const nested of [false, true]) {
     }
   );
 }
+
+async function captureWithInsertDuringReply(insertExpression) {
+  execFileSync(
+    'cargo',
+    ['build', '--locked', '-p', 'slicc-cdp-client', '--example', 'guard_bridge'],
+    { stdio: 'inherit' }
+  );
+  const fixture = await fixtureServer();
+  let browser;
+  let raw;
+  let proxy;
+  let client;
+  try {
+    browser = await launchBrowser([
+      ...browserArgs({ privileged: true }),
+      '--enable-unsafe-extension-debugging',
+    ]);
+    raw = await observer(browser.wsUrl);
+    const path = fileURLToPath(
+      new URL(
+        './harness/extension',
+        import.meta.resolve('@ai-ecoverse/slicc-shared-web/package.json')
+      )
+    );
+    const extension = await raw.send('Extensions.loadUnpacked', { path });
+    const { targetId } = await raw.send('Target.createTarget', { url: 'about:blank' });
+    const page = (await raw.send('Target.attachToTarget', { targetId, flatten: true })).sessionId;
+    await raw.send('Page.enable', {}, page);
+    const loaded = raw.waitEvent(
+      (event) => event.method === 'Page.loadEventFired' && event.sessionId === page,
+      10000
+    );
+    await raw.send('Page.navigate', { url: `${origins(fixture).ordinary}/blank` }, page);
+    await loaded;
+    await raw.send('Page.bringToFront', {}, page);
+    await value(raw, page, insertExpression(extension.id, origins(fixture)));
+    let captureId;
+    proxy = await cdpProxy(browser.wsUrl, {
+      observe(direction, message) {
+        if (direction === 'client' && message.method === 'Page.captureScreenshot')
+          captureId = message.id;
+      },
+      responseBarrier(message) {
+        if (!captureId || message.id !== captureId) return null;
+        return value(raw, page, 'insertDuringCapture()').then(() => undefined);
+      },
+    });
+    client = await guarded(proxy.url, origins(fixture).client, {
+      variant: 'prompt',
+      detachDelay: 0,
+    });
+    const session = (await client.send('Target.attachToTarget', { targetId, flatten: true }))
+      .sessionId;
+    return {
+      send: () => client.send('Page.captureScreenshot', { format: 'png' }, session),
+      cleanup: () =>
+        cleanup([
+          () => client?.close(),
+          () => proxy?.close(),
+          () => raw?.close(),
+          () => browser?.close(),
+          () => fixture.close(),
+        ]),
+    };
+  } catch (error) {
+    await cleanup([
+      () => client?.close(),
+      () => proxy?.close(),
+      () => raw?.close(),
+      () => browser?.close(),
+      () => fixture.close(),
+    ]);
+    throw error;
+  }
+}
+
+chromeTest(
+  'shown extension frame inserted during capture is refused',
+  { timeout: 120000 },
+  async () => {
+    const row = await captureWithInsertDuringReply(
+      (extensionId) => `(() => {
+      document.body.innerHTML = '<input id="ordinary">';
+      globalThis.insertDuringCapture = () => new Promise(resolve => {
+        const frame = document.createElement('iframe');
+        frame.style.cssText = 'position:fixed;left:0;top:0;width:300px;height:200px';
+        frame.onload = () => resolve(true);
+        frame.src = ${JSON.stringify(`chrome-extension://${extensionId}/frame.html`)};
+        document.body.append(frame);
+      });
+      return true;
+    })()`
+    );
+    try {
+      await assert.rejects(row.send(), /slicc: refused:.*chrome-extension:\/\//);
+    } finally {
+      await row.cleanup();
+    }
+  }
+);
+
+chromeTest(
+  'protected frame inserted during capture keeps protected refusal',
+  { timeout: 120000 },
+  async () => {
+    const row = await captureWithInsertDuringReply(
+      (_extensionId, hosts) => `(() => {
+      document.body.innerHTML = '<input id="ordinary">';
+      globalThis.insertDuringCapture = () => new Promise(resolve => {
+        const frame = document.createElement('iframe');
+        frame.style.cssText = 'position:fixed;left:0;top:0;width:300px;height:200px';
+        frame.onload = () => resolve(true);
+        frame.onerror = () => resolve(true);
+        frame.src = ${JSON.stringify(`${hosts.seven}/blank`)};
+        document.body.append(frame);
+      });
+      return true;
+    })()`
+    );
+    try {
+      await assert.rejects(row.send(), /slicc: refused: target is on seven's origin/);
+    } finally {
+      await row.cleanup();
+    }
+  }
+);

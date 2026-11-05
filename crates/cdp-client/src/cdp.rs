@@ -629,16 +629,13 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_stage(method, "reply-proof");
         if content_command(method, &params) == Some(true) && !executed {
-            self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"), !method.starts_with("Input."))?;
-        }
-        if executed { self.verify_execution(&checks)?; }
-        if method == "Page.captureScreenshot" {
-            if let Some(page) = session_id.and_then(|session| self.session_target(session)).and_then(|target| self.page_scope_owners.get(&target).cloned()) {
-                if let Some(frames) = self.extension_frames.get(&page).cloned() {
-                    if self.extension_frames_shown(&page, &frames) { return Err(self.guard.extension_shown_refusal().to_string()) }
-                }
+            if method == "Page.captureScreenshot" {
+                self.verify_screenshot_reply(&checks)?;
+            } else {
+                self.verify_checks(&checks, matches!(method, "IO.read" | "IO.close"), !method.starts_with("Input."))?;
             }
         }
+        if executed { self.verify_execution(&checks)?; }
         if let (true, Some(session), Some(id)) = (
             shield::answers_interception(method),
             session_id,
@@ -1250,6 +1247,37 @@ impl Cdp {
                 None => self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.unverified())?,
             };
             if same_document && &current != expected { return Err(self.refusal()) }
+        }
+        Ok(())
+    }
+
+    fn verify_screenshot_reply(&mut self, checks: &[(String, DocumentState)]) -> Result<(), String> {
+        for (target, expected) in checks {
+            let Some(proof) = &expected.page_scope else {
+                let current = self.document_state_for(target, true, expected.scope.as_deref()).ok_or_else(|| self.unverified())?;
+                if &current != expected { return Err(self.refusal()) }
+                continue;
+            };
+            let session = self.guards.get(&proof.0).cloned().ok_or_else(|| self.unverified())?;
+            let before_ext = self.extension_frames.get(&proof.0).cloned().unwrap_or_default();
+            let (current, state) = self.verify_page_scope_state(Some(&session))?;
+            if current.0 != proof.0 { return Err(self.refusal()) }
+            let after_ext = self.extension_frames.get(&current.0).cloned().unwrap_or_default();
+            if self.extension_frames_shown(&current.0, &after_ext) {
+                return Err(self.guard.extension_shown_refusal().to_string());
+            }
+            if &current != proof {
+                let ordinary = |frames: &BTreeMap<String, Vec<String>>| {
+                    frames.iter().filter(|(_, evidence)| !evidence.get(1).is_some_and(|url| self.guard.extension_frame(url)))
+                        .map(|(id, evidence)| (id.clone(), evidence.clone())).collect::<BTreeMap<_, _>>()
+                };
+                if state.scope == expected.scope && state.worker == expected.worker && ordinary(&state.frames) == ordinary(&expected.frames)
+                    && before_ext != after_ext
+                {
+                    return Err(self.guard.extension_shown_refusal().to_string());
+                }
+                return Err(self.refusal());
+            }
         }
         Ok(())
     }
