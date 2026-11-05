@@ -701,6 +701,37 @@ fn pending_gates_byte_cap_resumes_privately_publishes_nothing_and_stays_bounded(
 }
 
 #[test]
+fn saturated_id_cap_instrumentation_for_unknown_script_resumes_without_install_or_publish() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp.arms.get_mut("H").unwrap().accepted.clear();
+    cdp.webmcp.id_cap_override = 2;
+    for i in 0..6 {
+        cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":format!("FLOOD-{i}"),"executionContextId":7,"url":format!("https://ordinary.test/flood-{i}.js")})));
+    }
+    assert_eq!(cdp.webmcp.scripts.len(), 2);
+    assert!(!cdp.webmcp.scripts.contains_key(&("H".into(), "UNRECORDED".into())));
+    let resumes = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count();
+    let pauses = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.pause").count();
+    let installs = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count();
+    let api = state.borrow().api;
+    let events = cdp.events().len();
+    let mut pause = paused_with("UNRECORDED");
+    pause["params"]["reason"] = json!("instrumentation");
+    pause["params"]["data"] = json!({"scriptId":"UNRECORDED"});
+    cdp.absorb(pause);
+    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count() > resumes);
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.pause").count(), pauses);
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count(), installs);
+    assert_eq!(state.borrow().api, api);
+    assert!(cdp.webmcp.arms["H"].conversion.is_none());
+    assert!(cdp.webmcp.arms["H"].accepted.is_empty());
+    assert_eq!(cdp.events().len(), events);
+    no_debugger_published(&cdp);
+    assert!(!cdp.webmcp_is_paused("H"));
+}
+
+#[test]
 fn lower_only_overrides_never_raise_the_stage1_defaults() {
     assert_eq!(lower_only(DEFAULT_ID_CAP, "SLICC_WEBMCP_MISSING_CAP_ENV"), DEFAULT_ID_CAP);
     assert_eq!(DEFAULT_ID_CAP, 4096);

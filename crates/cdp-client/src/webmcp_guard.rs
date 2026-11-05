@@ -673,7 +673,13 @@ impl Cdp {
         let until = started + DOCUMENT_CHECK;
         let script = value.pointer("/params/data/scriptId").or_else(|| value.pointer("/params/callFrames/0/location/scriptId")).and_then(Value::as_str);
         let evaluate = script.is_some_and(|script| self.webmcp.evaluations.contains(&(session.to_string(), script.to_string())));
-        let accepted = self.webmcp_pause_context(value, session).is_some_and(|(_, context)| self.webmcp.arms.get(session).is_some_and(|arm| arm.accepted.contains(&(context.frame, context.loader, context.unique))));
+        let pause_context = self.webmcp_pause_context(value, session);
+        let accepted = pause_context.as_ref().is_some_and(|(_, context)| self.webmcp.arms.get(session).is_some_and(|arm| arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone()))));
+        let Some((_, context)) = pause_context else {
+            let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
+            self.webmcp.paused.remove(session);
+            return true;
+        };
         if evaluate || accepted {
             let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
             self.webmcp.paused.remove(session);
@@ -681,7 +687,6 @@ impl Cdp {
         }
         let root_proof = self.webmcp_known_root(session);
         let converted = root_proof.and_then(|root| {
-            let context = self.webmcp_pause_context(value, session).map(|(_, context)| context).unwrap_or_else(|| root.1.clone());
             let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
             if arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone())) || context.origin != root.1.origin {
                 return self.raw_call("Debugger.resume", json!({}), Some(session), until.saturating_duration_since(Instant::now()));
@@ -812,6 +817,11 @@ impl Cdp {
             return;
         }
         if self.webmcp_handle_instrumentation(value, session) { return; }
+        if self.webmcp_pause_context(value, session).is_none() {
+            let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
+            self.webmcp.paused.remove(session);
+            return;
+        }
         let conversion = self.webmcp.arms.get_mut(session).and_then(|arm| arm.conversion.take());
         let started = conversion.as_ref().map_or_else(Instant::now, |(_, started, _)| *started);
         let until = conversion.as_ref().map_or(started + DOCUMENT_CHECK, |(_, _, until)| (*until).min(started + Duration::from_secs(1)));
