@@ -1271,9 +1271,10 @@ impl Cdp {
                     frames.iter().filter(|(_, evidence)| !evidence.get(1).is_some_and(|url| self.guard.extension_frame(url)))
                         .map(|(id, evidence)| (id.clone(), evidence.clone())).collect::<BTreeMap<_, _>>()
                 };
-                if state.scope != expected.scope || state.worker != expected.worker || ordinary(&state.frames) != ordinary(&expected.frames) {
-                    return Err(self.refusal());
+                if state.scope == expected.scope && state.worker == expected.worker && ordinary(&state.frames) == ordinary(&expected.frames) {
+                    return Err(self.guard.extension_shown_refusal().to_string());
                 }
+                return Err(self.refusal());
             }
         }
         Ok(())

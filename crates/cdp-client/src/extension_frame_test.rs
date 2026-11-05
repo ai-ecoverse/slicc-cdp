@@ -6,6 +6,7 @@ struct ExtensionFrameBrowser {
     reveal_on_capture: bool,
     attach_on_capture: Option<bool>,
     attach_seven_on_capture: bool,
+    flash_seven_on_capture: bool,
     visibility_error: bool,
     calls: Vec<Value>,
     attached: usize,
@@ -76,6 +77,10 @@ impl Transport for ExtensionFrameTransport {
                     browser.seven = true;
                     self.inbox.push_back(json!({"method":"Target.targetCreated","params":{"targetInfo":seven_frame_target()}}).to_string());
                 }
+                if browser.flash_seven_on_capture {
+                    self.inbox.push_back(json!({"method":"Target.targetCreated","params":{"targetInfo":seven_frame_target()}}).to_string());
+                    self.inbox.push_back(json!({"method":"Target.targetDestroyed","params":{"targetId":"SEVEN"}}).to_string());
+                }
                 json!({"data":"private-pixels"})
             }
             _ => json!({}),
@@ -92,7 +97,7 @@ impl Transport for ExtensionFrameTransport {
 fn extension_frame_client(present: bool, shown: bool) -> (Cdp, String, Rc<RefCell<ExtensionFrameBrowser>>) {
     let browser = Rc::new(RefCell::new(ExtensionFrameBrowser {
         present, shown, focused:false, seven:false, reveal_on_capture:false, attach_on_capture:None, attach_seven_on_capture:false,
-        visibility_error:false, calls:Vec::new(), attached:0,
+        flash_seven_on_capture:false, visibility_error:false, calls:Vec::new(), attached:0,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ExtensionFrameTransport { browser:browser.clone(), inbox:VecDeque::new() }));
     let session = super::attach(&mut cdp, "T").unwrap();
@@ -150,12 +155,16 @@ fn extension_frame_attaching_shown_during_capture_is_refused_after_reply() {
 }
 
 #[test]
-fn extension_frame_attaching_hidden_during_capture_keeps_the_pixels() {
+fn extension_frame_attaching_hidden_during_capture_is_refused_after_reply() {
     let (mut cdp, session, browser) = extension_frame_client(false, false);
     browser.borrow_mut().attach_on_capture = Some(false);
-    let picture = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap();
-    assert_eq!(picture["data"], "private-pixels");
+    let message = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap_err();
+    assert_eq!(message, cdp.guard.extension_shown_refusal());
+    assert!(browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
     assert_eq!(cdp.extension_frames["T"], ["EXT"]);
+    browser.borrow_mut().attach_on_capture = None;
+    browser.borrow_mut().shown = false;
+    assert!(cdp.call("Page.captureScreenshot", json!({}), Some(&session)).is_ok());
 }
 
 #[test]
@@ -166,6 +175,16 @@ fn protected_frame_attaching_during_capture_keeps_protected_refusal() {
     assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
     assert!(!message.contains("chrome-extension://"));
     assert!(browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
+}
+
+#[test]
+fn protected_frame_flash_during_capture_is_refused_after_reply() {
+    let (mut cdp, session, browser) = extension_frame_client(false, false);
+    browser.borrow_mut().flash_seven_on_capture = true;
+    let message = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap_err();
+    assert!(message.starts_with("slicc: refused:"), "{message}");
+    assert!(browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
+    assert!(!cdp.extension_frames.contains_key("T"));
 }
 
 #[test]
