@@ -623,3 +623,100 @@ fn ordinary_documents_without_holder_pay_no_debugger_or_init_overhead() {
     cdp.call("Runtime.evaluate", json!({"expression":"1"}), Some("H")).unwrap();
     assert!(state.borrow().sent.iter().all(|command| !command["method"].as_str().unwrap().starts_with("Debugger.") && command["method"] != "Page.addScriptToEvaluateOnNewDocument"));
 }
+
+fn no_debugger_published(cdp: &Cdp) {
+    assert!(cdp.events().iter().all(|event| !event["method"].as_str().unwrap_or("").starts_with("Debugger.")), "{:?}", cdp.events());
+}
+
+#[test]
+fn script_id_cap_refuses_new_ids_resumes_nothing_published_and_stays_bounded() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    let before = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count();
+    cdp.webmcp.id_cap_override = 3;
+    for i in 0..8 {
+        cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":format!("S{i}"),"executionContextId":7,"url":format!("https://ordinary.test/{i}.js")})));
+    }
+    assert!(cdp.webmcp.scripts.len() <= 3, "{}", cdp.webmcp.scripts.len());
+    assert!(cdp.webmcp.evaluations.len() <= 3, "{}", cdp.webmcp.evaluations.len());
+    let events = cdp.events().len();
+    cdp.absorb(event("Debugger.scriptParsed", json!({"scriptId":"OVERFLOW","executionContextId":7,"url":"https://ordinary.test/overflow.js"})));
+    cdp.absorb(paused_with("OVERFLOW"));
+    assert!(cdp.webmcp.scripts.len() <= 3, "{}", cdp.webmcp.scripts.len());
+    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count() > before);
+    assert_eq!(cdp.events().len(), events);
+    no_debugger_published(&cdp);
+    assert!(!cdp.webmcp_is_paused("H"));
+}
+
+fn paused_with(script: &str) -> Value {
+    event("Debugger.paused", json!({"reason":"other","callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":script,"lineNumber":0,"columnNumber":0}}]}))
+}
+
+#[test]
+fn pending_gates_count_cap_resumes_privately_publishes_nothing_and_stays_bounded() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp.pending_count_override = 2;
+    cdp.webmcp.handling_gate = true;
+    let before = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count();
+    let events = cdp.events().len();
+    for i in 0..5 {
+        cdp.absorb(paused_with(&format!("SCRIPT-{i}")));
+    }
+    assert!(cdp.webmcp.pending_gates.len() <= 2, "{}", cdp.webmcp.pending_gates.len());
+    assert!(cdp.webmcp.pending_gate_bytes <= cdp.webmcp.pending_bytes_cap());
+    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count() > before);
+    assert_eq!(cdp.events().len(), events);
+    no_debugger_published(&cdp);
+    cdp.webmcp.handling_gate = false;
+    cdp.webmcp_cancel_queued("H");
+    assert!(cdp.webmcp.pending_gates.is_empty());
+    assert_eq!(cdp.webmcp.pending_gate_bytes, 0);
+}
+
+#[test]
+fn pending_gates_byte_cap_resumes_privately_publishes_nothing_and_stays_bounded() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    let sample = paused_with("SCRIPT");
+    let sample_bytes = sample.to_string().len();
+    cdp.webmcp.pending_bytes_override = sample_bytes.saturating_mul(2).max(1);
+    cdp.webmcp.pending_count_override = 64;
+    cdp.webmcp.handling_gate = true;
+    let before = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count();
+    let events = cdp.events().len();
+    for i in 0..6 {
+        let mut pause = paused_with(&format!("SCRIPT-{i}"));
+        pause["params"]["callFrames"][0]["functionName"] = json!("x".repeat(32));
+        cdp.absorb(pause);
+    }
+    assert!(cdp.webmcp.pending_gates.len() <= cdp.webmcp.pending_count_cap());
+    assert!(cdp.webmcp.pending_gate_bytes <= cdp.webmcp.pending_bytes_cap(), "{} > {}", cdp.webmcp.pending_gate_bytes, cdp.webmcp.pending_bytes_cap());
+    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count() > before);
+    assert_eq!(cdp.events().len(), events);
+    no_debugger_published(&cdp);
+    cdp.webmcp.handling_gate = false;
+    cdp.stop_webmcp("H");
+}
+
+#[test]
+fn lower_only_overrides_never_raise_the_stage1_defaults() {
+    assert_eq!(lower_only(DEFAULT_ID_CAP, "SLICC_WEBMCP_MISSING_CAP_ENV"), DEFAULT_ID_CAP);
+    assert_eq!(DEFAULT_ID_CAP, 4096);
+    assert_eq!(DEFAULT_PENDING_COUNT, 4096);
+    assert_eq!(DEFAULT_PENDING_BYTES, 64 << 20);
+    let (mut cdp, _) = client();
+    cdp.webmcp.id_cap_override = DEFAULT_ID_CAP.saturating_mul(4);
+    cdp.webmcp.pending_count_override = DEFAULT_PENDING_COUNT.saturating_mul(4);
+    cdp.webmcp.pending_bytes_override = DEFAULT_PENDING_BYTES.saturating_mul(4);
+    assert_eq!(cdp.webmcp.id_cap(), DEFAULT_ID_CAP);
+    assert_eq!(cdp.webmcp.pending_count_cap(), DEFAULT_PENDING_COUNT);
+    assert_eq!(cdp.webmcp.pending_bytes_cap(), DEFAULT_PENDING_BYTES);
+    cdp.webmcp.id_cap_override = 7;
+    cdp.webmcp.pending_count_override = 5;
+    cdp.webmcp.pending_bytes_override = 11;
+    assert_eq!(cdp.webmcp.id_cap(), 7);
+    assert_eq!(cdp.webmcp.pending_count_cap(), 5);
+    assert_eq!(cdp.webmcp.pending_bytes_cap(), 11);
+}

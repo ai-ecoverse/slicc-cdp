@@ -5,6 +5,20 @@ use std::time::{Duration, Instant};
 
 const SHIM: &str = include_str!("webmcp-shim.js");
 const SHIM_HASH: &str = "911b9c665b7bf8183de1d4eeebb4a96d72ddcfe7b6b222316998c595b410fe53";
+const DEFAULT_ID_CAP: usize = 4096;
+const DEFAULT_PENDING_COUNT: usize = 4096;
+const DEFAULT_PENDING_BYTES: usize = 64 << 20;
+const ID_CAP_ENV: &str = "SLICC_WEBMCP_ID_CAP";
+const PENDING_COUNT_ENV: &str = "SLICC_WEBMCP_PENDING_CAP";
+const PENDING_BYTES_ENV: &str = "SLICC_WEBMCP_PENDING_BYTES";
+
+fn lower_only(default: usize, name: &str) -> usize {
+    std::env::var(name).ok().and_then(|text| text.parse::<usize>().ok()).filter(|&n| n > 0).map(|n| n.min(default)).unwrap_or(default)
+}
+
+fn gate_bytes(value: &Value) -> usize {
+    value.to_string().len()
+}
 
 fn vetted_source(source: &str) -> Result<&str, String> {
     if crate::hash::sha256_hex(source.as_bytes()) != SHIM_HASH { return Err("slicc: refused: WebMCP shim integrity check failed\n".into()); }
@@ -58,6 +72,10 @@ pub(super) struct Webmcp {
     handling_gate: bool,
     handling_children: bool,
     pending_gates: VecDeque<Value>,
+    pending_gate_bytes: usize,
+    id_cap_override: usize,
+    pending_count_override: usize,
+    pending_bytes_override: usize,
     pub(super) deferred: BTreeSet<String>,
     pub(super) quarantined: BTreeSet<String>,
     parents: BTreeMap<String, String>,
@@ -71,6 +89,31 @@ pub(super) struct Webmcp {
 }
 
 impl Webmcp {
+    fn id_cap(&self) -> usize {
+        match self.id_cap_override {
+            0 => lower_only(DEFAULT_ID_CAP, ID_CAP_ENV),
+            n => n.min(DEFAULT_ID_CAP).max(1),
+        }
+    }
+
+    fn pending_count_cap(&self) -> usize {
+        match self.pending_count_override {
+            0 => lower_only(DEFAULT_PENDING_COUNT, PENDING_COUNT_ENV),
+            n => n.min(DEFAULT_PENDING_COUNT).max(1),
+        }
+    }
+
+    fn pending_bytes_cap(&self) -> usize {
+        match self.pending_bytes_override {
+            0 => lower_only(DEFAULT_PENDING_BYTES, PENDING_BYTES_ENV),
+            n => n.min(DEFAULT_PENDING_BYTES).max(1),
+        }
+    }
+
+    fn drop_pending(&mut self, value: &Value) {
+        self.pending_gate_bytes = self.pending_gate_bytes.saturating_sub(gate_bytes(value));
+    }
+
     pub(super) fn forget(&mut self, session: &str) {
         self.arms.remove(session);
         self.holders.retain(|_, owner| owner != session);
@@ -78,7 +121,13 @@ impl Webmcp {
         self.scripts.retain(|(owner, _), _| owner != session);
         self.evaluations.retain(|(owner, _)| owner != session);
         self.paused.remove(session);
-        self.pending_gates.retain(|value| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
+        let mut dropped = 0;
+        self.pending_gates.retain(|value| {
+            let matches = value.get("sessionId").and_then(Value::as_str) == Some(session) || value.pointer("/params/sessionId").and_then(Value::as_str) == Some(session);
+            if matches { dropped += gate_bytes(value); }
+            !matches
+        });
+        self.pending_gate_bytes = self.pending_gate_bytes.saturating_sub(dropped);
         self.deferred.remove(session);
         self.quarantined.remove(session);
         self.parents.retain(|child, parent| child != session && parent != session);
@@ -825,7 +874,13 @@ impl Cdp {
 
     pub(super) fn webmcp_cancel_queued(&mut self, session: &str) {
         let cancelled = self.webmcp.pending_gates.iter().filter(|value| value.get("sessionId").and_then(Value::as_str) == Some(session) || value.pointer("/params/sessionId").and_then(Value::as_str) == Some(session)).cloned().collect::<Vec<_>>();
-        self.webmcp.pending_gates.retain(|value| value.get("sessionId").and_then(Value::as_str) != Some(session) && value.pointer("/params/sessionId").and_then(Value::as_str) != Some(session));
+        let mut dropped = 0;
+        self.webmcp.pending_gates.retain(|value| {
+            let matches = value.get("sessionId").and_then(Value::as_str) == Some(session) || value.pointer("/params/sessionId").and_then(Value::as_str) == Some(session);
+            if matches { dropped += gate_bytes(value); }
+            !matches
+        });
+        self.webmcp.pending_gate_bytes = self.webmcp.pending_gate_bytes.saturating_sub(dropped);
         for value in cancelled {
             let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
             if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
@@ -839,14 +894,34 @@ impl Cdp {
         }
     }
 
-    fn webmcp_gate_event(&mut self, value: &Value) {
+    fn webmcp_refuse_gate(&mut self, value: &Value) {
         if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
+            let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            let _ = self.send("Debugger.resume", json!({}), Some(owner));
+            self.webmcp.paused.remove(owner);
+        } else if value.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
+            self.webmcp_adopt_child(value);
+        }
+    }
+
+    fn webmcp_gate_event(&mut self, value: &Value) {
+        let paused = value.get("method").and_then(Value::as_str) == Some("Debugger.paused");
+        if paused {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) { self.webmcp.paused.insert(session.to_string()); }
         }
+        let bytes = gate_bytes(value);
+        let count_cap = self.webmcp.pending_count_cap();
+        let bytes_cap = self.webmcp.pending_bytes_cap();
+        if self.webmcp.pending_gates.len() >= count_cap || self.webmcp.pending_gate_bytes.saturating_add(bytes) > bytes_cap {
+            self.webmcp_refuse_gate(value);
+            return;
+        }
         self.webmcp.pending_gates.push_back(value.clone());
+        self.webmcp.pending_gate_bytes = self.webmcp.pending_gate_bytes.saturating_add(bytes);
         if self.webmcp.handling_gate { return; }
         self.webmcp.handling_gate = true;
         while let Some(gate) = self.webmcp.pending_gates.pop_front() {
+            self.webmcp.drop_pending(&gate);
             let owner = gate.get("sessionId").and_then(Value::as_str).unwrap_or("");
             if gate.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
                 self.webmcp_adopt_child(&gate);
@@ -1059,10 +1134,18 @@ impl Cdp {
         }
         if method == "Debugger.scriptParsed" {
             if let (Some(script), Some(context)) = (value.pointer("/params/scriptId").and_then(Value::as_str), value.pointer("/params/executionContextId").and_then(Value::as_i64)) {
-                self.webmcp.scripts.insert((session.to_string(), script.to_string()), context);
-                self.webmcp.evaluations.remove(&(session.to_string(), script.to_string()));
-                if value.pointer("/params/url").and_then(Value::as_str) == Some("") && value.pointer("/params/embedderName").and_then(Value::as_str) == Some("") {
-                    self.webmcp.evaluations.insert((session.to_string(), script.to_string()));
+                let key = (session.to_string(), script.to_string());
+                let evaluate = value.pointer("/params/url").and_then(Value::as_str) == Some("") && value.pointer("/params/embedderName").and_then(Value::as_str) == Some("");
+                let id_cap = self.webmcp.id_cap();
+                let new_script = !self.webmcp.scripts.contains_key(&key);
+                let new_evaluate = evaluate && !self.webmcp.evaluations.contains(&key);
+                if (new_script && self.webmcp.scripts.len() >= id_cap) || (new_evaluate && self.webmcp.evaluations.len() >= id_cap) {
+                    return;
+                }
+                self.webmcp.scripts.insert(key.clone(), context);
+                self.webmcp.evaluations.remove(&key);
+                if evaluate {
+                    self.webmcp.evaluations.insert(key);
                 }
             }
         }
