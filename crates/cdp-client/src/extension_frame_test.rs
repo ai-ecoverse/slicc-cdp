@@ -182,7 +182,8 @@ fn protected_frame_flash_during_capture_is_refused_after_reply() {
     let (mut cdp, session, browser) = extension_frame_client(false, false);
     browser.borrow_mut().flash_seven_on_capture = true;
     let message = cdp.call("Page.captureScreenshot", json!({}), Some(&session)).unwrap_err();
-    assert!(message.starts_with("slicc: refused:"), "{message}");
+    assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
+    assert!(!message.contains("chrome-extension://"));
     assert!(browser.borrow().calls.iter().any(|call| call["method"] == "Page.captureScreenshot"));
     assert!(!cdp.extension_frames.contains_key("T"));
 }
