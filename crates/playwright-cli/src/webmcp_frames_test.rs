@@ -136,6 +136,7 @@ fn plant_route_evidence(cwd: &std::path::Path, connection: &str, documents: Valu
         json!({
             "schema":crate::webmcp::SNAPSHOT_SCHEMA,
             "holderPid":std::process::id(),
+            "updatedAtMs":crate::webmcp::snapshot_now_ms(),
             "owner":"__wmcp_0123456789abcdef0123456789abcdef",
             "connection":connection,
             "sessions":[{"target":"ROOT","bridge":"__wmcp_0123456789abcdef0123456789abcdef","documents":documents,"plain":false}]

@@ -20,10 +20,16 @@ fn holder_alive(pid: u32) -> bool {
     }
 }
 
+pub(crate) fn snapshot_now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0)
+}
+
 pub(crate) fn snapshot_evidence(entry: &Value) -> bool {
     if entry.get("schema").and_then(Value::as_u64).unwrap_or(0) < SNAPSHOT_SCHEMA { return false; }
     let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) else { return false; };
     if pid == 0 || pid > u64::from(u32::MAX) || !holder_alive(pid as u32) { return false; }
+    let Some(updated) = entry.get("updatedAtMs").and_then(Value::as_u64) else { return false; };
+    if snapshot_now_ms().saturating_sub(updated) > 15_000 { return false; }
     true
 }
 
@@ -933,10 +939,13 @@ mod tests {
 
     #[test]
     fn snapshot_evidence_rejects_old_schema_and_dead_holder() {
+        let now = snapshot_now_ms();
         assert!(!snapshot_evidence(&json!({"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
-        assert!(!snapshot_evidence(&json!({"schema":0,"holderPid":std::process::id(),"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
-        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":4_294_967_294u64,"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
-        assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":0,"holderPid":std::process::id(),"updatedAtMs":now,"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":4_294_967_294u64,"updatedAtMs":now,"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"updatedAtMs":now.saturating_sub(16_000),"routeAttested":false})));
+        assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"updatedAtMs":now,"routeAttested":false})));
     }
 
     #[test]

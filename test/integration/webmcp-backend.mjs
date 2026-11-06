@@ -113,9 +113,7 @@ export async function webmcpBackend({
   });
   const tree = () => ({
     frame: frame(pages.get('TAB')),
-    childFrames: children
-      .filter((child) => !child.oopif)
-      .map((child) => ({ frame: frame(pages.get(child.id)) })),
+    childFrames: children.map((child) => ({ frame: frame(pages.get(child.id)) })),
   });
   const commands = new EventEmitter();
   const fake = await fakeCdp({
