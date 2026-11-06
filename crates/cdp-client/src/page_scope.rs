@@ -2,6 +2,7 @@ use super::*;
 
 const MAX_FRAMES: usize = 4096;
 const MAX_TARGETS: usize = 256;
+pub(super) const PAGE_SCOPE_ATTEMPTS: u32 = 3;
 
 pub(super) fn content(method: &str) -> bool {
     ["Runtime.", "DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
@@ -55,10 +56,25 @@ impl Cdp {
         self.page_scope_state(session, true, None)
     }
 
+    pub(super) fn verify_page_scope_state_until(&mut self, session: Option<&str>, until: Instant) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state(session, false, Some(until))
+    }
+
+    pub(super) fn verify_runtime_page_scope_state_until(&mut self, session: Option<&str>, until: Instant) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state(session, true, Some(until))
+    }
+
     pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state_attempt(session, refresh_main, saved_deadline)
+    }
+
+    fn page_scope_state_attempt(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
         #[cfg(test)]
         self.runtime_prepare_probe("scope-selected-session", json!({"target_known":session.and_then(|session| self.session_target(session)).is_some()}));
         let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.unverified())?;
+        if session.is_some_and(|session| self.blocked.contains(session)) || self.protected_targets.contains(&target) {
+            return Err(self.refusal());
+        }
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-read", json!({}));
         let left = saved_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(DOCUMENT_CHECK);
@@ -75,6 +91,7 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-selected-type", json!({"page":selected.get("type").and_then(Value::as_str) == Some("page"),"iframe":selected.get("type").and_then(Value::as_str) == Some("iframe")}));
         if !matches!(selected.get("type").and_then(Value::as_str), Some("page" | "iframe")) { return Err(self.refusal()) }
+        if self.info_protected(selected, infos) || self.protected_targets.contains(&target) { return Err(self.refusal()) }
         let context = selected.get("browserContextId").cloned();
         let candidates: Vec<Value> = infos.iter().filter(|info| info.get("browserContextId") == context.as_ref()
             && matches!(info.get("type").and_then(Value::as_str), Some("page" | "iframe"))).cloned().collect();
@@ -164,15 +181,16 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("iframe-ancestry", json!({}));
         for id in &iframe_roots { owner(id).ok_or_else(|| self.unverified())?; }
+        let mut next_owners = BTreeMap::new();
         for id in nodes.keys() {
-            if let Some(page) = owner(id) { self.page_scope_owners.insert(id.clone(), page); }
+            if let Some(page) = owner(id) { next_owners.insert(id.clone(), page); }
         }
         for (target, root) in &target_roots {
-            if let Some(page) = owner(root) { self.page_scope_owners.insert(target.clone(), page); }
+            if let Some(page) = owner(root) { next_owners.insert(target.clone(), page); }
         }
         for info in &infos {
             let id = info.get("targetId").and_then(Value::as_str).unwrap();
-            if info.get("type").and_then(Value::as_str) == Some("page") { self.page_scope_owners.insert(id.to_string(), id.to_string()); }
+            if info.get("type").and_then(Value::as_str) == Some("page") { next_owners.insert(id.to_string(), id.to_string()); }
         }
         let page = if selected.get("type").and_then(Value::as_str) == Some("page") { target.clone() } else { owner(target_roots.get(&target).map(String::as_str).unwrap_or(&target)).ok_or_else(|| self.unverified())? };
         #[cfg(test)]
@@ -180,7 +198,6 @@ impl Cdp {
         if protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page)) { return Err(self.refusal()) }
         if nodes.keys().any(|id| owner(id).as_deref() == Some(&page) && inside_extension(id)) { return Err(self.refusal()) }
         let held: Vec<String> = extension_iframes.iter().filter(|(_, parent)| owner(parent).as_deref() == Some(&page)).map(|(id, _)| id.clone()).collect();
-        if held.is_empty() { self.extension_frames.remove(&page); } else { self.extension_frames.insert(page.clone(), held); }
         #[cfg(test)]
         self.runtime_prepare_probe("root-placement", json!({}));
         let root = roots.iter().find(|(_, owner)| *owner == &page).map(|(id, _)| id).ok_or_else(|| self.unverified())?;
@@ -196,9 +213,9 @@ impl Cdp {
                 && unknown == self.page_scope_unknown && runtime_epochs.get(&page).copied().unwrap_or(0) == self.runtime_scope_epochs.get(&page).copied().unwrap_or(0)
                 && guard.is_some() && guard.as_ref() == self.guards.get(&page) && !self.protected_targets.contains(&page)
                 && session.is_some_and(|session| !self.blocked.contains(session)) {
-                return self.page_scope_state(session, false, Some(deadline));
+                return self.page_scope_state_attempt(session, false, Some(deadline));
             }
-            return Err(self.refusal());
+            return Err(self.page_changed());
         }
         if !self.placed_frames(&tree, &mut frames, true, None) {
             #[cfg(test)]
@@ -212,6 +229,8 @@ impl Cdp {
                     && if frame[4].is_empty() { self.documents.get(&page).is_some_and(|doc| !doc.previous) } else { self.frame_decisions.get(id) == Some(&false) };
                 !ordinary_error && (self.guard.url(&frame[1]) || self.guard.url(&frame[2]))
             }) { return Err(self.refusal()) }
+        for (id, owner_page) in next_owners { self.page_scope_owners.insert(id, owner_page); }
+        if held.is_empty() { self.extension_frames.remove(&page); } else { self.extension_frames.insert(page.clone(), held); }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
             self.note_parent(id, &evidence[4]);
@@ -333,7 +352,17 @@ impl Cdp {
         if left.is_zero() { return Err(self.refusal()) }
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-read", json!({"budget_remaining":!left.is_zero()}));
-        let mut tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.unverified())?;
+        let page = self.page_scope_owner(target).unwrap_or_else(|| target.to_string());
+        let epoch = self.page_scope_epochs.get(&page).copied().unwrap_or(0);
+        let mut tree = match self.raw_call("Page.getFrameTree", json!({}), Some(&session), left) {
+            Ok(tree) => tree,
+            Err(_) => {
+                if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch {
+                    return Err(self.page_changed());
+                }
+                return Err(self.unverified());
+            }
+        };
         self.verify_document_order(&tree, Some(&session))?;
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-versions", json!({}));
@@ -351,7 +380,16 @@ impl Cdp {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(self.refusal()) }
-            tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.unverified())?;
+            let epoch = self.page_scope_epochs.get(&page).copied().unwrap_or(0);
+            tree = match self.raw_call("Page.getFrameTree", json!({}), Some(&session), left) {
+                Ok(tree) => tree,
+                Err(_) => {
+                    if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch {
+                        return Err(self.page_changed());
+                    }
+                    return Err(self.unverified());
+                }
+            };
             self.verify_document_order(&tree, Some(&session))?;
         }
         Ok(tree)

@@ -118,13 +118,13 @@ fn a_close_during_an_error_page_refresh_is_passed_through() {
     assert_eq!(sent.borrow().iter().filter(|call| call["method"] == "Page.getFrameTree").count(), 1);
     let (mut cdp, _) = closing_client(nth("Page.getFrameTree", 1));
     guarded_error_page(&mut cdp);
-    assert_eq!(cdp.refresh("T"), Err(GONE.to_string()));
+    assert_eq!(cdp.refresh("T", Duration::from_secs(10)), Err(GONE.to_string()));
     let (mut cdp, _) = closing_client(nth("Page.getFrameTree", 1));
     guarded_error_page(&mut cdp);
     assert_eq!(cdp.call("Runtime.evaluate", json!({"expression":"1"}), Some("S")).unwrap_err(), GONE);
     let (mut cdp, _) = closing_client(|_| false);
     guarded_error_page(&mut cdp);
-    assert_eq!(cdp.refresh("T"), Ok(true));
+    assert_eq!(cdp.refresh("T", Duration::from_secs(10)), Ok(true));
 }
 
 #[test]

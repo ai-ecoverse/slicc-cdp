@@ -191,7 +191,7 @@ fn protected_frame_flash_during_capture_is_refused_after_reply() {
 #[test]
 fn screenshot_reply_refuses_non_extension_proof_drift() {
     let (mut cdp, session, _) = extension_frame_client(false, false);
-    let mut checks = cdp.prepare("Page.captureScreenshot", &json!({}), Some(&session)).unwrap();
+    let mut checks = cdp.prepare("Page.captureScreenshot", &json!({}), Some(&session), Instant::now() + DOCUMENT_CHECK).unwrap();
     let proof = checks[0].1.page_scope.clone().unwrap();
     checks[0].1.worker = Some(("https://ordinary.test/worker.js".into(), proof.0.clone()));
     *cdp.page_scope_epochs.entry(proof.0.clone()).or_default() += 1;

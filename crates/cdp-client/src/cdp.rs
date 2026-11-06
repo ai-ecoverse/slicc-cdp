@@ -43,6 +43,7 @@ pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it 
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
 pub const UNANSWERED: &str = "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser)";
 pub const UNVERIFIED: &str = "slicc: refused: slicc could not finish checking this target, so it left it alone; the browser may not answer the check\n";
+pub const PAGE_CHANGED: &str = "slicc: refused: the page changed while slicc was checking it; try again once it settles\n";
 pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
@@ -204,6 +205,8 @@ pub struct Cdp {
     #[cfg(test)]
     runtime_probe: Vec<Value>,
     #[cfg(test)]
+    admit_probe: Vec<Value>,
+    #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
@@ -328,6 +331,8 @@ impl Cdp {
             runtime_preparing: false,
             #[cfg(test)]
             runtime_probe: Vec::new(),
+            #[cfg(test)]
+            admit_probe: Vec::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -544,7 +549,7 @@ impl Cdp {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let result = self.call_for(method, params, session_id, Duration::from_secs(30));
+        let result = self.call_guarded_for(method, params, session_id, Duration::from_secs(30), false, true);
         #[cfg(test)]
         if result.is_err() && method == "Runtime.evaluate" && std::env::var_os("CI").is_some() {
             eprintln!("document call refused: stages={:?}", self.runtime_diagnostics().iter().filter_map(|probe| probe.get("stage").and_then(Value::as_str)).collect::<Vec<_>>());
@@ -559,7 +564,7 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
-        self.call_guarded_for(method, params, session_id, timeout, false)
+        self.call_guarded_for(method, params, session_id, timeout, false, false)
     }
 
     fn call_guarded_for(
@@ -569,20 +574,17 @@ impl Cdp {
         session_id: Option<&str>,
         timeout: Duration,
         holder_debugger: bool,
+        retry_opt_in: bool,
     ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
         #[cfg(test)]
         if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
-        #[cfg(test)]
-        self.runtime_stage(method, "admit");
-        self.admit_for(method, &params, session_id, holder_debugger)?;
-        if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
         if method == "Target.createTarget" {
+            let left = timeout.min(OPTIONAL_STEP);
+            self.admit_for(method, &params, session_id, holder_debugger, left)?;
             return self.create_target(params, timeout);
         }
-        #[cfg(test)]
-        self.runtime_stage(method, "prepare");
-        let mut checks = self.prepare(method, &params, session_id)?;
+        let mut checks = self.page_scope_admit_prepare(method, std::slice::from_ref(&params), &params, session_id, timeout, holder_debugger, retry_opt_in)?;
         #[cfg(test)]
         self.runtime_stage(method, "pin");
         let pinned = self.pin_execution(method, &params, session_id, &mut checks)?;
@@ -673,8 +675,7 @@ impl Cdp {
         if !batchable(method, &batch) {
             return batch.into_iter().map(|params| self.call(method, params, session_id)).collect();
         }
-        for params in &batch { self.admit_for(method, params, session_id, false)?; }
-        let checks = self.prepare(method, &batch[0], session_id)?;
+        let checks = self.page_scope_admit_prepare(method, &batch, &batch[0], session_id, Duration::from_secs(30), false, true)?;
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
         let mut ids = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
@@ -708,6 +709,63 @@ impl Cdp {
             results.push(result);
         }
         Ok(results)
+    }
+
+    fn page_scope_admit_prepare(
+        &mut self,
+        method: &str,
+        admissions: &[Value],
+        prepare_params: &Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        holder_debugger: bool,
+        retry_opt_in: bool,
+    ) -> Result<Vec<(String, DocumentState)>, String> {
+        let overall = Instant::now() + timeout.min(DOCUMENT_CHECK * page_scope::PAGE_SCOPE_ATTEMPTS);
+        let retry_eligible = retry_opt_in && !holder_debugger && self.page_scope_prepare_retry_eligible(method, session_id);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let left = overall.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(self.refusal()) }
+            #[cfg(test)]
+            self.runtime_stage(method, "admit");
+            let refresh = left.min(OPTIONAL_STEP);
+            for params in admissions {
+                #[cfg(test)]
+                self.admit_probe.push(params.clone());
+                self.admit_for(method, params, session_id, holder_debugger, refresh)?;
+            }
+            if method == "Page.navigate" {
+                if let Some(params) = admissions.first() { self.remember_navigation(params, session_id); }
+            }
+            #[cfg(test)]
+            self.runtime_stage(method, "prepare");
+            let prepare_until = Instant::now() + left.min(DOCUMENT_CHECK);
+            match self.prepare(method, prepare_params, session_id, prepare_until) {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) if error == PAGE_CHANGED
+                    && retry_eligible
+                    && self.page_scope_prepare_retry_still_allowed(session_id)
+                    && attempt < page_scope::PAGE_SCOPE_ATTEMPTS
+                    && Instant::now() < overall => continue,
+                Err(error) if error == PAGE_CHANGED => {
+                    if attempt > 1 {
+                        let left = overall.saturating_duration_since(Instant::now());
+                        if !left.is_zero() {
+                            let refresh = left.min(OPTIONAL_STEP);
+                            for params in admissions {
+                                #[cfg(test)]
+                                self.admit_probe.push(params.clone());
+                                self.admit_for(method, params, session_id, holder_debugger, refresh)?;
+                            }
+                        }
+                    }
+                    return Err(PAGE_CHANGED.to_string());
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn start_navigation(&mut self, params: Value, session: Option<&str>) -> Result<i64, String> {
@@ -759,7 +817,7 @@ impl Cdp {
             self.call(method, params, session_id)?;
             return Ok(());
         }
-        self.prepare(method, &params, session_id)?;
+        self.prepare(method, &params, session_id, Instant::now() + DOCUMENT_CHECK)?;
         let answered = shield::answers_interception(method)
             .then(|| shield::request_key(&params))
             .flatten()
@@ -798,6 +856,10 @@ impl Cdp {
         self.closed.clone().unwrap_or_else(|| UNVERIFIED.to_string())
     }
 
+    fn page_changed(&self) -> String {
+        self.closed.clone().unwrap_or_else(|| PAGE_CHANGED.to_string())
+    }
+
     fn closing(&mut self, message: String) -> String {
         if crate::net::connection_closed(&message) { self.closed.get_or_insert(message).clone() } else { message }
     }
@@ -807,10 +869,10 @@ impl Cdp {
     }
 
     fn admit(&mut self, method: &str, params: &Value, session_id: Option<&str>) -> Result<(), String> {
-        self.admit_for(method, params, session_id, false)
+        self.admit_for(method, params, session_id, false, OPTIONAL_STEP)
     }
 
-    fn admit_for(&mut self, method: &str, params: &Value, session_id: Option<&str>, holder_debugger: bool) -> Result<(), String> {
+    fn admit_for(&mut self, method: &str, params: &Value, session_id: Option<&str>, holder_debugger: bool, refresh_left: Duration) -> Result<(), String> {
         if debugger_domain(method) && (!holder_debugger || !matches!(debugger_lifetime(method), Some(DebuggerLifetime::Persistent | DebuggerLifetime::Cleanup | DebuggerLifetime::Control))) { return Err(PERSISTENT.into()); }
         if self.renderer_crashed(session_id, params.get("targetId").and_then(Value::as_str)) { return Err(RENDERER_CRASHED.to_string()) }
         if method == "Page.handleJavaScriptDialog" {
@@ -830,7 +892,7 @@ impl Cdp {
                 return Err(self.refusal());
             }
             if let Some(target) = self.session_target(session) {
-                if !self.refresh(&target)? { return Err(self.refusal()) }
+                if !self.refresh(&target, refresh_left)? { return Err(self.refusal()) }
             }
             if !recovery(method, params) && self.session_target(session).and_then(|target| self.documents.get(&target)).is_some_and(|doc| self.sealed(doc)) {
                 return Err(self.refusal());
@@ -1042,18 +1104,38 @@ impl Cdp {
             })
     }
 
-    fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+    fn page_scope_prepare_retry_eligible(&self, method: &str, session: Option<&str>) -> bool {
+        if !page_scope::content(method) { return false }
+        let Some(target) = session.and_then(|session| self.session_target(session)) else { return false };
+        let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+        !url.is_empty() && url != "about:blank"
+    }
+
+    fn page_scope_prepare_retry_still_allowed(&self, session: Option<&str>) -> bool {
+        let Some(session) = session else { return false };
+        if self.webmcp_is_paused(session) { return false }
+        let Some(target) = self.session_target(session) else { return false };
+        if self.document_paused(&target) { return false }
+        !(self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url))
+            && self.documents.get(&target).is_none_or(|doc| !self.guard.error_page_url(&doc.url) || self.unverified_error(&doc.url, &doc.unreachable_url)))
+    }
+
+    fn page_scope_prepare_retry_allowed(&self, method: &str, session: Option<&str>) -> bool {
+        self.page_scope_prepare_retry_eligible(method, session) && self.page_scope_prepare_retry_still_allowed(session)
+    }
+
+    fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>, until: Instant) -> Result<Vec<(String, DocumentState)>, String> {
         #[cfg(test)]
         let previous = self.runtime_preparing;
         #[cfg(test)]
         { self.runtime_preparing = method == "Runtime.evaluate"; }
-        let result = self.prepare_state(method, params, session);
+        let result = self.prepare_state(method, params, session, until);
         #[cfg(test)]
         { self.runtime_preparing = previous; }
         result
     }
 
-    fn prepare_state(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {
+    fn prepare_state(&mut self, method: &str, params: &Value, session: Option<&str>, until: Instant) -> Result<Vec<(String, DocumentState)>, String> {
         #[cfg(test)]
         self.runtime_prepare_probe("command-classification", json!({}));
         let content = content_command(method, params).ok_or_else(|| self.refusal())?;
@@ -1061,8 +1143,11 @@ impl Cdp {
         if !content { return Ok(checks) }
         let runtime = method.starts_with("Runtime.");
         let page_scope = if page_scope::content(method) {
-            Some(if method == "Runtime.evaluate" && !Worlds::selectors(params) { self.verify_runtime_page_scope_state(session)? }
-                else { self.verify_page_scope_state(session)? })
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(self.refusal()) }
+            let attempt_until = Instant::now() + left.min(DOCUMENT_CHECK);
+            Some(if method == "Runtime.evaluate" && !Worlds::selectors(params) { self.verify_runtime_page_scope_state_until(session, attempt_until)? }
+                else { self.verify_page_scope_state_until(session, attempt_until)? })
         } else { None };
         if let Some(((page, _, _), _)) = &page_scope {
             let page = page.clone();
@@ -1231,7 +1316,7 @@ impl Cdp {
                     if attempt != 0 || !ordinary_default_commit { return Err(self.refusal()) }
                     #[cfg(test)]
                     self.runtime_stage(method, "private-context-readmission");
-                    *checks = self.prepare(method, params, Some(session))?;
+                    *checks = self.prepare(method, params, Some(session), Instant::now() + DOCUMENT_CHECK)?;
                     state = checks.iter().find(|(id, _)| id == &target).map(|(_, state)| state.clone()).ok_or_else(|| self.unverified())?;
                     continue;
                 }
@@ -1613,7 +1698,7 @@ impl Cdp {
             self.targets.insert(target_id.to_string(), info.clone());
             if self.documents.get(target_id).is_some_and(|doc| doc.probed) {
                 self.documents.remove(target_id);
-            } else if !self.refresh(target_id)? {
+            } else if !self.refresh(target_id, OPTIONAL_STEP)? {
                 return Ok(true);
             }
             self.probe_error(&info)?;
@@ -2177,14 +2262,16 @@ impl Cdp {
         }
     }
 
-    fn refresh(&mut self, target: &str) -> Result<bool, String> {
+    fn refresh(&mut self, target: &str, left: Duration) -> Result<bool, String> {
         let Some(doc) = self.documents.get(target) else { return Ok(true) };
         if self.document_paused(target) { return Ok(true) }
         if doc.navigating || doc.probed || !(self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()) {
             return Ok(true);
         }
         let Some(guard) = self.guards.get(target).cloned() else { return Ok(true) };
-        let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok().and_then(|tree| tree.pointer("/frameTree/frame").cloned());
+        let span = left.min(OPTIONAL_STEP);
+        if span.is_zero() { return Err(self.refusal()) }
+        let frame = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), span).ok().and_then(|tree| tree.pointer("/frameTree/frame").cloned());
         self.connected()?;
         Ok(match frame {
             Some(frame) if self.guards.get(target) == Some(&guard) => {
@@ -4318,6 +4405,7 @@ mod tests {
     include!("client_id_test.rs");
     include!("late_reply_test.rs");
     include!("close_latch_test.rs");
+    include!("page_scope_retry_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
