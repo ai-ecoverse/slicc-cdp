@@ -60,7 +60,8 @@ pub fn terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '\n' | '\t' => out.push(ch),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
             '\x07' => out.push_str("\\x07"),
             '\r' => out.push_str("\\r"),
             '\x1b' => out.push_str("\\x1b"),
@@ -100,8 +101,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_newline_and_tab() {
-        assert_eq!(terminal("a\tb\nc"), "a\tb\nc");
+    fn escapes_newline_and_tab() {
+        assert_eq!(terminal("a\tb\nc"), "a\\tb\\nc");
+    }
+
+    #[test]
+    fn browser_message_strips_child_description_controls() {
+        set_full_urls(false);
+        assert_eq!(browser_message("line\nbreak\tand tab"), "line\\nbreak\\tand tab");
     }
 
     #[test]

@@ -116,6 +116,15 @@ async function hasShim(raw, session) {
   ).result.value;
 }
 
+async function waitForShim(raw, session, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if ((await hasShim(raw, session)).api) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('child shim did not appear');
+}
+
 await test('Chrome: guarded WebMCP holder registers load-time tools, enforces policy and excludes protected documents', {
   timeout: 180000,
 }, async (t) => {
@@ -147,27 +156,46 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
         '-subj',
         '/CN=localhost',
         '-addext',
-        'subjectAltName=DNS:localhost,DNS:seven.sliccy.ai,DNS:vault.sliccy.ai',
+        'subjectAltName=DNS:localhost,DNS:seven.sliccy.ai,DNS:vault.sliccy.ai,DNS:foreign.test',
       ],
       { stdio: 'ignore' }
     );
+    const crossReady = [];
+    let crossReadyOpen = false;
+    const releaseCrossReady = () => {
+      crossReadyOpen = true;
+      for (const pending of crossReady.splice(0)) {
+        pending.writeHead(200, { 'content-type': 'text/plain' });
+        pending.end('ok');
+      }
+    };
     server = createServer(
       { key: await readFile(keyPath), cert: await readFile(certPath) },
       (req, res) => {
-        if (req.url === '/error') {
+        const url = new URL(req.url, 'https://localhost');
+        if (url.pathname === '/cross-child-ready') {
+          if (crossReadyOpen) {
+            res.writeHead(200, { 'content-type': 'text/plain' });
+            res.end('ok');
+            return;
+          }
+          crossReady.push(res);
+          return;
+        }
+        if (url.pathname === '/error') {
           req.socket.destroy();
           return;
         }
         const policy =
-          req.url === '/deny'
+          url.pathname === '/deny'
             ? { 'permissions-policy': 'tools=()' }
-            : ['/frames', '/ordinary-frames', '/cross'].includes(req.url)
+            : ['/frames', '/ordinary-frames', '/cross'].includes(url.pathname)
               ? { 'permissions-policy': 'tools=*' }
               : {};
         res.writeHead(200, { 'content-type': 'text/html', ...policy });
-        const child = req.url === '/same' || req.url === '/cross';
+        const child = url.pathname === '/same' || url.pathname === '/cross';
         const names = child
-          ? [req.url === '/same' ? 'same_child' : 'cross_child']
+          ? [url.pathname === '/same' ? 'same_child' : 'cross_child']
           : [
               'get_inbox_state',
               'list_threads',
@@ -178,19 +206,19 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
               'set_preferences',
               'send_reply',
             ];
-        const frames = ['/frames', '/ordinary-frames'].includes(req.url)
-          ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${req.url === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
+        const frames = ['/frames', '/ordinary-frames'].includes(url.pathname)
+          ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${url.pathname === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
           : '';
         const childScript =
-          req.url === '/cross'
+          url.pathname === '/cross'
             ? `void (async () => {
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await fetch('/cross-child-ready');
   if (!document.modelContext) return;
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
   }
 })();`
-            : req.url === '/same'
+            : url.pathname === '/same'
               ? `const register = () => {
   if (!document.modelContext) return false;
   for (const name of ${JSON.stringify(names)}) {
@@ -359,6 +387,7 @@ ${childScript}
     ).sessionId;
     assert.equal((await hasShim(raw, childSession)).api, false);
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
+    crossReadyOpen = false;
     await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
     holder = command(browser.wsUrl, cwd, [
       'webmcp-polyfill',
@@ -369,24 +398,43 @@ ${childScript}
       `https://foreign.test:${port}`,
     ]);
     assert.equal((await holder.ready).mode, 'polyfill');
+    const crossChild = (await raw.send('Target.getTargets', {})).targetInfos.find(
+      (target) => target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross`
+    );
+    assert.ok(crossChild, 'ordinary OOPIF was not created');
+    const crossSession = (
+      await raw.send('Target.attachToTarget', { targetId: crossChild.targetId, flatten: true })
+    ).sessionId;
+    await waitForShim(raw, crossSession);
+    releaseCrossReady();
+    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);
     assert.equal(JSON.parse(same.stdout).length, 9);
-    const cross = await once(browser.wsUrl, cwd, [
-      'webmcp-list',
-      '--tab',
-      targetId,
-      '--json',
-      '--from-origin',
-      `https://foreign.test:${port}`,
-    ]);
-    assert.equal(cross.code, 0, cross.stderr);
-    assert.equal(
-      cross.stderr.includes('cross-origin child tools are unavailable'),
-      false,
-      cross.stderr
-    );
-    const crossTools = JSON.parse(cross.stdout);
+    let crossTools;
+    {
+      const deadline = Date.now() + 15000;
+      let cross;
+      while (Date.now() < deadline) {
+        cross = await once(browser.wsUrl, cwd, [
+          'webmcp-list',
+          '--tab',
+          targetId,
+          '--json',
+          '--from-origin',
+          `https://foreign.test:${port}`,
+        ]);
+        assert.equal(cross.code, 0, cross.stderr);
+        assert.equal(
+          cross.stderr.includes('cross-origin child tools are unavailable'),
+          false,
+          cross.stderr
+        );
+        crossTools = JSON.parse(cross.stdout);
+        if (crossTools.some((tool) => tool.name === 'cross_child')) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     assert.ok(
       crossTools.some((tool) => tool.name === 'cross_child'),
       `cross_child missing from ${JSON.stringify(crossTools)}\n${holder.stderr()}`

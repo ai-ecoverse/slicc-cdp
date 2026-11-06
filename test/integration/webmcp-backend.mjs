@@ -521,6 +521,20 @@ export async function webmcpBackend({
         });
         return true;
       }
+      if (method === 'Network.loadNetworkResource') {
+        const page =
+          pages.get(params.frameId) ||
+          pages.get(sessions.get(sessionId)) ||
+          [...pages.values()].find((page) => `${page.origin}/` === params.url);
+        answer({
+          resource: {
+            success: true,
+            httpStatusCode: 200,
+            headers: { 'permissions-policy': page?.policy || '' },
+          },
+        });
+        return true;
+      }
       if (
         [
           'Page.enable',
