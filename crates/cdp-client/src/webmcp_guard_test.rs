@@ -19,6 +19,9 @@ struct BackendState {
     initial_child: bool,
     child_loader_race: bool,
     runtime_child: Option<Value>,
+    attach_on_auto_attach: bool,
+    refuse_auto_attach: bool,
+    route: Option<String>,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -179,6 +182,24 @@ impl Transport for Backend {
             "Debugger.removeBreakpoint" | "Debugger.disable" | "Target.detachFromTarget" => {
                 state.installed = false;
                 json!({})
+            }
+            "Target.setAutoAttach" => {
+                if state.refuse_auto_attach {
+                    state.inbox.push_back(json!({"id":command["id"],"error":{"message":"slicc: refused: Target.setAutoAttach is not supported: attach to each target"}}).to_string());
+                    return Ok(());
+                }
+                if state.attach_on_auto_attach {
+                    let parent = command["sessionId"].as_str().unwrap_or("H");
+                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}).to_string());
+                }
+                json!({})
+            }
+            "Browser.getVersion" => {
+                if let Some(route) = state.route.clone() {
+                    json!({"product":"Chrome/156.0.0.0","slicc":{"route":route}})
+                } else {
+                    json!({"product":"Chrome/156.0.0.0"})
+                }
             }
             _ => json!({}),
         };
@@ -887,4 +908,82 @@ fn pending_child_cap_drops_the_1025th_cross_origin_candidate() {
     cdp.webmcp_install_children();
     assert!(cdp.webmcp.arms["H"].pending_children.len() <= 1024);
     assert!(cdp.webmcp.arms["H"].child_done.len() <= 1024 || cdp.webmcp.arms["H"].pending_children.len() + cdp.webmcp.arms["H"].accepted.len() <= 2048);
+}
+
+#[test]
+fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
+    let (mut premature, state) = client();
+    premature.start_webmcp_for("H", true).unwrap();
+    let before = state.borrow().sent.len();
+    premature.absorb(json!({"method":"Target.attachedToTarget","sessionId":"H","params":{"sessionId":"EARLY","targetInfo":{"targetId":"EARLY","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
+    assert!(premature.session_blocked("EARLY"));
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"));
+
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp.buffering_attach = true;
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"EARLY","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
+    assert_eq!(cdp.webmcp.pending_attaches.len(), 1);
+    assert!(!cdp.session_blocked("EARLY"));
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    let before = state.borrow().sent.len();
+    cdp.webmcp_auto_attach("H").unwrap();
+    assert!(cdp.webmcp.arms[&holder].direct_child_attach);
+    assert!(cdp.webmcp.pending_attaches.is_empty());
+    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"));
+    assert!(
+        cdp.webmcp.parents.contains_key("EARLY")
+            || cdp.webmcp.arms.contains_key("EARLY")
+            || state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"),
+        "buffered attach must be adopted after setAutoAttach succeeds"
+    );
+}
+
+#[test]
+fn refused_auto_attach_or_route_hint_keeps_cross_origin_off() {
+    let (mut refused, state) = client();
+    refused.start_webmcp_for("H", true).unwrap();
+    state.borrow_mut().refuse_auto_attach = true;
+    refused.webmcp_auto_attach("H").unwrap();
+    assert!(!refused.webmcp.arms["H"].direct_child_attach);
+    refused.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    assert!(refused.session_blocked("CHILD"));
+    assert!(refused.take_webmcp_children().is_empty());
+
+    for route in ["link", "extension", "devtools", "unknown-guard"] {
+        let (mut cdp, state) = client();
+        cdp.start_webmcp_for("H", true).unwrap();
+        state.borrow_mut().route = Some(route.into());
+        cdp.webmcp_auto_attach("H").unwrap();
+        assert!(!cdp.webmcp.arms["H"].direct_child_attach, "{route}");
+        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+        assert!(cdp.session_blocked("CHILD"), "{route}");
+        assert!(cdp.take_webmcp_children().is_empty(), "{route}");
+    }
+}
+
+#[test]
+fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp_auto_attach("H").unwrap();
+    assert!(cdp.webmcp.arms["H"].direct_child_attach);
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    assert!(cdp.webmcp_alive("H"));
+    assert!(!cdp.webmcp.arms["H"].revoked);
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
+        arm.pending_contexts.insert(1, Instant::now() - Duration::from_secs(1));
+        arm.pending_frames.insert("IFRAME".into(), ("L".into(), Instant::now() - Duration::from_secs(1)));
+    }
+    cdp.webmcp_sweep();
+    assert!(cdp.webmcp_alive("H"));
+    assert!(!cdp.webmcp.arms["H"].revoked);
+    assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked) || cdp.session_blocked("CHILD"));
+    assert!(cdp.webmcp_settled() || cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked));
+    let notices = cdp.take_notices().join("");
+    assert!(notices.contains("cross-origin child") || cdp.session_blocked("CHILD") || cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked));
+    assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "H" && command["method"] == "Debugger.disable"));
 }

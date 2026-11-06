@@ -40,21 +40,39 @@ fn remember_origins(state: &mut Session, target: &str, from: &[String]) {
     state.webmcp.insert(target.to_string(), saved);
 }
 
+fn pending_requested(sessions: &[Value], from: &[String]) -> bool {
+    sessions.iter().any(|session| {
+        session.get("pendingOrigins").and_then(Value::as_array).is_some_and(|origins| {
+            !origins.is_empty() && from.iter().any(|wanted| origins.iter().any(|origin| origin.as_str() == Some(wanted.as_str())))
+        })
+    })
+}
+
 fn wait_for_child_origins(state: &Session, target: &str, from: &[String]) {
     if from.is_empty() || !child_evidence(state, target) { return; }
+    let Some(sessions) = state.webmcp.get(target).and_then(|entry| entry.get("sessions")).and_then(Value::as_array) else { return; };
+    if !pending_requested(sessions, from) { return; }
     let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < until {
         let latest = crate::session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
-        if latest.webmcp.get(target).and_then(|entry| entry.get("sessions")).and_then(Value::as_array).is_some_and(|sessions| {
-            sessions.iter().any(|session| {
-                session.get("admittedOrigins").and_then(Value::as_array).is_some_and(|origins| {
-                    from.iter().any(|wanted| origins.iter().any(|origin| origin.as_str() == Some(wanted.as_str())))
-                })
+        let Some(sessions) = latest.webmcp.get(target).and_then(|entry| entry.get("sessions")).and_then(Value::as_array) else { return; };
+        if sessions.iter().any(|session| {
+            session.get("admittedOrigins").and_then(Value::as_array).is_some_and(|origins| {
+                from.iter().any(|wanted| origins.iter().any(|origin| origin.as_str() == Some(wanted.as_str())))
             })
         }) {
             return;
         }
+        if !pending_requested(sessions, from) { return; }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn refuse_protected_origins(cdp: &Cdp, from: &[String]) -> Option<Output> {
+    if from.iter().any(|origin| cdp.guard().url(origin)) {
+        Some(Output::err(format!("{}\n", cdp.guard().refusal())))
+    } else {
+        None
     }
 }
 
@@ -78,6 +96,10 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    if let Some(refused) = refuse_protected_origins(cdp, from) {
+        let _ = browser::watch_detach(cdp, state, &target, &session);
+        return refused;
+    }
     remember_origins(state, &target, from);
     let evidence = child_evidence(state, &target);
     if evidence { wait_for_child_origins(state, &target, from); }
@@ -200,6 +222,10 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    if let Some(refused) = refuse_protected_origins(cdp, from) {
+        let _ = browser::watch_detach(cdp, state, &target, &session);
+        return refused;
+    }
     remember_origins(state, &target, from);
     let evidence = child_evidence(state, &target);
     if evidence { wait_for_child_origins(state, &target, from); }

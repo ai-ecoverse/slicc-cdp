@@ -84,6 +84,8 @@ pub(super) struct Webmcp {
     samples: Vec<u128>,
     requested_origins: BTreeSet<String>,
     route_attested: bool,
+    buffering_attach: bool,
+    pending_attaches: VecDeque<Value>,
     trace_sequence: u64,
     trace_lifecycle: BTreeMap<(String, &'static str), u64>,
     trace_requests: BTreeMap<(String, String), (String, u64)>,
@@ -273,17 +275,28 @@ impl Cdp {
     }
 
     pub fn webmcp_auto_attach(&mut self, session: &str) -> Result<(), String> {
-        if !self.webmcp_alive(session) { return Err(self.refusal()); }
+        let session = self.webmcp_session(session).to_string();
+        if !self.webmcp_alive(&session) { return Err(self.refusal()); }
         if self.webmcp_route_attested() {
-            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.direct_child_attach = false; }
+            if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = false; }
             return Ok(());
         }
-        match self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(session), OPTIONAL_STEP) {
+        if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = true; }
+        self.webmcp.buffering_attach = true;
+        let result = self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(&session), OPTIONAL_STEP);
+        self.webmcp.buffering_attach = false;
+        let pending = std::mem::take(&mut self.webmcp.pending_attaches);
+        match result {
             Ok(_) => {
-                if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.direct_child_attach = true; }
+                for event in pending { self.webmcp_adopt_child(&event); }
             }
             Err(_) => {
-                if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.direct_child_attach = false; }
+                if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = false; }
+                for event in pending {
+                    if let Some(child) = event.pointer("/params/sessionId").and_then(Value::as_str) {
+                        self.webmcp_release_child(child);
+                    }
+                }
             }
         }
         Ok(())
@@ -299,7 +312,8 @@ impl Cdp {
         #[cfg(not(target_os = "wasi"))]
         {
             let attested = self.raw_call("Browser.getVersion", json!({}), None, OPTIONAL_STEP).ok().is_some_and(|version| {
-                matches!(version.pointer("/slicc/route/kind").and_then(Value::as_str), Some("extension" | "link"))
+                version.pointer("/slicc/route").and_then(Value::as_str).is_some_and(|route| !route.is_empty())
+                    || version.pointer("/slicc/route/kind").and_then(Value::as_str).is_some_and(|route| !route.is_empty())
             });
             if attested { self.webmcp.route_attested = true; }
             attested
@@ -353,25 +367,37 @@ impl Cdp {
     }
 
     pub fn webmcp_snapshot(&self) -> Vec<Value> {
-        self.webmcp.arms.iter().filter(|(session, arm)| !arm.revoked && !self.webmcp.quarantined.contains(*session) && !self.content_blocked(session)).map(|(session, arm)| {
+        self.webmcp.arms.iter().filter(|(session, arm)| !arm.revoked && !self.blocked.contains(*session) && (self.webmcp.quarantined.contains(*session) || !self.content_blocked(session))).map(|(session, arm)| {
             let admitted_origins = self.webmcp.contexts.iter().filter(|((owner, _), context)| {
                 owner == session && arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone()))
             }).map(|(_, context)| context.origin.clone()).collect::<BTreeSet<_>>();
-            json!({"session":session,"bridge":arm.bridge,"target":self.session_target(session),"documents":arm.documents,"plain":arm.plain,"directChildAttach":arm.direct_child_attach,"admittedOrigins":admitted_origins})
+            let pending_origins = if self.webmcp.quarantined.contains(session) && arm.admitted == 0 {
+                self.webmcp_child_origin(session).into_iter().collect::<BTreeSet<_>>()
+            } else {
+                arm.pending_children.values().map(|(context, _, _)| context.origin.clone()).collect::<BTreeSet<_>>()
+            };
+            json!({"session":session,"bridge":arm.bridge,"target":self.session_target(session),"documents":arm.documents,"plain":arm.plain,"directChildAttach":arm.direct_child_attach,"admittedOrigins":admitted_origins,"pendingOrigins":pending_origins,"quarantined":self.webmcp.quarantined.contains(session)})
         }).collect()
     }
 
     pub fn webmcp_alive(&self, session: &str) -> bool {
         let session = self.webmcp_session(session);
-        self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked) && !self.content_blocked(session)
+        if !self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked) || self.blocked.contains(session) { return false; }
+        if self.webmcp.quarantined.contains(session) {
+            return self.session_target(session).and_then(|target| self.documents.get(&target)).is_none_or(|doc| !self.sealed(doc));
+        }
+        !self.content_blocked(session)
     }
 
     pub fn webmcp_settled(&self) -> bool {
         self.webmcp.arms.iter().all(|(session, arm)| {
-            let quarantined = self.webmcp.quarantined.contains(session);
-            let awaiting_origins = quarantined && arm.admitted == 0 && arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty();
-            arm.revoked || self.blocked.contains(session) || awaiting_origins || !quarantined && (self.content_blocked(session)
-                || arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty())
+            let child = self.webmcp.parents.contains_key(session) || self.webmcp.quarantined.contains(session);
+            if child {
+                return arm.revoked || self.blocked.contains(session)
+                    || arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty();
+            }
+            arm.revoked || self.blocked.contains(session) || self.content_blocked(session)
+                || arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty()
         })
     }
 
@@ -389,7 +415,10 @@ impl Cdp {
     }
 
     pub(super) fn webmcp_sweep(&mut self) {
-        let pending = self.webmcp.arms.iter().filter(|(_, arm)| arm.plain && arm.admitted > 0 && !arm.revoked && (!arm.pending_contexts.is_empty() || !arm.pending_frames.is_empty())).map(|(session, _)| session.clone()).collect::<Vec<_>>();
+        let pending = self.webmcp.arms.iter().filter(|(session, arm)| {
+            !self.webmcp.parents.contains_key(*session) && !self.webmcp.quarantined.contains(*session)
+                && arm.plain && arm.admitted > 0 && !arm.revoked && (!arm.pending_contexts.is_empty() || !arm.pending_frames.is_empty())
+        }).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         if !self.webmcp.handling_gate {
             self.webmcp.handling_gate = true;
             for session in pending {
@@ -400,10 +429,37 @@ impl Cdp {
         let now = Instant::now();
         let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
+            if self.webmcp.parents.contains_key(&session) || self.webmcp.quarantined.contains(&session) {
+                self.webmcp_settle_child(&session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                continue;
+            }
             let reason = self.webmcp.arms.get(&session).map(|arm| if arm.pending_install.is_some_and(|deadline| deadline <= now) { "installer deadline" } else if arm.pending_contexts.values().any(|deadline| *deadline <= now) { "context deadline" } else { "frame deadline" }).unwrap_or("missing holder");
             self.webmcp_revoke_because(&session, reason);
             if !self.webmcp_plain(&session) { let _ = self.send("Debugger.resume", json!({}), Some(&session)); }
         }
+        self.webmcp_install_children();
+    }
+
+    fn webmcp_settle_child(&mut self, child: &str, notice: &str) {
+        if let Some(arm) = self.webmcp.arms.get_mut(child) {
+            arm.pending_install = None;
+            arm.pending_contexts.clear();
+            arm.pending_frames.clear();
+        }
+        if let Some(parent) = self.webmcp.parents.get(child).cloned() {
+            if let Some(realm) = self.webmcp.contexts.iter().find(|((owner, _), _)| owner == child).map(|(_, context)| (context.frame.clone(), context.loader.clone(), context.unique.clone())) {
+                if let Some(arm) = self.webmcp.arms.get_mut(&parent) {
+                    if arm.child_done.len() < 1024 { arm.child_done.insert(realm); }
+                }
+            }
+        }
+        self.notices.push(format!("webmcp-polyfill: {notice}\n"));
+        self.webmcp_revoke(child);
+        let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), DOCUMENT_CHECK);
+        let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
+        self.blocked.insert(child.to_string());
+        self.webmcp.quarantined.remove(child);
+        self.guard_sessions.remove(child);
     }
 
     pub fn stop_webmcp(&mut self, session: &str) {
@@ -1079,14 +1135,17 @@ impl Cdp {
                 Ok(true) => {}
                 Ok(false) => {}
                 Err(_) => {
-                    self.webmcp_revoke(&child);
-                    self.webmcp_release_child(&child);
+                    self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
                 }
             }
         }
     }
 
     fn webmcp_adopt_child(&mut self, value: &Value) {
+        if self.webmcp.buffering_attach {
+            self.webmcp.pending_attaches.push_back(value.clone());
+            return;
+        }
         let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str).map(str::to_string) else { return; };
         let parent = value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
         let info = &value["params"]["targetInfo"];
@@ -1124,24 +1183,14 @@ impl Cdp {
             }
             self.webmcp_child_arm(&child, &seed, direct)?;
             if future_only && !verified { return Ok(()); }
-            let until = Instant::now() + DOCUMENT_CHECK;
-            loop {
-                match self.webmcp_adopt_install(&child, &parent, until) {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => return Ok(()),
-                    Err(_) if Instant::now() >= until => return Err(self.refusal()),
-                    Err(_) => {
-                        if !self.pump(until).unwrap_or(false) { return Err(self.refusal()); }
-                    }
-                }
+            match self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP) {
+                Ok(_) => Ok(()),
+                Err(_) => Ok(()),
             }
         })();
         let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(&child), DOCUMENT_CHECK);
         if outcome.is_err() {
-            self.notices.push("webmcp-polyfill: a cross-origin child could not verify its document; synchronous registration before installation is unavailable\n".into());
-            self.webmcp_revoke(&child);
-            let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
-            self.blocked.insert(child);
+            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
         }
     }
 
@@ -1178,6 +1227,10 @@ impl Cdp {
     }
 
     fn webmcp_gate_event(&mut self, value: &Value) {
+        if self.webmcp.buffering_attach && value.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
+            self.webmcp.pending_attaches.push_back(value.clone());
+            return;
+        }
         let paused = value.get("method").and_then(Value::as_str) == Some("Debugger.paused");
         if paused {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) { self.webmcp.paused.insert(session.to_string()); }

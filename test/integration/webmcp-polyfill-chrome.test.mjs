@@ -181,8 +181,17 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
         const frames = ['/frames', '/ordinary-frames'].includes(req.url)
           ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${req.url === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
           : '';
-        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
-const register = () => {
+        const childScript =
+          req.url === '/cross'
+            ? `void (async () => {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  if (!document.modelContext) return;
+  for (const name of ${JSON.stringify(names)}) {
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  }
+})();`
+            : req.url === '/same'
+              ? `const register = () => {
   if (!document.modelContext) return false;
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
@@ -192,7 +201,14 @@ const register = () => {
 if (!register()) {
   const timer = setInterval(() => { if (register()) clearInterval(timer); }, 50);
   setTimeout(() => clearInterval(timer), 5000);
-}
+}`
+              : `if (document.modelContext) {
+  for (const name of ${JSON.stringify(names)}) {
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  }
+}`;
+        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
+${childScript}
 </script>`);
       }
     );

@@ -164,7 +164,7 @@ for (const protectedFrames of [true, false]) {
             `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
           if (url.pathname === '/cross') {
             res.end(
-              `<!doctype html><script>const crossController = new AbortController(); window.addCross = () => document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); window.removeCross = () => crossController.abort();</script>`
+              `<!doctype html><script>const crossController = new AbortController(); window.addCross = async () => { await new Promise((resolve) => setTimeout(resolve, 50)); document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); }; window.removeCross = () => crossController.abort();</script>`
             );
             return;
           }
