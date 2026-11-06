@@ -192,6 +192,9 @@ impl Transport for Backend {
                 json!({"result":{"type":"undefined"}})
             }
             "Runtime.evaluate" if command["params"]["expression"] == "document.readyState" => json!({"result":{"type":"string","value":"complete"}}),
+            "Runtime.evaluate" if command["params"]["expression"].as_str().is_some_and(|source| source.contains("permissions-policy")) => {
+                json!({"result":{"type":"string","value":"tools=*"}})
+            }
             "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
             "Debugger.resume" => {
                 if state.context_race == "resume" && state.api {
@@ -1028,6 +1031,34 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
     let notices = cdp.take_notices().join("");
     assert!(notices.contains("cross-origin child") || cdp.session_blocked("CHILD") || cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked));
     assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "H" && command["method"] == "Debugger.disable"));
+}
+
+#[test]
+fn child_arm_enables_network_before_page_and_observes_policy_before_shim() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    let child_sent = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD").cloned().collect::<Vec<_>>();
+    let network = child_sent.iter().position(|command| command["method"] == "Network.enable");
+    let page = child_sent.iter().position(|command| command["method"] == "Page.enable");
+    assert!(network.is_some_and(|network| page.is_some_and(|page| network < page)), "Network.enable must precede Page.enable on the child: {child_sent:?}");
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(
+        cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.documents.get("FRAME:CROSS").is_some_and(|document| document.get("policy").and_then(Value::as_str) == Some("tools=*"))),
+        "already-loaded children must observe Permissions-Policy before listing: {:?}",
+        cdp.webmcp.arms.get("CHILD").map(|arm| &arm.documents)
+    );
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0));
 }
 
 #[test]

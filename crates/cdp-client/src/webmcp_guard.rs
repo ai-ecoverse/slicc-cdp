@@ -1095,12 +1095,43 @@ impl Cdp {
             documents: BTreeMap::new(),
             parked_origin: String::new(),
         });
+        self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.raw_call("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.raw_call("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.worlds.enable(session);
         self.raw_call("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
-        self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         Ok(bridge)
+    }
+
+    fn webmcp_record_document_policy(&mut self, session: &str, frame: &str, loader: &str, origin: &str, policy: &str) {
+        if frame.is_empty() || loader.is_empty() || origin.is_empty() || origin == "null" { return; }
+        let policy = if policy.len() > 16384 { "tools=()" } else { policy };
+        if let Some(arm) = self.webmcp.arms.get_mut(session) {
+            arm.documents.entry(format!("{frame}:{loader}")).or_insert_with(|| {
+                json!({"frameId":frame,"loaderId":loader,"origin":origin,"policy":policy})
+            });
+        }
+    }
+
+    fn webmcp_observe_child_policy(&mut self, child: &str, frame_id: &str, loader: &str, origin: &str, context: i64) {
+        let key = format!("{frame_id}:{loader}");
+        if self.webmcp.arms.get(child).is_some_and(|arm| arm.documents.contains_key(&key)) {
+            return;
+        }
+        let Ok(result) = self.raw_call(
+            "Runtime.evaluate",
+            json!({
+                "expression":"(async () => { try { const response = await fetch(document.URL, { cache: 'no-store', credentials: 'same-origin' }); return response.headers.get('permissions-policy') || ''; } catch { return null; } })()",
+                "awaitPromise":true,
+                "returnByValue":true,
+                "contextId":context
+            }),
+            Some(child),
+            DOCUMENT_CHECK,
+        ) else { return; };
+        let Some(policy) = result.pointer("/result/value").and_then(Value::as_str) else { return; };
+        self.webmcp_record_document_policy(child, frame_id, loader, origin, policy);
+        self.webmcp_trace_stage(child, "policy", if policy.is_empty() { "observed-empty" } else if policy.contains("tools") { "observed-tools" } else { "observed-other" });
     }
 
     fn webmcp_parked_child(&self, session: &str) -> bool {
@@ -1205,8 +1236,9 @@ impl Cdp {
         self.webmcp_trace_stage(child, "context", &format!("matched;frame={frame_id};origin={origin};unique={}", !context.unique.is_empty()));
         context.loader = loader.clone();
         if let Some(stored) = self.webmcp.contexts.get_mut(&(child.to_string(), id)) {
-            stored.loader = loader;
+            stored.loader = loader.clone();
         }
+        self.webmcp_observe_child_policy(child, frame_id, &loader, &origin, id);
         if let Some(arm) = self.webmcp.arms.get_mut(child) {
             arm.loaders.insert(frame_id.to_string(), context.loader.clone());
             arm.root_identity = Some((target.clone(), context.clone()));
@@ -1521,11 +1553,8 @@ impl Cdp {
             let loader = params.get("loaderId").and_then(Value::as_str).unwrap_or("");
             if !frame.is_empty() && !loader.is_empty() && !self.guard.url(url) {
                 let policy = params.pointer("/response/headers").and_then(Value::as_object).and_then(|headers| headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("permissions-policy"))).map(|(_, value)| value.as_str().unwrap_or("tools=()")).unwrap_or("");
-                let policy = if policy.len() > 16384 { "tools=()" } else { policy };
                 let origin = url::Url::parse(url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
-                if let Some(arm) = self.webmcp.arms.get_mut(session) {
-                    arm.documents.insert(format!("{frame}:{loader}"), json!({"frameId":frame,"loaderId":loader,"origin":origin,"policy":policy}));
-                }
+                self.webmcp_record_document_policy(session, frame, loader, &origin, policy);
             }
         }
         if method == "Page.frameNavigated" {
