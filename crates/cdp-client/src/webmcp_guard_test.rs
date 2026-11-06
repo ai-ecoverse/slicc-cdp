@@ -1031,24 +1031,29 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
 }
 
 #[test]
-fn unverified_child_is_armed_then_released_at_deadline() {
+fn unverified_child_parks_until_first_commit_then_installs() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
     cdp.start_webmcp_for("H", true).unwrap();
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp_auto_attach(&holder).unwrap();
     assert!(cdp.webmcp.arms[&holder].direct_child_attach);
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     let before = state.borrow().sent.len();
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
     assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
     assert!(!cdp.content_blocked("CHILD"));
-    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "unverified child must be armed with a deadline");
-    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
-        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
-    }
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()), "unverified blank child must park with no deadline");
     cdp.webmcp_sweep();
-    assert!(cdp.session_blocked("CHILD"), "deadline must settle and detach the child");
-    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert!(!cdp.session_blocked("CHILD"), "parked blank child must survive a sweep");
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(
+        cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
+            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
+        "first real commit must make a parked blank child eligible"
+    );
     assert!(cdp.webmcp_alive(&holder));
     assert!(!cdp.webmcp.arms[&holder].revoked);
 }
@@ -1076,13 +1081,14 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     assert!(!cdp.content_blocked("CHILD"), "OOPIF must not be content-blocked before install");
     assert!(!cdp.session_blocked("CHILD"), "OOPIF must not settle as blocked before install");
     assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"), "late Option A must not hold the OOPIF");
-    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "blank OOPIF must stay armed until commit");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()), "blank OOPIF must park until first commit");
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"FRAME","parentId":"F","url":"https://foreign.test/cross","securityOrigin":"","loaderId":""}}}));
     assert!(!cdp.webmcp.arms[&holder].revoked, "parent-session iframe navigation must not revoke the root");
     assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty(), "parent-session iframe navigation must not add root pending frames");
     assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty(), "parent-session iframe navigation must not add root pending contexts");
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    assert!(!cdp.session_blocked("CHILD"), "parked child must not settle on its first real commit");
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(!cdp.content_blocked("CHILD"));
     assert!(
@@ -1245,11 +1251,9 @@ fn private_oopif_attach_does_not_touch_protect_or_guard_the_root_but_settled_chi
     assert!(!cdp.session_blocked(&holder));
     assert!(!cdp.content_blocked(&holder));
     assert!(cdp.webmcp_alive(&holder));
-    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
-        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
-    }
-    cdp.webmcp_sweep();
-    assert!(cdp.session_blocked("CHILD"), "deadline settle blocks the child");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()), "blank child parks with no deadline");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
+    assert!(cdp.session_blocked("CHILD"), "parent navigation settles parked children");
     assert!(!cdp.webmcp.parents.contains_key("CHILD"), "detach reply forgets the child and drops parents during settle");
     assert!(!cdp.session_blocked(&holder), "root stays unblocked after child settle/forget");
     assert!(!cdp.content_blocked(&holder), "root stays content-unblocked after child settle/forget");
