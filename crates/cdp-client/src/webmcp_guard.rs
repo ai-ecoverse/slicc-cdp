@@ -445,6 +445,7 @@ impl Cdp {
     }
 
     fn webmcp_settle_child(&mut self, child: &str, notice: &str) {
+        self.webmcp_trace_stage(child, "settle", notice);
         if let Some(arm) = self.webmcp.arms.get_mut(child) {
             arm.pending_install = None;
             arm.pending_contexts.clear();
@@ -708,8 +709,21 @@ impl Cdp {
         let arm = self.webmcp.arms.get(session);
         let location = arm.and_then(|arm| arm.revoked_at).map(|(file, line)| format!("{}:{line}", file.rsplit('/').next().unwrap_or("guard")));
         let child = self.webmcp.parents.contains_key(session);
-        let trace = json!({"event":event,"reason":reason,"sessionRole":if child {"child"} else {"root"},"frameRole":self.webmcp.trace_roles.get(session).copied().unwrap_or(if child {"OOPIF"} else {"unknown"}),"sequence":self.webmcp.trace_sequence,"firstReason":arm.and_then(|arm| arm.revoked_reason),"firstLocation":location,"revoked":arm.is_some_and(|arm| arm.revoked),"blocked":self.blocked.contains(session),"contentBlocked":self.content_blocked(session),"pendingInstall":arm.is_some_and(|arm| arm.pending_install.is_some()),"pendingContexts":arm.map(|arm| arm.pending_contexts.len()),"pendingFrames":arm.map(|arm| arm.pending_frames.len()),"page":self.webmcp_trace_page(session)});
+        let trace = json!({"event":event,"reason":reason,"sessionRole":if child {"child"} else {"root"},"frameRole":self.webmcp.trace_roles.get(session).copied().unwrap_or(if child {"OOPIF"} else {"unknown"}),"sequence":self.webmcp.trace_sequence,"firstReason":arm.and_then(|arm| arm.revoked_reason),"firstLocation":location,"revoked":arm.is_some_and(|arm| arm.revoked),"blocked":self.blocked.contains(session),"contentBlocked":self.content_blocked(session),"pendingInstall":arm.is_some_and(|arm| arm.pending_install.is_some()),"pendingContexts":arm.map(|arm| arm.pending_contexts.len()),"pendingFrames":arm.map(|arm| arm.pending_frames.len()),"page":self.webmcp_trace_page(session),"childOrigin":self.webmcp_child_origin(session),"requested":self.webmcp_child_origin(session).is_some_and(|origin| self.webmcp.requested_origins.contains(&origin)),"parked":self.webmcp_parked_child(session),"quarantined":self.webmcp.quarantined.contains(session),"admitted":arm.map(|arm| arm.admitted)});
         eprintln!("webmcp-polyfill: {trace}");
+    }
+
+    fn webmcp_trace_tree_refusal(frame: &Value) -> &'static str {
+        let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
+        if text("id").is_empty() { return "missing-id"; }
+        if text("url").is_empty() { return "empty-url"; }
+        if text("securityOrigin").is_empty() || text("securityOrigin") == "null" { return "empty-origin"; }
+        if text("loaderId").is_empty() { return "empty-loader"; }
+        "unverified"
+    }
+
+    fn webmcp_trace_origin_label(value: &str) -> String {
+        url::Url::parse(value).ok().map(|url| url.origin().ascii_serialization()).filter(|origin| !origin.is_empty() && origin != "null").unwrap_or_else(|| "unknown".into())
     }
 
     fn webmcp_frame_refusal(&self, frame: &Value) -> Option<&'static str> {
@@ -1113,14 +1127,20 @@ impl Cdp {
     fn webmcp_adopt_install(&mut self, child: &str, parent: &str, until: Instant) -> Result<bool, String> {
         let target = self.session_target(child).ok_or_else(|| self.refusal())?;
         let tree = self.webmcp_stable(child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(child), left.min(OPTIONAL_STEP)))?;
-        if !self.webmcp_tree_verified(&tree, None) { return Ok(false); }
+        if !self.webmcp_tree_verified(&tree, None) {
+            self.webmcp_trace_stage(child, "tree", Self::webmcp_trace_tree_refusal(&tree["frameTree"]["frame"]));
+            return Ok(false);
+        }
+        self.webmcp_trace_stage(child, "tree", "verified");
         self.main_commit(child, &tree["frameTree"]["frame"]);
         let frame = &tree["frameTree"]["frame"];
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
         let loader = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
         if origin.is_empty() || origin == "null" || loader.is_empty() {
+            self.webmcp_trace_stage(child, "origin", "empty-after-verified-tree");
             return Ok(false);
         }
+        self.webmcp_trace_stage(child, "origin", &format!("known={};requested={}", origin, self.webmcp.requested_origins.contains(&origin)));
         if self.guard.url(&origin) || self.guard.extension_frame(&origin)
             || self.frame_protected(frame.get("id").and_then(Value::as_str).unwrap_or(""))
             || frame.get("url").and_then(Value::as_str).is_some_and(|url| self.guard.extension_frame(url) || self.guard.url(url)) {
@@ -1130,6 +1150,7 @@ impl Cdp {
             if let Some(arm) = self.webmcp.arms.get_mut(child) {
                 arm.pending_install = None;
             }
+            self.webmcp_trace_stage(child, "arm", "parked-unrequested");
             return Ok(false);
         }
         if let Some(arm) = self.webmcp.arms.get_mut(child) {
@@ -1137,6 +1158,7 @@ impl Cdp {
                 arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
             }
         }
+        self.webmcp_trace_stage(child, "arm", "deadline-for-requested");
         let parent_root = self.webmcp_root_document(parent, until)?;
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
         if !loader.is_empty() {
@@ -1148,6 +1170,9 @@ impl Cdp {
                 }
             }
         }
+        let candidates = self.webmcp.contexts.iter().filter(|((owner, _), _)| owner == child).map(|((_, id), context)| {
+            format!("id={id};frame={};origin={};hasUnique={};loaderEmpty={}", context.frame, context.origin, !context.unique.is_empty(), context.loader.is_empty())
+        }).collect::<Vec<_>>();
         let Some((id, mut context)) = self.webmcp.contexts.iter().find(|((owner, _), context)| {
             owner == child
                 && context.frame == frame_id
@@ -1158,8 +1183,10 @@ impl Cdp {
             if let Some(arm) = self.webmcp.arms.get_mut(child) {
                 arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
             }
+            self.webmcp_trace_stage(child, "context", &format!("miss;wantFrame={frame_id};wantOrigin={origin};have=[{}]", candidates.join("|")));
             return Ok(false);
         };
+        self.webmcp_trace_stage(child, "context", &format!("matched;frame={frame_id};origin={origin};unique={}", !context.unique.is_empty()));
         context.loader = loader.clone();
         if let Some(stored) = self.webmcp.contexts.get_mut(&(child.to_string(), id)) {
             stored.loader = loader;
@@ -1169,7 +1196,14 @@ impl Cdp {
             arm.root_identity = Some((target.clone(), context.clone()));
             arm.pending_install = None;
         }
-        self.webmcp_evaluate(child, id, &context, parent_root, until)?;
+        self.webmcp_trace_stage(child, "evaluate", "sending");
+        match self.webmcp_evaluate(child, id, &context, parent_root, until) {
+            Ok(()) => self.webmcp_trace_stage(child, "evaluate", "ok"),
+            Err(message) => {
+                self.webmcp_trace_stage(child, "evaluate", "error");
+                return Err(message);
+            }
+        }
         self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
         Ok(true)
     }
@@ -1177,12 +1211,21 @@ impl Cdp {
     fn webmcp_finish_awaiting_children(&mut self) {
         if self.webmcp.handling_children || self.webmcp.handling_gate { return; }
         self.webmcp.handling_children = true;
-        let waiting = self.webmcp.quarantined.iter().filter(|child| {
-            self.webmcp.parents.contains_key(*child)
-                && self.webmcp.arms.get(*child).is_some_and(|arm| !arm.revoked && arm.admitted == 0)
-                && self.webmcp_child_origin(child).is_some_and(|origin| self.webmcp.requested_origins.contains(&origin))
-        }).cloned().collect::<Vec<_>>();
-        for child in waiting {
+        let candidates = self.webmcp.quarantined.iter().cloned().collect::<Vec<_>>();
+        let mut selected = Vec::new();
+        for child in &candidates {
+            let parented = self.webmcp.parents.contains_key(child);
+            let arm_ok = self.webmcp.arms.get(child).is_some_and(|arm| !arm.revoked && arm.admitted == 0);
+            let origin = self.webmcp_child_origin(child);
+            let requested = origin.as_ref().is_some_and(|origin| self.webmcp.requested_origins.contains(origin));
+            if parented && arm_ok && requested {
+                selected.push(child.clone());
+                self.webmcp_trace_stage(child, "request", &format!("selected;origin={}", origin.as_deref().unwrap_or("")));
+            } else {
+                self.webmcp_trace_stage(child, "request", &format!("skipped;parented={parented};armOk={arm_ok};origin={};requested={requested}", origin.as_deref().unwrap_or("none")));
+            }
+        }
+        for child in selected {
             let Some(parent) = self.webmcp.parents.get(&child).cloned() else { continue; };
             if let Some(arm) = self.webmcp.arms.get_mut(&child) {
                 if arm.pending_install.is_none() {
@@ -1212,6 +1255,7 @@ impl Cdp {
         let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
         let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         let direct = self.webmcp.arms.get(&parent).is_some_and(|arm| arm.direct_child_attach);
+        self.webmcp_trace_stage(&child, "adopt", &format!("target={target};origin={};direct={direct}", Self::webmcp_trace_origin_label(&url)));
         if !direct || self.guard.extension_frame(&url) {
             self.webmcp_release_child(&child);
             return;
@@ -1239,6 +1283,8 @@ impl Cdp {
             if seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|frame_url| self.guard.extension_frame(frame_url)) {
                 return Err(self.refusal());
             }
+            let verified = self.webmcp_tree_verified(&seed, None);
+            self.webmcp_trace_stage(&child, "tree", if verified { "verified-seed" } else { Self::webmcp_trace_tree_refusal(&seed["frameTree"]["frame"]) });
             let parked = self.webmcp.quarantined.iter().filter(|session| {
                 self.webmcp.parents.contains_key(*session)
                     && self.webmcp.arms.get(*session).is_none_or(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none())
@@ -1251,11 +1297,13 @@ impl Cdp {
                 .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
             let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
             let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
-            if child_tree && self.webmcp_tree_verified(&seed, None) {
+            if child_tree && verified {
                 let _ = self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP);
             } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
                 arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
+                self.webmcp_trace_stage(&child, "arm", "provisional-deadline");
             }
+            self.webmcp_trace_stage(&child, "arm", if self.webmcp_parked_child(&child) { "parked" } else if self.webmcp.arms.get(&child).is_some_and(|arm| arm.pending_install.is_some()) { "deadline" } else { "armed" });
             Ok(())
         })();
         if outcome.is_err() {
