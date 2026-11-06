@@ -68,7 +68,7 @@ pub(super) struct Webmcp {
     contexts: BTreeMap<(String, i64), Context>,
     scripts: BTreeMap<(String, String), i64>,
     evaluations: BTreeSet<(String, String)>,
-    paused: BTreeSet<String>,
+    pub(super) paused: BTreeSet<String>,
     handling_gate: bool,
     handling_children: bool,
     pending_gates: VecDeque<Value>,
@@ -375,7 +375,7 @@ impl Cdp {
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
-        let enabled = self.call_guarded_for("Debugger.enable", json!({}), Some(session), DOCUMENT_CHECK, true);
+        let enabled = self.call_guarded_for("Debugger.enable", json!({}), Some(session), DOCUMENT_CHECK, true, false);
         if let Err(message) = enabled {
             if Self::webmcp_foreign_refusal(&message) && self.webmcp_enter_plain(session, &message, false).is_ok() { return Ok(bridge); }
             self.webmcp_revoke(session);
@@ -431,7 +431,7 @@ impl Cdp {
 
     fn webmcp_arm(&mut self, session: &str) -> Result<(), String> {
         if self.webmcp_plain(session) { return Ok(()); }
-        let result = self.call_guarded_for("Debugger.setInstrumentationBreakpoint", json!({"instrumentation":"beforeScriptExecution"}), Some(session), DOCUMENT_CHECK, true)?;
+        let result = self.call_guarded_for("Debugger.setInstrumentationBreakpoint", json!({"instrumentation":"beforeScriptExecution"}), Some(session), DOCUMENT_CHECK, true, false)?;
         let identifier = result.get("breakpointId").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| "slicc: refused: WebMCP instrumentation is unavailable; update the browser guard and client\n".to_string())?;
         let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
         arm.identifier = Some(identifier.to_string());

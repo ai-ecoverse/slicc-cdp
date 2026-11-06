@@ -4,13 +4,6 @@ const MAX_FRAMES: usize = 4096;
 const MAX_TARGETS: usize = 256;
 pub(super) const PAGE_SCOPE_ATTEMPTS: u32 = 3;
 
-struct PageScopeScratch {
-    targets: BTreeMap<String, Value>,
-    page_scope_sessions: BTreeMap<String, String>,
-    guard_sessions: BTreeSet<String>,
-    session_targets: BTreeMap<String, String>,
-}
-
 pub(super) fn content(method: &str) -> bool {
     ["Runtime.", "DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
         || matches!(method, "Page.captureScreenshot" | "Page.printToPDF" | "Page.startScreencast")
@@ -63,30 +56,23 @@ impl Cdp {
         self.page_scope_state(session, true, None)
     }
 
+    pub(super) fn verify_page_scope_state_until(&mut self, session: Option<&str>, until: Instant) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state(session, false, Some(until))
+    }
+
+    pub(super) fn verify_runtime_page_scope_state_until(&mut self, session: Option<&str>, until: Instant) -> Result<((String, u64, u64), DocumentState), String> {
+        self.page_scope_state(session, true, Some(until))
+    }
+
     pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
-        let scratch = PageScopeScratch {
-            targets: self.targets.clone(),
-            page_scope_sessions: self.page_scope_sessions.clone(),
-            guard_sessions: self.guard_sessions.clone(),
-            session_targets: self.session_targets.clone(),
-        };
         match self.page_scope_state_attempt(session, refresh_main, saved_deadline) {
-            Ok(result) => Ok(result),
             Err(error) if error == PAGE_CHANGED => {
-                let stale: Vec<String> = self.page_scope_sessions.iter()
-                    .filter(|(target, session)| scratch.page_scope_sessions.get(*target) != Some(session))
-                    .map(|(_, session)| session.clone())
-                    .collect();
-                self.targets = scratch.targets;
-                self.page_scope_sessions = scratch.page_scope_sessions;
-                self.guard_sessions = scratch.guard_sessions;
-                self.session_targets = scratch.session_targets;
-                for session in stale {
-                    let _ = self.send("Target.detachFromTarget", json!({"sessionId":session}), None);
+                if let Some(target) = session.and_then(|session| self.session_target(session)) {
+                    self.unchecked_documents.retain(|(owner, _, _), _| owner != &target);
                 }
                 Err(PAGE_CHANGED.to_string())
             }
-            Err(error) => Err(error),
+            other => other,
         }
     }
 
@@ -376,11 +362,10 @@ impl Cdp {
         self.runtime_prepare_probe("renderer-frame-read", json!({"budget_remaining":!left.is_zero()}));
         let page = self.page_scope_owner(target).unwrap_or_else(|| target.to_string());
         let epoch = self.page_scope_epochs.get(&page).copied().unwrap_or(0);
-        let unknown = self.page_scope_unknown;
         let mut tree = match self.raw_call("Page.getFrameTree", json!({}), Some(&session), left) {
             Ok(tree) => tree,
             Err(_) => {
-                if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch || self.page_scope_unknown != unknown {
+                if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch {
                     return Err(self.page_changed());
                 }
                 return Err(self.unverified());
@@ -404,11 +389,10 @@ impl Cdp {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(self.refusal()) }
             let epoch = self.page_scope_epochs.get(&page).copied().unwrap_or(0);
-            let unknown = self.page_scope_unknown;
             tree = match self.raw_call("Page.getFrameTree", json!({}), Some(&session), left) {
                 Ok(tree) => tree,
                 Err(_) => {
-                    if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch || self.page_scope_unknown != unknown {
+                    if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch {
                         return Err(self.page_changed());
                     }
                     return Err(self.unverified());
