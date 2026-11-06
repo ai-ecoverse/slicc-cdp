@@ -458,6 +458,31 @@ fn an_empty_url_target_does_not_opt_into_page_check_retry() {
     let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
     assert_eq!(message, PAGE_CHANGED);
     assert_eq!(browser.borrow().inventories, 1);
+    assert_eq!(browser.borrow().trees, 1);
+}
+
+#[test]
+fn a_retry_off_call_matches_single_attempt_frame_tree_and_inventory_counts() {
+    let setup = |retry_opt_in| {
+        let (mut cdp, session, browser) = client(u32::MAX, None, false);
+        browser.borrow_mut().url = String::new();
+        cdp.targets.insert("T".into(), page(""));
+        browser.borrow_mut().inventories = 0;
+        browser.borrow_mut().trees = 0;
+        let message = if retry_opt_in {
+            cdp.call("Runtime.evaluate", json!({ "expression": "1", "returnByValue": true }), Some(&session))
+        } else {
+            cdp.call_for("Runtime.evaluate", json!({ "expression": "1", "returnByValue": true }), Some(&session), Duration::from_secs(30))
+        }.unwrap_err();
+        assert_eq!(message, PAGE_CHANGED);
+        let counts = (browser.borrow().inventories, browser.borrow().trees);
+        counts
+    };
+    let opted_out = setup(false);
+    let blocked = setup(true);
+    assert_eq!(blocked, opted_out);
+    assert!(blocked.0 <= 2, "inventories={}", blocked.0);
+    assert!(blocked.1 <= 2, "trees={}", blocked.1);
 }
 
 #[test]

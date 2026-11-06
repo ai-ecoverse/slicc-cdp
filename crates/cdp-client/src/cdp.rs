@@ -576,6 +576,7 @@ impl Cdp {
         #[cfg(test)]
         if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
         let overall = Instant::now() + timeout.min(DOCUMENT_CHECK * page_scope::PAGE_SCOPE_ATTEMPTS);
+        let retry_eligible = retry_opt_in && !holder_debugger && self.page_scope_prepare_retry_eligible(method, session_id);
         let mut attempt = 0;
         let mut checks;
         loop {
@@ -594,15 +595,16 @@ impl Cdp {
             match self.prepare(method, &params, session_id, overall) {
                 Ok(prepared) => { checks = prepared; break; }
                 Err(error) if error == PAGE_CHANGED
-                    && retry_opt_in
-                    && !holder_debugger
-                    && self.page_scope_prepare_retry_allowed(method, session_id)
+                    && retry_eligible
+                    && self.page_scope_prepare_retry_still_allowed(session_id)
                     && attempt < page_scope::PAGE_SCOPE_ATTEMPTS
                     && Instant::now() < overall => continue,
                 Err(error) if error == PAGE_CHANGED => {
-                    let left = overall.saturating_duration_since(Instant::now());
-                    if !left.is_zero() {
-                        self.admit_for(method, &params, session_id, holder_debugger, left)?;
+                    if attempt > 1 {
+                        let left = overall.saturating_duration_since(Instant::now());
+                        if !left.is_zero() {
+                            self.admit_for(method, &params, session_id, holder_debugger, left)?;
+                        }
                     }
                     return Err(PAGE_CHANGED.to_string());
                 }
@@ -1072,19 +1074,24 @@ impl Cdp {
             })
     }
 
-    fn page_scope_prepare_retry_allowed(&self, method: &str, session: Option<&str>) -> bool {
+    fn page_scope_prepare_retry_eligible(&self, method: &str, session: Option<&str>) -> bool {
         if !page_scope::content(method) { return false }
+        let Some(target) = session.and_then(|session| self.session_target(session)) else { return false };
+        let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+        !url.is_empty() && url != "about:blank"
+    }
+
+    fn page_scope_prepare_retry_still_allowed(&self, session: Option<&str>) -> bool {
         let Some(session) = session else { return false };
         if self.webmcp_is_paused(session) { return false }
         let Some(target) = self.session_target(session) else { return false };
         if self.document_paused(&target) { return false }
-        if self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url))
-            && self.documents.get(&target).is_none_or(|doc| !self.guard.error_page_url(&doc.url) || self.unverified_error(&doc.url, &doc.unreachable_url))
-        {
-            return false;
-        }
-        let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
-        !url.is_empty() && url != "about:blank"
+        !(self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url))
+            && self.documents.get(&target).is_none_or(|doc| !self.guard.error_page_url(&doc.url) || self.unverified_error(&doc.url, &doc.unreachable_url)))
+    }
+
+    fn page_scope_prepare_retry_allowed(&self, method: &str, session: Option<&str>) -> bool {
+        self.page_scope_prepare_retry_eligible(method, session) && self.page_scope_prepare_retry_still_allowed(session)
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>, until: Instant) -> Result<Vec<(String, DocumentState)>, String> {
