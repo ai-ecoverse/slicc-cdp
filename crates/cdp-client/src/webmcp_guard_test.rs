@@ -447,7 +447,10 @@ fn child_context_created_before_live_placement_waits_and_never_installs_in_unpla
         cdp.absorb(event("Page.frameNavigated", json!({"frame":final_frame})));
         cdp.webmcp_install_children();
         assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "PENDING-CHILD").count(), usize::from(!protected));
-        if protected { assert!(!cdp.webmcp_alive("H")); }
+        if protected {
+            assert!(cdp.webmcp_alive("H"), "protected subframe navigation must not revoke the root holder");
+            assert!(!cdp.webmcp.arms["H"].revoked);
+        }
     }
 }
 
@@ -532,13 +535,22 @@ fn refused_blank_installer_never_arms_for_a_future_protected_document() {
 fn holder_protected_child_frame_never_installs() {
     let (mut cdp, state) = client();
     cdp.start_webmcp("H").unwrap();
+    let before = state.borrow().sent.len();
     let mut tree = frame("https://ordinary.test/");
     let mut child = frame("https://seven.sliccy.ai/")["frameTree"].clone();
     child["frame"]["id"] = json!("CHILD");
     child["frame"]["parentId"] = json!("F");
     tree["frameTree"]["childFrames"] = json!([child]);
     enter_document(&mut cdp, &state, tree, "CHILD");
-    no_protected_api(&mut cdp, &state);
+    assert!(!state.borrow().api, "shim executed in a document the guard did not verify");
+    assert!(!cdp.webmcp.arms["H"].revoked, "protected subframe navigation must not revoke the root");
+    assert!(!state.borrow().sent[before..].iter().any(|command| {
+        command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+    }));
+    cdp.block("H");
+    for expression in ["document.modelContext.getTools()", "document.modelContext.executeTool('secret', {})"] {
+        assert!(cdp.call("Runtime.evaluate", json!({"expression":expression}), Some("H")).is_err());
+    }
 }
 
 #[test]
@@ -955,9 +967,13 @@ fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
     assert!(cdp.webmcp.pending_attaches.is_empty());
     assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"));
     assert!(
-        cdp.webmcp.parents.contains_key("EARLY")
+        cdp.session_blocked("EARLY")
+            || cdp.webmcp.parents.contains_key("EARLY")
             || cdp.webmcp.arms.contains_key("EARLY")
-            || state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"),
+            || state.borrow().sent[before..].iter().any(|command| {
+                command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "EARLY"
+                    || command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"
+            }),
         "buffered attach must be adopted after setAutoAttach succeeds"
     );
 }
@@ -1011,10 +1027,35 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
 }
 
 #[test]
+fn unverified_child_is_armed_then_released_at_deadline() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    assert!(cdp.webmcp.arms[&holder].direct_child_attach);
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":true}}));
+    assert!(
+        state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger" && command["sessionId"] == "CHILD"),
+        "provisional child must be released from the debugger wait"
+    );
+    assert!(!cdp.content_blocked("CHILD"));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "unverified child must be armed with a deadline");
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
+    }
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"), "deadline must settle and detach the child");
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert!(cdp.webmcp_alive(&holder));
+    assert!(!cdp.webmcp.arms[&holder].revoked);
+}
+
+#[test]
 fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     let (mut cdp, state) = client();
-    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"IFRAME","url":"https://foreign.test/","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
-    state.borrow_mut().runtime_child = Some(json!({"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"IFRAME","isDefault":true}}));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
     cdp.start_webmcp_for("H", true).unwrap();
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp_auto_attach(&holder).unwrap();
@@ -1026,20 +1067,29 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     }
     assert!(cdp.webmcp.arms[&holder].admitted > 0);
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":true}}));
     assert!(cdp.webmcp_alive(&holder), "root must stay ready while adopting an OOPIF");
     assert!(!cdp.webmcp.arms[&holder].revoked);
     assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty(), "root pendingContexts must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_contexts);
     assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty(), "root pendingFrames must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_frames);
     assert!(!cdp.content_blocked("CHILD"), "OOPIF must not be content-blocked before install");
     assert!(!cdp.session_blocked("CHILD"), "OOPIF must not settle as blocked before install");
-    assert!(
-        cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && (arm.admitted > 0 || arm.pending_install.is_some())),
-        "auto-attached OOPIF must install or remain pending, not revoke"
-    );
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "blank OOPIF must stay armed until commit");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"FRAME","parentId":"F","url":"https://foreign.test/cross","securityOrigin":"","loaderId":""}}}));
+    assert!(!cdp.webmcp.arms[&holder].revoked, "parent-session iframe navigation must not revoke the root");
+    assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty(), "parent-session iframe navigation must not add root pending frames");
+    assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty(), "parent-session iframe navigation must not add root pending contexts");
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(!cdp.content_blocked("CHILD"));
     assert!(
         cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
             || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
-        "requested-origin OOPIF must reach install on the child session"
+        "requested-origin OOPIF must install after commit on the child session"
     );
+    assert!(cdp.webmcp_alive(&holder));
+    assert!(!cdp.webmcp.arms[&holder].revoked);
+    assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty());
+    assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty());
 }
