@@ -668,6 +668,48 @@ impl Cdp {
         Ok(result)
     }
 
+    pub fn call_batch(&mut self, method: &str, batch: Vec<Value>, session_id: Option<&str>) -> Result<Vec<Value>, String> {
+        let session_id = session_id.filter(|id| !id.is_empty());
+        if !batchable(method, &batch) {
+            return batch.into_iter().map(|params| self.call(method, params, session_id)).collect();
+        }
+        for params in &batch { self.admit_for(method, params, session_id, false)?; }
+        let checks = self.prepare(method, &batch[0], session_id)?;
+        if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
+        let mut ids = Vec::with_capacity(batch.len());
+        let mut replies = Vec::with_capacity(batch.len());
+        let mut failed = None;
+        for params in &batch {
+            let (forwarded, sent) = self.fetch_command(method, params.clone(), session_id);
+            match self.send(&forwarded, sent, session_id) {
+                Ok(id) => { self.waiting_calls.insert(id); ids.push(id); }
+                Err(message) => { failed = Some(message); break }
+            }
+        }
+        if failed.is_none() {
+            for &id in &ids {
+                match self.raw_reply(method, id, session_id, Duration::from_secs(30), false) {
+                    Ok(value) => replies.push(value),
+                    Err(message) => { failed = Some(message); break }
+                }
+            }
+        }
+        for id in &ids {
+            self.waiting_calls.remove(id);
+            self.call_replies.remove(id);
+        }
+        if let Some(message) = failed { return Err(message) }
+        self.verify_checks(&checks, false, true)?;
+        if session_id.is_some_and(|session| self.blocked.contains(session)) { return Err(self.refusal()) }
+        let mut results = Vec::with_capacity(replies.len());
+        for (params, reply) in batch.iter().zip(replies) {
+            let result = self.after(method, params, session_id, reply)?;
+            self.bind_streams(method, session_id, &result, &checks);
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     pub fn start_navigation(&mut self, params: Value, session: Option<&str>) -> Result<i64, String> {
         let session = session.filter(|session| !session.is_empty());
         self.admit("Page.navigate", &params, session)?;
@@ -3798,6 +3840,12 @@ fn unguarded(message: String) -> String {
 
 fn frame_text_known(text: &str) -> bool {
     !matches!(text, "" | "null" | "://")
+}
+
+fn batchable(method: &str, batch: &[Value]) -> bool {
+    method == "DOM.describeNode" && batch.len() > 1 && batch.iter().all(|params| {
+        params.as_object().is_some_and(|object| object.len() == 1 && object.get("objectId").is_some_and(Value::is_string))
+    })
 }
 
 fn crosses_frames(method: &str, params: &Value) -> bool {
