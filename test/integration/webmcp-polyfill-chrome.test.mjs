@@ -367,7 +367,14 @@ ${childScript}
     assert.equal((await hasShim(raw, childSession)).api, false);
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
     await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    holder = command(browser.wsUrl, cwd, [
+      'webmcp-polyfill',
+      '--tab',
+      targetId,
+      '--reload',
+      '--from-origin',
+      `https://foreign.test:${port}`,
+    ]);
     assert.equal((await holder.ready).mode, 'polyfill');
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);

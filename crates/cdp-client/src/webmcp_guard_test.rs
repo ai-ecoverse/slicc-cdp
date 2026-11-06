@@ -1031,6 +1031,34 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
 }
 
 #[test]
+fn start_time_requested_origin_installs_when_default_context_appears() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.admitted == 0));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(
+        cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
+            || state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_")))
+            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
+        "start-time --from-origin must install once the default context appears"
+    );
+    assert!(cdp.webmcp_alive(&holder));
+}
+
+#[test]
 fn unverified_child_parks_until_first_commit_then_installs() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));

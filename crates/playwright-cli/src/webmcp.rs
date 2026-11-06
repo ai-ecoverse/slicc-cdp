@@ -30,7 +30,7 @@ fn child_evidence(state: &Session, target: &str) -> bool {
     })
 }
 
-fn remember_origins(state: &mut Session, target: &str, from: &[String]) {
+pub(crate) fn remember_origins(state: &mut Session, target: &str, from: &[String]) {
     if from.is_empty() { return; }
     let mut latest = crate::session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.webmcp_connection = state.webmcp_connection.clone();
@@ -76,7 +76,7 @@ fn wait_for_child_origins(state: &Session, target: &str, from: &[String]) {
     }
 }
 
-fn refuse_protected_origins(cdp: &Cdp, from: &[String]) -> Option<Output> {
+pub(crate) fn refuse_protected_origins(cdp: &Cdp, from: &[String]) -> Option<Output> {
     if from.iter().any(|origin| cdp.guard().url(origin)) {
         Some(Output::err(format!("{}\n", cdp.guard().refusal())))
     } else {
