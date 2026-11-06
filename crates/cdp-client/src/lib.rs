@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod batch_test;
 pub mod cdp;
 pub mod connect;
 pub mod contract;

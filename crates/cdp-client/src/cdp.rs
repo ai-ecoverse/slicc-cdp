@@ -46,6 +46,8 @@ pub const UNVERIFIED: &str = "slicc: refused: slicc could not finish checking th
 pub const PAGE_CHANGED: &str = "slicc: refused: the page changed while slicc was checking it; try again once it settles\n";
 pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
+pub const BATCH_LIMIT: usize = 512;
+const BATCH_WAIT: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
 const WAITER_SLICE: Duration = Duration::from_millis(5);
@@ -675,12 +677,22 @@ impl Cdp {
         if !batchable(method, &batch) {
             return batch.into_iter().map(|params| self.call(method, params, session_id)).collect();
         }
-        let checks = self.page_scope_admit_prepare(method, &batch, &batch[0], session_id, Duration::from_secs(30), false, true)?;
+        let mut results = Vec::with_capacity(batch.len());
+        for chunk in batch.chunks(BATCH_LIMIT) {
+            results.extend(self.call_chunk(method, chunk, session_id)?);
+        }
+        Ok(results)
+    }
+
+    fn call_chunk(&mut self, method: &str, batch: &[Value], session_id: Option<&str>) -> Result<Vec<Value>, String> {
+        let checks = self.page_scope_admit_prepare(method, batch, &batch[0], session_id, BATCH_WAIT, false, true)?;
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
+        let deadline = Instant::now() + BATCH_WAIT;
         let mut ids = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
         let mut failed = None;
-        for params in &batch {
+        for params in batch {
+            if Instant::now() >= deadline { failed = Some(self.refusal()); break }
             let (forwarded, sent) = self.fetch_command(method, params.clone(), session_id);
             match self.send(&forwarded, sent, session_id) {
                 Ok(id) => { self.waiting_calls.insert(id); ids.push(id); }
@@ -689,7 +701,9 @@ impl Cdp {
         }
         if failed.is_none() {
             for &id in &ids {
-                match self.raw_reply(method, id, session_id, Duration::from_secs(30), false) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { failed = Some(self.refusal()); break }
+                match self.raw_reply(method, id, session_id, left, false) {
                     Ok(value) => replies.push(value),
                     Err(message) => { failed = Some(message); break }
                 }
