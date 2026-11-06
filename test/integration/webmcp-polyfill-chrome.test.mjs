@@ -158,7 +158,12 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
           req.socket.destroy();
           return;
         }
-        const policy = req.url === '/deny' ? { 'permissions-policy': 'tools=()' } : {};
+        const policy =
+          req.url === '/deny'
+            ? { 'permissions-policy': 'tools=()' }
+            : ['/frames', '/ordinary-frames', '/cross'].includes(req.url)
+              ? { 'permissions-policy': 'tools=*' }
+              : {};
         res.writeHead(200, { 'content-type': 'text/html', ...policy });
         const child = req.url === '/same' || req.url === '/cross';
         const names = child
@@ -177,10 +182,16 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
           ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${req.url === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
           : '';
         res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
-if (document.modelContext) {
+const register = () => {
+  if (!document.modelContext) return false;
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
   }
+  return true;
+};
+if (!register()) {
+  const timer = setInterval(() => { if (register()) clearInterval(timer); }, 50);
+  setTimeout(() => clearInterval(timer), 5000);
 }
 </script>`);
       }
@@ -347,8 +358,20 @@ if (document.modelContext) {
       `https://foreign.test:${port}`,
     ]);
     assert.equal(cross.code, 0, cross.stderr);
-    assert.equal(JSON.parse(cross.stdout).length, 9, holder.stderr());
-    assert.match(cross.stderr, /cross-origin child tools are unavailable/);
+    assert.equal(
+      cross.stderr.includes('cross-origin child tools are unavailable'),
+      false,
+      cross.stderr
+    );
+    const crossTools = JSON.parse(cross.stdout);
+    assert.ok(
+      crossTools.some((tool) => tool.name === 'cross_child'),
+      holder.stderr()
+    );
+    const crossTool = crossTools.find((tool) => tool.name === 'cross_child');
+    assert.equal(crossTool.origin, `https://foreign.test:${port}`);
+    assert.equal(crossTool.policy, 'allowed');
+    assert.ok(crossTool.frameId);
     const crossCall = await once(browser.wsUrl, cwd, [
       'webmcp-call',
       'cross_child',
@@ -358,8 +381,8 @@ if (document.modelContext) {
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.notEqual(crossCall.code, 0, crossCall.stderr);
-    assert.equal(crossCall.stdout, '');
+    assert.equal(crossCall.code, 0, crossCall.stderr);
+    assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
 
     const restored = raw.waitEvent(
       (event) => event.method === 'Page.frameNavigated' && event.sessionId === sessionId,

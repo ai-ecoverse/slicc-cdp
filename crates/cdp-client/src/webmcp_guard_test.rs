@@ -802,3 +802,89 @@ fn lower_only_overrides_never_raise_the_stage1_defaults() {
     assert_eq!(cdp.webmcp.pending_count_cap(), 5);
     assert_eq!(cdp.webmcp.pending_bytes_cap(), 11);
 }
+
+#[test]
+fn direct_auto_attach_marks_the_arm_and_refused_or_attested_routes_stay_detach_only() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp_auto_attach("H").unwrap();
+    assert!(cdp.webmcp.arms["H"].direct_child_attach);
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.setAutoAttach" && command["params"]["waitForDebuggerOnStart"] == true));
+    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    assert!(cdp.webmcp_child_evidence() || cdp.webmcp.parents.contains_key("CHILD") || cdp.session_blocked("CHILD"));
+
+    let (mut guarded, state) = client();
+    guarded.start_webmcp_for("H", true).unwrap();
+    guarded.webmcp_set_route_attested(true);
+    guarded.webmcp_auto_attach("H").unwrap();
+    assert!(!guarded.webmcp.arms["H"].direct_child_attach);
+    let before = state.borrow().sent.len();
+    guarded.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    assert!(guarded.session_blocked("CHILD"));
+    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger" || command["method"] == "Target.detachFromTarget"));
+    assert!(guarded.take_webmcp_children().is_empty());
+}
+
+#[test]
+fn in_process_cross_origin_installs_only_after_requested_origin_and_keeps_same_origin_equality() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp_auto_attach("H").unwrap();
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CROSS","url":"https://foreign.test/child","securityOrigin":"https://foreign.test"}}]);
+    cdp.absorb(event("Page.frameNavigated", json!({"frame":state.borrow().tree["frameTree"]["childFrames"][0]["frame"]})));
+    let context = json!({"id":8,"uniqueId":"CROSS-CONTEXT","origin":"https://foreign.test","auxData":{"frameId":"C","isDefault":true}});
+    state.borrow_mut().runtime_child = Some(context.clone());
+    cdp.absorb(event("Runtime.executionContextCreated", json!({"context":context})));
+    cdp.webmcp_install_children();
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CROSS-CONTEXT"));
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CROSS-CONTEXT").count(), 1);
+    assert!(cdp.webmcp_generations().iter().any(|entry| entry["frameId"] == "C" && entry["origin"] == "https://foreign.test"));
+    cdp.webmcp_install_children();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CROSS-CONTEXT").count(), 1);
+
+    let (mut same, state) = client();
+    same.start_webmcp_for("H", true).unwrap();
+    same.webmcp_auto_attach("H").unwrap();
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"}}]);
+    same.absorb(event("Page.frameNavigated", json!({"frame":state.borrow().tree["frameTree"]["childFrames"][0]["frame"]})));
+    child_context(&mut same, &state, 8, "CHILD-CONTEXT");
+    same.webmcp_install_children();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CHILD-CONTEXT").count(), 1);
+}
+
+#[test]
+fn extension_frame_and_protected_oopif_never_install_on_direct() {
+    for url in ["chrome-extension://abcd/frame.html", "https://seven.sliccy.ai/"] {
+        let (mut cdp, state) = client();
+        cdp.start_webmcp_for("H", true).unwrap();
+        cdp.webmcp_auto_attach("H").unwrap();
+        cdp.webmcp_request_origins(&["https://foreign.test".into(), "https://seven.sliccy.ai".into()]);
+        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":url},"waitingForDebugger":true})));
+        assert!(cdp.take_webmcp_children().is_empty());
+        assert!(cdp.session_blocked("CHILD"));
+        assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))));
+    }
+}
+
+#[test]
+fn pending_child_cap_drops_the_1025th_cross_origin_candidate() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp_auto_attach("H").unwrap();
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    let mut children = Vec::new();
+    for i in 0..1025 {
+        let id = format!("C{i}");
+        children.push(json!({"frame":{"id":id,"parentId":"F","loaderId":format!("L{i}"),"url":"https://foreign.test/child","securityOrigin":"https://foreign.test"}}));
+    }
+    state.borrow_mut().tree["frameTree"]["childFrames"] = json!(children);
+    for i in 0..1025 {
+        let frame = format!("C{i}");
+        cdp.absorb(event("Page.frameNavigated", json!({"frame":{"id":frame.clone(),"parentId":"F","loaderId":format!("L{i}"),"url":"https://foreign.test/child","securityOrigin":"https://foreign.test"}})));
+        cdp.absorb(event("Runtime.executionContextCreated", json!({"context":{"id":100 + i as i64,"uniqueId":format!("U{i}"),"origin":"https://foreign.test","auxData":{"frameId":frame,"isDefault":true}}})));
+    }
+    cdp.webmcp_install_children();
+    assert!(cdp.webmcp.arms["H"].pending_children.len() <= 1024);
+    assert!(cdp.webmcp.arms["H"].child_done.len() <= 1024 || cdp.webmcp.arms["H"].pending_children.len() + cdp.webmcp.arms["H"].accepted.len() <= 2048);
+}

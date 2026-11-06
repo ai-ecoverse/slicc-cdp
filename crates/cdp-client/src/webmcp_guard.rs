@@ -37,6 +37,7 @@ struct Arm {
     identifier: Option<String>,
     conversion: Option<((String, Context), Instant, Instant)>,
     plain: bool,
+    direct_child_attach: bool,
     root_identity: Option<(String, Context)>,
     pending_children: BTreeMap<i64, (Context, (String, Context), Instant)>,
     child_done: BTreeSet<(String, String, String)>,
@@ -81,6 +82,8 @@ pub(super) struct Webmcp {
     parents: BTreeMap<String, String>,
     children: Vec<(String, String, String)>,
     samples: Vec<u128>,
+    requested_origins: BTreeSet<String>,
+    route_attested: bool,
     trace_sequence: u64,
     trace_lifecycle: BTreeMap<(String, &'static str), u64>,
     trace_requests: BTreeMap<(String, String), (String, u64)>,
@@ -271,7 +274,59 @@ impl Cdp {
 
     pub fn webmcp_auto_attach(&mut self, session: &str) -> Result<(), String> {
         if !self.webmcp_alive(session) { return Err(self.refusal()); }
+        if self.webmcp_route_attested() {
+            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.direct_child_attach = false; }
+            return Ok(());
+        }
+        match self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(session), OPTIONAL_STEP) {
+            Ok(_) => {
+                if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.direct_child_attach = true; }
+            }
+            Err(_) => {
+                if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.direct_child_attach = false; }
+            }
+        }
         Ok(())
+    }
+
+    fn webmcp_route_attested(&mut self) -> bool {
+        if self.webmcp.route_attested { return true; }
+        #[cfg(target_os = "wasi")]
+        {
+            self.webmcp.route_attested = true;
+            return true;
+        }
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let attested = self.raw_call("Browser.getVersion", json!({}), None, OPTIONAL_STEP).ok().is_some_and(|version| {
+                matches!(version.pointer("/slicc/route/kind").and_then(Value::as_str), Some("extension" | "link"))
+            });
+            if attested { self.webmcp.route_attested = true; }
+            attested
+        }
+    }
+
+    pub fn webmcp_request_origins(&mut self, origins: &[String]) {
+        let mut added = false;
+        for origin in origins {
+            added |= self.webmcp.requested_origins.insert(origin.clone());
+        }
+        if added { self.webmcp_install_children(); self.webmcp_finish_awaiting_children(); }
+    }
+
+    pub fn webmcp_child_evidence(&self) -> bool {
+        self.webmcp.arms.values().any(|arm| arm.direct_child_attach)
+            || self.webmcp.parents.keys().any(|child| self.webmcp_alive(child))
+            || self.webmcp.arms.iter().any(|(session, arm)| {
+                let Some(root) = arm.root_identity.as_ref() else { return false; };
+                self.webmcp.contexts.iter().any(|((owner, _), context)| {
+                    owner == session && context.origin != root.1.origin && arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone()))
+                })
+            })
+    }
+
+    pub fn webmcp_set_route_attested(&mut self, attested: bool) {
+        self.webmcp.route_attested = attested;
     }
 
     pub fn take_webmcp_children(&mut self) -> Vec<(String, String, String)> {
@@ -299,7 +354,10 @@ impl Cdp {
 
     pub fn webmcp_snapshot(&self) -> Vec<Value> {
         self.webmcp.arms.iter().filter(|(session, arm)| !arm.revoked && !self.webmcp.quarantined.contains(*session) && !self.content_blocked(session)).map(|(session, arm)| {
-            json!({"session":session,"bridge":arm.bridge,"target":self.session_target(session),"documents":arm.documents,"plain":arm.plain})
+            let admitted_origins = self.webmcp.contexts.iter().filter(|((owner, _), context)| {
+                owner == session && arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone()))
+            }).map(|(_, context)| context.origin.clone()).collect::<BTreeSet<_>>();
+            json!({"session":session,"bridge":arm.bridge,"target":self.session_target(session),"documents":arm.documents,"plain":arm.plain,"directChildAttach":arm.direct_child_attach,"admittedOrigins":admitted_origins})
         }).collect()
     }
 
@@ -311,7 +369,8 @@ impl Cdp {
     pub fn webmcp_settled(&self) -> bool {
         self.webmcp.arms.iter().all(|(session, arm)| {
             let quarantined = self.webmcp.quarantined.contains(session);
-            arm.revoked || self.blocked.contains(session) || !quarantined && (self.content_blocked(session)
+            let awaiting_origins = quarantined && arm.admitted == 0 && arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty();
+            arm.revoked || self.blocked.contains(session) || awaiting_origins || !quarantined && (self.content_blocked(session)
                 || arm.pending_install.is_none() && arm.pending_contexts.is_empty() && arm.pending_frames.is_empty())
         })
     }
@@ -370,7 +429,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new() });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -479,12 +538,20 @@ impl Cdp {
         self.webmcp_mark_admitted(session, id, &context, Instant::now())
     }
 
+    fn webmcp_bound_root(&mut self, session: &str, until: Instant) -> Result<(String, Context), String> {
+        if let Some(parent) = self.webmcp.parents.get(session).cloned() {
+            self.webmcp_root_document(&parent, until)
+        } else {
+            self.webmcp_root_document(session, until)
+        }
+    }
+
     fn webmcp_evaluate(&mut self, session: &str, id: i64, context: &Context, root: (String, Context), until: Instant) -> Result<(), String> {
         let arm = self.webmcp.arms.get(session).filter(|arm| !arm.revoked).ok_or_else(|| self.refusal())?;
         if arm.plain && !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
         if arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone())) { return Ok(()); }
         let source = arm.source.clone();
-        if self.webmcp_root_document(session, until)? != root || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context) { return Err(self.refusal()); }
+        if self.webmcp_bound_root(session, until)? != root || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context) { return Err(self.refusal()); }
         self.webmcp_check_context(session, id, context, until)?;
         if self.webmcp_plain(session) && !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
         if self.webmcp.arms.get(session).is_some_and(|arm| arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone()))) { return Ok(()); }
@@ -493,7 +560,7 @@ impl Cdp {
         let result = self.call_for("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()));
         if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.installing.remove(&realm); }
         let result = result?;
-        if result.get("exceptionDetails").is_some() || self.webmcp_plain(session) && !self.worlds.fallback_safe(session) || self.webmcp_root_document(session, until)? != root { return Err(self.refusal()); }
+        if result.get("exceptionDetails").is_some() || self.webmcp_plain(session) && !self.worlds.fallback_safe(session) || self.webmcp_bound_root(session, until)? != root { return Err(self.refusal()); }
         self.webmcp_check_context(session, id, context, until)
     }
 
@@ -530,11 +597,16 @@ impl Cdp {
         let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
         let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), until.saturating_duration_since(Instant::now()))?;
         let frame = Self::webmcp_frame(&tree["frameTree"], &context.frame).ok_or_else(|| self.refusal())?;
+        let same_origin = root.origin == context.origin;
+        let cross = !same_origin && self.webmcp.arms.get(session).is_some_and(|arm| arm.direct_child_attach);
         if Instant::now() >= until || !self.webmcp_alive(session) || !self.webmcp_tree_verified(&tree, Some(&context.frame))
             || frame.get("loaderId").and_then(Value::as_str) != Some(&context.loader)
             || frame.get("securityOrigin").and_then(Value::as_str) != Some(&context.origin)
-            || root.origin != context.origin || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context)
+            || !same_origin && !cross || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context)
             || !self.webmcp_plain(session) && self.worlds.reason(session, "Debugger.enable", &json!({})).is_some() { return Err(self.refusal()); }
+        if cross && (self.frame_protected(&context.frame) || self.guard.url(&context.origin) || self.guard.extension_frame(&context.origin)
+            || frame.get("url").and_then(Value::as_str).is_some_and(|url| self.guard.extension_frame(url) || self.guard.url(url))
+            || !self.webmcp_frame_verified(frame)) { return Err(self.refusal()); }
         Ok(())
     }
 
@@ -776,20 +848,29 @@ impl Cdp {
             && known.loaders.get(&frame) == Some(&context.loader) && !context.unique.is_empty()).map(|(_, context)| context.clone()) else { return false; };
         let root = (target, context);
         if known.root_identity.as_ref() != Some(&root) || !known.accepted.contains(&(root.1.frame.clone(), root.1.loader.clone(), root.1.unique.clone())) { return false; }
+        let direct = known.direct_child_attach;
+        let requested = self.webmcp.requested_origins.clone();
+        if known.plain && !self.worlds.fallback_safe(session) { return false; }
+        let candidates = self.webmcp.contexts.iter().filter_map(|((owner, id), context)| {
+            if owner != session || context.frame == root.1.frame || context.loader.is_empty() || context.unique.is_empty() { return None; }
+            let same = context.origin == root.1.origin;
+            let cross = !same && direct && requested.contains(&context.origin);
+            if !same && !cross { return None; }
+            if !same && (self.frame_protected(&context.frame) || self.guard.url(&context.origin) || self.guard.extension_frame(&context.origin)) { return None; }
+            Some((*id, context.clone()))
+        }).collect::<Vec<_>>();
         let Some(arm) = self.webmcp.arms.get_mut(session) else { return false; };
-        if arm.plain && !self.worlds.fallback_safe(session) { return false; }
         arm.pending_children.retain(|id, (context, known_root, _)| known_root == &root && self.webmcp.contexts.get(&(session.to_string(), *id)) == Some(context));
-        for ((owner, id), context) in &self.webmcp.contexts {
+        for (id, context) in candidates {
             let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
-            if owner != session || context.frame == root.1.frame || context.origin != root.1.origin || context.loader.is_empty() || context.unique.is_empty()
-                || arm.accepted.contains(&realm) || arm.child_done.contains(&realm) || arm.child_done.len() >= 1024 { continue; }
+            if arm.accepted.contains(&realm) || arm.child_done.contains(&realm) || arm.child_done.len() >= 1024 { continue; }
             if arm.pending_children.len() >= 1024 { break; }
-            arm.pending_children.entry(*id).or_insert_with(|| (context.clone(), root.clone(), Instant::now() + DOCUMENT_CHECK));
+            arm.pending_children.entry(id).or_insert_with(|| (context, root.clone(), Instant::now() + DOCUMENT_CHECK));
         }
         true
     }
 
-    pub(super) fn webmcp_install_children(&mut self) {
+    pub fn webmcp_install_children(&mut self) {
         if self.webmcp.handling_gate || self.webmcp.handling_children { return; }
         self.webmcp.handling_children = true;
         let sessions = self.webmcp.arms.keys().cloned().collect::<Vec<_>>();
@@ -798,9 +879,14 @@ impl Cdp {
             let pending = self.webmcp.arms.get(&session).filter(|arm| !arm.revoked && arm.conversion.is_none() && arm.pending_install.is_none()).map(|arm| arm.pending_children.clone()).unwrap_or_default();
             for (id, (context, root, until)) in pending {
                 let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
+                let cross = context.origin != root.1.origin;
                 if Instant::now() >= until {
                     if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.pending_children.remove(&id); arm.child_done.insert(realm); }
-                    self.notices.push("webmcp-polyfill: a same-origin child placement did not settle before its installation deadline\n".into());
+                    self.notices.push(if cross {
+                        "webmcp-polyfill: a cross-origin child placement did not settle before its installation deadline\n".into()
+                    } else {
+                        "webmcp-polyfill: a same-origin child placement did not settle before its installation deadline\n".into()
+                    });
                     continue;
                 }
                 if self.webmcp_root_document(&session, until).as_ref() != Ok(&root)
@@ -816,7 +902,11 @@ impl Cdp {
                         let _ = self.webmcp_mark_admitted(&session, id, &context, Instant::now());
                     }
                 } else {
-                    self.notices.push("webmcp-polyfill: a same-origin child could not verify its document; synchronous registration before installation is unavailable\n".into());
+                    self.notices.push(if cross {
+                        "webmcp-polyfill: a cross-origin child could not verify its document; synchronous registration before installation is unavailable\n".into()
+                    } else {
+                        "webmcp-polyfill: a same-origin child could not verify its document; synchronous registration before installation is unavailable\n".into()
+                    });
                 }
             }
         }
@@ -891,11 +981,168 @@ impl Cdp {
         Ok(())
     }
 
-    fn webmcp_adopt_child(&mut self, value: &Value) {
-        let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str) else { return; };
+    fn webmcp_release_child(&mut self, child: &str) {
+        let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), DOCUMENT_CHECK);
+        let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
         self.blocked.insert(child.to_string());
-        let _ = self.send("Runtime.runIfWaitingForDebugger", json!({}), Some(child));
-        let _ = self.send("Target.detachFromTarget", json!({"sessionId":child}), None);
+    }
+
+    fn webmcp_child_arm(&mut self, session: &str, seed: &Value, parent_direct: bool) -> Result<String, String> {
+        let shim = vetted_source(SHIM)?;
+        let bridge = private_bridge(getrandom::fill)?;
+        let source = format!("const {bridge} = {shim};");
+        let mut loaders = BTreeMap::new();
+        Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
+        self.webmcp.arms.insert(session.to_string(), Arm {
+            source,
+            bridge: bridge.clone(),
+            identifier: None,
+            conversion: None,
+            plain: true,
+            direct_child_attach: parent_direct,
+            root_identity: None,
+            pending_children: BTreeMap::new(),
+            child_done: BTreeSet::new(),
+            admitted: 0,
+            revoked: false,
+            revoked_at: None,
+            revoked_reason: None,
+            pending_contexts: BTreeMap::new(),
+            pending_install: Some(Instant::now() + DOCUMENT_CHECK),
+            pending_frames: BTreeMap::new(),
+            accepted: BTreeSet::new(),
+            installing: BTreeSet::new(),
+            loaders,
+            documents: BTreeMap::new(),
+        });
+        self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
+        self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+        self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+        self.call_for("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+        Ok(bridge)
+    }
+
+    fn webmcp_child_origin(&self, child: &str) -> Option<String> {
+        self.webmcp.contexts.iter().find(|((owner, _), context)| owner == child && !context.origin.is_empty() && context.origin != "null")
+            .map(|(_, context)| context.origin.clone())
+            .or_else(|| {
+                self.session_target(child).and_then(|target| self.documents.get(&target)).and_then(|document| {
+                    url::Url::parse(&document.url).ok().map(|parsed| parsed.origin().ascii_serialization())
+                }).filter(|origin| !origin.is_empty() && origin != "null")
+            })
+    }
+
+    fn webmcp_adopt_install(&mut self, child: &str, parent: &str, until: Instant) -> Result<bool, String> {
+        let target = self.session_target(child).ok_or_else(|| self.refusal())?;
+        let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
+        let tree = self.webmcp_stable(child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(&guard), left.min(OPTIONAL_STEP)))?;
+        if !self.webmcp_tree_verified(&tree, None) { return Err(self.refusal()); }
+        self.main_commit(&guard, &tree["frameTree"]["frame"]);
+        let frame = &tree["frameTree"]["frame"];
+        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
+        if origin.is_empty() || origin == "null" || self.guard.url(&origin) || self.guard.extension_frame(&origin)
+            || self.frame_protected(frame.get("id").and_then(Value::as_str).unwrap_or(""))
+            || frame.get("url").and_then(Value::as_str).is_some_and(|url| self.guard.extension_frame(url) || self.guard.url(url)) {
+            return Err(self.refusal());
+        }
+        if !self.webmcp.requested_origins.contains(&origin) {
+            if let Some(arm) = self.webmcp.arms.get_mut(child) { arm.pending_install = None; }
+            return Ok(false);
+        }
+        let parent_root = self.webmcp_root_document(parent, until)?;
+        let (id, context) = self.webmcp.contexts.iter().find(|((owner, _), context)| {
+            owner == child
+                && frame.get("id").and_then(Value::as_str) == Some(&context.frame)
+                && frame.get("loaderId").and_then(Value::as_str) == Some(&context.loader)
+                && context.origin == origin
+                && !context.unique.is_empty()
+        }).map(|(key, context)| (key.1, context.clone())).ok_or_else(|| self.refusal())?;
+        if let Some(arm) = self.webmcp.arms.get_mut(child) {
+            arm.root_identity = Some((target.clone(), context.clone()));
+            arm.pending_install = None;
+        }
+        self.webmcp_evaluate(child, id, &context, parent_root, until)?;
+        self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
+        Ok(true)
+    }
+
+    fn webmcp_finish_awaiting_children(&mut self) {
+        let waiting = self.webmcp.quarantined.iter().filter(|child| {
+            self.webmcp.parents.contains_key(*child)
+                && self.webmcp.arms.get(*child).is_some_and(|arm| !arm.revoked && arm.admitted == 0)
+                && self.webmcp_child_origin(child).is_some_and(|origin| self.webmcp.requested_origins.contains(&origin))
+        }).cloned().collect::<Vec<_>>();
+        for child in waiting {
+            let Some(parent) = self.webmcp.parents.get(&child).cloned() else { continue; };
+            let until = Instant::now() + DOCUMENT_CHECK;
+            match self.webmcp_adopt_install(&child, &parent, until) {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(_) => {
+                    self.webmcp_revoke(&child);
+                    self.webmcp_release_child(&child);
+                }
+            }
+        }
+    }
+
+    fn webmcp_adopt_child(&mut self, value: &Value) {
+        let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str).map(str::to_string) else { return; };
+        let parent = value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+        let info = &value["params"]["targetInfo"];
+        let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+        let direct = self.webmcp.arms.get(&parent).is_some_and(|arm| arm.direct_child_attach);
+        if !direct || self.guard.extension_frame(&url) {
+            self.webmcp_release_child(&child);
+            return;
+        }
+        let provisional = url.is_empty() || url == "about:blank";
+        let allowed = info.get("type").and_then(Value::as_str) == Some("iframe") && !target.is_empty()
+            && (provisional || url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")))
+            && !self.guard.url(&url) && !self.info_protected(info, &[]) && !self.content_blocked(&parent);
+        self.session_targets.insert(child.clone(), target.clone());
+        self.guard_sessions.insert(child.clone());
+        self.webmcp.quarantined.insert(child.clone());
+        self.webmcp.parents.insert(child.clone(), parent.clone());
+        self.targets.insert(target.clone(), info.clone());
+        let outcome = (|| -> Result<(), String> {
+            if !allowed { return Err(self.refusal()); }
+            self.touch(&target)?;
+            if self.is_protected_target(&target) { return Err(self.refusal()); }
+            let guard = self.guards.get(&target).cloned().ok_or_else(|| self.refusal())?;
+            let until = Instant::now() + DOCUMENT_CHECK;
+            let seed = self.webmcp_stable(&child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(&guard), left.min(OPTIONAL_STEP)))?;
+            let verified = self.webmcp_tree_verified(&seed, None);
+            let future_only = seed.pointer("/frameTree/frame/id").and_then(Value::as_str) == Some(target.as_str())
+                && seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|frame_url| frame_url.is_empty() || frame_url == "about:blank")
+                && seed.pointer("/frameTree/frame/unreachableUrl").and_then(Value::as_str).is_none_or(|frame_url| frame_url.is_empty())
+                && self.webmcp_alive(&parent);
+            if !verified && !future_only { return Err(self.refusal()); }
+            if seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|frame_url| self.guard.extension_frame(frame_url)) {
+                return Err(self.refusal());
+            }
+            self.webmcp_child_arm(&child, &seed, direct)?;
+            if future_only && !verified { return Ok(()); }
+            let until = Instant::now() + DOCUMENT_CHECK;
+            loop {
+                match self.webmcp_adopt_install(&child, &parent, until) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => return Ok(()),
+                    Err(_) if Instant::now() >= until => return Err(self.refusal()),
+                    Err(_) => {
+                        if !self.pump(until).unwrap_or(false) { return Err(self.refusal()); }
+                    }
+                }
+            }
+        })();
+        let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(&child), DOCUMENT_CHECK);
+        if outcome.is_err() {
+            self.notices.push("webmcp-polyfill: a cross-origin child could not verify its document; synchronous registration before installation is unavailable\n".into());
+            self.webmcp_revoke(&child);
+            let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
+            self.blocked.insert(child);
+        }
     }
 
     pub(super) fn webmcp_cancel_queued(&mut self, session: &str) {
@@ -956,6 +1203,7 @@ impl Cdp {
             }
         }
         self.webmcp.handling_gate = false;
+        self.webmcp_finish_awaiting_children();
         self.webmcp_install_children();
     }
 
@@ -1067,6 +1315,9 @@ impl Cdp {
         }
         if matches!(method, "Page.frameDetached" | "Runtime.executionContextCreated" | "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared" | "Debugger.scriptParsed") {
             self.webmcp_context_event(value, session, method);
+            if self.webmcp.parents.contains_key(session) {
+                self.webmcp_finish_awaiting_children();
+            }
             return false;
         }
         if !self.webmcp.arms.contains_key(session) { return false; }
@@ -1096,6 +1347,9 @@ impl Cdp {
                 self.webmcp_revoke_because(session, "frame navigation refused");
             }
             self.webmcp_navigated(session, value);
+            if self.webmcp.parents.contains_key(session) {
+                self.webmcp_finish_awaiting_children();
+            }
         }
         if method == "Debugger.paused" {
             self.webmcp_gate_event(value);

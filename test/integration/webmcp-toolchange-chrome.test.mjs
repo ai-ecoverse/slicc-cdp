@@ -154,8 +154,12 @@ for (const protectedFrames of [true, false]) {
       server = createServer(
         { key: await readFile(keyPath), cert: await readFile(certPath) },
         (req, res) => {
-          res.writeHead(200, { 'content-type': 'text/html' });
           const url = new URL(req.url, 'https://localhost');
+          const headers = { 'content-type': 'text/html' };
+          if (['/cross', '/frames', '/ordinary-frames', '/ordinary-start'].includes(url.pathname)) {
+            headers['permissions-policy'] = 'tools=*';
+          }
+          res.writeHead(200, headers);
           const tool = (name) =>
             `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
           if (url.pathname === '/cross') {
@@ -349,22 +353,37 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           `https://foreign.test:${port}`,
         ]);
         assert.equal(listed.code, 0, listed.stderr);
-        assert.match(listed.stderr, /cross-origin child tools are unavailable/);
-        const tools = JSON.parse(listed.stdout);
-        assert.ok(tools.some((tool) => tool.name === 'initial'));
         assert.equal(
-          tools.some((tool) => tool.frameId === child.targetId),
-          false
+          listed.stderr.includes('cross-origin child tools are unavailable'),
+          false,
+          listed.stderr
+        );
+        await evaluate(raw, childSession, 'addCross()');
+        const after = await once(wire.url, cwd, [
+          'webmcp-list',
+          '--tab',
+          targetId,
+          '--json',
+          '--from-origin',
+          `https://foreign.test:${port}`,
+        ]);
+        assert.equal(after.code, 0, after.stderr);
+        const tools = JSON.parse(after.stdout);
+        assert.ok(tools.some((tool) => tool.name === 'initial'));
+        assert.ok(
+          tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId)
         );
         const called = await once(wire.url, cwd, [
           'webmcp-call',
-          'initial',
+          'cross_late',
           '{}',
           '--tab',
           targetId,
+          '--from-origin',
+          `https://foreign.test:${port}`,
         ]);
         assert.equal(called.code, 0, called.stderr);
-        assert.equal(called.stdout.trim(), 'initial');
+        assert.equal(called.stdout.trim(), 'cross_late');
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
         return child.targetId;
       };

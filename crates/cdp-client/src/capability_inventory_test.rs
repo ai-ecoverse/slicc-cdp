@@ -20,7 +20,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Target.activateTarget", "Target.attachToTarget", "Target.closeTarget", "Target.createTarget",
         "Target.detachFromTarget", "Target.getTargetInfo", "Target.getTargets",
     ]);
-    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable", "Runtime.runIfWaitingForDebugger"]);
+    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable", "Runtime.runIfWaitingForDebugger", "Target.setAutoAttach"]);
     let debugger_control = set(&["Debugger.pause"]);
     let debugger_persistent = set(&["Debugger.enable", "Debugger.setInstrumentationBreakpoint"]);
     let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);

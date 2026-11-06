@@ -45,11 +45,24 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
 fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str, changes: Value) -> Result<(), String> {
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.webmcp_connection = state.webmcp_connection.clone();
-    let data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes});
+    let requested = latest.webmcp.get(target).and_then(|entry| entry.get("requestedOrigins")).cloned();
+    let mut data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes});
+    if let Some(requested) = requested { data["requestedOrigins"] = requested; }
     latest.webmcp.insert(target.to_string(), data.clone());
     session::save_webmcp(&latest)?;
     state.webmcp.insert(target.to_string(), data);
     Ok(())
+}
+
+fn apply_requested_origins(cdp: &mut Cdp, state: &Session, target: &str) {
+    let latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
+    let Some(origins) = latest.webmcp.get(target)
+        .filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection))
+        .and_then(|entry| entry.get("requestedOrigins"))
+        .and_then(Value::as_array)
+        .map(|origins| origins.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
+    else { return; };
+    if !origins.is_empty() { cdp.webmcp_request_origins(&origins); }
 }
 
 pub(crate) type Input = Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>;
@@ -89,6 +102,8 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         }
         let pumped = cdp.pump(Instant::now() + Duration::from_millis(50));
         cdp.webmcp_trace_result(session, "event pump", pumped)?;
+        apply_requested_origins(cdp, state, target);
+        cdp.webmcp_install_children();
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
         if current != saved {
