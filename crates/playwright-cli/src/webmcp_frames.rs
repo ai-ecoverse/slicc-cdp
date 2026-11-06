@@ -186,6 +186,11 @@ try {{
     result.map(|value| (value, native_mode))
 }
 
+fn list_trace(reason: &str, detail: &Value) {
+    if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() != Some("1") { return; }
+    eprintln!("webmcp-polyfill: {}", json!({"event":"list","reason":reason,"detail":detail}));
+}
+
 fn with_tools<T>(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[String], invoke: impl FnOnce(&mut Cdp, Collected) -> Result<T, String>) -> Result<T, String> {
     if from.iter().any(|origin| cdp.guard().url(origin)) { return Err(format!("{}\n", cdp.guard().refusal())); }
     let mut opened = Vec::new();
@@ -205,6 +210,19 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     let native = evaluate(cdp, &root_scope, "'modelContext' in Document.prototype", true)?.as_bool() == Some(true);
     let available = evaluate(cdp, &root_scope, "document.modelContext != null", false)?.as_bool() == Some(true);
     let native = native && available;
+    let latest = crate::session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
+    let snapshot = latest.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).and_then(|entry| entry.get("sessions")).and_then(Value::as_array).cloned().unwrap_or_default();
+    list_trace("snapshot", &json!({
+        "from":from,
+        "sessions":snapshot.iter().map(|entry| json!({
+            "target":entry.get("target"),
+            "admitted":entry.get("admittedOrigins"),
+            "pending":entry.get("pendingOrigins"),
+            "quarantined":entry.get("quarantined"),
+            "bridge":entry.get("bridge").and_then(Value::as_str).is_some_and(bridge_name),
+            "policyKeys":entry.get("documents").and_then(Value::as_object).map(|documents| documents.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+        })).collect::<Vec<_>>()
+    }));
     let evidence = cdp.webmcp_child_evidence() || state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
         if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
         entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
@@ -219,8 +237,14 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     for frame in &frames {
         if frame.frame_id == root.frame_id { continue; }
         let origin = url::Url::parse(&frame.url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
-        if origin != top && !from.contains(&origin) { continue; }
-        if cdp.guard().url(&frame.url) || !matches!(url::Url::parse(&frame.url).map(|url| url.scheme().to_string()).as_deref(), Ok("http" | "https")) { continue; }
+        if origin != top && !from.contains(&origin) {
+            list_trace("frame-skip", &json!({"frame":frame.frame_id,"origin":origin,"why":"origin-not-requested"}));
+            continue;
+        }
+        if cdp.guard().url(&frame.url) || !matches!(url::Url::parse(&frame.url).map(|url| url.scheme().to_string()).as_deref(), Ok("http" | "https")) {
+            list_trace("frame-skip", &json!({"frame":frame.frame_id,"origin":origin,"why":"guarded-or-non-http"}));
+            continue;
+        }
         let chain = ancestor_chain(frame, &frames, &scopes)?;
         for item in chain.iter().rev() {
             if !scopes.contains_key(&item.frame_id) {
@@ -264,8 +288,14 @@ try {{
     {
         for scope in scopes.values() {
             if result.iter().any(|tool| tool.scope.frame == scope.frame) { continue; }
-            if scope.origin != top && !from.contains(&scope.origin) { continue; }
-            if !allowed(cdp, scope, &frames, &scopes, &owners, true)? { continue; }
+            if scope.origin != top && !from.contains(&scope.origin) {
+                list_trace("scope-skip", &json!({"frame":scope.frame,"origin":scope.origin,"why":"origin-not-requested","policyKnown":scope.policy.is_some(),"bridge":scope.bridge.is_some()}));
+                continue;
+            }
+            let admit = allowed_traced(cdp, scope, &frames, &scopes, &owners, true)?;
+            if !admit {
+                continue;
+            }
             let unknown = scope.page_defined && scope.policy.is_none() && scope.path.is_empty() && native_policy(cdp, scope)?.is_none();
             let bridge = scope.bridge.as_deref().unwrap_or("undefined");
             let expression = format!(r#"(async () => {{ 'use strict'; {CAP}
@@ -283,13 +313,21 @@ try {{
 }})()"#);
             let value = evaluate(cdp, scope, &expression, false)?;
             for mut tool in decode_tools(&value)? {
-                if scope.origin != top && !exposed(&tool, &top) { continue; }
-                if !tool.is_object() || tool.get("name").and_then(Value::as_str).is_none() { continue; }
+                let name = tool.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                if scope.origin != top && !exposed(&tool, &top) {
+                    list_trace("tool-skip", &json!({"name":name,"frame":scope.frame,"origin":scope.origin,"why":"exposedTo"}));
+                    continue;
+                }
+                if !tool.is_object() || tool.get("name").and_then(Value::as_str).is_none() {
+                    list_trace("tool-skip", &json!({"name":name,"frame":scope.frame,"origin":scope.origin,"why":"invalid"}));
+                    continue;
+                }
                 tool["origin"] = json!(scope.origin);
                 tool["frameId"] = json!(scope.frame);
                 tool["polyfilled"] = json!(value.get("kind").and_then(Value::as_str) == Some("bridge"));
                 tool["policy"] = json!(if unknown { "unknown" } else { "allowed" });
                 tool.as_object_mut().unwrap().remove("exposedTo");
+                list_trace("tool-keep", &json!({"name":name,"frame":scope.frame,"origin":scope.origin,"kind":value.get("kind"),"policy":if unknown { "unknown" } else { "allowed" }}));
                 result.push(Tool { value: tool, scope: scope.clone(), kind: value.get("kind").and_then(Value::as_str).unwrap_or("page").to_string(), native_scope: None });
             }
         }
@@ -383,6 +421,16 @@ fn build_scope(cdp: &mut Cdp, state: &Session, target: &str, session: &str, fram
     let remembered = entries.and_then(|entries| entries.iter().find(|entry| entry.get("target").and_then(Value::as_str) == Some(&frame_target)));
     let bridge = remembered.and_then(|entry| entry.get("bridge")).and_then(Value::as_str).filter(|name| bridge_name(name)).map(str::to_string);
     let policy = entries.into_iter().flatten().filter_map(|entry| entry.get("documents").and_then(|documents| documents.get(format!("{}:{}", frame.frame_id, loader)))).filter(|entry| entry.get("origin").and_then(Value::as_str) == Some(&origin)).map(|entry| entry.get("policy").and_then(Value::as_str).unwrap_or("tools=()").to_string()).reduce(|first, next| if first == next { first } else { "tools=()".to_string() });
+    list_trace("scope", &json!({
+        "frame":frame.frame_id,
+        "loader":loader,
+        "origin":origin,
+        "target":frame_target,
+        "bridge":bridge.is_some(),
+        "policyKnown":policy.is_some(),
+        "policy":policy.as_deref().map(|header| if header.is_empty() { "empty" } else if header.contains("tools") { "tools" } else { "other" }),
+        "admitted":remembered.and_then(|entry| entry.get("admittedOrigins")).cloned(),
+    }));
     let mut scope = Scope { session, frame: frame.frame_id.clone(), origin, loader, isolated, isolated_unique, main, bridge, policy, path: Vec::new(), page_defined: false };
     scope.page_defined = evaluate(cdp, &scope, PAGE_DEFINED, false)?.as_bool() == Some(true);
     scopes.insert(frame.frame_id.clone(), scope);
@@ -456,26 +504,60 @@ fn native_policy(cdp: &mut Cdp, scope: &Scope) -> Result<Option<bool>, String> {
 }
 
 fn allowed(cdp: &mut Cdp, scope: &Scope, frames: &[FrameRec], scopes: &BTreeMap<String, Scope>, owners: &BTreeMap<String, Value>, compatibility: bool) -> Result<bool, String> {
+    allowed_traced(cdp, scope, frames, scopes, owners, compatibility)
+}
+
+fn allowed_traced(cdp: &mut Cdp, scope: &Scope, frames: &[FrameRec], scopes: &BTreeMap<String, Scope>, owners: &BTreeMap<String, Value>, compatibility: bool) -> Result<bool, String> {
     let native = native_policy(cdp, scope)?;
-    if native == Some(false) { return Ok(false); }
+    if native == Some(false) {
+        list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"native-false","policyKnown":scope.policy.is_some()}));
+        return Ok(false);
+    }
     let mut current = scope;
     let mut seen = BTreeSet::new();
     loop {
         let current_native = if current.frame == scope.frame { native } else {
             native_policy(cdp, current)?
         };
-        if current_native == Some(false) { return Ok(false); }
-        if !seen.insert(current.frame.clone()) { return Ok(false); }
+        if current_native == Some(false) {
+            list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"ancestor-native-false","at":current.frame}));
+            return Ok(false);
+        }
+        if !seen.insert(current.frame.clone()) {
+            list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"cycle","at":current.frame}));
+            return Ok(false);
+        }
         match current.policy.as_deref() {
-            Some(header) if !header_allows(header, &current.origin, &current.origin) => return Ok(false),
-            None if current_native.is_none() && !(compatibility && current.frame == scope.frame && scope.page_defined && frames.iter().any(|frame| frame.frame_id == scope.frame && frame.parent_frame_id.is_none())) => return Ok(false),
+            Some(header) if !header_allows(header, &current.origin, &current.origin) => {
+                list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"header-tools-denied","at":current.frame,"policyKnown":true}));
+                return Ok(false);
+            }
+            None if current_native.is_none() && !(compatibility && current.frame == scope.frame && scope.page_defined && frames.iter().any(|frame| frame.frame_id == scope.frame && frame.parent_frame_id.is_none())) => {
+                list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"unknown-policy","at":current.frame,"policyKnown":false,"native":current_native,"compatibility":compatibility}));
+                return Ok(false);
+            }
             _ => {}
         }
-        let Some(parent) = frames.iter().find(|frame| frame.frame_id == current.frame).and_then(|frame| frame.parent_frame_id.as_deref()) else { return Ok(true); };
-        let Some(parent) = scopes.get(parent) else { return Ok(false) };
-        let Some(owner) = owners.get(&current.frame) else { return Ok(false) };
-        if !iframe_allows(owner.get("allow").and_then(Value::as_str).unwrap_or(""), &parent.origin, &current.origin, owner.get("srcOrigin").and_then(Value::as_str).unwrap_or("")) { return Ok(false); }
-        if parent.policy.as_deref().is_some_and(|header| !header_allows(header, &parent.origin, &current.origin)) { return Ok(false); }
+        let Some(parent) = frames.iter().find(|frame| frame.frame_id == current.frame).and_then(|frame| frame.parent_frame_id.as_deref()) else {
+            list_trace("policy-allow", &json!({"frame":scope.frame,"origin":scope.origin,"policyKnown":scope.policy.is_some(),"native":native}));
+            return Ok(true);
+        };
+        let Some(parent) = scopes.get(parent) else {
+            list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"missing-parent-scope"}));
+            return Ok(false);
+        };
+        let Some(owner) = owners.get(&current.frame) else {
+            list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"missing-owner"}));
+            return Ok(false);
+        };
+        if !iframe_allows(owner.get("allow").and_then(Value::as_str).unwrap_or(""), &parent.origin, &current.origin, owner.get("srcOrigin").and_then(Value::as_str).unwrap_or("")) {
+            list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"iframe-allow"}));
+            return Ok(false);
+        }
+        if parent.policy.as_deref().is_some_and(|header| !header_allows(header, &parent.origin, &current.origin)) {
+            list_trace("policy-deny", &json!({"frame":scope.frame,"origin":scope.origin,"why":"parent-header"}));
+            return Ok(false);
+        }
         current = parent;
     }
 }
