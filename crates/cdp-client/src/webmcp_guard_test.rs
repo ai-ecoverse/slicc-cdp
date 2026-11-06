@@ -3,6 +3,10 @@ use crate::cdp::Transport;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+fn webmcp_shim_install(source: &str) -> bool {
+    source.starts_with("const __wmcp_") || source.starts_with("if (globalThis.__wmcp_")
+}
+
 #[derive(Default)]
 struct BackendState {
     inbox: VecDeque<String>,
@@ -168,7 +172,7 @@ impl Transport for Backend {
                 }
                 json!({})
             }
-            "Runtime.evaluate" if command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_")) => {
+            "Runtime.evaluate" if command["params"]["expression"].as_str().is_some_and(webmcp_shim_install) => {
                 if state.race {
                     state.tree = frame("https://seven.sliccy.ai/");
                     let changed = state.tree["frameTree"]["frame"].clone();
@@ -327,7 +331,7 @@ fn initial_same_origin_child_installs_on_a_guarded_root_pause_once_without_child
     state.borrow_mut().initial_child = true;
     state.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"C","parentId":"F","loaderId":"CHILD","url":"https://ordinary.test/child","securityOrigin":"https://ordinary.test"}}]);
     cdp.start_webmcp_for("H", true).unwrap();
-    let installed = || state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).cloned().collect::<Vec<_>>();
+    let installed = || state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).cloned().collect::<Vec<_>>();
     assert_eq!(installed().len(), 2);
     assert!(installed().iter().any(|command| command["params"]["uniqueContextId"] == "CHILD-CONTEXT"));
     assert_eq!(cdp.webmcp_generations().len(), 2);
@@ -556,7 +560,7 @@ fn holder_protected_child_frame_never_installs() {
     assert!(!state.borrow().api, "shim executed in a document the guard did not verify");
     assert!(!cdp.webmcp.arms["H"].revoked, "protected subframe navigation must not revoke the root");
     assert!(!state.borrow().sent[before..].iter().any(|command| {
-        command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+        command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
     }));
     cdp.block("H");
     for expression in ["document.modelContext.getTools()", "document.modelContext.executeTool('secret', {})"] {
@@ -787,7 +791,7 @@ fn saturated_id_cap_instrumentation_for_unknown_script_resumes_without_install_o
     assert!(!cdp.webmcp.scripts.contains_key(&("H".into(), "UNRECORDED".into())));
     let resumes = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count();
     let pauses = state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.pause").count();
-    let installs = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count();
+    let installs = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count();
     let api = state.borrow().api;
     let events = cdp.events().len();
     let mut pause = paused_with("UNRECORDED");
@@ -796,7 +800,7 @@ fn saturated_id_cap_instrumentation_for_unknown_script_resumes_without_install_o
     cdp.absorb(pause);
     assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.resume").count() > resumes);
     assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Debugger.pause").count(), pauses);
-    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count(), installs);
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count(), installs);
     assert_eq!(state.borrow().api, api);
     assert!(cdp.webmcp.arms["H"].conversion.is_none());
     assert!(cdp.webmcp.arms["H"].accepted.is_empty());
@@ -820,12 +824,12 @@ fn flooding_session_does_not_starve_another_holders_root_install() {
     cdp.guard_sessions.insert("G2".into());
     cdp.targets.insert("T2".into(), json!({"targetId":"T2","type":"page","url":"https://ordinary.test/"}));
     cdp.main_commit("G2", &state.borrow().tree["frameTree"]["frame"]);
-    let installs_before = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count();
+    let installs_before = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count();
     assert!(cdp.start_webmcp_for("H2", true).is_ok());
     assert!(cdp.webmcp.arms.get("H2").is_some_and(|arm| !arm.revoked && arm.admitted > 0 && !arm.accepted.is_empty()));
     assert!(cdp.webmcp.session_script_count("H2") > 0);
     assert!(cdp.webmcp.session_script_count("H2") <= 2);
-    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["sessionId"] == "H2" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count() > 0 || state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count() > installs_before);
+    assert!(state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["sessionId"] == "H2" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count() > 0 || state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count() > installs_before);
     assert!(!cdp.webmcp.arms["H2"].accepted.is_empty());
 }
 
@@ -930,7 +934,7 @@ fn extension_frame_and_protected_oopif_never_install_on_direct() {
         cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":url},"waitingForDebugger":true})));
         assert!(cdp.take_webmcp_children().is_empty());
         assert!(cdp.session_blocked("CHILD"));
-        assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))));
+        assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)));
     }
 }
 
@@ -1034,6 +1038,34 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
 }
 
 #[test]
+fn rematching_the_same_child_realm_does_not_raise_admitted() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    let admitted = cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted).unwrap_or(0);
+    assert!(admitted >= 1);
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(admitted), "admitted counts realms, not evaluates");
+    assert!(
+        state.borrow().sent.iter().filter(|command| {
+            command["sessionId"] == "CHILD"
+                && command["method"] == "Runtime.evaluate"
+                && command["params"]["expression"].as_str().is_some_and(|source| source.contains("globalThis.") && source.contains("__wmcp_installed"))
+        }).count() >= 1
+    );
+}
+
+#[test]
 fn child_arm_enables_network_before_page_and_observes_policy_before_shim() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
@@ -1082,8 +1114,8 @@ fn start_time_requested_origin_installs_when_default_context_appears() {
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(
         cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
-            || state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_")))
-            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
+            || state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install))
+            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)),
         "start-time --from-origin must install once the default context appears"
     );
     assert!(cdp.webmcp_alive(&holder));
@@ -1110,7 +1142,7 @@ fn unverified_child_parks_until_first_commit_then_installs() {
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(
         cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
-            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
+            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)),
         "first real commit must make a parked blank child eligible"
     );
     assert!(cdp.webmcp_alive(&holder));
@@ -1152,7 +1184,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     assert!(!cdp.content_blocked("CHILD"));
     assert!(
         cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
-            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
+            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)),
         "requested-origin OOPIF must install after commit on the child session"
     );
     assert!(cdp.webmcp_alive(&holder));
@@ -1183,7 +1215,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     );
     assert!(
         !state.borrow().sent[before..].iter().any(|command| {
-            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
         }),
         "shim must not evaluate before --from-origin"
     );
@@ -1194,7 +1226,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     late.webmcp_request_origins(&["https://other.test".into()]);
     assert!(
         !state.borrow().sent[before..].iter().any(|command| {
-            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
         }),
         "unrelated requested origin must not install a parked child"
     );
@@ -1203,7 +1235,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     let before = state.borrow().sent.len();
     late.webmcp_request_origins(&["https://foreign.test".into()]);
     let child_evals = state.borrow().sent[before..].iter().filter(|command| {
-        command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+        command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
     }).count();
     assert_eq!(child_evals, 1, "exactly one child shim evaluate after the origin is requested");
     assert!(!late.session_blocked(&holder));
@@ -1241,7 +1273,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     buffered.webmcp_request_origins(&["https://foreign.test".into()]);
     assert!(
         state.borrow().sent[before..].iter().any(|command| {
-            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
         }),
         "replayed attach must still install after the origin is requested"
     );

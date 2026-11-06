@@ -615,7 +615,7 @@ fn plain_replayed_root_installs_with_one_identity_read_and_no_execution_replay()
     cdp.start_webmcp_for(&session, true).unwrap();
     let wire = state.borrow();
     let reload = wire.calls.iter().position(|call| call["method"] == "Page.reload").unwrap();
-    let install = wire.calls.iter().position(|call| call["method"] == "Runtime.evaluate" && call["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).unwrap();
+    let install = wire.calls.iter().position(|call| call["method"] == "Runtime.evaluate" && call["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_") || source.starts_with("if (globalThis.__wmcp_"))).unwrap();
     let before = &wire.calls[reload + 1..install];
     let methods = before.iter().map(|call| call["method"].as_str().unwrap()).collect::<Vec<_>>();
     assert_eq!(before.iter().filter(|call| call["method"] == "Runtime.enable").count(), 1, "{methods:?}");

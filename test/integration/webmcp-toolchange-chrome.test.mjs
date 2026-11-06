@@ -108,6 +108,29 @@ async function evaluate(raw, session, expression) {
   return result.result.value;
 }
 
+async function hasShim(raw, session) {
+  return (
+    await raw.send(
+      'Runtime.evaluate',
+      {
+        expression:
+          '({secure:isSecureContext,api:!!document.modelContext,alias:!!navigator.modelContext})',
+        returnByValue: true,
+      },
+      session
+    )
+  ).result.value;
+}
+
+async function waitForShim(raw, session, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if ((await hasShim(raw, session)).api) return;
+    await sleep(50);
+  }
+  throw new Error('child shim did not appear');
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
@@ -151,10 +174,28 @@ for (const protectedFrames of [true, false]) {
       );
       let port;
       let ordinary;
+      const crossReady = [];
+      let crossReadyOpen = false;
+      const releaseCrossReady = () => {
+        crossReadyOpen = true;
+        for (const pending of crossReady.splice(0)) {
+          pending.writeHead(200, { 'content-type': 'text/plain' });
+          pending.end('ok');
+        }
+      };
       server = createServer(
         { key: await readFile(keyPath), cert: await readFile(certPath) },
         (req, res) => {
           const url = new URL(req.url, 'https://localhost');
+          if (url.pathname === '/cross-child-ready') {
+            if (crossReadyOpen) {
+              res.writeHead(200, { 'content-type': 'text/plain' });
+              res.end('ok');
+              return;
+            }
+            crossReady.push(res);
+            return;
+          }
           const headers = { 'content-type': 'text/html' };
           if (['/cross', '/frames', '/ordinary-frames', '/ordinary-start'].includes(url.pathname)) {
             headers['permissions-policy'] = 'tools=*';
@@ -164,7 +205,7 @@ for (const protectedFrames of [true, false]) {
             `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
           if (url.pathname === '/cross') {
             res.end(
-              `<!doctype html><script>const crossController = new AbortController(); window.addCross = async () => { await new Promise((resolve) => setTimeout(resolve, 50)); document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); }; window.removeCross = () => crossController.abort();</script>`
+              `<!doctype html><script>const crossController = new AbortController(); window.addCross = async () => { document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); }; window.removeCross = () => crossController.abort(); void (async () => { await fetch('/cross-child-ready'); await window.addCross(); })();</script>`
             );
             return;
           }
@@ -338,6 +379,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       else assert.ok(document.loaderId);
 
       const crossControl = async (stale) => {
+        crossReadyOpen = false;
         const child = (await raw.send('Target.getTargets', {})).targetInfos.find(
           (target) =>
             target.type === 'iframe' &&
@@ -349,12 +391,17 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         const childSession = (
           await raw.send('Target.attachToTarget', { targetId: child.targetId, flatten: true })
         ).sessionId;
-        assert.equal(
-          await evaluate(raw, childSession, 'typeof document.modelContext'),
-          'object',
-          'start-time --from-origin must install before listing'
+        await waitForShim(raw, childSession);
+        const from = held.lines.length;
+        releaseCrossReady();
+        const late = await held.next(
+          (line) =>
+            line.event === 'tools-changed' &&
+            line.frameId === child.targetId &&
+            names(line).includes('cross_late'),
+          from
         );
-        await evaluate(raw, childSession, 'addCross()');
+        assert.ok(names(late).includes('cross_late'), JSON.stringify(late));
         const after = await once(wire.url, cwd, [
           'webmcp-list',
           '--tab',
@@ -366,7 +413,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         assert.equal(
           after.code,
           0,
-          `list after addCross failed\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
+          `list after gate failed\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
         );
         assert.equal(
           after.stderr.includes('cross-origin child tools are unavailable'),
@@ -425,6 +472,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       held.child.stdin.end();
       assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
 
+      crossReadyOpen = false;
       held = stream(wire.url, cwd, [
         'webmcp-polyfill',
         '--tab',

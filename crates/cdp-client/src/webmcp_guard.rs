@@ -488,7 +488,7 @@ impl Cdp {
     fn webmcp_install(&mut self, session: &str, seed: &Value) -> Result<String, String> {
         let shim = vetted_source(SHIM)?;
         let bridge = private_bridge(getrandom::fill)?;
-        let source = format!("const {bridge} = {shim};");
+        let source = format!("if (globalThis.{bridge} == null) {{ const __wmcp_installed = ({shim}); if (__wmcp_installed != null) globalThis.{bridge} = __wmcp_installed; }}");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
         self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new() });
@@ -1046,14 +1046,19 @@ impl Cdp {
         let root = self.documents.get(&target).is_some_and(|document| document.frame_id == context.frame);
         let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
         if root { arm.root_identity = Some((target.clone(), context.clone())); }
-        arm.admitted += 1;
         arm.pending_install = None;
         arm.pending_contexts.remove(&id);
         arm.pending_frames.remove(&context.frame);
-        if arm.accepted.len() >= 1024 { arm.accepted.clear(); }
-        arm.accepted.insert((context.frame, context.loader, context.unique));
+        if arm.accepted.len() >= 1024 {
+            arm.accepted.clear();
+            arm.admitted = 0;
+        }
+        let realm = (context.frame, context.loader, context.unique);
+        if arm.accepted.insert(realm) {
+            arm.admitted = arm.accepted.len();
+            self.webmcp.samples.push(started.elapsed().as_micros());
+        }
         let bridge = arm.bridge.clone();
-        self.webmcp.samples.push(started.elapsed().as_micros());
         if self.webmcp.quarantined.remove(session) {
             self.guard_sessions.remove(session);
             self.webmcp.children.push((target, session.to_string(), bridge));
@@ -1069,7 +1074,7 @@ impl Cdp {
     fn webmcp_child_arm(&mut self, session: &str, seed: &Value, parent_direct: bool) -> Result<String, String> {
         let shim = vetted_source(SHIM)?;
         let bridge = private_bridge(getrandom::fill)?;
-        let source = format!("const {bridge} = {shim};");
+        let source = format!("if (globalThis.{bridge} == null) {{ const __wmcp_installed = ({shim}); if (__wmcp_installed != null) globalThis.{bridge} = __wmcp_installed; }}");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
         self.webmcp.arms.insert(session.to_string(), Arm {

@@ -151,7 +151,7 @@ try {{
         } else {
             format!(r#"(async () => {{ 'use strict'; {CAP}
 try {{
-  const bridge = typeof {bridge} === 'undefined' ? null : {bridge};
+  const bridge = globalThis.{bridge} ?? (typeof {bridge} === 'undefined' ? null : {bridge});
   if ({is_bridge} && bridge) {{
     const reply = await bridge.call({name}, {input}, {allow});
     if (reply.__webmcp_result !== undefined) reply.__webmcp_result = cap(reply.__webmcp_result);
@@ -300,7 +300,7 @@ try {{
             let bridge = scope.bridge.as_deref().unwrap_or("undefined");
             let expression = format!(r#"(async () => {{ 'use strict'; {CAP}
 try {{
- const bridge = typeof {bridge} === 'undefined' ? null : {bridge};
+ const bridge = globalThis.{bridge} ?? (typeof {bridge} === 'undefined' ? null : {bridge});
  if (bridge) {{ const listed = bridge.list(); if (listed.error) return pack({{__webmcp_error:'limit'}}); if (!listed.replaced || JSON.parse(listed.toolsJson).length) return pack({{kind:'bridge',toolsJson:listed.toolsJson}}); }}
  const api = document.modelContext;
  if (!api) return pack({{kind:'none',toolsJson:'[]'}});

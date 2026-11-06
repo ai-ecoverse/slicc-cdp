@@ -59,7 +59,7 @@ fn probe(cdp: &mut Cdp, generation: &Value, state: &mut Generation) -> Result<Op
     let session = text(generation, "session");
     let bridge = text(generation, "bridge");
     if !bridge_name(bridge) { return Ok(None); }
-    let expression = format!("(() => {{ 'use strict'; try {{ if (typeof {bridge} === 'undefined' || !{bridge}) return ''; const listed = {bridge}.list(); return listed.error ? 'b!' : 'b' + listed.changes; }} catch {{ return 'b?'; }} }})()");
+    let expression = format!("(() => {{ 'use strict'; try {{ const bridge = globalThis.{bridge} ?? (typeof {bridge} === 'undefined' ? null : {bridge}); if (!bridge) return ''; const listed = bridge.list(); return listed.error ? 'b!' : 'b' + listed.changes; }} catch {{ return 'b?'; }} }})()");
     let Some(main) = evaluate(cdp, session, json!({"expression":expression,"uniqueContextId":text(generation, "uniqueId"),"returnByValue":true}))? else { return Ok(None); };
     if !main.is_empty() { return Ok(Some(main)); }
     if state.world.is_none() {
