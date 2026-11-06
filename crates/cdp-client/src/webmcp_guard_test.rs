@@ -31,6 +31,7 @@ struct BackendState {
     child_policy: Option<String>,
     load_network_headers: Option<Value>,
     oopif_tree: Option<Value>,
+    place_remote_oopif: bool,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -112,6 +113,37 @@ fn frame(url: &str) -> Value {
     json!({"frameTree":{"frame":{"id":"F","url":url,"securityOrigin":origin,"loaderId":"LOADER"}}})
 }
 
+fn tree_has_frame(node: &Value, frame: &str) -> bool {
+    if node.pointer("/frame/id").and_then(Value::as_str) == Some(frame) { return true; }
+    node.get("childFrames").and_then(Value::as_array).is_some_and(|children| children.iter().any(|child| tree_has_frame(child, frame)))
+}
+
+fn inject_remote_oopif(tree: &mut Value, oopif: &Value) {
+    let frame = &oopif["frameTree"]["frame"];
+    let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+    let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("");
+    if origin.is_empty() || origin == "null" || origin == "://" { return; }
+    if url.contains("seven.sliccy.ai") || origin.contains("seven.sliccy.ai") { return; }
+    if !url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https") && parsed.origin().ascii_serialization() == origin) {
+        return;
+    }
+    let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("IFRAME");
+    let remote_id = if frame_id == "FRAME" { "IFRAME" } else { frame_id };
+    if tree_has_frame(&tree["frameTree"], remote_id) { return; }
+    let parent = tree["frameTree"]["frame"]["id"].as_str().unwrap_or("F").to_string();
+    let remote = json!({"frame":{
+        "id":remote_id,
+        "parentId":parent,
+        "url":frame.get("url").cloned().unwrap_or_else(|| json!("")),
+        "securityOrigin":frame.get("securityOrigin").cloned().unwrap_or_else(|| json!("")),
+        "loaderId":frame.get("loaderId").cloned().unwrap_or_else(|| json!("")),
+    }});
+    match tree["frameTree"].get_mut("childFrames") {
+        Some(Value::Array(children)) => children.push(remote),
+        _ => { tree["frameTree"]["childFrames"] = json!([remote]); }
+    }
+}
+
 impl Transport for Backend {
     fn send_text(&mut self, text: &str) -> Result<(), String> {
         let command: Value = serde_json::from_str(text).unwrap();
@@ -131,7 +163,13 @@ impl Transport for Backend {
                 if command["sessionId"] == "CHILD" {
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
-                    state.tree.clone()
+                    let mut tree = state.tree.clone();
+                    if state.place_remote_oopif {
+                        if let Some(oopif) = state.oopif_tree.as_ref() {
+                            inject_remote_oopif(&mut tree, oopif);
+                        }
+                    }
+                    tree
                 }
             }
             "Target.attachToTarget" => {
@@ -206,7 +244,12 @@ impl Transport for Backend {
             }
             "Network.loadNetworkResource" => match state.load_network_headers.as_ref() {
                 Some(Value::Null) => json!({"resource":{"success":true}}),
-                Some(headers) => json!({"resource":{"success":true,"httpStatusCode":200,"headers":headers}}),
+                Some(headers) => {
+                    let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
+                    let mut clean = headers.clone();
+                    if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
+                    json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+                }
                 None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
             },
             "Debugger.resume" => {
@@ -275,7 +318,7 @@ impl Transport for Backend {
 }
 
 fn client() -> (Cdp, Rc<RefCell<BackendState>>) {
-    let state = Rc::new(RefCell::new(BackendState { tree: frame("https://ordinary.test/"), current_frame: "F".into(), pause: true, ..Default::default() }));
+    let state = Rc::new(RefCell::new(BackendState { tree: frame("https://ordinary.test/"), current_frame: "F".into(), pause: true, place_remote_oopif: true, ..Default::default() }));
     let mut cdp = Cdp::from_transport(Box::new(Backend(state.clone())));
     cdp.protect_origins(&["https://catalog.test"]);
     cdp.session_targets.insert("H".into(), "T".into());
@@ -995,6 +1038,7 @@ fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
     assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"));
 
     let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"EARLY","url":"https://foreign.test/","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.start_webmcp_for("H", true).unwrap();
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp.buffering_attach = true;
@@ -1513,9 +1557,9 @@ fn child_navigation_to_protected_or_extension_detaches() {
 fn oopif_under_protected_ancestor_refuses_install() {
     let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    state.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"LOADER"},"childFrames":[{"frame":{"id":"PROT","parentId":"F","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai","loaderId":"P"}}]}});
+    state.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"LOADER"},"childFrames":[{"frame":{"id":"PROT","parentId":"F","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai","loaderId":"P"},"childFrames":[{"frame":{"id":"IFRAME","parentId":"PROT","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}]}]}});
     let before = state.borrow().sent.len();
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"PROT"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(
         cdp.session_blocked("CHILD")
@@ -1661,4 +1705,102 @@ fn debugger_paused_on_holder_child_resumes_and_settles() {
     cdp.absorb(json!({"method":"Debugger.paused","sessionId":"CHILD","params":{"reason":"other","callFrames":[{"callFrameId":"CALL","location":{"scriptId":"S","lineNumber":0,"columnNumber":0}}]}}));
     assert!(state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Debugger.resume"));
     assert!(cdp.session_blocked("CHILD") || !cdp.webmcp.parents.contains_key("CHILD"));
+}
+
+#[test]
+fn load_network_resource_is_credentialless_and_stores_fetched_source() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    let load = state.borrow().sent.iter().find(|command| command["method"] == "Network.loadNetworkResource").cloned().expect("loadNetworkResource");
+    assert_eq!(load["params"]["options"]["includeCredentials"], false);
+    assert_eq!(load["params"]["options"]["disableCache"], true);
+    assert_eq!(cdp.webmcp.arms["CHILD"].documents["FRAME:CROSS"]["source"], "fetched");
+    let (mut empty, empty_state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    empty_state.borrow_mut().load_network_headers = Some(json!({"content-type":"text/html"}));
+    empty.webmcp_request_origins(&["https://foreign.test".into()]);
+    empty.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    empty.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(empty.webmcp.arms.get("CHILD").is_none_or(|arm| !arm.documents.contains_key("FRAME:CROSS")));
+    let (mut non_2xx, status_state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    status_state.borrow_mut().load_network_headers = Some(json!({"__status":404,"permissions-policy":"tools=*"}));
+    non_2xx.webmcp_request_origins(&["https://foreign.test".into()]);
+    non_2xx.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    non_2xx.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(non_2xx.webmcp.arms.get("CHILD").is_none_or(|arm| !arm.documents.contains_key("FRAME:CROSS")));
+}
+
+#[test]
+fn missing_parent_frame_id_uses_root_tree_placement() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0), "ordinary root placement installs without parentFrameId");
+
+    let (mut protected, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"LOADER"},"childFrames":[{"frame":{"id":"PROT","parentId":"F","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai","loaderId":"P"},"childFrames":[{"frame":{"id":"IFRAME","parentId":"PROT","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}]}]}});
+    protected.webmcp_request_origins(&["https://foreign.test".into()]);
+    protected.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(protected.session_blocked("CHILD") || !protected.webmcp.parents.contains_key("CHILD"));
+
+    let (mut missing, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().place_remote_oopif = false;
+    missing.webmcp_request_origins(&["https://foreign.test".into()]);
+    missing.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(missing.session_blocked("CHILD") || !missing.webmcp.parents.contains_key("CHILD"), "unplaced child must detach");
+}
+
+#[test]
+fn provisional_under_protected_ancestor_detaches_without_domain_enable() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    state.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"LOADER"},"childFrames":[{"frame":{"id":"PROT","parentId":"F","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai","loaderId":"P"},"childFrames":[{"frame":{"id":"IFRAME","parentId":"PROT","url":"about:blank","securityOrigin":"https://seven.sliccy.ai","loaderId":""}}]}]}});
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    let child_sent = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD").cloned().collect::<Vec<_>>();
+    assert!(cdp.session_blocked("CHILD") || !cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(!child_sent.iter().any(|command| matches!(command["method"].as_str(), Some("Network.enable" | "Runtime.enable" | "Page.enable"))), "{child_sent:?}");
+    assert!(cdp.webmcp_snapshot().iter().all(|session| session["pendingOrigins"].as_array().is_none_or(|origins| origins.iter().all(|origin| origin != "https://seven.sliccy.ai"))));
+}
+
+#[test]
+fn post_navigation_reinstall_matches_current_generation_not_loader() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/a","securityOrigin":"https://foreign.test","loaderId":"L1"}}}));
+    state.borrow_mut().runtime_child = Some(json!({"id":7,"uniqueId":"OLD-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}));
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/a"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+    state.borrow_mut().runtime_child = None;
+    cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":8,"uniqueId":"NEW-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert_eq!(cdp.webmcp.contexts.get(&("CHILD".into(), 8)).map(|context| (context.loader.as_str(), context.generation)), Some(("L1", 1)));
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+    let installs = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).cloned().collect::<Vec<_>>();
+    assert!(installs.iter().any(|command| command["params"]["uniqueContextId"] == "NEW-CTX"), "context-before-nav must install by generation: {installs:?}");
+    assert_eq!(cdp.webmcp.contexts.get(&("CHILD".into(), 8)).map(|context| context.loader.as_str()), Some("L2"));
+
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/c","securityOrigin":"https://foreign.test","loaderId":"L3"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/c","securityOrigin":"https://foreign.test","loaderId":"L3"}}}));
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"THIRD-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    let second = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).cloned().collect::<Vec<_>>();
+    assert!(second.iter().any(|command| command["params"]["uniqueContextId"] == "THIRD-CTX"), "two navigations in a row: {second:?}");
+
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.accepted.clear();
+        arm.admitted = 0;
+        arm.pending_install = None;
+        arm.pending_install_loader = None;
+    }
+    cdp.webmcp.quarantined.insert("CHILD".into());
+    cdp.webmcp.contexts.insert(("CHILD".into(), 1), Context { frame: "FRAME".into(), origin: "https://foreign.test".into(), unique: "STALE-CTX".into(), loader: "L3".into(), generation: 0 });
+    let before = state.borrow().sent.len();
+    assert!(cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK).unwrap());
+    let installs = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).cloned().collect::<Vec<_>>();
+    assert!(installs.iter().any(|command| command["params"]["uniqueContextId"] == "THIRD-CTX"), "{installs:?}");
+    assert!(!installs.iter().any(|command| command["params"]["uniqueContextId"] == "STALE-CTX"), "old generation must not win: {installs:?}");
 }

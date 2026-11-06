@@ -134,6 +134,8 @@ fn plant_route_evidence(cwd: &std::path::Path, connection: &str, documents: Valu
     planted.webmcp.insert(
         "ROOT".into(),
         json!({
+            "schema":crate::webmcp::SNAPSHOT_SCHEMA,
+            "holderPid":std::process::id(),
             "owner":"__wmcp_0123456789abcdef0123456789abcdef",
             "connection":connection,
             "sessions":[{"target":"ROOT","bridge":"__wmcp_0123456789abcdef0123456789abcdef","documents":documents,"plain":false}]

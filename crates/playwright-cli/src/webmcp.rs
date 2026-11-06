@@ -5,8 +5,31 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
+pub(crate) const SNAPSHOT_SCHEMA: u64 = 1;
+
+fn holder_alive(pid: u32) -> bool {
+    if pid == 0 { return false; }
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    {
+        pid == std::process::id()
+    }
+}
+
+pub(crate) fn snapshot_evidence(entry: &Value) -> bool {
+    if entry.get("schema").and_then(Value::as_u64).unwrap_or(0) < SNAPSHOT_SCHEMA { return false; }
+    let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) else { return false; };
+    if pid == 0 || pid > u64::from(u32::MAX) || !holder_alive(pid as u32) { return false; }
+    true
+}
+
 fn child_evidence(state: &Session, target: &str) -> bool {
     state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
+        if !snapshot_evidence(entry) { return false; }
         if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
         entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
             sessions.iter().any(|session| {
@@ -146,6 +169,18 @@ fn unavailable(command: &str) -> Output {
     }
 }
 
+fn list_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' | '\r' | '\t' => out.push(' '),
+            c if c.is_control() => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    sanitize::browser_message(&out)
+}
+
 fn format_list(tools: &Value) -> String {
     let arr = match tools.as_array() {
         Some(arr) if arr.is_empty() => return "No WebMCP tools on this page\n".to_string(),
@@ -154,8 +189,8 @@ fn format_list(tools: &Value) -> String {
     };
     let mut lines = Vec::new();
     for tool in arr {
-        let name = sanitize::browser_message(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
-        let desc = sanitize::browser_message(
+        let name = list_field(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+        let desc = list_field(
             tool.get("description")
                 .and_then(|v| v.as_str())
                 .or_else(|| tool.get("title").and_then(|v| v.as_str()))
@@ -887,8 +922,21 @@ mod tests {
         let text = format_list(&tools);
         assert!(!text.contains('\x1b'), "{text}");
         assert!(!text.contains('\x07'), "{text}");
-        assert!(text.contains("\\x1b"), "{text}");
-        assert!(text.contains("\\x07"), "{text}");
+    }
+
+    #[test]
+    fn list_field_strips_newline_tab_and_controls() {
+        assert_eq!(list_field("a\nb\tc\rd\x07e"), sanitize::browser_message("a b c d e"));
+        assert!(!list_field("line\nbreak").contains('\n'));
+        assert!(!list_field("a\tb").contains('\t'));
+    }
+
+    #[test]
+    fn snapshot_evidence_rejects_old_schema_and_dead_holder() {
+        assert!(!snapshot_evidence(&json!({"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
+        assert!(!snapshot_evidence(&json!({"schema":0,"holderPid":std::process::id(),"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":4_294_967_294u64,"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
+        assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"routeAttested":false})));
     }
 
     #[test]

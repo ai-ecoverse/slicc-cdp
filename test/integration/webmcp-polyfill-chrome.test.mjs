@@ -499,3 +499,152 @@ ${childScript}
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test('Chrome: service worker cannot forge fetched child Permissions-Policy', async (t) => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-sw-policy-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const keyPath = path.join(cwd, 'key.pem');
+  const certPath = path.join(cwd, 'cert.pem');
+  execFileSync(
+    'openssl',
+    [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-keyout',
+      keyPath,
+      '-out',
+      certPath,
+      '-days',
+      '1',
+      '-nodes',
+      '-subj',
+      '/CN=localhost',
+      '-addext',
+      'subjectAltName=DNS:localhost,DNS:foreign.test',
+    ],
+    { stdio: 'ignore' }
+  );
+  let browser;
+  let raw;
+  let holder;
+  let server;
+  try {
+    server = createServer(
+      { key: await readFile(keyPath), cert: await readFile(certPath) },
+      (req, res) => {
+        const url = new URL(req.url, 'https://localhost');
+        if (url.pathname === '/sw.js') {
+          res.writeHead(200, {
+            'content-type': 'text/javascript',
+            'service-worker-allowed': '/',
+          });
+          res.end(`self.addEventListener('fetch', (event) => {
+  if (event.request.mode === 'navigate' || event.request.destination === 'document') {
+    event.respondWith(new Response('<!doctype html><title>sw</title>', {
+      status: 200,
+      headers: { 'content-type': 'text/html', 'permissions-policy': 'tools=*' }
+    }));
+  }
+});`);
+          return;
+        }
+        if (url.pathname === '/cross-sw') {
+          res.writeHead(200, {
+            'content-type': 'text/html',
+            'permissions-policy': 'tools=()',
+          });
+          res.end(`<!doctype html><title>child</title><script>
+navigator.serviceWorker.register('/sw.js', { scope: '/' });
+</script>`);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/html', 'permissions-policy': 'tools=*' });
+        res.end(
+          `<!doctype html><title>parent</title><iframe src="https://foreign.test:${server.address().port}/cross-sw" allow="tools *"></iframe>`
+        );
+      }
+    );
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const ordinary = `https://localhost:${port}`;
+    const foreign = `https://foreign.test:${port}`;
+    browser = await launchBrowser([
+      '--ignore-certificate-errors',
+      '--no-proxy-server',
+      '--disable-features=WebMCP,WebMCPTesting',
+      '--site-per-process',
+      '--host-resolver-rules=MAP foreign.test 127.0.0.1',
+    ]);
+    raw = await observer(browser.wsUrl);
+    const { targetId } = await raw.send('Target.createTarget', {
+      url: 'about:blank',
+      background: true,
+    });
+    const { sessionId } = await raw.send('Target.attachToTarget', { targetId, flatten: true });
+    await raw.send('Page.enable', {}, sessionId);
+    await navigate(raw, sessionId, `${ordinary}/`);
+    const until = Date.now() + 15000;
+    let crossChild;
+    while (Date.now() < until) {
+      crossChild = (await raw.send('Target.getTargets', {})).targetInfos.find(
+        (target) => target.type === 'iframe' && target.url === `${foreign}/cross-sw`
+      );
+      if (crossChild) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(crossChild, 'SW child iframe missing');
+    const crossSession = (
+      await raw.send('Target.attachToTarget', { targetId: crossChild.targetId, flatten: true })
+    ).sessionId;
+    await raw.send('Runtime.enable', {}, crossSession);
+    await raw.send(
+      'Runtime.evaluate',
+      {
+        expression: 'navigator.serviceWorker.ready.then(() => true).catch(() => false)',
+        awaitPromise: true,
+        returnByValue: true,
+      },
+      crossSession
+    );
+    await raw.send('Target.detachFromTarget', { sessionId: crossSession });
+    holder = command(browser.wsUrl, cwd, [
+      'webmcp-polyfill',
+      '--tab',
+      targetId,
+      '--reload',
+      '--from-origin',
+      foreign,
+    ]);
+    assert.equal((await holder.ready).mode, 'polyfill');
+    let listed;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      listed = await once(browser.wsUrl, cwd, [
+        'webmcp-list',
+        '--tab',
+        targetId,
+        '--json',
+        '--from-origin',
+        foreign,
+      ]);
+      if (listed.code === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.equal(listed.code, 0, listed.stderr);
+    const tools = JSON.parse(listed.stdout);
+    assert.equal(
+      tools.some((tool) => tool.origin === foreign),
+      false,
+      `SW-forged tools must stay denied: ${JSON.stringify(tools)}\n${holder.stderr()}`
+    );
+    holder.child.stdin.end();
+    await holder.ended;
+    holder = undefined;
+  } finally {
+    holder?.child.kill('SIGKILL');
+    await raw?.close();
+    await browser?.close();
+    await new Promise((resolve) => (server ? server.close(resolve) : resolve()));
+  }
+});
