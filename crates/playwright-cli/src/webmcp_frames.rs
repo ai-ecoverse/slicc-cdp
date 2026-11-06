@@ -312,7 +312,17 @@ try {{
 }} catch {{ return '{{"__webmcp_error":"threw","message":"WebMCP listing failed"}}'; }}
 }})()"#);
             let value = evaluate(cdp, scope, &expression, false)?;
-            for mut tool in decode_tools(&value)? {
+            let decoded = decode_tools(&value)?;
+            list_trace("scope-tools", &json!({
+                "session":scope.session,
+                "frame":scope.frame,
+                "origin":scope.origin,
+                "kind":value.get("kind"),
+                "bridge":scope.bridge.is_some(),
+                "count":decoded.len(),
+                "names":decoded.iter().filter_map(|tool| tool.get("name").and_then(Value::as_str)).collect::<Vec<_>>(),
+            }));
+            for mut tool in decoded {
                 let name = tool.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                 if scope.origin != top && !exposed(&tool, &top) {
                     list_trace("tool-skip", &json!({"name":name,"frame":scope.frame,"origin":scope.origin,"why":"exposedTo"}));
