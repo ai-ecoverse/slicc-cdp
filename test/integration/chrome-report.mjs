@@ -64,6 +64,7 @@ export const CHROME_FILES = new Set(
     'session',
     'sliccy-browser',
     'sliccy-browser-install',
+    'snapshot-batch-chrome',
     'snapshot-golden',
     'snapshot-oopif-chrome',
     'storage-chrome',
