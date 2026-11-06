@@ -15,6 +15,8 @@ enum Twist {
     Reverted,
     Error,
     Disconnect,
+    Silent,
+    BetweenChunks,
 }
 
 struct Page {
@@ -26,6 +28,8 @@ struct Page {
     closed: bool,
     url: String,
     sessions: Vec<String>,
+    pending: Option<Value>,
+    fired: bool,
 }
 
 impl Page {
@@ -48,6 +52,9 @@ impl Transport for Page {
         self.sent.borrow_mut().push(message.clone());
         let session = message["sessionId"].clone();
         let method = message["method"].as_str().unwrap();
+        if method != "DOM.describeNode" {
+            if let Some(late) = self.pending.take() { self.incoming.push_back(late) }
+        }
         if method == "Runtime.enable" {
             self.incoming.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":1,"uniqueId":format!("world-{}", session.as_str().unwrap_or("")),"name":"","origin":"https://example.test","auxData":{"isDefault":true,"frameId":"T","type":"default"}}}}));
         }
@@ -72,10 +79,15 @@ impl Transport for Page {
                         self.closed = true;
                         return Ok(());
                     }
-                    Twist::None => {}
+                    Twist::Silent => {
+                        self.pending = Some(json!({"id":message["id"],"sessionId":session,"result":{"node":{"nodeId":0,"backendNodeId":5}}}));
+                        return Ok(());
+                    }
+                    Twist::None | Twist::BetweenChunks => {}
                 }
             }
         }
+        let after_first_chunk = self.twist == Twist::BetweenChunks && !self.fired && method == "Page.getFrameTree" && self.described == BATCH_LIMIT;
         let origin = self.url.trim_end_matches('/').to_string();
         let result = match method {
             "Target.attachToTarget" => {
@@ -93,6 +105,12 @@ impl Transport for Page {
             _ => json!({}),
         };
         self.incoming.push_back(json!({"id":message["id"],"result":result,"sessionId":session}));
+        if after_first_chunk {
+            self.fired = true;
+            for session in self.sessions.clone() {
+                self.incoming.push_back(json!({"method":"Page.navigatedWithinDocument","sessionId":session,"params":{"frameId":"T","url":"https://example.test/#moved","navigationType":"fragment"}}));
+            }
+        }
         Ok(())
     }
 
@@ -105,7 +123,7 @@ impl Transport for Page {
 
 fn page(objects: usize, twist: Twist) -> (Cdp, Rc<RefCell<Vec<Value>>>, Vec<Value>, String) {
     let sent = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(Page { sent: sent.clone(), incoming: VecDeque::new(), objects, twist, described: 0, closed: false, url: "https://example.test/".into(), sessions: Vec::new() }));
+    let mut cdp = Cdp::from_transport(Box::new(Page { sent: sent.clone(), incoming: VecDeque::new(), objects, twist, described: 0, closed: false, url: "https://example.test/".into(), sessions: Vec::new(), pending: None, fired: false }));
     let session = crate::cdp::attach(&mut cdp, "T").unwrap();
     cdp.call("Runtime.enable", json!({}), Some(&session)).unwrap();
     let handle = cdp.call("Runtime.evaluate", json!({"expression":"elements"}), Some(&session)).unwrap();
@@ -194,4 +212,23 @@ fn an_object_the_client_never_saw_refuses_the_batch_before_anything_is_sent() {
     batch.push(json!({"objectId":"stale-object"}));
     assert_eq!(cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap_err(), UNSEEN);
     assert!(methods(&sent).iter().all(|method| method != "DOM.describeNode"));
+}
+
+#[test]
+fn a_page_change_between_chunks_refuses_the_whole_call_and_never_resends_the_first_chunk() {
+    let (mut cdp, sent, batch, session) = page(BATCH_LIMIT + 1, Twist::BetweenChunks);
+    refused(cdp.call_batch("DOM.describeNode", batch, Some(&session)));
+    let ids: Vec<Value> = sent.borrow().iter().filter(|message| message["method"] == "DOM.describeNode").map(|message| message["params"]["objectId"].clone()).collect();
+    assert_eq!(ids.len(), BATCH_LIMIT);
+    let unique: std::collections::BTreeSet<String> = ids.iter().map(Value::to_string).collect();
+    assert_eq!(unique.len(), BATCH_LIMIT);
+}
+
+#[test]
+fn a_reply_that_never_comes_fails_the_whole_batch_and_a_late_reply_cannot_answer_a_later_call() {
+    let (mut cdp, _, batch, session) = page(20, Twist::Silent);
+    let message = cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap_err();
+    assert_eq!(message, "DOM.describeNode timed out\n");
+    let next = cdp.call("Runtime.evaluate", json!({"expression":"elements"}), Some(&session)).unwrap();
+    assert_eq!(next.pointer("/result/objectId").and_then(Value::as_str), Some("elements"));
 }

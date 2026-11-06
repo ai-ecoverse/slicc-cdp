@@ -678,14 +678,18 @@ impl Cdp {
             return batch.into_iter().map(|params| self.call(method, params, session_id)).collect();
         }
         let mut results = Vec::with_capacity(batch.len());
+        let mut first = None;
         for chunk in batch.chunks(BATCH_LIMIT) {
-            results.extend(self.call_chunk(method, chunk, session_id)?);
+            let (described, checks) = self.call_chunk(method, chunk, session_id, first.as_ref())?;
+            results.extend(described);
+            first.get_or_insert(checks);
         }
         Ok(results)
     }
 
-    fn call_chunk(&mut self, method: &str, batch: &[Value], session_id: Option<&str>) -> Result<Vec<Value>, String> {
+    fn call_chunk(&mut self, method: &str, batch: &[Value], session_id: Option<&str>, first: Option<&Vec<(String, DocumentState)>>) -> Result<(Vec<Value>, Vec<(String, DocumentState)>), String> {
         let checks = self.page_scope_admit_prepare(method, batch, &batch[0], session_id, BATCH_WAIT, false, true)?;
+        if first.is_some_and(|first| !same_proof(first, &checks)) { return Err(self.refusal()) }
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
         let deadline = Instant::now() + BATCH_WAIT;
         let mut ids = Vec::with_capacity(batch.len());
@@ -722,7 +726,7 @@ impl Cdp {
             self.bind_streams(method, session_id, &result, &checks);
             results.push(result);
         }
-        Ok(results)
+        Ok((results, checks))
     }
 
     fn page_scope_admit_prepare(
@@ -3941,6 +3945,12 @@ fn unguarded(message: String) -> String {
 
 fn frame_text_known(text: &str) -> bool {
     !matches!(text, "" | "null" | "://")
+}
+
+fn same_proof(first: &[(String, DocumentState)], next: &[(String, DocumentState)]) -> bool {
+    first.len() == next.len() && first.iter().zip(next).all(|((target, before), (now, after))| {
+        target == now && before == after && before.page_scope == after.page_scope && before.frames == after.frames
+    })
 }
 
 fn batchable(method: &str, batch: &[Value]) -> bool {
