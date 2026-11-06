@@ -20,10 +20,13 @@ struct ScopeBrowser {
     mid_tree_iframe: Option<Value>,
     mid_tree_pause_session: Option<String>,
     iframe_after_first_inventory: Option<Value>,
+    navigate_on_describe: u32,
+    seed_object: Option<String>,
     user_session: String,
     trees: u32,
     inventories: u32,
     forwarded: Vec<String>,
+    described: Vec<String>,
 }
 
 struct ScopeTransport {
@@ -64,6 +67,38 @@ impl Transport for ScopeTransport {
                 | "CSS.getComputedStyleForNode"
         ) {
             browser.forwarded.push(method.to_string());
+        }
+        if method == "DOM.describeNode" {
+            let id = call["params"].get("objectId").and_then(Value::as_str).unwrap_or("").to_string();
+            browser.described.push(id);
+            if browser.navigate_on_describe > 0 {
+                browser.navigate_on_describe -= 1;
+                let (url, origin, unreachable) = browser.navigate_to.clone().unwrap_or_else(|| {
+                    (format!("https://ordinary.test/d{}", browser.described.len()), "https://ordinary.test".into(), String::new())
+                });
+                browser.loader = format!("L-desc-{}", browser.described.len());
+                browser.url = url.clone();
+                browser.origin = origin.clone();
+                browser.unreachable = unreachable.clone();
+                let mut frame = json!({
+                    "id": "T",
+                    "loaderId": browser.loader,
+                    "url": url,
+                    "securityOrigin": origin,
+                });
+                if !unreachable.is_empty() {
+                    frame["unreachableUrl"] = json!(unreachable);
+                }
+                self.inbox.push_back(json!({
+                    "method": "Page.frameNavigated",
+                    "sessionId": call["sessionId"],
+                    "params": { "frame": frame, "type": "Navigation" },
+                }).to_string());
+                self.inbox.push_back(json!({
+                    "method": "Target.targetInfoChanged",
+                    "params": { "targetInfo": page(&browser.url) },
+                }).to_string());
+            }
         }
         if method == "Page.getFrameTree" {
             browser.trees += 1;
@@ -219,7 +254,13 @@ impl Transport for ScopeTransport {
             "Page.captureScreenshot" => json!({ "data": "pixels" }),
             "Accessibility.getFullAXTree" => json!({ "nodes": [] }),
             "CSS.getComputedStyleForNode" => json!({ "computedStyle": [] }),
-            "Runtime.evaluate" => json!({ "result": { "type": "string", "value": "ok" } }),
+            "Runtime.evaluate" => {
+                if let Some(id) = browser.seed_object.take() {
+                    json!({ "result": { "type": "object", "objectId": id } })
+                } else {
+                    json!({ "result": { "type": "string", "value": "ok" } })
+                }
+            }
             "Browser.getWindowForTarget" => json!({ "windowId": 1, "bounds": { "windowState": "normal" } }),
             _ => json!({}),
         };
@@ -278,10 +319,13 @@ fn configured(
         mid_tree_iframe: None,
         mid_tree_pause_session: None,
         iframe_after_first_inventory: None,
+        navigate_on_describe: 0,
+        seed_object: None,
         user_session: String::new(),
         trees: 0,
         inventories: 0,
         forwarded: Vec::new(),
+        described: Vec::new(),
     }));
     let mut cdp = Cdp::from_transport(Box::new(ScopeTransport {
         browser: browser.clone(),
@@ -686,4 +730,115 @@ fn a_reload_between_describe_node_checks_rechecks_the_new_document() {
     assert!(cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).is_ok());
     assert!(browser.borrow().inventories > first);
     assert!(browser.borrow().url.ends_with("/reloaded"));
+}
+
+fn describe_batch() -> Vec<Value> {
+    vec![json!({ "objectId": "A" }), json!({ "objectId": "B" })]
+}
+
+fn seed_describe_objects(cdp: &mut Cdp, session: &str, browser: &Rc<RefCell<ScopeBrowser>>) {
+    for id in ["A", "B"] {
+        browser.borrow_mut().seed_object = Some(id.into());
+        cdp.call("Runtime.evaluate", json!({ "expression": "1", "returnByValue": false }), Some(session)).unwrap();
+    }
+    let mut browser = browser.borrow_mut();
+    browser.inventories = 0;
+    browser.trees = 0;
+    browser.forwarded.clear();
+    browser.described.clear();
+}
+
+fn batch_client(
+    navigate_on_tree: u32,
+    navigate_to: Option<(&str, &str, &str)>,
+) -> (Cdp, String, Rc<RefCell<ScopeBrowser>>) {
+    let (mut cdp, session, browser) = configured(0, navigate_to, false, false, false, None, None, vec![]);
+    seed_describe_objects(&mut cdp, &session, &browser);
+    {
+        let mut browser = browser.borrow_mut();
+        browser.navigate_on_tree = navigate_on_tree;
+        browser.navigate_to = navigate_to.map(|(url, origin, unreachable)| (url.into(), origin.into(), unreachable.into()));
+    }
+    (cdp, session, browser)
+}
+
+#[test]
+fn a_batch_pre_check_navigation_to_an_ordinary_document_retries_and_sends_once() {
+    let (mut cdp, session, browser) = batch_client(1, Some(("https://ordinary.test/done", "https://ordinary.test", "")));
+    let results = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(browser.borrow().inventories >= 2);
+    assert!(browser.borrow().url.ends_with("/done"));
+    assert_eq!(browser.borrow().described, vec!["A".to_string(), "B".to_string()]);
+}
+
+#[test]
+fn a_batch_pre_check_navigation_to_a_protected_document_refuses_without_sending() {
+    let (mut cdp, session, browser) = batch_client(1, Some(("https://seven.sliccy.ai/app", "https://seven.sliccy.ai", "")));
+    let message = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap_err();
+    assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
+    assert_ne!(message, PAGE_CHANGED);
+    assert!(browser.borrow().described.is_empty());
+}
+
+#[test]
+fn a_batch_pre_check_navigation_to_a_sealed_document_refuses_without_sending() {
+    let (mut cdp, session, browser) = batch_client(1, Some(("chrome-error://chromewebdata/", "://", "")));
+    let message = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap_err();
+    assert!(message.starts_with("slicc: refused:"), "{message}");
+    assert_ne!(message, PAGE_CHANGED);
+    assert!(browser.borrow().described.is_empty());
+}
+
+#[test]
+fn a_batch_navigation_after_the_first_request_refuses_without_retry() {
+    let (mut cdp, session, browser) = batch_client(0, Some(("https://ordinary.test/after", "https://ordinary.test", "")));
+    browser.borrow_mut().navigate_on_describe = 1;
+    browser.borrow_mut().inventories = 0;
+    browser.borrow_mut().described.clear();
+    let message = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap_err();
+    assert!(message.starts_with("slicc: refused:"), "{message}");
+    assert!(!browser.borrow().described.is_empty());
+    assert_eq!(browser.borrow().described.iter().filter(|id| *id == "A").count(), 1);
+    assert_eq!(browser.borrow().described.iter().filter(|id| *id == "B").count(), 1);
+}
+
+#[test]
+fn a_batch_under_a_held_holder_pause_does_not_retry() {
+    let (mut cdp, session, browser) = batch_client(u32::MAX, None);
+    cdp.webmcp.paused.insert(session.clone());
+    let message = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap_err();
+    assert_eq!(message, PAGE_CHANGED);
+    assert_eq!(browser.borrow().inventories, 1);
+    assert!(browser.borrow().described.is_empty());
+}
+
+#[test]
+fn a_batch_under_a_paused_document_does_not_retry() {
+    let (mut cdp, session, browser) = batch_client(u32::MAX, None);
+    cdp.paused_documents.insert((session.clone(), "REQ".into()));
+    let message = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap_err();
+    assert_eq!(message, PAGE_CHANGED);
+    assert_eq!(browser.borrow().inventories, 1);
+    assert!(browser.borrow().described.is_empty());
+}
+
+#[test]
+fn a_retried_batch_re_admits_every_call_on_each_attempt() {
+    let (mut cdp, session, browser) = batch_client(1, Some(("https://ordinary.test/done", "https://ordinary.test", "")));
+    cdp.admit_probe.clear();
+    assert!(cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).is_ok());
+    assert!(browser.borrow().inventories >= 2);
+    let ids: Vec<_> = cdp.admit_probe.iter().filter_map(|params| params.get("objectId").and_then(Value::as_str).map(str::to_string)).collect();
+    assert_eq!(ids, vec!["A".to_string(), "B".to_string(), "A".to_string(), "B".to_string()]);
+}
+
+#[test]
+fn a_non_batchable_shape_falls_back_per_call() {
+    let (mut cdp, session, browser) = client(1, Some(("https://ordinary.test/done", "https://ordinary.test")), false);
+    let batch = vec![json!({ "nodeId": 1 }), json!({ "nodeId": 2 })];
+    let results = cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(browser.borrow().inventories >= 3);
+    assert_eq!(browser.borrow().forwarded.iter().filter(|method| *method == "DOM.describeNode").count(), 2);
 }

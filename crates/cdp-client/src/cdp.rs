@@ -205,6 +205,8 @@ pub struct Cdp {
     #[cfg(test)]
     runtime_probe: Vec<Value>,
     #[cfg(test)]
+    admit_probe: Vec<Value>,
+    #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
 }
 
@@ -329,6 +331,8 @@ impl Cdp {
             runtime_preparing: false,
             #[cfg(test)]
             runtime_probe: Vec::new(),
+            #[cfg(test)]
+            admit_probe: Vec::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
         }
@@ -575,42 +579,12 @@ impl Cdp {
         let session_id = session_id.filter(|id| !id.is_empty());
         #[cfg(test)]
         if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
-        let overall = Instant::now() + timeout.min(DOCUMENT_CHECK * page_scope::PAGE_SCOPE_ATTEMPTS);
-        let retry_eligible = retry_opt_in && !holder_debugger && self.page_scope_prepare_retry_eligible(method, session_id);
-        let mut attempt = 0;
-        let mut checks;
-        loop {
-            attempt += 1;
-            let left = overall.saturating_duration_since(Instant::now());
-            if left.is_zero() { return Err(self.refusal()) }
-            #[cfg(test)]
-            self.runtime_stage(method, "admit");
+        if method == "Target.createTarget" {
+            let left = timeout.min(OPTIONAL_STEP);
             self.admit_for(method, &params, session_id, holder_debugger, left)?;
-            if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
-            if method == "Target.createTarget" {
-                return self.create_target(params, timeout);
-            }
-            #[cfg(test)]
-            self.runtime_stage(method, "prepare");
-            match self.prepare(method, &params, session_id, overall) {
-                Ok(prepared) => { checks = prepared; break; }
-                Err(error) if error == PAGE_CHANGED
-                    && retry_eligible
-                    && self.page_scope_prepare_retry_still_allowed(session_id)
-                    && attempt < page_scope::PAGE_SCOPE_ATTEMPTS
-                    && Instant::now() < overall => continue,
-                Err(error) if error == PAGE_CHANGED => {
-                    if attempt > 1 {
-                        let left = overall.saturating_duration_since(Instant::now());
-                        if !left.is_zero() {
-                            self.admit_for(method, &params, session_id, holder_debugger, left)?;
-                        }
-                    }
-                    return Err(PAGE_CHANGED.to_string());
-                }
-                Err(error) => return Err(error),
-            }
+            return self.create_target(params, timeout);
         }
+        let mut checks = self.page_scope_admit_prepare(method, std::slice::from_ref(&params), &params, session_id, timeout, holder_debugger, retry_opt_in)?;
         #[cfg(test)]
         self.runtime_stage(method, "pin");
         let pinned = self.pin_execution(method, &params, session_id, &mut checks)?;
@@ -701,8 +675,7 @@ impl Cdp {
         if !batchable(method, &batch) {
             return batch.into_iter().map(|params| self.call(method, params, session_id)).collect();
         }
-        for params in &batch { self.admit_for(method, params, session_id, false)?; }
-        let checks = self.prepare(method, &batch[0], session_id)?;
+        let checks = self.page_scope_admit_prepare(method, &batch, &batch[0], session_id, Duration::from_secs(30), false, true)?;
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
         let mut ids = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
@@ -736,6 +709,63 @@ impl Cdp {
             results.push(result);
         }
         Ok(results)
+    }
+
+    fn page_scope_admit_prepare(
+        &mut self,
+        method: &str,
+        admissions: &[Value],
+        prepare_params: &Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        holder_debugger: bool,
+        retry_opt_in: bool,
+    ) -> Result<Vec<(String, DocumentState)>, String> {
+        let overall = Instant::now() + timeout.min(DOCUMENT_CHECK * page_scope::PAGE_SCOPE_ATTEMPTS);
+        let retry_eligible = retry_opt_in && !holder_debugger && self.page_scope_prepare_retry_eligible(method, session_id);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let left = overall.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(self.refusal()) }
+            #[cfg(test)]
+            self.runtime_stage(method, "admit");
+            let refresh = left.min(OPTIONAL_STEP);
+            for params in admissions {
+                #[cfg(test)]
+                self.admit_probe.push(params.clone());
+                self.admit_for(method, params, session_id, holder_debugger, refresh)?;
+            }
+            if method == "Page.navigate" {
+                if let Some(params) = admissions.first() { self.remember_navigation(params, session_id); }
+            }
+            #[cfg(test)]
+            self.runtime_stage(method, "prepare");
+            let prepare_until = Instant::now() + left.min(DOCUMENT_CHECK);
+            match self.prepare(method, prepare_params, session_id, prepare_until) {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) if error == PAGE_CHANGED
+                    && retry_eligible
+                    && self.page_scope_prepare_retry_still_allowed(session_id)
+                    && attempt < page_scope::PAGE_SCOPE_ATTEMPTS
+                    && Instant::now() < overall => continue,
+                Err(error) if error == PAGE_CHANGED => {
+                    if attempt > 1 {
+                        let left = overall.saturating_duration_since(Instant::now());
+                        if !left.is_zero() {
+                            let refresh = left.min(OPTIONAL_STEP);
+                            for params in admissions {
+                                #[cfg(test)]
+                                self.admit_probe.push(params.clone());
+                                self.admit_for(method, params, session_id, holder_debugger, refresh)?;
+                            }
+                        }
+                    }
+                    return Err(PAGE_CHANGED.to_string());
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn start_navigation(&mut self, params: Value, session: Option<&str>) -> Result<i64, String> {
