@@ -886,7 +886,7 @@ impl Cdp {
             if !provisional && cdp.guard.url(text("url")) { return None; }
             let unsettled = provisional || matches!(text("securityOrigin"), "" | "null" | "://") || text("loaderId").is_empty();
             if !unsettled && !cdp.webmcp_frame_verified(frame) { return None; }
-            let mut result = false;
+            let mut result = unsettled;
             if let Some(children) = node.get("childFrames") {
                 for child in children.as_array()? { result |= pending(cdp, child, id)?; }
             }
