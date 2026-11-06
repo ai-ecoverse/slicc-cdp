@@ -574,16 +574,28 @@ impl Cdp {
         let session_id = session_id.filter(|id| !id.is_empty());
         #[cfg(test)]
         if method == "Runtime.evaluate" { self.runtime_probe.clear(); }
-        #[cfg(test)]
-        self.runtime_stage(method, "admit");
-        self.admit_for(method, &params, session_id, holder_debugger)?;
-        if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
-        if method == "Target.createTarget" {
-            return self.create_target(params, timeout);
+        let retry = self.page_scope_prepare_retry_allowed(method, session_id, holder_debugger);
+        let overall = Instant::now() + DOCUMENT_CHECK * page_scope::PAGE_SCOPE_ATTEMPTS;
+        let mut attempt = 0;
+        let mut checks;
+        loop {
+            attempt += 1;
+            #[cfg(test)]
+            self.runtime_stage(method, "admit");
+            self.admit_for(method, &params, session_id, holder_debugger)?;
+            if method == "Page.navigate" { self.remember_navigation(&params, session_id); }
+            if method == "Target.createTarget" {
+                return self.create_target(params, timeout);
+            }
+            #[cfg(test)]
+            self.runtime_stage(method, "prepare");
+            match self.prepare(method, &params, session_id) {
+                Ok(prepared) => { checks = prepared; break; }
+                Err(error) if error == PAGE_CHANGED && retry && attempt < page_scope::PAGE_SCOPE_ATTEMPTS && Instant::now() < overall => continue,
+                Err(error) if error == PAGE_CHANGED => return Err(PAGE_CHANGED.to_string()),
+                Err(error) => return Err(error),
+            }
         }
-        #[cfg(test)]
-        self.runtime_stage(method, "prepare");
-        let mut checks = self.prepare(method, &params, session_id)?;
         #[cfg(test)]
         self.runtime_stage(method, "pin");
         let pinned = self.pin_execution(method, &params, session_id, &mut checks)?;
@@ -1045,6 +1057,14 @@ impl Cdp {
                         info.get("type").and_then(Value::as_str) == Some("page") && !self.info_protected(info, &[])
                     })
             })
+    }
+
+    fn page_scope_prepare_retry_allowed(&self, method: &str, session: Option<&str>, holder_debugger: bool) -> bool {
+        if holder_debugger || !page_scope::content(method) { return false }
+        let Some(target) = session.and_then(|session| self.session_target(session)) else { return false };
+        if self.document_paused(&target) || self.unchecked_document(&target) { return false }
+        let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+        !url.is_empty() && url != "about:blank"
     }
 
     fn prepare(&mut self, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<(String, DocumentState)>, String> {

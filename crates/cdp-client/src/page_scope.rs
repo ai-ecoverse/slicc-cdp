@@ -2,7 +2,14 @@ use super::*;
 
 const MAX_FRAMES: usize = 4096;
 const MAX_TARGETS: usize = 256;
-const PAGE_SCOPE_ATTEMPTS: u32 = 3;
+pub(super) const PAGE_SCOPE_ATTEMPTS: u32 = 3;
+
+struct PageScopeScratch {
+    targets: BTreeMap<String, Value>,
+    page_scope_sessions: BTreeMap<String, String>,
+    guard_sessions: BTreeSet<String>,
+    session_targets: BTreeMap<String, String>,
+}
 
 pub(super) fn content(method: &str) -> bool {
     ["Runtime.", "DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
@@ -49,29 +56,41 @@ impl Cdp {
     }
 
     pub(super) fn verify_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
-        self.page_scope_retry(session, false)
+        self.page_scope_state(session, false, None)
     }
 
     pub(super) fn verify_runtime_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
-        self.page_scope_retry(session, true)
-    }
-
-    fn page_scope_retry(&mut self, session: Option<&str>, refresh_main: bool) -> Result<((String, u64, u64), DocumentState), String> {
-        let overall = Instant::now() + DOCUMENT_CHECK * PAGE_SCOPE_ATTEMPTS;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let deadline = (Instant::now() + DOCUMENT_CHECK).min(overall);
-            match self.page_scope_state(session, refresh_main && attempt == 1, Some(deadline)) {
-                Ok(result) => return Ok(result),
-                Err(error) if error == PAGE_CHANGED && attempt < PAGE_SCOPE_ATTEMPTS && Instant::now() < overall => continue,
-                Err(error) if error == PAGE_CHANGED => return Err(PAGE_CHANGED.to_string()),
-                Err(error) => return Err(error),
-            }
-        }
+        self.page_scope_state(session, true, None)
     }
 
     pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
+        let scratch = PageScopeScratch {
+            targets: self.targets.clone(),
+            page_scope_sessions: self.page_scope_sessions.clone(),
+            guard_sessions: self.guard_sessions.clone(),
+            session_targets: self.session_targets.clone(),
+        };
+        match self.page_scope_state_attempt(session, refresh_main, saved_deadline) {
+            Ok(result) => Ok(result),
+            Err(error) if error == PAGE_CHANGED => {
+                let stale: Vec<String> = self.page_scope_sessions.iter()
+                    .filter(|(target, session)| scratch.page_scope_sessions.get(*target) != Some(session))
+                    .map(|(_, session)| session.clone())
+                    .collect();
+                self.targets = scratch.targets;
+                self.page_scope_sessions = scratch.page_scope_sessions;
+                self.guard_sessions = scratch.guard_sessions;
+                self.session_targets = scratch.session_targets;
+                for session in stale {
+                    let _ = self.send("Target.detachFromTarget", json!({"sessionId":session}), None);
+                }
+                Err(PAGE_CHANGED.to_string())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn page_scope_state_attempt(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
         #[cfg(test)]
         self.runtime_prepare_probe("scope-selected-session", json!({"target_known":session.and_then(|session| self.session_target(session)).is_some()}));
         let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.unverified())?;
@@ -94,6 +113,7 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-selected-type", json!({"page":selected.get("type").and_then(Value::as_str) == Some("page"),"iframe":selected.get("type").and_then(Value::as_str) == Some("iframe")}));
         if !matches!(selected.get("type").and_then(Value::as_str), Some("page" | "iframe")) { return Err(self.refusal()) }
+        if self.info_protected(selected, infos) || self.protected_targets.contains(&target) { return Err(self.refusal()) }
         let context = selected.get("browserContextId").cloned();
         let candidates: Vec<Value> = infos.iter().filter(|info| info.get("browserContextId") == context.as_ref()
             && matches!(info.get("type").and_then(Value::as_str), Some("page" | "iframe"))).cloned().collect();
@@ -183,15 +203,16 @@ impl Cdp {
         #[cfg(test)]
         self.runtime_prepare_probe("iframe-ancestry", json!({}));
         for id in &iframe_roots { owner(id).ok_or_else(|| self.unverified())?; }
+        let mut next_owners = BTreeMap::new();
         for id in nodes.keys() {
-            if let Some(page) = owner(id) { self.page_scope_owners.insert(id.clone(), page); }
+            if let Some(page) = owner(id) { next_owners.insert(id.clone(), page); }
         }
         for (target, root) in &target_roots {
-            if let Some(page) = owner(root) { self.page_scope_owners.insert(target.clone(), page); }
+            if let Some(page) = owner(root) { next_owners.insert(target.clone(), page); }
         }
         for info in &infos {
             let id = info.get("targetId").and_then(Value::as_str).unwrap();
-            if info.get("type").and_then(Value::as_str) == Some("page") { self.page_scope_owners.insert(id.to_string(), id.to_string()); }
+            if info.get("type").and_then(Value::as_str) == Some("page") { next_owners.insert(id.to_string(), id.to_string()); }
         }
         let page = if selected.get("type").and_then(Value::as_str) == Some("page") { target.clone() } else { owner(target_roots.get(&target).map(String::as_str).unwrap_or(&target)).ok_or_else(|| self.unverified())? };
         #[cfg(test)]
@@ -199,7 +220,6 @@ impl Cdp {
         if protected_iframes.iter().any(|id| owner(id).as_deref() == Some(&page)) { return Err(self.refusal()) }
         if nodes.keys().any(|id| owner(id).as_deref() == Some(&page) && inside_extension(id)) { return Err(self.refusal()) }
         let held: Vec<String> = extension_iframes.iter().filter(|(_, parent)| owner(parent).as_deref() == Some(&page)).map(|(id, _)| id.clone()).collect();
-        if held.is_empty() { self.extension_frames.remove(&page); } else { self.extension_frames.insert(page.clone(), held); }
         #[cfg(test)]
         self.runtime_prepare_probe("root-placement", json!({}));
         let root = roots.iter().find(|(_, owner)| *owner == &page).map(|(id, _)| id).ok_or_else(|| self.unverified())?;
@@ -215,7 +235,7 @@ impl Cdp {
                 && unknown == self.page_scope_unknown && runtime_epochs.get(&page).copied().unwrap_or(0) == self.runtime_scope_epochs.get(&page).copied().unwrap_or(0)
                 && guard.is_some() && guard.as_ref() == self.guards.get(&page) && !self.protected_targets.contains(&page)
                 && session.is_some_and(|session| !self.blocked.contains(session)) {
-                return self.page_scope_state(session, false, Some(deadline));
+                return self.page_scope_state_attempt(session, false, Some(deadline));
             }
             return Err(self.page_changed());
         }
@@ -231,6 +251,8 @@ impl Cdp {
                     && if frame[4].is_empty() { self.documents.get(&page).is_some_and(|doc| !doc.previous) } else { self.frame_decisions.get(id) == Some(&false) };
                 !ordinary_error && (self.guard.url(&frame[1]) || self.guard.url(&frame[2]))
             }) { return Err(self.refusal()) }
+        for (id, owner_page) in next_owners { self.page_scope_owners.insert(id, owner_page); }
+        if held.is_empty() { self.extension_frames.remove(&page); } else { self.extension_frames.insert(page.clone(), held); }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
             self.note_parent(id, &evidence[4]);

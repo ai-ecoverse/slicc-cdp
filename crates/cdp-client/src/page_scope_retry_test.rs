@@ -4,11 +4,18 @@ struct ScopeBrowser {
     url: String,
     origin: String,
     loader: String,
+    unreachable: String,
+    iframes: Vec<Value>,
     navigate_on_tree: u32,
-    navigate_to: Option<(String, String)>,
+    navigate_to: Option<(String, String, String)>,
+    protect_url_after_nav: Option<String>,
+    bump_unknown_on_tree: bool,
+    drop_iframes_after: Option<u32>,
+    tree_error_with_nav: bool,
     silent_tree: bool,
     trees: u32,
     inventories: u32,
+    forwarded: Vec<String>,
 }
 
 struct ScopeTransport {
@@ -24,6 +31,16 @@ impl Transport for ScopeTransport {
         let method = call["method"].as_str().unwrap();
         if method == "Target.getTargets" && call["params"].get("filter").is_some() {
             browser.inventories += 1;
+            if let Some(url) = browser.protect_url_after_nav.clone().filter(|_| browser.inventories > 1) {
+                browser.url = url;
+                browser.origin = browser.url.rsplit_once('/').map(|(origin, _)| origin.to_string()).unwrap_or_else(|| browser.url.clone());
+            }
+            if browser.drop_iframes_after.is_some_and(|after| browser.inventories > after) {
+                browser.iframes.clear();
+            }
+        }
+        if matches!(method, "DOM.describeNode" | "Page.captureScreenshot" | "Runtime.evaluate") {
+            browser.forwarded.push(method.to_string());
         }
         if method == "Page.getFrameTree" {
             browser.trees += 1;
@@ -31,21 +48,49 @@ impl Transport for ScopeTransport {
                 self.inbox.push_back(json!({ "id": call["id"], "sessionId": call["sessionId"], "error": { "message": "No frame" } }).to_string());
                 return Ok(());
             }
-            if browser.navigate_on_tree > 0 {
+            if browser.tree_error_with_nav {
+                browser.tree_error_with_nav = false;
+                browser.loader = format!("L{}", browser.trees);
+                let frame = json!({
+                    "id": "T",
+                    "loaderId": browser.loader,
+                    "url": browser.url,
+                    "securityOrigin": browser.origin,
+                });
+                self.inbox.push_back(json!({
+                    "method": "Page.frameNavigated",
+                    "sessionId": call["sessionId"],
+                    "params": { "frame": frame, "type": "Navigation" },
+                }).to_string());
+                self.inbox.push_back(json!({ "id": call["id"], "sessionId": call["sessionId"], "error": { "message": "No frame" } }).to_string());
+                return Ok(());
+            }
+            if browser.bump_unknown_on_tree && browser.navigate_on_tree > 0 {
                 browser.navigate_on_tree -= 1;
-                let (url, origin) = browser.navigate_to.clone().unwrap_or_else(|| {
+                self.inbox.push_back(json!({
+                    "method": "Page.frameAttached",
+                    "sessionId": "UNKNOWN",
+                    "params": { "frameId": "UNKNOWN", "parentFrameId": "UNKNOWN_PARENT" },
+                }).to_string());
+            } else if browser.navigate_on_tree > 0 {
+                browser.navigate_on_tree -= 1;
+                let (url, origin, unreachable) = browser.navigate_to.clone().unwrap_or_else(|| {
                     let next = browser.trees;
-                    (format!("https://ordinary.test/n{next}"), "https://ordinary.test".into())
+                    (format!("https://ordinary.test/n{next}"), "https://ordinary.test".into(), String::new())
                 });
                 browser.loader = format!("L{}", browser.trees);
                 browser.url = url.clone();
                 browser.origin = origin.clone();
-                let frame = json!({
+                browser.unreachable = unreachable.clone();
+                let mut frame = json!({
                     "id": "T",
                     "loaderId": browser.loader,
                     "url": url,
                     "securityOrigin": origin,
                 });
+                if !unreachable.is_empty() {
+                    frame["unreachableUrl"] = json!(unreachable);
+                }
                 self.inbox.push_back(json!({
                     "method": "Page.frameNavigated",
                     "sessionId": call["sessionId"],
@@ -63,7 +108,11 @@ impl Transport for ScopeTransport {
                 json!({ "sessionId": format!("S{}", self.attached) })
             }
             "Target.getTargetInfo" => json!({ "targetInfo": page(&browser.url) }),
-            "Target.getTargets" => json!({ "targetInfos": [page(&browser.url)] }),
+            "Target.getTargets" => {
+                let mut infos = vec![page(&browser.url)];
+                infos.extend(browser.iframes.iter().cloned());
+                json!({ "targetInfos": infos })
+            }
             "Page.getFrameTree" => json!({
                 "frameTree": {
                     "frame": {
@@ -71,11 +120,29 @@ impl Transport for ScopeTransport {
                         "loaderId": browser.loader,
                         "url": browser.url,
                         "securityOrigin": browser.origin,
+                        "unreachableUrl": browser.unreachable,
                     },
                 },
             }),
+            "Runtime.enable" => {
+                self.inbox.push_back(json!({
+                    "method": "Runtime.executionContextCreated",
+                    "sessionId": call["sessionId"],
+                    "params": {
+                        "context": {
+                            "id": 1,
+                            "uniqueId": format!("context:{}", browser.loader),
+                            "origin": browser.origin,
+                            "name": "",
+                            "auxData": { "frameId": "T", "isDefault": true },
+                        },
+                    },
+                }).to_string());
+                json!({})
+            }
             "DOM.describeNode" => json!({ "node": { "nodeId": 1, "backendNodeId": 1, "nodeName": "HTML" } }),
             "DOM.getDocument" => json!({ "root": { "nodeId": 1, "backendNodeId": 1, "nodeName": "HTML" } }),
+            "Page.captureScreenshot" => json!({ "data": "pixels" }),
             "Runtime.evaluate" => json!({ "result": { "type": "string", "value": "ok" } }),
             "Browser.getWindowForTarget" => json!({ "windowId": 1, "bounds": { "windowState": "normal" } }),
             _ => json!({}),
@@ -93,16 +160,40 @@ fn page(url: &str) -> Value {
     json!({ "targetId": "T", "type": "page", "url": url, "title": "", "browserContextId": "CTX" })
 }
 
+fn iframe(id: &str, url: &str) -> Value {
+    json!({ "targetId": id, "type": "iframe", "parentFrameId": "T", "url": url, "title": "", "browserContextId": "CTX" })
+}
+
 fn client(navigate_on_tree: u32, navigate_to: Option<(&str, &str)>, silent_tree: bool) -> (Cdp, String, Rc<RefCell<ScopeBrowser>>) {
+    configured(navigate_on_tree, navigate_to.map(|(url, origin)| (url, origin, "")), silent_tree, false, false, None, None, vec![])
+}
+
+fn configured(
+    navigate_on_tree: u32,
+    navigate_to: Option<(&str, &str, &str)>,
+    silent_tree: bool,
+    tree_error_with_nav: bool,
+    bump_unknown_on_tree: bool,
+    protect_url_after_nav: Option<&str>,
+    drop_iframes_after: Option<u32>,
+    iframes: Vec<Value>,
+) -> (Cdp, String, Rc<RefCell<ScopeBrowser>>) {
     let browser = Rc::new(RefCell::new(ScopeBrowser {
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         loader: "L0".into(),
+        unreachable: String::new(),
+        iframes: iframes.clone(),
         navigate_on_tree: 0,
-        navigate_to: navigate_to.map(|(url, origin)| (url.into(), origin.into())),
+        navigate_to: navigate_to.map(|(url, origin, unreachable)| (url.into(), origin.into(), unreachable.into())),
+        protect_url_after_nav: None,
+        bump_unknown_on_tree: false,
+        drop_iframes_after: None,
+        tree_error_with_nav: false,
         silent_tree: false,
         trees: 0,
         inventories: 0,
+        forwarded: Vec::new(),
     }));
     let mut cdp = Cdp::from_transport(Box::new(ScopeTransport {
         browser: browser.clone(),
@@ -114,8 +205,14 @@ fn client(navigate_on_tree: u32, navigate_to: Option<(&str, &str)>, silent_tree:
         let mut browser = browser.borrow_mut();
         browser.trees = 0;
         browser.inventories = 0;
+        browser.forwarded.clear();
         browser.navigate_on_tree = navigate_on_tree;
         browser.silent_tree = silent_tree;
+        browser.tree_error_with_nav = tree_error_with_nav;
+        browser.bump_unknown_on_tree = bump_unknown_on_tree;
+        browser.protect_url_after_nav = protect_url_after_nav.map(str::to_string);
+        browser.drop_iframes_after = drop_iframes_after;
+        browser.iframes = iframes;
     }
     (cdp, session, browser)
 }
@@ -139,12 +236,47 @@ fn a_navigation_to_an_ordinary_document_during_the_check_retries_and_succeeds() 
 
 #[test]
 fn a_navigation_to_a_protected_document_during_the_check_keeps_the_protected_refusal() {
-    let (mut cdp, session, browser) = client(1, Some(("https://seven.sliccy.ai/app", "https://seven.sliccy.ai")), false);
+    let (mut cdp, session, browser) = configured(
+        1, None, false, false, true, Some("https://seven.sliccy.ai/app"), None, vec![],
+    );
     let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
     assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
     assert_ne!(message, PAGE_CHANGED);
     assert_ne!(message, UNVERIFIED);
-    assert!(browser.borrow().url.contains("seven.sliccy.ai"));
+    assert!(browser.borrow().inventories >= 2);
+    assert!(!browser.borrow().forwarded.iter().any(|method| method == "DOM.describeNode"));
+}
+
+#[test]
+fn a_navigation_to_the_vault_during_the_check_keeps_the_protected_refusal() {
+    let (mut cdp, session, browser) = configured(
+        1, None, false, false, true, Some("https://vault.sliccy.ai/box"), None, vec![],
+    );
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
+    assert_ne!(message, PAGE_CHANGED);
+    assert!(browser.borrow().inventories >= 2);
+    assert!(!browser.borrow().forwarded.iter().any(|method| method == "DOM.describeNode"));
+}
+
+#[test]
+fn a_sealed_error_page_during_the_check_is_refused_and_not_forwarded() {
+    for method in ["DOM.describeNode", "Page.captureScreenshot"] {
+        let (mut cdp, session, browser) = configured(
+            1,
+            Some(("chrome-error://chromewebdata/", "://", "")),
+            false,
+            false,
+            false,
+            None,
+            None,
+            vec![],
+        );
+        let message = cdp.call(method, json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+        assert_eq!(message, format!("{}\n", cdp.guard.refusal()), "{method}");
+        assert_ne!(message, PAGE_CHANGED, "{method}");
+        assert!(!browser.borrow().forwarded.iter().any(|sent| sent == method), "{method} {:?}", browser.borrow().forwarded);
+    }
 }
 
 #[test]
@@ -162,6 +294,94 @@ fn a_check_the_browser_does_not_answer_is_not_retried() {
     assert_eq!(message, UNVERIFIED);
     assert_eq!(browser.borrow().inventories, 1);
     assert_eq!(browser.borrow().trees, 1);
+}
+
+#[test]
+fn a_get_frame_tree_error_with_an_epoch_move_is_retried() {
+    let (mut cdp, session, browser) = configured(0, None, false, true, false, None, None, vec![]);
+    assert!(cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).is_ok());
+    assert!(browser.borrow().inventories >= 2);
+}
+
+#[test]
+fn a_runtime_evaluate_retries_a_main_frame_change() {
+    let (mut cdp, session, browser) = client(0, None, false);
+    assert!(cdp.call("Runtime.evaluate", json!({ "expression": "1", "returnByValue": true }), Some(&session)).is_ok());
+    browser.borrow_mut().inventories = 0;
+    browser.borrow_mut().forwarded.clear();
+    browser.borrow_mut().navigate_on_tree = 1;
+    browser.borrow_mut().navigate_to = Some(("https://ordinary.test/eval".into(), "https://ordinary.test".into(), String::new()));
+    assert!(cdp.call("Runtime.evaluate", json!({ "expression": "1", "returnByValue": true }), Some(&session)).is_ok());
+    assert!(browser.borrow().inventories >= 2);
+    assert!(browser.borrow().url.ends_with("/eval"));
+}
+
+#[test]
+fn a_closed_connection_is_not_retried_as_page_changed() {
+    let (mut cdp, session, browser) = client(1, Some(("https://ordinary.test/x", "https://ordinary.test")), false);
+    cdp.closed = Some("websocket closed\n".into());
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_eq!(message, "websocket closed\n");
+    assert_ne!(message, PAGE_CHANGED);
+    assert!(browser.borrow().inventories <= 1);
+}
+
+#[test]
+fn a_paused_document_does_not_retry_the_page_check() {
+    let (mut cdp, session, browser) = client(u32::MAX, None, false);
+    cdp.paused_documents.insert((session.clone(), "REQ".into()));
+    let start = Instant::now();
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_eq!(message, PAGE_CHANGED);
+    assert_eq!(browser.borrow().inventories, 1);
+    assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn an_empty_url_target_does_not_opt_into_page_check_retry() {
+    let (mut cdp, session, browser) = client(u32::MAX, None, false);
+    cdp.targets.insert("T".into(), page(""));
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_eq!(message, PAGE_CHANGED);
+    assert_eq!(browser.borrow().inventories, 1);
+}
+
+#[test]
+fn a_protected_iframe_appearing_during_the_check_is_refused() {
+    let (mut cdp, session, browser) = configured(0, None, false, false, false, None, None, vec![iframe("SEVEN", "https://seven.sliccy.ai/app")]);
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
+    assert!(!browser.borrow().forwarded.iter().any(|method| method == "DOM.describeNode"));
+}
+
+#[test]
+fn a_torn_iframe_owner_from_a_failed_attempt_still_refuses_when_omitted() {
+    let (mut cdp, session, browser) = client(0, None, false);
+    cdp.page_scope_owners.insert("CHILD".into(), "T".into());
+    cdp.targets.insert("CHILD".into(), iframe("CHILD", "https://ordinary.test/child"));
+    {
+        let mut browser = browser.borrow_mut();
+        browser.inventories = 0;
+        browser.forwarded.clear();
+        browser.navigate_on_tree = 1;
+        browser.navigate_to = Some(("https://ordinary.test/next".into(), "https://ordinary.test".into(), String::new()));
+        browser.drop_iframes_after = Some(1);
+        browser.iframes = vec![iframe("CHILD", "https://ordinary.test/child")];
+    }
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_ne!(message, PAGE_CHANGED);
+    assert!(message.starts_with("slicc: refused:"), "{message}");
+    assert!(!browser.borrow().forwarded.iter().any(|method| method == "DOM.describeNode"));
+}
+
+#[test]
+fn page_scope_prepare_retry_stays_off_for_holder_and_paused_paths() {
+    let (cdp, session, _) = client(0, None, false);
+    assert!(cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session), false));
+    assert!(!cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session), true));
+    let mut cdp = cdp;
+    cdp.paused_documents.insert((session.clone(), "REQ".into()));
+    assert!(!cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session), false));
 }
 
 #[test]
