@@ -470,6 +470,7 @@ impl Cdp {
         let session = owner.as_str();
         let attached = self.webmcp.holders.values().any(|holder| holder == session);
         let debug = self.webmcp.arms.get(session).is_some_and(|arm| !arm.plain);
+        self.webmcp_detach_parked_children(session);
         self.webmcp_revoke(session);
         if debug {
             let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
@@ -693,6 +694,7 @@ impl Cdp {
                 let _ = self.send("Debugger.removeBreakpoint", json!({"breakpointId":identifier}), Some(session));
             }
         }
+        self.webmcp_detach_parked_children(session);
         self.webmcp_trace_stage(session, "revoke", reason);
     }
 
@@ -1070,7 +1072,7 @@ impl Cdp {
             revoked_at: None,
             revoked_reason: None,
             pending_contexts: BTreeMap::new(),
-            pending_install: Some(Instant::now() + DOCUMENT_CHECK),
+            pending_install: None,
             pending_frames: BTreeMap::new(),
             accepted: BTreeSet::new(),
             installing: BTreeSet::new(),
@@ -1083,6 +1085,19 @@ impl Cdp {
         self.raw_call("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         Ok(bridge)
+    }
+
+    fn webmcp_parked_child(&self, session: &str) -> bool {
+        self.webmcp.parents.contains_key(session)
+            && self.webmcp.quarantined.contains(session)
+            && self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none())
+    }
+
+    fn webmcp_detach_parked_children(&mut self, parent: &str) {
+        let parked = self.webmcp.parents.iter().filter(|(child, owner)| *owner == parent && self.webmcp_parked_child(child)).map(|(child, _)| child.clone()).collect::<Vec<_>>();
+        for child in parked {
+            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+        }
     }
 
     fn webmcp_child_origin(&self, child: &str) -> Option<String> {
@@ -1112,7 +1127,15 @@ impl Cdp {
             return Err(self.refusal());
         }
         if !self.webmcp.requested_origins.contains(&origin) {
+            if let Some(arm) = self.webmcp.arms.get_mut(child) {
+                arm.pending_install = None;
+            }
             return Ok(false);
+        }
+        if let Some(arm) = self.webmcp.arms.get_mut(child) {
+            if arm.pending_install.is_none() {
+                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
+            }
         }
         let parent_root = self.webmcp_root_document(parent, until)?;
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1161,6 +1184,11 @@ impl Cdp {
         }).cloned().collect::<Vec<_>>();
         for child in waiting {
             let Some(parent) = self.webmcp.parents.get(&child).cloned() else { continue; };
+            if let Some(arm) = self.webmcp.arms.get_mut(&child) {
+                if arm.pending_install.is_none() {
+                    arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
+                }
+            }
             let until = Instant::now() + DOCUMENT_CHECK;
             match self.webmcp_adopt_install(&child, &parent, until) {
                 Ok(true) => {}
@@ -1211,16 +1239,22 @@ impl Cdp {
             if seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|frame_url| self.guard.extension_frame(frame_url)) {
                 return Err(self.refusal());
             }
-            self.webmcp_child_arm(&child, &seed, direct)?;
-            if let Some(arm) = self.webmcp.arms.get_mut(&child) {
-                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
+            let parked = self.webmcp.quarantined.iter().filter(|session| {
+                self.webmcp.parents.contains_key(*session)
+                    && self.webmcp.arms.get(*session).is_none_or(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none())
+            }).count();
+            if parked > 1024 {
+                return Err(self.refusal());
             }
+            self.webmcp_child_arm(&child, &seed, direct)?;
             let parent_frame = self.webmcp.arms.get(&parent).and_then(|arm| arm.root_identity.as_ref()).map(|(_, context)| context.frame.clone())
                 .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
             let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
             let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
             if child_tree && self.webmcp_tree_verified(&seed, None) {
                 let _ = self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP);
+            } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
+                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
             }
             Ok(())
         })();
@@ -1428,6 +1462,10 @@ impl Cdp {
             let initial_child = child_frame
                 && frame.get("url").and_then(Value::as_str).is_some_and(|url| url.is_empty() || url == "about:blank")
                 && frame.get("unreachableUrl").and_then(Value::as_str).is_none_or(|url| url.is_empty());
+            if self.webmcp_parked_child(session) && !initial_child && frame.get("parentId").is_none() {
+                self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                return true;
+            }
             if let Some(reason) = self.webmcp_frame_refusal(frame).filter(|_| !initial_child) {
                 self.webmcp_trace_navigation(session, frame);
                 let role = if self.webmcp.parents.contains_key(session) { "OOPIF" } else if frame.get("parentId").is_some() { "subframe" } else { "top frame" };
@@ -1437,6 +1475,9 @@ impl Cdp {
                 }
             }
             self.webmcp_navigated(session, value);
+            if !child_frame && frame.get("parentId").is_none() {
+                self.webmcp_detach_parked_children(session);
+            }
             if self.webmcp.parents.contains_key(session) {
                 self.webmcp_finish_awaiting_children();
             }

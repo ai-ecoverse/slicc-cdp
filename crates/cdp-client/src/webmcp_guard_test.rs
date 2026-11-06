@@ -1108,13 +1108,33 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     }
     let before = state.borrow().sent.len();
     late.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
-    assert!(late.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "verified child must stay armed until the origin is requested");
+    assert!(late.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()), "verified unrequested child must park with no deadline");
+    assert!(late.webmcp.quarantined.contains("CHILD"));
+    assert!(
+        late.webmcp_snapshot().iter().any(|session| {
+            session["session"] == "CHILD" && session["pendingOrigins"].as_array().is_some_and(|origins| origins.iter().any(|origin| origin == "https://foreign.test"))
+        }),
+        "parked child origin must be visible to pendingOrigins"
+    );
     assert!(
         !state.borrow().sent[before..].iter().any(|command| {
             command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
         }),
         "shim must not evaluate before --from-origin"
     );
+    late.webmcp_sweep();
+    assert!(!late.session_blocked("CHILD"), "parked child must survive a sweep with no deadline");
+    assert!(late.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()));
+    let before = state.borrow().sent.len();
+    late.webmcp_request_origins(&["https://other.test".into()]);
+    assert!(
+        !state.borrow().sent[before..].iter().any(|command| {
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+        }),
+        "unrelated requested origin must not install a parked child"
+    );
+    assert!(!late.session_blocked("CHILD"));
+    assert!(late.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()));
     let before = state.borrow().sent.len();
     late.webmcp_request_origins(&["https://foreign.test".into()]);
     let child_evals = state.borrow().sent[before..].iter().filter(|command| {
@@ -1123,6 +1143,22 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     assert_eq!(child_evals, 1, "exactly one child shim evaluate after the origin is requested");
     assert!(!late.session_blocked(&holder));
     assert!(late.webmcp_alive(&holder));
+
+    let (mut rooted, state) = client();
+    state.borrow_mut().oopif_tree = Some(verified.clone());
+    rooted.start_webmcp_for("H", true).unwrap();
+    let holder = rooted.webmcp_session("H").to_string();
+    rooted.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = rooted.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    rooted.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(rooted.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()));
+    rooted.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
+    assert!(rooted.session_blocked("CHILD") || !rooted.webmcp.parents.contains_key("CHILD"), "parent root navigation must detach parked children");
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
 
     let (mut buffered, state) = client();
     state.borrow_mut().oopif_tree = Some(verified);
