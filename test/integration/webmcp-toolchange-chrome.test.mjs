@@ -352,11 +352,15 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           '--from-origin',
           `https://foreign.test:${port}`,
         ]);
-        assert.equal(listed.code, 0, listed.stderr);
+        assert.equal(
+          listed.code,
+          0,
+          `list failed\nlist stderr: ${listed.stderr}\nholder trace: ${held.stderr()}`
+        );
         assert.equal(
           listed.stderr.includes('cross-origin child tools are unavailable'),
           false,
-          listed.stderr
+          `guarded-route refusal\nlist stderr: ${listed.stderr}\nholder trace: ${held.stderr()}`
         );
         await evaluate(raw, childSession, 'addCross()');
         const after = await once(wire.url, cwd, [
@@ -367,11 +371,19 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           '--from-origin',
           `https://foreign.test:${port}`,
         ]);
-        assert.equal(after.code, 0, after.stderr);
+        assert.equal(
+          after.code,
+          0,
+          `list after addCross failed\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
+        );
         const tools = JSON.parse(after.stdout);
-        assert.ok(tools.some((tool) => tool.name === 'initial'));
         assert.ok(
-          tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId)
+          tools.some((tool) => tool.name === 'initial'),
+          `initial missing\nholder trace: ${held.stderr()}`
+        );
+        assert.ok(
+          tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId),
+          `cross_late missing from ${JSON.stringify(tools)}\nholder trace: ${held.stderr()}`
         );
         const called = await once(wire.url, cwd, [
           'webmcp-call',
@@ -382,7 +394,11 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           '--from-origin',
           `https://foreign.test:${port}`,
         ]);
-        assert.equal(called.code, 0, called.stderr);
+        assert.equal(
+          called.code,
+          0,
+          `call failed\ncall stderr: ${called.stderr}\nholder trace: ${held.stderr()}`
+        );
         assert.equal(called.stdout.trim(), 'cross_late');
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
         return child.targetId;
@@ -403,7 +419,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
       held.child.stdin.end();
-      assert.equal(await held.ended, 0, held.stderr());
+      assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
 
       held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
       const restarted = await held.next((line) => line.event === 'ready', 0);
@@ -412,11 +428,11 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       await crossControl([cross.targetId, navigatedCross]);
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       held.child.stdin.end();
-      assert.equal(await held.ended, 0, held.stderr());
+      assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
       held = undefined;
     } catch (error) {
       throw new Error(
-        `${error.message}\nholder: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        `${error.message}\nholder trace: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
         { cause: error }
       );
     } finally {

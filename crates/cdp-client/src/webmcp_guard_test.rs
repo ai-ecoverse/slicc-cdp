@@ -1092,3 +1092,60 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty());
     assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty());
 }
+
+#[test]
+fn private_oopif_attach_does_not_touch_protect_or_guard_the_root_but_settled_child_traces_as_root() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    let before = state.borrow().sent.len();
+    let root_blocked = cdp.session_blocked(&holder);
+    let root_guarded = cdp.guard_sessions.contains(&holder);
+    let root_content = cdp.content_blocked(&holder);
+    let root_protected = cdp.protected_targets.contains("T");
+    let page_document = cdp.documents.get("T").map(|document| document.url.clone());
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    let after_attach = state.borrow().sent[before..].to_vec();
+    assert!(
+        !after_attach.iter().any(|command| {
+            command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "T"
+        }),
+        "private auto-attach must not touch the page target: {after_attach:?}"
+    );
+    assert_eq!(cdp.session_blocked(&holder), root_blocked, "adopt must not block the root session");
+    assert_eq!(cdp.guard_sessions.contains(&holder), root_guarded, "adopt must not place the root in guard_sessions");
+    assert_eq!(cdp.content_blocked(&holder), root_content, "adopt must not content-block the root");
+    assert_eq!(cdp.protected_targets.contains("T"), root_protected, "adopt must not protect_target the page");
+    assert_eq!(cdp.documents.get("T").map(|document| document.url.clone()), page_document, "adopt must not clear the page document (page:unknown)");
+    assert_eq!(cdp.guards.get("IFRAME").map(String::as_str), Some("CHILD"), "adopt registers the OOPIF as its own guard slot");
+    assert!(!cdp.guard_sessions.contains("CHILD"), "OOPIF guard slot is not a Fetch guard_sessions entry");
+    assert!(cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(!cdp.session_blocked(&holder));
+    assert!(!cdp.content_blocked(&holder));
+    assert!(cdp.webmcp_alive(&holder));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
+    }
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"), "deadline settle blocks the child");
+    assert!(!cdp.webmcp.parents.contains_key("CHILD"), "detach reply forgets the child and drops parents during settle");
+    assert!(!cdp.session_blocked(&holder), "root stays unblocked after child settle/forget");
+    assert!(!cdp.content_blocked(&holder), "root stays content-unblocked after child settle/forget");
+    assert!(!cdp.guard_sessions.contains(&holder));
+    assert!(cdp.documents.get("T").is_some(), "page document remains; root page label stays known");
+    assert!(
+        cdp.session_blocked("CHILD") && cdp.content_blocked("CHILD") && !cdp.webmcp.parents.contains_key("CHILD"),
+        "settled child stays blocked after forget, so webmcp_trace_stage labels it sessionRole:root frameRole:unknown page:unknown"
+    );
+    assert_eq!(cdp.guards.get("IFRAME"), None, "forget abandons the OOPIF guard slot via protect_target on IFRAME only");
+    assert!(cdp.protected_targets.contains("IFRAME"));
+    assert!(!cdp.protected_targets.contains("T") || root_protected);
+}
