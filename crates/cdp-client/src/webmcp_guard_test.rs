@@ -864,8 +864,8 @@ fn direct_auto_attach_marks_the_arm_and_refused_or_attested_routes_stay_detach_o
     cdp.start_webmcp_for("H", true).unwrap();
     cdp.webmcp_auto_attach("H").unwrap();
     assert!(cdp.webmcp.arms["H"].direct_child_attach);
-    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.setAutoAttach" && command["params"]["waitForDebuggerOnStart"] == true));
-    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.setAutoAttach" && command["params"]["waitForDebuggerOnStart"] == false));
+    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":false})));
     assert!(cdp.webmcp_child_evidence() || cdp.webmcp.parents.contains_key("CHILD") || cdp.session_blocked("CHILD"));
 
     let (mut guarded, state) = client();
@@ -874,9 +874,10 @@ fn direct_auto_attach_marks_the_arm_and_refused_or_attested_routes_stay_detach_o
     guarded.webmcp_auto_attach("H").unwrap();
     assert!(!guarded.webmcp.arms["H"].direct_child_attach);
     let before = state.borrow().sent.len();
-    guarded.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    guarded.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":false})));
     assert!(guarded.session_blocked("CHILD"));
-    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger" || command["method"] == "Target.detachFromTarget"));
+    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.detachFromTarget"));
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
     assert!(guarded.take_webmcp_children().is_empty());
 }
 
@@ -1035,11 +1036,8 @@ fn unverified_child_is_armed_then_released_at_deadline() {
     cdp.webmcp_auto_attach(&holder).unwrap();
     assert!(cdp.webmcp.arms[&holder].direct_child_attach);
     let before = state.borrow().sent.len();
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":true}}));
-    assert!(
-        state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger" && command["sessionId"] == "CHILD"),
-        "provisional child must be released from the debugger wait"
-    );
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
     assert!(!cdp.content_blocked("CHILD"));
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "unverified child must be armed with a deadline");
     if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
@@ -1067,13 +1065,14 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     }
     assert!(cdp.webmcp.arms[&holder].admitted > 0);
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":true}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
     assert!(cdp.webmcp_alive(&holder), "root must stay ready while adopting an OOPIF");
     assert!(!cdp.webmcp.arms[&holder].revoked);
     assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty(), "root pendingContexts must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_contexts);
     assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty(), "root pendingFrames must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_frames);
     assert!(!cdp.content_blocked("CHILD"), "OOPIF must not be content-blocked before install");
     assert!(!cdp.session_blocked("CHILD"), "OOPIF must not settle as blocked before install");
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"), "late Option A must not hold the OOPIF");
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "blank OOPIF must stay armed until commit");
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"FRAME","parentId":"F","url":"https://foreign.test/cross","securityOrigin":"","loaderId":""}}}));
     assert!(!cdp.webmcp.arms[&holder].revoked, "parent-session iframe navigation must not revoke the root");

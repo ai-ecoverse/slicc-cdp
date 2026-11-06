@@ -283,7 +283,7 @@ impl Cdp {
         }
         if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = true; }
         self.webmcp.buffering_attach = true;
-        let result = self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(&session), OPTIONAL_STEP);
+        let result = self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(&session), OPTIONAL_STEP);
         self.webmcp.buffering_attach = false;
         let pending = std::mem::take(&mut self.webmcp.pending_attaches);
         match result {
@@ -459,7 +459,6 @@ impl Cdp {
         }
         self.notices.push(format!("webmcp-polyfill: {notice}\n"));
         self.webmcp_revoke(child);
-        let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), DOCUMENT_CHECK);
         let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
         self.blocked.insert(child.to_string());
         self.webmcp.quarantined.remove(child);
@@ -1046,7 +1045,6 @@ impl Cdp {
     }
 
     fn webmcp_release_child(&mut self, child: &str) {
-        let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(child), DOCUMENT_CHECK);
         let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
         self.blocked.insert(child.to_string());
     }
@@ -1215,7 +1213,6 @@ impl Cdp {
             }
             Ok(())
         })();
-        let _ = self.raw_call("Runtime.runIfWaitingForDebugger", json!({}), Some(&child), DOCUMENT_CHECK);
         if outcome.is_err() {
             self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
         }
@@ -1236,7 +1233,6 @@ impl Cdp {
                 let _ = self.send("Debugger.resume", json!({}), Some(owner));
             } else if let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str) {
                 self.webmcp_revoke(child);
-                let _ = self.send("Runtime.runIfWaitingForDebugger", json!({}), Some(child));
                 let _ = self.send("Debugger.resume", json!({}), Some(child));
                 let _ = self.send("Target.detachFromTarget", json!({"sessionId":child}), None);
             }
