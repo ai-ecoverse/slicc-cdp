@@ -7,15 +7,23 @@ use serde_json::{json, Value};
 
 fn child_evidence(state: &Session, target: &str) -> bool {
     state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
+        if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
         entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
             sessions.iter().any(|session| {
-                session.get("directChildAttach").and_then(Value::as_bool) == Some(true)
-                    || session.get("target").and_then(Value::as_str).is_some_and(|child| child != target)
+                let owns_page = session.get("target").and_then(Value::as_str) == Some(target);
+                (owns_page && session.get("directChildAttach").and_then(Value::as_bool) == Some(true))
+                    || (!owns_page
+                        && session.get("target").and_then(Value::as_str).is_some()
+                        && session.get("quarantined").and_then(Value::as_bool) != Some(true))
                     || session.get("admittedOrigins").and_then(Value::as_array).is_some_and(|origins| {
                         let root = session.get("documents").and_then(Value::as_object).and_then(|documents| {
-                            documents.values().find_map(|document| document.get("origin").and_then(Value::as_str))
+                            documents.values().find_map(|document| {
+                                (document.get("frameId").and_then(Value::as_str) == Some(target))
+                                    .then(|| document.get("origin").and_then(Value::as_str))
+                                    .flatten()
+                            })
                         });
-                        origins.iter().filter_map(Value::as_str).any(|origin| root != Some(origin))
+                        origins.iter().filter_map(Value::as_str).any(|origin| root.is_some_and(|root| root != origin))
                     })
             })
         })

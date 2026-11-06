@@ -618,9 +618,8 @@ for (const message of [
           backend.calls.some(
             (call) =>
               call.method === 'Runtime.evaluate' &&
-              call.sessionId &&
-              call.sessionId !== 'TAB' &&
-              String(call.params?.expression || '').startsWith('const __wmcp_')
+              String(call.params?.expression || '').startsWith('const __wmcp_') &&
+              String(call.params?.uniqueContextId || '').includes('-CROSS')
           ),
           false
         );

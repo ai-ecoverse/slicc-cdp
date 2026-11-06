@@ -22,6 +22,7 @@ struct BackendState {
     attach_on_auto_attach: bool,
     refuse_auto_attach: bool,
     route: Option<String>,
+    oopif_tree: Option<Value>,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -119,17 +120,38 @@ impl Transport for Backend {
                     state.inbox.push_back(json!({"id":command["id"],"error":{"message":"verification failed"}}).to_string());
                     return Ok(());
                 }
-                state.tree.clone()
+                if command["sessionId"] == "CHILD" {
+                    if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
+                } else {
+                    state.tree.clone()
+                }
+            }
+            "Target.attachToTarget" => {
+                let target = command["params"]["targetId"].as_str().unwrap_or("");
+                json!({"sessionId": format!("TOUCH-{target}")})
             }
             "Runtime.enable" => {
-                let mut created = context(&state.current_frame, "https://ordinary.test");
-                created["sessionId"] = command["sessionId"].clone();
-                state.inbox.push_back(created.to_string());
-                let child = state.runtime_child.clone().or_else(|| state.initial_child.then(|| json!({"id":8,"uniqueId":"CHILD-CONTEXT","origin":state.tree["frameTree"]["childFrames"][0]["frame"]["securityOrigin"],"auxData":{"frameId":"C","isDefault":true}})));
-                if let Some(child) = child {
-                    state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":command["sessionId"],"params":{"context":child}}).to_string());
+                let session = command["sessionId"].as_str().unwrap_or("H");
+                if session == "CHILD" {
+                    if let Some(child) = state.runtime_child.clone().or_else(|| {
+                        state.oopif_tree.as_ref().map(|tree| {
+                            let frame = &tree["frameTree"]["frame"];
+                            json!({"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}})
+                        })
+                    }) {
+                        state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":child}}).to_string());
+                    }
+                    json!({})
+                } else {
+                    let mut created = context(&state.current_frame, "https://ordinary.test");
+                    created["sessionId"] = command["sessionId"].clone();
+                    state.inbox.push_back(created.to_string());
+                    let child = state.runtime_child.clone().or_else(|| state.initial_child.then(|| json!({"id":8,"uniqueId":"CHILD-CONTEXT","origin":state.tree["frameTree"]["childFrames"][0]["frame"]["securityOrigin"],"auxData":{"frameId":"C","isDefault":true}})));
+                    if let Some(child) = child {
+                        state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":command["sessionId"],"params":{"context":child}}).to_string());
+                    }
+                    json!({})
                 }
-                json!({})
             }
             "Debugger.setInstrumentationBreakpoint" => {
                 state.installed = true;
@@ -986,4 +1008,38 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
     let notices = cdp.take_notices().join("");
     assert!(notices.contains("cross-origin child") || cdp.session_blocked("CHILD") || cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked));
     assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "H" && command["method"] == "Debugger.disable"));
+}
+
+#[test]
+fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"IFRAME","url":"https://foreign.test/","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().runtime_child = Some(json!({"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"IFRAME","isDefault":true}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    assert!(cdp.webmcp.arms[&holder].direct_child_attach);
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    assert!(cdp.webmcp.arms[&holder].admitted > 0);
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
+    assert!(cdp.webmcp_alive(&holder), "root must stay ready while adopting an OOPIF");
+    assert!(!cdp.webmcp.arms[&holder].revoked);
+    assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty(), "root pendingContexts must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_contexts);
+    assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty(), "root pendingFrames must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_frames);
+    assert!(!cdp.content_blocked("CHILD"), "OOPIF must not be content-blocked before install");
+    assert!(!cdp.session_blocked("CHILD"), "OOPIF must not settle as blocked before install");
+    assert!(
+        cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && (arm.admitted > 0 || arm.pending_install.is_some())),
+        "auto-attached OOPIF must install or remain pending, not revoke"
+    );
+    assert!(
+        cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0)
+            || state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))),
+        "requested-origin OOPIF must reach install on the child session"
+    );
 }

@@ -206,8 +206,13 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     let available = evaluate(cdp, &root_scope, "document.modelContext != null", false)?.as_bool() == Some(true);
     let native = native && available;
     let evidence = cdp.webmcp_child_evidence() || state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
+        if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
         entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
-            sessions.iter().any(|session| session.get("directChildAttach").and_then(Value::as_bool) == Some(true) || session.get("target").and_then(Value::as_str).is_some_and(|child| child != target))
+            sessions.iter().any(|session| {
+                let owns_page = session.get("target").and_then(Value::as_str) == Some(target);
+                (owns_page && session.get("directChildAttach").and_then(Value::as_bool) == Some(true))
+                    || (!owns_page && session.get("target").and_then(Value::as_str).is_some() && session.get("quarantined").and_then(Value::as_bool) != Some(true))
+            })
         })
     });
     let from: &[String] = if native || evidence { from } else { &[] };

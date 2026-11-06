@@ -46,7 +46,7 @@ fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str, changes: Valu
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.webmcp_connection = state.webmcp_connection.clone();
     let requested = latest.webmcp.get(target).and_then(|entry| entry.get("requestedOrigins")).cloned();
-    let mut data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes});
+    let mut data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes,"routeAttested":cdp.webmcp_route_attested_snapshot()});
     if let Some(requested) = requested { data["requestedOrigins"] = requested; }
     latest.webmcp.insert(target.to_string(), data.clone());
     session::save_webmcp(&latest)?;

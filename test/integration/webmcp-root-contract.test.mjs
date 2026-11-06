@@ -8,12 +8,14 @@ const chrome = await readFile(
   'utf8'
 );
 const wire = await readFile(new URL('./webmcp-wire.mjs', import.meta.url), 'utf8');
-const start = chrome.indexOf('if (document.modelContext) {');
-const end = chrome.indexOf('\n</script>', start);
-assert.ok(start >= 0 && end > start);
+const start = chrome.indexOf(': `if (document.modelContext) {');
+assert.ok(start >= 0);
+const scriptStart = start + 3;
+const end = chrome.indexOf('}`;', scriptStart);
+assert.ok(end > scriptStart);
 const names = Array.from({ length: 8 }, (_, index) => `tool-${index}`);
 const script = chrome
-  .slice(start, end)
+  .slice(scriptStart, end + 1)
   .replace('${JSON.stringify(names)}', JSON.stringify(names))
   .replace('${JSON.stringify(ordinary)}', JSON.stringify('https://ordinary.invalid'));
 
