@@ -362,13 +362,20 @@ fn describe_elements(
             objects[index] = Some(object.to_string());
         }
     }
+    let present: Vec<String> = objects.iter().flatten().cloned().collect();
+    let mut described = Vec::with_capacity(present.len());
+    for chunk in present.chunks(DESCRIBE_BATCH) {
+        let batch = chunk.iter().map(|object| json!({ "objectId": object })).collect();
+        described.extend(cdp.call_batch("DOM.describeNode", batch, Some(session))?);
+    }
+    let mut described = described.into_iter();
     let mut out = Vec::with_capacity(count);
     for object in objects {
-        let Some(object) = object else {
+        if object.is_none() {
             out.push((None, None));
             continue;
-        };
-        let node = cdp.call("DOM.describeNode", json!({ "objectId": object }), Some(session))?;
+        }
+        let node = described.next().unwrap_or(Value::Null);
         out.push((
             node.pointer("/node/backendNodeId").and_then(Value::as_u64),
             node.pointer("/node/frameId").and_then(Value::as_str).map(str::to_string),
@@ -376,6 +383,8 @@ fn describe_elements(
     }
     Ok(out)
 }
+
+const DESCRIBE_BATCH: usize = 128;
 
 const PENDING_FRAME_URL: &str = "(navigating)";
 
