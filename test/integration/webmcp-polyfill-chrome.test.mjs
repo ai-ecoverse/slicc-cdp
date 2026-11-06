@@ -18,14 +18,7 @@ const binary = path.join(
 );
 
 function command(endpoint, cwd, args) {
-  const env = {
-    ...process.env,
-    HOME: cwd,
-    USERPROFILE: cwd,
-    APPDATA: cwd,
-    XDG_CONFIG_HOME: cwd,
-    SLICC_WEBMCP_TRACE: '1',
-  };
+  const env = { ...process.env, HOME: cwd, USERPROFILE: cwd, APPDATA: cwd, XDG_CONFIG_HOME: cwd };
   delete env.SLICC_CDP_URL;
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
@@ -387,20 +380,16 @@ ${childScript}
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.equal(
-      cross.code,
-      0,
-      `list failed\nlist stderr: ${cross.stderr}\nholder trace: ${holder.stderr()}`
-    );
+    assert.equal(cross.code, 0, cross.stderr);
     assert.equal(
       cross.stderr.includes('cross-origin child tools are unavailable'),
       false,
-      `guarded-route refusal\nlist stderr: ${cross.stderr}\nholder trace: ${holder.stderr()}`
+      cross.stderr
     );
     const crossTools = JSON.parse(cross.stdout);
     assert.ok(
       crossTools.some((tool) => tool.name === 'cross_child'),
-      `cross_child missing from ${JSON.stringify(crossTools)}\nholder trace: ${holder.stderr()}`
+      `cross_child missing from ${JSON.stringify(crossTools)}\n${holder.stderr()}`
     );
     const crossTool = crossTools.find((tool) => tool.name === 'cross_child');
     assert.equal(crossTool.origin, `https://foreign.test:${port}`);
@@ -415,11 +404,7 @@ ${childScript}
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.equal(
-      crossCall.code,
-      0,
-      `call failed\ncall stderr: ${crossCall.stderr}\nholder trace: ${holder.stderr()}`
-    );
+    assert.equal(crossCall.code, 0, crossCall.stderr);
     assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
 
     const restored = raw.waitEvent(
@@ -455,13 +440,6 @@ ${childScript}
       await navigate(raw, sessionId, `${ordinary}/tools`);
       assert.equal((await hasShim(raw, sessionId)).api, false);
     }
-  } catch (error) {
-    throw new Error(
-      `${error.message}\nholder trace: ${holder?.stderr()}\nconversion holder trace: ${conversionHolder?.stderr?.() ?? conversionHolder?.stderr}`,
-      {
-        cause: error,
-      }
-    );
   } finally {
     holder?.child.kill('SIGKILL');
     await ordinaryGuard?.close();
