@@ -488,7 +488,7 @@ impl Cdp {
     fn webmcp_install(&mut self, session: &str, seed: &Value) -> Result<String, String> {
         let shim = vetted_source(SHIM)?;
         let bridge = private_bridge(getrandom::fill)?;
-        let source = format!("if (globalThis.{bridge} == null) {{ const __wmcp_installed = ({shim}); if (__wmcp_installed != null) globalThis.{bridge} = __wmcp_installed; }}");
+        let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
         self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new() });
@@ -609,25 +609,28 @@ impl Cdp {
     }
 
     fn webmcp_evaluate(&mut self, session: &str, id: i64, context: &Context, root: (String, Context), until: Instant) -> Result<(), String> {
+        let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
         let arm = self.webmcp.arms.get(session).filter(|arm| !arm.revoked).ok_or_else(|| self.refusal())?;
         if arm.plain && !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
-        if arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone())) { return Ok(()); }
+        if arm.accepted.contains(&realm) || arm.installing.contains(&realm) { return Ok(()); }
         let source = arm.source.clone();
-        if self.webmcp_bound_root(session, until)? != root || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context) { return Err(self.refusal()); }
-        self.webmcp_check_context(session, id, context, until)?;
-        if self.webmcp_plain(session) && !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
-        if self.webmcp.arms.get(session).is_some_and(|arm| arm.accepted.contains(&(context.frame.clone(), context.loader.clone(), context.unique.clone()))) { return Ok(()); }
-        let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
-        self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?.installing.insert(realm.clone());
-        let result = if self.webmcp.parents.contains_key(session) {
-            self.raw_call("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()))
-        } else {
-            self.call_for("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()))
-        };
+        let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
+        if !arm.installing.insert(realm.clone()) { return Ok(()); }
+        let outcome = (|| -> Result<(), String> {
+            if self.webmcp_bound_root(session, until)? != root || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context) { return Err(self.refusal()); }
+            self.webmcp_check_context(session, id, context, until)?;
+            if self.webmcp_plain(session) && !self.worlds.fallback_safe(session) { return Err(self.refusal()); }
+            if self.webmcp.arms.get(session).is_some_and(|arm| arm.accepted.contains(&realm)) { return Ok(()); }
+            let result = if self.webmcp.parents.contains_key(session) {
+                self.raw_call("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()))
+            } else {
+                self.call_for("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context.unique,"returnByValue":true,"silent":true}), Some(session), until.saturating_duration_since(Instant::now()))
+            }?;
+            if result.get("exceptionDetails").is_some() || self.webmcp_plain(session) && !self.worlds.fallback_safe(session) || self.webmcp_bound_root(session, until)? != root { return Err(self.refusal()); }
+            self.webmcp_check_context(session, id, context, until)
+        })();
         if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.installing.remove(&realm); }
-        let result = result?;
-        if result.get("exceptionDetails").is_some() || self.webmcp_plain(session) && !self.worlds.fallback_safe(session) || self.webmcp_bound_root(session, until)? != root { return Err(self.refusal()); }
-        self.webmcp_check_context(session, id, context, until)
+        outcome
     }
 
     fn webmcp_known_root(&self, session: &str) -> Result<(String, Context), String> {
@@ -1055,9 +1058,9 @@ impl Cdp {
         }
         let realm = (context.frame, context.loader, context.unique);
         if arm.accepted.insert(realm) {
-            arm.admitted = arm.accepted.len();
             self.webmcp.samples.push(started.elapsed().as_micros());
         }
+        arm.admitted = arm.accepted.len();
         let bridge = arm.bridge.clone();
         if self.webmcp.quarantined.remove(session) {
             self.guard_sessions.remove(session);
@@ -1074,7 +1077,7 @@ impl Cdp {
     fn webmcp_child_arm(&mut self, session: &str, seed: &Value, parent_direct: bool) -> Result<String, String> {
         let shim = vetted_source(SHIM)?;
         let bridge = private_bridge(getrandom::fill)?;
-        let source = format!("if (globalThis.{bridge} == null) {{ const __wmcp_installed = ({shim}); if (__wmcp_installed != null) globalThis.{bridge} = __wmcp_installed; }}");
+        let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
         self.webmcp.arms.insert(session.to_string(), Arm {
@@ -1249,6 +1252,16 @@ impl Cdp {
             arm.root_identity = Some((target.clone(), context.clone()));
             arm.pending_install = None;
         }
+        let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
+        if self.webmcp.arms.get(child).is_some_and(|arm| arm.accepted.contains(&realm)) {
+            self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
+            self.webmcp_trace_stage(child, "evaluate", "ok");
+            return Ok(true);
+        }
+        if self.webmcp.arms.get(child).is_some_and(|arm| arm.installing.contains(&realm)) {
+            self.webmcp_trace_stage(child, "evaluate", "ok");
+            return Ok(false);
+        }
         self.webmcp_trace_stage(child, "evaluate", "sending");
         match self.webmcp_evaluate(child, id, &context, parent_root, until) {
             Ok(()) => self.webmcp_trace_stage(child, "evaluate", "ok"),
@@ -1268,7 +1281,7 @@ impl Cdp {
         let mut selected = Vec::new();
         for child in &candidates {
             let parented = self.webmcp.parents.contains_key(child);
-            let arm_ok = self.webmcp.arms.get(child).is_some_and(|arm| !arm.revoked && arm.admitted == 0);
+            let arm_ok = self.webmcp.arms.get(child).is_some_and(|arm| !arm.revoked && arm.admitted == 0 && arm.installing.is_empty());
             let origin = self.webmcp_child_origin(child);
             let requested = origin.as_ref().is_some_and(|origin| self.webmcp.requested_origins.contains(origin));
             if parented && arm_ok && requested {

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 fn webmcp_shim_install(source: &str) -> bool {
-    source.starts_with("const __wmcp_") || source.starts_with("if (globalThis.__wmcp_")
+    source.starts_with("const __wmcp_")
 }
 
 #[derive(Default)]
@@ -1054,15 +1054,72 @@ fn rematching_the_same_child_realm_does_not_raise_admitted() {
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     let admitted = cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted).unwrap_or(0);
     assert!(admitted >= 1);
+    let child_evals = state.borrow().sent.iter().filter(|command| {
+        command["sessionId"] == "CHILD"
+            && command["method"] == "Runtime.evaluate"
+            && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+    }).count();
+    assert_eq!(child_evals, 1, "shim Runtime.evaluate once per realm");
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(admitted), "admitted counts realms, not evaluates");
-    assert!(
+    assert_eq!(
         state.borrow().sent.iter().filter(|command| {
             command["sessionId"] == "CHILD"
                 && command["method"] == "Runtime.evaluate"
-                && command["params"]["expression"].as_str().is_some_and(|source| source.contains("globalThis.") && source.contains("__wmcp_installed"))
-        }).count() >= 1
+                && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+        }).count(),
+        1,
+        "rematch must not send another shim evaluate"
     );
+}
+
+#[test]
+fn adopt_install_and_finish_awaiting_evaluate_the_same_realm_once() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 1));
+    let shim_evals = || state.borrow().sent.iter().filter(|command| {
+        command["sessionId"] == "CHILD"
+            && command["method"] == "Runtime.evaluate"
+            && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+    }).count();
+    assert_eq!(shim_evals(), 1);
+    assert!(cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK).unwrap());
+    cdp.webmcp_finish_awaiting_children();
+    assert_eq!(shim_evals(), 1, "adopt_install then finish_awaiting must not re-send the shim");
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.admitted = 0;
+        arm.accepted.clear();
+        arm.pending_install = None;
+        arm.installing.insert(("FRAME".into(), "CROSS".into(), "CROSS-CTX".into()));
+    }
+    cdp.webmcp.quarantined.insert("CHILD".into());
+    cdp.webmcp_finish_awaiting_children();
+    assert_eq!(shim_evals(), 1, "in-flight installing blocks finish_awaiting from selecting the child");
+    assert_eq!(cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK).ok(), Some(false));
+    assert_eq!(shim_evals(), 1, "in-flight installing makes adopt_install a no-op send");
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.installing.clear();
+        arm.accepted.insert(("FRAME".into(), "CROSS".into(), "CROSS-CTX".into()));
+        arm.admitted = 0;
+        arm.pending_install = None;
+    }
+    cdp.webmcp.quarantined.insert("CHILD".into());
+    assert!(cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK).unwrap());
+    cdp.webmcp_finish_awaiting_children();
+    assert_eq!(shim_evals(), 1, "accepted realm stays at one evaluate after both paths run");
+    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(1));
 }
 
 #[test]
