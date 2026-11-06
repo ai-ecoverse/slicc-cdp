@@ -65,15 +65,7 @@ impl Cdp {
     }
 
     pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
-        match self.page_scope_state_attempt(session, refresh_main, saved_deadline) {
-            Err(error) if error == PAGE_CHANGED => {
-                if let Some(target) = session.and_then(|session| self.session_target(session)) {
-                    self.unchecked_documents.retain(|(owner, _, _), _| owner != &target);
-                }
-                Err(PAGE_CHANGED.to_string())
-            }
-            other => other,
-        }
+        self.page_scope_state_attempt(session, refresh_main, saved_deadline)
     }
 
     fn page_scope_state_attempt(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {

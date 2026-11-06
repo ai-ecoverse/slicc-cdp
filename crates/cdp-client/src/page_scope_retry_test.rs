@@ -13,6 +13,7 @@ struct ScopeBrowser {
     drop_iframes_after: Option<u32>,
     tree_error_with_nav: bool,
     tree_error_with_unknown: bool,
+    tree_error_with_protected_child: bool,
     silent_tree: bool,
     hang_tree_after: Option<u32>,
     inventory_delay: Option<Duration>,
@@ -96,6 +97,25 @@ impl Transport for ScopeTransport {
                     "method": "Page.frameNavigated",
                     "sessionId": call["sessionId"],
                     "params": { "frame": frame, "type": "Navigation" },
+                }).to_string());
+                self.inbox.push_back(json!({ "id": call["id"], "sessionId": call["sessionId"], "error": { "message": "No frame" } }).to_string());
+                return Ok(());
+            }
+            if browser.tree_error_with_protected_child {
+                browser.tree_error_with_protected_child = false;
+                self.inbox.push_back(json!({
+                    "method": "Page.frameNavigated",
+                    "sessionId": call["sessionId"],
+                    "params": {
+                        "frame": {
+                            "id": "C",
+                            "parentId": "T",
+                            "loaderId": "LC",
+                            "url": "https://seven.sliccy.ai/secret",
+                            "securityOrigin": "https://seven.sliccy.ai",
+                        },
+                        "type": "Navigation",
+                    },
                 }).to_string());
                 self.inbox.push_back(json!({ "id": call["id"], "sessionId": call["sessionId"], "error": { "message": "No frame" } }).to_string());
                 return Ok(());
@@ -251,6 +271,7 @@ fn configured(
         drop_iframes_after: None,
         tree_error_with_nav: false,
         tree_error_with_unknown: false,
+        tree_error_with_protected_child: false,
         silent_tree: false,
         hang_tree_after: None,
         inventory_delay: None,
@@ -475,6 +496,51 @@ fn page_scope_prepare_retry_stays_off_for_holder_and_paused_paths() {
     cdp.webmcp.paused.clear();
     cdp.paused_documents.insert((session.clone(), "REQ".into()));
     assert!(!cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session)));
+}
+
+#[test]
+fn page_scope_prepare_retry_ignores_leftover_records_but_not_error_urls() {
+    let (mut cdp, session, _) = client(0, None, false);
+    cdp.unchecked_documents.insert(
+        ("T".into(), session.clone(), "C".into()),
+        super::document_order::ObservedDocument {
+            frame: json!({
+                "id": "C",
+                "parentId": "T",
+                "loaderId": "LC",
+                "url": "https://seven.sliccy.ai/secret",
+                "securityOrigin": "https://seven.sliccy.ai",
+            }),
+            epoch: 0,
+            root: Some(("T".into(), "L0".into())),
+        },
+    );
+    assert!(cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session)));
+    cdp.targets.insert("T".into(), page("chrome-error://chromewebdata/"));
+    assert!(!cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session)));
+}
+
+#[test]
+fn a_protected_child_observed_then_omitted_on_retry_is_refused() {
+    let (mut cdp, session, browser) = client(0, None, false);
+    browser.borrow_mut().tree_error_with_protected_child = true;
+    browser.borrow_mut().inventories = 0;
+    browser.borrow_mut().trees = 0;
+    browser.borrow_mut().forwarded.clear();
+    let message = cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).unwrap_err();
+    assert_eq!(message, format!("{}\n", cdp.guard.refusal()));
+    assert_ne!(message, PAGE_CHANGED);
+    assert!(browser.borrow().inventories >= 2, "inventories={}", browser.borrow().inventories);
+    assert!(!browser.borrow().forwarded.iter().any(|method| method == "DOM.describeNode"));
+}
+
+#[test]
+fn a_main_frame_navigation_record_is_matched_and_cleared_on_retry() {
+    let (mut cdp, session, browser) = client(1, Some(("https://ordinary.test/done", "https://ordinary.test")), false);
+    assert!(cdp.call("DOM.describeNode", json!({ "nodeId": 1 }), Some(&session)).is_ok());
+    assert!(browser.borrow().inventories >= 2);
+    assert!(browser.borrow().url.ends_with("/done"));
+    assert!(!cdp.unchecked_documents.keys().any(|(owner, _, _)| owner == "T"));
 }
 
 #[test]

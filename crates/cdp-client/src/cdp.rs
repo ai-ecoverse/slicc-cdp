@@ -1077,7 +1077,12 @@ impl Cdp {
         let Some(session) = session else { return false };
         if self.webmcp_is_paused(session) { return false }
         let Some(target) = self.session_target(session) else { return false };
-        if self.document_paused(&target) || self.unchecked_document(&target) { return false }
+        if self.document_paused(&target) { return false }
+        if self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url))
+            && self.documents.get(&target).is_none_or(|doc| !self.guard.error_page_url(&doc.url) || self.unverified_error(&doc.url, &doc.unreachable_url))
+        {
+            return false;
+        }
         let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
         !url.is_empty() && url != "about:blank"
     }
