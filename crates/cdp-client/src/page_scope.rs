@@ -2,6 +2,7 @@ use super::*;
 
 const MAX_FRAMES: usize = 4096;
 const MAX_TARGETS: usize = 256;
+const PAGE_SCOPE_ATTEMPTS: u32 = 3;
 
 pub(super) fn content(method: &str) -> bool {
     ["Runtime.", "DOM.", "CSS.", "DOMSnapshot.", "Accessibility.", "Input."].iter().any(|prefix| method.starts_with(prefix))
@@ -48,17 +49,35 @@ impl Cdp {
     }
 
     pub(super) fn verify_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
-        self.page_scope_state(session, false, None)
+        self.page_scope_retry(session, false)
     }
 
     pub(super) fn verify_runtime_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
-        self.page_scope_state(session, true, None)
+        self.page_scope_retry(session, true)
+    }
+
+    fn page_scope_retry(&mut self, session: Option<&str>, refresh_main: bool) -> Result<((String, u64, u64), DocumentState), String> {
+        let overall = Instant::now() + DOCUMENT_CHECK * PAGE_SCOPE_ATTEMPTS;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let deadline = (Instant::now() + DOCUMENT_CHECK).min(overall);
+            match self.page_scope_state(session, refresh_main && attempt == 1, Some(deadline)) {
+                Ok(result) => return Ok(result),
+                Err(error) if error == PAGE_CHANGED && attempt < PAGE_SCOPE_ATTEMPTS && Instant::now() < overall => continue,
+                Err(error) if error == PAGE_CHANGED => return Err(PAGE_CHANGED.to_string()),
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(super) fn page_scope_state(&mut self, session: Option<&str>, refresh_main: bool, saved_deadline: Option<Instant>) -> Result<((String, u64, u64), DocumentState), String> {
         #[cfg(test)]
         self.runtime_prepare_probe("scope-selected-session", json!({"target_known":session.and_then(|session| self.session_target(session)).is_some()}));
         let mut target = session.and_then(|session| self.session_target(session)).ok_or_else(|| self.unverified())?;
+        if session.is_some_and(|session| self.blocked.contains(session)) || self.protected_targets.contains(&target) {
+            return Err(self.refusal());
+        }
         #[cfg(test)]
         self.runtime_prepare_probe("inventory-read", json!({}));
         let left = saved_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(DOCUMENT_CHECK);
@@ -198,7 +217,7 @@ impl Cdp {
                 && session.is_some_and(|session| !self.blocked.contains(session)) {
                 return self.page_scope_state(session, false, Some(deadline));
             }
-            return Err(self.refusal());
+            return Err(self.page_changed());
         }
         if !self.placed_frames(&tree, &mut frames, true, None) {
             #[cfg(test)]
@@ -333,7 +352,18 @@ impl Cdp {
         if left.is_zero() { return Err(self.refusal()) }
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-read", json!({"budget_remaining":!left.is_zero()}));
-        let mut tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.unverified())?;
+        let page = self.page_scope_owner(target).unwrap_or_else(|| target.to_string());
+        let epoch = self.page_scope_epochs.get(&page).copied().unwrap_or(0);
+        let unknown = self.page_scope_unknown;
+        let mut tree = match self.raw_call("Page.getFrameTree", json!({}), Some(&session), left) {
+            Ok(tree) => tree,
+            Err(_) => {
+                if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch || self.page_scope_unknown != unknown {
+                    return Err(self.page_changed());
+                }
+                return Err(self.unverified());
+            }
+        };
         self.verify_document_order(&tree, Some(&session))?;
         #[cfg(test)]
         self.runtime_prepare_probe("renderer-frame-versions", json!({}));
@@ -351,7 +381,17 @@ impl Cdp {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() { return Err(self.refusal()) }
-            tree = self.raw_call("Page.getFrameTree", json!({}), Some(&session), left).map_err(|_| self.unverified())?;
+            let epoch = self.page_scope_epochs.get(&page).copied().unwrap_or(0);
+            let unknown = self.page_scope_unknown;
+            tree = match self.raw_call("Page.getFrameTree", json!({}), Some(&session), left) {
+                Ok(tree) => tree,
+                Err(_) => {
+                    if self.page_scope_epochs.get(&page).copied().unwrap_or(0) != epoch || self.page_scope_unknown != unknown {
+                        return Err(self.page_changed());
+                    }
+                    return Err(self.unverified());
+                }
+            };
             self.verify_document_order(&tree, Some(&session))?;
         }
         Ok(tree)

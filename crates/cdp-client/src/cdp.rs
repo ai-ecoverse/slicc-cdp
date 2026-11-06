@@ -43,6 +43,7 @@ pub const UNSEEN: &str = "slicc: refused: slicc hasn't seen this request, so it 
 pub const UNGUARDED: &str = "slicc: refused: slicc can't keep seven's origin out of this target\n";
 pub const UNANSWERED: &str = "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser)";
 pub const UNVERIFIED: &str = "slicc: refused: slicc could not finish checking this target, so it left it alone; the browser may not answer the check\n";
+pub const PAGE_CHANGED: &str = "slicc: refused: the page changed while slicc was checking it; try again once it settles\n";
 pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
@@ -796,6 +797,10 @@ impl Cdp {
 
     pub fn unverified(&self) -> String {
         self.closed.clone().unwrap_or_else(|| UNVERIFIED.to_string())
+    }
+
+    fn page_changed(&self) -> String {
+        self.closed.clone().unwrap_or_else(|| PAGE_CHANGED.to_string())
     }
 
     fn closing(&mut self, message: String) -> String {
@@ -4318,6 +4323,7 @@ mod tests {
     include!("client_id_test.rs");
     include!("late_reply_test.rs");
     include!("close_latch_test.rs");
+    include!("page_scope_retry_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
