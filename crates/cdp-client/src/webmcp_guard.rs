@@ -1112,11 +1112,19 @@ impl Cdp {
             return Err(self.refusal());
         }
         if !self.webmcp.requested_origins.contains(&origin) {
-            if let Some(arm) = self.webmcp.arms.get_mut(child) { arm.pending_install = None; }
             return Ok(false);
         }
         let parent_root = self.webmcp_root_document(parent, until)?;
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+        if !loader.is_empty() {
+            for ((owner, _), context) in &mut self.webmcp.contexts {
+                if owner == child && context.frame == frame_id && context.origin == origin && !context.unique.is_empty()
+                    && !context.loader.is_empty() && context.loader != loader
+                {
+                    context.loader = loader.clone();
+                }
+            }
+        }
         let Some((id, mut context)) = self.webmcp.contexts.iter().find(|((owner, _), context)| {
             owner == child
                 && context.frame == frame_id
@@ -1124,6 +1132,9 @@ impl Cdp {
                 && !context.unique.is_empty()
                 && (context.loader.is_empty() || context.loader == loader)
         }).map(|(key, context)| (key.1, context.clone())) else {
+            if let Some(arm) = self.webmcp.arms.get_mut(child) {
+                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
+            }
             return Ok(false);
         };
         context.loader = loader.clone();

@@ -20,6 +20,7 @@ struct BackendState {
     child_loader_race: bool,
     runtime_child: Option<Value>,
     attach_on_auto_attach: bool,
+    buffer_child_lifecycle_on_auto_attach: bool,
     refuse_auto_attach: bool,
     route: Option<String>,
     oopif_tree: Option<Value>,
@@ -213,6 +214,13 @@ impl Transport for Backend {
                 if state.attach_on_auto_attach {
                     let parent = command["sessionId"].as_str().unwrap_or("H");
                     state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}).to_string());
+                }
+                if state.buffer_child_lifecycle_on_auto_attach {
+                    let parent = command["sessionId"].as_str().unwrap_or("H");
+                    let frame = state.oopif_tree.as_ref().map(|tree| tree["frameTree"]["frame"].clone()).unwrap_or_else(|| json!({"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}));
+                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":frame["url"].as_str().unwrap_or("https://foreign.test/cross")},"waitingForDebugger":false}}).to_string());
+                    state.inbox.push_back(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":frame.clone()}}).to_string());
+                    state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}}}}).to_string());
                 }
                 json!({})
             }
@@ -968,15 +976,10 @@ fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
     assert!(cdp.webmcp.pending_attaches.is_empty());
     assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"));
     assert!(
-        cdp.session_blocked("EARLY")
-            || cdp.webmcp.parents.contains_key("EARLY")
-            || cdp.webmcp.arms.contains_key("EARLY")
-            || state.borrow().sent[before..].iter().any(|command| {
-                command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "EARLY"
-                    || command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"
-            }),
-        "buffered attach must be adopted after setAutoAttach succeeds"
+        cdp.webmcp.parents.contains_key("EARLY") || cdp.webmcp.arms.contains_key("EARLY"),
+        "buffered attach must be adopted after setAutoAttach succeeds; a merely blocked child is not enough"
     );
+    assert!(!cdp.session_blocked("EARLY") || cdp.webmcp.parents.contains_key("EARLY") || cdp.webmcp.arms.contains_key("EARLY"));
 }
 
 #[test]
@@ -1091,6 +1094,81 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     assert!(!cdp.webmcp.arms[&holder].revoked);
     assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty());
     assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty());
+
+    let (mut late, state) = client();
+    let verified = json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}});
+    state.borrow_mut().oopif_tree = Some(verified.clone());
+    late.start_webmcp_for("H", true).unwrap();
+    let holder = late.webmcp_session("H").to_string();
+    late.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = late.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    let before = state.borrow().sent.len();
+    late.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(late.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "verified child must stay armed until the origin is requested");
+    assert!(
+        !state.borrow().sent[before..].iter().any(|command| {
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+        }),
+        "shim must not evaluate before --from-origin"
+    );
+    let before = state.borrow().sent.len();
+    late.webmcp_request_origins(&["https://foreign.test".into()]);
+    let child_evals = state.borrow().sent[before..].iter().filter(|command| {
+        command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+    }).count();
+    assert_eq!(child_evals, 1, "exactly one child shim evaluate after the origin is requested");
+    assert!(!late.session_blocked(&holder));
+    assert!(late.webmcp_alive(&holder));
+
+    let (mut buffered, state) = client();
+    state.borrow_mut().oopif_tree = Some(verified);
+    state.borrow_mut().buffer_child_lifecycle_on_auto_attach = true;
+    buffered.start_webmcp_for("H", true).unwrap();
+    let holder = buffered.webmcp_session("H").to_string();
+    if let Some(arm) = buffered.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    buffered.webmcp_auto_attach(&holder).unwrap();
+    assert!(buffered.webmcp.parents.contains_key("CHILD") || buffered.webmcp.arms.contains_key("CHILD"));
+    let before = state.borrow().sent.len();
+    buffered.webmcp_request_origins(&["https://foreign.test".into()]);
+    assert!(
+        state.borrow().sent[before..].iter().any(|command| {
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))
+        }),
+        "replayed attach must still install after the origin is requested"
+    );
+    assert!(!buffered.session_blocked(&holder));
+
+    let (mut missing, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().runtime_child = Some(json!({"id":9,"uniqueId":"","origin":"https://foreign.test","auxData":{"frameId":"OTHER","isDefault":true}}));
+    missing.start_webmcp_for("H", true).unwrap();
+    let holder = missing.webmcp_session("H").to_string();
+    missing.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = missing.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    missing.webmcp_request_origins(&["https://foreign.test".into()]);
+    missing.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(missing.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_some()), "context miss must restore the install deadline");
+    if let Some(arm) = missing.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
+    }
+    missing.webmcp_sweep();
+    assert!(missing.session_blocked("CHILD"));
+    let notices = missing.take_notices().join("");
+    assert!(notices.contains("cross-origin child"), "{notices}");
+    assert!(missing.webmcp_alive(&holder));
+    assert!(!missing.webmcp.arms[&holder].revoked);
 }
 
 #[test]
