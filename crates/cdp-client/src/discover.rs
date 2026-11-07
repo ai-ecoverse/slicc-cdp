@@ -196,8 +196,31 @@ pub fn run_slicc_browsers(
     max_stdout: usize,
 ) -> Option<String> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn kill_and_reap(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    fn wait_deadline(child: &mut Child, deadline: Instant) -> Option<std::process::ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    kill_and_reap(child);
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    kill_and_reap(child);
+                    return None;
+                }
+            }
+        }
+    }
 
     let mut command = match program {
         Some(path) => Command::new(path),
@@ -218,7 +241,14 @@ pub fn run_slicc_browsers(
         Ok(child) => child,
         Err(_) => return None,
     };
-    let mut stdout = child.stdout.take()?;
+    let deadline = Instant::now() + timeout;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_and_reap(&mut child);
+            return None;
+        }
+    };
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, ()>>();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -243,15 +273,15 @@ pub fn run_slicc_browsers(
             }
         }
     });
-    let buf = match rx.recv_timeout(timeout) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let buf = match rx.recv_timeout(remaining) {
         Ok(Ok(buf)) => buf,
         Ok(Err(())) | Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             return None;
         }
     };
-    let status = child.wait().ok()?;
+    let status = wait_deadline(&mut child, deadline)?;
     if !status.success() || buf.len() > max_stdout {
         return None;
     }
@@ -992,6 +1022,26 @@ mod tests {
             run_slicc_browsers(Some(&slow), Duration::from_millis(200), CLI_MAX_STDOUT),
             None
         );
+
+        #[cfg(unix)]
+        {
+            let closed = bin.join("closed-stdout-slicc");
+            std::fs::write(&closed, "#!/bin/sh\nexec 1>&-\n/bin/sleep 3\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&closed).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&closed, perms).unwrap();
+            let started = std::time::Instant::now();
+            assert_eq!(
+                run_slicc_browsers(Some(&closed), Duration::from_millis(200), CLI_MAX_STDOUT),
+                None
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(800),
+                "closed-stdout hang exceeded margin: {:?}",
+                started.elapsed()
+            );
+        }
 
         let bad = bin.join("bad-slicc");
         std::fs::write(&bad, "#!/bin/sh\nprintf not-json\nexit 0\n").unwrap();
