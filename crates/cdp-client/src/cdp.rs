@@ -197,6 +197,7 @@ pub struct Cdp {
     webmcp: webmcp_guard::Webmcp,
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
+    pub(crate) batch_wait: Duration,
     issued: issued::Issued,
     waiter: Option<Waiter>,
     waiter_due: Instant,
@@ -324,6 +325,7 @@ impl Cdp {
             webmcp: webmcp_guard::Webmcp::default(),
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
+            batch_wait: BATCH_WAIT,
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
@@ -691,12 +693,12 @@ impl Cdp {
         let checks = self.page_scope_admit_prepare(method, batch, &batch[0], session_id, BATCH_WAIT, false, true)?;
         if first.is_some_and(|first| !same_proof(first, &checks)) { return Err(self.refusal()) }
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
-        let deadline = Instant::now() + BATCH_WAIT;
+        let deadline = Instant::now() + self.batch_wait;
         let mut ids = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
         let mut failed = None;
         for params in batch {
-            if Instant::now() >= deadline { failed = Some(self.refusal()); break }
+            if Instant::now() >= deadline { failed = Some(format!("{method} timed out\n")); break }
             let (forwarded, sent) = self.fetch_command(method, params.clone(), session_id);
             match self.send(&forwarded, sent, session_id) {
                 Ok(id) => { self.waiting_calls.insert(id); ids.push(id); }
@@ -706,7 +708,7 @@ impl Cdp {
         if failed.is_none() {
             for &id in &ids {
                 let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() { failed = Some(self.refusal()); break }
+                if left.is_zero() { failed = Some(format!("{method} timed out\n")); break }
                 match self.raw_reply(method, id, session_id, left, false) {
                     Ok(value) => replies.push(value),
                     Err(message) => { failed = Some(message); break }

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const UNSEEN: &str =
     "slicc: refused: that execution context or object is not exposed to browser automation\n";
@@ -30,6 +30,7 @@ struct Page {
     sessions: Vec<String>,
     pending: Option<Value>,
     fired: bool,
+    delay: Option<Duration>,
 }
 
 impl Page {
@@ -115,15 +116,22 @@ impl Transport for Page {
     }
 
     fn recv_text(&mut self, _: Instant) -> Result<Option<String>, String> {
-        if let Some(value) = self.incoming.pop_front() { return Ok(Some(value.to_string())) }
+        if let Some(value) = self.incoming.pop_front() {
+            if let (Some(delay), true) = (self.delay, value.pointer("/result/node").is_some()) { std::thread::sleep(delay) }
+            return Ok(Some(value.to_string()))
+        }
         if self.closed { return Err("websocket closed 1006 \n".into()) }
         Ok(None)
     }
 }
 
 fn page(objects: usize, twist: Twist) -> (Cdp, Rc<RefCell<Vec<Value>>>, Vec<Value>, String) {
+    slow_page(objects, twist, None)
+}
+
+fn slow_page(objects: usize, twist: Twist, delay: Option<Duration>) -> (Cdp, Rc<RefCell<Vec<Value>>>, Vec<Value>, String) {
     let sent = Rc::new(RefCell::new(Vec::new()));
-    let mut cdp = Cdp::from_transport(Box::new(Page { sent: sent.clone(), incoming: VecDeque::new(), objects, twist, described: 0, closed: false, url: "https://example.test/".into(), sessions: Vec::new(), pending: None, fired: false }));
+    let mut cdp = Cdp::from_transport(Box::new(Page { sent: sent.clone(), incoming: VecDeque::new(), objects, twist, described: 0, closed: false, url: "https://example.test/".into(), sessions: Vec::new(), pending: None, fired: false, delay }));
     let session = crate::cdp::attach(&mut cdp, "T").unwrap();
     cdp.call("Runtime.enable", json!({}), Some(&session)).unwrap();
     let handle = cdp.call("Runtime.evaluate", json!({"expression":"elements"}), Some(&session)).unwrap();
@@ -231,4 +239,22 @@ fn a_reply_that_never_comes_fails_the_whole_batch_and_a_late_reply_cannot_answer
     assert_eq!(message, "DOM.describeNode timed out\n");
     let next = cdp.call("Runtime.evaluate", json!({"expression":"elements"}), Some(&session)).unwrap();
     assert_eq!(next.pointer("/result/objectId").and_then(Value::as_str), Some("elements"));
+}
+
+#[test]
+fn replies_that_each_fit_alone_but_not_together_fail_the_whole_batch_on_one_deadline() {
+    let (mut cdp, sent, batch, session) = slow_page(5, Twist::None, Some(Duration::from_millis(60)));
+    cdp.batch_wait = Duration::from_millis(150);
+    let message = cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap_err();
+    assert_eq!(message, "DOM.describeNode timed out\n");
+    assert_eq!(methods(&sent).last().map(String::as_str), Some("DOM.describeNode"));
+}
+
+#[test]
+fn a_budget_spent_before_the_first_send_fails_the_batch_with_the_same_timeout() {
+    let (mut cdp, sent, batch, session) = page(5, Twist::None);
+    cdp.batch_wait = Duration::ZERO;
+    let message = cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap_err();
+    assert_eq!(message, "DOM.describeNode timed out\n");
+    assert!(methods(&sent).iter().all(|method| method != "DOM.describeNode"));
 }
