@@ -8,12 +8,25 @@ const SHIM_HASH: &str = "911b9c665b7bf8183de1d4eeebb4a96d72ddcfe7b6b222316998c59
 const DEFAULT_ID_CAP: usize = 4096;
 const DEFAULT_PENDING_COUNT: usize = 4096;
 const DEFAULT_PENDING_BYTES: usize = 64 << 20;
+const MAX_TREE_DEPTH: usize = 64;
+const MAX_TREE_NODES: usize = 4096;
 const ID_CAP_ENV: &str = "SLICC_WEBMCP_ID_CAP";
 const PENDING_COUNT_ENV: &str = "SLICC_WEBMCP_PENDING_CAP";
 const PENDING_BYTES_ENV: &str = "SLICC_WEBMCP_PENDING_BYTES";
 
 fn lower_only(default: usize, name: &str) -> usize {
     std::env::var(name).ok().and_then(|text| text.parse::<usize>().ok()).filter(|&n| n > 0).map(|n| n.min(default)).unwrap_or(default)
+}
+
+fn tree_bounded(root: &Value) -> bool {
+    let mut stack = vec![(root, 1usize)];
+    let mut nodes = 0usize;
+    while let Some((node, depth)) = stack.pop() {
+        nodes += 1;
+        if depth > MAX_TREE_DEPTH || nodes > MAX_TREE_NODES { return false; }
+        for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() { stack.push((child, depth + 1)); }
+    }
+    true
 }
 
 fn gate_bytes(value: &Value) -> usize {
@@ -542,7 +555,7 @@ impl Cdp {
             if left.is_zero() || !self.worlds.fallback_safe(session) || self.content_blocked(session) { return Err(self.refusal()); }
             let tree = self.call_for("Page.getFrameTree", json!({}), Some(session), left)?;
             if Instant::now() >= until || !self.worlds.fallback_safe(session) || self.content_blocked(session) { return Err(self.refusal()); }
-            match tree.get("frameTree").and_then(|node| tree_complete(self, node, false)) {
+            match tree.get("frameTree").filter(|node| tree_bounded(node)).and_then(|node| tree_complete(self, node, false)) {
                 Some(true) if self.webmcp_tree_verified(&tree, None) => return Ok(()),
                 Some(false) => { let _ = self.pump(until.min(Instant::now() + Duration::from_millis(25)))?; }
                 _ => return Err(self.refusal()),
@@ -755,19 +768,28 @@ impl Cdp {
             if frame.is_none_or(|frame| frame == id) { return true; }
             node.get("childFrames").and_then(Value::as_array).is_some_and(|children| children.iter().any(|child| find(cdp, child, frame)))
         }
-        tree.get("frameTree").is_some_and(|node| find(self, node, frame))
+        tree.get("frameTree").is_some_and(|node| tree_bounded(node) && find(self, node, frame))
     }
 
     fn webmcp_loaders(node: &Value, out: &mut BTreeMap<String, String>) {
+        if tree_bounded(node) { Self::webmcp_loaders_walk(node, out); }
+    }
+
+    fn webmcp_loaders_walk(node: &Value, out: &mut BTreeMap<String, String>) {
         if let (Some(id), Some(loader)) = (node.pointer("/frame/id").and_then(Value::as_str), node.pointer("/frame/loaderId").and_then(Value::as_str)) {
             if !loader.is_empty() { out.insert(id.to_string(), loader.to_string()); }
         }
-        for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() { Self::webmcp_loaders(child, out); }
+        for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() { Self::webmcp_loaders_walk(child, out); }
     }
 
     fn webmcp_frame<'a>(node: &'a Value, frame: &str) -> Option<&'a Value> {
+        if !tree_bounded(node) { return None; }
+        Self::webmcp_frame_walk(node, frame)
+    }
+
+    fn webmcp_frame_walk<'a>(node: &'a Value, frame: &str) -> Option<&'a Value> {
         if node.pointer("/frame/id").and_then(Value::as_str) == Some(frame) { return node.get("frame"); }
-        node.get("childFrames").and_then(Value::as_array)?.iter().find_map(|child| Self::webmcp_frame(child, frame))
+        node.get("childFrames").and_then(Value::as_array)?.iter().find_map(|child| Self::webmcp_frame_walk(child, frame))
     }
 
     fn webmcp_verify_pause(&mut self, session: &str, paused: &Value, deadline: Instant) -> Result<(String, (String, Context), i64, Context), String> {
@@ -784,7 +806,7 @@ impl Cdp {
         let mut ancestors = BTreeSet::new();
         let mut ancestor_documents = Vec::new();
         while let Some(parent) = self.webmcp.parents.get(&owner).cloned() {
-            if !ancestors.insert(parent.clone()) || !self.webmcp_alive(&parent) {
+            if ancestors.len() >= MAX_TREE_DEPTH || !ancestors.insert(parent.clone()) || !self.webmcp_alive(&parent) {
                 return Err(self.refusal());
             }
             let target = self.session_target(&parent).ok_or_else(|| self.refusal())?;
@@ -887,6 +909,7 @@ impl Cdp {
             || self.documents.get(&root.0).is_none_or(|doc| doc.frame_id != root.1.frame || doc.navigating || doc.probed || doc.previous || !doc.unreachable_url.is_empty()) { return false; }
         let Some(guard) = self.guards.get(&root.0).cloned() else { return false; };
         let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), until.saturating_duration_since(Instant::now())) else { return false; };
+        if !tree_bounded(&tree["frameTree"]) { return false; }
         let frame = &tree["frameTree"]["frame"];
         if !self.webmcp_frame_verified(frame) || self.frame_protected(&root.1.frame)
             || frame.get("id").and_then(Value::as_str) != Some(&root.1.frame)
@@ -1510,7 +1533,7 @@ impl Cdp {
         let mut root = session;
         let mut visited = BTreeSet::new();
         while let Some(parent) = self.webmcp.parents.get(root) {
-            if !visited.insert(root) { return "unknown"; }
+            if visited.len() >= MAX_TREE_DEPTH || !visited.insert(root) { return "unknown"; }
             root = parent;
         }
         let url = self.session_target(root).and_then(|target| self.documents.get(&target)).map(|document| document.url.as_str()).unwrap_or("");
@@ -1727,4 +1750,5 @@ impl Cdp {
 mod tests {
     include!("webmcp_guard_test.rs");
     include!("webmcp_plain_retry_test.rs");
+    include!("webmcp_bounds_test.rs");
 }
