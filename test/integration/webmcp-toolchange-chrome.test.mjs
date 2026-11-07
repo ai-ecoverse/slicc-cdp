@@ -26,7 +26,7 @@ function environment(cwd) {
 function stream(endpoint, cwd, args) {
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
-    env: { ...environment(cwd), SLICC_WEBMCP_TRACE: '1' },
+    env: environment(cwd),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let pending = '';
@@ -413,21 +413,21 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         assert.equal(
           after.code,
           0,
-          `list after gate failed\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
+          `list after gate failed\nlist stderr: ${after.stderr}\n${held.stderr()}`
         );
         assert.equal(
           after.stderr.includes('cross-origin child tools are unavailable'),
           false,
-          `guarded-route refusal\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
+          `guarded-route refusal\nlist stderr: ${after.stderr}\n${held.stderr()}`
         );
         const tools = JSON.parse(after.stdout);
         assert.ok(
           tools.some((tool) => tool.name === 'initial'),
-          `initial missing\nholder trace: ${held.stderr()}`
+          `initial missing\n${held.stderr()}`
         );
         assert.ok(
           tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId),
-          `cross_late missing from ${JSON.stringify(tools)}\nholder trace: ${held.stderr()}`
+          `cross_late missing from ${JSON.stringify(tools)}\n${held.stderr()}`
         );
         const called = await once(wire.url, cwd, [
           'webmcp-call',
@@ -441,7 +441,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         assert.equal(
           called.code,
           0,
-          `call failed\ncall stderr: ${called.stderr}\nholder trace: ${held.stderr()}`
+          `call failed\ncall stderr: ${called.stderr}\n${held.stderr()}`
         );
         assert.equal(called.stdout.trim(), 'cross_late');
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
@@ -470,7 +470,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
       held.child.stdin.end();
-      assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
+      assert.equal(await held.ended, 0, held.stderr());
 
       crossReadyOpen = false;
       held = stream(wire.url, cwd, [
@@ -487,11 +487,11 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       await crossControl([cross.targetId, navigatedCross]);
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       held.child.stdin.end();
-      assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
+      assert.equal(await held.ended, 0, held.stderr());
       held = undefined;
     } catch (error) {
       throw new Error(
-        `${error.message}\nholder trace: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        `${error.message}\nholder: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
         { cause: error }
       );
     } finally {
@@ -682,7 +682,7 @@ if (document.modelContext) document.modelContext.registerTool(${tool('initial')}
     assert.equal(await held.ended, 0, `holder exit\nholder: ${held.stderr()}`);
     held = undefined;
   } catch (error) {
-    throw new Error(`${error.message}\nholder trace: ${held?.stderr()}`, { cause: error });
+    throw new Error(`${error.message}\nholder: ${held?.stderr()}`, { cause: error });
   } finally {
     held?.child.kill('SIGKILL');
     await wire?.close();

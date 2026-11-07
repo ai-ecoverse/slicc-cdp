@@ -1373,7 +1373,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
 }
 
 #[test]
-fn private_oopif_attach_does_not_touch_protect_or_guard_the_root_but_settled_child_traces_as_root() {
+fn private_oopif_attach_does_not_touch_protect_or_guard_the_root() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
     cdp.start_webmcp_for("H", true).unwrap();
@@ -1420,7 +1420,7 @@ fn private_oopif_attach_does_not_touch_protect_or_guard_the_root_but_settled_chi
     assert!(cdp.documents.get("T").is_some(), "page document remains; root page label stays known");
     assert!(
         cdp.session_blocked("CHILD") && cdp.content_blocked("CHILD") && !cdp.webmcp.parents.contains_key("CHILD"),
-        "settled child stays blocked after forget, so webmcp_trace_stage labels it sessionRole:root frameRole:unknown page:unknown"
+        "settled child stays blocked after forget"
     );
     assert_eq!(cdp.guards.get("IFRAME"), None, "forget abandons the OOPIF guard slot via protect_target on IFRAME only");
     assert!(cdp.protected_targets.contains("IFRAME"));
