@@ -472,6 +472,7 @@ impl Cdp {
         for session in stale {
             if self.webmcp.parents.contains_key(&session) || self.webmcp.quarantined.contains(&session) {
                 self.notices.push(format!("webmcp-polyfill: [diag:sweep-deadline] {}\n", self.webmcp_diag_child_state(&session)));
+                self.webmcp_diag_chrome_trees(&session, "sweep-deadline");
                 self.webmcp_settle_child(&session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:sweep-deadline]");
                 continue;
             }
@@ -1338,35 +1339,106 @@ impl Cdp {
         Self::webmcp_frame(&tree["frameTree"], frame).is_some()
     }
 
-    fn webmcp_ancestors_verified(&mut self, child: &str, until: Instant) -> Result<bool, String> {
+    fn webmcp_parent_frame_id(&mut self, target: &str, until: Instant) -> Result<String, String> {
+        if let Some(frame) = self.targets.get(target).and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).filter(|frame| !frame.is_empty()) {
+            return Ok(frame.to_string());
+        }
+        let left = until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP);
+        let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, left)?;
+        let frame = info.pointer("/targetInfo/parentFrameId").and_then(Value::as_str).filter(|frame| !frame.is_empty()).ok_or_else(|| self.refusal())?.to_string();
+        if let Some(Value::Object(stored)) = self.targets.get_mut(target) {
+            stored.insert("parentFrameId".into(), json!(frame.clone()));
+        } else if let Some(target_info) = info.get("targetInfo").cloned() {
+            self.targets.insert(target.to_string(), target_info);
+        }
+        Ok(frame)
+    }
+
+    fn webmcp_root_holder(&self, child: &str) -> Result<String, String> {
         let mut root = child.to_string();
         let mut visited = BTreeSet::new();
         while let Some(parent) = self.webmcp.parents.get(&root).cloned() {
             if !visited.insert(parent.clone()) || !self.webmcp_alive(&parent) { return Err(self.refusal()); }
             root = parent;
         }
-        if root == child { return Ok(true); }
-        let root_target = self.session_target(&root).ok_or_else(|| self.refusal())?;
-        let guard = self.guards.get(&root_target).cloned().unwrap_or_else(|| root.clone());
-        let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP))?;
-        if !self.webmcp_tree_verified(&tree, None) { return Err(self.refusal()); }
-        let child_target = self.session_target(child).ok_or_else(|| self.refusal())?;
-        let child_left = until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP);
-        let frame_f = self.raw_call("Page.getFrameTree", json!({}), Some(child), child_left).ok()
-            .and_then(|tree| tree.pointer("/frameTree/frame/id").and_then(Value::as_str).map(str::to_string))
-            .filter(|frame| !frame.is_empty())
-            .or_else(|| {
-                self.documents.get(&child_target).map(|document| document.frame_id.clone()).filter(|frame| !frame.is_empty())
-            });
-        let placed = match frame_f {
-            Some(frame) if Self::webmcp_child_placed(&tree, &frame) => frame,
-            Some(_) if Self::webmcp_child_placed(&tree, &child_target) => child_target,
-            Some(_) => return Ok(false),
-            None if Self::webmcp_child_placed(&tree, &child_target) => child_target,
-            None => return Ok(false),
-        };
-        if !self.webmcp_frame_ancestry_verified(&tree, &placed) { return Err(self.refusal()); }
-        Ok(true)
+        if root == child { return Err(self.refusal()); }
+        Ok(root)
+    }
+
+    fn webmcp_ancestors_verified(&mut self, child: &str, until: Instant) -> Result<(), String> {
+        let mut target = self.session_target(child).ok_or_else(|| self.refusal())?;
+        let mut seen = BTreeSet::new();
+        let mut depth = 0u32;
+        loop {
+            if depth > 64 || !seen.insert(target.clone()) { return Err(self.refusal()); }
+            depth = depth.saturating_add(1);
+            let parent_frame = self.webmcp_parent_frame_id(&target, until)?;
+            if let Some(nested) = self.session_targets.iter().find(|(session, nested_target)| {
+                self.webmcp.parents.contains_key(*session) && *nested_target == &parent_frame
+            }).map(|(_, nested_target)| nested_target.clone()) {
+                target = nested;
+                continue;
+            }
+            let root = self.webmcp_root_holder(child)?;
+            let root_target = self.session_target(&root).ok_or_else(|| self.refusal())?;
+            let guard = self.guards.get(&root_target).cloned().unwrap_or_else(|| root.clone());
+            let tree = self.raw_call("Page.getFrameTree", json!({}), Some(&guard), until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP))?;
+            if !self.webmcp_tree_verified(&tree, None) { return Err(self.refusal()); }
+            if !Self::webmcp_child_placed(&tree, &parent_frame) { return Err(self.refusal()); }
+            if !self.webmcp_frame_ancestry_verified(&tree, &parent_frame) { return Err(self.refusal()); }
+            return Ok(());
+        }
+    }
+
+    fn webmcp_diag_chrome_trees(&mut self, child: &str, tag: &str) {
+        let target = self.session_target(child).unwrap_or_default();
+        let attached = self.targets.get(&target).cloned().unwrap_or(json!({}));
+        let attach_parent = attached.get("parentFrameId").and_then(Value::as_str).unwrap_or("");
+        let attach_type = attached.get("type").and_then(Value::as_str).unwrap_or("");
+        let attach_opener = attached.get("openerId").and_then(Value::as_str).unwrap_or("");
+        let attach_url = attached.get("url").and_then(Value::as_str).unwrap_or("");
+        let queried = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, OPTIONAL_STEP).ok();
+        let queried_parent = queried.as_ref().and_then(|info| info.pointer("/targetInfo/parentFrameId")).and_then(Value::as_str).unwrap_or("");
+        let root_tree = self.webmcp_root_holder(child).ok().and_then(|holder| {
+            let target = self.session_target(&holder)?;
+            let guard = self.guards.get(&target).cloned().unwrap_or_else(|| holder.clone());
+            self.raw_call("Page.getFrameTree", json!({}), Some(&guard), OPTIONAL_STEP).ok()
+        });
+        let mut root_frames = Vec::new();
+        fn collect(node: &Value, out: &mut Vec<String>) {
+            let frame = &node["frame"];
+            out.push(format!(
+                "id={} parentId={} url={}",
+                frame.get("id").and_then(Value::as_str).unwrap_or(""),
+                frame.get("parentId").and_then(Value::as_str).unwrap_or(""),
+                frame.get("url").and_then(Value::as_str).unwrap_or("")
+            ));
+            for child in node.get("childFrames").and_then(Value::as_array).into_iter().flatten() {
+                collect(child, out);
+            }
+        }
+        if let Some(tree) = root_tree.as_ref().and_then(|tree| tree.get("frameTree")) {
+            collect(tree, &mut root_frames);
+        }
+        let child_tree = self.raw_call("Page.getFrameTree", json!({}), Some(child), OPTIONAL_STEP).ok();
+        let child_root = child_tree.as_ref().map(|tree| {
+            let frame = &tree["frameTree"]["frame"];
+            format!(
+                "id={} parentId={} url={}",
+                frame.get("id").and_then(Value::as_str).unwrap_or(""),
+                frame.get("parentId").and_then(Value::as_str).unwrap_or(""),
+                frame.get("url").and_then(Value::as_str).unwrap_or("")
+            )
+        }).unwrap_or_default();
+        self.notices.push(format!(
+            "webmcp-polyfill: [diag:chrome-trees:{tag}] target={target} type={attach_type} attachParentFrameId={attach_parent} attachParentPresent={} openerId={attach_opener} url={attach_url} getTargetInfoParentFrameId={queried_parent} getTargetInfoParentPresent={} rootFrames=[{}] childRoot={{{}}} {}
+",
+            !attach_parent.is_empty(),
+            !queried_parent.is_empty(),
+            root_frames.join("; "),
+            child_root,
+            self.webmcp_diag_child_state(child)
+        ));
     }
 
     fn webmcp_adopt_install(&mut self, child: &str, parent: &str, until: Instant) -> Result<bool, String> {
@@ -1390,16 +1462,10 @@ impl Cdp {
             self.webmcp_diag_adopt(child, "unrequested", &frame_id, &loader, &origin);
             return Ok(false);
         }
-        match self.webmcp_ancestors_verified(child, until)? {
-            true => {}
-            false => {
-                if let Some(arm) = self.webmcp.arms.get_mut(child) {
-                    arm.pending_install = None;
-                    arm.pending_install_loader = None;
-                }
-                self.webmcp_diag_adopt(child, "unplaced", &frame_id, &loader, &origin);
-                return Ok(false);
-            }
+        if let Err(error) = self.webmcp_ancestors_verified(child, until) {
+            self.webmcp_diag_adopt(child, &format!("ancestry:{error}"), &frame_id, &loader, &origin);
+            self.webmcp_diag_chrome_trees(child, "ancestry-fail");
+            return Err(error);
         }
         self.webmcp_child_enable(child)?;
         self.webmcp_pend_install(child, &loader);
@@ -1441,9 +1507,7 @@ impl Cdp {
         }
         let candidates = matched.len();
         let Some((id, context)) = matched.into_iter().find(|(_, context)| {
-            !accepted_uniques.contains(&context.unique)
-                && last_accepted.is_none_or(|last| context.generation > last)
-                && (last_accepted.is_some() || context.generation == current_generation)
+            !accepted_uniques.contains(&context.unique) && last_accepted.is_none_or(|last| context.generation > last)
         }) else {
             self.webmcp_diag_adopt(
                 child,
@@ -1452,6 +1516,7 @@ impl Cdp {
                 &loader,
                 &origin,
             );
+            self.webmcp_diag_chrome_trees(child, "no-match");
             return Ok(false);
         };
         if let Some(stored) = self.webmcp.contexts.get_mut(&(child.to_string(), id)) {
@@ -1493,6 +1558,7 @@ impl Cdp {
                 Ok(true) => {}
                 Ok(false) => {
                     self.notices.push(format!("webmcp-polyfill: [diag:finish-await-false] {}\n", self.webmcp_diag_child_state(&child)));
+                    self.webmcp_diag_chrome_trees(&child, "finish-await-false");
                 }
                 Err(error) => {
                     self.notices.push(format!("webmcp-polyfill: [diag:finish-await-err] {error} {}\n", self.webmcp_diag_child_state(&child)));
@@ -1543,7 +1609,8 @@ impl Cdp {
             if !provisional_seed && (self.webmcp_child_refusal(&seed_root) || !self.webmcp_tree_verified(&seed, None)) {
                 return Err(self.refusal());
             }
-            let placed = self.webmcp_ancestors_verified(&child, until)?;
+            self.webmcp_diag_chrome_trees(&child, "attach");
+            self.webmcp_ancestors_verified(&child, until)?;
             let parked = self.webmcp.quarantined.iter().filter(|session| {
                 *session != &child && self.webmcp.parents.contains_key(*session)
                     && self.webmcp.arms.get(*session).is_none_or(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none())
@@ -1551,16 +1618,16 @@ impl Cdp {
             if parked >= 1024 {
                 return Err(self.refusal());
             }
-            let enable = placed && !provisional_seed;
-            self.webmcp_child_arm(&child, &seed, direct, enable)?;
+            self.webmcp_child_arm(&child, &seed, direct, true)?;
             let parent_frame = self.webmcp.arms.get(&parent).and_then(|arm| arm.root_identity.as_ref()).map(|(_, context)| context.frame.clone())
                 .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
             let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
             let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
-            if placed && child_tree && !provisional_seed {
+            if child_tree && !provisional_seed {
                 match self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP) {
                     Ok(false) => {
                         self.notices.push(format!("webmcp-polyfill: [diag:adopt-child-false] {}\n", self.webmcp_diag_child_state(&child)));
+                        self.webmcp_diag_chrome_trees(&child, "adopt-false");
                     }
                     Ok(true) => {}
                     Err(error) => return Err(error),
@@ -1569,19 +1636,18 @@ impl Cdp {
                 arm.pending_install = None;
                 arm.pending_install_loader = None;
             }
-            if placed {
-                if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
-                    self.webmcp_remember_child_origin(&child, origin);
-                } else if !provisional {
-                    if let Ok(parsed) = url::Url::parse(&url) {
-                        self.webmcp_remember_child_origin(&child, &parsed.origin().ascii_serialization());
-                    }
+            if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
+                self.webmcp_remember_child_origin(&child, origin);
+            } else if !provisional {
+                if let Ok(parsed) = url::Url::parse(&url) {
+                    self.webmcp_remember_child_origin(&child, &parsed.origin().ascii_serialization());
                 }
             }
             Ok(())
         })();
         if let Err(error) = outcome {
             self.notices.push(format!("webmcp-polyfill: [diag:adopt-child-err] {error} {}\n", self.webmcp_diag_child_state(&child)));
+            self.webmcp_diag_chrome_trees(&child, "adopt-err");
             self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:adopt-child]");
         }
     }
@@ -1806,37 +1872,18 @@ impl Cdp {
                 return false;
             }
             if child_main && !self.webmcp_provisional_frame(frame) {
-                match self.webmcp_ancestors_verified(session, Instant::now() + DOCUMENT_CHECK) {
-                    Ok(true) => {
-                        let _ = self.webmcp_child_enable(session);
-                        self.main_commit(session, frame);
-                        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
-                        self.webmcp_remember_child_origin(session, &origin);
-                        self.webmcp_child_navigated(session, frame, &origin);
+                if self.webmcp_ancestors_verified(session, Instant::now() + DOCUMENT_CHECK).is_err() {
+                    self.webmcp_diag_chrome_trees(session, "frameNavigated-ancestry");
+                    if !self.blocked.contains(session) {
+                        self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:frameNavigated-ancestry-err]");
                     }
-                    Ok(false) => {
-                        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
-                        self.notices.push(format!(
-                            "webmcp-polyfill: [diag:frameNavigated-unplaced] frame={} target={} loader={} origin={} {}\n",
-                            frame.get("id").and_then(Value::as_str).unwrap_or(""),
-                            self.session_target(session).unwrap_or_default(),
-                            frame.get("loaderId").and_then(Value::as_str).unwrap_or(""),
-                            origin,
-                            self.webmcp_diag_child_state(session)
-                        ));
-                        if let Some(arm) = self.webmcp.arms.get_mut(session) {
-                            arm.pending_install = None;
-                            arm.pending_install_loader = None;
-                        }
-                        return false;
-                    }
-                    Err(_) => {
-                        if !self.blocked.contains(session) {
-                            self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:frameNavigated-ancestry-err]");
-                        }
-                        return false;
-                    }
+                    return false;
                 }
+                let _ = self.webmcp_child_enable(session);
+                self.main_commit(session, frame);
+                let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
+                self.webmcp_remember_child_origin(session, &origin);
+                self.webmcp_child_navigated(session, frame, &origin);
             }
             self.webmcp_navigated(session, value);
             if !child_frame && frame.get("parentId").is_none() {
