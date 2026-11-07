@@ -719,7 +719,15 @@ impl Cdp {
             self.waiting_calls.remove(id);
             self.call_replies.remove(id);
         }
-        if let Some(message) = failed { return Err(message) }
+        if let Some(message) = failed {
+            let keep = message.starts_with("slicc: refused:")
+                || transport_error(&message)
+                || message.ends_with(" timed out\n");
+            if !keep {
+                self.verify_checks(&checks, false, true)?;
+            }
+            return Err(message);
+        }
         self.verify_checks(&checks, false, true)?;
         if session_id.is_some_and(|session| self.blocked.contains(session)) { return Err(self.refusal()) }
         let mut results = Vec::with_capacity(replies.len());
