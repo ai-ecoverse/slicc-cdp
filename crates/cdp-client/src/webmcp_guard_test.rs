@@ -1781,6 +1781,62 @@ fn missing_parent_frame_id_uses_root_tree_placement() {
 }
 
 #[test]
+fn unplaced_child_later_under_protected_ancestor_settles_without_leaking() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().place_remote_oopif = false;
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.domains_enabled && arm.pending_install.is_none()));
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate"));
+    state.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"LOADER"},"childFrames":[{"frame":{"id":"PROT","parentId":"F","url":"https://seven.sliccy.ai/","securityOrigin":"https://seven.sliccy.ai","loaderId":"P"},"childFrames":[{"frame":{"id":"FRAME","parentId":"PROT","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}]}]}});
+    state.borrow_mut().place_remote_oopif = true;
+    let before = state.borrow().sent.len();
+    cdp.webmcp_finish_awaiting_children();
+    assert!(cdp.session_blocked("CHILD") || !cdp.webmcp.parents.contains_key("CHILD"), "protected ancestry must settle");
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)));
+    assert!(cdp.webmcp_snapshot().iter().all(|session| {
+        session["pendingOrigins"].as_array().is_none_or(|origins| origins.iter().all(|origin| origin != "https://seven.sliccy.ai"))
+            && session["admittedOrigins"].as_array().is_none_or(|origins| origins.iter().all(|origin| origin != "https://seven.sliccy.ai"))
+    }));
+    assert!(!serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default().contains("seven.sliccy.ai"));
+}
+
+#[test]
+fn unplaced_child_later_under_ordinary_ancestor_installs_once() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().place_remote_oopif = false;
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 0 && !arm.domains_enabled));
+    state.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"LOADER"},"childFrames":[{"frame":{"id":"FRAME","parentId":"F","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}]}});
+    state.borrow_mut().place_remote_oopif = true;
+    let before = state.borrow().sent.len();
+    cdp.webmcp_finish_awaiting_children();
+    let installs = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count();
+    assert_eq!(installs, 1, "ordinary late placement installs exactly once");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0 && arm.domains_enabled));
+}
+
+#[test]
+fn unplaced_child_never_placed_is_parked_then_detached_on_root_navigation() {
+    let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().place_remote_oopif = false;
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(cdp.webmcp.quarantined.contains("CHILD"));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 0 && !arm.domains_enabled && arm.pending_install.is_none()), "unplaced stays parked with no deadline");
+    let parked = cdp.webmcp.quarantined.iter().filter(|session| cdp.webmcp.parents.contains_key(*session) && cdp.webmcp.arms.get(*session).is_none_or(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none())).count();
+    assert!(parked < 1024);
+    cdp.webmcp_sweep();
+    assert!(cdp.webmcp.parents.contains_key("CHILD"), "no-deadline park survives sweep");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
+    assert!(cdp.session_blocked("CHILD") || !cdp.webmcp.parents.contains_key("CHILD"), "root navigation detaches the parked child");
+}
+
+#[test]
 fn root_tree_frame_id_differs_from_target_id_like_chrome() {
     let (mut cdp, state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     state.borrow_mut().place_remote_oopif = false;

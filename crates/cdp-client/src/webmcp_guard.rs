@@ -471,6 +471,7 @@ impl Cdp {
         let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
             if self.webmcp.parents.contains_key(&session) || self.webmcp.quarantined.contains(&session) {
+                self.notices.push(format!("webmcp-polyfill: [diag:sweep-deadline] {}\n", self.webmcp_diag_child_state(&session)));
                 self.webmcp_settle_child(&session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:sweep-deadline]");
                 continue;
             }
@@ -1269,6 +1270,53 @@ impl Cdp {
         }
     }
 
+    fn webmcp_diag_unique(unique: &str) -> String {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in unique.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    fn webmcp_diag_child_state(&self, child: &str) -> String {
+        let target = self.session_target(child).unwrap_or_default();
+        let frame = self.documents.get(&target).map(|document| document.frame_id.as_str()).unwrap_or("");
+        let arm = self.webmcp.arms.get(child);
+        let current_generation = arm.map(|arm| arm.context_generation).unwrap_or(0);
+        let last_accepted = arm.and_then(|arm| arm.frame_accept_generation.get(frame).copied());
+        let accepted = arm.map(|arm| arm.accepted.len()).unwrap_or(0);
+        let domains = arm.map(|arm| arm.domains_enabled).unwrap_or(false);
+        let pending_loader = arm.and_then(|arm| arm.pending_install_loader.clone()).unwrap_or_default();
+        let loader = arm.and_then(|arm| arm.loaders.get(frame).cloned())
+            .or_else(|| arm.and_then(|arm| arm.loaders.values().next().cloned()))
+            .unwrap_or_default();
+        let mut contexts = self.webmcp.contexts.iter().filter(|((owner, _), _)| owner == child).map(|((_, id), context)| {
+            format!(
+                "id={id} frame={} loader_empty={} gen={} unique={} origin={}",
+                context.frame,
+                context.loader.is_empty(),
+                context.generation,
+                Self::webmcp_diag_unique(&context.unique),
+                context.origin
+            )
+        }).collect::<Vec<_>>();
+        contexts.sort();
+        let created = !contexts.is_empty();
+        format!(
+            "F={frame} T={target} loader={loader} contexts={} created={created} current_generation={current_generation} last_accepted={last_accepted:?} accepted={accepted} domains_enabled={domains} pending_loader={pending_loader} [{}]",
+            contexts.len(),
+            contexts.join("; ")
+        )
+    }
+
+    fn webmcp_diag_adopt(&mut self, child: &str, why: &str, frame: &str, loader: &str, origin: &str) {
+        self.notices.push(format!(
+            "webmcp-polyfill: [diag:adopt-install] why={why} frame={frame} loader={loader} origin={origin} {}\n",
+            self.webmcp_diag_child_state(child)
+        ));
+    }
+
     fn webmcp_frame_ancestry_verified(&self, tree: &Value, frame: &str) -> bool {
         fn walk(cdp: &Cdp, node: &Value, frame: &str, ancestors_ok: bool, depth: u32, count: &mut u32) -> Option<bool> {
             if depth > 64 || *count >= 4096 { return Some(false); }
@@ -1335,16 +1383,33 @@ impl Cdp {
         if loader.is_empty() || !self.webmcp_ordinary_origin(&origin) { return Err(self.refusal()); }
         self.webmcp_remember_child_origin(child, &origin);
         if !self.webmcp.requested_origins.contains(&origin) {
-            self.webmcp_pend_install(child, &loader);
+            if let Some(arm) = self.webmcp.arms.get_mut(child) {
+                arm.pending_install = None;
+                arm.pending_install_loader = None;
+            }
+            self.webmcp_diag_adopt(child, "unrequested", &frame_id, &loader, &origin);
             return Ok(false);
         }
         match self.webmcp_ancestors_verified(child, until)? {
             true => {}
-            false => return Ok(false),
+            false => {
+                if let Some(arm) = self.webmcp.arms.get_mut(child) {
+                    arm.pending_install = None;
+                    arm.pending_install_loader = None;
+                }
+                self.webmcp_diag_adopt(child, "unplaced", &frame_id, &loader, &origin);
+                return Ok(false);
+            }
         }
         self.webmcp_child_enable(child)?;
         self.webmcp_pend_install(child, &loader);
-        let parent_root = self.webmcp_root_document(parent, until)?;
+        let parent_root = match self.webmcp_root_document(parent, until) {
+            Ok(root) => root,
+            Err(error) => {
+                self.webmcp_diag_adopt(child, &format!("root-document:{error}"), &frame_id, &loader, &origin);
+                return Err(error);
+            }
+        };
         let last_accepted = self.webmcp.arms.get(child).and_then(|arm| arm.frame_accept_generation.get(&frame_id).copied());
         let current_generation = self.webmcp.arms.get(child).map(|arm| arm.context_generation).unwrap_or(0);
         let accepted_uniques = self.webmcp.arms.get(child).map(|arm| {
@@ -1374,11 +1439,19 @@ impl Cdp {
             self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
             return Ok(true);
         }
+        let candidates = matched.len();
         let Some((id, context)) = matched.into_iter().find(|(_, context)| {
             !accepted_uniques.contains(&context.unique)
                 && last_accepted.is_none_or(|last| context.generation > last)
                 && (last_accepted.is_some() || context.generation == current_generation)
         }) else {
+            self.webmcp_diag_adopt(
+                child,
+                &format!("no-match candidates={candidates} last_accepted={last_accepted:?} current_generation={current_generation} accepted={}", accepted_uniques.len()),
+                &frame_id,
+                &loader,
+                &origin,
+            );
             return Ok(false);
         };
         if let Some(stored) = self.webmcp.contexts.get_mut(&(child.to_string(), id)) {
@@ -1391,9 +1464,13 @@ impl Cdp {
         }
         let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
         if self.webmcp.arms.get(child).is_some_and(|arm| arm.installing.contains(&realm)) {
+            self.webmcp_diag_adopt(child, "installing", &frame_id, &loader, &origin);
             return Ok(false);
         }
-        self.webmcp_evaluate(child, id, &context, parent_root, until)?;
+        if let Err(error) = self.webmcp_evaluate(child, id, &context, parent_root, until) {
+            self.webmcp_diag_adopt(child, &format!("evaluate:{error}"), &frame_id, &loader, &origin);
+            return Err(error);
+        }
         self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
         Ok(true)
     }
@@ -1411,14 +1488,14 @@ impl Cdp {
             if origin.as_ref().is_some_and(|origin| !self.webmcp.requested_origins.contains(origin)) {
                 continue;
             }
-            let loader = self.session_target(&child).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone())
-                .and_then(|frame| self.webmcp.arms.get(&child).and_then(|arm| arm.loaders.get(&frame).cloned())).unwrap_or_default();
-            if origin.is_some() { self.webmcp_pend_install(&child, &loader); }
             let until = Instant::now() + DOCUMENT_CHECK;
             match self.webmcp_adopt_install(&child, &parent, until) {
                 Ok(true) => {}
-                Ok(false) => {}
-                Err(_) => {
+                Ok(false) => {
+                    self.notices.push(format!("webmcp-polyfill: [diag:finish-await-false] {}\n", self.webmcp_diag_child_state(&child)));
+                }
+                Err(error) => {
+                    self.notices.push(format!("webmcp-polyfill: [diag:finish-await-err] {error} {}\n", self.webmcp_diag_child_state(&child)));
                     self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:finish-await-err]");
                 }
             }
@@ -1474,34 +1551,37 @@ impl Cdp {
             if parked >= 1024 {
                 return Err(self.refusal());
             }
-            let enable = !provisional_seed || placed;
+            let enable = placed && !provisional_seed;
             self.webmcp_child_arm(&child, &seed, direct, enable)?;
             let parent_frame = self.webmcp.arms.get(&parent).and_then(|arm| arm.root_identity.as_ref()).map(|(_, context)| context.frame.clone())
                 .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
             let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
             let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
-            if child_tree && !provisional_seed {
+            if placed && child_tree && !provisional_seed {
                 match self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP) {
-                    Ok(_) => {}
+                    Ok(false) => {
+                        self.notices.push(format!("webmcp-polyfill: [diag:adopt-child-false] {}\n", self.webmcp_diag_child_state(&child)));
+                    }
+                    Ok(true) => {}
                     Err(error) => return Err(error),
                 }
             } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
-                if !placed || provisional_seed {
-                    arm.pending_install = None;
-                    arm.pending_install_loader = None;
-                }
+                arm.pending_install = None;
+                arm.pending_install_loader = None;
             }
-            if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
-                self.webmcp_remember_child_origin(&child, origin);
-            } else if !provisional {
-                if let Ok(parsed) = url::Url::parse(&url) {
-                    self.webmcp_remember_child_origin(&child, &parsed.origin().ascii_serialization());
+            if placed {
+                if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
+                    self.webmcp_remember_child_origin(&child, origin);
+                } else if !provisional {
+                    if let Ok(parsed) = url::Url::parse(&url) {
+                        self.webmcp_remember_child_origin(&child, &parsed.origin().ascii_serialization());
+                    }
                 }
             }
             Ok(())
         })();
         if let Err(error) = outcome {
-            self.notices.push(format!("webmcp-polyfill: [diag:adopt-child-err] {error}"));
+            self.notices.push(format!("webmcp-polyfill: [diag:adopt-child-err] {error} {}\n", self.webmcp_diag_child_state(&child)));
             self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:adopt-child]");
         }
     }
@@ -1735,16 +1815,20 @@ impl Cdp {
                         self.webmcp_child_navigated(session, frame, &origin);
                     }
                     Ok(false) => {
-                        let _ = self.webmcp_child_enable(session);
                         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
-                        self.webmcp_remember_child_origin(session, &origin);
                         self.notices.push(format!(
-                            "webmcp-polyfill: [diag:frameNavigated-unplaced] frame={} target={} loader={} origin={}\n",
+                            "webmcp-polyfill: [diag:frameNavigated-unplaced] frame={} target={} loader={} origin={} {}\n",
                             frame.get("id").and_then(Value::as_str).unwrap_or(""),
                             self.session_target(session).unwrap_or_default(),
                             frame.get("loaderId").and_then(Value::as_str).unwrap_or(""),
-                            origin
+                            origin,
+                            self.webmcp_diag_child_state(session)
                         ));
+                        if let Some(arm) = self.webmcp.arms.get_mut(session) {
+                            arm.pending_install = None;
+                            arm.pending_install_loader = None;
+                        }
+                        return false;
                     }
                     Err(_) => {
                         if !self.blocked.contains(session) {
