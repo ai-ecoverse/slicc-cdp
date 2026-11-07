@@ -18,7 +18,14 @@ const binary = path.join(
 );
 
 function command(endpoint, cwd, args) {
-  const env = { ...process.env, HOME: cwd, USERPROFILE: cwd, APPDATA: cwd, XDG_CONFIG_HOME: cwd };
+  const env = {
+    ...process.env,
+    HOME: cwd,
+    USERPROFILE: cwd,
+    APPDATA: cwd,
+    XDG_CONFIG_HOME: cwd,
+    SLICC_WEBMCP_TRACE: '1',
+  };
   delete env.SLICC_CDP_URL;
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
@@ -158,7 +165,12 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
           req.socket.destroy();
           return;
         }
-        const policy = req.url === '/deny' ? { 'permissions-policy': 'tools=()' } : {};
+        const policy =
+          req.url === '/deny'
+            ? { 'permissions-policy': 'tools=()' }
+            : ['/frames', '/ordinary-frames', '/cross'].includes(req.url)
+              ? { 'permissions-policy': 'tools=*' }
+              : {};
         res.writeHead(200, { 'content-type': 'text/html', ...policy });
         const child = req.url === '/same' || req.url === '/cross';
         const names = child
@@ -176,12 +188,34 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
         const frames = ['/frames', '/ordinary-frames'].includes(req.url)
           ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${req.url === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
           : '';
-        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
-if (document.modelContext) {
+        const childScript =
+          req.url === '/cross'
+            ? `void (async () => {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  if (!document.modelContext) return;
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
   }
-}
+})();`
+            : req.url === '/same'
+              ? `const register = () => {
+  if (!document.modelContext) return false;
+  for (const name of ${JSON.stringify(names)}) {
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  }
+  return true;
+};
+if (!register()) {
+  const timer = setInterval(() => { if (register()) clearInterval(timer); }, 50);
+  setTimeout(() => clearInterval(timer), 5000);
+}`
+              : `if (document.modelContext) {
+  for (const name of ${JSON.stringify(names)}) {
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  }
+}`;
+        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
+${childScript}
 </script>`);
       }
     );
@@ -333,7 +367,14 @@ if (document.modelContext) {
     assert.equal((await hasShim(raw, childSession)).api, false);
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
     await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    holder = command(browser.wsUrl, cwd, [
+      'webmcp-polyfill',
+      '--tab',
+      targetId,
+      '--reload',
+      '--from-origin',
+      `https://foreign.test:${port}`,
+    ]);
     assert.equal((await holder.ready).mode, 'polyfill');
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);
@@ -346,9 +387,25 @@ if (document.modelContext) {
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.equal(cross.code, 0, cross.stderr);
-    assert.equal(JSON.parse(cross.stdout).length, 9, holder.stderr());
-    assert.match(cross.stderr, /cross-origin child tools are unavailable/);
+    assert.equal(
+      cross.code,
+      0,
+      `list failed\nlist stderr: ${cross.stderr}\nholder trace: ${holder.stderr()}`
+    );
+    assert.equal(
+      cross.stderr.includes('cross-origin child tools are unavailable'),
+      false,
+      `guarded-route refusal\nlist stderr: ${cross.stderr}\nholder trace: ${holder.stderr()}`
+    );
+    const crossTools = JSON.parse(cross.stdout);
+    assert.ok(
+      crossTools.some((tool) => tool.name === 'cross_child'),
+      `cross_child missing from ${JSON.stringify(crossTools)}\nholder trace: ${holder.stderr()}`
+    );
+    const crossTool = crossTools.find((tool) => tool.name === 'cross_child');
+    assert.equal(crossTool.origin, `https://foreign.test:${port}`);
+    assert.equal(crossTool.policy, 'allowed');
+    assert.ok(crossTool.frameId);
     const crossCall = await once(browser.wsUrl, cwd, [
       'webmcp-call',
       'cross_child',
@@ -358,8 +415,12 @@ if (document.modelContext) {
       '--from-origin',
       `https://foreign.test:${port}`,
     ]);
-    assert.notEqual(crossCall.code, 0, crossCall.stderr);
-    assert.equal(crossCall.stdout, '');
+    assert.equal(
+      crossCall.code,
+      0,
+      `call failed\ncall stderr: ${crossCall.stderr}\nholder trace: ${holder.stderr()}`
+    );
+    assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
 
     const restored = raw.waitEvent(
       (event) => event.method === 'Page.frameNavigated' && event.sessionId === sessionId,
@@ -394,6 +455,13 @@ if (document.modelContext) {
       await navigate(raw, sessionId, `${ordinary}/tools`);
       assert.equal((await hasShim(raw, sessionId)).api, false);
     }
+  } catch (error) {
+    throw new Error(
+      `${error.message}\nholder trace: ${holder?.stderr()}\nconversion holder trace: ${conversionHolder?.stderr?.() ?? conversionHolder?.stderr}`,
+      {
+        cause: error,
+      }
+    );
   } finally {
     holder?.child.kill('SIGKILL');
     await ordinaryGuard?.close();

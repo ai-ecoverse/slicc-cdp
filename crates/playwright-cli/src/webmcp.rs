@@ -5,8 +5,87 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
-fn requested_origin(mut output: Output, from: &[String], native: Option<bool>) -> Output {
-    if !from.is_empty() && native == Some(false) {
+fn child_evidence(state: &Session, target: &str) -> bool {
+    state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
+        if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
+        entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                let owns_page = session.get("target").and_then(Value::as_str) == Some(target);
+                (owns_page && session.get("directChildAttach").and_then(Value::as_bool) == Some(true))
+                    || (!owns_page
+                        && session.get("target").and_then(Value::as_str).is_some()
+                        && session.get("quarantined").and_then(Value::as_bool) != Some(true))
+                    || session.get("admittedOrigins").and_then(Value::as_array).is_some_and(|origins| {
+                        let root = session.get("documents").and_then(Value::as_object).and_then(|documents| {
+                            documents.values().find_map(|document| {
+                                (document.get("frameId").and_then(Value::as_str) == Some(target))
+                                    .then(|| document.get("origin").and_then(Value::as_str))
+                                    .flatten()
+                            })
+                        });
+                        origins.iter().filter_map(Value::as_str).any(|origin| root.is_some_and(|root| root != origin))
+                    })
+            })
+        })
+    })
+}
+
+pub(crate) fn remember_origins(state: &mut Session, target: &str, from: &[String]) {
+    if from.is_empty() { return; }
+    let mut latest = crate::session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
+    latest.webmcp_connection = state.webmcp_connection.clone();
+    let Some(entry) = latest.webmcp.get_mut(target) else { return; };
+    if entry.get("connection").and_then(Value::as_str) != Some(&state.webmcp_connection) { return; }
+    let mut origins = entry.get("requestedOrigins").and_then(Value::as_array).cloned().unwrap_or_default();
+    for origin in from {
+        if !origins.iter().any(|value| value.as_str() == Some(origin)) {
+            origins.push(json!(origin));
+        }
+    }
+    entry["requestedOrigins"] = Value::Array(origins);
+    let saved = entry.clone();
+    let _ = crate::session::save_webmcp(&latest);
+    state.webmcp.insert(target.to_string(), saved);
+}
+
+fn pending_requested(sessions: &[Value], from: &[String]) -> bool {
+    sessions.iter().any(|session| {
+        session.get("pendingOrigins").and_then(Value::as_array).is_some_and(|origins| {
+            !origins.is_empty() && from.iter().any(|wanted| origins.iter().any(|origin| origin.as_str() == Some(wanted.as_str())))
+        })
+    })
+}
+
+fn wait_for_child_origins(state: &Session, target: &str, from: &[String]) {
+    if from.is_empty() || !child_evidence(state, target) { return; }
+    let Some(sessions) = state.webmcp.get(target).and_then(|entry| entry.get("sessions")).and_then(Value::as_array) else { return; };
+    if !pending_requested(sessions, from) { return; }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < until {
+        let latest = crate::session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
+        let Some(sessions) = latest.webmcp.get(target).and_then(|entry| entry.get("sessions")).and_then(Value::as_array) else { return; };
+        if sessions.iter().any(|session| {
+            session.get("admittedOrigins").and_then(Value::as_array).is_some_and(|origins| {
+                from.iter().any(|wanted| origins.iter().any(|origin| origin.as_str() == Some(wanted.as_str())))
+            })
+        }) {
+            return;
+        }
+        if !pending_requested(sessions, from) { return; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+pub(crate) fn refuse_protected_origins(cdp: &Cdp, from: &[String]) -> Option<Output> {
+    if from.iter().any(|origin| cdp.guard().url(origin)) {
+        Some(Output::err(format!("{}\n", cdp.guard().refusal())))
+    } else {
+        None
+    }
+}
+
+fn requested_origin(mut output: Output, from: &[String], native: Option<bool>, evidence: bool) -> Output {
+    if !from.is_empty() && native == Some(false) && !evidence {
         output.stderr.insert_str(0, "cross-origin child tools are unavailable on this guarded route\n");
     }
     output
@@ -25,6 +104,13 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    if let Some(refused) = refuse_protected_origins(cdp, from) {
+        let _ = browser::watch_detach(cdp, state, &target, &session);
+        return refused;
+    }
+    remember_origins(state, &target, from);
+    let evidence = child_evidence(state, &target);
+    if evidence { wait_for_child_origins(state, &target, from); }
     let result = crate::webmcp_frames::list(cdp, state, &target, &session, from);
     let native = result.as_ref().ok().map(|(_, native)| *native);
     let _ = browser::watch_detach(cdp, state, &target, &session);
@@ -49,7 +135,7 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
             }
         }
         Err(message) => Output::err(message),
-    })(), from, native)
+    })(), from, native, evidence)
 }
 
 fn unavailable(command: &str) -> Output {
@@ -144,6 +230,13 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    if let Some(refused) = refuse_protected_origins(cdp, from) {
+        let _ = browser::watch_detach(cdp, state, &target, &session);
+        return refused;
+    }
+    remember_origins(state, &target, from);
+    let evidence = child_evidence(state, &target);
+    if evidence { wait_for_child_origins(state, &target, from); }
     let outcome = crate::webmcp_frames::call(cdp, state, &target, &session, from, frame, name, &parsed, allow_consequential);
     let native = outcome.as_ref().ok().map(|(_, native)| *native);
     let outcome = outcome.and_then(|(value, _)| parse_value(value));
@@ -187,7 +280,7 @@ pub fn call_from(cdp: &mut Cdp, state: &mut Session, name: &str, input_json: &st
             }
         }
         Err(message) => Output::err(message),
-    }, from, native)
+    }, from, native, evidence)
 }
 
 pub fn read_stdin() -> Result<String, String> {

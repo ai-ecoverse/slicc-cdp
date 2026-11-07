@@ -108,6 +108,29 @@ async function evaluate(raw, session, expression) {
   return result.result.value;
 }
 
+async function hasShim(raw, session) {
+  return (
+    await raw.send(
+      'Runtime.evaluate',
+      {
+        expression:
+          '({secure:isSecureContext,api:!!document.modelContext,alias:!!navigator.modelContext})',
+        returnByValue: true,
+      },
+      session
+    )
+  ).result.value;
+}
+
+async function waitForShim(raw, session, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if ((await hasShim(raw, session)).api) return;
+    await sleep(50);
+  }
+  throw new Error('child shim did not appear');
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
@@ -151,16 +174,38 @@ for (const protectedFrames of [true, false]) {
       );
       let port;
       let ordinary;
+      const crossReady = [];
+      let crossReadyOpen = false;
+      const releaseCrossReady = () => {
+        crossReadyOpen = true;
+        for (const pending of crossReady.splice(0)) {
+          pending.writeHead(200, { 'content-type': 'text/plain' });
+          pending.end('ok');
+        }
+      };
       server = createServer(
         { key: await readFile(keyPath), cert: await readFile(certPath) },
         (req, res) => {
-          res.writeHead(200, { 'content-type': 'text/html' });
           const url = new URL(req.url, 'https://localhost');
+          if (url.pathname === '/cross-child-ready') {
+            if (crossReadyOpen) {
+              res.writeHead(200, { 'content-type': 'text/plain' });
+              res.end('ok');
+              return;
+            }
+            crossReady.push(res);
+            return;
+          }
+          const headers = { 'content-type': 'text/html' };
+          if (['/cross', '/frames', '/ordinary-frames', '/ordinary-start'].includes(url.pathname)) {
+            headers['permissions-policy'] = 'tools=*';
+          }
+          res.writeHead(200, headers);
           const tool = (name) =>
             `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
           if (url.pathname === '/cross') {
             res.end(
-              `<!doctype html><script>const crossController = new AbortController(); window.addCross = () => document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); window.removeCross = () => crossController.abort();</script>`
+              `<!doctype html><script>const crossController = new AbortController(); window.addCross = async () => { document.modelContext?.registerTool(${tool('cross_late')}, { signal: crossController.signal }); }; window.removeCross = () => crossController.abort(); void (async () => { await fetch('/cross-child-ready'); await window.addCross(); })();</script>`
             );
             return;
           }
@@ -201,7 +246,15 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       const { sessionId } = await raw.send('Target.attachToTarget', { targetId, flatten: true });
       await raw.send('Page.enable', {}, sessionId);
       await navigate(raw, sessionId, `${ordinary}/${protectedFrames ? 'tools' : 'ordinary-start'}`);
-      held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+      const foreignOrigin = `https://foreign.test:${port}`;
+      held = stream(wire.url, cwd, [
+        'webmcp-polyfill',
+        '--tab',
+        targetId,
+        '--reload',
+        '--from-origin',
+        foreignOrigin,
+      ]);
       const ready = await held.next((line) => line.event === 'ready', 0);
       assert.equal(ready.mode, 'polyfill');
       watcher = stream(wire.url, cwd, ['discover', '--json', '--no-probe']);
@@ -250,7 +303,8 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         ).sessionId;
         assert.equal(
           await evaluate(raw, childSession, 'typeof document.modelContext'),
-          'undefined'
+          'object',
+          'start-time --from-origin installs the child shim before listing'
         );
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
       }
@@ -325,6 +379,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       else assert.ok(document.loaderId);
 
       const crossControl = async (stale) => {
+        crossReadyOpen = false;
         const child = (await raw.send('Target.getTargets', {})).targetInfos.find(
           (target) =>
             target.type === 'iframe' &&
@@ -336,42 +391,73 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
         const childSession = (
           await raw.send('Target.attachToTarget', { targetId: child.targetId, flatten: true })
         ).sessionId;
-        assert.equal(
-          await evaluate(raw, childSession, 'typeof document.modelContext'),
-          'undefined'
+        await waitForShim(raw, childSession);
+        const from = held.lines.length;
+        releaseCrossReady();
+        const late = await held.next(
+          (line) =>
+            line.event === 'tools-changed' &&
+            line.frameId === child.targetId &&
+            names(line).includes('cross_late'),
+          from
         );
-        const listed = await once(wire.url, cwd, [
+        assert.ok(names(late).includes('cross_late'), JSON.stringify(late));
+        const after = await once(wire.url, cwd, [
           'webmcp-list',
           '--tab',
           targetId,
           '--json',
           '--from-origin',
-          `https://foreign.test:${port}`,
+          foreignOrigin,
         ]);
-        assert.equal(listed.code, 0, listed.stderr);
-        assert.match(listed.stderr, /cross-origin child tools are unavailable/);
-        const tools = JSON.parse(listed.stdout);
-        assert.ok(tools.some((tool) => tool.name === 'initial'));
         assert.equal(
-          tools.some((tool) => tool.frameId === child.targetId),
-          false
+          after.code,
+          0,
+          `list after gate failed\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
+        );
+        assert.equal(
+          after.stderr.includes('cross-origin child tools are unavailable'),
+          false,
+          `guarded-route refusal\nlist stderr: ${after.stderr}\nholder trace: ${held.stderr()}`
+        );
+        const tools = JSON.parse(after.stdout);
+        assert.ok(
+          tools.some((tool) => tool.name === 'initial'),
+          `initial missing\nholder trace: ${held.stderr()}`
+        );
+        assert.ok(
+          tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId),
+          `cross_late missing from ${JSON.stringify(tools)}\nholder trace: ${held.stderr()}`
         );
         const called = await once(wire.url, cwd, [
           'webmcp-call',
-          'initial',
+          'cross_late',
           '{}',
           '--tab',
           targetId,
+          '--from-origin',
+          foreignOrigin,
         ]);
-        assert.equal(called.code, 0, called.stderr);
-        assert.equal(called.stdout.trim(), 'initial');
+        assert.equal(
+          called.code,
+          0,
+          `call failed\ncall stderr: ${called.stderr}\nholder trace: ${held.stderr()}`
+        );
+        assert.equal(called.stdout.trim(), 'cross_late');
         await raw.send('Target.detachFromTarget', { sessionId: childSession });
         return child.targetId;
       };
 
       if (protectedFrames) {
         await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-        held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+        held = stream(wire.url, cwd, [
+          'webmcp-polyfill',
+          '--tab',
+          targetId,
+          '--reload',
+          '--from-origin',
+          foreignOrigin,
+        ]);
         assert.equal((await held.next((line) => line.event === 'ready', 0)).mode, 'polyfill');
       } else {
         const ordinaryReady = held.next(
@@ -384,20 +470,28 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       assert.equal(JSON.stringify(held.lines).includes('protected_tool'), false);
       held.child.stdin.end();
-      assert.equal(await held.ended, 0, held.stderr());
+      assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
 
-      held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+      crossReadyOpen = false;
+      held = stream(wire.url, cwd, [
+        'webmcp-polyfill',
+        '--tab',
+        targetId,
+        '--reload',
+        '--from-origin',
+        foreignOrigin,
+      ]);
       const restarted = await held.next((line) => line.event === 'ready', 0);
       assert.equal(restarted.mode, 'polyfill');
       assert.equal(restarted.reloaded, true);
       await crossControl([cross.targetId, navigatedCross]);
       assert.equal(JSON.stringify(held.lines).includes('seven.sliccy.ai'), false);
       held.child.stdin.end();
-      assert.equal(await held.ended, 0, held.stderr());
+      assert.equal(await held.ended, 0, `holder exit\nholder trace: ${held.stderr()}`);
       held = undefined;
     } catch (error) {
       throw new Error(
-        `${error.message}\nholder: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        `${error.message}\nholder trace: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
         { cause: error }
       );
     } finally {
@@ -411,3 +505,190 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     }
   });
 }
+
+await test('Chrome: lazy --from-origin installs after list; tools registered before install need a reload', {
+  timeout: 180000,
+}, async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-lazy-chrome-'));
+  let browser;
+  let raw;
+  let held;
+  let server;
+  let wire;
+  try {
+    const keyPath = path.join(cwd, 'key.pem');
+    const certPath = path.join(cwd, 'cert.pem');
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        keyPath,
+        '-out',
+        certPath,
+        '-days',
+        '1',
+        '-subj',
+        '/CN=localhost',
+        '-addext',
+        'subjectAltName=DNS:localhost,DNS:foreign.test',
+      ],
+      { stdio: 'ignore' }
+    );
+    let port;
+    let ordinary;
+    server = createServer(
+      { key: await readFile(keyPath), cert: await readFile(certPath) },
+      (req, res) => {
+        const url = new URL(req.url, 'https://localhost');
+        const headers = { 'content-type': 'text/html', 'permissions-policy': 'tools=*' };
+        res.writeHead(200, headers);
+        const tool = (name) =>
+          `{name:${JSON.stringify(name)},description:${JSON.stringify(`${name} tool`)},inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:true},execute:async()=>${JSON.stringify(name)}}`;
+        if (url.pathname === '/cross-lazy') {
+          const awaitShim = url.searchParams.has('await');
+          res.end(`<!doctype html><script>
+let gateResolve;
+const gate = new Promise((resolve) => { gateResolve = resolve; });
+window.openGate = () => gateResolve();
+const early = ${tool('cross_early')};
+const late = ${tool('cross_late')};
+const awaitShim = ${awaitShim ? 'true' : 'false'};
+if (awaitShim) {
+  void (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    document.modelContext?.registerTool(early);
+  })();
+} else if (document.modelContext) {
+  document.modelContext.registerTool(early);
+}
+gate.then(() => { document.modelContext?.registerTool(late); });
+</script>`);
+          return;
+        }
+        const childQuery = url.searchParams.has('reload') ? '?await=1' : '';
+        res.end(`<!doctype html><title>lazy</title><iframe src="https://foreign.test:${port}/cross-lazy${childQuery}" allow="tools *"></iframe><script>
+if (document.modelContext) document.modelContext.registerTool(${tool('initial')});
+</script>`);
+      }
+    );
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = server.address().port;
+    ordinary = `https://localhost:${port}`;
+    const foreignOrigin = `https://foreign.test:${port}`;
+    browser = await launchBrowser([
+      '--ignore-certificate-errors',
+      '--no-proxy-server',
+      '--disable-features=WebMCP,WebMCPTesting',
+      '--site-per-process',
+      '--host-resolver-rules=MAP foreign.test 127.0.0.1',
+    ]);
+    wire = await webmcpWire(browser.wsUrl);
+    raw = await observer(browser.wsUrl);
+    const { targetId } = await raw.send('Target.createTarget', {
+      url: 'about:blank',
+      background: true,
+    });
+    const { sessionId } = await raw.send('Target.attachToTarget', { targetId, flatten: true });
+    await raw.send('Page.enable', {}, sessionId);
+    await navigate(raw, sessionId, `${ordinary}/lazy`);
+    held = stream(wire.url, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    assert.equal((await held.next((line) => line.event === 'ready', 0)).mode, 'polyfill');
+    const child = (await raw.send('Target.getTargets', {})).targetInfos.find(
+      (target) =>
+        target.type === 'iframe' && target.url === `https://foreign.test:${port}/cross-lazy`
+    );
+    assert.ok(child, 'lazy OOPIF was not created');
+    const childSession = (
+      await raw.send('Target.attachToTarget', { targetId: child.targetId, flatten: true })
+    ).sessionId;
+    assert.equal(await evaluate(raw, childSession, 'typeof document.modelContext'), 'undefined');
+    const before = await once(wire.url, cwd, [
+      'webmcp-list',
+      '--tab',
+      targetId,
+      '--json',
+      '--from-origin',
+      foreignOrigin,
+    ]);
+    assert.equal(before.code, 0, `lazy list failed\n${before.stderr}\nholder: ${held.stderr()}`);
+    assert.equal(
+      before.stderr.includes('cross-origin child tools are unavailable'),
+      false,
+      before.stderr
+    );
+    const beforeTools = JSON.parse(before.stdout);
+    assert.equal(
+      beforeTools.some((tool) => tool.name === 'cross_early'),
+      false,
+      'tool registered before install must stay absent until reload'
+    );
+    assert.equal(
+      beforeTools.some((tool) => tool.name === 'cross_late'),
+      false
+    );
+    assert.equal(await evaluate(raw, childSession, 'typeof document.modelContext'), 'object');
+    await evaluate(raw, childSession, 'openGate()');
+    const after = await once(wire.url, cwd, [
+      'webmcp-list',
+      '--tab',
+      targetId,
+      '--json',
+      '--from-origin',
+      foreignOrigin,
+    ]);
+    assert.equal(
+      after.code,
+      0,
+      `list after gate failed\n${after.stderr}\nholder: ${held.stderr()}`
+    );
+    const afterTools = JSON.parse(after.stdout);
+    assert.ok(
+      afterTools.some((tool) => tool.name === 'cross_late'),
+      `cross_late missing from ${JSON.stringify(afterTools)}\nholder: ${held.stderr()}`
+    );
+    assert.equal(
+      afterTools.some((tool) => tool.name === 'cross_early'),
+      false,
+      'pre-install registration stays missing until reload'
+    );
+    await raw.send('Target.detachFromTarget', { sessionId: childSession });
+    const ready = held.next((line) => line.event === 'document-ready', held.lines.length);
+    await Promise.all([navigate(raw, sessionId, `${ordinary}/lazy?reload=1`), ready]);
+    await sleep(500);
+    const reloaded = await once(wire.url, cwd, [
+      'webmcp-list',
+      '--tab',
+      targetId,
+      '--json',
+      '--from-origin',
+      foreignOrigin,
+    ]);
+    assert.equal(
+      reloaded.code,
+      0,
+      `list after reload failed\n${reloaded.stderr}\nholder: ${held.stderr()}`
+    );
+    const reloadedTools = JSON.parse(reloaded.stdout);
+    assert.ok(
+      reloadedTools.some((tool) => tool.name === 'cross_early'),
+      `cross_early missing after reload from ${JSON.stringify(reloadedTools)}\nholder: ${held.stderr()}`
+    );
+    held.child.stdin.end();
+    assert.equal(await held.ended, 0, `holder exit\nholder: ${held.stderr()}`);
+    held = undefined;
+  } catch (error) {
+    throw new Error(`${error.message}\nholder trace: ${held?.stderr()}`, { cause: error });
+  } finally {
+    held?.child.kill('SIGKILL');
+    await wire?.close();
+    await raw?.close();
+    await browser?.close();
+    await new Promise((resolve) => (server ? server.close(resolve) : resolve()));
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

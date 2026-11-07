@@ -150,7 +150,7 @@ export async function webmcpBackend({
                 parentFrameId: 'TAB',
                 url: `${page.origin}/`,
               },
-              waitingForDebugger: true,
+              waitingForDebugger: false,
             },
             parent
           );
