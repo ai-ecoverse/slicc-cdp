@@ -437,3 +437,73 @@ fn reconcile_skips_a_protected_sibling_without_protecting_the_foreign_child() {
     assert_eq!(shim_evals(&state, "CHILD"), 1);
     assert!(cdp.webmcp.arms.get(&holder).is_some_and(|arm| !arm.revoked));
 }
+
+fn child_enables(state: &Rc<RefCell<BackendState>>, session: &str) -> Vec<String> {
+    state.borrow().sent.iter().filter(|command| {
+        command["sessionId"] == session
+            && matches!(command["method"].as_str(), Some("Network.enable" | "Runtime.enable" | "Page.enable"))
+    }).filter_map(|command| command["method"].as_str().map(str::to_string)).collect()
+}
+
+#[test]
+fn adopt_judges_seed_tree_before_any_child_domain_enable() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().iframe_targets = Some(vec![json!({"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"})]);
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"SEVEN","url":"https://seven.sliccy.ai/app","securityOrigin":"https://seven.sliccy.ai","loaderId":"P"}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(child_enables(&state, "CHILD").is_empty(), "protected seed must never receive domain enables: {:?}", child_enables(&state, "CHILD"));
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate"));
+    assert!(cdp.session_blocked("CHILD"));
+    assert!(!cdp.webmcp.parents.contains_key("CHILD") || cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked));
+    assert!(cdp.protected_targets.contains("IFRAME"));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+}
+
+#[test]
+fn adopt_settles_chrome_error_seed_without_enabling_domains() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"ERR","url":"chrome-error://chromewebdata/","securityOrigin":"://","loaderId":"E","unreachableUrl":"https://foreign.test/cross"}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(child_enables(&state, "CHILD").is_empty(), "chrome-error seed must never receive domain enables: {:?}", child_enables(&state, "CHILD"));
+    assert!(cdp.session_blocked("CHILD"));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+}
+
+#[test]
+fn provisional_child_arms_without_domain_enables_until_verified() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && !arm.domains && arm.pending_install.is_none()));
+    assert!(child_enables(&state, "CHILD").is_empty(), "provisional arm must not enable domains: {:?}", child_enables(&state, "CHILD"));
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.domains && arm.admitted > 0));
+    assert!(!child_enables(&state, "CHILD").is_empty());
+    assert_eq!(shim_evals(&state, "CHILD"), 1);
+}
+
+#[test]
+fn parked_unverified_non_provisional_child_gets_a_deadline_and_settles() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().iframe_targets = Some(vec![json!({"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"})]);
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(child_enables(&state, "CHILD").is_empty(), "unverified non-provisional must not enable before verification: {:?}", child_enables(&state, "CHILD"));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && !arm.domains && arm.pending_install.is_some()));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
+    }
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"), "deadline must settle a parked unverified child");
+}
