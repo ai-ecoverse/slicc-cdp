@@ -5,8 +5,63 @@ use crate::sanitize;
 use crate::session::Session;
 use serde_json::{json, Value};
 
+pub(crate) const SNAPSHOT_SCHEMA: u64 = 1;
+
+fn holder_alive(pid: u32) -> bool {
+    if pid == 0 { return false; }
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(all(not(unix), not(target_arch = "wasm32")))]
+    {
+        pid == std::process::id()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub(crate) fn snapshot_now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0)
+}
+
+pub(crate) fn snapshot_holder_pid() -> Option<u32> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(std::process::id())
+    }
+}
+
+pub(crate) fn snapshot_evidence(entry: &Value) -> bool {
+    if entry.get("schema").and_then(Value::as_u64).unwrap_or(0) < SNAPSHOT_SCHEMA { return false; }
+    let Some(updated) = entry.get("updatedAtMs").and_then(Value::as_u64) else { return false; };
+    if snapshot_now_ms().saturating_sub(updated) > 15_000 { return false; }
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) {
+            if pid != 0 { return false; }
+        }
+        true
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) else { return false; };
+        if pid == 0 || pid > u64::from(u32::MAX) || !holder_alive(pid as u32) { return false; }
+        true
+    }
+}
+
 fn child_evidence(state: &Session, target: &str) -> bool {
     state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
+        if !snapshot_evidence(entry) { return false; }
         if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
         entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
             sessions.iter().any(|session| {
@@ -627,6 +682,35 @@ mod tests {
 
     fn eval_exception(text: &str) -> Value {
         json!({ "result": { "result": { "type": "undefined" }, "exceptionDetails": { "text": text } } })
+    }
+
+    #[test]
+    fn snapshot_evidence_rejects_old_schema_stale_and_dead_holder() {
+        let now = snapshot_now_ms();
+        assert!(!snapshot_evidence(&json!({"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
+        assert!(!snapshot_evidence(&json!({"schema":0,"updatedAtMs":now,"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"updatedAtMs":now.saturating_sub(16_000),"routeAttested":false})));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":4_294_967_294u64,"updatedAtMs":now,"routeAttested":false})));
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"updatedAtMs":now,"routeAttested":false})));
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"routeAttested":false})));
+            assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"updatedAtMs":now,"routeAttested":false})));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"updatedAtMs":now,"routeAttested":false})));
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":1u64,"updatedAtMs":now,"routeAttested":false})));
+        }
+    }
+
+    #[test]
+    fn snapshot_holder_pid_matches_target() {
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(snapshot_holder_pid(), None);
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(snapshot_holder_pid(), Some(std::process::id()));
     }
 
     #[test]
