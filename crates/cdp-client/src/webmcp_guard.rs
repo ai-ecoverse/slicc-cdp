@@ -185,6 +185,7 @@ impl Cdp {
     pub fn start_webmcp_for(&mut self, session: &str, reload: bool) -> Result<String, String> {
         let session = self.webmcp_session(session).to_string();
         let result = self.webmcp_start_once(&session, reload);
+        self.webmcp.buffering_attach = false;
         if result.is_err() { self.stop_webmcp(&session); }
         else { self.webmcp_install_children(); }
         result
@@ -192,37 +193,50 @@ impl Cdp {
 
     fn webmcp_start_once(&mut self, session: &str, reload: bool) -> Result<String, String> {
         if let Some(arm) = self.webmcp.arms.get(session).filter(|arm| !arm.revoked) { return Ok(arm.bridge.clone()); }
-        self.admit("Runtime.enable", &json!({}), Some(session))?;
-        let tree = self.webmcp_stable(session, Instant::now() + DOCUMENT_CHECK, |cdp, left| {
-            let target = cdp.session_target(session).ok_or_else(|| cdp.refusal())?;
-            let guard = cdp.guards.get(&target).cloned().ok_or_else(|| cdp.refusal())?;
-            let tree = cdp.raw_call("Page.getFrameTree", json!({}), Some(&guard), left)?;
-            if !cdp.webmcp_tree_verified(&tree, None) || cdp.content_blocked(session) || cdp.unobserved.contains(&target) {
-                return Err(cdp.refusal());
-            }
-            Ok(tree)
-        })?;
-        let bridge = self.webmcp_install(session, &tree)?;
-        if reload {
-            let from = self.events.len();
-            self.call_for("Page.reload", json!({}), Some(session), DOCUMENT_CHECK)?;
-            if self.webmcp_plain(session) {
-                self.webmcp_plain_reload(session, &tree, from).map_err(|message| format!("{message}webmcp-polyfill: other-extension fallback could not verify the reloaded document; tools are unavailable\n"))?;
-            }
+        self.webmcp.buffering_attach = true;
+        let started = (|| {
+            self.admit("Runtime.enable", &json!({}), Some(session))?;
+            let tree = self.webmcp_stable(session, Instant::now() + DOCUMENT_CHECK, |cdp, left| {
+                let target = cdp.session_target(session).ok_or_else(|| cdp.refusal())?;
+                let guard = cdp.guards.get(&target).cloned().ok_or_else(|| cdp.refusal())?;
+                let tree = cdp.raw_call("Page.getFrameTree", json!({}), Some(&guard), left)?;
+                if !cdp.webmcp_tree_verified(&tree, None) || cdp.content_blocked(session) || cdp.unobserved.contains(&target) {
+                    return Err(cdp.refusal());
+                }
+                Ok(tree)
+            })?;
+            let bridge = self.webmcp_install(session, &tree)?;
+            if reload {
+                let from = self.events.len();
+                self.call_for("Page.reload", json!({}), Some(session), DOCUMENT_CHECK)?;
+                if self.webmcp_plain(session) {
+                    self.webmcp_plain_reload(session, &tree, from).map_err(|message| format!("{message}webmcp-polyfill: other-extension fallback could not verify the reloaded document; tools are unavailable\n"))?;
+                }
+                let holder = self.webmcp_session(session).to_string();
+                let session = holder.as_str();
+                let until = Instant::now() + DOCUMENT_CHECK;
+                while self.webmcp.arms.get(session).is_some_and(|arm| (arm.admitted == 0 || !arm.pending_contexts.is_empty()) && !arm.revoked) && Instant::now() < until {
+                    if !self.pump(until)? { break; }
+                }
+            } else { self.webmcp_install_current(session)?; }
             let holder = self.webmcp_session(session).to_string();
             let session = holder.as_str();
-            let until = Instant::now() + DOCUMENT_CHECK;
-            while self.webmcp.arms.get(session).is_some_and(|arm| (arm.admitted == 0 || !arm.pending_contexts.is_empty()) && !arm.revoked) && Instant::now() < until {
-                if !self.pump(until)? { break; }
+            if self.webmcp.arms.get(session).is_none_or(|arm| arm.revoked || arm.admitted == 0 || !arm.pending_contexts.is_empty()) {
+                self.webmcp_revoke(session);
+                return Err("slicc: refused: WebMCP installation could not verify the document; update the browser guard and client\n".into());
             }
-        } else { self.webmcp_install_current(session)?; }
-        let holder = self.webmcp_session(session).to_string();
-        let session = holder.as_str();
-        if self.webmcp.arms.get(session).is_none_or(|arm| arm.revoked || arm.admitted == 0 || !arm.pending_contexts.is_empty()) {
-            self.webmcp_revoke(session);
-            return Err("slicc: refused: WebMCP installation could not verify the document; update the browser guard and client\n".into());
+            Ok(bridge)
+        })();
+        if started.is_err() {
+            self.webmcp.buffering_attach = false;
+            let pending = std::mem::take(&mut self.webmcp.pending_attaches);
+            for event in pending {
+                if let Some(child) = event.pointer("/params/sessionId").and_then(Value::as_str) {
+                    self.webmcp_release_child(child);
+                }
+            }
         }
-        Ok(bridge)
+        started
     }
 
     pub fn webmcp_session<'a>(&'a self, session: &'a str) -> &'a str {
@@ -315,6 +329,11 @@ impl Cdp {
                     if attested {
                         if let Some(child) = event.pointer("/params/sessionId").and_then(Value::as_str) { self.webmcp_release_child(child); }
                     } else {
+                        let parent = event.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+                        let mut event = event;
+                        if !self.webmcp.arms.get(&parent).is_some_and(|arm| arm.direct_child_attach) {
+                            event["sessionId"] = json!(session.clone());
+                        }
                         self.webmcp_adopt_child(&event);
                     }
                 }
@@ -1440,6 +1459,8 @@ impl Cdp {
             self.webmcp.parents.remove(&old);
             self.webmcp.arms.remove(&old);
             self.webmcp.quarantined.remove(&old);
+            self.protected_targets.remove(&target);
+            self.abandoned.remove(&target);
             if self.guards.get(&target).map(String::as_str) == Some(old.as_str()) {
                 self.guards.insert(target.clone(), child.clone());
             }
@@ -1451,6 +1472,8 @@ impl Cdp {
         let outcome = (|| -> Result<(), String> {
             if !allowed { return Err(self.refusal()); }
             self.guards.insert(target.clone(), child.clone());
+            self.protected_targets.remove(&target);
+            self.abandoned.remove(&target);
             if self.is_protected_target(&target) { return Err(self.refusal()); }
             let until = Instant::now() + DOCUMENT_CHECK;
             self.webmcp_parent_frame_id(&target, until)?;
@@ -1466,16 +1489,20 @@ impl Cdp {
             if parked > 1024 {
                 return Err(self.refusal());
             }
-            self.webmcp_child_arm(&child, &seed, direct)?;
             let parent_frame = self.webmcp.arms.get(&parent).and_then(|arm| arm.root_identity.as_ref()).map(|(_, context)| context.frame.clone())
                 .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
             let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
             let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
-            if child_tree && verified {
+            if !child_tree {
+                return Err(self.refusal());
+            }
+            self.webmcp_child_arm(&child, &seed, direct)?;
+            if verified {
                 let _ = self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP);
             } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
                 arm.pending_install = None;
                 arm.pending_install_loader = None;
+                arm.pending_install_restarts = 0;
             }
             if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
                 self.webmcp_remember_child_origin(&child, origin);
@@ -1658,9 +1685,28 @@ impl Cdp {
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if self.webmcp_plain(session) && method.starts_with("Debugger.") { return true; }
-        if method == "Target.attachedToTarget" && self.webmcp.arms.contains_key(session) {
-            self.webmcp_gate_event(value);
-            return true;
+        if method == "Target.attachedToTarget" {
+            if self.webmcp.buffering_attach {
+                self.webmcp.pending_attaches.push_back(value.clone());
+                return true;
+            }
+            let owner = self.webmcp_session(session).to_string();
+            if self.webmcp.arms.contains_key(session) || self.webmcp.arms.contains_key(&owner) {
+                if owner != session {
+                    let mut rewritten = value.clone();
+                    rewritten["sessionId"] = json!(owner);
+                    self.webmcp_gate_event(&rewritten);
+                } else {
+                    self.webmcp_gate_event(value);
+                }
+                return true;
+            }
+            if value.pointer("/params/targetInfo/type").and_then(Value::as_str) == Some("iframe")
+                && self.webmcp.arms.values().any(|arm| !arm.revoked)
+            {
+                self.webmcp.pending_attaches.push_back(value.clone());
+                return true;
+            }
         }
         if matches!(method, "Page.frameDetached" | "Runtime.executionContextCreated" | "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared" | "Debugger.scriptParsed") {
             self.webmcp_context_event(value, session, method);
