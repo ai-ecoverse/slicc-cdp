@@ -111,6 +111,42 @@ function once(endpoint, cwd, args) {
   });
 }
 
+function toolsFrom(result) {
+  if (result?.code !== 0 || !result.stdout.trim()) return [];
+  try {
+    const parsed = JSON.parse(result.stdout);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function listUntil(endpoint, cwd, args, predicate, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const intervalMs = options.intervalMs ?? 100;
+  const label = options.label ?? 'list';
+  const holderStderr = options.holderStderr ?? (() => '');
+  const deadline = Date.now() + timeoutMs;
+  let last = { code: 1, stdout: '', stderr: '' };
+  let tools = [];
+  while (Date.now() < deadline) {
+    last = await once(endpoint, cwd, args);
+    tools = toolsFrom(last);
+    assert.equal(
+      String(last.stderr).includes('cross-origin child tools are unavailable'),
+      false,
+      `${label} guarded-route refusal\nlist stderr: ${last.stderr}\n${holderStderr()}`
+    );
+    if (last.code === 0 && predicate(tools, last)) {
+      return { ...last, tools };
+    }
+    await sleep(intervalMs);
+  }
+  assert.fail(
+    `${label} timed out\nlast=${JSON.stringify({ code: last.code, tools, stderr: last.stderr })}\n${holderStderr()}`
+  );
+}
+
 async function navigate(raw, session, url) {
   const loaded = raw.waitEvent(
     (event) => event.method === 'Page.loadEventFired' && event.sessionId === session,
@@ -437,32 +473,14 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
           from
         );
         assert.ok(names(late).includes('cross_late'), JSON.stringify(late));
-        const after = await once(wire.url, cwd, [
-          'webmcp-list',
-          '--tab',
-          targetId,
-          '--json',
-          '--from-origin',
-          foreignOrigin,
-        ]);
-        assert.equal(
-          after.code,
-          0,
-          `list after gate failed\nlist stderr: ${after.stderr}\n${held.stderr()}`
-        );
-        assert.equal(
-          after.stderr.includes('cross-origin child tools are unavailable'),
-          false,
-          `guarded-route refusal\nlist stderr: ${after.stderr}\n${held.stderr()}`
-        );
-        const tools = JSON.parse(after.stdout);
-        assert.ok(
-          tools.some((tool) => tool.name === 'initial'),
-          `initial missing\n${held.stderr()}`
-        );
-        assert.ok(
-          tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId),
-          `cross_late missing from ${JSON.stringify(tools)}\n${held.stderr()}`
+        await listUntil(
+          wire.url,
+          cwd,
+          ['webmcp-list', '--tab', targetId, '--json', '--from-origin', foreignOrigin],
+          (tools) =>
+            tools.some((tool) => tool.name === 'initial') &&
+            tools.some((tool) => tool.name === 'cross_late' && tool.frameId === child.targetId),
+          { label: 'crossControl', holderStderr: () => held.stderr() }
         );
         const called = await once(wire.url, cwd, [
           'webmcp-call',
@@ -669,24 +687,14 @@ if (document.modelContext) document.modelContext.registerTool(${tool('initial')}
     );
     assert.equal(await evaluate(raw, childSession, 'typeof document.modelContext'), 'object');
     await evaluate(raw, childSession, 'openGate()');
-    const after = await once(wire.url, cwd, [
-      'webmcp-list',
-      '--tab',
-      targetId,
-      '--json',
-      '--from-origin',
-      foreignOrigin,
-    ]);
-    assert.equal(
-      after.code,
-      0,
-      `list after gate failed\n${after.stderr}\nholder: ${held.stderr()}`
+    const after = await listUntil(
+      wire.url,
+      cwd,
+      ['webmcp-list', '--tab', targetId, '--json', '--from-origin', foreignOrigin],
+      (tools) => tools.some((tool) => tool.name === 'cross_late'),
+      { label: 'lazy-after-gate', holderStderr: () => held.stderr() }
     );
-    const afterTools = JSON.parse(after.stdout);
-    assert.ok(
-      afterTools.some((tool) => tool.name === 'cross_late'),
-      `cross_late missing from ${JSON.stringify(afterTools)}\nholder: ${held.stderr()}`
-    );
+    const afterTools = after.tools;
     assert.equal(
       afterTools.some((tool) => tool.name === 'cross_early'),
       false,
@@ -695,25 +703,14 @@ if (document.modelContext) document.modelContext.registerTool(${tool('initial')}
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
     const ready = held.next((line) => line.event === 'document-ready', held.lines.length);
     await Promise.all([navigate(raw, sessionId, `${ordinary}/lazy?reload=1`), ready]);
-    await sleep(500);
-    const reloaded = await once(wire.url, cwd, [
-      'webmcp-list',
-      '--tab',
-      targetId,
-      '--json',
-      '--from-origin',
-      foreignOrigin,
-    ]);
-    assert.equal(
-      reloaded.code,
-      0,
-      `list after reload failed\n${reloaded.stderr}\nholder: ${held.stderr()}`
+    const reloaded = await listUntil(
+      wire.url,
+      cwd,
+      ['webmcp-list', '--tab', targetId, '--json', '--from-origin', foreignOrigin],
+      (tools) => tools.some((tool) => tool.name === 'cross_early'),
+      { label: 'lazy-after-reload', holderStderr: () => held.stderr() }
     );
-    const reloadedTools = JSON.parse(reloaded.stdout);
-    assert.ok(
-      reloadedTools.some((tool) => tool.name === 'cross_early'),
-      `cross_early missing after reload from ${JSON.stringify(reloadedTools)}\nholder: ${held.stderr()}`
-    );
+    assert.ok(reloaded.tools.some((tool) => tool.name === 'cross_early'));
     held.child.stdin.end();
     assert.equal(await held.ended, 0, `holder exit\nholder: ${held.stderr()}`);
     held = undefined;

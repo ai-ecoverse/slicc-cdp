@@ -114,6 +114,71 @@ async function once(endpoint, cwd, args) {
   return process.ended;
 }
 
+function clock(phase, extra = {}) {
+  console.error(
+    `webmcp-polyfill: ${JSON.stringify({ event: 'clock', phase, at: Date.now(), ...extra })}`
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function toolsFrom(result) {
+  if (result?.code !== 0 || !result.stdout.trim()) return [];
+  try {
+    const parsed = JSON.parse(result.stdout);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function admitClock(holderStarted, stderr) {
+  for (const row of holderTimeline(stderr)) {
+    if (row.event === 'guard-decision' && row.decision === 'install' && row.detail === 'admitted') {
+      clock('child-admit', { holderMs: row.ms, at: holderStarted + Number(row.ms || 0) });
+    }
+  }
+}
+
+async function listUntil(endpoint, cwd, args, predicate, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const intervalMs = options.intervalMs ?? 100;
+  const label = options.label ?? 'list';
+  const holderStderr = options.holderStderr ?? (() => '');
+  const beacons = options.beacons ?? (() => []);
+  const deadline = Date.now() + timeoutMs;
+  let last = { code: 1, stdout: '', stderr: '' };
+  let tools = [];
+  while (Date.now() < deadline) {
+    const start = Date.now();
+    last = await once(endpoint, cwd, args);
+    const end = Date.now();
+    tools = toolsFrom(last);
+    clock('list', {
+      label,
+      startAt: start,
+      endAt: end,
+      code: last.code,
+      toolCount: tools.length,
+      names: tools.map((tool) => tool.name),
+    });
+    assert.equal(
+      String(last.stderr).includes('cross-origin child tools are unavailable'),
+      false,
+      last.stderr
+    );
+    if (last.code === 0 && predicate(tools, last)) {
+      return { ...last, tools };
+    }
+    await sleep(intervalMs);
+  }
+  assert.fail(
+    `${label} timed out waiting for child tool\nlast=${JSON.stringify({ code: last.code, tools, stderr: last.stderr })}\nholder: ${holderStderr()}\nbeacons: ${JSON.stringify(beacons())}`
+  );
+}
+
 async function navigate(raw, session, url) {
   const loaded = raw.waitEvent(
     (event) => event.method === 'Page.loadEventFired' && event.sessionId === session,
@@ -150,6 +215,7 @@ for (const _repeat of [1, 2, 3, 4, 5]) {
     let holder;
     let conversionHolder;
     let server;
+    const beacons = [];
     try {
       const keyPath = path.join(cwd, 'key.pem');
       const certPath = path.join(cwd, 'cert.pem');
@@ -183,14 +249,15 @@ for (const _repeat of [1, 2, 3, 4, 5]) {
           }
           if (req.url.startsWith('/diag-register')) {
             const query = new URL(req.url, 'https://localhost').searchParams;
-            console.error(
-              `webmcp-polyfill: ${JSON.stringify({
-                event: 'fixture-register',
-                ok: query.get('ok') === '1',
-                tool: query.get('tool') === 'cross_child' ? 'cross_child' : 'other',
-                ms: Number(query.get('ms') || 0),
-              })}`
-            );
+            const beacon = {
+              event: 'fixture-register',
+              ok: query.get('ok') === '1',
+              tool: query.get('tool') === 'cross_child' ? 'cross_child' : 'other',
+              ms: Number(query.get('ms') || 0),
+              at: Number(query.get('at') || Date.now()),
+            };
+            beacons.push(beacon);
+            console.error(`webmcp-polyfill: ${JSON.stringify(beacon)}`);
             res.writeHead(204);
             res.end();
             return;
@@ -226,14 +293,14 @@ const register = () => {
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
   }
-  fetch('/diag-register?ok=1&tool=' + encodeURIComponent(${JSON.stringify(names[0] || '')}) + '&ms=' + Math.round(performance.now() - started)).catch(() => {});
+  fetch('/diag-register?ok=1&tool=' + encodeURIComponent(${JSON.stringify(names[0] || '')}) + '&ms=' + Math.round(performance.now() - started) + '&at=' + Date.now()).catch(() => {});
   return true;
 };
 if (!register()) {
   const timer = setInterval(() => { if (register()) clearInterval(timer); }, 50);
   setTimeout(() => {
     clearInterval(timer);
-    if (!document.modelContext) fetch('/diag-register?ok=0&tool=' + encodeURIComponent(${JSON.stringify(names[0] || '')}) + '&ms=' + Math.round(performance.now() - started)).catch(() => {});
+    if (!document.modelContext) fetch('/diag-register?ok=0&tool=' + encodeURIComponent(${JSON.stringify(names[0] || '')}) + '&ms=' + Math.round(performance.now() - started) + '&at=' + Date.now()).catch(() => {});
   }, 5000);
 }`
               : `if (document.modelContext) {
@@ -400,39 +467,40 @@ ${childScript}
       assert.equal((await hasShim(raw, childSession)).api, false);
       await raw.send('Target.detachFromTarget', { sessionId: childSession });
       await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
+      const foreignOrigin = `https://foreign.test:${port}`;
+      const holderStarted = Date.now();
       holder = command(browser.wsUrl, cwd, [
         'webmcp-polyfill',
         '--tab',
         targetId,
         '--reload',
         '--from-origin',
-        `https://foreign.test:${port}`,
+        foreignOrigin,
       ]);
       assert.equal((await holder.ready).mode, 'polyfill');
+      clock('holder-ready', { at: Date.now(), holderStarted });
       const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
       assert.equal(same.code, 0, same.stderr);
       assert.equal(JSON.parse(same.stdout).length, 9);
-      const cross = await once(browser.wsUrl, cwd, [
-        'webmcp-list',
-        '--tab',
-        targetId,
-        '--json',
-        '--from-origin',
-        `https://foreign.test:${port}`,
-      ]);
-      assert.equal(cross.code, 0, cross.stderr);
-      assert.equal(
-        cross.stderr.includes('cross-origin child tools are unavailable'),
-        false,
-        cross.stderr
+      admitClock(holderStarted, holder.stderr());
+      const cross = await listUntil(
+        browser.wsUrl,
+        cwd,
+        ['webmcp-list', '--tab', targetId, '--json', '--from-origin', foreignOrigin],
+        (tools) => tools.some((tool) => tool.name === 'cross_child'),
+        {
+          label: 'cross-from-origin',
+          holderStderr: () => holder.stderr(),
+          beacons: () => beacons,
+        }
       );
-      const crossTools = JSON.parse(cross.stdout);
-      assert.ok(
-        crossTools.some((tool) => tool.name === 'cross_child'),
-        `cross_child missing from ${JSON.stringify(crossTools)}\n${holder.stderr()}`
-      );
+      admitClock(holderStarted, holder.stderr());
+      for (const beacon of beacons.filter((row) => row.tool === 'cross_child')) {
+        clock('fixture-register-seen', beacon);
+      }
+      const crossTools = cross.tools;
       const crossTool = crossTools.find((tool) => tool.name === 'cross_child');
-      assert.equal(crossTool.origin, `https://foreign.test:${port}`);
+      assert.equal(crossTool.origin, foreignOrigin);
       assert.equal(crossTool.policy, 'allowed');
       assert.ok(crossTool.frameId);
       const crossCall = await once(browser.wsUrl, cwd, [
@@ -442,7 +510,7 @@ ${childScript}
         '--tab',
         targetId,
         '--from-origin',
-        `https://foreign.test:${port}`,
+        foreignOrigin,
       ]);
       assert.equal(crossCall.code, 0, crossCall.stderr);
       assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
