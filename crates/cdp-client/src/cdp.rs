@@ -46,6 +46,8 @@ pub const UNVERIFIED: &str = "slicc: refused: slicc could not finish checking th
 pub const PAGE_CHANGED: &str = "slicc: refused: the page changed while slicc was checking it; try again once it settles\n";
 pub const RENDERER_CRASHED: &str = "slicc: refused: renderer crashed\n";
 pub const GUARD_SETUP: Duration = Duration::from_secs(30);
+pub const BATCH_LIMIT: usize = 512;
+const BATCH_WAIT: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
 const WAITER_SLICE: Duration = Duration::from_millis(5);
@@ -195,6 +197,7 @@ pub struct Cdp {
     webmcp: webmcp_guard::Webmcp,
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
+    pub(crate) batch_wait: Duration,
     issued: issued::Issued,
     waiter: Option<Waiter>,
     waiter_due: Instant,
@@ -322,6 +325,7 @@ impl Cdp {
             webmcp: webmcp_guard::Webmcp::default(),
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
+            batch_wait: BATCH_WAIT,
             issued: issued::Issued::default(),
             waiter: None,
             waiter_due: Instant::now(),
@@ -675,12 +679,26 @@ impl Cdp {
         if !batchable(method, &batch) {
             return batch.into_iter().map(|params| self.call(method, params, session_id)).collect();
         }
-        let checks = self.page_scope_admit_prepare(method, &batch, &batch[0], session_id, Duration::from_secs(30), false, true)?;
+        let mut results = Vec::with_capacity(batch.len());
+        let mut first = None;
+        for chunk in batch.chunks(BATCH_LIMIT) {
+            let (described, checks) = self.call_chunk(method, chunk, session_id, first.as_ref())?;
+            results.extend(described);
+            first.get_or_insert(checks);
+        }
+        Ok(results)
+    }
+
+    fn call_chunk(&mut self, method: &str, batch: &[Value], session_id: Option<&str>, first: Option<&Vec<(String, DocumentState)>>) -> Result<(Vec<Value>, Vec<(String, DocumentState)>), String> {
+        let checks = self.page_scope_admit_prepare(method, batch, &batch[0], session_id, BATCH_WAIT, false, true)?;
+        if first.is_some_and(|first| !same_proof(first, &checks)) { return Err(self.refusal()) }
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
+        let deadline = Instant::now() + self.batch_wait;
         let mut ids = Vec::with_capacity(batch.len());
         let mut replies = Vec::with_capacity(batch.len());
         let mut failed = None;
-        for params in &batch {
+        for params in batch {
+            if Instant::now() >= deadline { failed = Some(format!("{method} timed out\n")); break }
             let (forwarded, sent) = self.fetch_command(method, params.clone(), session_id);
             match self.send(&forwarded, sent, session_id) {
                 Ok(id) => { self.waiting_calls.insert(id); ids.push(id); }
@@ -689,7 +707,9 @@ impl Cdp {
         }
         if failed.is_none() {
             for &id in &ids {
-                match self.raw_reply(method, id, session_id, Duration::from_secs(30), false) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() { failed = Some(format!("{method} timed out\n")); break }
+                match self.raw_reply(method, id, session_id, left, false) {
                     Ok(value) => replies.push(value),
                     Err(message) => { failed = Some(message); break }
                 }
@@ -708,7 +728,7 @@ impl Cdp {
             self.bind_streams(method, session_id, &result, &checks);
             results.push(result);
         }
-        Ok(results)
+        Ok((results, checks))
     }
 
     fn page_scope_admit_prepare(
@@ -3927,6 +3947,12 @@ fn unguarded(message: String) -> String {
 
 fn frame_text_known(text: &str) -> bool {
     !matches!(text, "" | "null" | "://")
+}
+
+fn same_proof(first: &[(String, DocumentState)], next: &[(String, DocumentState)]) -> bool {
+    first.len() == next.len() && first.iter().zip(next).all(|((target, before), (now, after))| {
+        target == now && before == after && before.page_scope == after.page_scope && before.frames == after.frames
+    })
 }
 
 fn batchable(method: &str, batch: &[Value]) -> bool {
