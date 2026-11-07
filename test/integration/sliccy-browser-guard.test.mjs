@@ -58,6 +58,26 @@ async function settle() {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 
+async function withDiscovered(fake, work) {
+  const bin = await fakeSlicc(fake.url);
+  const previous = process.env.SLICC_CDP_URL;
+  const previousPath = process.env.PATH;
+  const previousHome = process.env.HOME;
+  delete process.env.SLICC_CDP_URL;
+  process.env.PATH = `${bin}${path.delimiter}/nonexistent`;
+  process.env.HOME = path.join(scratch, `home-${Math.random().toString(36).slice(2)}`);
+  await settle();
+  try {
+    return await work();
+  } finally {
+    process.env.PATH = previousPath;
+    process.env.HOME = previousHome;
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
+}
+
 const seven = { targetId: 'SEVEN', url: 'https://lars.sliccy.ai/', title: 'seven' };
 const vault = { targetId: 'VAULT', url: 'https://vault.sliccy.ai/', title: 'vault' };
 const extension = {
@@ -125,15 +145,7 @@ test('isProtectedUrl covers seven, vault, extension, error pages; fail closed', 
 test('discovered endpoint refuses protected findTab/eval/cookie/localStorage/fetch', async () => {
   const fake = await fakeCdp({ answers: guardedAnswers(), intercept: guardedIntercept });
   after(() => fake.close());
-  const bin = await fakeSlicc(fake.url);
-  const previous = process.env.SLICC_CDP_URL;
-  const previousPath = process.env.PATH;
-  const previousHome = process.env.HOME;
-  delete process.env.SLICC_CDP_URL;
-  process.env.PATH = `${bin}${path.delimiter}/nonexistent`;
-  process.env.HOME = path.join(scratch, 'discovered-home');
-  await settle();
-  try {
+  await withDiscovered(fake, async () => {
     await assert.rejects(() => browser.findTab({ domain: 'lars.sliccy.ai' }), {
       message: REFUSAL,
     });
@@ -158,13 +170,7 @@ test('discovered endpoint refuses protected findTab/eval/cookie/localStorage/fet
     });
     const fetched = await browser.fetch(ok, 'https://example.test/');
     assert.equal(fetched?.status, 200);
-  } finally {
-    process.env.PATH = previousPath;
-    process.env.HOME = previousHome;
-    if (previous === undefined) delete process.env.SLICC_CDP_URL;
-    else process.env.SLICC_CDP_URL = previous;
-    await settle();
-  }
+  });
 });
 
 test('explicit SLICC_CDP_URL stays unguarded', async () => {
@@ -178,6 +184,8 @@ test('explicit SLICC_CDP_URL stays unguarded', async () => {
     assert.equal(tab?.targetId, 'SEVEN');
     assert.equal(await browser.eval(seven, '1'), 'leaked');
     assert.equal(await browser.cookie(seven, 'seven_session'), 'secret');
+    const ensured = await browser.ensureTab('https://lars.sliccy.ai/app');
+    assert.equal(ensured?.url, 'https://lars.sliccy.ai/');
   } finally {
     if (previous === undefined) delete process.env.SLICC_CDP_URL;
     else process.env.SLICC_CDP_URL = previous;
@@ -203,4 +211,223 @@ test('openClient clears guarded when connect fails after discovery', async () =>
     else process.env.SLICC_CDP_URL = previous;
     await settle();
   }
+});
+
+test('live urlOf refuses after handle navigates to seven; cookie value discarded', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+      'Network.getCookies': {
+        cookies: [{ name: 'seven_session', value: 'secret', domain: '.sliccy.ai', path: '/' }],
+      },
+    },
+    intercept: (message, send) => {
+      if (message.method === 'Target.getTargets') {
+        send({ id: message.id, result: { targetInfos: [info(page)] } });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      if (expression.includes("location.href='https://lars.sliccy.ai/'")) {
+        page.url = 'https://lars.sliccy.ai/';
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { result: { type: 'undefined' } },
+        });
+        return true;
+      }
+      const payload = expression.includes('await fetch(')
+        ? {
+            result: {
+              type: 'object',
+              value: { status: 200, statusText: 'OK', headers: {}, body: 'leak', url: page.url },
+            },
+          }
+        : { result: { type: 'string', value: 'leaked' } };
+      send({
+        id: message.id,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        result: payload,
+      });
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    assert.equal(tab?.targetId, 'OK');
+    assert.equal(tab?.url, 'https://example.test/');
+    await assert.rejects(() => browser.eval(tab, "location.href='https://lars.sliccy.ai/'"), {
+      message: REFUSAL,
+    });
+    assert.equal(page.url, 'https://lars.sliccy.ai/');
+    await assert.rejects(() => browser.eval(tab, '1'), { message: REFUSAL });
+    await assert.rejects(() => browser.evalAsync(tab, '1'), { message: REFUSAL });
+    await assert.rejects(() => browser.cookie(tab, 'seven_session'), { message: REFUSAL });
+    assert.equal(fake.calls.filter((call) => call.method === 'Network.getCookies').length, 0);
+    await assert.rejects(() => browser.localStorage(tab, 'k'), { message: REFUSAL });
+    await assert.rejects(() => browser.fetch(tab, 'https://example.test/'), { message: REFUSAL });
+  });
+});
+
+test('navigation during eval is refused and the result is discarded', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let evalResultSent = false;
+  const fake = await fakeCdp({
+    answers: {
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (message.method === 'Target.getTargets') {
+        send({ id: message.id, result: { targetInfos: [info(page)] } });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      page.url = 'https://vault.sliccy.ai/';
+      evalResultSent = true;
+      send({
+        id: message.id,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        result: { result: { type: 'string', value: 'should-not-return' } },
+      });
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await assert.rejects(() => browser.eval(tab, 'document.cookie'), { message: REFUSAL });
+    assert.equal(evalResultSent, true);
+    await assert.rejects(() => browser.evalAsync(tab, '1'), { message: REFUSAL });
+  });
+});
+
+test('findTab skips a protected first match and never returns a protected tab', async () => {
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': {
+        targetInfos: [seven, vault, ok].map(info),
+      },
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const hit = await browser.findTab({ urlMatch: '.' });
+    assert.equal(hit?.targetId, 'OK');
+    assert.equal(isProtectedUrl(hit.url), false);
+    await assert.rejects(() => browser.findTab({ urlMatch: 'sliccy\\.ai' }), {
+      message: REFUSAL,
+    });
+  });
+});
+
+test('ensureTab refuses a protected url with no Target.createTarget', async () => {
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [ok].map(info) },
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.ensureTab('https://lars.sliccy.ai/app'), {
+      message: REFUSAL,
+    });
+    assert.equal(fake.calls.filter((call) => call.method === 'Target.createTarget').length, 0);
+  });
+});
+
+test('ensureTab that redirects to seven closes the created target and refuses', async () => {
+  const fake = await fakeCdp({
+    onCommand: (message) => {
+      if (
+        message.method === 'Page.navigate' &&
+        message.params?.url === 'https://example.test/to-seven'
+      ) {
+        message.params.url = 'https://lars.sliccy.ai/';
+      }
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.ensureTab('https://example.test/to-seven'), {
+      message: REFUSAL,
+    });
+    const created = fake.calls.find((call) => call.method === 'Target.createTarget');
+    const closed = fake.calls.find((call) => call.method === 'Target.closeTarget');
+    assert.ok(created?.params);
+    assert.equal(closed?.params?.targetId, 'TAB1');
+  });
+});
+
+test('ensureTab match branches skip protected tabs and never return them', async () => {
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': {
+        targetInfos: [seven, { targetId: 'OK', url: 'https://example.test/app', title: 'ok' }].map(
+          info
+        ),
+      },
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const byMatch = await browser.ensureTab('https://example.test/other', {
+      matchUrl: 'example\\.test|sliccy\\.ai',
+    });
+    assert.equal(byMatch?.targetId, 'OK');
+    assert.equal(isProtectedUrl(byMatch.url), false);
+    assert.equal(fake.calls.filter((call) => call.method === 'Target.createTarget').length, 0);
+    const byOrigin = await browser.ensureTab('https://example.test/again');
+    assert.equal(byOrigin?.targetId, 'OK');
+    assert.equal(fake.calls.filter((call) => call.method === 'Target.createTarget').length, 0);
+  });
+});
+
+test('findTab returns null when nothing matches', async () => {
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [ok].map(info) },
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    assert.equal(await browser.findTab({ domain: 'missing.test' }), null);
+  });
+});
+
+test('eval surfaces Runtime.evaluate exceptionDetails under guard', async () => {
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [ok].map(info) },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      send({
+        id: message.id,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        result: {
+          result: { type: 'object' },
+          exceptionDetails: { text: 'boom' },
+        },
+      });
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.eval(ok, 'throw 1'), { message: 'boom' });
+  });
 });

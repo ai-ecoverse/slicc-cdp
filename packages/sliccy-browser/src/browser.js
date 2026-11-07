@@ -3,7 +3,7 @@ import path from 'node:path';
 import { connect } from './connect.js';
 import { resolveCdpEndpoint } from './discover.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
-import { isProtectedHost, REFUSAL, refuseProtected } from './guard.js';
+import { isProtectedHost, isProtectedUrl, REFUSAL, refuseProtected } from './guard.js';
 import { version } from './version.js';
 
 export { REFUSAL, resolveCdpEndpoint, version };
@@ -66,15 +66,17 @@ async function openResolved() {
 }
 
 async function urlOf(tab) {
-  if (tab && typeof tab === 'object' && typeof tab.url === 'string') return tab.url;
   const targetId = targetIdOf(tab);
   const tabs = await listTabs();
   return tabs.find((item) => item.targetId === targetId)?.url ?? '';
 }
 
-async function refuseGuardedTab(tab) {
-  if (!guarded) return;
+async function withGuardedTab(tab, work) {
+  if (!guarded) return work();
   refuseProtected(await urlOf(tab));
+  const result = await work();
+  refuseProtected(await urlOf(tab));
+  return result;
 }
 
 async function using(work) {
@@ -339,14 +341,16 @@ async function findTabNow(query = {}) {
   const tabs = await listTabs();
   const wanted = domain?.toLowerCase();
   const re = urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.findTab');
-  const hit =
-    tabs.find(
-      (tab) =>
-        (wanted === undefined || hostnameOf(tab.url)?.toLowerCase() === wanted) &&
-        (re === undefined || re.test(tab.url))
-    ) ?? null;
-  if (hit && guarded) refuseProtected(hit.url);
-  return hit;
+  const matches = tabs.filter(
+    (tab) =>
+      (wanted === undefined || hostnameOf(tab.url)?.toLowerCase() === wanted) &&
+      (re === undefined || re.test(tab.url))
+  );
+  if (!guarded) return matches[0] ?? null;
+  const allowed = matches.find((tab) => !isProtectedUrl(tab.url));
+  if (allowed) return allowed;
+  if (matches.length > 0) throw new Error(REFUSAL);
+  return null;
 }
 
 export async function ensureTab(url, options) {
@@ -357,16 +361,20 @@ async function ensureTabNow(url, options = {}) {
   if (typeof url !== 'string' || url.length === 0) {
     throw new TypeError('browser.ensureTab: url must be a string');
   }
+  await openClient();
+  if (guarded) refuseProtected(url);
   const tabs = await listTabs();
   const matchUrl = patternOf(options.matchUrl);
   if (matchUrl !== undefined) {
     const re = compilePattern(matchUrl, 'browser.ensureTab');
-    const hit = tabs.find((tab) => re.test(tab.url));
+    const hit = tabs.find((tab) => re.test(tab.url) && (!guarded || !isProtectedUrl(tab.url)));
     if (hit) return hit;
   } else {
     const wanted = originOf(url);
     if (wanted) {
-      const hit = tabs.find((tab) => originOf(tab.url) === wanted);
+      const hit = tabs.find(
+        (tab) => originOf(tab.url) === wanted && (!guarded || !isProtectedUrl(tab.url))
+      );
       if (hit) return hit;
     }
   }
@@ -380,10 +388,18 @@ async function ensureTabNow(url, options = {}) {
     throw new Error('Target.createTarget returned no targetId');
   }
   const { sessionId } = await sessionFor(targetId);
-  if (url === 'about:blank') await waitForLoad(client, sessionId);
-  else await navigateAndWait(client, sessionId, url);
-  const live = (await listTabs()).find((tab) => tab.targetId === targetId);
-  return live ?? { targetId, url, title: '' };
+  try {
+    if (url === 'about:blank') await waitForLoad(client, sessionId);
+    else await navigateAndWait(client, sessionId, url);
+    const live = (await listTabs()).find((tab) => tab.targetId === targetId);
+    if (guarded) refuseProtected(live?.url ?? '');
+    return live ?? { targetId, url, title: '' };
+  } catch (error) {
+    if (guarded) {
+      await client.send('Target.closeTarget', { targetId }).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 function evalSource(tab, source) {
@@ -401,22 +417,23 @@ function evaluate(tab, source, awaitPromise, decodeJson = true) {
 }
 
 async function evaluateNow(tab, source, awaitPromise, decodeJson) {
-  await refuseGuardedTab(tab);
-  const { client, sessionId } = await sessionFor(targetIdOf(tab));
-  const result = await client.send(
-    'Runtime.evaluate',
-    {
-      expression: serializeEvalSource(source),
-      returnByValue: true,
-      awaitPromise,
-    },
-    sessionId
-  );
-  if (result?.exceptionDetails) {
-    throw new Error(exceptionMessage(result.exceptionDetails));
-  }
-  const value = result?.result?.value;
-  return decodeJson ? unwrapEvalResult(value) : value;
+  return withGuardedTab(tab, async () => {
+    const { client, sessionId } = await sessionFor(targetIdOf(tab));
+    const result = await client.send(
+      'Runtime.evaluate',
+      {
+        expression: serializeEvalSource(source),
+        returnByValue: true,
+        awaitPromise,
+      },
+      sessionId
+    );
+    if (result?.exceptionDetails) {
+      throw new Error(exceptionMessage(result.exceptionDetails));
+    }
+    const value = result?.result?.value;
+    return decodeJson ? unwrapEvalResult(value) : value;
+  });
 }
 
 export async function cookie(tab, name) {
@@ -425,12 +442,13 @@ export async function cookie(tab, name) {
 }
 
 async function cookieNow(tab, name) {
-  await refuseGuardedTab(tab);
-  const { client, sessionId } = await sessionFor(targetIdOf(tab));
-  const result = await client.send('Network.getCookies', {}, sessionId);
-  const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
-  const hit = cookies.find((item) => item && item.name === name);
-  return hit && typeof hit.value === 'string' ? hit.value : null;
+  return withGuardedTab(tab, async () => {
+    const { client, sessionId } = await sessionFor(targetIdOf(tab));
+    const result = await client.send('Network.getCookies', {}, sessionId);
+    const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
+    const hit = cookies.find((item) => item && item.name === name);
+    return hit && typeof hit.value === 'string' ? hit.value : null;
+  });
 }
 
 export async function localStorage(tab, key) {
@@ -450,7 +468,6 @@ export async function fetch(tab, url, opts = {}) {
   return using(async () => {
     await openClient();
     if (guarded) refuseProtected(url);
-    await refuseGuardedTab(tab);
     const script = await buildBrowserFetchScript(url, opts);
     return evaluateNow(tab, script, true);
   });
