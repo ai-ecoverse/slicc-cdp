@@ -1567,6 +1567,46 @@ fn parked_child_attached_before_root_navigation_survives_and_installs_once() {
 }
 
 #[test]
+fn adopt_install_parks_instead_of_settling_when_parent_root_is_mid_navigation() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 0));
+    let parent_contexts = cdp.webmcp.contexts.iter().filter(|((owner, _), _)| owner == &holder).map(|(key, context)| (key.clone(), context.clone())).collect::<Vec<_>>();
+    cdp.webmcp.contexts.retain(|(owner, _), _| owner != &holder);
+    cdp.webmcp.requested_origins.insert("https://foreign.test".into());
+    let before = state.borrow().sent.len();
+    assert_eq!(cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + Duration::from_secs(1)), Ok(false));
+    assert!(!cdp.session_blocked("CHILD"), "unstable parent root must park the child, not settle it");
+    assert!(cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(
+        !state.borrow().sent[before..].iter().any(|command| {
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+        }),
+        "no evaluate while the parent root cannot be verified"
+    );
+    for (key, context) in parent_contexts {
+        cdp.webmcp.contexts.insert(key, context);
+    }
+    let before = state.borrow().sent.len();
+    assert_eq!(cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + Duration::from_secs(1)), Ok(true));
+    let child_evals = state.borrow().sent[before..].iter().filter(|command| {
+        command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+    }).count();
+    assert_eq!(child_evals, 1, "child installs once the parent root is stable again");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0));
+}
+
+#[test]
 fn protected_root_navigation_never_evaluates_a_parked_child() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));

@@ -1310,7 +1310,10 @@ impl Cdp {
             return Ok(false);
         }
         self.webmcp_pend_install(child, &loader);
-        let parent_root = self.webmcp_root_document(parent, until)?;
+        let Ok(parent_root) = self.webmcp_root_document(parent, until) else {
+            self.webmcp_pend_install(child, &loader);
+            return Ok(false);
+        };
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
         let last_accepted = self.webmcp.arms.get(child).and_then(|arm| arm.frame_accept_generation.get(frame_id).copied());
         let matched = self.webmcp.contexts.iter().filter(|((owner, _), context)| {
@@ -1340,14 +1343,24 @@ impl Cdp {
         }
         let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
         if self.webmcp.arms.get(child).is_some_and(|arm| arm.accepted.contains(&realm)) {
-            self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
+            if self.webmcp_mark_admitted(child, id, &context, Instant::now()).is_err() {
+                self.webmcp_pend_install(child, &loader);
+                return Ok(false);
+            }
             return Ok(true);
         }
         if self.webmcp.arms.get(child).is_some_and(|arm| arm.installing.contains(&realm)) {
             return Ok(false);
         }
-        self.webmcp_evaluate(child, id, &context, parent_root, until)?;
-        self.webmcp_mark_admitted(child, id, &context, Instant::now())?;
+        if let Err(message) = self.webmcp_evaluate(child, id, &context, parent_root, until) {
+            if Self::webmcp_foreign_refusal(&message) { return Err(message); }
+            self.webmcp_pend_install(child, &loader);
+            return Ok(false);
+        }
+        if self.webmcp_mark_admitted(child, id, &context, Instant::now()).is_err() {
+            self.webmcp_pend_install(child, &loader);
+            return Ok(false);
+        }
         Ok(true)
     }
 
