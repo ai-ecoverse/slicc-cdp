@@ -584,6 +584,67 @@ await test('fake: polyfill on direct drops the guarded-route sentence for reques
   );
 });
 
+await test('fake: idle holder heartbeat keeps snapshot fresh past the 15s evidence window', async () => {
+  const registration = Promise.withResolvers();
+  await fixture(
+    '',
+    async (backend, cwd) => {
+      let timer;
+      try {
+        await Promise.race([
+          registration.promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('same-origin child did not register after installation')),
+              5000
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 16_000));
+      const listed = await run(
+        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://foreign.test'],
+        cwd,
+        backend.url
+      );
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.equal(listed.stderr.includes('cross-origin child tools are unavailable'), false);
+    },
+    [
+      {
+        id: 'SAME',
+        origin: 'https://ordinary.test',
+        definitions: [],
+      },
+      {
+        id: 'CROSS',
+        origin: 'https://foreign.test',
+        allow: 'tools *',
+        definitions: [],
+      },
+    ],
+    (command, pages) => {
+      const child = pages.get('SAME');
+      if (
+        command.method === 'Runtime.evaluate' &&
+        command.params.expression.startsWith('const __wmcp_') &&
+        command.params.uniqueContextId === `main-${child.loader}`
+      ) {
+        void (async () => {
+          await new Promise((resolve) => setImmediate(resolve));
+          child.document.modelContext.registerTool({
+            name: 'greet',
+            execute: () => 'same-origin child',
+          });
+          registration.resolve();
+        })().catch(registration.reject);
+      }
+    }
+  );
+});
+
 for (const message of [
   'slicc: refused: Target.setAutoAttach is not supported: attach to each target',
   'slicc: refused: auto-attach is not supported by the extension bridge',

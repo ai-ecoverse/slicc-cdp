@@ -54,7 +54,8 @@ fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str, changes: Valu
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.webmcp_connection = state.webmcp_connection.clone();
     let requested = latest.webmcp.get(target).and_then(|entry| entry.get("requestedOrigins")).cloned();
-    let mut data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes,"routeAttested":cdp.webmcp_route_attested_snapshot()});
+    let mut data = json!({"schema":crate::webmcp::SNAPSHOT_SCHEMA,"updatedAtMs":crate::webmcp::snapshot_now_ms(),"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes,"routeAttested":cdp.webmcp_route_attested_snapshot()});
+    if let Some(pid) = crate::webmcp::snapshot_holder_pid() { data["holderPid"] = json!(pid); }
     if let Some(requested) = requested { data["requestedOrigins"] = requested; }
     latest.webmcp.insert(target.to_string(), data.clone());
     session::save_webmcp(&latest)?;
@@ -103,6 +104,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
     io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
     let mut saved = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
     let mut readiness = Readiness { seen: cdp.events().len(), waiting: false };
+    let mut heartbeat = Instant::now();
     loop {
         match input() {
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -118,9 +120,10 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         cdp.webmcp_install_children();
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
-        if current != saved {
+        if current != saved || heartbeat.elapsed() >= Duration::from_secs(3) {
             save(cdp, state, target, &owner, watch.changes())?;
             saved = current;
+            heartbeat = Instant::now();
         }
         for (_target, child, _bridge) in cdp.take_webmcp_children() {
             let attached = cdp.webmcp_auto_attach(&child);
