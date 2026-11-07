@@ -1663,9 +1663,6 @@ impl Cdp {
                 }
             }
             self.webmcp_navigated(session, value);
-            if !child_frame && frame.get("parentId").is_none() {
-                self.webmcp_detach_parked_children(session);
-            }
             if self.webmcp.parents.contains_key(session) {
                 self.webmcp_finish_awaiting_children();
             }

@@ -1436,8 +1436,8 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     rooted.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
     assert!(rooted.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()));
     rooted.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
-    assert!(rooted.session_blocked("CHILD") || !rooted.webmcp.parents.contains_key("CHILD"), "parent root navigation must detach parked children");
-    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert!(!rooted.session_blocked("CHILD") && rooted.webmcp.parents.contains_key("CHILD"), "ordinary root navigation must keep parked children of the new document");
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
 
     let (mut buffered, state) = client();
     state.borrow_mut().oopif_tree = Some(verified);
@@ -1526,19 +1526,73 @@ fn private_oopif_attach_does_not_touch_protect_or_guard_the_root() {
     assert!(cdp.webmcp_alive(&holder));
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()), "blank child parks with no deadline");
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
-    assert!(cdp.session_blocked("CHILD"), "parent navigation settles parked children");
-    assert!(!cdp.webmcp.parents.contains_key("CHILD"), "detach reply forgets the child and drops parents during settle");
-    assert!(!cdp.session_blocked(&holder), "root stays unblocked after child settle/forget");
-    assert!(!cdp.content_blocked(&holder), "root stays content-unblocked after child settle/forget");
+    assert!(!cdp.session_blocked("CHILD"), "ordinary root navigation must not settle a parked child that attached before frameNavigated");
+    assert!(cdp.webmcp.parents.contains_key("CHILD"), "parked child remains parented across ordinary root navigation");
+    assert!(!cdp.session_blocked(&holder), "root stays unblocked after ordinary navigation");
+    assert!(!cdp.content_blocked(&holder), "root stays content-unblocked after ordinary navigation");
     assert!(!cdp.guard_sessions.contains(&holder));
     assert!(cdp.documents.get("T").is_some(), "page document remains; root page label stays known");
-    assert!(
-        cdp.session_blocked("CHILD") && cdp.content_blocked("CHILD") && !cdp.webmcp.parents.contains_key("CHILD"),
-        "settled child stays blocked after forget"
-    );
-    assert_eq!(cdp.guards.get("IFRAME"), None, "forget abandons the OOPIF guard slot via protect_target on IFRAME only");
-    assert!(cdp.protected_targets.contains("IFRAME"));
+    assert_eq!(cdp.guards.get("IFRAME").map(String::as_str), Some("CHILD"), "OOPIF guard slot survives ordinary root navigation");
     assert!(!cdp.protected_targets.contains("T") || root_protected);
+}
+
+#[test]
+fn parked_child_attached_before_root_navigation_survives_and_installs_once() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none()));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
+    assert!(!cdp.session_blocked("CHILD"), "attach-before-navigation parked child must survive root frameNavigated");
+    assert!(cdp.webmcp.parents.contains_key("CHILD"));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    let child_evals = state.borrow().sent[before..].iter().filter(|command| {
+        command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+    }).count();
+    assert_eq!(child_evals, 1, "surviving parked child installs exactly once after request");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0));
+    assert!(cdp.webmcp_alive(&holder));
+}
+
+#[test]
+fn protected_root_navigation_never_evaluates_a_parked_child() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.parents.contains_key("CHILD") || cdp.webmcp.arms.contains_key("CHILD"));
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://catalog.test/vault","securityOrigin":"https://catalog.test","loaderId":"PROTECTED"}}}));
+    assert!(cdp.webmcp.arms.get(&holder).is_some_and(|arm| arm.revoked), "protected root navigation revokes the holder");
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.webmcp_finish_awaiting_children();
+    assert!(
+        !state.borrow().sent[before..].iter().any(|command| {
+            command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+        }),
+        "parked child must never evaluate after the root navigates to a protected document"
+    );
 }
 
 #[test]
