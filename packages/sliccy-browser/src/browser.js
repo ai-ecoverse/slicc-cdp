@@ -3,7 +3,13 @@ import path from 'node:path';
 import { connect } from './connect.js';
 import { resolveCdpEndpoint } from './discover.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
-import { isProtectedHost, isProtectedUrl, REFUSAL, refuseProtected } from './guard.js';
+import {
+  dropProtectedCookies,
+  isProtectedHost,
+  isProtectedUrl,
+  REFUSAL,
+  refuseProtected,
+} from './guard.js';
 import { version } from './version.js';
 
 export { REFUSAL, resolveCdpEndpoint, version };
@@ -187,6 +193,7 @@ function dispatchFrame(message) {
 }
 
 function route(targetId, url, raw, which) {
+  if (guarded && typeof url === 'string' && isProtectedUrl(url)) return;
   for (const sub of subscribers.values()) {
     if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
     const body = parseFrame(raw, sub.filter?.parseAs);
@@ -456,9 +463,11 @@ export async function cookie(tab, name) {
 async function cookieNow(tab, name) {
   return withGuardedTab(tab, async () => {
     const { client, sessionId } = await sessionFor(targetIdOf(tab));
-    const result = await client.send('Network.getCookies', {}, sessionId);
+    const params = guarded ? { urls: [await urlOf(tab)] } : {};
+    const result = await client.send('Network.getCookies', params, sessionId);
     const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
-    const hit = cookies.find((item) => item && item.name === name);
+    const visible = guarded ? dropProtectedCookies(cookies) : cookies;
+    const hit = visible.find((item) => item && item.name === name);
     return hit && typeof hit.value === 'string' ? hit.value : null;
   });
 }
@@ -712,6 +721,8 @@ export const websocket = {
       },
     };
     async function subscribe(sink) {
+      await openClient();
+      if (guarded) refuseProtected(await urlOf(tab));
       const urlMatchRe =
         urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
       const { sessionId } = await sessionFor(targetId);

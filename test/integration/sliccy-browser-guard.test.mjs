@@ -5,7 +5,11 @@ import path from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import browser, { REFUSAL } from '../../packages/sliccy-browser/src/browser.js';
-import { isProtectedUrl } from '../../packages/sliccy-browser/src/guard.js';
+import {
+  cookieProtected,
+  dropProtectedCookies,
+  isProtectedUrl,
+} from '../../packages/sliccy-browser/src/guard.js';
 import { fakeCdp } from './fake-cdp.mjs';
 import './watchdog.mjs';
 
@@ -604,5 +608,214 @@ test('discovered mode refuses file, chrome, devtools, blob-seven, about:blank vi
     await assert.rejects(() => browser.ensureTab('chrome://settings/'), { message: REFUSAL });
     await assert.rejects(() => browser.ensureTab('about:blank'), { message: REFUSAL });
     assert.equal((await browser.findTab({ domain: 'example.test' }))?.targetId, 'OK');
+  });
+});
+
+test('cookieProtected drops domain, url, and partitioned seven scopes', () => {
+  assert.equal(cookieProtected(null), true);
+  assert.equal(cookieProtected({ name: 'a', domain: '.sliccy.ai' }), true);
+  assert.equal(cookieProtected({ name: 'a', domain: 'seven.sliccy.ai' }), true);
+  assert.equal(cookieProtected({ name: 'a', domain: '.ai' }), true);
+  assert.equal(cookieProtected({ name: 'a', domain: 'example.test' }), false);
+  assert.equal(cookieProtected({ name: 'a', url: 'https://seven.sliccy.ai/' }), true);
+  assert.equal(cookieProtected({ name: 'a', url: 'ftp://seven.sliccy.ai/' }), true);
+  assert.equal(cookieProtected({ name: 'a', url: 'ftp://example.test./' }), false);
+  assert.equal(isProtectedUrl('wss://seven.sliccy.ai/socket'), true);
+  assert.equal(isProtectedUrl('ws://seven.sliccy.ai/socket'), true);
+  assert.equal(
+    cookieProtected({
+      name: 'a',
+      domain: 'cdn.example.test',
+      partitionKey: { topLevelSite: 'https://seven.sliccy.ai' },
+    }),
+    true
+  );
+  assert.equal(
+    cookieProtected({
+      name: 'a',
+      domain: 'cdn.example.test',
+      partitionKey: 'https://seven.sliccy.ai',
+    }),
+    true
+  );
+  assert.equal(
+    cookieProtected({
+      name: 'a',
+      domain: 'cdn.example.test',
+      partitionKey: { topLevelSite: 'ftp://seven.sliccy.ai/' },
+    }),
+    true
+  );
+  assert.deepEqual(
+    dropProtectedCookies([
+      { name: 'ok', value: '1', domain: 'example.test' },
+      { name: 'bad', value: '2', domain: '.sliccy.ai' },
+    ]).map((c) => c.name),
+    ['ok']
+  );
+  assert.deepEqual(dropProtectedCookies(null), []);
+});
+
+const iframeJar = [
+  { name: 'ok', value: 'allowed', domain: 'example.test', path: '/' },
+  { name: 'seven_session', value: 'secret', domain: '.sliccy.ai', path: '/' },
+  { name: 'host_only', value: 'secret2', domain: 'seven.sliccy.ai', path: '/' },
+  { name: 'parent', value: 'secret3', domain: '.ai', path: '/' },
+  {
+    name: 'part',
+    value: 'secret4',
+    domain: 'cdn.example.test',
+    path: '/',
+    partitionKey: { topLevelSite: 'https://seven.sliccy.ai' },
+  },
+];
+
+async function cookieIframeFake() {
+  const page = {
+    targetId: 'OK',
+    url: 'https://example.test/',
+    title: 'ok',
+    frames: [{ url: 'https://seven.sliccy.ai/embed' }],
+  };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (message.method === 'Network.getCookies') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { cookies: iframeJar.map((cookie) => ({ ...cookie })) },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  return { fake, page };
+}
+
+test('cookie with seven iframe never returns protected cookies; getCookies uses urls', async () => {
+  const { fake, page } = await cookieIframeFake();
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    assert.equal(tab?.targetId, 'OK');
+    assert.equal(await browser.cookie(tab, 'ok'), 'allowed');
+    assert.equal(await browser.cookie(tab, 'seven_session'), null);
+    assert.equal(await browser.cookie(tab, 'host_only'), null);
+    assert.equal(await browser.cookie(tab, 'parent'), null);
+    assert.equal(await browser.cookie(tab, 'part'), null);
+    const gets = fake.calls.filter((call) => call.method === 'Network.getCookies');
+    assert.ok(gets.length > 0);
+    for (const call of gets) {
+      assert.deepEqual(call.params?.urls, [page.url]);
+    }
+  });
+});
+
+test('cookie after eval-created seven iframe still drops protected cookies', async () => {
+  const { fake, page } = await cookieIframeFake();
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await browser.eval(
+      tab,
+      "document.body.innerHTML='<iframe src=https://seven.sliccy.ai/x></iframe>'"
+    );
+    assert.equal(page.url, 'https://example.test/');
+    assert.equal(await browser.cookie(tab, 'seven_session'), null);
+    assert.equal(await browser.cookie(tab, 'ok'), 'allowed');
+  });
+});
+
+test('explicit SLICC_CDP_URL cookie still sends bare getCookies and returns seven cookies', async () => {
+  const { fake } = await cookieIframeFake();
+  after(() => fake.close());
+  const previous = process.env.SLICC_CDP_URL;
+  process.env.SLICC_CDP_URL = fake.url;
+  await settle();
+  try {
+    assert.equal(await browser.cookie(ok, 'seven_session'), 'secret');
+    const gets = fake.calls.filter((call) => call.method === 'Network.getCookies');
+    assert.ok(gets.length > 0);
+    for (const call of gets) {
+      assert.equal(call.params?.urls, undefined);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
+});
+
+test('websocket refuses a protected tab and drops protected socket frames', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page), info(seven)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (
+        message.method === 'Runtime.evaluate' &&
+        message.params?.expression === '"emit-seven-ws"'
+      ) {
+        const sessionId = message.sessionId;
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'R1', url: 'wss://seven.sliccy.ai/ws' },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        send({
+          method: 'Network.webSocketFrameReceived',
+          params: {
+            requestId: 'R1',
+            response: { opcode: 1, payloadData: '{"kind":"tick","n":9}' },
+          },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'string', value: 'ok' } },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.websocket.on('SEVEN').forward({ sink: 'log' }), {
+      message: REFUSAL,
+    });
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const logged = [];
+    const write = console.log;
+    console.log = (...args) => {
+      logged.push(args.map(String).join(' '));
+    };
+    let handle;
+    try {
+      handle = await browser.websocket.on(tab).filter({ parseAs: 'json' }).forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"emit-seven-ws"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":9') || line.includes('"n": 9')),
+        false
+      );
+    } finally {
+      console.log = write;
+      await handle?.close();
+    }
   });
 });

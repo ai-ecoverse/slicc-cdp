@@ -20,6 +20,22 @@ function inheritingAbout(text) {
   }
 }
 
+function hostOf(text) {
+  const host = new URL(text).hostname.toLowerCase();
+  return host.endsWith('.') ? host.slice(0, -1) : host;
+}
+
+function asHttp(text) {
+  try {
+    const url = new URL(text);
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    else if (url.protocol === 'wss:') url.protocol = 'https:';
+    return url.href;
+  } catch {
+    return text;
+  }
+}
+
 export function isProtectedHost(host) {
   if (typeof host !== 'string' || host.length === 0) return true;
   const name = host.toLowerCase().replace(/\.$/u, '');
@@ -37,7 +53,36 @@ export function isProtectedUrl(text) {
     return true;
   }
   if (text.startsWith('chrome-error:')) return true;
-  return guard.url(text);
+  const mapped = asHttp(text);
+  return guard.url(text) || (mapped !== text && guard.url(mapped));
+}
+
+function siteProtected(site) {
+  if (typeof site !== 'string' || site.length === 0) return true;
+  if (isProtectedUrl(site)) return true;
+  const host = hostOf(site);
+  return host.length > 0 && guard.cookieDomain(host);
+}
+
+export function cookieProtected(cookie) {
+  if (!cookie || typeof cookie !== 'object') return true;
+  if (typeof cookie.domain === 'string' && guard.cookieDomain(cookie.domain)) return true;
+  if (typeof cookie.url === 'string') {
+    if (isProtectedUrl(cookie.url)) return true;
+    const host = hostOf(cookie.url);
+    if (host.length > 0 && guard.cookieDomain(host)) return true;
+  }
+  const key = cookie.partitionKey;
+  if (typeof key === 'string') return siteProtected(key);
+  if (key && typeof key === 'object' && typeof key.topLevelSite === 'string') {
+    return siteProtected(key.topLevelSite);
+  }
+  return false;
+}
+
+export function dropProtectedCookies(cookies) {
+  if (!Array.isArray(cookies)) return [];
+  return cookies.filter((cookie) => !cookieProtected(cookie));
 }
 
 export function refuseProtected(text) {
