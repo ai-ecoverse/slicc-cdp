@@ -14,6 +14,8 @@ enum Twist {
     Protected,
     Reverted,
     Error,
+    ContextLost,
+    ContextNav,
     Disconnect,
     Silent,
     BetweenChunks,
@@ -74,6 +76,15 @@ impl Transport for Page {
                     }
                     Twist::Error => {
                         self.incoming.push_back(json!({"id":message["id"],"sessionId":session,"error":{"code":-32000,"message":"Could not find node with given id"}}));
+                        return Ok(());
+                    }
+                    Twist::ContextLost => {
+                        self.incoming.push_back(json!({"id":message["id"],"sessionId":session,"error":{"code":-32000,"message":"Cannot find context with specified id"}}));
+                        return Ok(());
+                    }
+                    Twist::ContextNav => {
+                        self.navigated("L2", "https://other.test/");
+                        self.incoming.push_back(json!({"id":message["id"],"sessionId":session,"error":{"code":-32000,"message":"Cannot find context with specified id"}}));
                         return Ok(());
                     }
                     Twist::Disconnect => {
@@ -205,6 +216,19 @@ fn an_error_reply_mid_batch_fails_the_whole_batch_without_a_prefix() {
     let (mut cdp, _, batch, session) = page(20, Twist::Error);
     let message = cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap_err();
     assert_eq!(message, "DOM.describeNode: Could not find node with given id\n");
+}
+
+#[test]
+fn a_navigation_during_replies_with_a_context_error_refuses_the_whole_batch() {
+    let (mut cdp, _, batch, session) = page(20, Twist::ContextNav);
+    refused(cdp.call_batch("DOM.describeNode", batch, Some(&session)));
+}
+
+#[test]
+fn a_context_error_without_a_page_change_keeps_the_chrome_message() {
+    let (mut cdp, _, batch, session) = page(20, Twist::ContextLost);
+    let message = cdp.call_batch("DOM.describeNode", batch, Some(&session)).unwrap_err();
+    assert_eq!(message, "DOM.describeNode: Cannot find context with specified id\n");
 }
 
 #[test]
