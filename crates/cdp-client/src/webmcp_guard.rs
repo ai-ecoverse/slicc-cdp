@@ -1520,14 +1520,13 @@ impl Cdp {
         if !arm && !known && self.info_protected(info, &[]) { return false; }
         let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
         let prior = self.webmcp.recorded.get(&target).map(|recorded| recorded.session.clone());
-        if let Some(adopted) = prior.filter(|adopted| !waiting && adopted != &child) {
-            if let Some(holder) = holders.iter().find(|holder| self.webmcp_live_child(holder, &adopted)).cloned() {
-                self.webmcp_merge_target(&target, info);
-                self.webmcp_trace_decision("keep", &target, &adopted, &child);
-                if !arm { return true; }
-                self.webmcp.reconcile_dirty.insert(holder);
-                self.webmcp_reconcile_pending();
-                return true;
+        if !arm {
+            if let Some(adopted) = prior.filter(|adopted| !waiting && adopted != &child) {
+                if holders.iter().any(|holder| self.webmcp_live_child(holder, &adopted)) {
+                    self.webmcp_merge_target(&target, info);
+                    self.webmcp_trace_decision("keep", &target, &adopted, &child);
+                    return true;
+                }
             }
         }
         if self.webmcp.recorded.len() < RECORDED_CAP || self.webmcp.recorded.contains_key(&target) {
@@ -1681,13 +1680,8 @@ impl Cdp {
                     self.webmcp_release_child(&recorded.session);
                     continue;
                 }
-                (Some(adopted), Some(recorded)) if live => {
-                    self.webmcp_trace_decision("keep", &target, &adopted, &recorded.session);
-                    self.webmcp.recorded.insert(target.clone(), Recorded { session: adopted, waiting: false, info: info.clone() });
-                    continue;
-                }
                 (Some(adopted), Some(recorded)) => {
-                    if self.webmcp_live_child(holder, &adopted) { self.webmcp_retire_child(&target, &adopted); }
+                    if live { self.webmcp_retire_child(&target, &adopted); }
                     recorded.session
                 }
                 (None, Some(recorded)) => recorded.session,
