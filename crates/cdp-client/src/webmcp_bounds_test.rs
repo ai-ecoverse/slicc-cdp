@@ -56,16 +56,9 @@ fn an_ancestry_chain_past_the_depth_bound_is_not_walked() {
     }
     let leaf = format!("S{depth}");
     let target = format!("T{depth}");
-    cdp.session_targets.insert(leaf, target.clone());
-    cdp.documents.insert(target, MainDocument {
-        frame_id: "F-LEAF".into(),
-        url: "https://ordinary.test/leaf".into(),
-        origin: "https://ordinary.test".into(),
-        unreachable_url: String::new(),
-        navigating: false,
-        navigation_url: String::new(),
-        previous: false,
-        probed: false,
-    });
+    cdp.session_targets.insert(leaf.clone(), target.clone());
+    cdp.guards.insert(target.clone(), leaf.clone());
+    cdp.targets.insert(target.clone(), json!({"targetId":target,"type":"page","url":"https://ordinary.test/leaf"}));
+    cdp.main_commit(&leaf, &json!({"id":"F-LEAF","url":"https://ordinary.test/leaf","securityOrigin":"https://ordinary.test","loaderId":"L-LEAF"}));
     assert_eq!(cdp.webmcp_trace_page("S0"), "unknown");
 }
