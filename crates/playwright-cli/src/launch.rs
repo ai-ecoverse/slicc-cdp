@@ -259,8 +259,7 @@ pub fn attached_port() -> Result<Option<String>, String> {
     }
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        let env = current_env();
-        select_port(&env, &DiskFs, &mut |url| http_body(url))
+        cdp_client::discover::attached(&mut |url| http_body(url))
     }
 }
 
@@ -1061,10 +1060,8 @@ pub fn parse_active_port(text: &str) -> Option<(u16, String)> {
     Some((port, path.to_string()))
 }
 
-fn version_accepts(body: &str, path: &str) -> bool {
-    crate::connect::websocket_url_from_version(body)
-        .ok()
-        .is_some_and(|url| url.ends_with(path))
+fn version_accepts(body: &str, path: &str, port: u16) -> bool {
+    cdp_client::discover::version_accepts(body, path, port)
 }
 
 fn child_path(dir: &str, name: &str, windows: bool) -> String {
@@ -1116,7 +1113,7 @@ fn live_text(
     };
     let url = version_url(port);
     match probe(&url) {
-        Ok(body) if version_accepts(&body, &path) => Ok(Some(url)),
+        Ok(body) if version_accepts(&body, &path, port) => Ok(Some(url)),
         Ok(_) => Ok(None),
         Err(message) if message.starts_with("HTTP ") => Err(message),
         Err(_) => Ok(None),
@@ -1637,7 +1634,7 @@ fn wait_for_debugger(
         {
             let url = version_url(port);
             match http_body(&url) {
-                Ok(body) if version_accepts(&body, &path) => return Ok(url),
+                Ok(body) if version_accepts(&body, &path, port) => return Ok(url),
                 Ok(_) => {}
                 Err(message) if message.starts_with("HTTP ") => return Err(message),
                 Err(_) => {}

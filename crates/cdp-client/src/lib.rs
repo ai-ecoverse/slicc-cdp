@@ -3,6 +3,7 @@ mod batch_test;
 pub mod cdp;
 pub mod connect;
 pub mod contract;
+pub mod discover;
 pub mod fetch;
 #[cfg(test)]
 mod frames_test;
