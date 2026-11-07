@@ -1,7 +1,7 @@
 {
   "name": "@ai-ecoverse/sliccy-browser",
-  "version": "0.1.38",
-  "description": "sliccy:browser for jsh, over CDP",
+  "version": "0.1.40",
+  "description": "sliccy:browser for jsh, over CDP. Discovers Chrome via SLICC_CDP_URL, slicc browsers --json, DevToolsActivePort under slicc profiles, then 127.0.0.1:9222. Discovered endpoints refuse seven/vault/extension/error pages.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {

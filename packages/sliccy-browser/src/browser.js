@@ -1,10 +1,18 @@
 import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { connect } from './connect.js';
+import { resolveCdpEndpoint } from './discover.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
+import {
+  dropProtectedCookies,
+  isProtectedHost,
+  isProtectedUrl,
+  REFUSAL,
+  refuseProtected,
+} from './guard.js';
 import { version } from './version.js';
 
-export { version };
+export { REFUSAL, resolveCdpEndpoint, version };
 
 const LOAD_TIMEOUT_MS = 15000;
 const HELD_FRAMES = 100;
@@ -28,6 +36,7 @@ const RECORDER = `(() => {
 })()`;
 
 let opening;
+let guarded = false;
 const sessions = new Map();
 const tabsBySession = new Map();
 const sockets = new Map();
@@ -42,12 +51,50 @@ let idle;
 
 function openClient() {
   if (!opening) {
-    opening = connect().catch((error) => {
+    opening = openResolved().catch((error) => {
       opening = undefined;
+      guarded = false;
       throw error;
     });
   }
   return opening;
+}
+
+async function openResolved() {
+  const explicit = process.env.SLICC_CDP_URL;
+  if (typeof explicit === 'string' && explicit.trim().length > 0) {
+    guarded = false;
+    return connect();
+  }
+  const { url } = await resolveCdpEndpoint();
+  guarded = true;
+  return connect({ url });
+}
+
+async function liveInfo(tab) {
+  const targetId = targetIdOf(tab);
+  const client = await openClient();
+  const result = await client.send('Target.getTargets');
+  const infos = Array.isArray(result?.targetInfos) ? result.targetInfos : [];
+  return (
+    infos.find((info) => info && typeof info.targetId === 'string' && info.targetId === targetId) ??
+    null
+  );
+}
+
+async function urlOf(tab) {
+  const info = await liveInfo(tab);
+  if (info?.type !== 'page') return '';
+  return typeof info.url === 'string' ? info.url : '';
+}
+
+async function withGuardedTab(tab, work) {
+  await openClient();
+  if (!guarded) return work();
+  refuseProtected(await urlOf(tab));
+  const result = await work();
+  refuseProtected(await urlOf(tab));
+  return result;
 }
 
 async function using(work) {
@@ -72,6 +119,7 @@ function closeIdle() {
   if (active > 0 || subscribers.size > 0 || !opening) return;
   const closing = opening;
   opening = undefined;
+  guarded = false;
   sessions.clear();
   tabsBySession.clear();
   sockets.clear();
@@ -139,12 +187,17 @@ function dispatchFrame(message) {
   if (targetId === undefined) return;
   const key = socketKey(message.sessionId, params.requestId);
   const url = sockets.get(key);
-  if (url !== undefined) return route(targetId, url, response.payloadData, () => true);
+  if (typeof url === 'string') {
+    route(targetId, url, response.payloadData, () => true);
+    return;
+  }
+  if (guarded) return;
   route(targetId, url, response.payloadData, (sub) => sub.urlMatch === undefined);
   holdFrame(message.sessionId, targetId, key, response.payloadData);
 }
 
 function route(targetId, url, raw, which) {
+  if (guarded && (typeof url !== 'string' || isProtectedUrl(url))) return;
   for (const sub of subscribers.values()) {
     if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
     const body = parseFrame(raw, sub.filter?.parseAs);
@@ -198,6 +251,7 @@ async function learnUrl(client, message) {
   sockets.set(key, url);
   const frames = held.get(key) ?? [];
   held.delete(key);
+  if (guarded && isProtectedUrl(url)) return;
   const targetId = tabsBySession.get(sessionId);
   for (const raw of frames) route(targetId, url, raw, (sub) => sub.urlMatch !== undefined);
 }
@@ -306,16 +360,21 @@ async function findTabNow(query = {}) {
   if (domain === undefined && urlMatch === undefined) {
     throw new Error('browser.findTab: query requires `domain` or `urlMatch`');
   }
+  await openClient();
+  if (guarded && domain !== undefined && isProtectedHost(domain)) throw new Error(REFUSAL);
   const tabs = await listTabs();
   const wanted = domain?.toLowerCase();
   const re = urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.findTab');
-  return (
-    tabs.find(
-      (tab) =>
-        (wanted === undefined || hostnameOf(tab.url)?.toLowerCase() === wanted) &&
-        (re === undefined || re.test(tab.url))
-    ) ?? null
+  const matches = tabs.filter(
+    (tab) =>
+      (wanted === undefined || hostnameOf(tab.url)?.toLowerCase() === wanted) &&
+      (re === undefined || re.test(tab.url))
   );
+  if (!guarded) return matches[0] ?? null;
+  const allowed = matches.find((tab) => !isProtectedUrl(tab.url));
+  if (allowed) return allowed;
+  if (matches.length > 0) throw new Error(REFUSAL);
+  return null;
 }
 
 export async function ensureTab(url, options) {
@@ -326,16 +385,20 @@ async function ensureTabNow(url, options = {}) {
   if (typeof url !== 'string' || url.length === 0) {
     throw new TypeError('browser.ensureTab: url must be a string');
   }
+  await openClient();
+  if (guarded) refuseProtected(url);
   const tabs = await listTabs();
   const matchUrl = patternOf(options.matchUrl);
   if (matchUrl !== undefined) {
     const re = compilePattern(matchUrl, 'browser.ensureTab');
-    const hit = tabs.find((tab) => re.test(tab.url));
+    const hit = tabs.find((tab) => re.test(tab.url) && (!guarded || !isProtectedUrl(tab.url)));
     if (hit) return hit;
   } else {
     const wanted = originOf(url);
     if (wanted) {
-      const hit = tabs.find((tab) => originOf(tab.url) === wanted);
+      const hit = tabs.find(
+        (tab) => originOf(tab.url) === wanted && (!guarded || !isProtectedUrl(tab.url))
+      );
       if (hit) return hit;
     }
   }
@@ -349,10 +412,18 @@ async function ensureTabNow(url, options = {}) {
     throw new Error('Target.createTarget returned no targetId');
   }
   const { sessionId } = await sessionFor(targetId);
-  if (url === 'about:blank') await waitForLoad(client, sessionId);
-  else await navigateAndWait(client, sessionId, url);
-  const live = (await listTabs()).find((tab) => tab.targetId === targetId);
-  return live ?? { targetId, url, title: '' };
+  try {
+    if (url === 'about:blank') await waitForLoad(client, sessionId);
+    else await navigateAndWait(client, sessionId, url);
+    const live = (await listTabs()).find((tab) => tab.targetId === targetId);
+    if (guarded) refuseProtected(live?.url ?? '');
+    return live ?? { targetId, url, title: '' };
+  } catch (error) {
+    if (guarded) {
+      await client.send('Target.closeTarget', { targetId }).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 function evalSource(tab, source) {
@@ -370,21 +441,23 @@ function evaluate(tab, source, awaitPromise, decodeJson = true) {
 }
 
 async function evaluateNow(tab, source, awaitPromise, decodeJson) {
-  const { client, sessionId } = await sessionFor(targetIdOf(tab));
-  const result = await client.send(
-    'Runtime.evaluate',
-    {
-      expression: serializeEvalSource(source),
-      returnByValue: true,
-      awaitPromise,
-    },
-    sessionId
-  );
-  if (result?.exceptionDetails) {
-    throw new Error(exceptionMessage(result.exceptionDetails));
-  }
-  const value = result?.result?.value;
-  return decodeJson ? unwrapEvalResult(value) : value;
+  return withGuardedTab(tab, async () => {
+    const { client, sessionId } = await sessionFor(targetIdOf(tab));
+    const result = await client.send(
+      'Runtime.evaluate',
+      {
+        expression: serializeEvalSource(source),
+        returnByValue: true,
+        awaitPromise,
+      },
+      sessionId
+    );
+    if (result?.exceptionDetails) {
+      throw new Error(exceptionMessage(result.exceptionDetails));
+    }
+    const value = result?.result?.value;
+    return decodeJson ? unwrapEvalResult(value) : value;
+  });
 }
 
 export async function cookie(tab, name) {
@@ -393,11 +466,15 @@ export async function cookie(tab, name) {
 }
 
 async function cookieNow(tab, name) {
-  const { client, sessionId } = await sessionFor(targetIdOf(tab));
-  const result = await client.send('Network.getCookies', {}, sessionId);
-  const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
-  const hit = cookies.find((item) => item && item.name === name);
-  return hit && typeof hit.value === 'string' ? hit.value : null;
+  return withGuardedTab(tab, async () => {
+    const { client, sessionId } = await sessionFor(targetIdOf(tab));
+    const params = guarded ? { urls: [await urlOf(tab)] } : {};
+    const result = await client.send('Network.getCookies', params, sessionId);
+    const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
+    const visible = guarded ? dropProtectedCookies(cookies) : cookies;
+    const hit = visible.find((item) => item && item.name === name);
+    return hit && typeof hit.value === 'string' ? hit.value : null;
+  });
 }
 
 export async function localStorage(tab, key) {
@@ -412,10 +489,64 @@ export async function localStorage(tab, key) {
   return typeof raw === 'string' ? raw : String(raw);
 }
 
+function resolveFetchUrl(url, base) {
+  try {
+    return new URL(url, base).href;
+  } catch {
+    throw new TypeError(
+      `browser.fetch: could not resolve ${JSON.stringify(url)} against ${JSON.stringify(base)}`
+    );
+  }
+}
+
+async function baseUriOf(tab) {
+  const { client, sessionId } = await sessionFor(targetIdOf(tab));
+  const result = await client.send(
+    'Runtime.evaluate',
+    { expression: 'document.baseURI', returnByValue: true },
+    sessionId
+  );
+  if (result?.exceptionDetails) {
+    throw new Error(exceptionMessage(result.exceptionDetails));
+  }
+  const value = result?.result?.value;
+  return typeof value === 'string' ? value : '';
+}
+
+async function evaluateFetchScript(tab, script) {
+  const { client, sessionId } = await sessionFor(targetIdOf(tab));
+  const result = await client.send(
+    'Runtime.evaluate',
+    {
+      expression: serializeEvalSource(script),
+      returnByValue: true,
+      awaitPromise: true,
+    },
+    sessionId
+  );
+  if (result?.exceptionDetails) {
+    throw new Error(exceptionMessage(result.exceptionDetails));
+  }
+  return unwrapEvalResult(result?.result?.value);
+}
+
 export async function fetch(tab, url, opts = {}) {
   if (typeof url !== 'string') throw new TypeError('browser.fetch: url must be a string');
-  const script = await buildBrowserFetchScript(url, opts);
-  return evalSourceAsync(tab, script);
+  return using(async () => {
+    await openClient();
+    if (!guarded) {
+      const script = await buildBrowserFetchScript(url, opts);
+      return evaluateFetchScript(tab, script);
+    }
+    return withGuardedTab(tab, async () => {
+      const baseURI = await baseUriOf(tab);
+      refuseProtected(baseURI);
+      const absolute = resolveFetchUrl(url, baseURI);
+      refuseProtected(absolute);
+      const script = await buildBrowserFetchScript(absolute, opts);
+      return evaluateFetchScript(tab, script);
+    });
+  });
 }
 
 function serializeEvalSource(source) {
@@ -645,6 +776,8 @@ export const websocket = {
       },
     };
     async function subscribe(sink) {
+      await openClient();
+      if (guarded) refuseProtected(await urlOf(tab));
       const urlMatchRe =
         urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
       const { sessionId } = await sessionFor(targetId);
