@@ -30,7 +30,7 @@ test('discovered-mode Chrome regressions for every prior guard bypass', async ()
   let raw;
   try {
     chrome = await launchBrowser([
-      `--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1:${port}, MAP app.slack.com 127.0.0.1:${port}`,
+      '--host-resolver-rules=MAP seven.sliccy.ai 127.0.0.1, MAP app.slack.com 127.0.0.1',
       '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
     ]);
     raw = await rawSocket(chrome.wsUrl);
@@ -74,6 +74,23 @@ test('discovered-mode Chrome regressions for every prior guard bypass', async ()
       true
     );
 
+    const earlyAllowedTarget = await openAndWait(raw, `${site.origin}/early-allowed`);
+    await pageEval(
+      raw,
+      earlyAllowedTarget,
+      `new Promise((resolve, reject) => {
+        const ws = new WebSocket(${JSON.stringify(allowedWs)});
+        const timer = setTimeout(() => reject(new Error('early allowed ws timeout')), 8000);
+        ws.onerror = () => { clearTimeout(timer); reject(new Error('early allowed ws error')); };
+        ws.onopen = () => {
+          window.__guardEarlyAllowed = ws;
+          clearTimeout(timer);
+          resolve(true);
+        };
+      })`,
+      true
+    );
+
     const slackTarget = await openAndWait(raw, `${slackOrigin}/client/T1/C1`);
     await pageEval(raw, slackTarget, `localStorage.setItem('localConfig_v2', '{"ok":true}')`);
 
@@ -93,6 +110,7 @@ test('discovered-mode Chrome regressions for every prior guard bypass', async ()
     env.GUARD_ALLOWED_WS = allowedWs;
     env.GUARD_SECRET_FILE = secretFile;
     env.GUARD_EARLY_TARGET = earlyTarget;
+    env.GUARD_EARLY_ALLOWED_TARGET = earlyAllowedTarget;
     env.GUARD_SEVEN_TARGET = sevenTarget;
     env.GUARD_LOG = logPath;
 
@@ -103,6 +121,9 @@ test('discovered-mode Chrome regressions for every prior guard bypass', async ()
     assert.match(log, /refuse:first-eval-seven/);
     assert.match(log, /fetch:base-no-request/);
     assert.match(log, /websocket:early-dropped/);
+    assert.match(log, /websocket:early-allowed-dropped/);
+    assert.match(log, /websocket:reload-allowed/);
+    assert.match(log, /websocket:protected-still-dropped/);
     assert.match(log, /slack:positives/);
     assert.match(log, /websocket:allowed/);
     assert.match(log, /done/);
@@ -184,7 +205,7 @@ function runChild(env) {
 async function openAndWait(raw, url) {
   const { targetId } = await raw.send('Target.createTarget', { url, background: true });
   const sessionId = await attach(raw, targetId);
-  await waitReady(raw, sessionId);
+  await waitReady(raw, sessionId, url);
   return targetId;
 }
 
@@ -195,15 +216,29 @@ async function attach(raw, targetId) {
   return sessionId;
 }
 
-async function waitReady(raw, sessionId) {
+async function waitReady(raw, sessionId, expectedUrl) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     const result = await raw.send(
       'Runtime.evaluate',
-      { expression: 'document.readyState', returnByValue: true },
+      { expression: '({ state: document.readyState, href: location.href })', returnByValue: true },
       sessionId
     );
-    if (result?.result?.value === 'complete' || result?.result?.value === 'interactive') return;
+    const state = result?.result?.value?.state;
+    const href = result?.result?.value?.href;
+    const ready = state === 'complete' || state === 'interactive';
+    const matched =
+      expectedUrl === undefined ||
+      href === expectedUrl ||
+      (typeof href === 'string' &&
+        typeof expectedUrl === 'string' &&
+        expectedUrl.startsWith('file:') &&
+        href.startsWith('file:')) ||
+      (typeof href === 'string' &&
+        typeof expectedUrl === 'string' &&
+        expectedUrl.startsWith('chrome:') &&
+        href.startsWith('chrome:'));
+    if (ready && matched) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error('page never ready');

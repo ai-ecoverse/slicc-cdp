@@ -974,6 +974,166 @@ test('discovered websocket drops frames when socket URL is unknown', async () =>
   });
 });
 
+test('discovered websocket warns once and counts drops for unknown-URL sockets', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (
+        message.method === 'Runtime.evaluate' &&
+        message.params?.expression === '"emit-unknown-twice"'
+      ) {
+        const sessionId = message.sessionId;
+        for (const requestId of ['PRE1', 'PRE2']) {
+          send({
+            method: 'Network.webSocketFrameReceived',
+            params: {
+              requestId,
+              response: {
+                opcode: 1,
+                payloadData: '{"kind":"preattach","secret":"do-not-leak"}',
+              },
+            },
+            ...(sessionId ? { sessionId } : {}),
+          });
+        }
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'string', value: 'ok' } },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => {
+      warnings.push(args.map(String).join(' '));
+    };
+    let handle;
+    try {
+      handle = await browser.websocket.on(tab).filter({ parseAs: 'json' }).forward({ sink: 'log' });
+      assert.equal(handle.dropped, 0);
+      assert.equal(await browser.eval(tab, '"emit-unknown-twice"'), 'ok');
+      await settle();
+      assert.equal(handle.dropped, 2);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /before the first attach/);
+      assert.match(warnings[0], /reload the tab|reconnect the socket/);
+      assert.equal(warnings[0].includes('preattach'), false);
+      assert.equal(warnings[0].includes('do-not-leak'), false);
+      assert.equal(warnings[0].includes('PRE1'), false);
+      assert.equal(String(handle.dropped).includes('preattach'), false);
+    } finally {
+      console.warn = warn;
+      await handle?.close();
+    }
+  });
+});
+
+test('discovered websocket does not warn when nothing was dropped', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: guardedIntercept,
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const warnings = [];
+    const warn = console.warn;
+    console.warn = (...args) => {
+      warnings.push(args.map(String).join(' '));
+    };
+    let handle;
+    try {
+      handle = await browser.websocket.on(tab).forward({ sink: 'log' });
+      await settle();
+      assert.equal(handle.dropped, 0);
+      assert.deepEqual(warnings, []);
+    } finally {
+      console.warn = warn;
+      await handle?.close();
+    }
+  });
+});
+
+test('explicit SLICC_CDP_URL websocket does not warn on unknown-URL frames', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (
+        message.method === 'Runtime.evaluate' &&
+        message.params?.expression === '"emit-unknown-explicit"'
+      ) {
+        const sessionId = message.sessionId;
+        send({
+          method: 'Network.webSocketFrameReceived',
+          params: {
+            requestId: 'PREEXISTING',
+            response: { opcode: 1, payloadData: '{"kind":"explicit-canary","n":1}' },
+          },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'string', value: 'ok' } },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  const previous = process.env.SLICC_CDP_URL;
+  process.env.SLICC_CDP_URL = fake.url;
+  await settle();
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (...args) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  let handle;
+  try {
+    handle = await browser.websocket.on(page).filter({ parseAs: 'json' }).forward({ sink: 'log' });
+    assert.equal(await browser.eval(page, '"emit-unknown-explicit"'), 'ok');
+    await settle();
+    assert.equal(handle.dropped, 0);
+    assert.deepEqual(warnings, []);
+  } finally {
+    console.warn = warn;
+    await handle?.close();
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
+});
+
 test('Slack-shaped relative fetch works on discovered app.slack.com; seven relatives refuse', async () => {
   const slack = {
     targetId: 'SLACK',
