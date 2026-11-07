@@ -806,6 +806,20 @@ impl Cdp {
         eprintln!("webmcp-polyfill: {trace}");
     }
 
+    fn webmcp_trace_origin_class(&self, url: &str) -> &'static str {
+        if url.is_empty() { return "empty"; }
+        if self.guard.extension_frame(url) { return "extension"; }
+        if self.guard.url(url) { return "protected"; }
+        "ordinary"
+    }
+
+    fn webmcp_trace_url_fields(&self, url: &str) -> Value {
+        json!({
+            "scheme":Self::webmcp_trace_scheme(url),
+            "originClass":self.webmcp_trace_origin_class(url),
+        })
+    }
+
     fn webmcp_trace_raw_event(&mut self, value: &Value) {
         if !Self::webmcp_trace_enabled() { return; }
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
@@ -815,6 +829,7 @@ impl Cdp {
         let delivered = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let info = value.pointer("/params/targetInfo").or_else(|| value.get("params"));
         let frame = value.pointer("/params/frame");
+        let url = info.and_then(|info| info.get("url")).or_else(|| frame.and_then(|frame| frame.get("url"))).and_then(Value::as_str).unwrap_or("");
         self.webmcp.trace_sequence = self.webmcp.trace_sequence.saturating_add(1);
         let mut trace = json!({
             "event":"raw",
@@ -825,7 +840,7 @@ impl Cdp {
             "sessionId":value.pointer("/params/sessionId").and_then(Value::as_str).unwrap_or(delivered),
             "targetId":info.and_then(|info| info.get("targetId")).or_else(|| value.pointer("/params/targetId")).and_then(Value::as_str).unwrap_or(""),
             "type":info.and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or(""),
-            "url":info.and_then(|info| info.get("url")).or_else(|| frame.and_then(|frame| frame.get("url"))).and_then(Value::as_str).unwrap_or(""),
+            "url":self.webmcp_trace_url_fields(url),
             "parentFrameId":info.and_then(|info| info.get("parentFrameId")).or_else(|| frame.and_then(|frame| frame.get("parentId"))).and_then(Value::as_str).unwrap_or(""),
             "waitingForDebugger":value.pointer("/params/waitingForDebugger").and_then(Value::as_bool),
             "recorded":info.and_then(|info| info.get("targetId")).and_then(Value::as_str).is_some_and(|target| self.webmcp.recorded.contains_key(target)),
@@ -836,11 +851,13 @@ impl Cdp {
             if let Some(frame) = frame {
                 trace["frameId"] = json!(frame.get("id").and_then(Value::as_str).unwrap_or(""));
                 trace["loaderId"] = json!(frame.get("loaderId").and_then(Value::as_str).unwrap_or(""));
-                trace["securityOrigin"] = json!(frame.get("securityOrigin").and_then(Value::as_str).unwrap_or(""));
+                let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("");
+                trace["securityOrigin"] = self.webmcp_trace_url_fields(origin);
             }
             if let Some(context) = value.pointer("/params/context") {
                 trace["contextId"] = json!(context.get("id").and_then(Value::as_i64).unwrap_or(0));
-                trace["contextOrigin"] = json!(context.get("origin").and_then(Value::as_str).unwrap_or(""));
+                let origin = context.get("origin").and_then(Value::as_str).unwrap_or("");
+                trace["contextOrigin"] = self.webmcp_trace_url_fields(origin);
                 trace["contextFrameId"] = json!(context.pointer("/auxData/frameId").and_then(Value::as_str).unwrap_or(""));
             }
         }
@@ -1507,38 +1524,35 @@ impl Cdp {
         let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str).filter(|child| !child.is_empty()).map(str::to_string) else { return false; };
         let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
         let iframe = info.get("type").and_then(Value::as_str) == Some("iframe") && !target.is_empty();
-        let arm = !owner.is_empty() && self.webmcp.arms.contains_key(&owner);
-        let refused = self.webmcp.auto_attach_tried.contains(&owner) && self.webmcp.arms.get(&owner).is_some_and(|arm| !arm.direct_child_attach || arm.revoked);
-        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
-        if arm && (!iframe || refused || self.guard.url(url) || self.guard.extension_frame(url)) {
-            self.webmcp_release_child(&child);
-            return true;
-        }
-        if !iframe { return false; }
-        let holders = self.webmcp.arms.keys().filter(|session| self.webmcp_reconcile_eligible(session)).cloned().collect::<Vec<_>>();
-        let known = !self.webmcp.arms.is_empty() || !self.webmcp.auto_attach_tried.is_empty() || !holders.is_empty();
-        if !arm && !known && self.info_protected(info, &[]) { return false; }
-        let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
-        let prior = self.webmcp.recorded.get(&target).map(|recorded| recorded.session.clone());
-        if !arm {
-            if let Some(adopted) = prior.filter(|adopted| !waiting && adopted != &child) {
-                if holders.iter().any(|holder| self.webmcp_live_child(holder, &adopted)) {
-                    self.webmcp_merge_target(&target, info);
-                    self.webmcp_trace_decision("keep", &target, &adopted, &child);
-                    return true;
-                }
+        let armed = !owner.is_empty() && self.webmcp.arms.contains_key(&owner);
+        let direct = armed && self.webmcp.arms.get(&owner).is_some_and(|arm| arm.direct_child_attach && !arm.revoked);
+        if !iframe {
+            if armed {
+                self.webmcp_release_child(&child);
+                return true;
             }
+            return false;
         }
+        if armed && self.webmcp_refused_info(&target, info) {
+            self.webmcp_release_child(&child);
+            return false;
+        }
+        if !direct {
+            if armed && self.webmcp.auto_attach_tried.contains(&owner) {
+                self.webmcp_release_child(&child);
+            }
+            return false;
+        }
+        let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
         if self.webmcp.recorded.len() < RECORDED_CAP || self.webmcp.recorded.contains_key(&target) {
             self.webmcp.recorded.insert(target.clone(), Recorded { session: child.clone(), waiting, info: info.clone() });
-            self.webmcp_trace_decision("record", &target, &child, if owner.is_empty() { "unowned" } else { &owner });
-        } else if arm {
+            self.webmcp_trace_decision("record", &target, &child, &owner);
+        } else {
             self.webmcp_release_child(&child);
             return true;
         }
         self.webmcp_merge_target(&target, info);
-        if arm { self.webmcp.reconcile_dirty.insert(owner); }
-        else { self.webmcp.reconcile_dirty.extend(holders); }
+        self.webmcp.reconcile_dirty.insert(owner);
         self.webmcp_reconcile_pending();
         true
     }
@@ -1548,14 +1562,13 @@ impl Cdp {
         let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
         if target.is_empty() || info.get("type").and_then(Value::as_str) != Some("iframe") { return; }
         let holders = self.webmcp.arms.keys().filter(|session| self.webmcp_reconcile_eligible(session)).cloned().collect::<Vec<_>>();
+        if holders.is_empty() { return; }
         let known = self.targets.get(&target);
         let changed = ["url", "parentFrameId"].iter().any(|key| known.and_then(|known| known.get(*key)) != info.get(*key));
         if !changed && !self.webmcp.recorded.contains_key(&target) { return; }
-        self.webmcp_merge_target(&target, &info);
         if let Some(recorded) = self.webmcp.recorded.get_mut(&target) {
             recorded.info = info.clone();
         }
-        if holders.is_empty() { return; }
         self.webmcp.reconcile_dirty.extend(holders);
         self.webmcp_reconcile_pending();
     }

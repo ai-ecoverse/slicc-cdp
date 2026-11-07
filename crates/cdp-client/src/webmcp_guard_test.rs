@@ -1033,16 +1033,18 @@ fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
     let before = state.borrow().sent.len();
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
     assert!(!cdp.session_blocked("EARLY"));
+    assert!(cdp.webmcp.recorded.is_empty(), "attaches before direct_child_attach are never consumed");
     assert!(!cdp.webmcp.parents.contains_key("EARLY") && !cdp.webmcp.arms.contains_key("EARLY"), "no adoption before setAutoAttach succeeds");
     assert!(!state.borrow().sent[before..].iter().any(|command| matches!(command["method"].as_str(), Some("Target.attachToTarget" | "Target.getTargets"))));
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.webmcp.attach_grace = Some(Duration::ZERO);
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     let before = state.borrow().sent.len();
     cdp.webmcp_auto_attach("H").unwrap();
     assert!(cdp.webmcp.arms[&holder].direct_child_attach);
     assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"));
-    assert!(cdp.webmcp.parents.contains_key("EARLY"), "a recorded attach is adopted by reconcile after setAutoAttach succeeds");
-    assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget"));
+    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME"));
+    assert!(cdp.webmcp.parents.contains_key("TOUCH-IFRAME"), "reconcile attaches after setAutoAttach succeeds");
 }
 
 #[test]

@@ -313,20 +313,55 @@ fn child_attach(holder: &str, session: &str) -> Value {
 }
 
 #[test]
+fn iframe_attach_without_a_holder_is_never_consumed_and_protected_iframes_stay_blocked() {
+    let (mut cdp, _) = client();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","params":{"sessionId":"CHILD","targetInfo":{"targetId":"SEVEN","type":"iframe","url":"https://seven.sliccy.ai/app","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.recorded.is_empty());
+    assert!(cdp.protected_targets.contains("SEVEN"));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","params":{"sessionId":"ORDINARY","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.recorded.is_empty());
+    assert!(!cdp.protected_targets.contains("IFRAME"));
+}
+
+#[test]
+fn holder_does_not_consume_protected_or_extension_iframe_attaches() {
+    let (mut cdp, _) = client();
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"SEVEN","targetInfo":{"targetId":"SEVEN","type":"iframe","url":"https://seven.sliccy.ai/app","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(!cdp.webmcp.recorded.contains_key("SEVEN"));
+    assert!(cdp.protected_targets.contains("SEVEN"));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"EXT","targetInfo":{"targetId":"EXT","type":"iframe","url":"chrome-extension://abcdefghijklmnop/page.html","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(!cdp.webmcp.recorded.contains_key("EXT"));
+}
+
+#[test]
+fn iframe_attach_on_a_non_arm_session_is_not_consumed() {
+    let (mut cdp, _) = client();
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":"OTHER","params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(!cdp.webmcp.recorded.contains_key("IFRAME"));
+    assert!(!cdp.webmcp.parents.contains_key("CHILD"));
+}
+
+#[test]
 fn reconcile_adopts_a_child_whose_attach_was_recorded_before_the_root_arm_existed() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.webmcp.attach_grace = Some(Duration::ZERO);
     cdp.absorb(child_attach("H", "CHILD"));
+    assert!(cdp.webmcp.recorded.is_empty(), "no holder means the attach is never consumed or recorded");
     assert!(!cdp.webmcp.parents.contains_key("CHILD"));
     let holder = reconcile_holder(&mut cdp);
-    assert!(!cdp.webmcp.parents.contains_key("CHILD"), "recording alone never adopts");
+    assert!(!cdp.webmcp.parents.contains_key("CHILD"), "a pre-arm attach never adopts");
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_install_children();
-    assert_eq!(cdp.webmcp.parents.get("CHILD").map(String::as_str), Some(holder.as_str()));
-    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(1));
-    assert_eq!(shim_evals(&state, "CHILD"), 1);
-    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME"));
-    assert!(cdp.webmcp_generations().iter().any(|generation| generation["session"] == "CHILD"));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME" && command["params"]["flatten"] == true));
+    assert_eq!(cdp.webmcp.parents.get("TOUCH-IFRAME").map(String::as_str), Some(holder.as_str()));
+    assert_eq!(cdp.webmcp.arms.get("TOUCH-IFRAME").map(|arm| arm.admitted), Some(1));
+    assert_eq!(shim_evals(&state, "TOUCH-IFRAME"), 1);
+    assert!(cdp.webmcp_generations().iter().any(|generation| generation["session"] == "TOUCH-IFRAME"));
 }
 
 #[test]
@@ -373,8 +408,8 @@ fn reconcile_skips_a_protected_sibling_without_protecting_the_foreign_child() {
     ]);
     cdp.webmcp.attach_grace = Some(Duration::ZERO);
     let holder = reconcile_holder(&mut cdp);
-    cdp.absorb(child_attach(&holder, "CHILD"));
     cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(child_attach(&holder, "CHILD"));
     cdp.webmcp_install_children();
     assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "SEVEN"));
     assert!(!cdp.protected_targets.contains("IFRAME"));
