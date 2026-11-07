@@ -1097,34 +1097,61 @@ impl Cdp {
         Ok(bridge)
     }
 
-    fn webmcp_record_document_policy(&mut self, session: &str, frame: &str, loader: &str, origin: &str, policy: &str) {
+    fn webmcp_record_document_policy(&mut self, session: &str, frame: &str, loader: &str, origin: &str, policy: &str, source: &str) {
         if frame.is_empty() || loader.is_empty() || origin.is_empty() || origin == "null" { return; }
         let policy = if policy.len() > 16384 { "tools=()" } else { policy };
         if let Some(arm) = self.webmcp.arms.get_mut(session) {
-            arm.documents.entry(format!("{frame}:{loader}")).or_insert_with(|| {
-                json!({"frameId":frame,"loaderId":loader,"origin":origin,"policy":policy})
-            });
+            let key = format!("{frame}:{loader}");
+            let stronger = arm.documents.get(&key).and_then(|document| document.get("source").and_then(Value::as_str)).is_some_and(|known| known == "network" || known == "native");
+            if source == "fetched" && stronger { return; }
+            arm.documents.insert(key, json!({"frameId":frame,"loaderId":loader,"origin":origin,"policy":policy,"source":source}));
         }
     }
 
-    fn webmcp_observe_child_policy(&mut self, child: &str, frame_id: &str, loader: &str, origin: &str, context: i64) {
+    fn webmcp_policy_origin_usable(&self, origin: &str) -> bool {
+        !origin.is_empty() && origin != "null" && !self.guard.url(origin) && !self.guard.extension_frame(origin)
+    }
+
+    fn webmcp_observe_child_policy(&mut self, child: &str, frame_id: &str, loader: &str, origin: &str, url: &str) {
         let key = format!("{frame_id}:{loader}");
-        if self.webmcp.arms.get(child).is_some_and(|arm| arm.documents.contains_key(&key)) {
+        if self.webmcp.arms.get(child).is_some_and(|arm| {
+            arm.documents.get(&key).and_then(|document| document.get("source").and_then(Value::as_str)).is_some_and(|source| source == "network" || source == "native")
+        }) {
             return;
         }
+        if url.is_empty() || self.guard.url(url) || !self.webmcp_policy_origin_usable(origin) { return; }
+        if let Ok(result) = self.raw_call("Page.getPermissionsPolicyState", json!({"frameId":frame_id}), Some(child), DOCUMENT_CHECK) {
+            if let Some(state) = result.get("states").and_then(Value::as_array).and_then(|states| states.iter().find(|state| state.get("feature").and_then(Value::as_str) == Some("tools"))) {
+                let policy = if state.get("allowed").and_then(Value::as_bool) == Some(true) { "tools=*" } else { "tools=()" };
+                self.webmcp_record_document_policy(child, frame_id, loader, origin, policy, "native");
+                return;
+            }
+        }
+        let bound_frame = frame_id.to_string();
+        let bound_loader = loader.to_string();
+        let bound_origin = origin.to_string();
         let Ok(result) = self.raw_call(
-            "Runtime.evaluate",
-            json!({
-                "expression":"(async () => { try { const response = await fetch(document.URL, { cache: 'no-store', credentials: 'same-origin' }); return response.headers.get('permissions-policy') || ''; } catch { return null; } })()",
-                "awaitPromise":true,
-                "returnByValue":true,
-                "contextId":context
-            }),
+            "Network.loadNetworkResource",
+            json!({"frameId":frame_id,"url":url,"options":{"disableCache":true,"includeCredentials":false}}),
             Some(child),
             DOCUMENT_CHECK,
         ) else { return; };
-        let Some(policy) = result.pointer("/result/value").and_then(Value::as_str) else { return; };
-        self.webmcp_record_document_policy(child, frame_id, loader, origin, policy);
+        if result.to_string().len() > 65536 { return; }
+        if result.pointer("/resource/success").and_then(Value::as_bool) != Some(true) { return; }
+        let Some(status) = result.pointer("/resource/httpStatusCode").and_then(Value::as_u64) else { return; };
+        if !(200..300).contains(&status) { return; }
+        let Some(headers) = result.pointer("/resource/headers").and_then(Value::as_object) else { return; };
+        let Some(policy) = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("permissions-policy")).and_then(|(_, value)| value.as_str()).filter(|policy| !policy.is_empty()) else { return; };
+        let Ok(tree) = self.raw_call("Page.getFrameTree", json!({}), Some(child), OPTIONAL_STEP) else { return; };
+        let frame = &tree["frameTree"]["frame"];
+        if frame.get("id").and_then(Value::as_str) != Some(&bound_frame)
+            || frame.get("loaderId").and_then(Value::as_str) != Some(&bound_loader)
+            || frame.get("securityOrigin").and_then(Value::as_str) != Some(&bound_origin)
+            || !self.webmcp_policy_origin_usable(&bound_origin)
+        {
+            return;
+        }
+        self.webmcp_record_document_policy(child, &bound_frame, &bound_loader, &bound_origin, policy, "fetched");
     }
 
     fn webmcp_parent_frame_id(&mut self, target: &str, until: Instant) -> Result<String, String> {
@@ -1186,6 +1213,7 @@ impl Cdp {
         let frame = &tree["frameTree"]["frame"];
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
         let loader = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
+        let url = frame.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         if origin.is_empty() || origin == "null" || loader.is_empty() { return Ok(false); }
         self.webmcp_remember_child_origin(child, &origin);
         if self.guard.url(&origin) || self.guard.extension_frame(&origin)
@@ -1231,7 +1259,7 @@ impl Cdp {
         if let Some(stored) = self.webmcp.contexts.get_mut(&(child.to_string(), id)) {
             stored.loader = loader.clone();
         }
-        self.webmcp_observe_child_policy(child, frame_id, &loader, &origin, id);
+        self.webmcp_observe_child_policy(child, frame_id, &loader, &origin, &url);
         if let Some(arm) = self.webmcp.arms.get_mut(child) {
             arm.loaders.insert(frame_id.to_string(), context.loader.clone());
             arm.root_identity = Some((target.clone(), context.clone()));
@@ -1535,7 +1563,7 @@ impl Cdp {
             if !frame.is_empty() && !loader.is_empty() && !self.guard.url(url) {
                 let policy = params.pointer("/response/headers").and_then(Value::as_object).and_then(|headers| headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("permissions-policy"))).map(|(_, value)| value.as_str().unwrap_or("tools=()")).unwrap_or("");
                 let origin = url::Url::parse(url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
-                self.webmcp_record_document_policy(session, frame, loader, &origin, policy);
+                self.webmcp_record_document_policy(session, frame, loader, &origin, policy, "network");
             }
         }
         if method == "Page.frameNavigated" {

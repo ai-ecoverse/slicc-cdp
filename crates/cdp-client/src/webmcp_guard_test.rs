@@ -27,6 +27,9 @@ struct BackendState {
     buffer_child_lifecycle_on_auto_attach: bool,
     refuse_auto_attach: bool,
     route: Option<String>,
+    child_policy: Option<String>,
+    load_network_headers: Option<Value>,
+    native_policy: Option<bool>,
     oopif_tree: Option<Value>,
     get_target_parent: Option<String>,
     omit_get_target_parent: bool,
@@ -198,10 +201,24 @@ impl Transport for Backend {
                 json!({"result":{"type":"undefined"}})
             }
             "Runtime.evaluate" if command["params"]["expression"] == "document.readyState" => json!({"result":{"type":"string","value":"complete"}}),
-            "Runtime.evaluate" if command["params"]["expression"].as_str().is_some_and(|source| source.contains("permissions-policy")) => {
-                json!({"result":{"type":"string","value":"tools=*"}})
-            }
             "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
+            "Page.getPermissionsPolicyState" => match state.native_policy {
+                Some(allowed) => json!({"states":[{"feature":"tools","allowed":allowed}]}),
+                None => {
+                    state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Page.getPermissionsPolicyState wasn't found"}}).to_string());
+                    return Ok(());
+                }
+            },
+            "Network.loadNetworkResource" => match state.load_network_headers.as_ref() {
+                Some(Value::Null) => json!({"resource":{"success":true}}),
+                Some(headers) => {
+                    let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
+                    let mut clean = headers.clone();
+                    if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
+                    json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+                }
+                None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+            },
             "Debugger.resume" => {
                 if state.context_race == "resume" && state.api {
                     let mut changed = context("F", "https://ordinary.test");
@@ -1152,6 +1169,14 @@ fn child_arm_enables_network_before_page_and_observes_policy_before_shim() {
     let network = child_sent.iter().position(|command| command["method"] == "Network.enable");
     let page = child_sent.iter().position(|command| command["method"] == "Page.enable");
     assert!(network.is_some_and(|network| page.is_some_and(|page| network < page)), "Network.enable must precede Page.enable on the child: {child_sent:?}");
+    assert!(
+        child_sent.iter().any(|command| command["method"] == "Network.loadNetworkResource"),
+        "policy must come from browser-side loadNetworkResource, not page fetch: {child_sent:?}"
+    );
+    assert!(
+        !child_sent.iter().any(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.contains("fetch(document.URL)") || source.contains("permissions-policy"))),
+        "page-world fetch must not observe policy: {child_sent:?}"
+    );
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(
         cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.documents.get("FRAME:CROSS").is_some_and(|document| document.get("policy").and_then(Value::as_str) == Some("tools=*"))),
@@ -1480,4 +1505,92 @@ fn real_chrome_root_get_frame_tree_lists_only_local_frames_never_oopif() {
     let (_cdp, state) = client();
     assert_eq!(state.borrow().tree.pointer("/frameTree/frame/id").and_then(Value::as_str), Some("F"));
     assert!(state.borrow().tree.pointer("/frameTree/childFrames").and_then(Value::as_array).is_none_or(|children| children.is_empty()), "root Page.getFrameTree lists only local frames, never the OOPIF");
+}
+
+fn policy_child(configure: impl FnOnce(&mut BackendState)) -> Cdp {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    configure(&mut state.borrow_mut());
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    cdp
+}
+
+fn policy_document(cdp: &Cdp) -> Option<Value> {
+    cdp.webmcp.arms.get("CHILD").and_then(|arm| arm.documents.get("FRAME:CROSS").cloned())
+}
+
+#[test]
+fn load_network_resource_is_credentialless_and_stores_fetched_source() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    let load = state.borrow().sent.iter().find(|command| command["method"] == "Network.loadNetworkResource").cloned().expect("loadNetworkResource");
+    assert_eq!(load["params"]["options"]["includeCredentials"], false);
+    assert_eq!(load["params"]["options"]["disableCache"], true);
+    let document = policy_document(&cdp).expect("policy recorded");
+    assert_eq!(document["source"], "fetched");
+    assert_eq!(document["policy"], "tools=*");
+}
+
+#[test]
+fn native_policy_state_is_tried_before_load_network_resource() {
+    let cdp = policy_child(|state| state.native_policy = Some(false));
+    let document = policy_document(&cdp).expect("policy recorded");
+    assert_eq!(document["source"], "native");
+    assert_eq!(document["policy"], "tools=()");
+}
+
+#[test]
+fn fetched_policy_is_unknown_when_missing_failed_non_2xx_or_empty() {
+    for headers in [Value::Null, json!({"content-type":"text/html"}), json!({"__status":404,"permissions-policy":"tools=*"}), json!({"permissions-policy":""})] {
+        let cdp = policy_child(|state| state.load_network_headers = Some(headers.clone()));
+        assert!(policy_document(&cdp).is_none(), "headers {headers} must leave policy unknown");
+    }
+}
+
+#[test]
+fn oversized_fetched_policy_is_denied() {
+    let long = format!("tools=*, {}", "a".repeat(20000));
+    let cdp = policy_child(|state| state.child_policy = Some(long));
+    assert_eq!(policy_document(&cdp).expect("policy recorded")["policy"], "tools=()");
+}
+
+#[test]
+fn network_document_response_overwrites_fetched_policy_but_not_the_reverse() {
+    let mut cdp = policy_child(|_| {});
+    assert_eq!(policy_document(&cdp).expect("fetched")["source"], "fetched");
+    cdp.absorb(json!({"method":"Network.responseReceived","sessionId":"CHILD","params":{"frameId":"FRAME","loaderId":"CROSS","type":"Document","response":{"url":"https://foreign.test/cross","headers":{"permissions-policy":"tools=()"}}}}));
+    let document = policy_document(&cdp).expect("network");
+    assert_eq!(document["source"], "network");
+    assert_eq!(document["policy"], "tools=()");
+    cdp.webmcp_record_document_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "tools=*", "fetched");
+    assert_eq!(policy_document(&cdp).expect("kept")["policy"], "tools=()");
+}
+
+#[test]
+fn fetched_policy_is_dropped_when_committed_origin_changed_during_fetch() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://other.test/cross","securityOrigin":"https://other.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.webmcp_observe_child_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "https://foreign.test/cross");
+    assert!(policy_document(&cdp).is_none());
 }
