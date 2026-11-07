@@ -28,6 +28,8 @@ struct BackendState {
     refuse_auto_attach: bool,
     route: Option<String>,
     oopif_tree: Option<Value>,
+    get_target_parent: Option<String>,
+    omit_get_target_parent: bool,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -237,6 +239,15 @@ impl Transport for Backend {
                 } else {
                     json!({"product":"Chrome/156.0.0.0"})
                 }
+            }
+            "Target.getTargetInfo" => {
+                let id = command["params"]["targetId"].as_str().unwrap_or("IFRAME");
+                let mut info = json!({"targetId":id,"type":"iframe","url":"https://foreign.test/cross"});
+                if !state.omit_get_target_parent {
+                    let parent = state.get_target_parent.clone().unwrap_or_else(|| "F".into());
+                    info["parentFrameId"] = json!(parent);
+                }
+                json!({"targetInfo":info})
             }
             _ => json!({}),
         };
@@ -1414,4 +1425,59 @@ fn private_oopif_attach_does_not_touch_protect_or_guard_the_root_but_settled_chi
     assert_eq!(cdp.guards.get("IFRAME"), None, "forget abandons the OOPIF guard slot via protect_target on IFRAME only");
     assert!(cdp.protected_targets.contains("IFRAME"));
     assert!(!cdp.protected_targets.contains("T") || root_protected);
+}
+
+#[test]
+fn missing_parent_frame_id_from_attach_and_get_target_info_fails_closed_without_domains() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    state.borrow_mut().omit_get_target_parent = true;
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    let child_sent = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD").cloned().collect::<Vec<_>>();
+    assert!(cdp.session_blocked("CHILD") || !cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(!child_sent.iter().any(|command| matches!(command["method"].as_str(), Some("Network.enable" | "Runtime.enable" | "Page.enable" | "Runtime.evaluate"))), "{child_sent:?}");
+}
+
+#[test]
+fn attach_parent_frame_id_or_get_target_info_parent_frame_id_allows_arm() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some());
+    assert_eq!(cdp.targets["IFRAME"].get("parentFrameId").and_then(Value::as_str), Some("F"));
+}
+
+#[test]
+fn real_chrome_oopif_frame_id_equals_target_id_and_unit_keeps_differing_ids() {
+    for (frame_id, target_id) in [("IFRAME", "IFRAME"), ("FRAME", "IFRAME")] {
+        let (mut cdp, state) = client();
+        state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":frame_id,"url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+        cdp.start_webmcp_for("H", true).unwrap();
+        let holder = cdp.webmcp_session("H").to_string();
+        cdp.webmcp_auto_attach(&holder).unwrap();
+        if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+            arm.pending_contexts.clear();
+            arm.pending_frames.clear();
+            arm.pending_install = None;
+        }
+        cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+        cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":target_id,"type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+        cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":frame_id,"isDefault":true}}}}));
+        assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0), "real Chrome uses F==T; unit also keeps F!=T. F={frame_id} T={target_id}");
+    }
+}
+
+#[test]
+fn real_chrome_root_get_frame_tree_lists_only_local_frames_never_oopif() {
+    let (_cdp, state) = client();
+    assert_eq!(state.borrow().tree.pointer("/frameTree/frame/id").and_then(Value::as_str), Some("F"));
+    assert!(state.borrow().tree.pointer("/frameTree/childFrames").and_then(Value::as_array).is_none_or(|children| children.is_empty()), "root Page.getFrameTree lists only local frames, never the OOPIF");
 }

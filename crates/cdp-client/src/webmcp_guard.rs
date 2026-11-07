@@ -1142,6 +1142,21 @@ impl Cdp {
         self.webmcp_trace_stage(child, "policy", if policy.is_empty() { "observed-empty" } else if policy.contains("tools") { "observed-tools" } else { "observed-other" });
     }
 
+    fn webmcp_parent_frame_id(&mut self, target: &str, until: Instant) -> Result<String, String> {
+        if let Some(frame) = self.targets.get(target).and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).filter(|frame| !frame.is_empty()) {
+            return Ok(frame.to_string());
+        }
+        let left = until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP);
+        let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, left)?;
+        let frame = info.pointer("/targetInfo/parentFrameId").and_then(Value::as_str).filter(|frame| !frame.is_empty()).ok_or_else(|| self.refusal())?.to_string();
+        if let Some(Value::Object(stored)) = self.targets.get_mut(target) {
+            stored.insert("parentFrameId".into(), json!(frame.clone()));
+        } else if let Some(target_info) = info.get("targetInfo").cloned() {
+            self.targets.insert(target.to_string(), target_info);
+        }
+        Ok(frame)
+    }
+
     fn webmcp_parked_child(&self, session: &str) -> bool {
         self.webmcp.parents.contains_key(session)
             && self.webmcp.quarantined.contains(session)
@@ -1345,6 +1360,7 @@ impl Cdp {
             self.guards.entry(target.clone()).or_insert_with(|| child.clone());
             if self.is_protected_target(&target) { return Err(self.refusal()); }
             let until = Instant::now() + DOCUMENT_CHECK;
+            self.webmcp_parent_frame_id(&target, until)?;
             let seed = self.webmcp_stable(&child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(&child), left.min(OPTIONAL_STEP))).unwrap_or_else(|_| json!({"frameTree":{"frame":{"id":target,"url":url}}}));
             if seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|frame_url| self.guard.extension_frame(frame_url)) {
                 return Err(self.refusal());
