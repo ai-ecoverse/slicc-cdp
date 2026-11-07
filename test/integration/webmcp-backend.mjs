@@ -104,8 +104,11 @@ export async function webmcpBackend({
     }
   };
   reset('L');
+  const frameKey = (page) => (page?.oopif ? `${page.id}-frame` : page.id);
+  const pageByFrame = (frameId) =>
+    [...pages.values()].find((page) => frameKey(page) === frameId) || pages.get(frameId);
   const frame = (page) => ({
-    id: page.id,
+    id: frameKey(page),
     loaderId: page.loader,
     url: page.blank ? 'about:blank' : `${page.origin}/`,
     securityOrigin: page.origin,
@@ -163,7 +166,7 @@ export async function webmcpBackend({
                 id: page.main,
                 uniqueId: `main-${page.loader}`,
                 origin: page.origin,
-                auxData: { frameId: page.id, isDefault: true },
+                auxData: { frameId: frameKey(page), isDefault: true },
               },
             },
             peer
@@ -177,7 +180,7 @@ export async function webmcpBackend({
                   uniqueId: `isolated-${page.loader}`,
                   origin: page.origin,
                   name: 'slicc-webmcp',
-                  auxData: { frameId: page.id, isDefault: false },
+                  auxData: { frameId: frameKey(page), isDefault: false },
                 },
               },
               peer
@@ -229,7 +232,7 @@ export async function webmcpBackend({
             event(
               'Network.responseReceived',
               {
-                frameId: page.id,
+                frameId: frameKey(page),
                 loaderId: page.loader,
                 type: 'Document',
                 response: {
@@ -297,7 +300,7 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.createIsolatedWorld') {
-        const page = pages.get(params.frameId);
+        const page = pageByFrame(params.frameId);
         page.isolatedCreated = true;
         for (const peer of runtimeEnabled)
           event(
@@ -308,7 +311,7 @@ export async function webmcpBackend({
                 uniqueId: `isolated-${page.loader}`,
                 origin: page.origin,
                 name: 'slicc-webmcp',
-                auxData: { frameId: page.id, isDefault: false },
+                auxData: { frameId: frameKey(page), isDefault: false },
               },
             },
             peer
@@ -317,7 +320,7 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Page.getPermissionsPolicyState') {
-        const page = pages.get(params.frameId);
+        const page = pageByFrame(params.frameId);
         answer({
           states: native ? [{ feature: 'tools', allowed: page?.permitted !== false }] : [],
         });
@@ -333,7 +336,7 @@ export async function webmcpBackend({
               nodeId: index + 1,
               nodeType: 1,
               nodeName: 'IFRAME',
-              frameId: child.id,
+              frameId: frameKey(child),
               childNodeCount: 0,
             })),
           },
@@ -346,11 +349,13 @@ export async function webmcpBackend({
       }
       if (method === 'DOM.describeNode') {
         const child = children[params.nodeId - 1];
-        answer({ node: { backendNodeId: params.nodeId, frameId: child.id } });
+        answer({ node: { backendNodeId: params.nodeId, frameId: frameKey(child) } });
         return true;
       }
       if (method === 'DOM.getFrameOwner') {
-        answer({ backendNodeId: children.findIndex((child) => child.id === params.frameId) + 1 });
+        answer({
+          backendNodeId: children.findIndex((child) => frameKey(child) === params.frameId) + 1,
+        });
         return true;
       }
       if (method === 'DOM.resolveNode') {
@@ -474,7 +479,7 @@ export async function webmcpBackend({
             event(
               'Network.responseReceived',
               {
-                frameId: page.id,
+                frameId: frameKey(page),
                 loaderId: page.loader,
                 type: 'Document',
                 response: {
@@ -521,7 +526,7 @@ export async function webmcpBackend({
       }
       if (method === 'Network.loadNetworkResource') {
         const page =
-          pages.get(params.frameId) ||
+          pageByFrame(params.frameId) ||
           pages.get(sessions.get(sessionId)) ||
           [...pages.values()].find((page) => `${page.origin}/` === params.url);
         answer({

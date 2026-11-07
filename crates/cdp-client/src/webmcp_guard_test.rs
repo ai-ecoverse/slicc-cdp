@@ -30,6 +30,7 @@ struct BackendState {
     version_mode: Option<String>,
     child_policy: Option<String>,
     load_network_headers: Option<Value>,
+    load_network_mutate_tree: Option<Value>,
     oopif_tree: Option<Value>,
     place_remote_oopif: bool,
 }
@@ -241,15 +242,20 @@ impl Transport for Backend {
                 state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Page.getPermissionsPolicyState wasn't found"}}).to_string());
                 return Ok(());
             }
-            "Network.loadNetworkResource" => match state.load_network_headers.as_ref() {
-                Some(Value::Null) => json!({"resource":{"success":true}}),
-                Some(headers) => {
-                    let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
-                    let mut clean = headers.clone();
-                    if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
-                    json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+            "Network.loadNetworkResource" => {
+                if let Some(tree) = state.load_network_mutate_tree.take() {
+                    state.oopif_tree = Some(tree);
                 }
-                None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+                match state.load_network_headers.as_ref() {
+                    Some(Value::Null) => json!({"resource":{"success":true}}),
+                    Some(headers) => {
+                        let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
+                        let mut clean = headers.clone();
+                        if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
+                        json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+                    }
+                    None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+                }
             },
             "Debugger.resume" => {
                 if state.context_race == "resume" && state.api {
@@ -1729,6 +1735,20 @@ fn load_network_resource_is_credentialless_and_stores_fetched_source() {
     non_2xx.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
     non_2xx.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(non_2xx.webmcp.arms.get("CHILD").is_none_or(|arm| !arm.documents.contains_key("FRAME:CROSS")));
+
+    let (mut oversize, oversize_state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    oversize_state.borrow_mut().load_network_headers = Some(json!({"permissions-policy":"x".repeat(16385)}));
+    oversize.webmcp_request_origins(&["https://foreign.test".into()]);
+    oversize.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    oversize.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(oversize.webmcp.arms.get("CHILD").is_none_or(|arm| !arm.documents.contains_key("FRAME:CROSS")), "fetched header over 16 KiB stays unknown");
+
+    let (mut drifted, drifted_state, holder) = direct_holder_with_attach(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    drifted_state.borrow_mut().load_network_mutate_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://other.test/cross","securityOrigin":"https://other.test","loaderId":"CROSS"}}}));
+    drifted.webmcp_request_origins(&["https://foreign.test".into()]);
+    drifted.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    drifted.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert!(drifted.webmcp.arms.get("CHILD").is_none_or(|arm| !arm.documents.contains_key("FRAME:CROSS")), "fetched policy is dropped when the committed origin drifts");
 }
 
 #[test]
@@ -1770,9 +1790,10 @@ fn root_tree_frame_id_differs_from_target_id_like_chrome() {
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert_ne!("FRAME", "IFRAME");
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0), "Chrome reports F in the root tree and T as targetId");
-    assert!(!state.borrow().sent.iter().any(|command| {
-        command["method"] == "Page.getFrameTree" && command["sessionId"] != "CHILD" && false
-    }));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Page.getFrameTree" && command["sessionId"] == "CHILD"), "placement reads the child session tree for F");
+    assert!(state.borrow().sent.iter().any(|command| {
+        command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["uniqueContextId"] == "CROSS-CTX"
+    }), "shim installs against the child frame context, not the target id");
 }
 
 #[test]

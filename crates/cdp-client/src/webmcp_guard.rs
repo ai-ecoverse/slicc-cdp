@@ -471,7 +471,7 @@ impl Cdp {
         let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
             if self.webmcp.parents.contains_key(&session) || self.webmcp.quarantined.contains(&session) {
-                self.webmcp_settle_child(&session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                self.webmcp_settle_child(&session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:sweep-deadline]");
                 continue;
             }
             let reason = self.webmcp.arms.get(&session).map(|arm| if arm.pending_install.is_some_and(|deadline| deadline <= now) { "installer deadline" } else if arm.pending_contexts.values().any(|deadline| *deadline <= now) { "context deadline" } else { "frame deadline" }).unwrap_or("missing holder");
@@ -1017,9 +1017,9 @@ impl Cdp {
                     }
                 } else {
                     self.notices.push(if cross {
-                        "webmcp-polyfill: a cross-origin child could not verify its document; synchronous registration before installation is unavailable\n".into()
+                        "webmcp-polyfill: a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:install-children-cross]\n".into()
                     } else {
-                        "webmcp-polyfill: a same-origin child could not verify its document; synchronous registration before installation is unavailable\n".into()
+                        "webmcp-polyfill: a same-origin child could not verify its document; synchronous registration before installation is unavailable [diag:install-children-same]\n".into()
                     });
                 }
             }
@@ -1212,7 +1212,7 @@ impl Cdp {
     fn webmcp_detach_children(&mut self, parent: &str) {
         let children = self.webmcp.parents.iter().filter(|(child, owner)| *owner == parent && !self.blocked.contains(*child)).map(|(child, _)| child.clone()).collect::<Vec<_>>();
         for child in children {
-            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:detach-children]");
         }
     }
 
@@ -1306,9 +1306,13 @@ impl Cdp {
         let child_left = until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP);
         let frame_f = self.raw_call("Page.getFrameTree", json!({}), Some(child), child_left).ok()
             .and_then(|tree| tree.pointer("/frameTree/frame/id").and_then(Value::as_str).map(str::to_string))
-            .filter(|frame| !frame.is_empty());
+            .filter(|frame| !frame.is_empty())
+            .or_else(|| {
+                self.documents.get(&child_target).map(|document| document.frame_id.clone()).filter(|frame| !frame.is_empty())
+            });
         let placed = match frame_f {
             Some(frame) if Self::webmcp_child_placed(&tree, &frame) => frame,
+            Some(_) if Self::webmcp_child_placed(&tree, &child_target) => child_target,
             Some(_) => return Ok(false),
             None if Self::webmcp_child_placed(&tree, &child_target) => child_target,
             None => return Ok(false),
@@ -1331,10 +1335,7 @@ impl Cdp {
         if loader.is_empty() || !self.webmcp_ordinary_origin(&origin) { return Err(self.refusal()); }
         self.webmcp_remember_child_origin(child, &origin);
         if !self.webmcp.requested_origins.contains(&origin) {
-            if let Some(arm) = self.webmcp.arms.get_mut(child) {
-                arm.pending_install = None;
-                arm.pending_install_loader = None;
-            }
+            self.webmcp_pend_install(child, &loader);
             return Ok(false);
         }
         match self.webmcp_ancestors_verified(child, until)? {
@@ -1345,6 +1346,7 @@ impl Cdp {
         self.webmcp_pend_install(child, &loader);
         let parent_root = self.webmcp_root_document(parent, until)?;
         let last_accepted = self.webmcp.arms.get(child).and_then(|arm| arm.frame_accept_generation.get(&frame_id).copied());
+        let current_generation = self.webmcp.arms.get(child).map(|arm| arm.context_generation).unwrap_or(0);
         let accepted_uniques = self.webmcp.arms.get(child).map(|arm| {
             arm.accepted.iter().map(|(_, _, unique)| unique.clone()).collect::<BTreeSet<_>>()
         }).unwrap_or_default();
@@ -1373,7 +1375,9 @@ impl Cdp {
             return Ok(true);
         }
         let Some((id, context)) = matched.into_iter().find(|(_, context)| {
-            !accepted_uniques.contains(&context.unique) && last_accepted.is_none_or(|last| context.generation > last)
+            !accepted_uniques.contains(&context.unique)
+                && last_accepted.is_none_or(|last| context.generation > last)
+                && (last_accepted.is_some() || context.generation == current_generation)
         }) else {
             return Ok(false);
         };
@@ -1415,7 +1419,7 @@ impl Cdp {
                 Ok(true) => {}
                 Ok(false) => {}
                 Err(_) => {
-                    self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                    self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:finish-await-err]");
                 }
             }
         }
@@ -1445,7 +1449,7 @@ impl Cdp {
             *session != &child && self.session_targets.get(*session) == Some(&target)
         }).cloned().collect::<Vec<_>>();
         for old in prior {
-            self.webmcp_settle_child(&old, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            self.webmcp_settle_child(&old, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:adopt-prior]");
         }
         self.session_targets.insert(child.clone(), target.clone());
         self.webmcp.quarantined.insert(child.clone());
@@ -1470,20 +1474,22 @@ impl Cdp {
             if parked >= 1024 {
                 return Err(self.refusal());
             }
-            let enable = placed && !provisional_seed;
+            let enable = !provisional_seed || placed;
             self.webmcp_child_arm(&child, &seed, direct, enable)?;
             let parent_frame = self.webmcp.arms.get(&parent).and_then(|arm| arm.root_identity.as_ref()).map(|(_, context)| context.frame.clone())
                 .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
             let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
             let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
-            if placed && child_tree && !provisional_seed {
+            if child_tree && !provisional_seed {
                 match self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP) {
                     Ok(_) => {}
-                    Err(_) => return Err(self.refusal()),
+                    Err(error) => return Err(error),
                 }
             } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
-                arm.pending_install = None;
-                arm.pending_install_loader = None;
+                if !placed || provisional_seed {
+                    arm.pending_install = None;
+                    arm.pending_install_loader = None;
+                }
             }
             if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
                 self.webmcp_remember_child_origin(&child, origin);
@@ -1494,8 +1500,9 @@ impl Cdp {
             }
             Ok(())
         })();
-        if outcome.is_err() {
-            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+        if let Err(error) = outcome {
+            self.notices.push(format!("webmcp-polyfill: [diag:adopt-child-err] {error}"));
+            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:adopt-child]");
         }
     }
 
@@ -1669,7 +1676,7 @@ impl Cdp {
             let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
             self.webmcp.paused.remove(session);
             if !self.blocked.contains(session) {
-                self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:child-debugger-paused]");
             }
             return true;
         }
@@ -1714,7 +1721,7 @@ impl Cdp {
             let child_main = self.webmcp.parents.contains_key(session) && frame.get("parentId").is_none();
             if child_main && self.webmcp_child_refusal(frame) {
                 if !self.blocked.contains(session) {
-                    self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                    self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:frameNavigated-child-refusal]");
                 }
                 return false;
             }
@@ -1728,17 +1735,20 @@ impl Cdp {
                         self.webmcp_child_navigated(session, frame, &origin);
                     }
                     Ok(false) => {
+                        let _ = self.webmcp_child_enable(session);
                         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
                         self.webmcp_remember_child_origin(session, &origin);
-                        if let Some(arm) = self.webmcp.arms.get_mut(session) {
-                            arm.pending_install = None;
-                            arm.pending_install_loader = None;
-                        }
-                        return false;
+                        self.notices.push(format!(
+                            "webmcp-polyfill: [diag:frameNavigated-unplaced] frame={} target={} loader={} origin={}\n",
+                            frame.get("id").and_then(Value::as_str).unwrap_or(""),
+                            self.session_target(session).unwrap_or_default(),
+                            frame.get("loaderId").and_then(Value::as_str).unwrap_or(""),
+                            origin
+                        ));
                     }
                     Err(_) => {
                         if !self.blocked.contains(session) {
-                            self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                            self.webmcp_settle_child(session, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable [diag:frameNavigated-ancestry-err]");
                         }
                         return false;
                     }

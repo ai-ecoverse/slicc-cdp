@@ -14,9 +14,14 @@ fn holder_alive(pid: u32) -> bool {
         let rc = unsafe { libc::kill(pid as i32, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(all(not(unix), not(target_arch = "wasm32")))]
     {
         pid == std::process::id()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -24,13 +29,34 @@ pub(crate) fn snapshot_now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0)
 }
 
+pub(crate) fn snapshot_holder_pid() -> Option<u32> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(std::process::id())
+    }
+}
+
 pub(crate) fn snapshot_evidence(entry: &Value) -> bool {
     if entry.get("schema").and_then(Value::as_u64).unwrap_or(0) < SNAPSHOT_SCHEMA { return false; }
-    let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) else { return false; };
-    if pid == 0 || pid > u64::from(u32::MAX) || !holder_alive(pid as u32) { return false; }
     let Some(updated) = entry.get("updatedAtMs").and_then(Value::as_u64) else { return false; };
     if snapshot_now_ms().saturating_sub(updated) > 15_000 { return false; }
-    true
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) {
+            if pid != 0 { return false; }
+        }
+        true
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(pid) = entry.get("holderPid").and_then(Value::as_u64) else { return false; };
+        if pid == 0 || pid > u64::from(u32::MAX) || !holder_alive(pid as u32) { return false; }
+        true
+    }
 }
 
 fn child_evidence(state: &Session, target: &str) -> bool {
@@ -179,8 +205,7 @@ fn list_field(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
-            '\n' | '\r' | '\t' => out.push(' '),
-            c if c.is_control() => out.push(' '),
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
             _ => out.push(ch),
         }
     }
@@ -932,20 +957,34 @@ mod tests {
 
     #[test]
     fn list_field_strips_newline_tab_and_controls() {
-        assert_eq!(list_field("a\nb\tc\rd\x07e"), sanitize::browser_message("a b c d e"));
+        assert_eq!(list_field("a\nb\tc\rd"), sanitize::browser_message("a b c d"));
         assert!(!list_field("line\nbreak").contains('\n'));
         assert!(!list_field("a\tb").contains('\t'));
+        let escaped = list_field("esc\x1b[2J");
+        assert!(escaped.contains("\\x1b"), "{escaped}");
+        assert!(!escaped.contains('\x1b'));
+        assert!(list_field("bel\x07").contains("\\x07"));
     }
 
     #[test]
     fn snapshot_evidence_rejects_old_schema_and_dead_holder() {
         let now = snapshot_now_ms();
         assert!(!snapshot_evidence(&json!({"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
-        assert!(!snapshot_evidence(&json!({"schema":0,"holderPid":std::process::id(),"updatedAtMs":now,"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
-        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":4_294_967_294u64,"updatedAtMs":now,"routeAttested":false,"sessions":[{"target":"T","directChildAttach":true}]})));
-        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"routeAttested":false})));
-        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"updatedAtMs":now.saturating_sub(16_000),"routeAttested":false})));
-        assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"updatedAtMs":now,"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":0,"updatedAtMs":now,"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"routeAttested":false})));
+        assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"updatedAtMs":now.saturating_sub(16_000),"routeAttested":false})));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":4_294_967_294u64,"updatedAtMs":now,"routeAttested":false})));
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"updatedAtMs":now,"routeAttested":false})));
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"routeAttested":false})));
+            assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":std::process::id(),"updatedAtMs":now,"routeAttested":false})));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            assert!(snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"updatedAtMs":now,"routeAttested":false})));
+            assert!(!snapshot_evidence(&json!({"schema":SNAPSHOT_SCHEMA,"holderPid":1u64,"updatedAtMs":now,"routeAttested":false})));
+        }
     }
 
     #[test]
