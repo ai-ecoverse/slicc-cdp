@@ -1542,6 +1542,11 @@ impl Cdp {
         let changed = ["url", "parentFrameId"].iter().any(|key| known.and_then(|known| known.get(*key)) != info.get(*key));
         if !changed { return; }
         self.webmcp_merge_target(&target, &info);
+        for holder in &holders {
+            if let Some(recorded) = self.webmcp.recorded.get_mut(&(holder.clone(), target.clone())) {
+                recorded.info = info.clone();
+            }
+        }
         self.webmcp.reconcile_dirty.extend(holders);
         self.webmcp_reconcile_pending();
     }
@@ -1709,12 +1714,15 @@ impl Cdp {
 
     fn webmcp_adopt(&mut self, holder: &str, target: &str, child: &str, info: &Value) {
         let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+        let provisional = url.is_empty() || url == "about:blank";
         self.webmcp_trace_decision("adopt", target, child, holder);
         self.session_targets.insert(child.to_string(), target.to_string());
         self.webmcp.quarantined.insert(child.to_string());
         self.webmcp.parents.insert(child.to_string(), holder.to_string());
         let outcome = (|| -> Result<(), String> {
-            if !url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) { return Err(self.refusal()); }
+            if !(provisional || url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))) {
+                return Err(self.refusal());
+            }
             if !self.guards.contains_key(target) { self.guards.insert(target.to_string(), child.to_string()); }
             if self.is_protected_target(target) { return Err(self.refusal()); }
             let until = Instant::now() + DOCUMENT_CHECK;
@@ -1739,8 +1747,10 @@ impl Cdp {
             }
             if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
                 self.webmcp_remember_child_origin(child, origin);
-            } else if let Ok(parsed) = url::Url::parse(&url) {
-                self.webmcp_remember_child_origin(child, &parsed.origin().ascii_serialization());
+            } else if !provisional {
+                if let Ok(parsed) = url::Url::parse(&url) {
+                    self.webmcp_remember_child_origin(child, &parsed.origin().ascii_serialization());
+                }
             }
             Ok(())
         })();
