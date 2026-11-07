@@ -1084,6 +1084,78 @@ fn rematching_the_same_child_realm_does_not_raise_admitted() {
     );
 }
 
+fn reinstall_child_client() -> (Cdp, Rc<RefCell<BackendState>>, String) {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/a","securityOrigin":"https://foreign.test","loaderId":"L1"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/a"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.accepted.contains(&("FRAME".into(), "L1".into(), "CROSS-CTX".into()))));
+    (cdp, state, holder)
+}
+
+fn child_shim_installs(state: &Rc<RefCell<BackendState>>, from: usize) -> Vec<Value> {
+    state.borrow().sent[from..].iter().filter(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).cloned().collect()
+}
+
+#[test]
+fn context_generation_advances_only_on_contexts_cleared() {
+    let (mut cdp, _state, _holder) = reinstall_child_client();
+    assert_eq!(cdp.webmcp.arms["CHILD"].context_generation, 0);
+    assert_eq!(cdp.webmcp.contexts.iter().find(|((owner, _), context)| owner == "CHILD" && context.unique == "CROSS-CTX").map(|(_, context)| context.generation), Some(0));
+    assert_eq!(cdp.webmcp.arms["CHILD"].frame_accept_generation.get("FRAME"), Some(&0));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+    assert_eq!(cdp.webmcp.arms["CHILD"].context_generation, 0);
+    cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+    assert_eq!(cdp.webmcp.arms["CHILD"].context_generation, 1);
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":8,"uniqueId":"NEW-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+    assert_eq!(cdp.webmcp.contexts[&("CHILD".into(), 8)].generation, 1);
+}
+
+#[test]
+fn post_navigation_reinstall_requires_newer_generation() {
+    for order in ["cleared-created-navigated", "navigated-cleared-created", "created-navigated-cleared", "navigated-created-cleared"] {
+        let (mut cdp, state, holder) = reinstall_child_client();
+        state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+        let before = state.borrow().sent.len();
+        match order {
+            "cleared-created-navigated" => {
+                cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+                cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":8,"uniqueId":"NEW-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+                cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+            }
+            "navigated-cleared-created" => {
+                cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+                cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+                cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":8,"uniqueId":"NEW-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+            }
+            "created-navigated-cleared" => {
+                cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":8,"uniqueId":"NEW-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+                cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+                assert!({ let _ = cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK); child_shim_installs(&state, before).iter().all(|command| command["params"]["uniqueContextId"] != "NEW-CTX") }, "same generation must wait: {order}");
+                cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+                cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"AFTER-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+            }
+            "navigated-created-cleared" => {
+                cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/b","securityOrigin":"https://foreign.test","loaderId":"L2"}}}));
+                cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":8,"uniqueId":"NEW-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+                assert!({ let _ = cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK); child_shim_installs(&state, before).iter().all(|command| command["params"]["uniqueContextId"] != "NEW-CTX") }, "same generation must wait: {order}");
+                cdp.absorb(json!({"method":"Runtime.executionContextsCleared","sessionId":"CHILD","params":{}}));
+                cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"AFTER-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
+            }
+            _ => unreachable!(),
+        }
+        let _ = cdp.webmcp_adopt_install("CHILD", &holder, Instant::now() + DOCUMENT_CHECK);
+        let installs = child_shim_installs(&state, before);
+        let expected = if order.ends_with("cleared") { "AFTER-CTX" } else { "NEW-CTX" };
+        assert!(installs.iter().any(|command| command["params"]["uniqueContextId"] == expected), "{order}: {installs:?}");
+        assert!(installs.iter().all(|command| command["params"]["uniqueContextId"] != "CROSS-CTX"), "{order}: {installs:?}");
+        assert!(cdp.webmcp.contexts.values().all(|context| context.unique != "CROSS-CTX" || context.loader != "L2"), "{order}");
+    }
+}
+
 #[test]
 fn adopt_install_and_finish_awaiting_evaluate_the_same_realm_once() {
     let (mut cdp, state) = client();
