@@ -110,20 +110,25 @@ function guardedIntercept(message, send) {
   if (message.method !== 'Runtime.evaluate') return false;
   const expression =
     typeof message.params?.expression === 'string' ? message.params.expression : '';
-  const payload = expression.includes('await fetch(')
-    ? {
-        result: {
-          type: 'object',
-          value: {
-            status: 200,
-            statusText: 'OK',
-            headers: {},
-            body: 'ok',
-            url: 'https://example.test/',
-          },
+  let payload;
+  if (expression.includes('await fetch(')) {
+    payload = {
+      result: {
+        type: 'object',
+        value: {
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          body: 'ok',
+          url: 'https://example.test/',
         },
-      }
-    : { result: { type: 'string', value: 'leaked' } };
+      },
+    };
+  } else if (expression.trim() === 'document.baseURI') {
+    payload = { result: { type: 'string', value: 'https://example.test/' } };
+  } else {
+    payload = { result: { type: 'string', value: 'leaked' } };
+  }
   send({
     id: message.id,
     ...(message.sessionId ? { sessionId: message.sessionId } : {}),
@@ -845,6 +850,14 @@ test('Slack-shaped relative fetch works on discovered app.slack.com; seven relat
       if (message.method !== 'Runtime.evaluate') return false;
       const expression =
         typeof message.params?.expression === 'string' ? message.params.expression : '';
+      if (expression.trim() === 'document.baseURI') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { result: { type: 'string', value: slack.url } },
+        });
+        return true;
+      }
       if (expression.includes('await fetch(')) {
         const match = expression.match(/await fetch\(([^,]+),/u);
         if (match) seenFetch.push(match[1]);
@@ -891,10 +904,17 @@ test('Slack-shaped relative fetch works on discovered app.slack.com; seven relat
     assert.equal(found?.targetId, 'SLACK');
     const relative = await browser.fetch(found, '/api/auth.test', { method: 'POST' });
     assert.equal(relative?.status, 200);
-    assert.ok(seenFetch.some((arg) => arg.includes('/api/auth.test')));
-    assert.ok(!seenFetch.some((arg) => arg.includes('https://app.slack.com/api/auth.test')));
+    assert.ok(
+      seenFetch.some((arg) => arg.includes(JSON.stringify('https://app.slack.com/api/auth.test')))
+    );
+    assert.ok(!seenFetch.some((arg) => arg.includes(JSON.stringify('/api/auth.test'))));
     const absolute = await browser.fetch(found, 'https://edgeapi.slack.com/cache/T1/users/info');
     assert.equal(absolute?.status, 200);
+    assert.ok(
+      seenFetch.some((arg) =>
+        arg.includes(JSON.stringify('https://edgeapi.slack.com/cache/T1/users/info'))
+      )
+    );
     assert.equal(await browser.cookie(found, 'd'), 'slack-d');
     assert.equal(await browser.cookie(found, 'seven_session'), null);
     assert.equal(await browser.localStorage(found, 'localConfig_v2'), '{"ok":true}');
@@ -913,4 +933,191 @@ test('Slack-shaped relative fetch works on discovered app.slack.com; seven relat
       message: REFUSAL,
     });
   });
+});
+
+test('discovered fetch surfaces baseURI and page-fetch evaluate exceptions', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let phase = 'base';
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      if (expression.trim() === 'document.baseURI') {
+        if (phase === 'base') {
+          send({
+            id: message.id,
+            ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+            result: {
+              result: { type: 'object', value: null },
+              exceptionDetails: {
+                text: 'baseURI blew up',
+                exception: { description: 'baseURI blew up' },
+              },
+            },
+          });
+          return true;
+        }
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { result: { type: 'string', value: page.url } },
+        });
+        return true;
+      }
+      if (expression.includes('await fetch(')) {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            result: { type: 'object', value: null },
+            exceptionDetails: {
+              text: 'page fetch blew up',
+              exception: { description: 'page fetch blew up' },
+            },
+          },
+        });
+        return true;
+      }
+      send({
+        id: message.id,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        result: { result: { type: 'string', value: 'unexpected' } },
+      });
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.fetch(page, '/probe'), /baseURI blew up/);
+    phase = 'fetch';
+    await assert.rejects(() => browser.fetch(page, '/probe'), /page fetch blew up/);
+  });
+});
+
+test('discovered fetch refuses relative when document.baseURI is protected; no page fetch', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/a', title: 'ok' };
+  const seenFetch = [];
+  let baseReads = 0;
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      if (expression.trim() === 'document.baseURI') {
+        baseReads += 1;
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { result: { type: 'string', value: 'https://lars.sliccy.ai/' } },
+        });
+        return true;
+      }
+      if (expression.includes('await fetch(')) {
+        seenFetch.push(expression);
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            result: {
+              type: 'object',
+              value: {
+                status: 200,
+                statusText: 'OK',
+                headers: {},
+                body: 'leak',
+                url: 'https://lars.sliccy.ai/probe',
+              },
+            },
+          },
+        });
+        return true;
+      }
+      send({
+        id: message.id,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        result: { result: { type: 'string', value: 'unexpected' } },
+      });
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.fetch(page, '/probe'), { message: REFUSAL });
+    assert.equal(baseReads, 1);
+    assert.deepEqual(seenFetch, []);
+  });
+});
+
+test('explicit SLICC_CDP_URL fetch passes the original string and skips baseURI', async () => {
+  const seenFetch = [];
+  let baseReads = 0;
+  const fake = await fakeCdp({
+    answers: guardedAnswers(),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      if (expression.trim() === 'document.baseURI') {
+        baseReads += 1;
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { result: { type: 'string', value: 'https://example.test/' } },
+        });
+        return true;
+      }
+      if (expression.includes('await fetch(')) {
+        const match = expression.match(/await fetch\(([^,]+),/u);
+        if (match) seenFetch.push(match[1]);
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            result: {
+              type: 'object',
+              value: {
+                status: 200,
+                statusText: 'OK',
+                headers: {},
+                body: 'ok',
+                url: 'https://example.test/plain',
+              },
+            },
+          },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  const previous = process.env.SLICC_CDP_URL;
+  process.env.SLICC_CDP_URL = fake.url;
+  await settle();
+  try {
+    const result = await browser.fetch(ok, '/plain');
+    assert.equal(result?.status, 200);
+    assert.equal(baseReads, 0);
+    assert.ok(seenFetch.some((arg) => arg.includes(JSON.stringify('/plain'))));
+    assert.ok(!seenFetch.some((arg) => arg.includes('https://example.test/plain')));
+  } finally {
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
 });

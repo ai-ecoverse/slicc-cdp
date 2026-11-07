@@ -484,27 +484,63 @@ export async function localStorage(tab, key) {
   return typeof raw === 'string' ? raw : String(raw);
 }
 
-function resolveFetchUrl(url, liveTop) {
+function resolveFetchUrl(url, base) {
   try {
-    return new URL(url, liveTop).href;
+    return new URL(url, base).href;
   } catch {
     throw new TypeError(
-      `browser.fetch: could not resolve ${JSON.stringify(url)} against ${JSON.stringify(liveTop)}`
+      `browser.fetch: could not resolve ${JSON.stringify(url)} against ${JSON.stringify(base)}`
     );
   }
+}
+
+async function baseUriOf(tab) {
+  const { client, sessionId } = await sessionFor(targetIdOf(tab));
+  const result = await client.send(
+    'Runtime.evaluate',
+    { expression: 'document.baseURI', returnByValue: true },
+    sessionId
+  );
+  if (result?.exceptionDetails) {
+    throw new Error(exceptionMessage(result.exceptionDetails));
+  }
+  const value = result?.result?.value;
+  return typeof value === 'string' ? value : '';
+}
+
+async function evaluateFetchScript(tab, script) {
+  const { client, sessionId } = await sessionFor(targetIdOf(tab));
+  const result = await client.send(
+    'Runtime.evaluate',
+    {
+      expression: serializeEvalSource(script),
+      returnByValue: true,
+      awaitPromise: true,
+    },
+    sessionId
+  );
+  if (result?.exceptionDetails) {
+    throw new Error(exceptionMessage(result.exceptionDetails));
+  }
+  return unwrapEvalResult(result?.result?.value);
 }
 
 export async function fetch(tab, url, opts = {}) {
   if (typeof url !== 'string') throw new TypeError('browser.fetch: url must be a string');
   return using(async () => {
     await openClient();
-    if (guarded) {
-      const liveTop = await urlOf(tab);
-      refuseProtected(liveTop);
-      refuseProtected(resolveFetchUrl(url, liveTop));
+    if (!guarded) {
+      const script = await buildBrowserFetchScript(url, opts);
+      return evaluateFetchScript(tab, script);
     }
-    const script = await buildBrowserFetchScript(url, opts);
-    return evaluateNow(tab, script, true);
+    return withGuardedTab(tab, async () => {
+      const baseURI = await baseUriOf(tab);
+      refuseProtected(baseURI);
+      const absolute = resolveFetchUrl(url, baseURI);
+      refuseProtected(absolute);
+      const script = await buildBrowserFetchScript(absolute, opts);
+      return evaluateFetchScript(tab, script);
+    });
   });
 }
 
