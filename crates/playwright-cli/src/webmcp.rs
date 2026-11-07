@@ -166,36 +166,11 @@ pub fn list_from(cdp: &mut Cdp, state: &mut Session, tab: Option<&str>, json: bo
     remember_origins(state, &target, from);
     let evidence = child_evidence(state, &target);
     if evidence { wait_for_child_origins(state, &target, from); }
-    if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() == Some("1") {
-        let entry = state.webmcp.get(&target);
-        let updated = entry.and_then(|entry| entry.get("updatedAtMs")).and_then(Value::as_u64).unwrap_or(0);
-        let age = snapshot_now_ms().saturating_sub(updated);
-        let sessions = entry.and_then(|entry| entry.get("sessions")).and_then(Value::as_array).into_iter().flatten().map(|session| {
-            json!({
-                "directChildAttach":session.get("directChildAttach").and_then(Value::as_bool),
-                "quarantined":session.get("quarantined").and_then(Value::as_bool),
-                "plain":session.get("plain").and_then(Value::as_bool),
-                "admittedOriginCount":session.get("admittedOrigins").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
-                "pendingOriginCount":session.get("pendingOrigins").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
-                "ownsPage":session.get("target").and_then(Value::as_str) == Some(target.as_str()),
-            })
-        }).collect::<Vec<_>>();
-        eprintln!("webmcp-polyfill: {}", json!({"event":"list-snapshot","evidence":evidence,"updatedAtAgeMs":age,"fromOriginCount":from.len(),"sessions":sessions}));
-    }
     let result = crate::webmcp_frames::list(cdp, state, &target, &session, from);
     let native = result.as_ref().ok().map(|(_, native)| *native);
     let _ = browser::watch_detach(cdp, state, &target, &session);
     requested_origin((|| match result {
         Ok((tools, _)) => {
-            if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() == Some("1") {
-                let names = tools.as_array().into_iter().flatten().filter_map(|tool| tool.get("name").and_then(Value::as_str)).collect::<Vec<_>>();
-                let origins = tools.as_array().into_iter().flatten().filter_map(|tool| tool.get("origin").and_then(Value::as_str)).map(|origin| {
-                    if origin.is_empty() { "empty" } else if let Ok(url) = url::Url::parse(origin) {
-                        match url.scheme() { "chrome-extension" => "extension", "http" | "https" => "ordinary", _ => "other" }
-                    } else { "invalid" }
-                }).collect::<Vec<_>>();
-                eprintln!("webmcp-polyfill: {}", json!({"event":"list-result","native":native,"toolCount":names.len(),"names":names,"originClasses":origins,"unavailableHint":!from.is_empty() && native == Some(false) && !evidence}));
-            }
             let plain = state.webmcp.get(&target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection))
                 .and_then(|entry| entry.get("sessions")).and_then(Value::as_array)
                 .is_some_and(|sessions| sessions.iter().any(|session| session.get("target").and_then(Value::as_str) == Some(&target) && session.get("plain").and_then(Value::as_bool) == Some(true)));

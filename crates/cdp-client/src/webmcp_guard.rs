@@ -806,64 +806,6 @@ impl Cdp {
         eprintln!("webmcp-polyfill: {trace}");
     }
 
-    fn webmcp_trace_origin_class(&self, url: &str) -> &'static str {
-        if url.is_empty() { return "empty"; }
-        if self.guard.extension_frame(url) { return "extension"; }
-        if self.guard.url(url) { return "protected"; }
-        "ordinary"
-    }
-
-    fn webmcp_trace_url_fields(&self, url: &str) -> Value {
-        json!({
-            "scheme":Self::webmcp_trace_scheme(url),
-            "originClass":self.webmcp_trace_origin_class(url),
-        })
-    }
-
-    fn webmcp_trace_raw_event(&mut self, value: &Value) {
-        if !Self::webmcp_trace_enabled() { return; }
-        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-        let target_methods = matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget" | "Target.targetCreated" | "Target.targetDestroyed" | "Target.targetInfoChanged");
-        let root_lifecycle = matches!(method, "Page.frameNavigated" | "Runtime.executionContextsCleared" | "Runtime.executionContextCreated");
-        if !target_methods && !root_lifecycle { return; }
-        let delivered = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
-        let info = value.pointer("/params/targetInfo").or_else(|| value.get("params"));
-        let frame = value.pointer("/params/frame");
-        let url = info.and_then(|info| info.get("url")).or_else(|| frame.and_then(|frame| frame.get("url"))).and_then(Value::as_str).unwrap_or("");
-        self.webmcp.trace_sequence = self.webmcp.trace_sequence.saturating_add(1);
-        let mut trace = json!({
-            "event":"raw",
-            "method":method,
-            "sequence":self.webmcp.trace_sequence,
-            "ms":self.webmcp_trace_ms(),
-            "deliveredSessionId":delivered,
-            "sessionId":value.pointer("/params/sessionId").and_then(Value::as_str).unwrap_or(delivered),
-            "targetId":info.and_then(|info| info.get("targetId")).or_else(|| value.pointer("/params/targetId")).and_then(Value::as_str).unwrap_or(""),
-            "type":info.and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or(""),
-            "url":self.webmcp_trace_url_fields(url),
-            "parentFrameId":info.and_then(|info| info.get("parentFrameId")).or_else(|| frame.and_then(|frame| frame.get("parentId"))).and_then(Value::as_str).unwrap_or(""),
-            "waitingForDebugger":value.pointer("/params/waitingForDebugger").and_then(Value::as_bool),
-            "recorded":info.and_then(|info| info.get("targetId")).and_then(Value::as_str).is_some_and(|target| self.webmcp.recorded.contains_key(target)),
-            "holderArmed":self.webmcp.arms.contains_key(delivered),
-            "page":self.webmcp_trace_page(delivered),
-        });
-        if method == "Page.frameNavigated" || method == "Runtime.executionContextCreated" {
-            if let Some(frame) = frame {
-                trace["frameId"] = json!(frame.get("id").and_then(Value::as_str).unwrap_or(""));
-                trace["loaderId"] = json!(frame.get("loaderId").and_then(Value::as_str).unwrap_or(""));
-                let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("");
-                trace["securityOrigin"] = self.webmcp_trace_url_fields(origin);
-            }
-            if let Some(context) = value.pointer("/params/context") {
-                trace["contextId"] = json!(context.get("id").and_then(Value::as_i64).unwrap_or(0));
-                let origin = context.get("origin").and_then(Value::as_str).unwrap_or("");
-                trace["contextOrigin"] = self.webmcp_trace_url_fields(origin);
-                trace["contextFrameId"] = json!(context.pointer("/auxData/frameId").and_then(Value::as_str).unwrap_or(""));
-            }
-        }
-        eprintln!("webmcp-polyfill: {trace}");
-    }
-
     fn webmcp_frame_refusal(&self, frame: &Value) -> Option<&'static str> {
         let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
         if text("url").is_empty() { return Some("empty document URL"); }
@@ -1949,7 +1891,6 @@ impl Cdp {
     }
 
     pub(super) fn webmcp_event(&mut self, value: &Value) -> bool {
-        self.webmcp_trace_raw_event(value);
         self.webmcp_trace_event(value);
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");

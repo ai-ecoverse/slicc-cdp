@@ -24,30 +24,15 @@ function environment(cwd) {
     USERPROFILE: cwd,
     APPDATA: cwd,
     XDG_CONFIG_HOME: cwd,
-    SLICC_WEBMCP_TRACE: '1',
   };
   delete env.SLICC_CDP_URL;
   return env;
 }
 
-function holderTimeline(stderr) {
-  const rows = [];
-  for (const line of String(stderr).split('\n')) {
-    if (!line.includes('webmcp-polyfill:')) continue;
-    const json = line.slice(line.indexOf('{'));
-    try {
-      rows.push(JSON.parse(json));
-    } catch {
-      rows.push({ raw: line.trim() });
-    }
-  }
-  return rows;
-}
-
 function stream(endpoint, cwd, args) {
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
-    env: environment(cwd),
+    env: { ...environment(cwd), SLICC_WEBMCP_TRACE: '1' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let pending = '';
@@ -192,23 +177,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
-let ordinaryNavRun = 0;
-for (const protectedFrames of [
-  true,
-  false,
-  false,
-  false,
-  false,
-  false,
-  false,
-  false,
-  false,
-  false,
-  false,
-]) {
+for (const protectedFrames of [true, false]) {
   const title = protectedFrames
     ? 'Chrome: the WebMCP holder reports ordinary tool changes, recovers cross-origin frames after navigation and excludes protected frames'
-    : `Chrome: ordinary to ordinary navigation retains admitted cross-origin tool changes (temp ${++ordinaryNavRun}/10)`;
+    : 'Chrome: ordinary to ordinary navigation retains admitted cross-origin tool changes';
   await test(title, {
     timeout: 240000,
   }, async () => {
@@ -545,7 +517,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     } catch (error) {
       const stderr = held?.stderr() || '';
       throw new Error(
-        `${error.message}\nholder: ${stderr}\ntimeline: ${JSON.stringify(holderTimeline(stderr))}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        `${error.message}\nholder: ${stderr}\nwire: ${JSON.stringify(wire?.snapshot())}`,
         { cause: error }
       );
     } finally {
