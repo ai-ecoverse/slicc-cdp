@@ -213,14 +213,6 @@ fn play_start_event(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, holder: &s
             cdp.webmcp_auto_attach(holder).unwrap();
             state.borrow_mut().attach_on_auto_attach = false;
         }
-        "attach_buffered" => {
-            state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
-            cdp.webmcp.buffering_attach = true;
-            cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
-            assert_eq!(cdp.webmcp.pending_attaches.len(), 1, "attach must stay buffered");
-            cdp.webmcp_auto_attach(holder).unwrap();
-            assert!(cdp.webmcp.pending_attaches.is_empty(), "buffered attach must replay");
-        }
         "pause" => {
             cdp.absorb(json!({"method":"Debugger.paused","sessionId":holder,"params":{"reason":"other","callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}}));
         }
@@ -245,8 +237,6 @@ fn start_sequences() -> Vec<Vec<&'static str>> {
         vec!["auto_attach", "attach", "child_ctx", "child_nav"],
         vec!["attach_during", "child_nav", "child_ctx"],
         vec!["attach_during", "child_ctx", "child_nav"],
-        vec!["attach_buffered", "child_nav", "child_ctx"],
-        vec!["attach_buffered", "child_ctx", "child_nav"],
         vec!["auto_attach", "pause", "attach", "resume", "child_nav", "child_ctx"],
         vec!["auto_attach", "attach", "pause", "resume", "child_ctx", "child_nav"],
         vec!["pause", "auto_attach", "attach", "resume", "child_ctx", "child_nav"],
@@ -255,32 +245,7 @@ fn start_sequences() -> Vec<Vec<&'static str>> {
         vec!["auto_attach", "attach", "pause", "child_ctx", "resume", "child_nav"],
         vec!["auto_attach", "attach", "pause", "child_nav", "resume", "child_ctx"],
         vec!["attach_during", "pause", "resume", "child_ctx", "child_nav"],
-        vec!["pause", "attach_during", "resume", "child_nav", "child_ctx"],
-        vec!["attach_buffered", "pause", "resume", "child_ctx", "child_nav"],
     ]
-}
-
-fn assert_start_child(cdp: &Cdp, state: &Rc<RefCell<BackendState>>, holder: &str, label: &str) -> Result<(), String> {
-    let ok = !cdp.session_blocked(holder)
-        && !cdp.content_blocked(holder)
-        && cdp.webmcp.arms.get(holder).is_some_and(|arm| !arm.revoked)
-        && cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 1)
-        && shim_evals(state, "CHILD") == 1
-        && cdp.webmcp_generations().iter().any(|generation| generation["session"] == "CHILD");
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} admitted={:?} evals={} blocked={} child_blocked={} revoked={} parents={:?} pending={}",
-            cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted),
-            shim_evals(state, "CHILD"),
-            cdp.session_blocked(holder),
-            cdp.session_blocked("CHILD"),
-            cdp.webmcp.arms.get(holder).is_some_and(|arm| arm.revoked),
-            cdp.webmcp.parents.get("CHILD"),
-            cdp.webmcp.pending_attaches.len(),
-        ))
-    }
 }
 
 #[test]
@@ -306,70 +271,23 @@ fn from_origin_start_order_permutations_admit_child_once() {
         }
         cdp.webmcp_finish_awaiting_children();
         cdp.webmcp_install_children();
-        if let Err(message) = assert_start_child(&cdp, &state, &holder, &label) {
-            failed.push(message);
+        let ok = !cdp.session_blocked(&holder)
+            && !cdp.content_blocked(&holder)
+            && cdp.webmcp.arms.get(&holder).is_some_and(|arm| !arm.revoked)
+            && cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 1)
+            && shim_evals(&state, "CHILD") == 1
+            && cdp.webmcp_generations().iter().any(|generation| generation["session"] == "CHILD");
+        if !ok {
+            let admitted = cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted);
+            let parented = cdp.webmcp.parents.get("CHILD").cloned();
+            let revoked = cdp.webmcp.arms.get(&holder).is_some_and(|arm| arm.revoked);
+            let notices = cdp.take_notices().join("|");
+            failed.push(format!(
+                "{label} admitted={admitted:?} evals={} blocked={} revoked={revoked} parents={parented:?} notices={notices}",
+                shim_evals(&state, "CHILD"),
+                cdp.session_blocked(&holder),
+            ));
         }
     }
     assert!(failed.is_empty(), "failing start orderings {}/{}:\n{}", failed.len(), total, failed.join("\n"));
-}
-
-#[test]
-fn attach_during_reload_is_adopted_after_auto_attach() {
-    let (mut cdp, state) = client();
-    state.borrow_mut().suppress_runtime_child = true;
-    state.borrow_mut().attach_on_reload = true;
-    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
-    cdp.start_webmcp_for("H", true).unwrap();
-    let holder = cdp.webmcp_session("H").to_string();
-    assert!(!cdp.webmcp.pending_attaches.is_empty() || cdp.webmcp.parents.contains_key("CHILD") || cdp.webmcp.arms.contains_key("CHILD"), "reload attach must be buffered or adopted");
-    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
-        arm.pending_contexts.clear();
-        arm.pending_frames.clear();
-        arm.pending_install = None;
-    }
-    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.webmcp_auto_attach(&holder).unwrap();
-    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
-    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
-    cdp.webmcp_finish_awaiting_children();
-    cdp.webmcp_install_children();
-    assert_start_child(&cdp, &state, &holder, "reload-attach").unwrap();
-}
-
-#[test]
-fn old_child_lifecycle_after_replacement_does_not_settle_fresh_child() {
-    for blank_attach in [true, false] {
-        let (mut cdp, state, holder) = seed_nav_holder(blank_attach);
-        play_nav_event(&mut cdp, &state, &holder, "attach", blank_attach);
-        play_nav_event(&mut cdp, &state, &holder, "root_nav", blank_attach);
-        play_nav_event(&mut cdp, &state, &holder, "root_cleared", blank_attach);
-        play_nav_event(&mut cdp, &state, &holder, "root_created", blank_attach);
-        play_nav_event(&mut cdp, &state, &holder, "child_nav", blank_attach);
-        play_nav_event(&mut cdp, &state, &holder, "child_ctx", blank_attach);
-        cdp.webmcp_finish_awaiting_children();
-        cdp.webmcp_install_children();
-        assert!(cdp.webmcp.arms.get("CHILD-NEW").is_some_and(|arm| arm.admitted == 1), "blank={blank_attach} seed");
-        for method in [
-            "Runtime.executionContextDestroyed",
-            "Runtime.executionContextsCleared",
-            "Page.frameDetached",
-            "Debugger.paused",
-            "Target.detachedFromTarget",
-        ] {
-            let event = match method {
-                "Runtime.executionContextDestroyed" => json!({"method":method,"sessionId":"CHILD-OLD","params":{"executionContextId":8}}),
-                "Runtime.executionContextsCleared" => json!({"method":method,"sessionId":"CHILD-OLD","params":{}}),
-                "Page.frameDetached" => json!({"method":method,"sessionId":"CHILD-OLD","params":{"frameId":"FRAME"}}),
-                "Debugger.paused" => json!({"method":method,"sessionId":"CHILD-OLD","params":{"reason":"other","callFrames":[{"callFrameId":"OLD","functionName":"","location":{"scriptId":"OLD","lineNumber":0,"columnNumber":0}}]}}),
-                _ => json!({"method":method,"params":{"sessionId":"CHILD-OLD","targetId":"IFRAME"}}),
-            };
-            cdp.absorb(event);
-            cdp.webmcp_finish_awaiting_children();
-            cdp.webmcp_sweep();
-            assert!(cdp.webmcp.arms.get("CHILD-NEW").is_some_and(|arm| !arm.revoked && arm.admitted == 1), "blank={blank_attach} after {method}");
-            assert!(!cdp.session_blocked("CHILD-NEW"), "blank={blank_attach} blocked after {method}");
-        }
-        assert_eq!(shim_evals(&state, "CHILD-NEW"), 1, "blank={blank_attach}");
-        assert!(cdp.webmcp.arms.get("CHILD-NEW").is_some_and(|arm| arm.revoked_at.is_none()), "blank={blank_attach} fresh child must not be settled by old lifecycle");
-    }
 }

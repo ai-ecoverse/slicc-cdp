@@ -17,22 +17,13 @@ const binary = path.join(
   process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
 );
 
-function childTraceTimeline(stderr) {
+function holderTimeline(stderr) {
   const rows = [];
   for (const line of String(stderr).split('\n')) {
     if (!line.includes('webmcp-polyfill:')) continue;
     const json = line.slice(line.indexOf('{'));
     try {
-      const value = JSON.parse(json);
-      rows.push({
-        sequence: value.sequence,
-        event: value.event,
-        reason: value.reason,
-        sessionRole: value.sessionRole,
-        frameRole: value.frameRole,
-        revoked: value.revoked,
-        pendingInstall: value.pendingInstall,
-      });
+      rows.push(JSON.parse(json));
     } catch {
       rows.push({ raw: line.trim() });
     }
@@ -481,7 +472,7 @@ ${childScript}
     } catch (error) {
       const stderr = holder?.stderr?.() || conversionHolder?.stderr?.() || '';
       throw new Error(
-        `${error.message}\nholder: ${stderr}\nchild-trace: ${JSON.stringify(childTraceTimeline(stderr))}`,
+        `${error.message}\nholder: ${stderr}\ntimeline: ${JSON.stringify(holderTimeline(stderr))}`,
         { cause: error }
       );
     } finally {

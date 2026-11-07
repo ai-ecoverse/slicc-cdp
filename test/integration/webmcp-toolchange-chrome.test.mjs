@@ -30,24 +30,13 @@ function environment(cwd) {
   return env;
 }
 
-function childTraceTimeline(stderr, sinceMs = 0) {
+function holderTimeline(stderr) {
   const rows = [];
   for (const line of String(stderr).split('\n')) {
     if (!line.includes('webmcp-polyfill:')) continue;
     const json = line.slice(line.indexOf('{'));
     try {
-      const value = JSON.parse(json);
-      if (value.sessionRole === 'child' || value.frameRole === 'OOPIF' || value.event) {
-        rows.push({
-          sequence: value.sequence,
-          event: value.event,
-          reason: value.reason,
-          ms: sinceMs,
-          page: value.page,
-          revoked: value.revoked,
-          pendingInstall: value.pendingInstall,
-        });
-      }
+      rows.push(JSON.parse(json));
     } catch {
       rows.push({ raw: line.trim() });
     }
@@ -538,7 +527,7 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
     } catch (error) {
       const stderr = held?.stderr() || '';
       throw new Error(
-        `${error.message}\nholder: ${stderr}\nchild-trace: ${JSON.stringify(childTraceTimeline(stderr))}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        `${error.message}\nholder: ${stderr}\ntimeline: ${JSON.stringify(holderTimeline(stderr))}\nwire: ${JSON.stringify(wire?.snapshot())}`,
         { cause: error }
       );
     } finally {

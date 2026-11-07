@@ -24,7 +24,6 @@ struct BackendState {
     child_loader_race: bool,
     runtime_child: Option<Value>,
     attach_on_auto_attach: bool,
-    attach_on_reload: bool,
     buffer_child_lifecycle_on_auto_attach: bool,
     refuse_auto_attach: bool,
     route: Option<String>,
@@ -134,7 +133,7 @@ impl Transport for Backend {
                     return Ok(());
                 }
                 let session = command["sessionId"].as_str().unwrap_or("");
-                if session != "H" && session != "G" && !session.is_empty() {
+                if session.starts_with("CHILD") {
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
                     state.tree.clone()
@@ -174,16 +173,12 @@ impl Transport for Backend {
                 json!({"breakpointId":"INSTRUMENT"})
             }
             "Page.reload" => {
-                let session = command["sessionId"].as_str().unwrap_or("H");
                 if state.pause {
+                    let session = command["sessionId"].as_str().unwrap_or("H");
                     state.inbox.push_back(event_on(session, "Debugger.scriptParsed", json!({"scriptId":"SCRIPT","executionContextId":7})).to_string());
                     let mut pause = event_on(session, "Debugger.paused", json!({"reason":"other","callFrames":[{"callFrameId":"CALL","functionName":"","location":{"scriptId":"SCRIPT","lineNumber":0,"columnNumber":0}}]}));
                     if state.unconverted { pause["params"]["reason"] = json!("instrumentation"); }
                     state.inbox.push_back(pause.to_string());
-                }
-                if state.attach_on_reload {
-                    let frame = state.oopif_tree.as_ref().map(|tree| tree["frameTree"]["frame"].clone()).unwrap_or_else(|| json!({"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}));
-                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":session,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":frame["url"].as_str().unwrap_or("https://foreign.test/cross"),"parentFrameId":"F"},"waitingForDebugger":false}}).to_string());
                 }
                 json!({})
             }
@@ -1024,11 +1019,10 @@ fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
     assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"));
 
     let (mut cdp, state) = client();
-    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"EARLY","url":"https://foreign.test/","securityOrigin":"https://foreign.test","loaderId":"EARLY"}}}));
     cdp.start_webmcp_for("H", true).unwrap();
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp.buffering_attach = true;
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"EARLY","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":true}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"EARLY","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
     assert_eq!(cdp.webmcp.pending_attaches.len(), 1);
     assert!(!cdp.session_blocked("EARLY"));
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
