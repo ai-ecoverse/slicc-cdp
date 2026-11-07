@@ -201,6 +201,17 @@ fn unavailable(command: &str) -> Output {
     }
 }
 
+fn list_field(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    sanitize::browser_message(&out)
+}
+
 fn format_list(tools: &Value) -> String {
     let arr = match tools.as_array() {
         Some(arr) if arr.is_empty() => return "No WebMCP tools on this page\n".to_string(),
@@ -209,8 +220,8 @@ fn format_list(tools: &Value) -> String {
     };
     let mut lines = Vec::new();
     for tool in arr {
-        let name = sanitize::browser_message(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
-        let desc = sanitize::browser_message(
+        let name = list_field(tool.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+        let desc = list_field(
             tool.get("description")
                 .and_then(|v| v.as_str())
                 .or_else(|| tool.get("title").and_then(|v| v.as_str()))
@@ -868,6 +879,17 @@ mod tests {
     #[test]
     fn format_list_empty() {
         assert_eq!(format_list(&json!([])), "No WebMCP tools on this page\n");
+    }
+
+    #[test]
+    fn list_field_strips_newline_tab_and_controls() {
+        assert_eq!(list_field("a\nb\tc\rd"), sanitize::browser_message("a b c d"));
+        assert!(!list_field("line\nbreak").contains('\n'));
+        assert!(!list_field("a\tb").contains('\t'));
+        let escaped = list_field("esc\x1b[2J");
+        assert!(escaped.contains("\\x1b"), "{escaped}");
+        assert!(!escaped.contains('\x1b'));
+        assert!(list_field("bel\x07").contains("\\x07"));
     }
 
     #[test]
