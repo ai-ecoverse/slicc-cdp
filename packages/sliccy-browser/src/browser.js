@@ -1,10 +1,11 @@
 import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { connect } from './connect.js';
+import { resolveCdpEndpoint } from './discover.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
 import { version } from './version.js';
 
-export { version };
+export { resolveCdpEndpoint, version };
 
 const LOAD_TIMEOUT_MS = 15000;
 const HELD_FRAMES = 100;
@@ -42,12 +43,19 @@ let idle;
 
 function openClient() {
   if (!opening) {
-    opening = connect().catch((error) => {
+    opening = openResolved().catch((error) => {
       opening = undefined;
       throw error;
     });
   }
   return opening;
+}
+
+async function openResolved() {
+  const explicit = process.env.SLICC_CDP_URL;
+  if (typeof explicit === 'string' && explicit.trim().length > 0) return connect();
+  const { url } = await resolveCdpEndpoint();
+  return connect({ url });
 }
 
 async function using(work) {
