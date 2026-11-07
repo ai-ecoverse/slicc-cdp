@@ -35,6 +35,20 @@ struct BackendState {
     get_target_parent: Option<String>,
     omit_get_target_parent: bool,
     suppress_runtime_child: bool,
+    iframe_targets: Option<Vec<Value>>,
+}
+
+impl BackendState {
+    fn listed_iframes(&self) -> Vec<Value> {
+        if let Some(targets) = &self.iframe_targets { return targets.clone(); }
+        let Some(tree) = &self.oopif_tree else { return Vec::new(); };
+        let url = tree["frameTree"]["frame"]["url"].as_str().filter(|url| url.starts_with("http")).unwrap_or("https://foreign.test/cross");
+        let mut info = json!({"targetId":"IFRAME","type":"iframe","url":url});
+        if !self.omit_get_target_parent {
+            info["parentFrameId"] = json!(self.get_target_parent.clone().unwrap_or_else(|| "F".into()));
+        }
+        vec![info]
+    }
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -125,7 +139,9 @@ impl Transport for Backend {
         let result = match method {
             "Target.getTargets" => {
                 let url = state.tree["frameTree"]["frame"]["url"].clone();
-                json!({"targetInfos":[{"targetId":"T","type":"page","url":url},{"targetId":"T2","type":"page","url":url}]})
+                let mut infos = vec![json!({"targetId":"T","type":"page","url":url}), json!({"targetId":"T2","type":"page","url":url})];
+                if command["params"].get("filter").is_none() { infos.extend(state.listed_iframes()); }
+                json!({"targetInfos":infos})
             }
             "Page.getFrameTree" => {
                 if state.fail_tree && state.installed {
@@ -133,7 +149,7 @@ impl Transport for Backend {
                     return Ok(());
                 }
                 let session = command["sessionId"].as_str().unwrap_or("");
-                if session.starts_with("CHILD") {
+                if session.starts_with("CHILD") || session == "TOUCH-IFRAME" {
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
                     state.tree.clone()
@@ -145,7 +161,7 @@ impl Transport for Backend {
             }
             "Runtime.enable" => {
                 let session = command["sessionId"].as_str().unwrap_or("H");
-                if session == "CHILD" || session == "CHILD-NEW" || session == "CHILD-OLD" {
+                if session == "CHILD" || session == "CHILD-NEW" || session == "CHILD-OLD" || session == "TOUCH-IFRAME" {
                     if !state.suppress_runtime_child {
                         if let Some(child) = state.runtime_child.clone().or_else(|| {
                             state.oopif_tree.as_ref().map(|tree| {
@@ -1011,31 +1027,22 @@ fn pending_child_cap_drops_the_1025th_cross_origin_candidate() {
 
 #[test]
 fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
-    let (mut premature, state) = client();
-    premature.start_webmcp_for("H", true).unwrap();
-    let before = state.borrow().sent.len();
-    premature.absorb(json!({"method":"Target.attachedToTarget","sessionId":"H","params":{"sessionId":"EARLY","targetInfo":{"targetId":"EARLY","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
-    assert!(premature.session_blocked("EARLY"));
-    assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "EARLY"));
-
     let (mut cdp, state) = client();
     cdp.start_webmcp_for("H", true).unwrap();
     let holder = cdp.webmcp_session("H").to_string();
-    cdp.webmcp.buffering_attach = true;
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"EARLY","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
-    assert_eq!(cdp.webmcp.pending_attaches.len(), 1);
+    let before = state.borrow().sent.len();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
     assert!(!cdp.session_blocked("EARLY"));
+    assert!(!cdp.webmcp.parents.contains_key("EARLY") && !cdp.webmcp.arms.contains_key("EARLY"), "no adoption before setAutoAttach succeeds");
+    assert!(!state.borrow().sent[before..].iter().any(|command| matches!(command["method"].as_str(), Some("Target.attachToTarget" | "Target.getTargets"))));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     let before = state.borrow().sent.len();
     cdp.webmcp_auto_attach("H").unwrap();
     assert!(cdp.webmcp.arms[&holder].direct_child_attach);
-    assert!(cdp.webmcp.pending_attaches.is_empty());
     assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"));
-    assert!(
-        cdp.webmcp.parents.contains_key("EARLY") || cdp.webmcp.arms.contains_key("EARLY"),
-        "buffered attach must be adopted after setAutoAttach succeeds; a merely blocked child is not enough"
-    );
-    assert!(!cdp.session_blocked("EARLY") || cdp.webmcp.parents.contains_key("EARLY") || cdp.webmcp.arms.contains_key("EARLY"));
+    assert!(cdp.webmcp.parents.contains_key("EARLY"), "a recorded attach is adopted by reconcile after setAutoAttach succeeds");
+    assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.attachToTarget"));
 }
 
 #[test]

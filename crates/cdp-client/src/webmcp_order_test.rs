@@ -291,3 +291,95 @@ fn from_origin_start_order_permutations_admit_child_once() {
     }
     assert!(failed.is_empty(), "failing start orderings {}/{}:\n{}", failed.len(), total, failed.join("\n"));
 }
+
+fn cross_tree() -> Value {
+    json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}})
+}
+
+fn reconcile_holder(cdp: &mut Cdp) -> String {
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    if let Some(arm) = cdp.webmcp.arms.get_mut(&holder) {
+        arm.pending_contexts.clear();
+        arm.pending_frames.clear();
+        arm.pending_install = None;
+    }
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    holder
+}
+
+fn child_attach(holder: &str, session: &str) -> Value {
+    json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":session,"targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}})
+}
+
+#[test]
+fn reconcile_adopts_a_child_whose_attach_was_recorded_before_the_root_arm_existed() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.absorb(child_attach("H", "CHILD"));
+    assert!(!cdp.webmcp.parents.contains_key("CHILD"));
+    let holder = reconcile_holder(&mut cdp);
+    assert!(!cdp.webmcp.parents.contains_key("CHILD"), "recording alone never adopts");
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_install_children();
+    assert_eq!(cdp.webmcp.parents.get("CHILD").map(String::as_str), Some(holder.as_str()));
+    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(1));
+    assert_eq!(shim_evals(&state, "CHILD"), 1);
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME"));
+    assert!(cdp.webmcp_generations().iter().any(|generation| generation["session"] == "CHILD"));
+}
+
+#[test]
+fn reconcile_adopts_a_child_whose_attach_never_arrived() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.webmcp.attach_grace = Some(Duration::ZERO);
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_install_children();
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME" && command["params"]["flatten"] == true));
+    assert_eq!(cdp.webmcp.parents.get("TOUCH-IFRAME").map(String::as_str), Some(holder.as_str()));
+    assert_eq!(cdp.webmcp.arms.get("TOUCH-IFRAME").map(|arm| arm.admitted), Some(1));
+    assert_eq!(shim_evals(&state, "TOUCH-IFRAME"), 1);
+    cdp.webmcp_reconcile();
+    cdp.webmcp_reconcile();
+    assert_eq!(state.borrow().sent.iter().filter(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME").count(), 1, "adopt once per target and root loader");
+    assert_eq!(shim_evals(&state, "TOUCH-IFRAME"), 1);
+}
+
+#[test]
+fn reconcile_refuses_a_wrong_parent_frame_even_when_the_child_tree_reports_the_root_frame() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().iframe_targets = Some(vec![json!({"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"OTHER"})]);
+    cdp.webmcp.attach_grace = Some(Duration::ZERO);
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(child_attach(&holder, "CHILD"));
+    cdp.webmcp_install_children();
+    assert!(!cdp.webmcp.parents.contains_key("CHILD") && !cdp.webmcp.arms.contains_key("CHILD"));
+    assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && matches!(command["method"].as_str(), Some("Runtime.enable" | "Runtime.evaluate" | "Page.enable"))));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "IFRAME"));
+    assert!(cdp.webmcp.arms.get(&holder).is_some_and(|arm| !arm.revoked));
+}
+
+#[test]
+fn reconcile_skips_a_protected_sibling_without_protecting_the_foreign_child() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    state.borrow_mut().iframe_targets = Some(vec![
+        json!({"targetId":"SEVEN","type":"iframe","url":"https://seven.sliccy.ai/","parentFrameId":"F"}),
+        json!({"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"}),
+    ]);
+    cdp.webmcp.attach_grace = Some(Duration::ZERO);
+    let holder = reconcile_holder(&mut cdp);
+    cdp.absorb(child_attach(&holder, "CHILD"));
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_install_children();
+    assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Target.attachToTarget" && command["params"]["targetId"] == "SEVEN"));
+    assert!(!cdp.protected_targets.contains("IFRAME"));
+    assert!(!cdp.protected_targets.contains("SEVEN"), "listing never protects");
+    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(1));
+    assert_eq!(shim_evals(&state, "CHILD"), 1);
+    assert!(cdp.webmcp.arms.get(&holder).is_some_and(|arm| !arm.revoked));
+}

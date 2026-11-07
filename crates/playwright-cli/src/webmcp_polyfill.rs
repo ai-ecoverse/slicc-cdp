@@ -105,6 +105,7 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
     let mut saved = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
     let mut readiness = Readiness { seen: cdp.events().len(), waiting: false };
     let mut heartbeat = Instant::now();
+    let mut reconciled = Instant::now();
     loop {
         match input() {
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -117,6 +118,10 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         let pumped = cdp.pump(Instant::now() + Duration::from_millis(50));
         cdp.webmcp_trace_result(session, "event pump", pumped)?;
         apply_requested_origins(cdp, state, target);
+        if reconciled.elapsed() >= Duration::from_millis(250) && cdp.webmcp_reconcile_due() {
+            cdp.webmcp_reconcile();
+            reconciled = Instant::now();
+        }
         cdp.webmcp_install_children();
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();

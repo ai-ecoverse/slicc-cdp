@@ -1,4 +1,5 @@
 use super::{transport_error, Cdp, DOCUMENT_CHECK, OPTIONAL_STEP};
+use crate::protected::Opener;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -73,6 +74,15 @@ struct Arm {
 }
 
 const PENDING_INSTALL_RESTART_CAP: u8 = 8;
+const RECORDED_CAP: usize = 4096;
+const ATTACH_GRACE: Duration = Duration::from_millis(500);
+
+#[derive(Clone)]
+struct Recorded {
+    session: String,
+    waiting: bool,
+    info: Value,
+}
 
 #[derive(Clone, PartialEq)]
 struct Context {
@@ -105,8 +115,13 @@ pub(super) struct Webmcp {
     samples: Vec<u128>,
     requested_origins: BTreeSet<String>,
     route_attested: bool,
-    buffering_attach: bool,
-    pending_attaches: VecDeque<Value>,
+    recorded: BTreeMap<(String, String), Recorded>,
+    adopted: BTreeMap<(String, String), (String, String)>,
+    unrecorded: BTreeMap<(String, String), Instant>,
+    auto_attach_tried: BTreeSet<String>,
+    reconcile_dirty: BTreeSet<String>,
+    reconciling: bool,
+    attach_grace: Option<Duration>,
     holder_started: Option<Instant>,
     trace_sequence: u64,
     trace_lifecycle: BTreeMap<(String, &'static str), u64>,
@@ -175,6 +190,11 @@ impl Webmcp {
         self.quarantined.remove(session);
         self.parents.retain(|child, parent| child != session && parent != session);
         self.children.retain(|(_, owner, _)| owner != session);
+        self.recorded.retain(|(owner, _), recorded| owner != session && recorded.session != session);
+        self.adopted.retain(|_, (holder, _)| holder != session);
+        self.unrecorded.retain(|(holder, _), _| holder != session);
+        self.auto_attach_tried.remove(session);
+        self.reconcile_dirty.remove(session);
     }
 }
 
@@ -302,34 +322,20 @@ impl Cdp {
         if !self.webmcp_alive(&session) { return Err(self.refusal()); }
         if self.webmcp_route_attested() {
             if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = false; }
+            self.webmcp.auto_attach_tried.insert(session.clone());
+            self.webmcp_release_recorded(&session);
             return Ok(());
         }
         if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = true; }
-        self.webmcp.buffering_attach = true;
         let result = self.raw_call("Target.setAutoAttach", json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(&session), OPTIONAL_STEP);
-        self.webmcp.buffering_attach = false;
-        let pending = std::mem::take(&mut self.webmcp.pending_attaches);
-        match result {
-            Ok(_) => {
-                let attested = self.webmcp.route_attested;
-                if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = !attested; }
-                for event in pending {
-                    if attested {
-                        if let Some(child) = event.pointer("/params/sessionId").and_then(Value::as_str) { self.webmcp_release_child(child); }
-                    } else {
-                        self.webmcp_adopt_child(&event);
-                    }
-                }
-            }
-            Err(_) => {
-                if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = false; }
-                for event in pending {
-                    if let Some(child) = event.pointer("/params/sessionId").and_then(Value::as_str) {
-                        self.webmcp_release_child(child);
-                    }
-                }
-            }
+        self.webmcp.auto_attach_tried.insert(session.clone());
+        let direct = result.is_ok() && !self.webmcp.route_attested;
+        if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = direct; }
+        if !direct {
+            self.webmcp_release_recorded(&session);
+            return Ok(());
         }
+        self.webmcp_reconcile_children(&session);
         Ok(())
     }
 
@@ -368,7 +374,10 @@ impl Cdp {
         self.webmcp.route_attested = true;
         let holders = self.webmcp.arms.iter().filter(|(_, arm)| arm.direct_child_attach).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for arm in self.webmcp.arms.values_mut() { arm.direct_child_attach = false; }
-        for holder in holders { self.webmcp_detach_children(&holder); }
+        for holder in holders {
+            self.webmcp_detach_children(&holder);
+            self.webmcp_release_recorded(&holder);
+        }
     }
 
     pub fn webmcp_request_origins(&mut self, origins: &[String]) {
@@ -513,7 +522,7 @@ impl Cdp {
                 }
             }
         }
-        self.notices.push(format!("webmcp-polyfill: {notice}\n"));
+        if !notice.is_empty() { self.notices.push(format!("webmcp-polyfill: {notice}\n")); }
         self.webmcp_revoke(child);
         let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
         self.blocked.insert(child.to_string());
@@ -536,6 +545,11 @@ impl Cdp {
             let _ = self.raw_call("Debugger.disable", json!({}), Some(session), DOCUMENT_CHECK);
         }
         self.webmcp.arms.remove(session);
+        self.webmcp.recorded.retain(|(owner, _), _| owner != session);
+        self.webmcp.adopted.retain(|_, (holder, _)| holder != session);
+        self.webmcp.unrecorded.retain(|(holder, _), _| holder != session);
+        self.webmcp.auto_attach_tried.remove(session);
+        self.webmcp.reconcile_dirty.remove(session);
         if attached {
             let _ = self.call_for("Target.detachFromTarget", json!({"sessionId":session}), None, DOCUMENT_CHECK);
             self.webmcp.holders.retain(|_, holder| holder != session);
@@ -814,7 +828,7 @@ impl Cdp {
             "url":info.and_then(|info| info.get("url")).or_else(|| frame.and_then(|frame| frame.get("url"))).and_then(Value::as_str).unwrap_or(""),
             "parentFrameId":info.and_then(|info| info.get("parentFrameId")).or_else(|| frame.and_then(|frame| frame.get("parentId"))).and_then(Value::as_str).unwrap_or(""),
             "waitingForDebugger":value.pointer("/params/waitingForDebugger").and_then(Value::as_bool),
-            "bufferingAttach":self.webmcp.buffering_attach,
+            "recorded":self.webmcp.recorded.contains_key(&(delivered.to_string(), info.and_then(|info| info.get("targetId")).and_then(Value::as_str).unwrap_or("").to_string())),
             "holderArmed":self.webmcp.arms.contains_key(delivered),
             "page":self.webmcp_trace_page(delivered),
         });
@@ -1067,7 +1081,8 @@ impl Cdp {
     }
 
     pub fn webmcp_install_children(&mut self) {
-        if self.webmcp.handling_gate || self.webmcp.handling_children { return; }
+        self.webmcp_reconcile_pending();
+        if self.webmcp.handling_gate || self.webmcp.handling_children || self.webmcp.reconciling { return; }
         self.webmcp.handling_children = true;
         let sessions = self.webmcp.arms.keys().cloned().collect::<Vec<_>>();
         for session in sessions {
@@ -1292,21 +1307,6 @@ impl Cdp {
         self.webmcp_record_document_policy(child, &bound_frame, &bound_loader, &bound_origin, policy, "fetched");
     }
 
-    fn webmcp_parent_frame_id(&mut self, target: &str, until: Instant) -> Result<String, String> {
-        if let Some(frame) = self.targets.get(target).and_then(|info| info.get("parentFrameId")).and_then(Value::as_str).filter(|frame| !frame.is_empty()) {
-            return Ok(frame.to_string());
-        }
-        let left = until.saturating_duration_since(Instant::now()).min(OPTIONAL_STEP);
-        let info = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, left)?;
-        let frame = info.pointer("/targetInfo/parentFrameId").and_then(Value::as_str).filter(|frame| !frame.is_empty()).ok_or_else(|| self.refusal())?.to_string();
-        if let Some(Value::Object(stored)) = self.targets.get_mut(target) {
-            stored.insert("parentFrameId".into(), json!(frame.clone()));
-        } else if let Some(target_info) = info.get("targetInfo").cloned() {
-            self.targets.insert(target.to_string(), target_info);
-        }
-        Ok(frame)
-    }
-
     fn webmcp_parked_child(&self, session: &str) -> bool {
         self.webmcp.parents.contains_key(session)
             && self.webmcp.quarantined.contains(session)
@@ -1373,7 +1373,7 @@ impl Cdp {
         let target = self.session_target(child).ok_or_else(|| self.refusal())?;
         let tree = self.webmcp_stable(child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(child), left.min(OPTIONAL_STEP)))?;
         if !self.webmcp_tree_verified(&tree, None) {
-            self.webmcp_progress_pend(child, "", true);
+            self.webmcp_progress_pend(child, "", false);
             return Ok(false);
         }
         self.main_commit(child, &tree["frameTree"]["frame"]);
@@ -1382,7 +1382,7 @@ impl Cdp {
         let loader = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
         let url = frame.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         if origin.is_empty() || origin == "null" || loader.is_empty() {
-            self.webmcp_progress_pend(child, &loader, true);
+            self.webmcp_progress_pend(child, &loader, false);
             return Ok(false);
         }
         self.webmcp_remember_child_origin(child, &origin);
@@ -1398,9 +1398,9 @@ impl Cdp {
             }
             return Ok(false);
         }
-        self.webmcp_progress_pend(child, &loader, true);
+        self.webmcp_progress_pend(child, &loader, false);
         let Ok(parent_root) = self.webmcp_root_document(parent, until) else {
-            self.webmcp_progress_pend(child, &loader, true);
+            self.webmcp_progress_pend(child, &loader, false);
             return Ok(false);
         };
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1416,7 +1416,7 @@ impl Cdp {
         let chosen = matched.iter().find(|(_, context)| accepted(context)).cloned()
             .or_else(|| matched.iter().filter(|(_, context)| last_accepted.is_none_or(|last| context.generation > last)).max_by_key(|(_, context)| context.generation).cloned());
         let Some((id, mut context)) = chosen else {
-            self.webmcp_progress_pend(child, &loader, true);
+            self.webmcp_progress_pend(child, &loader, false);
             return Ok(false);
         };
         context.loader = loader.clone();
@@ -1434,7 +1434,7 @@ impl Cdp {
         let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
         if self.webmcp.arms.get(child).is_some_and(|arm| arm.accepted.contains(&realm)) {
             if self.webmcp_mark_admitted(child, id, &context, Instant::now()).is_err() {
-                self.webmcp_progress_pend(child, &loader, true);
+                self.webmcp_progress_pend(child, &loader, false);
                 return Ok(false);
             }
             return Ok(true);
@@ -1444,18 +1444,18 @@ impl Cdp {
         }
         if let Err(message) = self.webmcp_evaluate(child, id, &context, parent_root, until) {
             if Self::webmcp_foreign_refusal(&message) { return Err(message); }
-            self.webmcp_progress_pend(child, &loader, true);
+            self.webmcp_progress_pend(child, &loader, false);
             return Ok(false);
         }
         if self.webmcp_mark_admitted(child, id, &context, Instant::now()).is_err() {
-            self.webmcp_progress_pend(child, &loader, true);
+            self.webmcp_progress_pend(child, &loader, false);
             return Ok(false);
         }
         Ok(true)
     }
 
     fn webmcp_finish_awaiting_children(&mut self) {
-        if self.webmcp.handling_children || self.webmcp.handling_gate { return; }
+        if self.webmcp.handling_children || self.webmcp.handling_gate || self.webmcp.reconciling { return; }
         self.webmcp.handling_children = true;
         let waiting = self.webmcp.quarantined.iter().filter(|child| {
             self.webmcp.parents.contains_key(*child)
@@ -1479,64 +1479,246 @@ impl Cdp {
         self.webmcp.handling_children = false;
     }
 
-    fn webmcp_adopt_child(&mut self, value: &Value) {
-        if self.webmcp.buffering_attach {
-            self.webmcp.pending_attaches.push_back(value.clone());
-            return;
-        }
-        let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str).map(str::to_string) else { return; };
-        let parent = value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
-        let info = &value["params"]["targetInfo"];
-        let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
-        let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-        let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
-        let direct = self.webmcp.arms.get(&parent).is_some_and(|arm| arm.direct_child_attach);
-        if !direct || self.guard.extension_frame(&url) {
-            self.webmcp_release_child(&child);
-            return;
-        }
-        let provisional = url.is_empty() || url == "about:blank";
-        let protected = self.info_protected(info, &[]);
-        self.webmcp_trace_decision(
-            "info_protected",
-            &target,
-            &child,
-            if protected { "true" } else { "false" },
-        );
-        let allowed = info.get("type").and_then(Value::as_str) == Some("iframe") && !target.is_empty()
-            && (provisional || url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")))
-            && !self.guard.url(&url) && !protected && !self.content_blocked(&parent);
-        let prior = self.webmcp.parents.keys().filter(|session| {
-            *session != &child && self.session_targets.get(*session) == Some(&target)
-        }).cloned().collect::<Vec<_>>();
-        let had_prior = !prior.is_empty();
-        for old in prior {
-            self.webmcp_settle_child(&old, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
-            self.session_targets.remove(&old);
-            self.webmcp.parents.remove(&old);
-            self.webmcp.arms.remove(&old);
-            self.webmcp.quarantined.remove(&old);
-            if self.guards.get(&target).map(String::as_str) == Some(old.as_str()) {
-                self.guards.insert(target.clone(), child.clone());
+    fn webmcp_merge_target(&mut self, target: &str, info: &Value) {
+        if target.is_empty() { return; }
+        let entry = self.targets.entry(target.to_string()).or_insert_with(|| info.clone());
+        if let (Some(stored), Some(fresh)) = (entry.as_object_mut(), info.as_object()) {
+            for key in ["type", "url", "parentFrameId"] {
+                if let Some(value) = fresh.get(key) { stored.insert(key.into(), value.clone()); }
             }
         }
-        if waiting && had_prior {
-            self.webmcp_trace_decision("release", &target, &child, "waitingForDebugger re-attach after same-target prior");
-            let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
-            self.blocked.insert(child);
-            return;
+    }
+
+    fn webmcp_reconcile_eligible(&self, holder: &str) -> bool {
+        self.webmcp.auto_attach_tried.contains(holder)
+            && self.webmcp.arms.get(holder).is_some_and(|arm| arm.direct_child_attach && !arm.revoked)
+            && self.webmcp_alive(holder)
+    }
+
+    fn webmcp_live_child(&self, holder: &str, child: &str) -> bool {
+        self.webmcp.parents.get(child).map(String::as_str) == Some(holder)
+            && self.webmcp.arms.get(child).is_some_and(|arm| !arm.revoked)
+            && !self.blocked.contains(child)
+    }
+
+    fn webmcp_record_attach(&mut self, value: &Value) -> bool {
+        let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+        let info = &value["params"]["targetInfo"];
+        let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str).filter(|child| !child.is_empty()).map(str::to_string) else { return false; };
+        let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
+        let iframe = info.get("type").and_then(Value::as_str) == Some("iframe") && !target.is_empty();
+        let arm = !owner.is_empty() && self.webmcp.arms.contains_key(&owner);
+        let refused = self.webmcp.auto_attach_tried.contains(&owner) && self.webmcp.arms.get(&owner).is_some_and(|arm| !arm.direct_child_attach || arm.revoked);
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+        if arm && (!iframe || refused || self.guard.url(url) || self.guard.extension_frame(url)) {
+            self.webmcp_release_child(&child);
+            return true;
         }
-        self.session_targets.insert(child.clone(), target.clone());
-        self.webmcp.quarantined.insert(child.clone());
-        self.webmcp.parents.insert(child.clone(), parent.clone());
-        self.targets.insert(target.clone(), info.clone());
+        if !iframe { return false; }
+        let key = (owner.clone(), target.clone());
+        if self.webmcp.recorded.len() < RECORDED_CAP || self.webmcp.recorded.contains_key(&key) {
+            let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
+            self.webmcp.recorded.insert(key, Recorded { session: child.clone(), waiting, info: info.clone() });
+            self.webmcp_trace_decision("record", &target, &child, &owner);
+        } else if arm {
+            self.webmcp_release_child(&child);
+            return true;
+        }
+        let holders = self.webmcp.arms.keys().filter(|session| self.webmcp_reconcile_eligible(session)).cloned().collect::<Vec<_>>();
+        if !arm && (holders.is_empty() || self.info_protected(info, &[])) { return false; }
+        self.webmcp_merge_target(&target, info);
+        if arm { self.webmcp.reconcile_dirty.insert(owner); } else { self.webmcp.reconcile_dirty.extend(holders); }
+        self.webmcp_reconcile_pending();
+        true
+    }
+
+    fn webmcp_record_info(&mut self, value: &Value) {
+        let info = value.pointer("/params/targetInfo").cloned().unwrap_or(Value::Null);
+        let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
+        if target.is_empty() || info.get("type").and_then(Value::as_str) != Some("iframe") { return; }
+        let holders = self.webmcp.arms.keys().filter(|session| self.webmcp_reconcile_eligible(session)).cloned().collect::<Vec<_>>();
+        if holders.is_empty() { return; }
+        let known = self.targets.get(&target);
+        let changed = ["url", "parentFrameId"].iter().any(|key| known.and_then(|known| known.get(*key)) != info.get(*key));
+        if !changed { return; }
+        self.webmcp_merge_target(&target, &info);
+        self.webmcp.reconcile_dirty.extend(holders);
+        self.webmcp_reconcile_pending();
+    }
+
+    fn webmcp_release_recorded(&mut self, owner: &str) {
+        let doomed = self.webmcp.recorded.iter().filter(|((holder, _), recorded)| holder == owner && !self.webmcp.parents.contains_key(&recorded.session))
+            .map(|(key, recorded)| (key.clone(), recorded.session.clone())).collect::<Vec<_>>();
+        for (key, child) in doomed {
+            self.webmcp.recorded.remove(&key);
+            self.webmcp_release_child(&child);
+        }
+    }
+
+    pub fn webmcp_reconcile_children(&mut self, holder: &str) {
+        let holder = self.webmcp_session(holder).to_string();
+        self.webmcp.reconcile_dirty.insert(holder);
+        self.webmcp_reconcile_pending();
+    }
+
+    pub fn webmcp_reconcile(&mut self) {
+        let holders = self.webmcp.arms.keys().filter(|session| self.webmcp_reconcile_eligible(session)).cloned().collect::<Vec<_>>();
+        self.webmcp.reconcile_dirty.extend(holders);
+        self.webmcp_reconcile_pending();
+    }
+
+    pub fn webmcp_reconcile_due(&self) -> bool {
+        if !self.webmcp.arms.keys().any(|session| self.webmcp_reconcile_eligible(session)) { return false; }
+        self.webmcp.requested_origins.iter().any(|origin| !self.webmcp.parents.keys().any(|child| {
+            self.webmcp.arms.get(child).is_some_and(|arm| !arm.revoked && arm.admitted > 0) && self.webmcp_child_origin(child).as_deref() == Some(origin.as_str())
+        }))
+    }
+
+    fn webmcp_reconcile_pending(&mut self) {
+        if self.webmcp.reconciling || self.webmcp.handling_gate || self.webmcp.handling_children || self.webmcp.reconcile_dirty.is_empty() { return; }
+        self.webmcp.reconciling = true;
+        let mut rounds = 0;
+        while rounds < 16 {
+            let Some(holder) = self.webmcp.reconcile_dirty.pop_first() else { break; };
+            self.webmcp_reconcile_once(&holder);
+            rounds += 1;
+        }
+        self.webmcp.reconciling = false;
+        self.webmcp_finish_awaiting_children();
+    }
+
+    fn webmcp_reconcile_root(&self, holder: &str) -> Option<(String, String)> {
+        let arm = self.webmcp.arms.get(holder)?;
+        let target = self.session_target(holder)?;
+        let frame = arm.root_identity.as_ref().map(|(_, context)| context.frame.clone()).filter(|frame| !frame.is_empty())
+            .or_else(|| self.documents.get(&target).map(|document| document.frame_id.clone()).filter(|frame| !frame.is_empty()))?;
+        let loader = arm.loaders.get(&frame).cloned().filter(|loader| !loader.is_empty())
+            .or_else(|| arm.root_identity.as_ref().filter(|(_, context)| context.frame == frame).map(|(_, context)| context.loader.clone()).filter(|loader| !loader.is_empty()))?;
+        Some((frame, loader))
+    }
+
+    fn webmcp_refused_info(&self, target: &str, info: &Value) -> bool {
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+        self.guard.url(url) || self.guard.extension_frame(url) || self.is_protected_target(target) || self.info_protected(info, &[])
+    }
+
+    fn webmcp_reconcile_once(&mut self, holder: &str) {
+        if !self.webmcp_reconcile_eligible(holder) { return; }
+        let Ok(listed) = self.raw_call("Target.getTargets", json!({}), None, OPTIONAL_STEP) else { return; };
+        if !self.webmcp_reconcile_eligible(holder) { return; }
+        let Some((root_frame, root_loader)) = self.webmcp_reconcile_root(holder) else { return; };
+        let mut current = BTreeMap::new();
+        let mut misplaced = BTreeSet::new();
+        for info in listed.get("targetInfos").and_then(Value::as_array).into_iter().flatten() {
+            if info.get("type").and_then(Value::as_str) != Some("iframe") { continue; }
+            let Some(target) = info.get("targetId").and_then(Value::as_str).filter(|target| !target.is_empty()) else { continue; };
+            self.webmcp_merge_target(target, info);
+            if info.get("parentFrameId").and_then(Value::as_str) == Some(root_frame.as_str()) {
+                current.insert(target.to_string(), info.clone());
+            } else {
+                misplaced.insert(target.to_string());
+            }
+        }
+        let mine = self.webmcp.adopted.iter().filter(|(_, (owner, _))| owner == holder).map(|(key, (_, child))| (key.clone(), child.clone())).collect::<Vec<_>>();
+        for ((target, loader), child) in mine {
+            if loader == root_loader && current.contains_key(&target) { continue; }
+            self.webmcp.adopted.remove(&(target.clone(), loader.clone()));
+            let live = self.webmcp_live_child(holder, &child);
+            let rekey = (target.clone(), root_loader.clone());
+            if loader != root_loader && live && current.contains_key(&target) && !self.webmcp.adopted.contains_key(&rekey) {
+                self.webmcp_trace_decision("rekey", &target, &child, &root_loader);
+                self.webmcp.adopted.insert(rekey, (holder.to_string(), child));
+                continue;
+            }
+            let key = (holder.to_string(), target.clone());
+            if self.webmcp.recorded.get(&key).is_some_and(|recorded| recorded.session == child) { self.webmcp.recorded.remove(&key); }
+            if live { self.webmcp_retire_child(&target, &child); }
+        }
+        let now = Instant::now();
+        let grace = self.webmcp.attach_grace.unwrap_or(ATTACH_GRACE);
+        for (target, info) in current {
+            let key = (holder.to_string(), target.clone());
+            let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            if self.webmcp_refused_info(&target, &info) {
+                self.webmcp_trace_decision("skip", &target, "", "protected");
+                if let Some(recorded) = self.webmcp.recorded.get(&key).cloned().filter(|recorded| !self.webmcp.parents.contains_key(&recorded.session)) {
+                    self.webmcp.recorded.remove(&key);
+                    self.webmcp_release_child(&recorded.session);
+                }
+                continue;
+            }
+            if self.guard.target(&url, false, Opener::Unknown) {
+                self.webmcp_trace_decision("skip", &target, "", "inheriting");
+                continue;
+            }
+            let marker = self.webmcp.adopted.get(&(target.clone(), root_loader.clone())).map(|(_, child)| child.clone());
+            let live = marker.as_ref().is_some_and(|child| self.webmcp_live_child(holder, child));
+            let recorded = self.webmcp.recorded.get(&key).cloned();
+            let child = match (marker, recorded) {
+                (Some(adopted), Some(recorded)) if adopted == recorded.session => continue,
+                (Some(adopted), Some(recorded)) if recorded.waiting => {
+                    self.webmcp.recorded.remove(&key);
+                    self.webmcp_trace_decision("release", &target, &recorded.session, "waitingForDebugger re-attach after same-target adoption");
+                    if live { self.webmcp_retire_child(&target, &adopted); }
+                    self.webmcp_release_child(&recorded.session);
+                    continue;
+                }
+                (Some(adopted), Some(recorded)) => {
+                    if live { self.webmcp_retire_child(&target, &adopted); }
+                    recorded.session
+                }
+                (None, Some(recorded)) => recorded.session,
+                (Some(_), None) => continue,
+                (None, None) => {
+                    if self.webmcp.parents.iter().any(|(child, owner)| owner == holder && self.session_targets.get(child) == Some(&target) && self.webmcp_live_child(holder, child)) { continue; }
+                    let first = *self.webmcp.unrecorded.entry(key.clone()).or_insert(now);
+                    if now.duration_since(first) < grace { continue; }
+                    let Ok(attached) = self.raw_call("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None, OPTIONAL_STEP) else { continue; };
+                    let Some(session) = attached.get("sessionId").and_then(Value::as_str).filter(|session| !session.is_empty()).map(str::to_string) else { continue; };
+                    self.webmcp_trace_decision("attach", &target, &session, "getTargets without recorded attach");
+                    self.webmcp.recorded.insert(key.clone(), Recorded { session: session.clone(), waiting: false, info: info.clone() });
+                    session
+                }
+            };
+            self.webmcp.unrecorded.remove(&key);
+            if !self.webmcp_reconcile_eligible(holder) || self.webmcp_reconcile_root(holder).as_ref().map(|(_, loader)| loader) != Some(&root_loader) {
+                self.webmcp.reconcile_dirty.insert(holder.to_string());
+                return;
+            }
+            self.webmcp.adopted.insert((target.clone(), root_loader.clone()), (holder.to_string(), child.clone()));
+            self.webmcp_adopt(holder, &target, &child, &info);
+        }
+        let refused = self.webmcp.recorded.iter().filter(|((owner, target), recorded)| {
+            owner == holder && !self.webmcp.parents.contains_key(&recorded.session)
+                && (misplaced.contains(target) || self.webmcp_refused_info(target, &recorded.info))
+        }).map(|(key, recorded)| (key.clone(), recorded.session.clone())).collect::<Vec<_>>();
+        for ((_, target), child) in refused {
+            self.webmcp.recorded.remove(&(holder.to_string(), target.clone()));
+            self.webmcp_trace_decision("release", &target, &child, "refused recorded attach");
+            self.webmcp_release_child(&child);
+        }
+    }
+
+    fn webmcp_retire_child(&mut self, target: &str, child: &str) {
+        self.webmcp_trace_decision("retire", target, child, "");
+        self.webmcp_settle_child(child, "");
+        self.session_targets.remove(child);
+        self.guards.retain(|_, guard| guard != child);
+        self.webmcp.forget(child);
+    }
+
+    fn webmcp_adopt(&mut self, holder: &str, target: &str, child: &str, info: &Value) {
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+        self.webmcp_trace_decision("adopt", target, child, holder);
+        self.session_targets.insert(child.to_string(), target.to_string());
+        self.webmcp.quarantined.insert(child.to_string());
+        self.webmcp.parents.insert(child.to_string(), holder.to_string());
         let outcome = (|| -> Result<(), String> {
-            if !allowed { return Err(self.refusal()); }
-            self.guards.insert(target.clone(), child.clone());
-            if self.is_protected_target(&target) { return Err(self.refusal()); }
+            if !url::Url::parse(&url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) { return Err(self.refusal()); }
+            if !self.guards.contains_key(target) { self.guards.insert(target.to_string(), child.to_string()); }
+            if self.is_protected_target(target) { return Err(self.refusal()); }
             let until = Instant::now() + DOCUMENT_CHECK;
-            self.webmcp_parent_frame_id(&target, until)?;
-            let seed = self.webmcp_stable(&child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(&child), left.min(OPTIONAL_STEP))).unwrap_or_else(|_| json!({"frameTree":{"frame":{"id":target,"url":url}}}));
+            let seed = self.webmcp_stable(child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(child), left.min(OPTIONAL_STEP))).unwrap_or_else(|_| json!({"frameTree":{"frame":{"id":target,"url":url}}}));
             if seed.pointer("/frameTree/frame/url").and_then(Value::as_str).is_some_and(|frame_url| self.guard.extension_frame(frame_url)) {
                 return Err(self.refusal());
             }
@@ -1548,28 +1730,22 @@ impl Cdp {
             if parked > 1024 {
                 return Err(self.refusal());
             }
-            self.webmcp_child_arm(&child, &seed, direct)?;
-            let parent_frame = self.webmcp.arms.get(&parent).and_then(|arm| arm.root_identity.as_ref()).map(|(_, context)| context.frame.clone())
-                .or_else(|| self.session_target(&parent).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone()));
-            let seed_frame = seed.pointer("/frameTree/frame/id").and_then(Value::as_str);
-            let child_tree = seed_frame.is_some_and(|frame| parent_frame.as_deref() != Some(frame));
-            if child_tree && verified {
-                let _ = self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP);
-            } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
+            self.webmcp_child_arm(child, &seed, true)?;
+            if verified {
+                let _ = self.webmcp_adopt_install(child, holder, Instant::now() + OPTIONAL_STEP);
+            } else if let Some(arm) = self.webmcp.arms.get_mut(child) {
                 arm.pending_install = None;
                 arm.pending_install_loader = None;
             }
             if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
-                self.webmcp_remember_child_origin(&child, origin);
-            } else if !provisional {
-                if let Ok(parsed) = url::Url::parse(&url) {
-                    self.webmcp_remember_child_origin(&child, &parsed.origin().ascii_serialization());
-                }
+                self.webmcp_remember_child_origin(child, origin);
+            } else if let Ok(parsed) = url::Url::parse(&url) {
+                self.webmcp_remember_child_origin(child, &parsed.origin().ascii_serialization());
             }
             Ok(())
         })();
         if outcome.is_err() {
-            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
         }
     }
 
@@ -1599,16 +1775,10 @@ impl Cdp {
             let owner = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
             let _ = self.send("Debugger.resume", json!({}), Some(owner));
             self.webmcp.paused.remove(owner);
-        } else if value.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
-            self.webmcp_adopt_child(value);
         }
     }
 
     fn webmcp_gate_event(&mut self, value: &Value) {
-        if self.webmcp.buffering_attach && value.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
-            self.webmcp.pending_attaches.push_back(value.clone());
-            return;
-        }
         let paused = value.get("method").and_then(Value::as_str) == Some("Debugger.paused");
         if paused {
             if let Some(session) = value.get("sessionId").and_then(Value::as_str) { self.webmcp.paused.insert(session.to_string()); }
@@ -1627,13 +1797,10 @@ impl Cdp {
         while let Some(gate) = self.webmcp.pending_gates.pop_front() {
             self.webmcp.drop_pending(&gate);
             let owner = gate.get("sessionId").and_then(Value::as_str).unwrap_or("");
-            if gate.get("method").and_then(Value::as_str) == Some("Target.attachedToTarget") {
-                self.webmcp_adopt_child(&gate);
-            } else {
-                self.webmcp_handle_pause(&gate, owner);
-            }
+            self.webmcp_handle_pause(&gate, owner);
         }
         self.webmcp.handling_gate = false;
+        self.webmcp_reconcile_pending();
         self.webmcp_finish_awaiting_children();
         self.webmcp_install_children();
     }
@@ -1741,18 +1908,20 @@ impl Cdp {
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if self.webmcp_plain(session) && method.starts_with("Debugger.") { return true; }
-        if method == "Target.attachedToTarget" && self.webmcp.arms.contains_key(session) {
-            self.webmcp_gate_event(value);
-            return true;
+        if method == "Target.attachedToTarget" { return self.webmcp_record_attach(value); }
+        if method == "Target.detachedFromTarget" {
+            if let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str) {
+                self.webmcp.recorded.retain(|(owner, _), recorded| recorded.session != child && owner != child);
+            }
+            return false;
+        }
+        if method == "Target.targetInfoChanged" {
+            self.webmcp_record_info(value);
+            return false;
         }
         if matches!(method, "Page.frameDetached" | "Runtime.executionContextCreated" | "Runtime.executionContextDestroyed" | "Runtime.executionContextsCleared" | "Debugger.scriptParsed") {
             self.webmcp_context_event(value, session, method);
-            if self.webmcp.parents.contains_key(session) {
-                self.webmcp_progress_pend(session, "", true);
-                self.webmcp_finish_awaiting_children();
-            } else if self.webmcp.arms.contains_key(session) {
-                self.webmcp_finish_awaiting_children();
-            }
+            if self.webmcp.arms.contains_key(session) { self.webmcp_finish_awaiting_children(); }
             return false;
         }
         if !self.webmcp.arms.contains_key(session) { return false; }
@@ -1791,13 +1960,18 @@ impl Cdp {
                     }
                 }
             }
+            let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
+            let loader = frame.get("loaderId").and_then(Value::as_str).unwrap_or("");
+            let fresh = frame.get("parentId").is_none() && !loader.is_empty()
+                && self.webmcp.arms.get(session).is_some_and(|arm| arm.loaders.get(frame_id).map(String::as_str) != Some(loader));
             self.webmcp_navigated(session, value);
             if self.webmcp.parents.contains_key(session) {
-                self.webmcp_progress_pend(session, frame.get("loaderId").and_then(Value::as_str).unwrap_or(""), true);
+                self.webmcp_progress_pend(session, loader, true);
                 self.webmcp_finish_awaiting_children();
             } else if !child_frame {
                 self.webmcp_finish_awaiting_children();
             }
+            if fresh && self.webmcp_reconcile_eligible(session) { self.webmcp_reconcile_children(session); }
         }
         if method == "Debugger.paused" {
             self.webmcp_gate_event(value);
