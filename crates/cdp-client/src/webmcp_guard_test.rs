@@ -27,6 +27,7 @@ struct BackendState {
     buffer_child_lifecycle_on_auto_attach: bool,
     refuse_auto_attach: bool,
     route: Option<String>,
+    version_mode: Option<String>,
     oopif_tree: Option<Value>,
     get_target_parent: Option<String>,
     omit_get_target_parent: bool,
@@ -234,10 +235,26 @@ impl Transport for Backend {
                 json!({})
             }
             "Browser.getVersion" => {
-                if let Some(route) = state.route.clone() {
-                    json!({"product":"Chrome/156.0.0.0","slicc":{"route":route}})
-                } else {
-                    json!({"product":"Chrome/156.0.0.0"})
+                match state.version_mode.as_deref() {
+                    Some("timeout") => {
+                        state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Browser.getVersion timed out"}}).to_string());
+                        return Ok(());
+                    }
+                    Some("error") => {
+                        state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Backend unavailable"}}).to_string());
+                        return Ok(());
+                    }
+                    Some("empty") => json!({"product":"Chrome/156.0.0.0","slicc":{"route":""}}),
+                    Some("number") => json!({"product":"Chrome/156.0.0.0","slicc":{"route":1}}),
+                    Some("array") => json!({"product":"Chrome/156.0.0.0","slicc":{"route":[]}}),
+                    Some("nonobject") => json!("Chrome/156.0.0.0"),
+                    _ => {
+                        if let Some(route) = state.route.clone() {
+                            json!({"product":"Chrome/156.0.0.0","slicc":{"route":route}})
+                        } else {
+                            json!({"product":"Chrome/156.0.0.0"})
+                        }
+                    }
                 }
             }
             "Target.getTargetInfo" => {
@@ -1480,4 +1497,36 @@ fn real_chrome_root_get_frame_tree_lists_only_local_frames_never_oopif() {
     let (_cdp, state) = client();
     assert_eq!(state.borrow().tree.pointer("/frameTree/frame/id").and_then(Value::as_str), Some("F"));
     assert!(state.borrow().tree.pointer("/frameTree/childFrames").and_then(Value::as_array).is_none_or(|children| children.is_empty()), "root Page.getFrameTree lists only local frames, never the OOPIF");
+}
+
+#[test]
+fn get_version_failure_keeps_cross_origin_off() {
+    for mode in ["timeout", "error", "empty", "number", "array", "nonobject"] {
+        let (mut cdp, state) = client();
+        cdp.start_webmcp_for("H", true).unwrap();
+        state.borrow_mut().version_mode = Some(mode.into());
+        let before = state.borrow().sent.len();
+        cdp.webmcp_auto_attach("H").unwrap();
+        assert!(!cdp.webmcp.arms["H"].direct_child_attach, "{mode}");
+        assert!(cdp.webmcp_route_attested_snapshot(), "{mode}");
+        assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"), "{mode}");
+        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+        assert!(cdp.session_blocked("CHILD"), "{mode}");
+    }
+}
+
+#[test]
+fn later_route_hint_clears_direct_attach_and_detaches_children() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
+    cdp.start_webmcp_for("H", true).unwrap();
+    let holder = cdp.webmcp_session("H").to_string();
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.webmcp_request_origins(&["https://foreign.test".into()]);
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms[&holder].direct_child_attach);
+    cdp.webmcp_set_route_attested(true);
+    assert!(!cdp.webmcp.arms[&holder].direct_child_attach);
+    assert!(cdp.session_blocked("CHILD") || !cdp.webmcp.parents.contains_key("CHILD"));
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
 }

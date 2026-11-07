@@ -289,7 +289,15 @@ impl Cdp {
         let pending = std::mem::take(&mut self.webmcp.pending_attaches);
         match result {
             Ok(_) => {
-                for event in pending { self.webmcp_adopt_child(&event); }
+                let attested = self.webmcp.route_attested;
+                if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = !attested; }
+                for event in pending {
+                    if attested {
+                        if let Some(child) = event.pointer("/params/sessionId").and_then(Value::as_str) { self.webmcp_release_child(child); }
+                    } else {
+                        self.webmcp_adopt_child(&event);
+                    }
+                }
             }
             Err(_) => {
                 if let Some(arm) = self.webmcp.arms.get_mut(&session) { arm.direct_child_attach = false; }
@@ -312,13 +320,33 @@ impl Cdp {
         }
         #[cfg(not(target_os = "wasi"))]
         {
-            let attested = self.raw_call("Browser.getVersion", json!({}), None, OPTIONAL_STEP).ok().is_some_and(|version| {
-                version.pointer("/slicc/route").and_then(Value::as_str).is_some_and(|route| !route.is_empty())
-                    || version.pointer("/slicc/route/kind").and_then(Value::as_str).is_some_and(|route| !route.is_empty())
-            });
-            if attested { self.webmcp.route_attested = true; }
+            let version = self.raw_call("Browser.getVersion", json!({}), None, OPTIONAL_STEP);
+            let attested = Self::webmcp_version_attested(version);
+            if attested { self.webmcp_route_hint(); }
             attested
         }
+    }
+
+    fn webmcp_version_attested(version: Result<Value, String>) -> bool {
+        let Ok(Value::Object(version)) = version else { return true; };
+        let slicc = match version.get("slicc") {
+            None | Some(Value::Null) => return false,
+            Some(Value::Object(slicc)) => slicc,
+            Some(_) => return true,
+        };
+        match slicc.get("route") {
+            None => false,
+            Some(Value::String(_)) => true,
+            Some(Value::Object(route)) => route.get("kind").is_some(),
+            Some(_) => true,
+        }
+    }
+
+    pub(super) fn webmcp_route_hint(&mut self) {
+        self.webmcp.route_attested = true;
+        let holders = self.webmcp.arms.iter().filter(|(_, arm)| arm.direct_child_attach).map(|(session, _)| session.clone()).collect::<Vec<_>>();
+        for arm in self.webmcp.arms.values_mut() { arm.direct_child_attach = false; }
+        for holder in holders { self.webmcp_detach_children(&holder); }
     }
 
     pub fn webmcp_request_origins(&mut self, origins: &[String]) {
@@ -341,7 +369,7 @@ impl Cdp {
     }
 
     pub fn webmcp_set_route_attested(&mut self, attested: bool) {
-        self.webmcp.route_attested = attested;
+        if attested { self.webmcp_route_hint(); } else { self.webmcp.route_attested = false; }
     }
 
     pub fn webmcp_route_attested_snapshot(&self) -> bool {
@@ -1166,6 +1194,13 @@ impl Cdp {
     fn webmcp_detach_parked_children(&mut self, parent: &str) {
         let parked = self.webmcp.parents.iter().filter(|(child, owner)| *owner == parent && self.webmcp_parked_child(child)).map(|(child, _)| child.clone()).collect::<Vec<_>>();
         for child in parked {
+            self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+        }
+    }
+
+    fn webmcp_detach_children(&mut self, parent: &str) {
+        let children = self.webmcp.parents.iter().filter(|(child, owner)| *owner == parent && !self.blocked.contains(*child)).map(|(child, _)| child.clone()).collect::<Vec<_>>();
+        for child in children {
             self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
         }
     }
