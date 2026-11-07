@@ -18,7 +18,13 @@ const binary = path.join(
 );
 
 function command(endpoint, cwd, args) {
-  const env = { ...process.env, HOME: cwd, USERPROFILE: cwd, APPDATA: cwd, XDG_CONFIG_HOME: cwd };
+  const env = {
+    ...process.env,
+    HOME: cwd,
+    USERPROFILE: cwd,
+    APPDATA: cwd,
+    XDG_CONFIG_HOME: cwd,
+  };
   delete env.SLICC_CDP_URL;
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
@@ -93,6 +99,46 @@ async function once(endpoint, cwd, args) {
   return process.ended;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function toolsFrom(result) {
+  if (result?.code !== 0 || !result.stdout.trim()) return [];
+  try {
+    const parsed = JSON.parse(result.stdout);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function listUntil(endpoint, cwd, args, predicate, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const intervalMs = options.intervalMs ?? 100;
+  const label = options.label ?? 'list';
+  const holderStderr = options.holderStderr ?? (() => '');
+  const deadline = Date.now() + timeoutMs;
+  let last = { code: 1, stdout: '', stderr: '' };
+  let tools = [];
+  while (Date.now() < deadline) {
+    last = await once(endpoint, cwd, args);
+    tools = toolsFrom(last);
+    assert.equal(
+      String(last.stderr).includes('cross-origin child tools are unavailable'),
+      false,
+      last.stderr
+    );
+    if (last.code === 0 && predicate(tools, last)) {
+      return { ...last, tools };
+    }
+    await sleep(intervalMs);
+  }
+  assert.fail(
+    `${label} timed out waiting for child tool\nlast=${JSON.stringify({ code: last.code, tools, stderr: last.stderr })}\nholder: ${holderStderr()}`
+  );
+}
+
 async function navigate(raw, session, url) {
   const loaded = raw.waitEvent(
     (event) => event.method === 'Page.loadEventFired' && event.sessionId === session,
@@ -158,7 +204,12 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
           req.socket.destroy();
           return;
         }
-        const policy = req.url === '/deny' ? { 'permissions-policy': 'tools=()' } : {};
+        const policy =
+          req.url === '/deny'
+            ? { 'permissions-policy': 'tools=()' }
+            : ['/frames', '/ordinary-frames', '/cross'].includes(req.url)
+              ? { 'permissions-policy': 'tools=*' }
+              : {};
         res.writeHead(200, { 'content-type': 'text/html', ...policy });
         const child = req.url === '/same' || req.url === '/cross';
         const names = child
@@ -176,12 +227,26 @@ await test('Chrome: guarded WebMCP holder registers load-time tools, enforces po
         const frames = ['/frames', '/ordinary-frames'].includes(req.url)
           ? `<iframe src="${ordinary}/same"></iframe><iframe src="https://foreign.test:${port}/cross" allow="tools *"></iframe>${req.url === '/frames' ? `<iframe src="${protectedUrl}"></iframe>` : ''}`
           : '';
-        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
-if (document.modelContext) {
+        const childScript =
+          req.url === '/cross' || req.url === '/same'
+            ? `const register = () => {
+  if (!document.modelContext) return false;
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
   }
-}
+  return true;
+};
+if (!register()) {
+  const timer = setInterval(() => { if (register()) clearInterval(timer); }, 50);
+  setTimeout(() => clearInterval(timer), 5000);
+}`
+            : `if (document.modelContext) {
+  for (const name of ${JSON.stringify(names)}) {
+    document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
+  }
+}`;
+        res.end(`<!doctype html><title>WebMCP local fixture</title>${frames}<script>
+${childScript}
 </script>`);
       }
     );
@@ -266,7 +331,10 @@ if (document.modelContext) {
       detachDelay: 0,
       transport: 'native',
     });
-    const attached = await ordinaryGuard.send('Target.attachToTarget', { targetId, flatten: true });
+    const attached = await ordinaryGuard.send('Target.attachToTarget', {
+      targetId,
+      flatten: true,
+    });
     for (const [method, params] of [
       ['Debugger.setBreakpointByUrl', { urlRegex: '.*', lineNumber: 0, condition: 'true' }],
       ['DOMDebugger.setEventListenerBreakpoint', { eventName: 'load' }],
@@ -328,27 +396,41 @@ if (document.modelContext) {
     );
     assert.ok(protectedChild, 'protected OOPIF was not created');
     const childSession = (
-      await raw.send('Target.attachToTarget', { targetId: protectedChild.targetId, flatten: true })
+      await raw.send('Target.attachToTarget', {
+        targetId: protectedChild.targetId,
+        flatten: true,
+      })
     ).sessionId;
     assert.equal((await hasShim(raw, childSession)).api, false);
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
     await navigate(raw, sessionId, `${ordinary}/ordinary-frames`);
-    holder = command(browser.wsUrl, cwd, ['webmcp-polyfill', '--tab', targetId, '--reload']);
+    const foreignOrigin = `https://foreign.test:${port}`;
+    holder = command(browser.wsUrl, cwd, [
+      'webmcp-polyfill',
+      '--tab',
+      targetId,
+      '--reload',
+      '--from-origin',
+      foreignOrigin,
+    ]);
     assert.equal((await holder.ready).mode, 'polyfill');
     const same = await once(browser.wsUrl, cwd, ['webmcp-list', '--tab', targetId, '--json']);
     assert.equal(same.code, 0, same.stderr);
     assert.equal(JSON.parse(same.stdout).length, 9);
-    const cross = await once(browser.wsUrl, cwd, [
-      'webmcp-list',
-      '--tab',
-      targetId,
-      '--json',
-      '--from-origin',
-      `https://foreign.test:${port}`,
-    ]);
-    assert.equal(cross.code, 0, cross.stderr);
-    assert.equal(JSON.parse(cross.stdout).length, 9, holder.stderr());
-    assert.match(cross.stderr, /cross-origin child tools are unavailable/);
+    const cross = await listUntil(
+      browser.wsUrl,
+      cwd,
+      ['webmcp-list', '--tab', targetId, '--json', '--from-origin', foreignOrigin],
+      (tools) => tools.some((tool) => tool.name === 'cross_child'),
+      {
+        label: 'cross-from-origin',
+        holderStderr: () => holder.stderr(),
+      }
+    );
+    const crossTool = cross.tools.find((tool) => tool.name === 'cross_child');
+    assert.equal(crossTool.origin, foreignOrigin);
+    assert.equal(crossTool.policy, 'allowed');
+    assert.ok(crossTool.frameId);
     const crossCall = await once(browser.wsUrl, cwd, [
       'webmcp-call',
       'cross_child',
@@ -356,10 +438,10 @@ if (document.modelContext) {
       '--tab',
       targetId,
       '--from-origin',
-      `https://foreign.test:${port}`,
+      foreignOrigin,
     ]);
-    assert.notEqual(crossCall.code, 0, crossCall.stderr);
-    assert.equal(crossCall.stdout, '');
+    assert.equal(crossCall.code, 0, crossCall.stderr);
+    assert.equal(JSON.parse(crossCall.stdout).name, 'cross_child');
 
     const restored = raw.waitEvent(
       (event) => event.method === 'Page.frameNavigated' && event.sessionId === sessionId,
@@ -394,6 +476,9 @@ if (document.modelContext) {
       await navigate(raw, sessionId, `${ordinary}/tools`);
       assert.equal((await hasShim(raw, sessionId)).api, false);
     }
+  } catch (error) {
+    const stderr = holder?.stderr?.() || conversionHolder?.stderr?.() || '';
+    throw new Error(`${error.message}\nholder: ${stderr}`, { cause: error });
   } finally {
     holder?.child.kill('SIGKILL');
     await ordinaryGuard?.close();

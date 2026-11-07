@@ -2044,7 +2044,9 @@ impl Cdp {
         unguarded(message)
     }
 
+    #[track_caller]
     fn abandon(&mut self, target_id: &str) {
+        self.webmcp_trace_decision("abandon", target_id, "", "abandon target");
         self.abandoned.insert(target_id.to_string());
         self.protect_target(target_id);
     }
@@ -2072,7 +2074,10 @@ impl Cdp {
         }
     }
 
+    #[track_caller]
     fn block(&mut self, session_id: &str) {
+        let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
+        self.webmcp_trace_decision("block", &target, session_id, "block session");
         let newly_blocked = self.blocked.insert(session_id.to_string());
         if self.webmcp_is_paused(session_id) {
             self.webmcp.deferred.insert(session_id.to_string());
@@ -2554,7 +2559,9 @@ impl Cdp {
         })
     }
 
+    #[track_caller]
     fn protect_target(&mut self, target_id: &str) {
+        self.webmcp_trace_decision("protect_target", target_id, "", "protect target");
         self.protected_targets.insert(target_id.to_string());
         if let Some(doc) = self.documents.get_mut(target_id) {
             doc.previous = true;
@@ -3638,10 +3645,16 @@ impl Cdp {
         self.blocked.insert(session.to_string());
         self.detaching.retain(|_, owner| owner != session);
         for target in guards {
+            let iframe = self.targets.get(&target).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("iframe");
             self.guards.remove(&target);
             self.documents.remove(&target);
             self.cached_documents.remove(&target);
-            self.abandon(&target);
+            if iframe {
+                self.abandoned.remove(&target);
+                self.protected_targets.remove(&target);
+            } else {
+                self.abandon(&target);
+            }
         }
         self.runtime_sessions.retain(|_, owner| owner != session);
         self.frame_sessions.remove(session);

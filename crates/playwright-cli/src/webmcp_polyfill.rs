@@ -18,12 +18,20 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
     let Some(target) = invocation.flags.get("tab").filter(|value| !value.is_empty()) else {
         return Output::err("webmcp-polyfill requires --tab <targetId>\n");
     };
+    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
+        Ok(from) => from,
+        Err(message) => return Output::err(message),
+    };
     let session = match browser::watch_attach(cdp, state, target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    if let Some(refused) = crate::webmcp::refuse_protected_origins(cdp, &from) {
+        let _ = browser::watch_detach(cdp, state, target, &session);
+        return refused;
+    }
     let previous_owner = state.webmcp.get(target).and_then(|entry| entry.get("owner")).and_then(Value::as_str).map(str::to_string);
-    let result = run(cdp, state, target, &session, invocation.flags.contains_key("reload"));
+    let result = run(cdp, state, target, &session, invocation.flags.contains_key("reload"), &from);
     let result = cdp.webmcp_trace_result(&session, "holder run", result);
     cdp.stop_webmcp(&session);
     let _ = browser::watch_detach(cdp, state, target, &session);
@@ -45,25 +53,43 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Outp
 fn save(cdp: &Cdp, state: &mut Session, target: &str, owner: &str, changes: Value) -> Result<(), String> {
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.webmcp_connection = state.webmcp_connection.clone();
-    let data = json!({"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes});
+    let requested = latest.webmcp.get(target).and_then(|entry| entry.get("requestedOrigins")).cloned();
+    let mut data = json!({"schema":crate::webmcp::SNAPSHOT_SCHEMA,"updatedAtMs":crate::webmcp::snapshot_now_ms(),"owner":owner,"connection":state.webmcp_connection,"sessions":cdp.webmcp_snapshot(),"changes":changes,"routeAttested":cdp.webmcp_route_attested_snapshot()});
+    if let Some(pid) = crate::webmcp::snapshot_holder_pid() { data["holderPid"] = json!(pid); }
+    if let Some(requested) = requested { data["requestedOrigins"] = requested; }
     latest.webmcp.insert(target.to_string(), data.clone());
     session::save_webmcp(&latest)?;
     state.webmcp.insert(target.to_string(), data);
     Ok(())
 }
 
-pub(crate) type Input = Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>;
-
-fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool) -> Result<(), String> {
-    run_with_input(cdp, state, target, session, reload, input)
+fn apply_requested_origins(cdp: &mut Cdp, state: &Session, target: &str) {
+    let latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
+    let Some(origins) = latest.webmcp.get(target)
+        .filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection))
+        .and_then(|entry| entry.get("requestedOrigins"))
+        .and_then(Value::as_array)
+        .map(|origins| origins.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
+    else { return; };
+    if !origins.is_empty() { cdp.webmcp_request_origins(&origins); }
 }
 
-fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool, make_input: impl FnOnce() -> Result<Input, String>) -> Result<(), String> {
+pub(crate) type Input = Box<dyn FnMut() -> Result<(), mpsc::TryRecvError>>;
+
+fn run(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool, from: &[String]) -> Result<(), String> {
+    run_with_input(cdp, state, target, session, reload, from, input)
+}
+
+fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &str, reload: bool, from: &[String], make_input: impl FnOnce() -> Result<Input, String>) -> Result<(), String> {
     let owner = cdp.start_webmcp_for(session, reload)?;
     let holder = cdp.webmcp_session(session).to_string();
     let session = holder.as_str();
+    if !from.is_empty() {
+        cdp.webmcp_request_origins(from);
+    }
     cdp.webmcp_auto_attach(session)?;
     save(cdp, state, target, &owner, json!({}))?;
+    crate::webmcp::remember_origins(state, target, from);
     let mut input = make_input()?;
     let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
     let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).ok_or_else(|| "webmcp-polyfill: unverified document\n".to_string())?;
@@ -78,6 +104,8 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
     io::stdout().flush().map_err(|_| "webmcp-polyfill: failed to write status\n")?;
     let mut saved = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
     let mut readiness = Readiness { seen: cdp.events().len(), waiting: false };
+    let mut heartbeat = Instant::now();
+    let mut reconciled = Instant::now();
     loop {
         match input() {
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -89,11 +117,18 @@ fn run_with_input(cdp: &mut Cdp, state: &mut Session, target: &str, session: &st
         }
         let pumped = cdp.pump(Instant::now() + Duration::from_millis(50));
         cdp.webmcp_trace_result(session, "event pump", pumped)?;
+        apply_requested_origins(cdp, state, target);
+        if reconciled.elapsed() >= Duration::from_millis(250) && cdp.webmcp_reconcile_due() {
+            cdp.webmcp_reconcile();
+            reconciled = Instant::now();
+        }
+        cdp.webmcp_install_children();
         for notice in cdp.take_notices() { eprint!("{notice}"); }
         let current = serde_json::to_string(&cdp.webmcp_snapshot()).unwrap_or_default();
-        if current != saved {
+        if current != saved || heartbeat.elapsed() >= Duration::from_secs(3) {
             save(cdp, state, target, &owner, watch.changes())?;
             saved = current;
+            heartbeat = Instant::now();
         }
         for (_target, child, _bridge) in cdp.take_webmcp_children() {
             let attached = cdp.webmcp_auto_attach(&child);
@@ -180,6 +215,7 @@ pub(crate) fn input() -> Result<Input, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args;
 
     fn load(session: &str) -> Value {
         json!({"method":"Page.loadEventFired","sessionId":session,"params":{"timestamp":1}})
@@ -200,5 +236,23 @@ mod tests {
         events.extend([load("TOP"), load("TOP")]);
         assert!(readiness.due(&events, "TOP", true));
         assert!(!readiness.due(&events, "TOP", true));
+    }
+
+    #[test]
+    fn polyfill_parses_repeatable_from_origin_like_list() {
+        let args = ["webmcp-polyfill", "--tab", "TAB", "--reload", "--from-origin", "https://foreign.test", "--from-origin", "https://other.test/"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let invocation = args::parse(&args).expect("polyfill flags parse");
+        assert_eq!(invocation.command.as_deref(), Some("webmcp-polyfill"));
+        let from = crate::webmcp_frames::origins(&invocation.repeated("from-origin")).expect("origins");
+        assert_eq!(from, vec!["https://foreign.test".to_string(), "https://other.test".to_string()]);
+        let bad = ["webmcp-polyfill", "--tab", "TAB", "--from-origin", "https://foreign.test/path"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let invocation = args::parse(&bad).expect("polyfill accepts the flag");
+        assert!(crate::webmcp_frames::origins(&invocation.repeated("from-origin")).is_err());
     }
 }

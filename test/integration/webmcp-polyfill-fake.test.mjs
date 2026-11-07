@@ -384,7 +384,7 @@ await test('fake: verified response policy can be observed on the parent holder 
 });
 
 for (const native of [true, false]) {
-  await test(`fake: same-origin aggregation keeps ambiguous selection and ${native ? 'native requests admit' : 'polyfill requests refuse'} foreign child tools`, async () => {
+  await test(`fake: same-origin aggregation keeps ambiguous selection and ${native ? 'native requests admit' : 'polyfill requests refuse on a guarded route'} foreign child tools`, async () => {
     const registration = Promise.withResolvers();
     await fixture(
       '',
@@ -493,7 +493,14 @@ for (const native of [true, false]) {
       ],
       native
         ? undefined
-        : (command, pages) => {
+        : (command, pages, send) => {
+            if (command.method === 'Browser.getVersion') {
+              send({
+                id: command.id,
+                result: { product: 'Chrome/156.0.0.0', slicc: { route: 'link' } },
+              });
+              return true;
+            }
             const child = pages.get('SAME');
             if (
               command.method === 'Runtime.evaluate' &&
@@ -512,6 +519,264 @@ for (const native of [true, false]) {
             }
           },
       native
+    );
+  });
+}
+
+await test('fake: polyfill on direct drops the guarded-route sentence for requested origins', async () => {
+  const registration = Promise.withResolvers();
+  await fixture(
+    '',
+    async (backend, cwd) => {
+      let timer;
+      try {
+        await Promise.race([
+          registration.promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('same-origin child did not register after installation')),
+              5000
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      const listed = await run(
+        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://foreign.test'],
+        cwd,
+        backend.url
+      );
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.equal(listed.stderr.includes('cross-origin child tools are unavailable'), false);
+      assert.ok(backend.calls.some((call) => call.method === 'Target.setAutoAttach'));
+    },
+    [
+      {
+        id: 'SAME',
+        origin: 'https://ordinary.test',
+        definitions: [],
+      },
+      {
+        id: 'CROSS',
+        origin: 'https://foreign.test',
+        allow: 'tools *',
+        definitions: [],
+      },
+    ],
+    (command, pages) => {
+      const child = pages.get('SAME');
+      if (
+        command.method === 'Runtime.evaluate' &&
+        command.params.expression.startsWith('const __wmcp_') &&
+        command.params.uniqueContextId === `main-${child.loader}`
+      ) {
+        void (async () => {
+          await new Promise((resolve) => setImmediate(resolve));
+          child.document.modelContext.registerTool({
+            name: 'greet',
+            execute: () => 'same-origin child',
+          });
+          registration.resolve();
+        })().catch(registration.reject);
+      }
+    }
+  );
+});
+
+await test('fake: idle holder heartbeat keeps snapshot fresh past the 15s evidence window', async () => {
+  const registration = Promise.withResolvers();
+  await fixture(
+    '',
+    async (backend, cwd) => {
+      let timer;
+      try {
+        await Promise.race([
+          registration.promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('same-origin child did not register after installation')),
+              5000
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 16_000));
+      const listed = await run(
+        ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://foreign.test'],
+        cwd,
+        backend.url
+      );
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.equal(listed.stderr.includes('cross-origin child tools are unavailable'), false);
+    },
+    [
+      {
+        id: 'SAME',
+        origin: 'https://ordinary.test',
+        definitions: [],
+      },
+      {
+        id: 'CROSS',
+        origin: 'https://foreign.test',
+        allow: 'tools *',
+        definitions: [],
+      },
+    ],
+    (command, pages) => {
+      const child = pages.get('SAME');
+      if (
+        command.method === 'Runtime.evaluate' &&
+        command.params.expression.startsWith('const __wmcp_') &&
+        command.params.uniqueContextId === `main-${child.loader}`
+      ) {
+        void (async () => {
+          await new Promise((resolve) => setImmediate(resolve));
+          child.document.modelContext.registerTool({
+            name: 'greet',
+            execute: () => 'same-origin child',
+          });
+          registration.resolve();
+        })().catch(registration.reject);
+      }
+    }
+  );
+});
+
+for (const message of [
+  'slicc: refused: Target.setAutoAttach is not supported: attach to each target',
+  'slicc: refused: auto-attach is not supported by the extension bridge',
+]) {
+  await test(`fake: refused private setAutoAttach keeps cross-origin tools off (${message.slice(0, 40)})`, async () => {
+    const registration = Promise.withResolvers();
+    await fixture(
+      '',
+      async (backend, cwd) => {
+        let timer;
+        try {
+          await Promise.race([
+            registration.promise,
+            new Promise((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error('same-origin child did not register after installation')),
+                5000
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+        const listed = await run(
+          ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://foreign.test'],
+          cwd,
+          backend.url
+        );
+        assert.equal(listed.code, 0, listed.stderr);
+        assert.equal(listed.stderr.includes('cross-origin child tools are unavailable'), true);
+        assert.equal(
+          backend.calls.some(
+            (call) =>
+              call.method === 'Runtime.evaluate' &&
+              String(call.params?.expression || '').startsWith('const __wmcp_') &&
+              String(call.params?.uniqueContextId || '').includes('-CROSS')
+          ),
+          false
+        );
+      },
+      [
+        { id: 'SAME', origin: 'https://ordinary.test', definitions: [] },
+        {
+          id: 'CROSS',
+          origin: 'https://foreign.test',
+          allow: 'tools *',
+          definitions: [],
+        },
+      ],
+      (command, pages, send) => {
+        if (command.method === 'Target.setAutoAttach' && command.params?.autoAttach) {
+          send({ id: command.id, error: { message } });
+          return true;
+        }
+        const child = pages.get('SAME');
+        if (
+          command.method === 'Runtime.evaluate' &&
+          command.params.expression.startsWith('const __wmcp_') &&
+          command.params.uniqueContextId === `main-${child.loader}`
+        ) {
+          void (async () => {
+            await new Promise((resolve) => setImmediate(resolve));
+            child.document.modelContext.registerTool({
+              name: 'greet',
+              execute: () => 'same-origin child',
+            });
+            registration.resolve();
+          })().catch(registration.reject);
+        }
+      }
+    );
+  });
+}
+
+for (const route of ['link', 'extension', 'devtools', 'unknown-guard']) {
+  await test(`fake: slicc.route hint ${route} keeps cross-origin tools off`, async () => {
+    const registration = Promise.withResolvers();
+    await fixture(
+      '',
+      async (backend, cwd) => {
+        let timer;
+        try {
+          await Promise.race([
+            registration.promise,
+            new Promise((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error('same-origin child did not register after installation')),
+                5000
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+        const listed = await run(
+          ['webmcp-list', '--tab', 'TAB', '--json', '--from-origin', 'https://foreign.test'],
+          cwd,
+          backend.url
+        );
+        assert.equal(listed.code, 0, listed.stderr);
+        assert.equal(listed.stderr.includes('cross-origin child tools are unavailable'), true);
+      },
+      [
+        { id: 'SAME', origin: 'https://ordinary.test', definitions: [] },
+        {
+          id: 'CROSS',
+          origin: 'https://foreign.test',
+          allow: 'tools *',
+          definitions: [],
+        },
+      ],
+      (command, pages, send) => {
+        if (command.method === 'Browser.getVersion') {
+          send({ id: command.id, result: { product: 'Chrome/156.0.0.0', slicc: { route } } });
+          return true;
+        }
+        const child = pages.get('SAME');
+        if (
+          command.method === 'Runtime.evaluate' &&
+          command.params.expression.startsWith('const __wmcp_') &&
+          command.params.uniqueContextId === `main-${child.loader}`
+        ) {
+          void (async () => {
+            await new Promise((resolve) => setImmediate(resolve));
+            child.document.modelContext.registerTool({
+              name: 'greet',
+              execute: () => 'same-origin child',
+            });
+            registration.resolve();
+          })().catch(registration.reject);
+        }
+      }
     );
   });
 }

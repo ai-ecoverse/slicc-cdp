@@ -65,7 +65,7 @@ fn plain_fallback_retry_two_refusals_then_same_session_acceptance_installs_once(
     assert_eq!(state.sent.iter().filter(|command| command["method"] == "Target.attachToTarget").count(), 1);
     assert!(!state.sent.iter().any(|command| command["method"] == "Target.detachFromTarget"));
     assert_eq!(state.sent.iter().filter(|command| command["method"] == "Page.reload").count(), 1);
-    assert_eq!(state.sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(|source| source.starts_with("const __wmcp_"))).count(), 1);
+    assert_eq!(state.sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count(), 1);
     assert_eq!(cdp.webmcp_session("H"), "FRESH");
 }
 

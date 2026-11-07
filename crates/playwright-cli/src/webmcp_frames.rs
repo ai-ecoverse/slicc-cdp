@@ -205,7 +205,17 @@ fn collect(cdp: &mut Cdp, state: &Session, target: &str, session: &str, from: &[
     let native = evaluate(cdp, &root_scope, "'modelContext' in Document.prototype", true)?.as_bool() == Some(true);
     let available = evaluate(cdp, &root_scope, "document.modelContext != null", false)?.as_bool() == Some(true);
     let native = native && available;
-    let from: &[String] = if native { from } else { &[] };
+    let evidence = cdp.webmcp_child_evidence() || state.webmcp.get(target).filter(|entry| entry.get("connection").and_then(Value::as_str) == Some(&state.webmcp_connection)).is_some_and(|entry| {
+        if entry.get("routeAttested").and_then(Value::as_bool) == Some(true) { return false; }
+        entry.get("sessions").and_then(Value::as_array).is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                let owns_page = session.get("target").and_then(Value::as_str) == Some(target);
+                (owns_page && session.get("directChildAttach").and_then(Value::as_bool) == Some(true))
+                    || (!owns_page && session.get("target").and_then(Value::as_str).is_some() && session.get("quarantined").and_then(Value::as_bool) != Some(true))
+            })
+        })
+    });
+    let from: &[String] = if native || evidence { from } else { &[] };
     for frame in &frames {
         if frame.frame_id == root.frame_id { continue; }
         let origin = url::Url::parse(&frame.url).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
@@ -254,7 +264,7 @@ try {{
     {
         for scope in scopes.values() {
             if result.iter().any(|tool| tool.scope.frame == scope.frame) { continue; }
-            if scope.origin != top { continue; }
+            if scope.origin != top && !from.contains(&scope.origin) { continue; }
             if !allowed(cdp, scope, &frames, &scopes, &owners, true)? { continue; }
             let unknown = scope.page_defined && scope.policy.is_none() && scope.path.is_empty() && native_policy(cdp, scope)?.is_none();
             let bridge = scope.bridge.as_deref().unwrap_or("undefined");
