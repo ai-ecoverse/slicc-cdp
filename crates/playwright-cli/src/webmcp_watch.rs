@@ -173,6 +173,15 @@ impl Watch {
             tracked.emitted = Some(tools.clone());
             crate::webmcp::redact_output(&mut tools);
             self.sequence += 1;
+            let origin = text(generation, "origin");
+            let tool_count = tools.as_array().map(Vec::len).unwrap_or(0);
+            let names = tools.as_array().into_iter().flatten().filter_map(|tool| tool.get("name").and_then(Value::as_str)).take(16).collect::<Vec<_>>();
+            if std::env::var("SLICC_WEBMCP_TRACE").ok().as_deref() == Some("1") {
+                let origin_class = if origin.is_empty() { "empty" } else if let Ok(url) = url::Url::parse(origin) {
+                    match url.scheme() { "chrome-extension" => "extension", "http" | "https" => "ordinary", _ => "other" }
+                } else { "invalid" };
+                eprintln!("webmcp-polyfill: {}", json!({"event":"tools-changed-trace","sessionId":text(generation, "session"),"frameId":frame,"loaderId":text(generation, "loaderId"),"originClass":origin_class,"toolCount":tool_count,"names":names,"sequence":self.sequence}));
+            }
             let event = json!({"event":"tools-changed","tab":self.tab,"target":generation["target"],"frameId":frame,"loaderId":generation["loaderId"],"origin":generation["origin"],"tools":tools});
             self.changes.insert(frame.to_string(), json!({"sequence":self.sequence,"topLoaderId":self.armed,"event":event}));
             events.push(event);

@@ -181,6 +181,20 @@ for (const _repeat of [1, 2, 3, 4, 5]) {
             req.socket.destroy();
             return;
           }
+          if (req.url.startsWith('/diag-register')) {
+            const query = new URL(req.url, 'https://localhost').searchParams;
+            console.error(
+              `webmcp-polyfill: ${JSON.stringify({
+                event: 'fixture-register',
+                ok: query.get('ok') === '1',
+                tool: query.get('tool') === 'cross_child' ? 'cross_child' : 'other',
+                ms: Number(query.get('ms') || 0),
+              })}`
+            );
+            res.writeHead(204);
+            res.end();
+            return;
+          }
           const policy =
             req.url === '/deny'
               ? { 'permissions-policy': 'tools=()' }
@@ -206,16 +220,21 @@ for (const _repeat of [1, 2, 3, 4, 5]) {
             : '';
           const childScript =
             req.url === '/cross' || req.url === '/same'
-              ? `const register = () => {
+              ? `const started = performance.now();
+const register = () => {
   if (!document.modelContext) return false;
   for (const name of ${JSON.stringify(names)}) {
     document.modelContext.registerTool({name,description:name,inputSchema:{type:'object'},exposedTo:[${JSON.stringify(ordinary)}],annotations:{readOnly:name !== 'send_reply',consequential:name === 'send_reply',untrustedContent:true},execute:async(input,client)=>({name,signal:!!client.signal,input})});
   }
+  fetch('/diag-register?ok=1&tool=' + encodeURIComponent(${JSON.stringify(names[0] || '')}) + '&ms=' + Math.round(performance.now() - started)).catch(() => {});
   return true;
 };
 if (!register()) {
   const timer = setInterval(() => { if (register()) clearInterval(timer); }, 50);
-  setTimeout(() => clearInterval(timer), 5000);
+  setTimeout(() => {
+    clearInterval(timer);
+    if (!document.modelContext) fetch('/diag-register?ok=0&tool=' + encodeURIComponent(${JSON.stringify(names[0] || '')}) + '&ms=' + Math.round(performance.now() - started)).catch(() => {});
+  }, 5000);
 }`
               : `if (document.modelContext) {
   for (const name of ${JSON.stringify(names)}) {

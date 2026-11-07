@@ -346,6 +346,25 @@ fn iframe_attach_on_a_non_arm_session_is_not_consumed() {
 }
 
 #[test]
+fn unowned_reattach_after_admit_does_not_retire_or_replace_the_live_child() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(child_attach(&holder, "CHILD"));
+    cdp.webmcp_install_children();
+    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(1));
+    let recorded = cdp.webmcp.recorded.get("IFRAME").map(|recorded| recorded.session.clone());
+    assert_eq!(recorded.as_deref(), Some("CHILD"));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","params":{"sessionId":"OTHER","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert_eq!(cdp.webmcp.recorded.get("IFRAME").map(|recorded| recorded.session.as_str()), Some("CHILD"));
+    assert_eq!(cdp.webmcp.parents.get("CHILD").map(String::as_str), Some(holder.as_str()));
+    assert_eq!(cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted), Some(1));
+    assert!(!cdp.session_blocked("CHILD"));
+    assert!(!cdp.webmcp.parents.contains_key("OTHER"));
+}
+
+#[test]
 fn reconcile_adopts_a_child_whose_attach_was_recorded_before_the_root_arm_existed() {
     let (mut cdp, state) = client();
     state.borrow_mut().oopif_tree = Some(cross_tree());
