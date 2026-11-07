@@ -54,6 +54,8 @@ struct Arm {
     loaders: BTreeMap<String, String>,
     documents: BTreeMap<String, Value>,
     parked_origin: String,
+    context_generation: u64,
+    frame_accept_generation: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -62,6 +64,7 @@ struct Context {
     origin: String,
     unique: String,
     loader: String,
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -523,7 +526,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new(), context_generation: 0, frame_accept_generation: BTreeMap::new() });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -1076,8 +1079,9 @@ impl Cdp {
             arm.accepted.clear();
             arm.admitted = 0;
         }
-        let realm = (context.frame, context.loader, context.unique);
+        let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
         if arm.accepted.insert(realm) {
+            arm.frame_accept_generation.insert(context.frame.clone(), context.generation);
             self.webmcp.samples.push(started.elapsed().as_micros());
         }
         arm.admitted = arm.accepted.len();
@@ -1123,6 +1127,8 @@ impl Cdp {
             loaders,
             documents: BTreeMap::new(),
             parked_origin: String::new(),
+            context_generation: 0,
+            frame_accept_generation: BTreeMap::new(),
         });
         self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.raw_call("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -1283,22 +1289,18 @@ impl Cdp {
         self.webmcp_pend_install(child, &loader);
         let parent_root = self.webmcp_root_document(parent, until)?;
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
-        if !loader.is_empty() {
-            for ((owner, _), context) in &mut self.webmcp.contexts {
-                if owner == child && context.frame == frame_id && context.origin == origin && !context.unique.is_empty()
-                    && !context.loader.is_empty() && context.loader != loader
-                {
-                    context.loader = loader.clone();
-                }
-            }
-        }
-        let Some((id, mut context)) = self.webmcp.contexts.iter().find(|((owner, _), context)| {
+        let last_accepted = self.webmcp.arms.get(child).and_then(|arm| arm.frame_accept_generation.get(frame_id).copied());
+        let matched = self.webmcp.contexts.iter().filter(|((owner, _), context)| {
             owner == child
                 && context.frame == frame_id
                 && context.origin == origin
                 && !context.unique.is_empty()
                 && (context.loader.is_empty() || context.loader == loader)
-        }).map(|(key, context)| (key.1, context.clone())) else {
+        }).map(|(key, context)| (key.1, context.clone())).collect::<Vec<_>>();
+        let accepted = |context: &Context| self.webmcp.arms.get(child).is_some_and(|arm| arm.accepted.contains(&(context.frame.clone(), if context.loader.is_empty() { loader.clone() } else { context.loader.clone() }, context.unique.clone())));
+        let chosen = matched.iter().find(|(_, context)| accepted(context)).cloned()
+            .or_else(|| matched.iter().filter(|(_, context)| last_accepted.is_none_or(|last| context.generation > last)).max_by_key(|(_, context)| context.generation).cloned());
+        let Some((id, mut context)) = chosen else {
             self.webmcp_pend_install(child, &loader);
             return Ok(false);
         };
@@ -1695,11 +1697,12 @@ impl Cdp {
                     let frame = context.pointer("/auxData/frameId").and_then(Value::as_str).unwrap_or("");
                     let unique = context.get("uniqueId").and_then(Value::as_str).unwrap_or("");
                     let origin = context.get("origin").and_then(Value::as_str).unwrap_or("").to_string();
-                    let loader = arm.loaders.get(frame).cloned().unwrap_or_default();
+                    let child = self.webmcp.parents.contains_key(session);
+                    let loader = if child { String::new() } else { arm.loaders.get(frame).cloned().unwrap_or_default() };
                     if root.as_deref() == Some(frame) && !arm.accepted.contains(&(frame.to_string(), loader.clone(), unique.to_string())) {
                         arm.pending_contexts.insert(id, Instant::now() + Duration::from_secs(2));
                     }
-                    if self.webmcp.parents.contains_key(session) && !origin.is_empty() && origin != "null" {
+                    if child && !origin.is_empty() && origin != "null" {
                         arm.parked_origin = origin.clone();
                     }
                     self.webmcp.contexts.insert((session.to_string(), id), Context {
@@ -1707,6 +1710,7 @@ impl Cdp {
                         origin,
                         unique: unique.to_string(),
                         loader,
+                        generation: arm.context_generation,
                     });
                 }
             }
@@ -1719,6 +1723,7 @@ impl Cdp {
             }
         }
         if method == "Runtime.executionContextsCleared" {
+            arm.context_generation = arm.context_generation.saturating_add(1);
             arm.pending_contexts.clear();
             self.webmcp.contexts.retain(|(owner, _), _| owner != session);
             self.webmcp.scripts.retain(|(owner, _), _| owner != session);
