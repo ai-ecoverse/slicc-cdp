@@ -299,16 +299,34 @@ async function fromDevToolsActivePort(options) {
   const roots = options.profileRoots ?? sliccProfileRoots(options);
   const files = await collectActivePorts(roots);
   files.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  let identityMismatch = 0;
+  let probeRejected = 0;
   for (const item of files) {
     const url = await probeVersion(fetchImpl, item.port, timeoutMs);
-    if (url === undefined) continue;
-    if (new URL(url).pathname !== item.wsPath) continue;
+    if (url === undefined) {
+      probeRejected += 1;
+      continue;
+    }
+    if (new URL(url).pathname !== item.wsPath) {
+      identityMismatch += 1;
+      continue;
+    }
     return { ok: true, url };
   }
   if (files.length === 0) {
     return { ok: false, reason: 'no DevToolsActivePort files under slicc profile dirs' };
   }
-  return { ok: false, reason: 'no live DevToolsActivePort (stale or rejected websocket URL)' };
+  const parts = [];
+  if (identityMismatch > 0) {
+    parts.push(`${identityMismatch} rejected for browser identity mismatch`);
+  }
+  if (probeRejected > 0) {
+    parts.push(`${probeRejected} stale or rejected websocket URL`);
+  }
+  return {
+    ok: false,
+    reason: `no live DevToolsActivePort (${parts.join('; ')})`,
+  };
 }
 
 async function fromFallback(options) {
