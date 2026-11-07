@@ -16,6 +16,8 @@ export { REFUSAL, resolveCdpEndpoint, version };
 
 const LOAD_TIMEOUT_MS = 15000;
 const HELD_FRAMES = 100;
+const UNKNOWN_SOCKET_WARNING =
+  'browser.websocket: frames from sockets opened before the first attach are ignored in discovered mode; reload the tab or reconnect the socket after the first attach to make them visible';
 const RECORDER = `(() => {
   if (globalThis.__sliccWsSent) return true;
   const sent = [];
@@ -191,9 +193,22 @@ function dispatchFrame(message) {
     route(targetId, url, response.payloadData, () => true);
     return;
   }
-  if (guarded) return;
+  if (guarded) {
+    noteUnknownDrop(targetId);
+    return;
+  }
   route(targetId, url, response.payloadData, (sub) => sub.urlMatch === undefined);
   holdFrame(message.sessionId, targetId, key, response.payloadData);
+}
+
+function noteUnknownDrop(targetId) {
+  for (const sub of subscribers.values()) {
+    if (sub.targetId !== targetId) continue;
+    sub.dropped += 1;
+    if (sub.warnedUnknown) continue;
+    sub.warnedUnknown = true;
+    console.warn(UNKNOWN_SOCKET_WARNING);
+  }
 }
 
 function route(targetId, url, raw, which) {
@@ -719,6 +734,9 @@ function toInfo(sub) {
 function makeHandle(sub) {
   return {
     ...toInfo(sub),
+    get dropped() {
+      return sub.dropped;
+    },
     async update(patch = {}) {
       if (patch.urlMatch === null) {
         delete sub.urlMatch;
@@ -792,6 +810,8 @@ export const websocket = {
         forward: sink,
         createdAt: new Date().toISOString(),
         writing: Promise.resolve(),
+        dropped: 0,
+        warnedUnknown: false,
       };
       if (urlMatch !== undefined) {
         sub.urlMatch = urlMatch;

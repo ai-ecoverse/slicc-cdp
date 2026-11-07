@@ -12,6 +12,7 @@ const protectedWs = process.env.GUARD_PROTECTED_WS;
 const allowedWs = process.env.GUARD_ALLOWED_WS;
 const secretFile = process.env.GUARD_SECRET_FILE;
 const earlyTargetId = process.env.GUARD_EARLY_TARGET;
+const earlyAllowedTargetId = process.env.GUARD_EARLY_ALLOWED_TARGET;
 const sevenTargetId = process.env.GUARD_SEVEN_TARGET;
 const logPath = process.env.GUARD_LOG;
 
@@ -111,6 +112,73 @@ async function main() {
     console.log = write;
     await bare?.close();
     await matched?.close();
+  }
+
+  const earlyAllowedLogged = [];
+  console.log = (...args) => {
+    earlyAllowedLogged.push(args.map(String).join(' '));
+  };
+  let earlyAllowedHandle;
+  try {
+    earlyAllowedHandle = await browser.websocket
+      .on(earlyAllowedTargetId, {
+        urlMatch: new RegExp(allowedWs.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')),
+      })
+      .filter({ parseAs: 'json', where: { kind: 'tick' } })
+      .forward({ sink: 'log' });
+    await browser.eval(earlyAllowedTargetId, 'window.__guardEarlyAllowed.send("ping")');
+    await delay(800);
+    assert.equal(
+      earlyAllowedLogged.some((line) => line.includes('"n":1') || line.includes('"n": 1')),
+      false
+    );
+    assert.ok(earlyAllowedHandle.dropped > 0);
+    await log('websocket:early-allowed-dropped');
+
+    await browser.eval(earlyAllowedTargetId, 'location.reload()');
+    await delay(500);
+    await waitFor(
+      async () => (await browser.eval(earlyAllowedTargetId, 'document.readyState')) === 'complete',
+      'early allowed reload never completed'
+    );
+    earlyAllowedLogged.length = 0;
+    await browser.evalAsync(
+      earlyAllowedTargetId,
+      `new Promise((resolve, reject) => {
+        const ws = new WebSocket(${JSON.stringify(allowedWs)});
+        const timer = setTimeout(() => reject(new Error('reload ws timeout')), 8000);
+        ws.onerror = () => { clearTimeout(timer); reject(new Error('reload ws error')); };
+        ws.onopen = () => { ws.send('ping'); clearTimeout(timer); resolve('opened'); };
+      })`
+    );
+    await waitFor(
+      () => earlyAllowedLogged.some((line) => line.includes('"n":1') || line.includes('"n": 1')),
+      `reload allowed ws missed ${JSON.stringify(earlyAllowedLogged)}`
+    );
+    await log('websocket:reload-allowed');
+
+    const protectedAfter = [];
+    console.log = (...args) => {
+      protectedAfter.push(args.map(String).join(' '));
+    };
+    const protectedHandle = await browser.websocket
+      .on(earlyTargetId, { urlMatch: /sliccy\.ai/u })
+      .filter({ parseAs: 'json' })
+      .forward({ sink: 'log' });
+    try {
+      await browser.eval(earlyTargetId, 'window.__guardEarly.send("ping-again")');
+      await delay(800);
+      assert.equal(
+        protectedAfter.some((line) => line.includes('canary') || line.includes('"n":42')),
+        false
+      );
+      await log('websocket:protected-still-dropped');
+    } finally {
+      await protectedHandle.close();
+    }
+  } finally {
+    console.log = write;
+    await earlyAllowedHandle?.close();
   }
 
   const plain = await browser.ensureTab(`${site}/plain`, { matchUrl: '/plain$' });

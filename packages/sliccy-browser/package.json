@@ -1,7 +1,7 @@
 {
   "name": "@ai-ecoverse/sliccy-browser",
-  "version": "0.1.41",
-  "description": "sliccy:browser for jsh, over CDP. Discovers Chrome via SLICC_CDP_URL, slicc browsers --json, DevToolsActivePort under slicc profiles (live /json/version must match the file's websocket path), then 127.0.0.1:9222. Discovered endpoints refuse seven/vault/extension/error pages.",
+  "version": "0.1.42",
+  "description": "sliccy:browser for jsh, over CDP. Discovers Chrome via SLICC_CDP_URL, slicc browsers --json, DevToolsActivePort under slicc profiles (live /json/version must match the file's websocket path), then 127.0.0.1:9222. Discovered endpoints refuse seven/vault/extension/error pages; pre-attach websocket frames are dropped with a one-time warning.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
