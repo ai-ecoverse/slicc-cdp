@@ -18,7 +18,14 @@ const binary = path.join(
 );
 
 function environment(cwd) {
-  const env = { ...process.env, HOME: cwd, USERPROFILE: cwd, APPDATA: cwd, XDG_CONFIG_HOME: cwd };
+  const env = {
+    ...process.env,
+    HOME: cwd,
+    USERPROFILE: cwd,
+    APPDATA: cwd,
+    XDG_CONFIG_HOME: cwd,
+    SLICC_WEBMCP_TRACE: '1',
+  };
   delete env.SLICC_CDP_URL;
   return env;
 }
@@ -65,7 +72,15 @@ function stream(endpoint, cwd, args) {
       };
       const timer = setTimeout(() => {
         waiters.delete(check);
-        reject(new Error(`event did not arrive: ${JSON.stringify(lines)} ${stderr}`));
+        const revokes = (
+          stderr.match(/webmcp-polyfill: \{[^\n]*"event":"revoke"[^\n]*/g) || []
+        ).join('\n');
+        const parked = (stderr.match(/\[diag:parked:[^\]]+\][^\n]*/g) || []).slice(-8).join('\n');
+        reject(
+          new Error(
+            `event did not arrive: ${JSON.stringify(lines)}\nstderr: ${stderr}\ntrace-revokes: ${revokes}\nparked-diag: ${parked}`
+          )
+        );
       }, timeout);
       waiters.add(check);
       check();

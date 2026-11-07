@@ -18,7 +18,14 @@ const binary = path.join(
 );
 
 function command(endpoint, cwd, args) {
-  const env = { ...process.env, HOME: cwd, USERPROFILE: cwd, APPDATA: cwd, XDG_CONFIG_HOME: cwd };
+  const env = {
+    ...process.env,
+    HOME: cwd,
+    USERPROFILE: cwd,
+    APPDATA: cwd,
+    XDG_CONFIG_HOME: cwd,
+    SLICC_WEBMCP_TRACE: '1',
+  };
   delete env.SLICC_CDP_URL;
   const child = spawn(binary, ['--cdp', endpoint, ...args], {
     cwd,
@@ -61,7 +68,13 @@ function command(endpoint, cwd, args) {
     });
     ended.then((result) => {
       clearTimeout(timer);
-      if (!stdout.includes('\n')) reject(new Error(result.stderr));
+      if (!stdout.includes('\n')) {
+        reject(
+          new Error(
+            `holder ready failed\nstderr: ${result.stderr}\ntrace-revokes: ${(result.stderr.match(/webmcp-polyfill: \{[^\n]*"event":"revoke"[^\n]*/g) || []).join('\n')}`
+          )
+        );
+      }
     }, reject);
   });
   ready.catch(() => {});
@@ -69,7 +82,11 @@ function command(endpoint, cwd, args) {
     new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         documentWaiters.delete(done);
-        reject(new Error(`document readiness did not arrive: ${stderr}`));
+        reject(
+          new Error(
+            `document readiness did not arrive\nstderr: ${stderr}\ntrace-revokes: ${(stderr.match(/webmcp-polyfill: \{[^\n]*"event":"revoke"[^\n]*/g) || []).join('\n')}`
+          )
+        );
       }, 15000);
       const done = (value) => {
         clearTimeout(timer);
@@ -99,7 +116,13 @@ async function navigate(raw, session, url) {
     15000
   );
   await raw.send('Page.navigate', { url }, session);
-  await loaded;
+  try {
+    await loaded;
+  } catch (error) {
+    throw new Error(`Page.loadEventFired did not arrive for ${new URL(url).pathname}`, {
+      cause: error,
+    });
+  }
 }
 
 async function hasShim(raw, session) {
