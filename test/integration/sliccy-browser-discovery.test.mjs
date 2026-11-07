@@ -361,6 +361,134 @@ test('DevToolsActivePort picks the live newest file and ignores stale or non-loo
   assert.equal(contacted.includes(`http://127.0.0.1:${live.port}/json/version`), true);
 });
 
+test('DevToolsActivePort rejects a reused port whose live browser id differs', async () => {
+  const live = await listen((req, res, server) => {
+    if (req.url !== '/json/version') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const port = server.address().port;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        Browser: 'Chrome/154.0.0.0',
+        webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/live-browser-id`,
+      })
+    );
+  });
+  after(() => live.close());
+
+  const home = path.join(scratch, 'identity-home');
+  const now = Date.now();
+  const retiredDir = path.join(
+    home,
+    'Library',
+    'Application Support',
+    'slicc',
+    'seven-profiles',
+    'retired'
+  );
+  await mkdir(retiredDir, { recursive: true });
+  await writeFile(
+    path.join(retiredDir, 'DevToolsActivePort'),
+    `${live.port}\n/devtools/browser/retired-browser-id\n`
+  );
+  await utimes(
+    path.join(retiredDir, 'DevToolsActivePort'),
+    (now + 10_000) / 1000,
+    (now + 10_000) / 1000
+  );
+  await writeActive(
+    home,
+    ['Library', 'Application Support', 'slicc', 'seven-profiles', 'matching'],
+    live.port,
+    now
+  );
+  const matchingFile = path.join(
+    home,
+    'Library',
+    'Application Support',
+    'slicc',
+    'seven-profiles',
+    'matching',
+    'DevToolsActivePort'
+  );
+  await writeFile(matchingFile, `${live.port}\n/devtools/browser/live-browser-id\n`);
+  await utimes(matchingFile, now / 1000, now / 1000);
+
+  const result = await resolveCdpEndpoint({
+    env: { ...process.env, HOME: home, PATH: '/nonexistent', SLICC_CDP_URL: '' },
+    platform: 'darwin',
+    fetch: globalThis.fetch,
+  });
+  assert.equal(result.url, `ws://127.0.0.1:${live.port}/devtools/browser/live-browser-id`);
+  assert.match(result.tried.join('\n'), /DevToolsActivePort: chose a live loopback port/);
+});
+
+test('DevToolsActivePort identity mismatch falls through to 9222 and names the reason', async () => {
+  const reuse = await listen((req, res, server) => {
+    if (req.url !== '/json/version') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const port = server.address().port;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        Browser: 'Chrome/154.0.0.0',
+        webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/other-id`,
+      })
+    );
+  });
+  after(() => reuse.close());
+
+  const home = path.join(scratch, 'mismatch-home');
+  const dir = path.join(
+    home,
+    'Library',
+    'Application Support',
+    'slicc',
+    'seven-profiles',
+    'stale-id'
+  );
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    path.join(dir, 'DevToolsActivePort'),
+    `${reuse.port}\n/devtools/browser/retired-browser-id\n`
+  );
+
+  const contacted = [];
+  const result = await resolveCdpEndpoint({
+    env: { ...process.env, HOME: home, PATH: '/nonexistent', SLICC_CDP_URL: '' },
+    platform: 'darwin',
+    fetch: async (url) => {
+      contacted.push(String(url));
+      if (String(url) === `http://127.0.0.1:${reuse.port}/json/version`) {
+        return globalThis.fetch(url);
+      }
+      assert.equal(String(url), 'http://127.0.0.1:9222/json/version');
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({
+            webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/fallback',
+          });
+        },
+      };
+    },
+  });
+  assert.equal(result.url, 'ws://127.0.0.1:9222/devtools/browser/fallback');
+  assert.equal(contacted[0], `http://127.0.0.1:${reuse.port}/json/version`);
+  assert.equal(contacted.at(-1), 'http://127.0.0.1:9222/json/version');
+  assert.match(
+    result.tried.join('\n'),
+    /DevToolsActivePort: no live DevToolsActivePort \(1 rejected for browser identity mismatch\)/
+  );
+  assert.match(result.tried.join('\n'), /127\.0\.0\.1:9222: answered/);
+});
+
 test('127.0.0.1:9222 is last when CLI and DevToolsActivePort fail', async () => {
   const contacted = [];
   const result = await resolveCdpEndpoint({
