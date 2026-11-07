@@ -187,13 +187,17 @@ function dispatchFrame(message) {
   if (targetId === undefined) return;
   const key = socketKey(message.sessionId, params.requestId);
   const url = sockets.get(key);
-  if (url !== undefined) return route(targetId, url, response.payloadData, () => true);
+  if (typeof url === 'string') {
+    route(targetId, url, response.payloadData, () => true);
+    return;
+  }
+  if (guarded) return;
   route(targetId, url, response.payloadData, (sub) => sub.urlMatch === undefined);
   holdFrame(message.sessionId, targetId, key, response.payloadData);
 }
 
 function route(targetId, url, raw, which) {
-  if (guarded && typeof url === 'string' && isProtectedUrl(url)) return;
+  if (guarded && (typeof url !== 'string' || isProtectedUrl(url))) return;
   for (const sub of subscribers.values()) {
     if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
     const body = parseFrame(raw, sub.filter?.parseAs);
@@ -247,6 +251,7 @@ async function learnUrl(client, message) {
   sockets.set(key, url);
   const frames = held.get(key) ?? [];
   held.delete(key);
+  if (guarded && isProtectedUrl(url)) return;
   const targetId = tabsBySession.get(sessionId);
   for (const raw of frames) route(targetId, url, raw, (sub) => sub.urlMatch !== undefined);
 }

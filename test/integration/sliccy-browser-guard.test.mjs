@@ -825,6 +825,155 @@ test('websocket refuses a protected tab and drops protected socket frames', asyn
   });
 });
 
+test('discovered websocket learnUrl keeps a protected learned URL dropped', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression.includes('.take(')) {
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'string', value: 'wss://seven.sliccy.ai/ws' } },
+        });
+        return true;
+      }
+      if (expression.includes('__sliccWsSent')) {
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'boolean', value: true } },
+        });
+        return true;
+      }
+      if (expression === '"learn-protected-ws"') {
+        send({
+          method: 'Network.webSocketFrameSent',
+          params: {
+            requestId: 'LEARN1',
+            response: { opcode: 1, payloadData: 'ping-protected' },
+          },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        send({
+          method: 'Network.webSocketFrameReceived',
+          params: {
+            requestId: 'LEARN1',
+            response: { opcode: 1, payloadData: '{"kind":"after-learn","n":3}' },
+          },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'string', value: 'ok' } },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const logged = [];
+    const write = console.log;
+    console.log = (...args) => {
+      logged.push(args.map(String).join(' '));
+    };
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /example\.test|sliccy\.ai/u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"learn-protected-ws"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('after-learn')),
+        false
+      );
+    } finally {
+      console.log = write;
+      await handle?.close();
+    }
+  });
+});
+
+test('discovered websocket drops frames when socket URL is unknown', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(page)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+    },
+    intercept: (message, send) => {
+      if (
+        message.method === 'Runtime.evaluate' &&
+        message.params?.expression === '"emit-unknown-ws"'
+      ) {
+        const sessionId = message.sessionId;
+        send({
+          method: 'Network.webSocketFrameReceived',
+          params: {
+            requestId: 'PREEXISTING',
+            response: { opcode: 1, payloadData: '{"kind":"canary","n":7}' },
+          },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: { result: { type: 'string', value: 'ok' } },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const logged = [];
+    const write = console.log;
+    console.log = (...args) => {
+      logged.push(args.map(String).join(' '));
+    };
+    let bare;
+    let matched;
+    try {
+      bare = await browser.websocket.on(tab).filter({ parseAs: 'json' }).forward({ sink: 'log' });
+      matched = await browser.websocket
+        .on(tab, { urlMatch: /sliccy\.ai/u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"emit-unknown-ws"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('canary')),
+        false
+      );
+    } finally {
+      console.log = write;
+      await bare?.close();
+      await matched?.close();
+    }
+  });
+});
+
 test('Slack-shaped relative fetch works on discovered app.slack.com; seven relatives refuse', async () => {
   const slack = {
     targetId: 'SLACK',
