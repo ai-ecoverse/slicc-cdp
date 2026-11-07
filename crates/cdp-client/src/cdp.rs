@@ -3630,10 +3630,16 @@ impl Cdp {
         self.blocked.insert(session.to_string());
         self.detaching.retain(|_, owner| owner != session);
         for target in guards {
+            let iframe = self.targets.get(&target).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("iframe");
             self.guards.remove(&target);
             self.documents.remove(&target);
             self.cached_documents.remove(&target);
-            self.abandon(&target);
+            if iframe {
+                self.abandoned.remove(&target);
+                self.protected_targets.remove(&target);
+            } else {
+                self.abandon(&target);
+            }
         }
         self.runtime_sessions.retain(|_, owner| owner != session);
         self.frame_sessions.remove(session);

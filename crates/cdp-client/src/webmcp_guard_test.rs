@@ -34,6 +34,7 @@ struct BackendState {
     oopif_tree: Option<Value>,
     get_target_parent: Option<String>,
     omit_get_target_parent: bool,
+    suppress_runtime_child: bool,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -131,7 +132,8 @@ impl Transport for Backend {
                     state.inbox.push_back(json!({"id":command["id"],"error":{"message":"verification failed"}}).to_string());
                     return Ok(());
                 }
-                if command["sessionId"] == "CHILD" {
+                let session = command["sessionId"].as_str().unwrap_or("");
+                if session.starts_with("CHILD") {
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
                     state.tree.clone()
@@ -143,14 +145,16 @@ impl Transport for Backend {
             }
             "Runtime.enable" => {
                 let session = command["sessionId"].as_str().unwrap_or("H");
-                if session == "CHILD" {
-                    if let Some(child) = state.runtime_child.clone().or_else(|| {
-                        state.oopif_tree.as_ref().map(|tree| {
-                            let frame = &tree["frameTree"]["frame"];
-                            json!({"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}})
-                        })
-                    }) {
-                        state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":child}}).to_string());
+                if session == "CHILD" || session == "CHILD-NEW" || session == "CHILD-OLD" {
+                    if !state.suppress_runtime_child {
+                        if let Some(child) = state.runtime_child.clone().or_else(|| {
+                            state.oopif_tree.as_ref().map(|tree| {
+                                let frame = &tree["frameTree"]["frame"];
+                                json!({"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}})
+                            })
+                        }) {
+                            state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":child}}).to_string());
+                        }
                     }
                     json!({})
                 } else {
@@ -240,7 +244,7 @@ impl Transport for Backend {
                 }
                 if state.attach_on_auto_attach {
                     let parent = command["sessionId"].as_str().unwrap_or("H");
-                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}).to_string());
+                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}).to_string());
                 }
                 if state.buffer_child_lifecycle_on_auto_attach {
                     let parent = command["sessionId"].as_str().unwrap_or("H");

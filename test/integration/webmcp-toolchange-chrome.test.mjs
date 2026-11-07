@@ -18,9 +18,41 @@ const binary = path.join(
 );
 
 function environment(cwd) {
-  const env = { ...process.env, HOME: cwd, USERPROFILE: cwd, APPDATA: cwd, XDG_CONFIG_HOME: cwd };
+  const env = {
+    ...process.env,
+    HOME: cwd,
+    USERPROFILE: cwd,
+    APPDATA: cwd,
+    XDG_CONFIG_HOME: cwd,
+    SLICC_WEBMCP_TRACE: '1',
+  };
   delete env.SLICC_CDP_URL;
   return env;
+}
+
+function childTraceTimeline(stderr, sinceMs = 0) {
+  const rows = [];
+  for (const line of String(stderr).split('\n')) {
+    if (!line.includes('webmcp-polyfill:')) continue;
+    const json = line.slice(line.indexOf('{'));
+    try {
+      const value = JSON.parse(json);
+      if (value.sessionRole === 'child' || value.frameRole === 'OOPIF' || value.event) {
+        rows.push({
+          sequence: value.sequence,
+          event: value.event,
+          reason: value.reason,
+          ms: sinceMs,
+          page: value.page,
+          revoked: value.revoked,
+          pendingInstall: value.pendingInstall,
+        });
+      }
+    } catch {
+      rows.push({ raw: line.trim() });
+    }
+  }
+  return rows;
 }
 
 function stream(endpoint, cwd, args) {
@@ -136,10 +168,22 @@ const changed = (frameId) => (line) => line.event === 'tools-changed' && line.fr
 const names = (event) => event.tools.map((tool) => tool.name);
 
 let ordinaryNavRun = 0;
-for (const protectedFrames of [true, false, false, false, false, false]) {
+for (const protectedFrames of [
+  true,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+]) {
   const title = protectedFrames
     ? 'Chrome: the WebMCP holder reports ordinary tool changes, recovers cross-origin frames after navigation and excludes protected frames'
-    : `Chrome: ordinary to ordinary navigation retains admitted cross-origin tool changes (temp ${++ordinaryNavRun}/5)`;
+    : `Chrome: ordinary to ordinary navigation retains admitted cross-origin tool changes (temp ${++ordinaryNavRun}/10)`;
   await test(title, {
     timeout: 240000,
   }, async () => {
@@ -492,8 +536,9 @@ addEventListener('pagehide', () => document.modelContext.registerTool(${tool('st
       assert.equal(await held.ended, 0, held.stderr());
       held = undefined;
     } catch (error) {
+      const stderr = held?.stderr() || '';
       throw new Error(
-        `${error.message}\nholder: ${held?.stderr()}\nwire: ${JSON.stringify(wire?.snapshot())}`,
+        `${error.message}\nholder: ${stderr}\nchild-trace: ${JSON.stringify(childTraceTimeline(stderr))}\nwire: ${JSON.stringify(wire?.snapshot())}`,
         { cause: error }
       );
     } finally {
