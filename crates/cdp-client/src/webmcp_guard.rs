@@ -47,6 +47,7 @@ struct Arm {
     revoked_reason: Option<&'static str>,
     pending_contexts: BTreeMap<i64, Instant>,
     pending_install: Option<Instant>,
+    pending_install_loader: Option<String>,
     pending_frames: BTreeMap<String, (String, Instant)>,
     accepted: BTreeSet<(String, String, String)>,
     installing: BTreeSet<(String, String, String)>,
@@ -476,6 +477,7 @@ impl Cdp {
     fn webmcp_settle_child(&mut self, child: &str, notice: &str) {
         if let Some(arm) = self.webmcp.arms.get_mut(child) {
             arm.pending_install = None;
+            arm.pending_install_loader = None;
             arm.pending_contexts.clear();
             arm.pending_frames.clear();
         }
@@ -500,6 +502,9 @@ impl Cdp {
         let attached = self.webmcp.holders.values().any(|holder| holder == session);
         let debug = self.webmcp.arms.get(session).is_some_and(|arm| !arm.plain);
         self.webmcp_detach_parked_children(session);
+        if self.webmcp.arms.contains_key(session) {
+            let _ = self.raw_call("Target.setAutoAttach", json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(session), OPTIONAL_STEP);
+        }
         self.webmcp_revoke(session);
         if debug {
             let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
@@ -518,7 +523,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new() });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new() });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -700,7 +705,7 @@ impl Cdp {
             || frame.get("securityOrigin").and_then(Value::as_str) != Some(&context.origin)
             || !same_origin && !cross || context.unique.is_empty() || self.webmcp.contexts.get(&(session.to_string(), id)) != Some(context)
             || !self.webmcp_plain(session) && self.worlds.reason(session, "Debugger.enable", &json!({})).is_some() { return Err(self.refusal()); }
-        if cross && (self.frame_protected(&context.frame) || self.guard.url(&context.origin) || self.guard.extension_frame(&context.origin)
+        if (cross || self.webmcp.parents.contains_key(session)) && (self.frame_protected(&context.frame) || self.guard.url(&context.origin) || self.guard.extension_frame(&context.origin)
             || frame.get("url").and_then(Value::as_str).is_some_and(|url| self.guard.extension_frame(url) || self.guard.url(url))
             || !self.webmcp_frame_verified(frame)) { return Err(self.refusal()); }
         Ok(())
@@ -886,7 +891,7 @@ impl Cdp {
             })
         });
         if converted.is_err() {
-            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.conversion = None; arm.pending_install = None; }
+            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.conversion = None; arm.pending_install = None; arm.pending_install_loader = None; }
             let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
         }
         self.webmcp.paused.remove(session);
@@ -1046,7 +1051,7 @@ impl Cdp {
         });
         let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
         self.webmcp.paused.remove(session);
-        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.pending_install = None; }
+        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.pending_install = None; arm.pending_install_loader = None; }
         if let Err(message) = admitted {
             if Self::webmcp_foreign_refusal(&message) {
                 let _ = self.webmcp_enter_plain(session, &message, true).and_then(|_| self.webmcp_install_current(session));
@@ -1064,6 +1069,7 @@ impl Cdp {
         let arm = self.webmcp.arms.get_mut(session).ok_or_else(|| "slicc: refused: WebMCP holder disappeared\n".to_string())?;
         if root { arm.root_identity = Some((target.clone(), context.clone())); }
         arm.pending_install = None;
+        arm.pending_install_loader = None;
         arm.pending_contexts.remove(&id);
         arm.pending_frames.remove(&context.frame);
         if arm.accepted.len() >= 1024 {
@@ -1110,6 +1116,7 @@ impl Cdp {
             revoked_reason: None,
             pending_contexts: BTreeMap::new(),
             pending_install: None,
+            pending_install_loader: None,
             pending_frames: BTreeMap::new(),
             accepted: BTreeSet::new(),
             installing: BTreeSet::new(),
@@ -1240,6 +1247,16 @@ impl Cdp {
             })
     }
 
+    fn webmcp_pend_install(&mut self, child: &str, loader: &str) {
+        if loader.is_empty() { return; }
+        if let Some(arm) = self.webmcp.arms.get_mut(child) {
+            if arm.pending_install.is_none() || arm.pending_install_loader.as_deref() != Some(loader) {
+                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
+                arm.pending_install_loader = Some(loader.to_string());
+            }
+        }
+    }
+
     fn webmcp_adopt_install(&mut self, child: &str, parent: &str, until: Instant) -> Result<bool, String> {
         let target = self.session_target(child).ok_or_else(|| self.refusal())?;
         let tree = self.webmcp_stable(child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(child), left.min(OPTIONAL_STEP)))?;
@@ -1259,14 +1276,11 @@ impl Cdp {
         if !self.webmcp.requested_origins.contains(&origin) {
             if let Some(arm) = self.webmcp.arms.get_mut(child) {
                 arm.pending_install = None;
+                arm.pending_install_loader = None;
             }
             return Ok(false);
         }
-        if let Some(arm) = self.webmcp.arms.get_mut(child) {
-            if arm.pending_install.is_none() {
-                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
-            }
-        }
+        self.webmcp_pend_install(child, &loader);
         let parent_root = self.webmcp_root_document(parent, until)?;
         let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("");
         if !loader.is_empty() {
@@ -1285,9 +1299,7 @@ impl Cdp {
                 && !context.unique.is_empty()
                 && (context.loader.is_empty() || context.loader == loader)
         }).map(|(key, context)| (key.1, context.clone())) else {
-            if let Some(arm) = self.webmcp.arms.get_mut(child) {
-                arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
-            }
+            self.webmcp_pend_install(child, &loader);
             return Ok(false);
         };
         context.loader = loader.clone();
@@ -1299,6 +1311,7 @@ impl Cdp {
             arm.loaders.insert(frame_id.to_string(), context.loader.clone());
             arm.root_identity = Some((target.clone(), context.clone()));
             arm.pending_install = None;
+            arm.pending_install_loader = None;
         }
         let realm = (context.frame.clone(), context.loader.clone(), context.unique.clone());
         if self.webmcp.arms.get(child).is_some_and(|arm| arm.accepted.contains(&realm)) {
@@ -1323,11 +1336,9 @@ impl Cdp {
         }).cloned().collect::<Vec<_>>();
         for child in waiting {
             let Some(parent) = self.webmcp.parents.get(&child).cloned() else { continue; };
-            if let Some(arm) = self.webmcp.arms.get_mut(&child) {
-                if arm.pending_install.is_none() {
-                    arm.pending_install = Some(Instant::now() + DOCUMENT_CHECK);
-                }
-            }
+            let loader = self.session_target(&child).and_then(|target| self.documents.get(&target)).map(|document| document.frame_id.clone())
+                .and_then(|frame| self.webmcp.arms.get(&child).and_then(|arm| arm.loaders.get(&frame).cloned())).unwrap_or_default();
+            self.webmcp_pend_install(&child, &loader);
             let until = Instant::now() + DOCUMENT_CHECK;
             match self.webmcp_adopt_install(&child, &parent, until) {
                 Ok(true) => {}
@@ -1396,6 +1407,7 @@ impl Cdp {
                 let _ = self.webmcp_adopt_install(&child, &parent, Instant::now() + OPTIONAL_STEP);
             } else if let Some(arm) = self.webmcp.arms.get_mut(&child) {
                 arm.pending_install = None;
+                arm.pending_install_loader = None;
             }
             if let Some(origin) = seed.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str) {
                 self.webmcp_remember_child_origin(&child, origin);
