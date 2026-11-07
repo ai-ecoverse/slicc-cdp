@@ -819,3 +819,98 @@ test('websocket refuses a protected tab and drops protected socket frames', asyn
     }
   });
 });
+
+test('Slack-shaped relative fetch works on discovered app.slack.com; seven relatives refuse', async () => {
+  const slack = {
+    targetId: 'SLACK',
+    url: 'https://app.slack.com/client/T1/C1',
+    title: 'Slack',
+  };
+  const seenFetch = [];
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: [info(slack), info(seven)] },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+      'Network.getCookies': {
+        cookies: [
+          { name: 'd', value: 'slack-d', domain: '.slack.com', path: '/' },
+          { name: 'seven_session', value: 'secret', domain: '.sliccy.ai', path: '/' },
+        ],
+      },
+    },
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      if (expression.includes('await fetch(')) {
+        const match = expression.match(/await fetch\(([^,]+),/u);
+        if (match) seenFetch.push(match[1]);
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            result: {
+              type: 'object',
+              value: {
+                status: 200,
+                statusText: 'OK',
+                headers: {},
+                body: 'ok',
+                url: 'https://app.slack.com/api/auth.test',
+              },
+            },
+          },
+        });
+        return true;
+      }
+      if (expression.includes('localStorage.getItem')) {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { result: { type: 'string', value: '{"ok":true}' } },
+        });
+        return true;
+      }
+      send({
+        id: message.id,
+        ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        result: { result: { type: 'string', value: 'async-ok' } },
+      });
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const found = await browser.findTab({
+      domain: 'app.slack.com',
+      urlMatch: /\/client\/[A-Z0-9]+/u,
+    });
+    assert.equal(found?.targetId, 'SLACK');
+    const relative = await browser.fetch(found, '/api/auth.test', { method: 'POST' });
+    assert.equal(relative?.status, 200);
+    assert.ok(seenFetch.some((arg) => arg.includes('/api/auth.test')));
+    assert.ok(!seenFetch.some((arg) => arg.includes('https://app.slack.com/api/auth.test')));
+    const absolute = await browser.fetch(found, 'https://edgeapi.slack.com/cache/T1/users/info');
+    assert.equal(absolute?.status, 200);
+    assert.equal(await browser.cookie(found, 'd'), 'slack-d');
+    assert.equal(await browser.cookie(found, 'seven_session'), null);
+    assert.equal(await browser.localStorage(found, 'localConfig_v2'), '{"ok":true}');
+    assert.equal(await browser.evalAsync(found, '1'), 'async-ok');
+    await assert.rejects(() => browser.fetch(found, '//lars.sliccy.ai/x'), {
+      message: REFUSAL,
+    });
+    await assert.rejects(() => browser.fetch(seven, '/api/x'), { message: REFUSAL });
+    await assert.rejects(() => browser.fetch(found, 'http://[::1'), /could not resolve/);
+    const handle = await browser.websocket
+      .on(found, { urlMatch: /slack\.com/u })
+      .forward({ sink: 'log' });
+    assert.equal(typeof handle.close, 'function');
+    await handle.close();
+    await assert.rejects(() => browser.websocket.on(seven).forward({ sink: 'log' }), {
+      message: REFUSAL,
+    });
+  });
+});

@@ -484,11 +484,25 @@ export async function localStorage(tab, key) {
   return typeof raw === 'string' ? raw : String(raw);
 }
 
+function resolveFetchUrl(url, liveTop) {
+  try {
+    return new URL(url, liveTop).href;
+  } catch {
+    throw new TypeError(
+      `browser.fetch: could not resolve ${JSON.stringify(url)} against ${JSON.stringify(liveTop)}`
+    );
+  }
+}
+
 export async function fetch(tab, url, opts = {}) {
   if (typeof url !== 'string') throw new TypeError('browser.fetch: url must be a string');
   return using(async () => {
     await openClient();
-    if (guarded) refuseProtected(url);
+    if (guarded) {
+      const liveTop = await urlOf(tab);
+      refuseProtected(liveTop);
+      refuseProtected(resolveFetchUrl(url, liveTop));
+    }
     const script = await buildBrowserFetchScript(url, opts);
     return evaluateNow(tab, script, true);
   });
