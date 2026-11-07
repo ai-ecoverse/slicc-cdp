@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import browser, { REFUSAL } from '../../packages/sliccy-browser/src/browser.js';
 import { isProtectedUrl } from '../../packages/sliccy-browser/src/guard.js';
 import { fakeCdp } from './fake-cdp.mjs';
@@ -134,9 +135,13 @@ test('isProtectedUrl covers seven, vault, extension, error pages; fail closed', 
   assert.equal(isProtectedUrl('https://sliccy.ai./'), true);
   assert.equal(isProtectedUrl('chrome-extension://abcd/page.html'), true);
   assert.equal(isProtectedUrl('chrome-error://chromewebdata/'), true);
+  assert.equal(isProtectedUrl('file:///tmp/x'), true);
+  assert.equal(isProtectedUrl('chrome://settings/'), true);
+  assert.equal(isProtectedUrl('devtools://devtools/bundled/'), true);
+  assert.equal(isProtectedUrl('blob:https://seven.sliccy.ai/uuid'), true);
+  assert.equal(isProtectedUrl('about:blank'), true);
+  assert.equal(isProtectedUrl('about:srcdoc'), true);
   assert.equal(isProtectedUrl('https://example.test/'), false);
-  assert.equal(isProtectedUrl('about:blank'), false);
-  assert.equal(isProtectedUrl('ftp://sliccy.ai/'), false);
   assert.equal(isProtectedUrl(''), true);
   assert.equal(isProtectedUrl('not a url'), true);
   assert.equal(isProtectedUrl(null), true);
@@ -429,5 +434,175 @@ test('eval surfaces Runtime.evaluate exceptionDetails under guard', async () => 
   after(() => fake.close());
   await withDiscovered(fake, async () => {
     await assert.rejects(() => browser.eval(ok, 'throw 1'), { message: 'boom' });
+  });
+});
+
+test('vendored guard matches protected.json vectors', async () => {
+  const catalog = JSON.parse(
+    await readFile(
+      fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/catalog.json')),
+      'utf8'
+    )
+  );
+  const vectors = JSON.parse(
+    await readFile(
+      fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/protected.json')),
+      'utf8'
+    )
+  );
+  const { protectedOrigins } = await import('../../packages/sliccy-browser/src/protected.js');
+  const { PROTECTED_ORIGINS } = await import(
+    '../../packages/sliccy-browser/src/protected-origins.js'
+  );
+  assert.deepEqual(PROTECTED_ORIGINS, catalog.protectedOrigins);
+  const reference = protectedOrigins(catalog.protectedOrigins, vectors.origins);
+  const vendored = protectedOrigins(PROTECTED_ORIGINS, vectors.origins);
+  for (const entry of vectors.urls) {
+    assert.equal(vendored.url(entry.url), reference.url(entry.url), entry.url);
+    assert.equal(vendored.url(entry.url), entry.protected, entry.url);
+  }
+  for (const entry of vectors.targets) {
+    assert.equal(vendored.target(entry), reference.target(entry), JSON.stringify(entry));
+    assert.equal(vendored.target(entry), entry.protected, JSON.stringify(entry));
+  }
+  for (const entry of vectors.cookieDomains) {
+    assert.equal(
+      vendored.cookieDomain(entry.domain),
+      reference.cookieDomain(entry.domain),
+      entry.domain
+    );
+    assert.equal(vendored.cookieDomain(entry.domain), entry.protected, entry.domain);
+  }
+  for (const entry of vectors.storageKeys) {
+    assert.equal(vendored.storageKey(entry.key), reference.storageKey(entry.key), entry.key);
+    assert.equal(vendored.storageKey(entry.key), entry.protected, entry.key);
+  }
+  assert.equal(
+    vendored.extensionFrame('chrome-extension://abcd/page.html'),
+    reference.extensionFrame('chrome-extension://abcd/page.html')
+  );
+  assert.equal(vendored.extensionFrame('chrome-extension://abcd/page.html'), true);
+  assert.equal(vendored.extensionFrame('https://example.test/'), false);
+  assert.equal(vendored.extensionFrame('not-a-url'), false);
+  assert.equal(vendored.unparseable('http://[::1'), reference.unparseable('http://[::1'));
+});
+
+test('first cookie/eval/fetch call discovers and refuses a protected tab', async () => {
+  const fake = await fakeCdp({ answers: guardedAnswers(), intercept: guardedIntercept });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.cookie('SEVEN', 'canary'), { message: REFUSAL });
+    await assert.rejects(() => browser.eval('SEVEN', 'location.href'), { message: REFUSAL });
+    await assert.rejects(() => browser.evalAsync('VAULT', '1'), { message: REFUSAL });
+    await assert.rejects(() => browser.localStorage('EXT', 'k'), { message: REFUSAL });
+    await assert.rejects(() => browser.fetch('SEVEN', 'https://example.test/'), {
+      message: REFUSAL,
+    });
+  });
+});
+
+test('after idle close, reopened discovery still refuses a protected tab', async () => {
+  const fake = await fakeCdp({ answers: guardedAnswers(), intercept: guardedIntercept });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    assert.equal((await browser.findTab({ domain: 'example.test' }))?.targetId, 'OK');
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await assert.rejects(() => browser.cookie('SEVEN', 'canary'), { message: REFUSAL });
+    await assert.rejects(() => browser.eval('SEVEN', 'location.href'), { message: REFUSAL });
+  });
+});
+
+test('first call with SLICC_CDP_URL stays unguarded for a protected tab', async () => {
+  const fake = await fakeCdp({ answers: guardedAnswers(), intercept: guardedIntercept });
+  after(() => fake.close());
+  const previous = process.env.SLICC_CDP_URL;
+  process.env.SLICC_CDP_URL = fake.url;
+  await settle();
+  try {
+    assert.equal(await browser.cookie('SEVEN', 'seven_session'), 'secret');
+    assert.equal(await browser.eval('SEVEN', '1'), 'leaked');
+  } finally {
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
+});
+
+test('missing and non-page targets are refused in discovered mode', async () => {
+  const worker = {
+    targetId: 'SW',
+    type: 'service_worker',
+    url: 'https://example.test/sw.js',
+    title: 'sw',
+  };
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': {
+        targetInfos: [info(ok), { ...info(worker), type: 'service_worker' }],
+      },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+      'Network.getCookies': { cookies: [{ name: 'x', value: 'leak' }] },
+    },
+    intercept: guardedIntercept,
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.cookie('GONE', 'x'), { message: REFUSAL });
+    await assert.rejects(() => browser.eval('SW', '1'), { message: REFUSAL });
+    await assert.rejects(() => browser.cookie('SW', 'x'), { message: REFUSAL });
+  });
+});
+
+test('discovered mode refuses file, chrome, devtools, blob-seven, about:blank via findTab and ops', async () => {
+  const fileTab = { targetId: 'FILE', url: 'file:///tmp/secret.txt', title: 'file' };
+  const settings = { targetId: 'SETTINGS', url: 'chrome://settings/', title: 'settings' };
+  const devtools = {
+    targetId: 'DEVTOOLS',
+    url: 'devtools://devtools/bundled/inspector.html',
+    title: 'devtools',
+  };
+  const blobSeven = {
+    targetId: 'BLOB',
+    url: 'blob:https://seven.sliccy.ai/11111111-1111-1111-1111-111111111111',
+    title: 'blob',
+  };
+  const blank = { targetId: 'BLANK', url: 'about:blank', title: 'blank' };
+  const pages = [fileTab, settings, devtools, blobSeven, blank, ok];
+  const fake = await fakeCdp({
+    answers: {
+      'Target.getTargets': { targetInfos: pages.map(info) },
+      'Target.attachToTarget': { sessionId: 'S1' },
+      'Page.enable': {},
+      'Runtime.enable': {},
+      'Network.enable': {},
+      'Network.getCookies': { cookies: [] },
+    },
+    intercept: guardedIntercept,
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    await assert.rejects(() => browser.findTab({ urlMatch: '^file:' }), { message: REFUSAL });
+    await assert.rejects(() => browser.findTab({ domain: 'settings' }), { message: REFUSAL });
+    await assert.rejects(() => browser.findTab({ urlMatch: '^devtools:' }), { message: REFUSAL });
+    await assert.rejects(() => browser.findTab({ urlMatch: '^blob:' }), { message: REFUSAL });
+    await assert.rejects(() => browser.findTab({ urlMatch: '^about:blank' }), {
+      message: REFUSAL,
+    });
+    for (const tab of [fileTab, settings, devtools, blobSeven, blank]) {
+      await assert.rejects(() => browser.eval(tab, '1'), { message: REFUSAL });
+      await assert.rejects(() => browser.cookie(tab, 'x'), { message: REFUSAL });
+      await assert.rejects(() => browser.localStorage(tab, 'k'), { message: REFUSAL });
+      await assert.rejects(() => browser.fetch(tab, 'https://example.test/'), {
+        message: REFUSAL,
+      });
+    }
+    await assert.rejects(() => browser.ensureTab('file:///tmp/x'), { message: REFUSAL });
+    await assert.rejects(() => browser.ensureTab('chrome://settings/'), { message: REFUSAL });
+    await assert.rejects(() => browser.ensureTab('about:blank'), { message: REFUSAL });
+    assert.equal((await browser.findTab({ domain: 'example.test' }))?.targetId, 'OK');
   });
 });

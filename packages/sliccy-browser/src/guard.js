@@ -1,37 +1,43 @@
-export const REFUSAL = "slicc: refused: target is on seven's origin";
+import { protectedOrigins } from './protected.js';
+import { PROTECTED_ORIGINS } from './protected-origins.js';
 
-function parse(text) {
-  if (typeof text !== 'string') return null;
-  try {
-    return new URL(text);
-  } catch {
-    return null;
-  }
-}
+export const REFUSAL = PROTECTED_ORIGINS.refusal;
 
-function hostOf(url) {
-  const host = url.hostname.toLowerCase();
-  return host.endsWith('.') ? host.slice(0, -1) : host;
-}
+const guard = protectedOrigins(PROTECTED_ORIGINS);
 
 function under(host, domain) {
   return host === domain || host.endsWith(`.${domain}`);
 }
 
+function inheritingAbout(text) {
+  if (typeof text !== 'string') return false;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== 'about:') return false;
+    return PROTECTED_ORIGINS.inheriting.includes(`about:${url.pathname.toLowerCase()}`);
+  } catch {
+    return false;
+  }
+}
+
 export function isProtectedHost(host) {
   if (typeof host !== 'string' || host.length === 0) return true;
   const name = host.toLowerCase().replace(/\.$/u, '');
-  return under(name, 'sliccy.ai');
+  if (PROTECTED_ORIGINS.hosts.includes(name)) return true;
+  return PROTECTED_ORIGINS.domains.some((domain) => under(name, domain));
 }
 
 export function isProtectedUrl(text) {
   if (typeof text !== 'string' || text.length === 0) return true;
-  const url = parse(text);
-  if (!url) return true;
-  const scheme = url.protocol.slice(0, -1);
-  if (scheme === 'chrome-extension' || scheme === 'chrome-error') return true;
-  if (scheme === 'https' || scheme === 'http') return isProtectedHost(hostOf(url));
-  return false;
+  if (inheritingAbout(text)) return true;
+  if (
+    typeof PROTECTED_ORIGINS.errorPage?.url === 'string' &&
+    text === PROTECTED_ORIGINS.errorPage.url
+  ) {
+    return true;
+  }
+  if (text.startsWith('chrome-error:')) return true;
+  return guard.url(text);
 }
 
 export function refuseProtected(text) {

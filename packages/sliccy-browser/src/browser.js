@@ -65,13 +65,25 @@ async function openResolved() {
   return connect({ url });
 }
 
-async function urlOf(tab) {
+async function liveInfo(tab) {
   const targetId = targetIdOf(tab);
-  const tabs = await listTabs();
-  return tabs.find((item) => item.targetId === targetId)?.url ?? '';
+  const client = await openClient();
+  const result = await client.send('Target.getTargets');
+  const infos = Array.isArray(result?.targetInfos) ? result.targetInfos : [];
+  return (
+    infos.find((info) => info && typeof info.targetId === 'string' && info.targetId === targetId) ??
+    null
+  );
+}
+
+async function urlOf(tab) {
+  const info = await liveInfo(tab);
+  if (info?.type !== 'page') return '';
+  return typeof info.url === 'string' ? info.url : '';
 }
 
 async function withGuardedTab(tab, work) {
+  await openClient();
   if (!guarded) return work();
   refuseProtected(await urlOf(tab));
   const result = await work();

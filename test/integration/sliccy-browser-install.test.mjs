@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { nodeTransport } from '@ai-ecoverse/slicc-kernel/node';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest } from './chrome-policy.mjs';
@@ -128,6 +129,34 @@ test('sliccy-browser’s copies of the CDP client are the same bytes as src/', a
       await readFile(path.resolve('src', file), 'utf8'),
       `run: cp src/${file} packages/sliccy-browser/src/, and raise its version`
     );
+});
+
+test("sliccy-browser's protected.mjs copy matches @ai-ecoverse/slicc-browsers", async () => {
+  assert.equal(
+    await readFile(path.join(PACKAGE, 'src', 'protected.js'), 'utf8'),
+    await readFile(
+      fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/protected.mjs')),
+      'utf8'
+    ),
+    'run: cp node_modules/@ai-ecoverse/slicc-browsers/protected.mjs packages/sliccy-browser/src/protected.js, and raise its version'
+  );
+});
+
+test("sliccy-browser's protectedOrigins rules match the installed catalog", async () => {
+  const catalog = JSON.parse(
+    await readFile(
+      fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/catalog.json')),
+      'utf8'
+    )
+  );
+  const { PROTECTED_ORIGINS } = await import(
+    '../../packages/sliccy-browser/src/protected-origins.js'
+  );
+  assert.deepEqual(
+    PROTECTED_ORIGINS,
+    catalog.protectedOrigins,
+    'copy catalog.protectedOrigins into packages/sliccy-browser/src/protected-origins.js, and raise its version'
+  );
 });
 
 test('what sliccy-browser ships is what npm has under its version, so a change to it names a new version for ci.yml to publish', async (t) => {
