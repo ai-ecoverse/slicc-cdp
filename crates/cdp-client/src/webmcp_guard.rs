@@ -1518,8 +1518,19 @@ impl Cdp {
         let holders = self.webmcp.arms.keys().filter(|session| self.webmcp_reconcile_eligible(session)).cloned().collect::<Vec<_>>();
         let known = !self.webmcp.arms.is_empty() || !self.webmcp.auto_attach_tried.is_empty() || !holders.is_empty();
         if !arm && !known && self.info_protected(info, &[]) { return false; }
+        let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
+        let prior = self.webmcp.recorded.get(&target).map(|recorded| recorded.session.clone());
+        if let Some(adopted) = prior.filter(|adopted| !waiting && adopted != &child) {
+            if let Some(holder) = holders.iter().find(|holder| self.webmcp_live_child(holder, &adopted)).cloned() {
+                self.webmcp_merge_target(&target, info);
+                self.webmcp_trace_decision("keep", &target, &adopted, &child);
+                if !arm { return true; }
+                self.webmcp.reconcile_dirty.insert(holder);
+                self.webmcp_reconcile_pending();
+                return true;
+            }
+        }
         if self.webmcp.recorded.len() < RECORDED_CAP || self.webmcp.recorded.contains_key(&target) {
-            let waiting = value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true);
             self.webmcp.recorded.insert(target.clone(), Recorded { session: child.clone(), waiting, info: info.clone() });
             self.webmcp_trace_decision("record", &target, &child, if owner.is_empty() { "unowned" } else { &owner });
         } else if arm {
@@ -1663,15 +1674,20 @@ impl Cdp {
             let recorded = self.webmcp.recorded.get(&target).cloned();
             let child = match (marker, recorded) {
                 (Some(adopted), Some(recorded)) if adopted == recorded.session => continue,
-                (Some(adopted), Some(recorded)) if recorded.waiting => {
+                (Some(adopted), Some(recorded)) if live && recorded.waiting => {
                     self.webmcp.recorded.remove(&target);
                     self.webmcp_trace_decision("release", &target, &recorded.session, "waitingForDebugger re-attach after same-target adoption");
-                    if live { self.webmcp_retire_child(&target, &adopted); }
+                    self.webmcp_retire_child(&target, &adopted);
                     self.webmcp_release_child(&recorded.session);
                     continue;
                 }
+                (Some(adopted), Some(recorded)) if live => {
+                    self.webmcp_trace_decision("keep", &target, &adopted, &recorded.session);
+                    self.webmcp.recorded.insert(target.clone(), Recorded { session: adopted, waiting: false, info: info.clone() });
+                    continue;
+                }
                 (Some(adopted), Some(recorded)) => {
-                    if live { self.webmcp_retire_child(&target, &adopted); }
+                    if self.webmcp_live_child(holder, &adopted) { self.webmcp_retire_child(&target, &adopted); }
                     recorded.session
                 }
                 (None, Some(recorded)) => recorded.session,
