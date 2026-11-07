@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -68,7 +69,7 @@ function versionOk(port, res, wsHost = '127.0.0.1') {
   res.end(
     JSON.stringify({
       Browser: 'Chrome/154.0.0.0',
-      webSocketDebuggerUrl: `ws://${wsHost}:${port}/devtools/browser/live`,
+      webSocketDebuggerUrl: `ws://${wsHost}:${port}/devtools/browser/${port}`,
     })
   );
 }
@@ -236,17 +237,32 @@ test('slicc missing, non-zero, invalid JSON, and timeout fall through', async ()
   }
 
   const missing = await through(undefined);
-  assert.equal(missing.url, `ws://127.0.0.1:${live.port}/devtools/browser/live`);
+  assert.equal(missing.url, `ws://127.0.0.1:${live.port}/devtools/browser/${live.port}`);
   assert.match(missing.tried.join('\n'), /slicc browsers --json: slicc not on PATH/);
 
-  const badExit = await fakeSlicc('#!/bin/sh\nexit 3\n');
-  const fromExit = await through(badExit);
-  assert.equal(fromExit.url, `ws://127.0.0.1:${live.port}/devtools/browser/live`);
+  const fromExit = await resolveCdpEndpoint({
+    env: {
+      ...process.env,
+      HOME: home,
+      PATH: '/nonexistent',
+      SLICC_CDP_URL: '',
+    },
+    platform: 'darwin',
+    spawn: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.kill = () => undefined;
+      queueMicrotask(() => child.emit('close', 3));
+      return child;
+    },
+    fetch: globalThis.fetch,
+  });
+  assert.equal(fromExit.url, `ws://127.0.0.1:${live.port}/devtools/browser/${live.port}`);
   assert.match(fromExit.tried.join('\n'), /slicc browsers --json: exited 3/);
 
   const badJson = await fakeSlicc('#!/bin/sh\nprintf not-json\n');
   const fromJson = await through(badJson);
-  assert.equal(fromJson.url, `ws://127.0.0.1:${live.port}/devtools/browser/live`);
+  assert.equal(fromJson.url, `ws://127.0.0.1:${live.port}/devtools/browser/${live.port}`);
   assert.match(fromJson.tried.join('\n'), /slicc browsers --json: invalid JSON/);
 
   const slow = await fakeSlicc('#!/bin/sh\n/bin/sleep 5\n');
@@ -260,7 +276,7 @@ test('slicc missing, non-zero, invalid JSON, and timeout fall through', async ()
     platform: 'darwin',
     cliTimeoutMs: 200,
   });
-  assert.equal(fromTimeout.url, `ws://127.0.0.1:${live.port}/devtools/browser/live`);
+  assert.equal(fromTimeout.url, `ws://127.0.0.1:${live.port}/devtools/browser/${live.port}`);
   assert.match(fromTimeout.tried.join('\n'), /slicc browsers --json: timed out/);
 });
 
@@ -335,7 +351,7 @@ test('DevToolsActivePort picks the live newest file and ignores stale or non-loo
     platform: 'darwin',
     fetch: fetchImpl,
   });
-  assert.equal(result.url, `ws://127.0.0.1:${live.port}/devtools/browser/live`);
+  assert.equal(result.url, `ws://127.0.0.1:${live.port}/devtools/browser/${live.port}`);
   assert.match(result.tried.join('\n'), /DevToolsActivePort: chose a live loopback port/);
   for (const url of contacted) {
     assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/json\/version$/u);
@@ -455,4 +471,53 @@ test('spawn uses fixed args without a shell', async () => {
     },
   });
   assert.deepEqual(seen, { command: 'slicc', args: ['browsers', '--json'], shell: false });
+});
+
+test('loadSpawn failure falls through like missing slicc (kernel without child_process)', async () => {
+  const result = await resolveCdpEndpoint({
+    env: {
+      ...process.env,
+      PATH: '/nonexistent',
+      SLICC_CDP_URL: '',
+      HOME: path.join(scratch, 'loadspawn-home'),
+    },
+    platform: 'darwin',
+    profileRoots: [path.join(scratch, 'loadspawn-profiles')],
+    loadSpawn: async () => {
+      throw new Error('Unavailable in this environment');
+    },
+    fetch: async (url) => {
+      assert.equal(String(url), 'http://127.0.0.1:9222/json/version');
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({
+            webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/fallback',
+          });
+        },
+      };
+    },
+  });
+  assert.equal(result.url, 'ws://127.0.0.1:9222/devtools/browser/fallback');
+  assert.match(
+    result.tried.join('\n'),
+    /slicc browsers --json: child_process unavailable \(Unavailable in this environment\)/
+  );
+});
+
+test('browser.js and discover.js do not statically import node:child_process', async () => {
+  const browserSrc = await readFile(
+    new URL('../../packages/sliccy-browser/src/browser.js', import.meta.url),
+    'utf8'
+  );
+  const discoverSrc = await readFile(
+    new URL('../../packages/sliccy-browser/src/discover.js', import.meta.url),
+    'utf8'
+  );
+  assert.equal(/from ['"]node:child_process['"]/u.test(browserSrc), false);
+  assert.equal(/from ['"]node:child_process['"]/u.test(discoverSrc), false);
+  assert.equal(/import\(['"]node:child_process['"]\)/u.test(discoverSrc), true);
+  const mod = await import('../../packages/sliccy-browser/src/browser.js');
+  assert.equal(typeof mod.default.findTab, 'function');
+  assert.equal(typeof mod.version, 'string');
 });

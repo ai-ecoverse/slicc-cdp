@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -142,8 +141,21 @@ function pickCliEndpoint(entries) {
   return candidates[0].url;
 }
 
+export async function loadSpawn() {
+  const mod = await import('node:child_process');
+  return mod.spawn;
+}
+
 async function runSliccBrowsers(options) {
-  const spawnImpl = options.spawn ?? spawn;
+  let spawnImpl = options.spawn;
+  if (spawnImpl === undefined) {
+    try {
+      spawnImpl = await (options.loadSpawn ?? loadSpawn)();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, reason: `child_process unavailable (${message})` };
+    }
+  }
   const timeoutMs = options.cliTimeoutMs ?? CLI_TIMEOUT_MS;
   const maxBytes = options.cliMaxStdout ?? CLI_MAX_STDOUT;
   const env = options.env ?? process.env;
@@ -289,7 +301,9 @@ async function fromDevToolsActivePort(options) {
   files.sort((left, right) => right.mtimeMs - left.mtimeMs);
   for (const item of files) {
     const url = await probeVersion(fetchImpl, item.port, timeoutMs);
-    if (url !== undefined) return { ok: true, url };
+    if (url === undefined) continue;
+    if (new URL(url).pathname !== item.wsPath) continue;
+    return { ok: true, url };
   }
   if (files.length === 0) {
     return { ok: false, reason: 'no DevToolsActivePort files under slicc profile dirs' };
