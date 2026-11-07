@@ -259,8 +259,7 @@ pub fn attached_port() -> Result<Option<String>, String> {
     }
     #[cfg(all(not(test), not(target_arch = "wasm32")))]
     {
-        let env = current_env();
-        select_port(&env, &DiskFs, &mut |url| http_body(url))
+        cdp_client::discover::attached(&mut |url| http_body(url))
     }
 }
 
@@ -833,20 +832,6 @@ fn path_parts(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn profile_dir_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > 64 || name.contains("..") {
-        return false;
-    }
-    let [first, rest @ ..] = bytes else {
-        return false;
-    };
-    first.is_ascii_alphanumeric()
-        && rest
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
 fn is_six_profile(path: &str) -> bool {
     six_profile_path(path)
         || std::fs::canonicalize(path)
@@ -1061,10 +1046,8 @@ pub fn parse_active_port(text: &str) -> Option<(u16, String)> {
     Some((port, path.to_string()))
 }
 
-fn version_accepts(body: &str, path: &str) -> bool {
-    crate::connect::websocket_url_from_version(body)
-        .ok()
-        .is_some_and(|url| url.ends_with(path))
+fn version_accepts(body: &str, path: &str, port: u16) -> bool {
+    cdp_client::discover::version_accepts(body, path, port)
 }
 
 fn child_path(dir: &str, name: &str, windows: bool) -> String {
@@ -1116,110 +1099,11 @@ fn live_text(
     };
     let url = version_url(port);
     match probe(&url) {
-        Ok(body) if version_accepts(&body, &path) => Ok(Some(url)),
+        Ok(body) if version_accepts(&body, &path, port) => Ok(Some(url)),
         Ok(_) => Ok(None),
         Err(message) if message.starts_with("HTTP ") => Err(message),
         Err(_) => Ok(None),
     }
-}
-
-trait ScanFs {
-    fn list_dirs(&self, path: &str) -> Vec<String>;
-    fn read_file(&self, path: &str) -> Option<String>;
-    fn modified(&self, path: &str) -> Option<i64>;
-}
-
-struct PortCandidate {
-    modified: i64,
-    path: String,
-    body: String,
-}
-
-fn config_seven_root(env: &HostEnv) -> String {
-    join_parts(
-        windows_host(env),
-        &[
-            config_dir(env),
-            "slicc".to_string(),
-            "seven-profiles".to_string(),
-        ],
-    )
-}
-
-fn collect_port_files<F: ScanFs>(env: &HostEnv, fs: &F) -> Vec<PortCandidate> {
-    let windows = windows_host(env);
-    let mut found = Vec::new();
-    collect_profile_root(&config_seven_root(env), windows, fs, &mut found);
-    let snap = join_parts(
-        windows,
-        &[env.home.clone(), "snap".to_string()],
-    );
-    for name in fs.list_dirs(&snap) {
-        let root = join_parts(
-            windows,
-            &[
-                snap.clone(),
-                name,
-                "common".to_string(),
-                "slicc".to_string(),
-                "seven-profiles".to_string(),
-            ],
-        );
-        collect_profile_root(&root, windows, fs, &mut found);
-    }
-    found
-}
-
-fn collect_profile_root<F: ScanFs>(
-    root: &str,
-    windows: bool,
-    fs: &F,
-    found: &mut Vec<PortCandidate>,
-) {
-    if is_six_profile(root) {
-        return;
-    }
-    for id in fs.list_dirs(root) {
-        if !profile_dir_name(&id) {
-            continue;
-        }
-        let dir = join_parts(windows, &[root.to_string(), id]);
-        if is_six_profile(&dir) {
-            continue;
-        }
-        let file = child_path(&dir, ACTIVE_PORT_FILE, windows);
-        let Some(body) = fs.read_file(&file) else {
-            continue;
-        };
-        let Some(modified) = fs.modified(&file) else {
-            continue;
-        };
-        found.push(PortCandidate {
-            modified,
-            path: file,
-            body,
-        });
-    }
-}
-
-fn select_port<F: ScanFs>(
-    env: &HostEnv,
-    fs: &F,
-    probe: &mut dyn FnMut(&str) -> Result<String, String>,
-) -> Result<Option<String>, String> {
-    let mut found = collect_port_files(env, fs);
-    found.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    for candidate in found {
-        if let Some(url) = live_text(&candidate.body, probe)? {
-            return Ok(Some(url));
-        }
-    }
-    Ok(None)
 }
 
 pub fn seed_preferences(existing: Option<&str>, unix_micros: i64) -> Result<Option<String>, ()> {
@@ -1637,7 +1521,7 @@ fn wait_for_debugger(
         {
             let url = version_url(port);
             match http_body(&url) {
-                Ok(body) if version_accepts(&body, &path) => return Ok(url),
+                Ok(body) if version_accepts(&body, &path, port) => return Ok(url),
                 Ok(_) => {}
                 Err(message) if message.starts_with("HTTP ") => return Err(message),
                 Err(_) => {}
@@ -1714,39 +1598,6 @@ impl ProfileFs for DiskFs {
         crate::session::write_private_file(std::path::Path::new(path), body).map_err(|err| {
             format!("playwright-cli: could not write preferences: {}", err.trim_start_matches("session: "))
         })
-    }
-}
-
-#[cfg(all(not(test), not(target_arch = "wasm32")))]
-impl ScanFs for DiskFs {
-    fn list_dirs(&self, path: &str) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return Vec::new();
-        };
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if !kind.is_dir() {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        names.sort();
-        names
-    }
-
-    fn read_file(&self, path: &str) -> Option<String> {
-        std::fs::read_to_string(path).ok()
-    }
-
-    fn modified(&self, path: &str) -> Option<i64> {
-        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-        let micros = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_micros();
-        i64::try_from(micros).ok()
     }
 }
 
@@ -2790,6 +2641,10 @@ mod tests {
         assert_no_six(&fs.0.borrow().reads);
     }
 
+    fn version_body(port: u16, path: &str) -> String {
+        format!(r#"{{"webSocketDebuggerUrl":"ws://127.0.0.1:{port}{path}"}}"#)
+    }
+
     #[test]
     fn a_catalog_port_file_is_probed_like_any_other() {
         let host = env("linux");
@@ -3279,443 +3134,6 @@ mod tests {
             ..plan
         };
         assert_eq!(with_debug_port(electron.clone(), 9224), electron);
-    }
-
-    fn version_body(port: u16, path: &str) -> String {
-        format!(r#"{{"webSocketDebuggerUrl":"ws://127.0.0.1:{port}{path}"}}"#)
-    }
-
-    fn assert_high_port(url: &str) {
-        let port: u16 = url
-            .trim_start_matches("http://127.0.0.1:")
-            .trim_end_matches("/json/version")
-            .parse()
-            .unwrap();
-        assert!(port >= 9333, "{url}");
-        assert!(!(9222..=9229).contains(&port), "{url}");
-    }
-
-    struct ClockFs {
-        dirs: BTreeMap<String, Vec<String>>,
-        files: BTreeMap<String, (i64, String)>,
-        lists: RefCell<Vec<String>>,
-        reads: RefCell<Vec<String>>,
-    }
-
-    impl ClockFs {
-        fn new() -> Self {
-            Self {
-                dirs: BTreeMap::new(),
-                files: BTreeMap::new(),
-                lists: RefCell::new(Vec::new()),
-                reads: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn dir(&mut self, path: &str, names: &[&str]) {
-            self.dirs.insert(
-                path.to_string(),
-                names.iter().map(|name| (*name).to_string()).collect(),
-            );
-        }
-
-        fn file(&mut self, path: &str, modified: i64, body: &str) {
-            self.files
-                .insert(path.to_string(), (modified, body.to_string()));
-        }
-    }
-
-    impl ScanFs for ClockFs {
-        fn list_dirs(&self, path: &str) -> Vec<String> {
-            self.lists.borrow_mut().push(path.to_string());
-            self.dirs.get(path).cloned().unwrap_or_default()
-        }
-
-        fn read_file(&self, path: &str) -> Option<String> {
-            self.reads.borrow_mut().push(path.to_string());
-            self.files.get(path).map(|(_, body)| body.clone())
-        }
-
-        fn modified(&self, path: &str) -> Option<i64> {
-            self.files.get(path).map(|(modified, _)| *modified)
-        }
-    }
-
-    fn port_file(dir: &str, windows: bool) -> String {
-        child_path(dir, ACTIVE_PORT_FILE, windows)
-    }
-
-    #[test]
-    fn the_newest_live_seven_profile_port_is_used() {
-        let host = env("macos");
-        let root = config_seven_root(&host);
-        assert_eq!(
-            root,
-            "/Users/me/Library/Application Support/slicc/seven-profiles"
-        );
-        let six = "/Users/me/Library/Application Support/Slicc/profiles";
-        let mut fs = ClockFs::new();
-        fs.dir(
-            &root,
-            &[
-                ".migrated-from-profiles",
-                ".hidden",
-                "browser-coding-agent-chrome",
-                "chrome",
-                "chrome..old",
-                "edge",
-                "has space",
-            ],
-        );
-        fs.dir(six, &["chrome"]);
-        fs.dir(
-            "/Users/me/Library/Application Support/Slicc",
-            &["profiles", "seven-profiles"],
-        );
-        fs.file(
-            &port_file(&format!("{root}/chrome"), false),
-            1,
-            "9333\n/devtools/browser/old\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/edge"), false),
-            5,
-            "9444\n/devtools/browser/new\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/browser-coding-agent-chrome"), false),
-            9,
-            "9555\n/devtools/browser/agent\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/.migrated-from-profiles"), false),
-            50,
-            "9667\n/devtools/browser/marker\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/.hidden"), false),
-            49,
-            "9668\n/devtools/browser/hidden\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/chrome..old"), false),
-            48,
-            "9669\n/devtools/browser/dots\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/has space"), false),
-            47,
-            "9670\n/devtools/browser/space\n",
-        );
-        fs.file(
-            &port_file(&format!("{six}/chrome"), false),
-            99,
-            "9666\n/devtools/browser/six\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            assert_eq!(url, "http://127.0.0.1:9444/json/version");
-            Ok(version_body(9444, "/devtools/browser/new"))
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9444/json/version"));
-        assert_eq!(seen, vec!["http://127.0.0.1:9444/json/version".to_string()]);
-        let snap = format!("{}/snap", host.home);
-        assert_eq!(fs.lists.borrow().as_slice(), [root.as_str(), snap.as_str()]);
-        assert!(fs.reads.borrow().iter().any(|path| path.contains("/edge/")));
-        assert!(fs.reads.borrow().iter().any(|path| path.contains("/chrome/")));
-        assert_no_six(&fs.reads.borrow());
-        assert_no_six(&fs.lists.borrow());
-        assert!(fs.reads.borrow().iter().all(|path| {
-            !path.contains("/.migrated-from-profiles/")
-                && !path.contains("/.hidden/")
-                && !path.contains("chrome..old")
-                && !path.contains("has space")
-        }));
-    }
-
-    #[test]
-    fn a_newer_catalog_port_file_is_probed_like_any_other() {
-        let host = env("macos");
-        let root = config_seven_root(&host);
-        let mut fs = ClockFs::new();
-        fs.dir(&root, &["brave", "brave-live", "chrome", "edge"]);
-        fs.file(
-            &port_file(&format!("{root}/chrome"), false),
-            10,
-            "9222\n/devtools/browser/default\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/edge"), false),
-            9,
-            "9223\n/devtools/browser/nope\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/brave"), false),
-            8,
-            "9228\n/devtools/browser/nope\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/brave-live"), false),
-            1,
-            "9333\n/devtools/browser/old\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            match url {
-                "http://127.0.0.1:9222/json/version" => Err("connection refused\n".to_string()),
-                "http://127.0.0.1:9223/json/version" => Ok(version_body(9223, "/devtools/browser/other")),
-                "http://127.0.0.1:9228/json/version" => Ok(version_body(9228, "/devtools/browser/nope")),
-                _ => panic!("{url}"),
-            }
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9228/json/version"));
-        assert_eq!(
-            seen,
-            vec![
-                "http://127.0.0.1:9222/json/version".to_string(),
-                "http://127.0.0.1:9223/json/version".to_string(),
-                "http://127.0.0.1:9228/json/version".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_mismatched_websocket_path_uses_the_older_live_file() {
-        let host = env("macos");
-        let root = config_seven_root(&host);
-        let mut fs = ClockFs::new();
-        fs.dir(&root, &["chrome", "edge"]);
-        fs.file(
-            &port_file(&format!("{root}/chrome"), false),
-            1,
-            "9333\n/devtools/browser/old\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/edge"), false),
-            5,
-            "9444\n/devtools/browser/new\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            if url.contains(":9444/") {
-                Ok(version_body(9444, "/devtools/browser/other"))
-            } else {
-                Ok(version_body(9333, "/devtools/browser/old"))
-            }
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9333/json/version"));
-        assert_eq!(
-            seen,
-            vec![
-                "http://127.0.0.1:9444/json/version".to_string(),
-                "http://127.0.0.1:9333/json/version".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_dead_newer_port_uses_the_older_live_file() {
-        let host = env("macos");
-        let root = config_seven_root(&host);
-        let mut fs = ClockFs::new();
-        fs.dir(&root, &["chrome", "edge"]);
-        fs.file(
-            &port_file(&format!("{root}/chrome"), false),
-            1,
-            "9333\n/devtools/browser/old\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/edge"), false),
-            5,
-            "9444\n/devtools/browser/new\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            if url.contains(":9444/") {
-                Err("connection refused\n".to_string())
-            } else {
-                Ok(version_body(9333, "/devtools/browser/old"))
-            }
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9333/json/version"));
-        assert_eq!(seen.len(), 2);
-    }
-
-    #[test]
-    fn an_http_error_from_the_newest_port_stops_the_scan() {
-        let host = env("macos");
-        let root = config_seven_root(&host);
-        let mut fs = ClockFs::new();
-        fs.dir(&root, &["chrome", "edge"]);
-        fs.file(
-            &port_file(&format!("{root}/chrome"), false),
-            1,
-            "9333\n/devtools/browser/old\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/edge"), false),
-            5,
-            "9444\n/devtools/browser/new\n",
-        );
-        let mut seen = Vec::new();
-        let err = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            Err("HTTP 500\nno\n".to_string())
-        })
-        .unwrap_err();
-        assert_eq!(err, "HTTP 500\nno\n");
-        assert_eq!(seen, vec!["http://127.0.0.1:9444/json/version".to_string()]);
-    }
-
-    #[test]
-    fn an_equal_clock_tries_the_earlier_path_first() {
-        let host = env("macos");
-        let root = config_seven_root(&host);
-        let mut fs = ClockFs::new();
-        fs.dir(&root, &["chrome", "edge"]);
-        fs.file(
-            &port_file(&format!("{root}/chrome"), false),
-            4,
-            "9333\n/devtools/browser/old\n",
-        );
-        fs.file(
-            &port_file(&format!("{root}/edge"), false),
-            4,
-            "9444\n/devtools/browser/new\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            if url.contains(":9333/") {
-                Ok(version_body(9333, "/devtools/browser/other"))
-            } else {
-                Ok(version_body(9444, "/devtools/browser/new"))
-            }
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9444/json/version"));
-        assert_eq!(
-            seen,
-            vec![
-                "http://127.0.0.1:9333/json/version".to_string(),
-                "http://127.0.0.1:9444/json/version".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_newer_snap_seven_profile_wins_without_reading_profiles() {
-        let host = env("linux");
-        let config = config_seven_root(&host);
-        assert_eq!(config, "/home/me/.config/slicc/seven-profiles");
-        let snap = format!("{}/snap", host.home);
-        let snap_root = format!("{snap}/chromium/common/slicc/seven-profiles");
-        let snap_six = format!("{snap}/chromium/common/slicc/profiles");
-        let config_six = "/home/me/.config/slicc/profiles";
-        let mut fs = ClockFs::new();
-        fs.dir(&config, &["chrome"]);
-        fs.dir(&snap, &["chromium"]);
-        fs.dir(&snap_root, &["chromium"]);
-        fs.dir(&snap_six, &["chromium"]);
-        fs.dir(config_six, &["chrome"]);
-        fs.dir("/home/me/.config/slicc", &["profiles", "seven-profiles"]);
-        fs.dir(
-            &format!("{snap}/chromium/common/slicc"),
-            &["profiles", "seven-profiles"],
-        );
-        fs.file(
-            &port_file(&format!("{config}/chrome"), false),
-            1,
-            "9333\n/devtools/browser/old\n",
-        );
-        fs.file(
-            &port_file(&format!("{snap_root}/chromium"), false),
-            9,
-            "9555\n/devtools/browser/snap\n",
-        );
-        fs.file(
-            &port_file(&format!("{snap_six}/chromium"), false),
-            100,
-            "9666\n/devtools/browser/six\n",
-        );
-        fs.file(
-            &port_file(&format!("{config_six}/chrome"), false),
-            100,
-            "9777\n/devtools/browser/six\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            assert_eq!(url, "http://127.0.0.1:9555/json/version");
-            Ok(version_body(9555, "/devtools/browser/snap"))
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9555/json/version"));
-        assert_eq!(
-            fs.lists.borrow().as_slice(),
-            [config.as_str(), snap.as_str(), snap_root.as_str()]
-        );
-        assert_no_six(&fs.reads.borrow());
-        assert_no_six(&fs.lists.borrow());
-        assert!(fs
-            .reads
-            .borrow()
-            .iter()
-            .any(|path| path.contains("/seven-profiles/chromium/")));
-    }
-
-    #[test]
-    fn a_windows_seven_profile_port_is_found_without_profiles() {
-        let mut host = env("windows");
-        host.app_data = Some("C:\\Users\\me\\AppData\\Roaming".to_string());
-        let root = config_seven_root(&host);
-        assert_eq!(
-            root,
-            "C:\\Users\\me\\AppData\\Roaming\\slicc\\seven-profiles"
-        );
-        let six = "C:\\Users\\me\\AppData\\Roaming\\Slicc\\profiles";
-        let mut fs = ClockFs::new();
-        fs.dir(&root, &["chrome"]);
-        fs.dir(six, &["chrome"]);
-        let dir = join_parts(true, &[root.clone(), "chrome".to_string()]);
-        fs.file(
-            &port_file(&dir, true),
-            3,
-            "9333\n/devtools/browser/win\n",
-        );
-        let six_dir = join_parts(true, &[six.to_string(), "chrome".to_string()]);
-        fs.file(
-            &port_file(&six_dir, true),
-            9,
-            "9444\n/devtools/browser/six\n",
-        );
-        let mut seen = Vec::new();
-        let found = select_port(&host, &fs, &mut |url| {
-            seen.push(url.to_string());
-            assert_high_port(url);
-            Ok(version_body(9333, "/devtools/browser/win"))
-        })
-        .unwrap();
-        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9333/json/version"));
-        assert_eq!(seen, vec!["http://127.0.0.1:9333/json/version".to_string()]);
-        let snap = join_parts(true, &[host.home.clone(), "snap".to_string()]);
-        assert_eq!(fs.lists.borrow().as_slice(), [root.as_str(), snap.as_str()]);
-        assert_no_six(&fs.reads.borrow());
-        assert_no_six(&fs.lists.borrow());
     }
 
     #[test]

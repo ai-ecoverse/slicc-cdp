@@ -40,7 +40,7 @@ playwright-cli click e3
 curlwright -i https://example.com/
 ```
 
-`open` attaches to a running Chrome or launches one. To pick a browser, pass `--cdp <port>` (for example `--cdp 9333`, which means `localhost:9333`) or `--cdp http://127.0.0.1:<port>`, or set `SLICC_CDP_URL`. Run `playwright-cli --help` for all commands.
+`open` attaches to a running Chrome or launches one. To pick a browser, pass `--cdp <port>` (for example `--cdp 9333`, which means `localhost:9333`) or `--cdp http://127.0.0.1:<port>`, or set `SLICC_CDP_URL`. Without those, host connect tries `slicc browsers --json` when `slicc` is on `PATH` (prefer `sevenOpen`, then a slicc profile, then best tier; loopback `ws://` only), then a live `DevToolsActivePort` under slicc `seven-profiles` / legacy `profiles` / SLICC six profile dirs (loopback `/json/version` check; the live websocket pathname must match the file; newest live wins), then a loopback endpoint saved under the user config dir, then probes `127.0.0.1:9222-9229`. `curlwright` uses the same order without the saved session and exits when nothing answers. The wasm builds still use port 9222 and skip the CLI and file steps. Run `playwright-cli --help` for all commands.
 
 `--cdp` and `SLICC_CDP_URL` take a port, `host`, `host:port` (port 9222 when it is left out), an `http://` or `https://` URL, or a `ws://` or `wss://` URL. A `ws://` or `wss://` URL with a path is dialled as it is; every other form reads `/json/version` first. The client tries every address the host resolves to, and `localhost`, `127.0.0.1`, `::1` (`[::1]`) and `0.0.0.0` all mean this machine: both `::1` and `127.0.0.1` are tried. Every address but the last gets two seconds to connect.
 
