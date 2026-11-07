@@ -703,6 +703,7 @@ mod tests {
     struct MemFs {
         dirs: BTreeMap<String, Vec<String>>,
         files: BTreeMap<String, (i64, String)>,
+        lists: RefCell<Vec<String>>,
         reads: RefCell<Vec<String>>,
     }
 
@@ -711,6 +712,7 @@ mod tests {
             Self {
                 dirs: BTreeMap::new(),
                 files: BTreeMap::new(),
+                lists: RefCell::new(Vec::new()),
                 reads: RefCell::new(Vec::new()),
             }
         }
@@ -730,6 +732,7 @@ mod tests {
 
     impl ScanFs for MemFs {
         fn list_dirs(&self, path: &str) -> Vec<String> {
+            self.lists.borrow_mut().push(path.to_string());
             self.dirs.get(path).cloned().unwrap_or_default()
         }
 
@@ -745,6 +748,20 @@ mod tests {
 
     fn version_body(port: u16, path: &str) -> String {
         format!(r#"{{"webSocketDebuggerUrl":"ws://127.0.0.1:{port}{path}"}}"#)
+    }
+
+    fn port_file(dir: &str, windows: bool) -> String {
+        join_parts(windows, &[dir.to_string(), ACTIVE_PORT_FILE.to_string()])
+    }
+
+    fn assert_high_port(url: &str) {
+        let port: u16 = url
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches("/json/version")
+            .parse()
+            .unwrap();
+        assert!(port >= 9333, "{url}");
+        assert!(!(9222..=9229).contains(&port), "{url}");
     }
 
     fn serve_version(port_path: &str) -> (u16, std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
@@ -1090,6 +1107,196 @@ mod tests {
         let _ = stop.send(());
         let _ = join.join();
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn an_http_error_from_the_newest_port_stops_the_scan() {
+        let host = env("macos");
+        let root = "/Users/me/Library/Application Support/slicc/seven-profiles";
+        let mut fs = MemFs::new();
+        fs.dir(root, &["chrome", "edge"]);
+        fs.file(
+            &port_file(&format!("{root}/chrome"), false),
+            1,
+            "9333\n/devtools/browser/old\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/edge"), false),
+            5,
+            "9444\n/devtools/browser/new\n",
+        );
+        let mut seen = Vec::new();
+        let err = from_devtools_active_port(&host, &fs, &[root.to_string()], &mut |url| {
+            seen.push(url.to_string());
+            assert_high_port(url);
+            Err("HTTP 500\nno\n".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, "HTTP 500\nno\n");
+        assert_eq!(seen, vec!["http://127.0.0.1:9444/json/version".to_string()]);
+    }
+
+    #[test]
+    fn an_equal_clock_tries_the_earlier_path_first() {
+        let host = env("macos");
+        let root = "/Users/me/Library/Application Support/slicc/seven-profiles";
+        let mut fs = MemFs::new();
+        fs.dir(root, &["chrome", "edge"]);
+        fs.file(
+            &port_file(&format!("{root}/chrome"), false),
+            4,
+            "9333\n/devtools/browser/old\n",
+        );
+        fs.file(
+            &port_file(&format!("{root}/edge"), false),
+            4,
+            "9444\n/devtools/browser/new\n",
+        );
+        let mut seen = Vec::new();
+        let found = from_devtools_active_port(&host, &fs, &[root.to_string()], &mut |url| {
+            seen.push(url.to_string());
+            assert_high_port(url);
+            if url.contains(":9333/") {
+                Ok(version_body(9333, "/devtools/browser/other"))
+            } else {
+                Ok(version_body(9444, "/devtools/browser/new"))
+            }
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9444/json/version"));
+        assert_eq!(
+            seen,
+            vec![
+                "http://127.0.0.1:9333/json/version".to_string(),
+                "http://127.0.0.1:9444/json/version".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_snap_seven_profile_wins_without_reading_profiles() {
+        let mut host = env("linux");
+        host.xdg_config_home = Some("/home/me/.config".to_string());
+        host.xdg_state_home = Some("/home/me/.local/state".to_string());
+        let roots = slicc_profile_roots(&host);
+        let config = "/home/me/.config/slicc/seven-profiles";
+        let legacy = "/home/me/.config/slicc/profiles";
+        let six = "/home/me/.local/state/slicc/profiles";
+        let snap = "/home/me/snap";
+        let snap_root = format!("{snap}/chromium/common/slicc/seven-profiles");
+        let snap_six = format!("{snap}/chromium/common/slicc/profiles");
+        assert_eq!(roots[0], config);
+        assert_eq!(roots[1], legacy);
+        assert_eq!(roots[2], six);
+        assert_eq!(roots[3], snap);
+        let mut fs = MemFs::new();
+        fs.dir(config, &["chrome"]);
+        fs.dir(legacy, &["chrome"]);
+        fs.dir(six, &["chrome"]);
+        fs.dir(snap, &["chromium", ".hidden", "has space"]);
+        fs.dir(&snap_root, &["chromium"]);
+        fs.dir(&snap_six, &["chromium"]);
+        fs.file(
+            &port_file(&format!("{config}/chrome"), false),
+            1,
+            "9333\n/devtools/browser/old\n",
+        );
+        fs.file(
+            &port_file(&format!("{snap_root}/chromium"), false),
+            9,
+            "9555\n/devtools/browser/snap\n",
+        );
+        fs.file(
+            &port_file(&format!("{snap_six}/chromium"), false),
+            100,
+            "9666\n/devtools/browser/six\n",
+        );
+        fs.file(
+            &port_file(&format!("{legacy}/chrome"), false),
+            100,
+            "9777\n/devtools/browser/legacy\n",
+        );
+        fs.file(
+            &port_file(&format!("{six}/chrome"), false),
+            100,
+            "9888\n/devtools/browser/six\n",
+        );
+        let mut seen = Vec::new();
+        let found = from_devtools_active_port(&host, &fs, &roots, &mut |url| {
+            seen.push(url.to_string());
+            match url {
+                "http://127.0.0.1:9777/json/version" | "http://127.0.0.1:9888/json/version" => {
+                    Err("connection refused\n".to_string())
+                }
+                "http://127.0.0.1:9555/json/version" => {
+                    assert_high_port(url);
+                    Ok(version_body(9555, "/devtools/browser/snap"))
+                }
+                other => panic!("unexpected probe {other}"),
+            }
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9555/json/version"));
+        assert!(fs.lists.borrow().iter().any(|path| path == snap));
+        assert!(fs.lists.borrow().iter().any(|path| path == &snap_root));
+        assert!(!fs.lists.borrow().iter().any(|path| path == &snap_six));
+        assert!(!fs
+            .reads
+            .borrow()
+            .iter()
+            .any(|path| path.contains("/snap/chromium/common/slicc/profiles/")));
+        assert!(fs
+            .reads
+            .borrow()
+            .iter()
+            .any(|path| path.contains("/seven-profiles/chromium/")));
+        assert!(!fs.lists.borrow().iter().any(|path| {
+            path.contains("/snap/.hidden/") || path.contains("/snap/has space/")
+        }));
+    }
+
+    #[test]
+    fn a_windows_seven_profile_port_is_found_without_profiles() {
+        let mut host = env("windows");
+        host.app_data = Some("C:\\Users\\me\\AppData\\Roaming".to_string());
+        host.local_app_data = Some("C:\\Users\\me\\AppData\\Local".to_string());
+        let roots = slicc_profile_roots(&host);
+        let root = "C:\\Users\\me\\AppData\\Roaming\\slicc\\seven-profiles";
+        let legacy = "C:\\Users\\me\\AppData\\Roaming\\slicc\\profiles";
+        let six = "C:\\Users\\me\\AppData\\Local\\Slicc\\profiles";
+        assert_eq!(roots[0], root);
+        assert_eq!(roots[1], legacy);
+        assert_eq!(roots[2], six);
+        let mut fs = MemFs::new();
+        fs.dir(root, &["chrome"]);
+        fs.dir(legacy, &["chrome"]);
+        fs.dir(six, &["chrome"]);
+        let dir = join_parts(true, &[root.to_string(), "chrome".to_string()]);
+        fs.file(&port_file(&dir, true), 3, "9333\n/devtools/browser/win\n");
+        let six_dir = join_parts(true, &[six.to_string(), "chrome".to_string()]);
+        fs.file(
+            &port_file(&six_dir, true),
+            9,
+            "9444\n/devtools/browser/six\n",
+        );
+        let mut seen = Vec::new();
+        let found = from_devtools_active_port(&host, &fs, &roots, &mut |url| {
+            seen.push(url.to_string());
+            match url {
+                "http://127.0.0.1:9444/json/version" => Err("connection refused\n".to_string()),
+                "http://127.0.0.1:9333/json/version" => {
+                    assert_high_port(url);
+                    Ok(version_body(9333, "/devtools/browser/win"))
+                }
+                other => panic!("unexpected probe {other}"),
+            }
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("http://127.0.0.1:9333/json/version"));
+        assert!(seen.contains(&"http://127.0.0.1:9444/json/version".to_string()));
+        assert!(seen.contains(&"http://127.0.0.1:9333/json/version".to_string()));
+        assert!(fs.reads.borrow().iter().any(|path| path.contains("seven-profiles")));
+        assert!(fs.reads.borrow().iter().any(|path| path.contains("Slicc\\profiles")));
     }
 
     #[cfg(any(target_arch = "wasm32", target_os = "wasi"))]
