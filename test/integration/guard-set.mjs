@@ -193,6 +193,55 @@ export function validApplicabilitySkip(vector, row) {
   );
 }
 
+export const runCapabilities = {
+  scope: 'slicc-cdp',
+  autoAttach: true,
+  browserSession: true,
+  chromeUrlsAttach: true,
+  extensionWorld: true,
+  extensionFrame: true,
+  browserContexts: true,
+  discovery: true,
+  clientExit: true,
+  siteIsolationOff: true,
+  inboundDelay: true,
+  forwardAudit: true,
+};
+
+export function declaredCapabilityNames(capabilities = runCapabilities) {
+  return new Set(
+    Object.entries(capabilities)
+      .filter(([key, value]) => key !== 'scope' && value === true)
+      .map(([key]) => key)
+  );
+}
+
+export function requiredCapabilities(vector) {
+  const caps = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (Array.isArray(value.requires))
+      for (const cap of value.requires) if (typeof cap === 'string' && cap) caps.add(cap);
+    for (const item of Object.values(value)) visit(item);
+  };
+  visit(vector);
+  return caps;
+}
+
+export function validCapabilitySkip(vector, row, capabilities = runCapabilities) {
+  if (!vector || typeof row.reason !== 'string') return false;
+  const prefix = 'not-supported:';
+  if (!row.reason.startsWith(prefix)) return false;
+  const cap = row.reason.slice(prefix.length);
+  if (!cap || cap.includes(':') || /\s/.test(cap)) return false;
+  if (declaredCapabilityNames(capabilities).has(cap)) return false;
+  return requiredCapabilities(vector).has(cap);
+}
+
 export function verdictProblems(results) {
   const problems = [];
   for (const row of results) {
@@ -240,7 +289,8 @@ export function verdictProblems(results) {
     if (vector?.kind === 'text' && legs.every((leg) => leg === 'not-run')) continue;
     const reason = canonicalSkip(vector, row.target);
     const declared = validApplicabilitySkip(vector, row);
-    if (legs.every((leg) => leg === 'skip') && reason && declared) continue;
+    const capability = validCapabilitySkip(vector, row);
+    if (legs.every((leg) => leg === 'skip') && ((reason && declared) || capability)) continue;
     problems.push(
       `${where} is ${legs.join('/')}${row.reason ? ` (${row.reason})` : ''}, not PASS${reason ? ` or the declared skip "${reason}"` : ''}`
     );
@@ -436,20 +486,7 @@ export async function runPartition(t, id) {
       const execution = await run(selected, {
         fixture,
         targets,
-        capabilities: {
-          scope: 'slicc-cdp',
-          autoAttach: true,
-          browserSession: true,
-          chromeUrlsAttach: true,
-          extensionWorld: true,
-          extensionFrame: true,
-          browserContexts: true,
-          discovery: true,
-          clientExit: true,
-          siteIsolationOff: true,
-          inboundDelay: true,
-          forwardAudit: true,
-        },
+        capabilities: runCapabilities,
         variant: Object.keys(set.variants),
         parallel,
         clientFactory: async ({ slot, variant, detachDelay, vector }) => {
