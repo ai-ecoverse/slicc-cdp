@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
+import { fetchExtension } from './download.mjs';
 import { kernelRunner, nativeRunner } from './runners.mjs';
 
 const run = promisify(execFile);
@@ -42,12 +43,7 @@ async function unpacked(extension) {
   const dir = path.join(root, 'node_modules', '.cache', `slicc-extension-${extension.version}`);
   const out = path.join(dir, 'unpacked');
   if (existsSync(path.join(out, 'manifest.json'))) return out;
-  const response = await fetch(extension.url);
-  if (!response.ok) throw new Error(`${extension.url}: HTTP ${response.status}`);
-  const zip = Buffer.from(await response.arrayBuffer());
-  const sum = createHash('sha256').update(zip).digest('hex');
-  if (sum !== extension.sha256)
-    throw new Error(`${extension.url}: sha256 ${sum}, want ${extension.sha256}`);
+  const zip = await fetchExtension(extension);
   await rm(dir, { recursive: true, force: true });
   await mkdir(out, { recursive: true });
   await writeFile(path.join(dir, 'slicc-extension.zip'), zip);
