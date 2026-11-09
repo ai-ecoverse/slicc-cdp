@@ -93,6 +93,21 @@ pub(crate) fn path_named(session_name: Option<&str>, cwd: Option<&Path>) -> Opti
     storage_path_named(&cwd, session_name)
 }
 
+pub(crate) fn recording_har(id: &str) -> Option<PathBuf> {
+    let root = config_root()?;
+    if !Path::new(&root).is_absolute() || id.is_empty() || id.contains('/') || id.contains('\\') {
+        return None;
+    }
+    Some(
+        Path::new(&root)
+            .join("slicc")
+            .join("playwright-cli")
+            .join("recordings")
+            .join(id)
+            .join("recording.har"),
+    )
+}
+
 pub fn load_in(session_name: Option<&str>, cwd: Option<&Path>) -> Session {
     let session_name = session_name.filter(|name| !name.is_empty());
     let mut sess = path_named(session_name, cwd)
