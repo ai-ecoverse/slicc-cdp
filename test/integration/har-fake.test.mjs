@@ -139,6 +139,62 @@ test('HAR stop retains traffic absorbed while finalizing another completed reque
   );
 });
 
+test('HAR keeps CORS preflight and worker fetches that Chrome reports with an empty loaderId', async () => {
+  await harFixture(async ({ home, backend, file, start, request, response, checkpoint }) => {
+    const held = await start();
+    request(
+      'PREFLIGHT',
+      'https://api.example.test/cors',
+      { 'Access-Control-Request-Method': 'POST' },
+      { type: 'Preflight', loaderId: '', documentURL: 'https://example.test/' }
+    );
+    response('PREFLIGHT', 'https://api.example.test/cors', {}, 204);
+    request(
+      'WORKER',
+      'https://api.example.test/from-worker',
+      {},
+      { type: 'Fetch', loaderId: '', documentURL: 'blob:https://example.test/1' }
+    );
+    response('WORKER', 'https://api.example.test/from-worker');
+    const har = await checkpoint(2);
+    assert.deepEqual(har.log.entries.map((entry) => entry.request.url).sort(), [
+      'https://api.example.test/cors',
+      'https://api.example.test/from-worker',
+    ]);
+    const stopped = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).log.entries.length, 2);
+  });
+});
+
+test('in-flight ordinary fetches survive a soft verify pause without a protected document', async () => {
+  await harFixture(async ({ home, backend, tab, file, start, send, request, response }) => {
+    const held = await start();
+    request('KEEP', 'https://example.test/api/keep');
+    tab.url = 'https://example.test/';
+    tab.loaderId = '';
+    send('Page.frameNavigated', {
+      frame: { id: 'TAB', loaderId: '', url: tab.url, securityOrigin: 'https://example.test' },
+    });
+    await held.event('paused');
+    response('KEEP', 'https://example.test/api/keep');
+    tab.loaderId = 'L';
+    send('Page.frameNavigated', {
+      frame: { id: 'TAB', loaderId: 'L', url: tab.url, securityOrigin: 'https://example.test' },
+    });
+    await held.event('resumed');
+    const stopped = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+    const har = JSON.parse(await readFile(file, 'utf8'));
+    assert.ok(
+      har.log.entries.some((entry) => entry.request.url === 'https://example.test/api/keep'),
+      JSON.stringify(har)
+    );
+  });
+});
+
 test('HAR captures ordinary traffic, atomically checkpoints, strips credentials and omits bodies', async () => {
   await harFixture(async ({ home, backend, file, start, request, response, checkpoint }) => {
     const held = await start();

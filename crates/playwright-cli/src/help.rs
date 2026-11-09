@@ -264,7 +264,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "A foreground holder: stdin EOF or har-stop ends recording. JSON ready, paused, resumed, checkpoint and stopped events include recordingId and path.",
                 "Writes atomically on main-frame navigation and stop. Capture pauses on protected or unknown documents and resumes on ordinary documents.",
                 "Protected and unknown requests and redirect hops are excluded; protected redirect carriers are redacted. Bodies are omitted by default.",
-                "record opens a new tab (about:blank by default) and writes /recordings/<recordingId>/recording.har. Filters are URL globs, never JavaScript.",
+                "record opens a new tab (about:blank by default) and writes /recordings/<recordingId>/recording.har when that directory is writable, otherwise recordings/<recordingId>/recording.har under the working directory. Filters are URL globs, never JavaScript.",
             ],
             &[("<file>", "HAR output file (har-start)"), ("[url]", "ordinary http(s) URL to open in a new tab (record)")],
             &[("--tab <targetId>", "existing tab to capture (har-start)"), ("--url-filter <glob>", "URL glob to include (record: --filter=<glob>)"), ("--content <omit|embed>", "omit bodies (default), or embed only on verified ordinary documents"), ("--mode <full|minimal>", "full timing metadata (default), or replay-oriented minimal metadata"), ("--include-credentials", "include ordinary credential headers; protected traffic remains excluded")],
