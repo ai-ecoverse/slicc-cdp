@@ -203,7 +203,7 @@ playwright-cli -s capture record https://example.com --filter='**/api/**'
 playwright-cli -s capture stop-recording <recordingId>
 ```
 
-`record [url] [--filter=<glob>] [--content omit|embed] [--mode full|minimal] [--include-credentials]` opens a new tab (default `about:blank`), attaches before navigating, and writes `/recordings/<recordingId>/recording.har`. Its JSON `ready` event prints the recordingId and path. The directory must be writable. The filter is now a URL glob; slicc6's arbitrary JavaScript filter functions are rejected with an explanatory error. `stop-recording [recordingId]` aliases `har-stop`; an optional ID must belong to the same session. The Microsoft action commands remain `recording-start` and `recording-stop`.
+`record [url] [--filter=<glob>] [--content omit|embed] [--mode full|minimal] [--include-credentials]` opens a new tab (default `about:blank`), attaches before navigating, and writes `/recordings/<recordingId>/recording.har` when that directory is writable, otherwise `recordings/<recordingId>/recording.har` under the working directory. Its JSON `ready` event prints the recordingId and path. The filter is a URL glob; slicc6's arbitrary JavaScript filter functions are rejected with an explanatory error. `stop-recording [recordingId]` aliases `har-stop`; an optional ID must belong to the same session. The Microsoft action commands remain `recording-start` and `recording-stop`.
 - Microsoft's `video-*` and `tracing-*` commands are not offered: `Page.startScreencast` and `Tracing.start` keep capturing across navigations, including into protected documents, and the guard refuses both.
 
 ## Develop

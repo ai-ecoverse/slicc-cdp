@@ -153,10 +153,14 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     let target = match target { Ok(target) => target, Err(message) => return Output::err(message) };
     let session = match attach(cdp, state, &target) { Ok(session) => session, Err(message) => return Output::err(message) };
     let id = format!("rec-{}-{}", now_ms(), &cdp_client::hash::sha256_hex(format!("{target}:{session}:{:?}", SystemTime::now()).as_bytes())[..12]);
-    let path = if alias { PathBuf::from(format!("/recordings/{id}/recording.har")) } else { PathBuf::from(&invocation.positionals[0]) };
+    let path = if alias {
+        recording_path(&id, invocation.cwd.as_deref())
+    } else {
+        PathBuf::from(&invocation.positionals[0])
+    };
     let path = if path.is_absolute() { path } else { invocation.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default().join(path) };
     let mut holder = Holder {
-        files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
+        files, id, target: target.clone(), session: Some(session), workers: BTreeSet::new(), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
         entries: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
         embed: invocation.flags.get("content").is_some_and(|value| value == "embed"),
         minimal: invocation.flags.get("mode").is_some_and(|value| value == "minimal"),
@@ -178,6 +182,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
         }
     };
     let result = holder.run(cdp, state, endpoint, if alias { invocation.positionals.first().map(String::as_str) } else { None });
+    for worker in &holder.workers { let _ = cdp.call("Network.disable", json!({}), Some(worker)); cdp::detach(cdp, worker); }
     if let Some(session) = &holder.session { cdp.set_decider(session, None); cdp::detach(cdp, session); }
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.endpoint = state.endpoint.clone();
@@ -198,6 +203,11 @@ fn attach(cdp: &mut Cdp, state: &Session, target: &str) -> Result<String, String
     for method in ["Page.enable", "Network.enable"] {
         if let Err(message) = cdp.call(method, json!({}), Some(&session)) { cdp::detach(cdp, &session); return Err(message) }
     }
+    let _ = cdp.call(
+        "Target.setAutoAttach",
+        json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}),
+        Some(&session),
+    );
     cdp.set_decider(&session, Some(Box::new(|paused| {
         if paused.status.is_some() { cdp_client::fetch::Decision::ContinueResponse(Default::default()) }
         else { cdp_client::fetch::Decision::default() }
@@ -208,6 +218,10 @@ fn attach(cdp: &mut Cdp, state: &Session, target: &str) -> Result<String, String
         return Err(message);
     }
     Ok(session)
+}
+
+fn worker_target(kind: &str) -> bool {
+    matches!(kind, "worker" | "service_worker" | "shared_worker")
 }
 
 struct Pending {
@@ -228,6 +242,7 @@ struct Holder {
     id: String,
     target: String,
     session: Option<String>,
+    workers: BTreeSet<String>,
     path: PathBuf,
     main_frame: String,
     seen: usize,
@@ -301,6 +316,7 @@ impl Holder {
             if beat.elapsed() >= Duration::from_secs(1) { self.beat()?; beat = Instant::now(); }
             if self.session.as_deref().is_some_and(|session| cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) {
                 if self.absorb(cdp)? { return Ok("closed".into()) }
+                self.drop_workers(cdp);
                 if let Some(session) = self.session.take() { cdp.set_decider(&session, None); cdp::detach(cdp, &session); }
                 self.pending.clear();
                 self.failed.clear();
@@ -316,8 +332,13 @@ impl Holder {
                     self.release(cdp, &loader, false)?;
                 } else {
                     if self.absorb(cdp)? { return Ok("closed".into()) }
-                    self.pending.retain(|_, pending| pending.recovering_document);
-                    self.failed.retain(|_, pending| pending.recovering_document);
+                    let protected = self.session.as_deref().is_some_and(|session| cdp.content_blocked(session))
+                        || cdp.is_protected_target(&self.target);
+                    if protected {
+                        self.pending.retain(|_, pending| pending.recovering_document);
+                        self.failed.retain(|_, pending| pending.recovering_document);
+                        self.held.clear();
+                    }
                     self.checkpoint(cdp)?;
                     self.pause()?;
                 }
@@ -350,6 +371,7 @@ impl Holder {
         let previous = previous.borrow_mut().take();
         match attached {
             Ok(Some(session)) => {
+                self.drop_workers(cdp);
                 self.session = Some(session);
                 self.seen = cdp.events().len();
                 Ok(())
@@ -366,6 +388,17 @@ impl Holder {
         Ok(())
     }
 
+    fn owns(&self, session: Option<&str>) -> bool {
+        session.is_some_and(|session| self.session.as_deref() == Some(session) || self.workers.contains(session))
+    }
+
+    fn drop_workers(&mut self, cdp: &mut Cdp) {
+        for worker in std::mem::take(&mut self.workers) {
+            let _ = cdp.call("Network.disable", json!({}), Some(&worker));
+            cdp::detach(cdp, &worker);
+        }
+    }
+
     fn absorb(&mut self, cdp: &mut Cdp) -> Result<bool, String> {
         let events = cdp.events()[self.seen.min(cdp.events().len())..].to_vec();
         self.seen = cdp.events().len();
@@ -373,7 +406,26 @@ impl Holder {
             if event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == self.target {
                 return Ok(true);
             }
-            if event["sessionId"].as_str() != self.session.as_deref() { continue }
+            if event["method"] == "Target.attachedToTarget" {
+                let params = &event["params"];
+                let child = text(params, "sessionId");
+                let kind = text(&params["targetInfo"], "type");
+                if event["sessionId"].as_str() == self.session.as_deref() && worker_target(kind) && !child.is_empty() {
+                    if cdp.call("Network.enable", json!({}), Some(child)).is_ok() {
+                        self.workers.insert(child.to_string());
+                    } else {
+                        cdp::detach(cdp, child);
+                    }
+                }
+                continue;
+            }
+            if event["method"] == "Target.detachedFromTarget" {
+                if let Some(child) = event["params"]["sessionId"].as_str() {
+                    self.workers.remove(child);
+                }
+                continue;
+            }
+            if !self.owns(event["sessionId"].as_str()) { continue }
             let params = &event["params"];
             let id = text(params, "requestId");
             match text(&event, "method") {
@@ -383,7 +435,17 @@ impl Holder {
                     if let Some(loader) = self.verify(cdp) {
                         if self.paused { self.paused = false; emit(self.status("resumed"))?; }
                         self.release(cdp, &loader, true)?;
-                    } else { self.pending.clear(); self.failed.clear(); self.held.clear(); self.pause()?; }
+                    } else {
+                        let protected = cdp.is_protected_target(&self.target)
+                            || self.session.as_deref().is_some_and(|session| cdp.content_blocked(session))
+                            || !ordinary(cdp.guard(), text(&params["frame"], "url"));
+                        if protected {
+                            self.pending.clear();
+                            self.failed.clear();
+                            self.held.clear();
+                        }
+                        self.pause()?;
+                    }
                 }
                 "Network.requestWillBeSent" => {
                     if let Some(response) = params.get("redirectResponse") {
@@ -395,11 +457,15 @@ impl Holder {
                     let request = &params["request"];
                     if !ordinary(cdp.guard(), text(request, "url")) { self.pending.remove(id); self.denied.insert(id.to_string()); continue }
                     if self.denied.contains(id) { continue }
-                    let recovering_document = self.paused && text(params, "type") == "Document" && !self.main_frame.is_empty() && text(params, "frameId") == self.main_frame;
+                    let resource = text(params, "type");
+                    let recovering_document = self.paused && resource == "Document" && !self.main_frame.is_empty() && text(params, "frameId") == self.main_frame;
                     if self.paused && !recovering_document { continue }
-                    if !ordinary(cdp.guard(), text(params, "documentURL")) || text(params, "loaderId").is_empty() { continue }
+                    let document_url = text(params, "documentURL");
+                    let loader = text(params, "loaderId");
+                    if resource == "Document" && loader.is_empty() { continue }
+                    if !document_context(cdp.guard(), document_url, loader) { continue }
                     if self.filter.as_ref().is_some_and(|filter| !filter.matches(text(request, "url"))) { continue }
-                    self.pending.insert(id.to_string(), Pending { request: request.clone(), response: None, extra_headers: None, ordinary_document: !self.paused, recovering_document, document_url: text(params, "documentURL").to_string(), timestamp: number(params, "timestamp"), wall: number(params, "wallTime"), end: number(params, "timestamp"), loader: text(params, "loaderId").to_string() });
+                    self.pending.insert(id.to_string(), Pending { request: request.clone(), response: None, extra_headers: None, ordinary_document: !self.paused, recovering_document, document_url: document_url.to_string(), timestamp: number(params, "timestamp"), wall: number(params, "wallTime"), end: number(params, "timestamp"), loader: loader.to_string() });
                 }
                 "Network.responseReceived" => {
                     let response = &params["response"];
@@ -479,15 +545,20 @@ impl Holder {
 
     fn admit(&mut self, cdp: &mut Cdp, id: &str, pending: Pending, body: bool) -> Result<(), String> {
         let Some(response) = &pending.response else { return Ok(()) };
-        if !ordinary(cdp.guard(), &pending.document_url) || !ordinary(cdp.guard(), text(&pending.request, "url")) || !ordinary(cdp.guard(), text(response, "url")) { return Ok(()) }
+        if !document_context(cdp.guard(), &pending.document_url, &pending.loader)
+            || !ordinary(cdp.guard(), text(&pending.request, "url"))
+            || !ordinary(cdp.guard(), text(response, "url"))
+        {
+            return Ok(());
+        }
         if !body && !response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) { return Ok(()) }
-        let verified = self.verify(cdp).is_some_and(|loader| loader == pending.loader);
+        let verified = self.verify(cdp).is_some_and(|loader| !pending.loader.is_empty() && loader == pending.loader);
         if !pending.ordinary_document && !(pending.recovering_document && verified && !self.paused) {
             if pending.recovering_document { self.held.push((id.to_string(), pending, body)); }
             return Ok(())
         }
         let redirect = response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308));
-        if self.paused && !redirect { return Ok(()) }
+        if self.paused && !pending.ordinary_document && !redirect { return Ok(()) }
         let can_embed = self.embed && verified && !self.paused && self.session.as_deref().is_some_and(|session| cdp.ordinary_response_body(session, id));
         let content = if can_embed && body {
             cdp.call_for("Network.getResponseBody", json!({"requestId":id}), self.session.as_deref(), Duration::from_secs(2)).ok()
@@ -506,6 +577,30 @@ fn drain(cdp: &mut Cdp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_loader_worker_documents_are_ordinary_request_context() {
+        let guard = cdp_client::protected::Protected::default();
+        assert!(document_context(&guard, "", ""));
+        assert!(document_context(&guard, "blob:https://example.test/1", ""));
+        assert!(document_context(&guard, "data:text/javascript,1", ""));
+        assert!(document_context(&guard, "https://example.test/", "L"));
+        assert!(!document_context(&guard, "https://seven.sliccy.ai/", ""));
+        assert!(!document_context(&guard, "file:///tmp/x", "L"));
+    }
+
+    #[test]
+    fn recording_path_prefers_writable_recordings_root_then_cwd() {
+        let cwd = std::env::temp_dir().join(format!("slicc-har-path-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&cwd).unwrap();
+        let path = recording_path("rec-test", Some(&cwd));
+        if Path::new("/recordings").is_dir() && recordings_root_writable() {
+            assert_eq!(path, PathBuf::from("/recordings/rec-test/recording.har"));
+        } else {
+            assert_eq!(path, cwd.join("recordings/rec-test/recording.har"));
+        }
+        fs::remove_dir_all(cwd).unwrap();
+    }
 
     #[test]
     fn har_completion_published_before_owner_exit_wins_the_final_liveness_check() {
@@ -562,6 +657,39 @@ fn number(value: &Value, key: &str) -> f64 {
 
 fn ordinary(guard: &cdp_client::protected::Protected, value: &str) -> bool {
     !guard.url(value) && url::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+}
+
+fn worker_document(value: &str) -> bool {
+    value.is_empty()
+        || url::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "blob" | "data"))
+}
+
+fn document_context(guard: &cdp_client::protected::Protected, document_url: &str, loader: &str) -> bool {
+    ordinary(guard, document_url) || (loader.is_empty() && worker_document(document_url) && !guard.url(document_url))
+}
+
+fn recording_path(id: &str, cwd: Option<&Path>) -> PathBuf {
+    let preferred = PathBuf::from(format!("/recordings/{id}/recording.har"));
+    if recordings_root_writable() {
+        preferred
+    } else {
+        let root = cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        root.join("recordings").join(id).join("recording.har")
+    }
+}
+
+fn recordings_root_writable() -> bool {
+    let root = Path::new("/recordings");
+    if root.is_dir() {
+        let probe = root.join(format!(".slicc-har-probe-{}", std::process::id()));
+        let ok = session::write_private_file(&probe, "").is_ok();
+        let _ = fs::remove_file(&probe);
+        return ok;
+    }
+    match fs::create_dir_all(root) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
 }
 
 fn headers(cdp: &Cdp, value: &Value, source: &str, credentials: bool) -> Vec<Value> {
