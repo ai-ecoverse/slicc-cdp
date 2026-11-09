@@ -154,11 +154,21 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     let session = match attach(cdp, state, &target) { Ok(session) => session, Err(message) => return Output::err(message) };
     let id = format!("rec-{}-{}", now_ms(), &cdp_client::hash::sha256_hex(format!("{target}:{session}:{:?}", SystemTime::now()).as_bytes())[..12]);
     let path = if alias {
-        recording_path(&id, invocation.cwd.as_deref())
+        match session::recording_har(&id) {
+            Some(path) => path,
+            None => {
+                cdp.set_decider(&session, None);
+                cdp::detach(cdp, &session);
+                let _ = browser::close_target(cdp, &target);
+                state.owned.retain(|owned| owned != &target);
+                state.created_blanks.remove(&target);
+                return Output::err("session: user config dir is not absolute\n");
+            }
+        }
     } else {
-        PathBuf::from(&invocation.positionals[0])
+        let path = PathBuf::from(&invocation.positionals[0]);
+        if path.is_absolute() { path } else { invocation.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default().join(path) }
     };
-    let path = if path.is_absolute() { path } else { invocation.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default().join(path) };
     let mut holder = Holder {
         files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
         entries: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
@@ -547,16 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn recording_path_prefers_writable_recordings_root_then_cwd() {
-        let cwd = std::env::temp_dir().join(format!("slicc-har-path-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
-        fs::create_dir_all(&cwd).unwrap();
-        let path = recording_path("rec-test", Some(&cwd));
-        if Path::new("/recordings").is_dir() && recordings_root_writable() {
-            assert_eq!(path, PathBuf::from("/recordings/rec-test/recording.har"));
-        } else {
-            assert_eq!(path, cwd.join("recordings/rec-test/recording.har"));
-        }
-        fs::remove_dir_all(cwd).unwrap();
+    fn recording_har_lives_beside_sessions_under_the_user_config_dir() {
+        let path = session::recording_har("rec-test").unwrap();
+        assert!(path.ends_with(Path::new("slicc/playwright-cli/recordings/rec-test/recording.har")));
+        assert!(path.is_absolute());
+        assert!(session::recording_har("../escape").is_none());
+        assert!(session::recording_har("").is_none());
     }
 
     #[test]
@@ -623,24 +629,6 @@ fn worker_document(value: &str) -> bool {
 
 fn document_context(guard: &cdp_client::protected::Protected, document_url: &str, loader: &str) -> bool {
     ordinary(guard, document_url) || (loader.is_empty() && worker_document(document_url) && !guard.url(document_url))
-}
-
-fn recording_path(id: &str, cwd: Option<&Path>) -> PathBuf {
-    let preferred = PathBuf::from(format!("/recordings/{id}/recording.har"));
-    if recordings_root_writable() {
-        preferred
-    } else {
-        let root = cwd.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
-        root.join("recordings").join(id).join("recording.har")
-    }
-}
-
-fn recordings_root_writable() -> bool {
-    let root = Path::new("/recordings");
-    if root.is_dir() {
-        return true;
-    }
-    fs::create_dir_all(root).is_ok()
 }
 
 fn headers(cdp: &Cdp, value: &Value, source: &str, credentials: bool) -> Vec<Value> {

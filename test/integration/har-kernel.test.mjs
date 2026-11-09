@@ -5,7 +5,7 @@ import { fakeCdp } from './fake-cdp.mjs';
 import { kernelRunner } from './runners.mjs';
 import './watchdog.mjs';
 
-test('slicc6 HAR aliases open a new tab and persist HAR 1.2 in the kernel recordings directory', async () => {
+test('slicc6 HAR aliases open a new tab and persist HAR 1.2 beside sessions under the user config dir', async () => {
   const backend = await fakeCdp();
   let runner;
   try {
@@ -14,8 +14,6 @@ test('slicc6 HAR aliases open a new tab and persist HAR 1.2 in the kernel record
       path.resolve('target/wasm32-wasip1/debug/curlwright.wasm'),
       backend.url
     );
-    await runner.writeFile('/recordings/.keep', '');
-    const recordingsMode = (await runner.stat('/recordings')).mode;
     const cwd = await runner.fresh();
     const cwdMode = (await runner.stat(cwd)).mode;
     const homeMode = (await runner.stat('/home')).mode;
@@ -28,14 +26,16 @@ test('slicc6 HAR aliases open a new tab and persist HAR 1.2 in the kernel record
     const events = held.stdout.trim().split('\n').map(JSON.parse);
     const ready = events.find((event) => event.event === 'ready');
     assert.match(ready.recordingId, /^rec-/);
-    assert.equal(ready.path, `/recordings/${ready.recordingId}/recording.har`);
+    assert.equal(
+      ready.path,
+      `/root/.config/slicc/playwright-cli/recordings/${ready.recordingId}/recording.har`
+    );
     assert.equal(events.at(-1).reason, 'stdin');
     assert.equal(
       JSON.parse(new TextDecoder().decode(await runner.readFile(ready.path))).log.version,
       '1.2'
     );
     assert.equal((await runner.stat(ready.path)).mode & 0o777, 0o600);
-    assert.equal((await runner.stat('/recordings')).mode, recordingsMode);
     assert.ok(backend.calls.some((call) => call.method === 'Target.createTarget'));
     assert.ok(
       backend.calls.some(
