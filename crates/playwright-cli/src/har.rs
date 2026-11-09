@@ -160,7 +160,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     };
     let path = if path.is_absolute() { path } else { invocation.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default().join(path) };
     let mut holder = Holder {
-        files, id, target: target.clone(), session: Some(session), workers: BTreeSet::new(), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
+        files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
         entries: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
         embed: invocation.flags.get("content").is_some_and(|value| value == "embed"),
         minimal: invocation.flags.get("mode").is_some_and(|value| value == "minimal"),
@@ -182,7 +182,6 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
         }
     };
     let result = holder.run(cdp, state, endpoint, if alias { invocation.positionals.first().map(String::as_str) } else { None });
-    for worker in &holder.workers { let _ = cdp.call("Network.disable", json!({}), Some(worker)); cdp::detach(cdp, worker); }
     if let Some(session) = &holder.session { cdp.set_decider(session, None); cdp::detach(cdp, session); }
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.endpoint = state.endpoint.clone();
@@ -203,11 +202,6 @@ fn attach(cdp: &mut Cdp, state: &Session, target: &str) -> Result<String, String
     for method in ["Page.enable", "Network.enable"] {
         if let Err(message) = cdp.call(method, json!({}), Some(&session)) { cdp::detach(cdp, &session); return Err(message) }
     }
-    let _ = cdp.call(
-        "Target.setAutoAttach",
-        json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}),
-        Some(&session),
-    );
     cdp.set_decider(&session, Some(Box::new(|paused| {
         if paused.status.is_some() { cdp_client::fetch::Decision::ContinueResponse(Default::default()) }
         else { cdp_client::fetch::Decision::default() }
@@ -218,10 +212,6 @@ fn attach(cdp: &mut Cdp, state: &Session, target: &str) -> Result<String, String
         return Err(message);
     }
     Ok(session)
-}
-
-fn worker_target(kind: &str) -> bool {
-    matches!(kind, "worker" | "service_worker" | "shared_worker")
 }
 
 struct Pending {
@@ -242,7 +232,6 @@ struct Holder {
     id: String,
     target: String,
     session: Option<String>,
-    workers: BTreeSet<String>,
     path: PathBuf,
     main_frame: String,
     seen: usize,
@@ -316,7 +305,6 @@ impl Holder {
             if beat.elapsed() >= Duration::from_secs(1) { self.beat()?; beat = Instant::now(); }
             if self.session.as_deref().is_some_and(|session| cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) {
                 if self.absorb(cdp)? { return Ok("closed".into()) }
-                self.drop_workers(cdp);
                 if let Some(session) = self.session.take() { cdp.set_decider(&session, None); cdp::detach(cdp, &session); }
                 self.pending.clear();
                 self.failed.clear();
@@ -371,7 +359,6 @@ impl Holder {
         let previous = previous.borrow_mut().take();
         match attached {
             Ok(Some(session)) => {
-                self.drop_workers(cdp);
                 self.session = Some(session);
                 self.seen = cdp.events().len();
                 Ok(())
@@ -388,17 +375,6 @@ impl Holder {
         Ok(())
     }
 
-    fn owns(&self, session: Option<&str>) -> bool {
-        session.is_some_and(|session| self.session.as_deref() == Some(session) || self.workers.contains(session))
-    }
-
-    fn drop_workers(&mut self, cdp: &mut Cdp) {
-        for worker in std::mem::take(&mut self.workers) {
-            let _ = cdp.call("Network.disable", json!({}), Some(&worker));
-            cdp::detach(cdp, &worker);
-        }
-    }
-
     fn absorb(&mut self, cdp: &mut Cdp) -> Result<bool, String> {
         let events = cdp.events()[self.seen.min(cdp.events().len())..].to_vec();
         self.seen = cdp.events().len();
@@ -406,26 +382,7 @@ impl Holder {
             if event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == self.target {
                 return Ok(true);
             }
-            if event["method"] == "Target.attachedToTarget" {
-                let params = &event["params"];
-                let child = text(params, "sessionId");
-                let kind = text(&params["targetInfo"], "type");
-                if event["sessionId"].as_str() == self.session.as_deref() && worker_target(kind) && !child.is_empty() {
-                    if cdp.call("Network.enable", json!({}), Some(child)).is_ok() {
-                        self.workers.insert(child.to_string());
-                    } else {
-                        cdp::detach(cdp, child);
-                    }
-                }
-                continue;
-            }
-            if event["method"] == "Target.detachedFromTarget" {
-                if let Some(child) = event["params"]["sessionId"].as_str() {
-                    self.workers.remove(child);
-                }
-                continue;
-            }
-            if !self.owns(event["sessionId"].as_str()) { continue }
+            if event["sessionId"].as_str() != self.session.as_deref() { continue }
             let params = &event["params"];
             let id = text(params, "requestId");
             match text(&event, "method") {
@@ -681,15 +638,9 @@ fn recording_path(id: &str, cwd: Option<&Path>) -> PathBuf {
 fn recordings_root_writable() -> bool {
     let root = Path::new("/recordings");
     if root.is_dir() {
-        let probe = root.join(format!(".slicc-har-probe-{}", std::process::id()));
-        let ok = session::write_private_file(&probe, "").is_ok();
-        let _ = fs::remove_file(&probe);
-        return ok;
+        return true;
     }
-    match fs::create_dir_all(root) {
-        Ok(()) => true,
-        Err(_) => false,
-    }
+    fs::create_dir_all(root).is_ok()
 }
 
 fn headers(cdp: &Cdp, value: &Value, source: &str, credentials: bool) -> Vec<Value> {
