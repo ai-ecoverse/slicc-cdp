@@ -348,8 +348,12 @@ fn cmd_close(
                 ));
             }
         },
-        None => match resolve_target(cdp, invocation, state, &pages, false) {
-            Ok(target) => target,
+        None => match protected_tab(cdp, invocation, state, &pages) {
+            Ok(Some(target)) => target,
+            Ok(None) => match resolve_target(cdp, invocation, state, &pages, false) {
+                Ok(target) => target,
+                Err(message) => return Output::err(message),
+            },
             Err(message) => return Output::err(message),
         },
     };
@@ -366,6 +370,27 @@ fn cmd_close(
             Output::ok(format!("Closed tab {target}\n"))
         }
         Err(message) => Output::err(message),
+    }
+}
+
+fn protected_tab(cdp: &mut Cdp, invocation: &Invocation, state: &Session, pages: &[PageInfo]) -> Result<Option<String>, String> {
+    let (tab, frame) = match invocation.flags.get("tab") {
+        Some(tab) => (tab.clone(), false),
+        None => match state.current.clone() {
+            Some(current) => (current, true),
+            None => return Ok(None),
+        },
+    };
+    if pages.iter().any(|page| page.target_id == tab) {
+        return Ok(None);
+    }
+    if cdp.is_protected_target(&tab) {
+        return Ok(Some(tab));
+    }
+    match cdp.target_protected(&tab, frame) {
+        Ok(true) => Ok(Some(tab)),
+        Err(message) if crate::cdp::transport_error(&message) => Err(message),
+        _ => Ok(None),
     }
 }
 

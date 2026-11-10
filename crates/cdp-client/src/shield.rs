@@ -1151,7 +1151,6 @@ mod tests {
                     json!({ "targetId": tab, "flatten": true }),
                 ),
                 ("Target.activateTarget", json!({ "targetId": tab })),
-                ("Target.closeTarget", json!({ "targetId": tab })),
                 ("Target.exposeDevToolsProtocol", json!({ "targetId": tab })),
                 (
                     "Target.sendMessageToTarget",
@@ -1700,8 +1699,16 @@ mod tests {
 
         nothing_mentions(&cdp, "SECRETKEY");
         nothing_mentions(&cdp, "COOKIESECRET");
-        raw.close(&seven_tab);
-        raw.close(&vault_tab);
+        for tab in [&seven_tab, &vault_tab] {
+            assert!(cdp.is_protected_target(tab));
+            let closed = cdp.call("Target.closeTarget", json!({ "targetId": tab }), None).unwrap();
+            assert_eq!(closed["success"], json!(true));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while page_ids(&mut raw).contains(tab.as_str()) {
+                assert!(Instant::now() < deadline, "the closed protected tab is still open");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     fn fixture_hits(app: &str, path: &str) -> String {
