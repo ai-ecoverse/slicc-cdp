@@ -40,9 +40,12 @@ pub fn run(tool: &Tool, command: &str, _check: bool, _force: bool) -> Report {
 #[cfg(not(target_os = "wasi"))]
 pub fn run(tool: &Tool, command: &str, check: bool, force: bool) -> Report {
     let name = tool.name;
-    let notice = native::api_override()
+    let mut notice = native::api_override()
         .map(|base| format!("{name} {command}: {} overrides the GitHub API with {base}\n", native::API_ENV))
         .unwrap_or_default();
+    if let Some(base) = native::web_override() {
+        notice.push_str(&format!("{name} {command}: {} overrides github.com with {base}\n", native::WEB_ENV));
+    }
     let mut report = match native::upgrade(tool, check, force) {
         Ok(stdout) => Report::ok(stdout),
         Err(message) => Report::err(format!("{name} {command}: {message}\n")),
@@ -204,7 +207,10 @@ mod native {
 
     const REPO: &str = "ai-ecoverse/slicc-cdp";
     const DEFAULT_API: &str = "https://api.github.com";
+    const DEFAULT_WEB: &str = "https://github.com";
     pub const API_ENV: &str = "SLICC_UPDATE_API_BASE";
+    pub const WEB_ENV: &str = "SLICC_UPDATE_WEB_BASE";
+    const TAG_PATH: &str = "/releases/tag/";
     const SUMS: &str = "SHA256SUMS";
     const MAX_JSON: usize = 4 << 20;
     const MAX_SUMS: usize = 1 << 20;
@@ -293,19 +299,54 @@ mod native {
             .to_string()
     }
 
+    pub fn web_override() -> Option<String> {
+        std::env::var(WEB_ENV).ok().filter(|base| !base.is_empty())
+    }
+
+    fn web_base() -> Option<String> {
+        match (web_override(), api_override()) {
+            (Some(web), _) => Some(web.trim_end_matches('/').to_string()),
+            (None, Some(_)) => None,
+            (None, None) => Some(DEFAULT_WEB.to_string()),
+        }
+    }
+
+    fn token() -> Option<String> {
+        ["GH_TOKEN", "GITHUB_TOKEN"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .map(|token| token.trim().to_string())
+            .find(|token| !token.is_empty())
+    }
+
     fn get(tool: &Tool, url: &str, accept: &str, cap: usize, total: Duration) -> Result<Vec<u8>, String> {
         let agent = format!("{}/{}", tool.name, normalize(tool.version));
         let mut current = url.to_string();
+        let api = format!("{}/repos/", api_base());
+        let token = token();
+        let bearer = token.as_ref().map(|token| format!("Bearer {token}"));
         for _ in 0..=MAX_REDIRECTS {
             let mut headers = vec![("User-Agent", agent.as_str())];
             if !accept.is_empty() {
                 headers.push(("Accept", accept));
             }
+            let to_api = current.starts_with(&api);
+            if let (true, Some(bearer)) = (to_api, bearer.as_deref()) {
+                headers.push(("Authorization", bearer));
+            }
             allowed_url(&current)?;
             let response = crate::net::http_fetch(&current, &headers, cap, total)
                 .map_err(|err| err.trim_end().to_string())?;
+            let limited = response
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-ratelimit-remaining") && value.trim() == "0");
             match response.status {
                 200 => return Ok(response.body),
+                status @ (403 | 429) if to_api && limited => {
+                    let hint = if token.is_some() { "" } else { "; set GH_TOKEN or GITHUB_TOKEN for a higher one" };
+                    return Err(format!("HTTP {status} (GitHub's API rate limit is used up{hint})"));
+                }
                 301 | 302 | 303 | 307 | 308 => {
                     let location = response
                         .headers
@@ -327,6 +368,64 @@ mod native {
     }
 
     fn latest(tool: &Tool) -> Result<Release, String> {
+        let Some(web) = web_base() else {
+            return from_api(tool);
+        };
+        let web_err = match from_web(tool, &web) {
+            Ok(release) => return Ok(release),
+            Err(message) => message,
+        };
+        from_api(tool).map_err(|message| format!("{message} (and {web}/{REPO}/releases/latest: {web_err})"))
+    }
+
+    fn from_web(tool: &Tool, web: &str) -> Result<Release, String> {
+        let asset = this_asset(tool)?;
+        let releases = format!("{web}/{REPO}/releases");
+        let url = format!("{releases}/latest");
+        allowed_url(&url)?;
+        let agent = format!("{}/{}", tool.name, normalize(tool.version));
+        let response = crate::net::http_fetch(&url, &[("User-Agent", agent.as_str())], MAX_JSON, Duration::from_secs(60))
+            .map_err(|err| err.trim_end().to_string())?;
+        if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            return Err(format!("HTTP {}", response.status));
+        }
+        let location = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| format!("HTTP {} without a Location", response.status))?;
+        let next = url::Url::parse(&url)
+            .and_then(|base| base.join(&location))
+            .map_err(|err| format!("bad redirect: {err}"))?;
+        let tag = next
+            .path()
+            .rfind(TAG_PATH)
+            .map(|at| &next.path()[at + TAG_PATH.len()..])
+            .ok_or_else(|| format!("redirected to {}, not to a release tag", next.origin().ascii_serialization() + next.path()))?;
+        if !is_release_version(tag) {
+            return Err(format!("the latest release has an unexpected tag {tag:?}"));
+        }
+        let download = format!("{releases}/download/{tag}");
+        Ok(Release {
+            version: normalize(tag).to_string(),
+            asset_url: format!("{download}/{asset}"),
+            sums_url: format!("{download}/{SUMS}"),
+            asset,
+        })
+    }
+
+    fn this_asset(tool: &Tool) -> Result<String, String> {
+        asset_name(tool.name, std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
+            format!(
+                "no release binary for {} {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        })
+    }
+
+    fn from_api(tool: &Tool) -> Result<Release, String> {
         let url = format!("{}/repos/{REPO}/releases/latest", api_base());
         let body = get(tool, &url, "application/vnd.github+json", MAX_JSON, Duration::from_secs(60))
             .map_err(|err| format!("asking GitHub for the latest release: {err}"))?;
@@ -337,13 +436,7 @@ mod native {
             return Err(format!("the latest release has an unexpected tag {tag:?}"));
         }
         let version = normalize(tag).to_string();
-        let asset = asset_name(tool.name, std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
-            format!(
-                "no release binary for {} {}",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            )
-        })?;
+        let asset = this_asset(tool)?;
         let mut asset_url = None;
         let mut sums_url = None;
         for entry in json.get("assets").and_then(|assets| assets.as_array()).into_iter().flatten() {

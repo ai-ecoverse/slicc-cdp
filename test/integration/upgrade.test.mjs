@@ -44,16 +44,36 @@ function fakeGitHub(asset = `playwright-cli-${os}-${arch}`) {
     assetUrl: null,
     sumsUrl: null,
     status: 200,
+    rateLimited: false,
+    noWeb: false,
     downloads: 0,
     requests: [],
   };
   const server = createServer((req, res) => {
-    state.requests.push({ url: req.url, agent: req.headers['user-agent'] });
+    state.requests.push({
+      url: req.url,
+      agent: req.headers['user-agent'],
+      auth: req.headers.authorization,
+    });
     if (state.status !== 200) {
-      res.writeHead(state.status).end('unavailable');
+      const limit = state.rateLimited && req.url.startsWith('/repos/');
+      res.writeHead(state.status, limit ? { 'x-ratelimit-remaining': '0' } : {}).end('unavailable');
       return;
     }
     const base = `http://127.0.0.1:${server.address().port}`;
+    const web = '/ai-ecoverse/slicc-cdp/releases';
+    if (req.url === `${web}/latest` && !state.noWeb) {
+      res.writeHead(302, { location: `${base}${web}/tag/${state.tag}` }).end();
+      return;
+    }
+    if (req.url === `${web}/download/${state.tag}/${asset}`) {
+      res.writeHead(302, { location: `/objects/${asset}` }).end();
+      return;
+    }
+    if (req.url === `${web}/download/${state.tag}/SHA256SUMS`) {
+      res.writeHead(302, { location: '/dl/SHA256SUMS' }).end();
+      return;
+    }
     if (req.url === '/repos/ai-ecoverse/slicc-cdp/releases/latest') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
@@ -101,6 +121,9 @@ function run(bin, args, base, extra = {}) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, SLICC_UPDATE_API_BASE: base };
     delete env.CARGO_HOME;
+    delete env.GH_TOKEN;
+    delete env.GITHUB_TOKEN;
+    delete env.SLICC_UPDATE_WEB_BASE;
     if (base === null) delete env.SLICC_UPDATE_API_BASE;
     Object.assign(env, extra);
     const child = spawn(bin, args, { env });
@@ -143,6 +166,8 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
       assetUrl: null,
       sumsUrl: null,
       status: 200,
+      rateLimited: false,
+      noWeb: false,
       downloads: 0,
       requests: [],
     });
@@ -377,6 +402,95 @@ test('playwright-cli upgrade replaces the binary with the verified latest releas
     untouched(bin);
   });
 
+  const both = (command) =>
+    `${notice(command)}playwright-cli ${command}: SLICC_UPDATE_WEB_BASE overrides github.com with ${fake.base}\n`;
+  const viaWeb = (bin, args, extra = {}) =>
+    run(bin, args, fake.base, { SLICC_UPDATE_WEB_BASE: fake.base, ...extra });
+  const api = () => fake.state.requests.filter((r) => r.url.startsWith('/repos/'));
+
+  await t.test('the latest release comes from github.com, without the API', async () => {
+    reset();
+    const bin = install();
+    const check = await viaWeb(bin, ['upgrade', '--check']);
+    assert.equal(check.code, 0, check.stderr);
+    assert.equal(check.stderr, both('upgrade'));
+    assert.match(check.stdout, /9\.9\.9/);
+    const result = await viaWeb(bin, ['update', '--force']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(
+      result.stdout,
+      `upgrading playwright-cli ${version} to 9.9.9\nupgraded ${realpathSync(bin)} to playwright-cli 9.9.9 (SHA256SUMS verified)\n`
+    );
+    assert.equal(readFileSync(bin, 'utf8'), script('9.9.9').toString());
+    assert.ok(
+      fake.state.requests.some(
+        (r) => r.url === `/ai-ecoverse/slicc-cdp/releases/download/v9.9.9/${asset}`
+      )
+    );
+    assert.deepEqual(api(), []);
+  });
+
+  await t.test('the API is the fallback when github.com names no release', async () => {
+    reset();
+    fake.state.noWeb = true;
+    const bin = install();
+    const result = await viaWeb(bin, ['upgrade', '--force']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(readFileSync(bin, 'utf8'), script('9.9.9').toString());
+    assert.equal(api().length, 1);
+  });
+
+  await t.test('a failure on both names both', async () => {
+    reset();
+    fake.state.status = 403;
+    const bin = install();
+    const result = await viaWeb(bin, ['upgrade', '--check']);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr.slice(both('upgrade').length),
+      `playwright-cli upgrade: asking GitHub for the latest release: HTTP 403 (and ${fake.base}/ai-ecoverse/slicc-cdp/releases/latest: HTTP 403)\n`
+    );
+    untouched(bin);
+  });
+
+  await t.test('GH_TOKEN or GITHUB_TOKEN goes to the API only', async () => {
+    for (const key of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+      reset();
+      fake.state.noWeb = true;
+      const bin = install();
+      const result = await viaWeb(bin, ['upgrade', '--force'], { [key]: 'fake-token-0001' });
+      assert.equal(result.code, 0, result.stderr);
+      assert.ok(fake.state.requests.length > 2);
+      for (const r of fake.state.requests) {
+        const want = r.url.startsWith('/repos/') ? 'Bearer fake-token-0001' : undefined;
+        assert.equal(r.auth, want, `${key} ${r.url}`);
+      }
+      assert.equal(api().length, 1);
+      assert.doesNotMatch(result.stdout + result.stderr, /fake-token/);
+    }
+  });
+
+  await t.test('a used-up API rate limit is named', async () => {
+    reset();
+    fake.state.status = 403;
+    fake.state.rateLimited = true;
+    const bin = install();
+    const bare = await run(bin, ['upgrade', '--check'], fake.base);
+    assert.equal(bare.code, 1);
+    assert.equal(
+      after(bare),
+      "playwright-cli upgrade: asking GitHub for the latest release: HTTP 403 (GitHub's API rate limit is used up; set GH_TOKEN or GITHUB_TOKEN for a higher one)\n"
+    );
+    const token = await run(bin, ['upgrade', '--check'], fake.base, {
+      GH_TOKEN: 'fake-token-0001',
+    });
+    assert.equal(
+      after(token),
+      "playwright-cli upgrade: asking GitHub for the latest release: HTTP 403 (GitHub's API rate limit is used up)\n"
+    );
+    untouched(bin);
+  });
+
   await t.test(
     'unknown options and arguments are refused, and help documents both names',
     async () => {
@@ -473,6 +587,25 @@ test('curlwright upgrade replaces its own binary with the verified latest releas
     const swapped = await run(bin, ['--version'], fake.base);
     assert.equal(swapped.stdout, 'curlwright 9.9.9\n');
     assert.deepEqual(readdirSync(path.dirname(bin)), ['curlwright']);
+  });
+
+  await t.test('github.com gives curlwright its own asset, without the API', async () => {
+    reset();
+    const bin = install();
+    const result = await run(bin, ['update', '--force'], fake.base, {
+      SLICC_UPDATE_WEB_BASE: fake.base,
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(readFileSync(bin, 'utf8'), script('9.9.9', 'curlwright').toString());
+    assert.ok(
+      fake.state.requests.some(
+        (r) => r.url === `/ai-ecoverse/slicc-cdp/releases/download/v9.9.9/${curlAsset}`
+      )
+    );
+    assert.deepEqual(
+      fake.state.requests.filter((r) => r.url.startsWith('/repos/')),
+      []
+    );
   });
 
   await t.test('a real release binary passes the version gate', async () => {
