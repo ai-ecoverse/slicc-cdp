@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 #[path = "webmcp_guard.rs"]
 mod webmcp_guard;
+#[path = "har_guard.rs"]
+mod har_guard;
 #[path = "page_scope.rs"]
 mod page_scope;
 #[path = "document_order.rs"]
@@ -195,6 +197,7 @@ pub struct Cdp {
     documents: BTreeMap<String, MainDocument>,
     unobserved: BTreeSet<String>,
     webmcp: webmcp_guard::Webmcp,
+    har: har_guard::Har,
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
     pub(crate) batch_wait: Duration,
@@ -323,6 +326,7 @@ impl Cdp {
             documents: BTreeMap::new(),
             unobserved: BTreeSet::new(),
             webmcp: webmcp_guard::Webmcp::default(),
+            har: har_guard::Har::default(),
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
             batch_wait: BATCH_WAIT,
@@ -3685,6 +3689,7 @@ impl Cdp {
         self.worlds.event(&json!({"method":"Target.detachedFromTarget","params":{"sessionId":session}}), &self.guard);
         self.issued.forget(session);
         self.webmcp.forget(session);
+        self.har_forget(session);
     }
 
     fn absorb(&mut self, mut value: Value) {
@@ -3723,6 +3728,9 @@ impl Cdp {
             for navigation in self.navigations.values_mut() {
                 if navigation.session.as_deref() == session { navigation.detached = true; }
             }
+        }
+        if self.har_event(&value) {
+            return;
         }
         if self.webmcp_event(&value) {
             return;
