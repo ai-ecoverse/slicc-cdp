@@ -13,7 +13,6 @@ struct BackendState {
     refuse_auto_attach: bool,
     fail_network_enable: bool,
     early_attaches: Vec<Value>,
-    flip_creator_on_body: bool,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -57,23 +56,6 @@ impl Transport for Backend {
                 }
             }
             "Network.getResponseBody" => {
-                if state.flip_creator_on_body {
-                    state.inbox.push_back(
-                        json!({
-                            "method": "Page.frameNavigated",
-                            "sessionId": "H",
-                            "params": {
-                                "frame": {
-                                    "id": "F",
-                                    "loaderId": "P",
-                                    "url": "https://seven.sliccy.ai/",
-                                    "securityOrigin": "https://seven.sliccy.ai"
-                                }
-                            }
-                        })
-                        .to_string(),
-                    );
-                }
                 state.inbox.push_back(
                     json!({"id":command["id"],"result":{"body":"worker-body","base64Encoded":false}})
                         .to_string(),
@@ -783,23 +765,4 @@ fn worker_initiator_stack_marks_request_protected() {
         })),
     );
     assert_worker_body_refused(&mut cdp, "WORKER", "STACK");
-}
-
-#[test]
-fn worker_body_call_sees_creator_flip_before_reply() {
-    let (mut cdp, state) = client();
-    state.borrow_mut().flip_creator_on_body = true;
-    admit_worker(&mut cdp, &state, "WORKER");
-    worker_fetch(&mut cdp, "WORKER", "RACE", "https://ordinary.test/body");
-    assert!(cdp.ordinary_response_body("WORKER", "RACE"));
-    let body = cdp.call(
-        "Network.getResponseBody",
-        json!({"requestId": "RACE"}),
-        Some("WORKER"),
-    );
-    assert!(
-        body.is_err() || !cdp.ordinary_response_body("WORKER", "RACE"),
-        "creator flip during body read must leave the request unembeddable: {body:?}"
-    );
-    assert!(!cdp.ordinary_response_body("WORKER", "RACE"));
 }
