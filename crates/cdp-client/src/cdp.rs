@@ -1045,7 +1045,7 @@ impl Cdp {
             for key in ["targetId"] {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
-                    if self.target_protected(&target, false)? {
+                    if self.target_protected(&target, false)? && !(method == "Target.closeTarget" && self.closable_tab(&target)) {
                         let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
                         return Err(format!("{}\n", self.guard.refusal_for_url(url)));
                     }
@@ -1702,6 +1702,24 @@ impl Cdp {
             },
         };
         self.guard.target(url, previous, opener)
+    }
+
+    fn closable_tab(&mut self, target_id: &str) -> bool {
+        if !self.targets.contains_key(target_id) {
+            if let Some(info) = self
+                .raw_call("Target.getTargetInfo", json!({ "targetId": target_id }), None, DOCUMENT_CHECK)
+                .ok()
+                .and_then(|found| found.get("targetInfo").cloned())
+                .filter(Value::is_object)
+            {
+                self.targets.insert(target_id.to_string(), info);
+            }
+        }
+        let Some(info) = self.targets.get(target_id).filter(|info| info.get("type").and_then(Value::as_str) == Some("page")) else { return false };
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+        let document = self.documents.get(target_id);
+        document.is_some_and(|doc| self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty())
+            || !kept_document(&self.guard, url) && document.is_none_or(|doc| !kept_document(&self.guard, &doc.url))
     }
 
     pub fn target_protected(&mut self, target_id: &str, frame: bool) -> Result<bool, String> {
@@ -4114,6 +4132,16 @@ fn storage_content(method: &str) -> bool {
         || matches!(method, "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota")
 }
 
+fn kept_document(guard: &Protected, text: &str) -> bool {
+    let Ok(mut url) = url::Url::parse(text) else { return false };
+    if !matches!(url.scheme(), "http" | "https") { return false }
+    let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    if host.strip_suffix(".sliccy.ai").is_some_and(|label| label == "vault" || label.starts_with("vault-")) { return true }
+    if url.set_host(Some(&host)).is_err() { return false }
+    let seven = guard.own_origin(url.as_str()) || seven_page(url.as_str());
+    seven && url.path().starts_with("/os/") && url.path() != "/os/callback.html"
+}
+
 fn harmless(method: &str, params: &Value) -> bool {
     match method {
         "Fetch.disable" => true,
@@ -4460,6 +4488,7 @@ mod tests {
     include!("client_id_test.rs");
     include!("late_reply_test.rs");
     include!("close_latch_test.rs");
+    include!("protected_close_test.rs");
     include!("page_scope_retry_test.rs");
 
     #[test]

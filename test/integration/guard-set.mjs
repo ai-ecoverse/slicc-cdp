@@ -206,6 +206,7 @@ export const runCapabilities = {
   siteIsolationOff: true,
   inboundDelay: true,
   forwardAudit: true,
+  closeProtected: true,
 };
 
 export function declaredCapabilityNames(capabilities = runCapabilities) {
@@ -327,7 +328,13 @@ export function assertGuardReport(report, id, head) {
     rowsFor(targets).map(rowKey).sort(),
     'every assigned row must be recorded exactly once'
   );
-  const checked = summary({ set, results: report.results, guard: 'slicc-cdp', sha: head });
+  const checked = summary({
+    set,
+    results: report.results,
+    guard: 'slicc-cdp',
+    sha: head,
+    capabilities: runCapabilities,
+  });
   assert.equal(report.pass, checked.pass, 'guard producer and recomputed raw verdicts must agree');
   assert.deepEqual(checked.missing, [], 'guard rows must not be missing');
   assert.deepEqual(checked.forged, [], 'guard rows must not be forged');
@@ -727,6 +734,7 @@ export async function runPartition(t, id) {
     set,
     results,
     guard: 'slicc-cdp',
+    capabilities: runCapabilities,
     sha:
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),

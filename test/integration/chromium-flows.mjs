@@ -572,6 +572,19 @@ async function protectedFlow(runner, site, wsUrl) {
     assert.match(result.stderr, refusal, args.join(' '));
     assert.doesNotMatch(result.stdout + result.stderr, /SECRET/);
   };
+  const closedTab = async (args, tab, cwd) => {
+    const result = await runner.playwright(args, cwd);
+    assert.equal(result.code, 0, `${args.join(' ')}\n${result.stderr}`);
+    assert.equal(result.stdout, `Closed tab ${tab}\n`);
+    assert.doesNotMatch(result.stderr, /SECRET|vault|sliccy/);
+    const deadline = Date.now() + 5000;
+    const open = async () =>
+      (await raw.send('Target.getTargets')).targetInfos.some((info) => info.targetId === tab);
+    while (await open()) {
+      assert.ok(Date.now() < deadline, `${tab} is still open`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  };
   try {
     const seven = await raw.open('http://seven.sliccy.ai/landing?k=SEVENSECRET');
     const vault = await raw.open('http://vault.sliccy.ai/landing?k=VAULTSECRET');
@@ -587,12 +600,18 @@ async function protectedFlow(runner, site, wsUrl) {
       await refused(['screenshot', '--tab', tab, '--filename', 'x.png'], cwd);
       await refused(['press', 'a', '--tab', tab], cwd);
       await refused(['goto', `${site.origin}/one`, '--tab', tab], cwd);
-      await refused(['tab-close', '--tab', tab], cwd);
       const curled = await runner.curl(['--tab', tab, `${site.origin}/api/me`], cwd);
       assert.notEqual(curled.code, 0, curled.stdout);
       assert.match(curled.stderr, /slicc: refused: /);
       assert.ok((await raw.targetUrl(tab)).includes('SECRET'), 'the protected tab moved');
     }
+    await closedTab(['tab-close', '--tab', seven], seven, cwd);
+    await refused(['tab-close', '--tab', vault], cwd);
+    assert.ok(
+      (await raw.targetUrl(vault)).includes('VAULTSECRET'),
+      'the live vault tab was closed'
+    );
+    await raw.send('Target.closeTarget', { targetId: vault });
     for (const url of ['http://vault.sliccy.ai/landing', '//seven.sliccy.ai/x']) {
       const curled = await runner.curl([url], cwd);
       assert.equal(curled.code, 1, curled.stdout);
@@ -646,7 +665,11 @@ async function protectedFlow(runner, site, wsUrl) {
     const requests = await runner.playwright(['requests', '--tab', tab], cwd);
     assert.doesNotMatch(requests.stdout + requests.stderr, /vault|n=refresh/);
     await runner.playwright(['unroute'], cwd);
-    for (const id of [seven, vault, tab]) await raw.send('Target.closeTarget', { targetId: id });
+    if (frame.url === 'chrome-error://chromewebdata/') await closedTab(['tab-close'], tab, cwd);
+    else {
+      await refused(['tab-close'], cwd);
+      await raw.send('Target.closeTarget', { targetId: tab });
+    }
   } finally {
     raw.close();
   }
