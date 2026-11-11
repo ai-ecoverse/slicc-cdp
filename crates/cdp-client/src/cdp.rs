@@ -102,6 +102,7 @@ struct Navigation {
     detached: bool,
 }
 
+#[derive(Clone)]
 struct MainDocument {
     frame_id: String,
     url: String,
@@ -1045,7 +1046,21 @@ impl Cdp {
             for key in ["targetId"] {
                 if let Some(target) = params.get(key).and_then(|v| v.as_str()) {
                     let target = target.to_string();
-                    if self.target_protected(&target, false)? && !(method == "Target.closeTarget" && self.closable_tab(&target)) {
+                    if method == "Target.closeTarget" {
+                        let protected = self.target_protected(&target, false)?;
+                        match self.closable_tab(&target) {
+                            Some(true) => {}
+                            Some(false) => {
+                                let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+                                return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                            }
+                            None if protected => {
+                                let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+                                return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                            }
+                            None => {}
+                        }
+                    } else if self.target_protected(&target, false)? {
                         let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
                         return Err(format!("{}\n", self.guard.refusal_for_url(url)));
                     }
@@ -1704,51 +1719,84 @@ impl Cdp {
         self.guard.target(url, previous, opener)
     }
 
-    fn closable_tab(&mut self, target_id: &str) -> bool {
-        self.refresh_close_state(target_id);
-        let Some(info) = self.targets.get(target_id).filter(|info| info.get("type").and_then(Value::as_str) == Some("page")) else { return false };
-        let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-        let document = self.documents.get(target_id);
-        if document.is_some_and(|doc| doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url))) {
-            return false;
+    fn closable_tab(&mut self, target_id: &str) -> Option<bool> {
+        let Some((url, doc)) = self.refresh_close_proof(target_id) else { return None };
+        if doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url)) {
+            self.protect_target(target_id);
+            return Some(false);
         }
-        let error = document.is_some_and(|doc| self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty());
+        if self.default_context_kept(target_id) {
+            self.protect_target(target_id);
+            return Some(false);
+        }
         let kept_now = kept_document(&self.guard, &url)
-            || document.is_some_and(|doc| kept_document(&self.guard, &doc.url) || kept_security_origin(&self.guard, &doc.url, &doc.origin));
-        if kept_now {
-            if !error {
-                return false;
-            }
-            let Some(doc) = document else { return false };
-            if kept_document(&self.guard, &doc.url) || kept_security_origin(&self.guard, &doc.url, &doc.origin) {
-                return false;
-            }
-            let explained = self.reported_unreachable(&doc.unreachable_url, &url)
-                || self.guard.error_page_url(&url) && doc.url == url && !doc.unreachable_url.is_empty();
-            return explained;
+            || kept_document(&self.guard, &doc.url)
+            || kept_security_origin(&self.guard, &doc.url, &doc.origin)
+            || doc.previous;
+        if !kept_now {
+            return Some(true);
         }
-        true
+        let error = self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty();
+        if !error {
+            self.protect_target(target_id);
+            return Some(false);
+        }
+        if kept_document(&self.guard, &doc.url) || kept_security_origin(&self.guard, &doc.url, &doc.origin) {
+            self.protect_target(target_id);
+            return Some(false);
+        }
+        let explained = self.reported_unreachable(&doc.unreachable_url, &url)
+            || self.guard.error_page_url(&url) && doc.url == url && !doc.unreachable_url.is_empty();
+        if explained {
+            Some(true)
+        } else {
+            self.protect_target(target_id);
+            Some(false)
+        }
     }
 
-    fn refresh_close_state(&mut self, target_id: &str) {
-        if let Some(info) = self
+    fn refresh_close_proof(&mut self, target_id: &str) -> Option<(String, MainDocument)> {
+        let info = self
             .raw_call("Target.getTargetInfo", json!({ "targetId": target_id }), None, DOCUMENT_CHECK)
             .ok()
             .and_then(|found| found.get("targetInfo").cloned())
-            .filter(Value::is_object)
-        {
-            self.targets.insert(target_id.to_string(), info);
+            .filter(Value::is_object)?;
+        if info.get("type").and_then(Value::as_str) != Some("page") {
+            return None;
         }
-        self.refresh_close_frame(target_id);
+        self.targets.insert(target_id.to_string(), info.clone());
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+        let frame = self.read_close_frame(target_id)?;
+        let frame_id = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?.to_string();
+        let frame_url = format!(
+            "{}{}",
+            frame.get("url").and_then(Value::as_str).unwrap_or(""),
+            frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")
+        );
+        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
+        let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
+        let previous = self.documents.get(target_id).map(|doc| doc.previous).unwrap_or(false);
+        let navigating = self.documents.get(target_id).map(|doc| doc.navigating).unwrap_or(false);
+        let navigation_url = self.documents.get(target_id).map(|doc| doc.navigation_url.clone()).unwrap_or_default();
+        let probed = self.documents.get(target_id).map(|doc| doc.probed).unwrap_or(false);
+        let doc = MainDocument {
+            frame_id: frame_id.clone(),
+            url: frame_url,
+            origin,
+            unreachable_url,
+            navigating,
+            navigation_url,
+            previous,
+            probed,
+        };
+        self.documents.insert(target_id.to_string(), doc.clone());
+        Some((url, doc))
     }
 
-    fn refresh_close_frame(&mut self, target: &str) {
+    fn read_close_frame(&mut self, target: &str) -> Option<Value> {
         let existing = self.guards.get(target).cloned().or_else(|| self.runtime_sessions.get(target).cloned());
-        let target_url = self.targets.get(target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("").to_string();
         let (session, temporary) = match existing {
             Some(session) => (session, false),
-            None if self.documents.contains_key(target) => return,
-            None if !(opaque_document(&target_url) || target_url.is_empty() || self.guard.error_page_url(&target_url)) => return,
             None => {
                 self.guarding.insert(target.to_string());
                 let attached = self.raw_call(
@@ -1758,13 +1806,10 @@ impl Cdp {
                     DOCUMENT_CHECK,
                 );
                 self.guarding.remove(target);
-                let Some(session) = attached
+                let session = attached
                     .ok()
                     .and_then(|value| value.get("sessionId").and_then(Value::as_str).map(str::to_string))
-                    .filter(|session| !session.is_empty())
-                else {
-                    return;
-                };
+                    .filter(|session| !session.is_empty())?;
                 let preexisting = self.session_targets.get(&session).is_some_and(|owner| owner == target);
                 if !preexisting {
                     self.guard_sessions.insert(session.clone());
@@ -1776,44 +1821,28 @@ impl Cdp {
         let frame = self
             .raw_call("Page.getFrameTree", json!({}), Some(&session), DOCUMENT_CHECK)
             .ok()
-            .and_then(|tree| tree.pointer("/frameTree/frame").cloned());
+            .and_then(|tree| tree.pointer("/frameTree/frame").cloned())
+            .filter(|frame| frame.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()));
         if temporary {
             let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session.clone() }), None, DOCUMENT_CHECK);
             self.guard_sessions.remove(&session);
             self.session_targets.remove(&session);
         }
-        let Some(frame) = frame else { return };
-        let frame_id = frame.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        if frame_id.is_empty() {
-            return;
-        }
-        let url = format!(
-            "{}{}",
-            frame.get("url").and_then(Value::as_str).unwrap_or(""),
-            frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")
-        );
-        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
-        let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
-        if let Some(doc) = self.documents.get_mut(target) {
-            doc.frame_id = frame_id;
-            doc.url = url;
-            doc.origin = origin;
-            doc.unreachable_url = unreachable_url;
-        } else {
-            self.documents.insert(
-                target.to_string(),
-                MainDocument {
-                    frame_id,
-                    url,
-                    origin,
-                    unreachable_url,
-                    navigating: false,
-                    navigation_url: String::new(),
-                    previous: false,
-                    probed: false,
-                },
-            );
-        }
+        frame
+    }
+
+    fn default_context_kept(&self, target: &str) -> bool {
+        let sessions: BTreeSet<&str> = self
+            .session_targets
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == target)
+            .map(|(session, _)| session.as_str())
+            .chain(self.guards.get(target).map(String::as_str))
+            .chain(self.runtime_sessions.get(target).map(String::as_str))
+            .collect();
+        self.context_proofs.iter().any(|((owner, _), proof)| {
+            sessions.contains(owner.as_str()) && proof.default && self.guard.url(&proof.origin)
+        })
     }
 
     pub fn target_protected(&mut self, target_id: &str, frame: bool) -> Result<bool, String> {
@@ -4227,7 +4256,7 @@ fn storage_content(method: &str) -> bool {
 }
 
 fn kept_document(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return false };
+    let Some(mut url) = guard.peel(text) else { return guard.url(text) };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
     if host.strip_suffix(".sliccy.ai").is_some_and(|label| label == "vault" || label.starts_with("vault-")) { return true }
@@ -4253,8 +4282,14 @@ fn opaque_document(url: &str) -> bool {
     parsed.scheme() == "about" && matches!(parsed.path().to_ascii_lowercase().as_str(), "blank" | "srcdoc")
 }
 
+fn non_http_document(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else { return !url.is_empty() };
+    !matches!(parsed.scheme(), "http" | "https")
+}
+
 fn kept_security_origin(guard: &Protected, url: &str, origin: &str) -> bool {
-    kept_document(guard, origin) || opaque_document(url) && seven_or_extra_host(guard, origin)
+    kept_document(guard, origin)
+        || (opaque_document(url) || non_http_document(url)) && seven_or_extra_host(guard, origin)
 }
 
 fn harmless(method: &str, params: &Value) -> bool {

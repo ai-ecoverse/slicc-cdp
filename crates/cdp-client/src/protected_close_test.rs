@@ -31,12 +31,21 @@ impl Transport for TabsBackend {
     fn send_text(&mut self, text: &str) -> Result<(), String> {
         let message: Value = serde_json::from_str(text).unwrap();
         self.sent.borrow_mut().push(message.clone());
-        let target = message["params"]["targetId"].as_str().unwrap_or("T");
+        let target = message["params"]["targetId"]
+            .as_str()
+            .or_else(|| message["sessionId"].as_str().and_then(|session| session.strip_prefix('S')))
+            .unwrap_or("T");
         let result = match message["method"].as_str().unwrap() {
             "Target.getTargetInfo" => json!({"targetInfo":tab_info(target)}),
             "Target.getTargets" => json!({"targetInfos":Value::Array(TABS.iter().map(|(id, _, _)| tab_info(id)).collect())}),
             "Target.attachToTarget" => json!({"sessionId":format!("S{target}")}),
+            "Page.getFrameTree" => {
+                let info = tab_info(target);
+                let url = info["url"].as_str().unwrap_or("");
+                json!({"frameTree":{"frame":{"id":format!("F{target}"),"url":url,"securityOrigin":origin_of(url),"loaderId":"L"}}})
+            }
             "Target.closeTarget" => json!({"success":true}),
+            "Target.detachFromTarget" => json!({}),
             _ => json!({}),
         };
         self.inbox.push_back(json!({"id":message["id"],"result":result}).to_string());
@@ -59,18 +68,53 @@ fn forwarded(sent: &std::rc::Rc<std::cell::RefCell<Vec<Value>>>, method: &str, t
     sent.borrow().iter().any(|call| call["method"] == method && call["params"]["targetId"] == target)
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ProbeMode {
+    Ok,
+    Timeout,
+    Error,
+}
+
 struct CloseProbe {
     inbox: VecDeque<String>,
     sent: std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
     info: std::rc::Rc<std::cell::RefCell<Value>>,
     frame: std::rc::Rc<std::cell::RefCell<Value>>,
+    info_mode: std::rc::Rc<std::cell::RefCell<ProbeMode>>,
+    frame_mode: std::rc::Rc<std::cell::RefCell<ProbeMode>>,
+    opener: std::rc::Rc<std::cell::RefCell<Option<Value>>>,
 }
 
 impl Transport for CloseProbe {
     fn send_text(&mut self, text: &str) -> Result<(), String> {
         let message: Value = serde_json::from_str(text).unwrap();
         self.sent.borrow_mut().push(message.clone());
-        let result = match message["method"].as_str().unwrap() {
+        let method = message["method"].as_str().unwrap();
+        let mode = match method {
+            "Target.getTargetInfo" => {
+                let target = message["params"]["targetId"].as_str().unwrap_or("T");
+                if target != "T" {
+                    if let Some(opener) = self.opener.borrow().as_ref() {
+                        if opener.get("targetId").and_then(Value::as_str) == Some(target) {
+                            self.inbox.push_back(json!({"id":message["id"],"result":{"targetInfo":opener}}).to_string());
+                            return Ok(());
+                        }
+                    }
+                }
+                *self.info_mode.borrow()
+            }
+            "Page.getFrameTree" => *self.frame_mode.borrow(),
+            _ => ProbeMode::Ok,
+        };
+        match mode {
+            ProbeMode::Timeout => return Ok(()),
+            ProbeMode::Error => {
+                self.inbox.push_back(json!({"id":message["id"],"error":{"message":"fake CDP error"}}).to_string());
+                return Ok(());
+            }
+            ProbeMode::Ok => {}
+        }
+        let result = match method {
             "Target.getTargetInfo" => json!({"targetInfo":self.info.borrow().clone()}),
             "Target.getTargets" => json!({"targetInfos":[self.info.borrow().clone()]}),
             "Target.attachToTarget" => {
@@ -92,17 +136,36 @@ impl Transport for CloseProbe {
 }
 
 fn close_probe(url: &str) -> (Cdp, std::rc::Rc<std::cell::RefCell<Vec<Value>>>, std::rc::Rc<std::cell::RefCell<Value>>, std::rc::Rc<std::cell::RefCell<Value>>) {
+    let (cdp, sent, info, frame, _, _, _) = close_probe_modes(url);
+    (cdp, sent, info, frame)
+}
+
+fn close_probe_modes(url: &str) -> (
+    Cdp,
+    std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
+    std::rc::Rc<std::cell::RefCell<Value>>,
+    std::rc::Rc<std::cell::RefCell<Value>>,
+    std::rc::Rc<std::cell::RefCell<ProbeMode>>,
+    std::rc::Rc<std::cell::RefCell<ProbeMode>>,
+    std::rc::Rc<std::cell::RefCell<Option<Value>>>,
+) {
     let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let info = std::rc::Rc::new(std::cell::RefCell::new(json!({"targetId":"T","type":"page","url":url,"title":"SECRETTITLE"})));
     let frame = std::rc::Rc::new(std::cell::RefCell::new(json!({"id":"F","url":url,"securityOrigin":origin_of(url),"loaderId":"L"})));
+    let info_mode = std::rc::Rc::new(std::cell::RefCell::new(ProbeMode::Ok));
+    let frame_mode = std::rc::Rc::new(std::cell::RefCell::new(ProbeMode::Ok));
+    let opener = std::rc::Rc::new(std::cell::RefCell::new(None));
     let mut cdp = Cdp::from_transport(Box::new(CloseProbe {
         inbox: VecDeque::new(),
         sent: std::rc::Rc::clone(&sent),
         info: std::rc::Rc::clone(&info),
         frame: std::rc::Rc::clone(&frame),
+        info_mode: std::rc::Rc::clone(&info_mode),
+        frame_mode: std::rc::Rc::clone(&frame_mode),
+        opener: std::rc::Rc::clone(&opener),
     }));
     cdp.protect_origins(&["http://127.0.0.1:8085"]);
-    (cdp, sent, info, frame)
+    (cdp, sent, info, frame, info_mode, frame_mode, opener)
 }
 
 fn origin_of(url: &str) -> String {
@@ -199,15 +262,17 @@ fn a_live_seven_ui_or_vault_page_stays_unclosable() {
 #[test]
 fn an_error_page_left_by_a_failed_vault_or_seven_ui_load_can_be_closed() {
     for url in ["https://vault.sliccy.ai/path?secret", "https://seven.sliccy.ai/os/?secret"] {
-        let (mut cdp, sent, info, _) = close_probe(url);
+        let (mut cdp, sent, info, frame) = close_probe(url);
         cdp.session_targets.insert("S".into(), "T".into());
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"type":"BackForwardCacheRestore","frame":{"id":"F","url":url,"securityOrigin":origin_of(url),"loaderId":"L0"}}}));
         *info.borrow_mut() = json!({"targetId":"T","type":"page","url":url,"title":"SECRETTITLE"});
+        *frame.borrow_mut() = json!({"id":"F","url":url,"securityOrigin":origin_of(url),"loaderId":"L0"});
         assert!(cdp.protected_targets.contains("T"), "{url} protected_set");
         refuse_close(&mut cdp, &sent, &format!("restored {url}"));
         cdp.session_targets.insert("S".into(), "T".into());
         cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":url,"loaderId":"L1"}}}));
         *info.borrow_mut() = json!({"targetId":"T","type":"page","url":url,"title":"SECRETTITLE"});
+        *frame.borrow_mut() = json!({"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":url,"loaderId":"L1"});
         assert!(cdp.target_protected("T", false).unwrap(), "{url}");
         assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err().starts_with("slicc: refused:"), "{url}");
         allow_close(&mut cdp, &sent, &format!("error {url}"));
@@ -305,4 +370,82 @@ fn intended_protected_closes_still_work_after_kept_hardening() {
         assert!(cdp.target_protected("T", false).unwrap(), "{url}");
         allow_close(&mut cdp, &sent, url);
     }
+}
+
+#[test]
+fn a_failed_or_timed_out_close_proof_refuses_a_protected_tab() {
+    let landing = "https://seven.sliccy.ai/landing?k=SECRET";
+    let live = "https://seven.sliccy.ai/os/?k=SECRET";
+    for mode in [ProbeMode::Timeout, ProbeMode::Error] {
+        let (mut cdp, sent, _info, frame, info_mode, _, _) = close_probe_modes(landing);
+        *frame.borrow_mut() = json!({"id":"F","url":live,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L"});
+        assert!(cdp.call("Target.activateTarget", json!({"targetId":"T"}), None).unwrap_err().starts_with("slicc: refused:"));
+        *info_mode.borrow_mut() = mode;
+        refuse_close(&mut cdp, &sent, &format!("getTargetInfo {mode:?}"));
+        assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"), "{mode:?}");
+    }
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    let (mut cdp, sent, info, frame, _, frame_mode, _) = close_probe_modes(vault);
+    cdp.session_targets.insert("S".into(), "T".into());
+    cdp.guards.insert("T".into(), "S".into());
+    cdp.guard_sessions.insert("S".into());
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":vault,"loaderId":"L1"}}}));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":vault,"title":"SECRETTITLE"});
+    *frame.borrow_mut() = json!({"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":vault,"loaderId":"L1"});
+    assert!(cdp.target_protected("T", false).unwrap());
+    *frame_mode.borrow_mut() = ProbeMode::Timeout;
+    refuse_close(&mut cdp, &sent, "getFrameTree timeout over stale error");
+    let blank = "about:blank";
+    let (mut cdp, sent, info, frame, _, frame_mode, opener) = close_probe_modes(blank);
+    *opener.borrow_mut() = Some(json!({"targetId":"O","type":"page","url":"https://vault.sliccy.ai/app","title":""}));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":blank,"title":"","openerId":"O"});
+    *frame.borrow_mut() = json!({"id":"F","url":blank,"securityOrigin":"https://vault.sliccy.ai","loaderId":"L"});
+    assert!(cdp.target_protected("T", false).unwrap());
+    *frame_mode.borrow_mut() = ProbeMode::Error;
+    refuse_close(&mut cdp, &sent, "getFrameTree CDP error on about:blank");
+}
+
+#[test]
+fn a_target_info_frame_disagreement_without_a_session_stays_unclosable() {
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    let decoy = "https://example.test/start";
+    let (mut cdp, sent, info, frame) = close_probe(vault);
+    assert!(cdp.call("Target.activateTarget", json!({"targetId":"T"}), None).unwrap_err().starts_with("slicc: refused:"));
+    assert!(!cdp.guards.contains_key("T"));
+    assert!(!cdp.runtime_sessions.contains_key("T"));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":decoy,"title":"ordinary"});
+    *frame.borrow_mut() = json!({"id":"F","url":vault,"securityOrigin":"https://vault.sliccy.ai","loaderId":"L"});
+    refuse_close(&mut cdp, &sent, "decoy targetInfo over vault frame");
+    assert!(sent.borrow().iter().any(|call| call["method"] == "Page.getFrameTree"), "frame must be read");
+}
+
+#[test]
+fn a_data_document_from_the_vault_stays_unclosable() {
+    let data = "data:text/html,SECRET";
+    let (mut cdp, sent, info, frame) = close_probe(data);
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":data,"title":""});
+    *frame.borrow_mut() = json!({"id":"F","url":data,"securityOrigin":"https://vault.sliccy.ai","loaderId":"L"});
+    refuse_close(&mut cdp, &sent, "data: with vault securityOrigin");
+    assert!(sent.borrow().iter().any(|call| call["method"] == "Page.getFrameTree"), "data: frame read");
+    assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err().starts_with("slicc: refused:"));
+    let (mut cdp, sent, info, frame) = close_probe("https://example.test/");
+    cdp.session_targets.insert("S".into(), "T".into());
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/","securityOrigin":"https://example.test","loaderId":"L0"}}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":data,"securityOrigin":null,"loaderId":"L1"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":"https://vault.sliccy.ai","name":"","uniqueId":"U1","auxData":{"isDefault":true,"frameId":"F","type":"default"}}}}));
+    assert!(cdp.is_protected_target("T"));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":data,"title":""});
+    *frame.borrow_mut() = json!({"id":"F","url":data,"securityOrigin":null,"loaderId":"L1"});
+    refuse_close(&mut cdp, &sent, "data: with vault default context origin");
+}
+
+#[test]
+fn nine_nested_view_source_wrappers_around_the_vault_stay_unclosable() {
+    let url = format!("{}https://vault.sliccy.ai/secret?k=SECRET", "view-source:".repeat(9));
+    let (mut cdp, sent, _, _) = close_probe(&url);
+    assert!(cdp.target_protected("T", false).unwrap(), "{url}");
+    let refused = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err();
+    assert!(refused.starts_with("slicc: refused:"), "{refused}");
+    assert!(!refused.contains("SECRET"), "{refused}");
+    refuse_close(&mut cdp, &sent, &url);
 }
