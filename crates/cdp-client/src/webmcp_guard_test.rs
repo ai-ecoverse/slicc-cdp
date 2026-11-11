@@ -47,6 +47,12 @@ struct BackendState {
     inject_before_child_network_enable: Option<Value>,
     child_network_enable_hook: Option<Rc<RefCell<Option<Box<dyn FnMut()>>>>>,
     fail_child_page_enable: bool,
+    replace_oopif_tree_on_child_page_enable: Option<Value>,
+    after_child_page_enable: bool,
+    delay_first_holder_get_frame_tree_after_child_page_enable: Option<Duration>,
+    delay_first_child_get_frame_tree_after_page_enable: Option<Duration>,
+    delay_nth_child_get_frame_tree_after_page_enable: Option<(usize, Duration)>,
+    child_get_frame_tree_after_page_enable_count: usize,
 }
 
 impl BackendState {
@@ -209,8 +215,25 @@ impl Transport for Backend {
                             std::thread::sleep(delay);
                         }
                     }
+                    if state.after_child_page_enable {
+                        state.child_get_frame_tree_after_page_enable_count += 1;
+                        let after = state.child_get_frame_tree_after_page_enable_count;
+                        if let Some(delay) = state.delay_first_child_get_frame_tree_after_page_enable.take() {
+                            std::thread::sleep(delay);
+                        }
+                        if let Some((nth, delay)) = state.delay_nth_child_get_frame_tree_after_page_enable {
+                            if after == nth {
+                                std::thread::sleep(delay);
+                            }
+                        }
+                    }
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
+                    if state.after_child_page_enable {
+                        if let Some(delay) = state.delay_first_holder_get_frame_tree_after_child_page_enable.take() {
+                            std::thread::sleep(delay);
+                        }
+                    }
                     state.tree.clone()
                 }
             }
@@ -242,14 +265,17 @@ impl Transport for Backend {
                     state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Page.enable failed"}}).to_string());
                     return Ok(());
                 }
+                if BackendState::child_session(session) {
+                    if let Some(tree) = state.replace_oopif_tree_on_child_page_enable.take() {
+                        state.oopif_tree = Some(tree);
+                    }
+                    state.after_child_page_enable = true;
+                }
                 state.enabled_page.insert(session.to_string());
                 if state.chrome_shaped_lifecycle && BackendState::child_session(session) {
                     if let Some(tree) = state.oopif_tree.clone() {
                         let frame = tree["frameTree"]["frame"].clone();
-                        let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
-                        if url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) {
-                            state.push_lifecycle(session, json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":frame}}));
-                        }
+                        state.push_lifecycle(session, json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":frame}}));
                     }
                     state.flush_lifecycle(session);
                 }
