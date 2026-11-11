@@ -55,6 +55,13 @@ impl Transport for Backend {
                     return Ok(());
                 }
             }
+            "Network.getResponseBody" => {
+                state.inbox.push_back(
+                    json!({"id":command["id"],"result":{"body":"worker-body","base64Encoded":false}})
+                        .to_string(),
+                );
+                return Ok(());
+            }
             "Runtime.runIfWaitingForDebugger" | "Target.detachFromTarget" => {}
             _ => {}
         }
@@ -566,4 +573,116 @@ fn client_issued_auto_attach_remains_refused() {
         Some("H"),
     );
     assert!(refused.as_ref().is_err_and(|message| message.contains("auto-attach")), "{refused:?}");
+}
+
+fn admit_worker(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, session: &str) {
+    cdp.har_auto_attach("H").unwrap();
+    cdp.absorb(worker_attach(
+        "H",
+        session,
+        "https://ordinary.test/worker.js",
+        true,
+    ));
+    drain(cdp, state);
+    assert!(cdp.har_owns(session));
+}
+
+fn worker_fetch(cdp: &mut Cdp, session: &str, id: &str, url: &str) {
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSent",
+        "sessionId": session,
+        "params": {
+            "requestId": id,
+            "loaderId": "",
+            "documentURL": "https://ordinary.test/worker.js",
+            "type": "Fetch",
+            "request": {"url": url, "method": "GET", "headers": {}}
+        }
+    }));
+    cdp.absorb(json!({
+        "method": "Network.responseReceived",
+        "sessionId": session,
+        "params": {
+            "requestId": id,
+            "response": {"url": url, "status": 200, "headers": {}, "mimeType": "text/plain"}
+        }
+    }));
+    cdp.absorb(json!({
+        "method": "Network.loadingFinished",
+        "sessionId": session,
+        "params": {"requestId": id, "timestamp": 1.2}
+    }));
+}
+
+#[test]
+fn ordinary_worker_fetch_body_is_readable() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch(&mut cdp, "WORKER", "W1", "https://ordinary.test/body");
+    assert_eq!(cdp.request_state("W1"), Some(false));
+    assert!(cdp.ordinary_response_body("WORKER", "W1"));
+    assert_eq!(
+        cdp.call("Network.getResponseBody", json!({"requestId":"W1"}), Some("WORKER"))
+            .unwrap()["body"],
+        "worker-body"
+    );
+}
+
+#[test]
+fn protected_worker_fetch_body_stays_refused() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch(&mut cdp, "WORKER", "W2", "https://catalog.test/secret");
+    assert_eq!(cdp.request_state("W2"), Some(true));
+    assert!(!cdp.ordinary_response_body("WORKER", "W2"));
+    assert!(cdp
+        .call("Network.getResponseBody", json!({"requestId":"W2"}), Some("WORKER"))
+        .unwrap_err()
+        .starts_with("slicc: refused:"));
+}
+
+#[test]
+fn unrecorded_worker_request_body_stays_refused() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    assert_eq!(cdp.request_state("MISSING"), None);
+    assert!(!cdp.ordinary_response_body("WORKER", "MISSING"));
+    assert!(cdp
+        .call(
+            "Network.getResponseBody",
+            json!({"requestId":"MISSING"}),
+            Some("WORKER")
+        )
+        .unwrap_err()
+        .starts_with("slicc: refused:"));
+}
+
+#[test]
+fn worker_bodies_stop_after_creator_becomes_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch(&mut cdp, "WORKER", "BEFORE", "https://ordinary.test/before");
+    assert!(cdp.ordinary_response_body("WORKER", "BEFORE"));
+    assert_eq!(
+        cdp.call(
+            "Network.getResponseBody",
+            json!({"requestId":"BEFORE"}),
+            Some("WORKER")
+        )
+        .unwrap()["body"],
+        "worker-body"
+    );
+    cdp.protected_targets.insert("T".into());
+    worker_fetch(&mut cdp, "WORKER", "AFTER", "https://ordinary.test/after");
+    assert_eq!(cdp.request_state("AFTER"), Some(true));
+    assert!(!cdp.ordinary_response_body("WORKER", "AFTER"));
+    assert!(!cdp.ordinary_response_body("WORKER", "BEFORE"));
+    assert!(cdp
+        .call(
+            "Network.getResponseBody",
+            json!({"requestId":"AFTER"}),
+            Some("WORKER")
+        )
+        .unwrap_err()
+        .starts_with("slicc: refused:"));
 }

@@ -81,6 +81,15 @@ impl Cdp {
         self.har.urls.get(session).map(String::as_str)
     }
 
+    pub(super) fn har_creator_blocked(&self, session: &str) -> bool {
+        self.har.workers.get(session).is_some_and(|owner| {
+            self.content_blocked(owner)
+                || self.session_target(owner).is_some_and(|target| {
+                    self.is_protected_target(&target) || self.abandoned.contains(&target)
+                })
+        })
+    }
+
     pub(super) fn har_event(&mut self, value: &Value) -> bool {
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "Target.detachedFromTarget" {

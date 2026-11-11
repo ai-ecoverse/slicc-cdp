@@ -34,7 +34,11 @@ async function workerFixture(body, options = {}) {
   const file = path.join(home, 'traffic.har');
   let held;
   try {
-    held = harHolder(backend.url, ['har-start', '--tab', 'TAB', file], home);
+    held = harHolder(
+      backend.url,
+      ['har-start', '--tab', 'TAB', ...(options.flags ?? []), file],
+      home
+    );
     await held.event('ready');
     await body({ home, backend, tab, file, held, emitters });
   } finally {
@@ -42,6 +46,65 @@ async function workerFixture(body, options = {}) {
     await backend.close();
     await rm(home, { recursive: true, force: true });
   }
+}
+
+async function admitWorker(backend, emitters, held, session = 'WORKER') {
+  await waitFor(
+    () =>
+      backend.calls.some(
+        (call) => call.method === 'Target.setAutoAttach' && call.params?.autoAttach === true
+      ),
+    'worker setAutoAttach'
+  );
+  const pageSession = backend.calls.find(
+    (call) => call.method === 'Target.setAutoAttach' && call.params?.autoAttach === true
+  )?.sessionId;
+  const pageEmit = emitters.get(pageSession);
+  assert.ok(pageEmit, `missing emitter for ${pageSession}`);
+  pageEmit('Target.attachedToTarget', {
+    sessionId: session,
+    targetInfo: {
+      targetId: `${session}-TARGET`,
+      type: 'worker',
+      url: 'https://example.test/worker.js',
+    },
+    waitingForDebugger: true,
+  });
+  await waitFor(
+    () =>
+      backend.calls.some(
+        (call) => call.method === 'Runtime.runIfWaitingForDebugger' && call.sessionId === session
+      ),
+    'worker runIfWaitingForDebugger'
+  );
+  const workerEmit = emitters.get(session);
+  assert.ok(workerEmit, 'worker session emitter');
+  return { pageSession, pageEmit, workerEmit };
+}
+
+function workerNetwork(workerEmit, id, url) {
+  workerEmit('Network.requestWillBeSent', {
+    requestId: id,
+    loaderId: '',
+    timestamp: 1,
+    wallTime: 1700000000,
+    documentURL: 'https://example.test/worker.js',
+    type: 'Fetch',
+    request: { url, method: 'GET', headers: {} },
+  });
+  workerEmit('Network.responseReceived', {
+    requestId: id,
+    timestamp: 1.1,
+    response: {
+      url,
+      headers: {},
+      status: 200,
+      statusText: 'OK',
+      mimeType: 'text/plain',
+      encodedDataLength: 13,
+    },
+  });
+  workerEmit('Network.loadingFinished', { requestId: id, timestamp: 1.2 });
 }
 
 test('HAR admits a dedicated worker, enables Network, and records its fetch', async () => {
@@ -375,5 +438,80 @@ test('extension-style setAutoAttach refusal prints one notice and keeps page rec
       refusalMessage:
         'slicc: refused: Target.setAutoAttach is not supported: attach to each target',
     }
+  );
+});
+
+test('HAR --content embed embeds ordinary worker bodies and omits protected or unrecorded ones', async () => {
+  await workerFixture(
+    async ({ home, backend, tab, file, held, emitters }) => {
+      const { pageEmit, workerEmit } = await admitWorker(backend, emitters, held);
+      workerNetwork(workerEmit, 'ORD', 'https://example.test/body');
+      workerNetwork(workerEmit, 'BAD', 'https://seven.sliccy.ai/secret');
+      pageEmit('Page.frameNavigated', {
+        frame: {
+          id: 'TAB',
+          loaderId: tab.loaderId,
+          url: tab.url,
+          securityOrigin: 'https://example.test',
+        },
+      });
+      await held.event('checkpoint', (event) => event.entries >= 1);
+      let har = JSON.parse(await readFile(file, 'utf8'));
+      const ordinary = har.log.entries.find(
+        (entry) => entry.request.url === 'https://example.test/body'
+      );
+      assert.ok(ordinary, JSON.stringify(har));
+      assert.equal(ordinary.response.content.text, 'ordinary-body');
+      assert.equal(
+        har.log.entries.filter((entry) => entry.request.url === 'https://seven.sliccy.ai/secret')
+          .length,
+        0
+      );
+      assert.deepEqual(
+        backend.calls
+          .filter((call) => call.method === 'Network.getResponseBody')
+          .map((call) => call.params.requestId),
+        ['ORD']
+      );
+      const beforeProtected = backend.calls.filter(
+        (call) => call.method === 'Network.getResponseBody'
+      ).length;
+      tab.url = 'https://seven.sliccy.ai/private';
+      pageEmit('Page.frameNavigated', {
+        frame: {
+          id: 'TAB',
+          loaderId: 'P',
+          url: tab.url,
+          securityOrigin: 'https://seven.sliccy.ai',
+        },
+      });
+      await held.event('paused');
+      workerNetwork(workerEmit, 'LATE', 'https://example.test/after-protected');
+      pageEmit('Page.frameNavigated', {
+        frame: {
+          id: 'TAB',
+          loaderId: 'P',
+          url: tab.url,
+          securityOrigin: 'https://seven.sliccy.ai',
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const stopped = await harCommand(backend.url, ['har-stop'], home);
+      assert.equal(stopped.code, 0, stopped.stderr);
+      assert.equal((await held.ended).code, 0);
+      har = JSON.parse(await readFile(file, 'utf8'));
+      assert.equal(
+        har.log.entries.filter(
+          (entry) => entry.request.url === 'https://example.test/after-protected'
+        ).length,
+        0,
+        JSON.stringify(har)
+      );
+      assert.equal(
+        backend.calls.filter((call) => call.method === 'Network.getResponseBody').length,
+        beforeProtected
+      );
+    },
+    { flags: ['--content', 'embed'] }
   );
 });

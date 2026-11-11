@@ -561,7 +561,11 @@ impl Holder {
             return Ok(());
         }
         if !body && !response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) { return Ok(()) }
-        let verified = self.verify(cdp).is_some_and(|loader| !pending.loader.is_empty() && loader == pending.loader);
+        let verified = if pending.worker {
+            self.verify(cdp).is_some()
+        } else {
+            self.verify(cdp).is_some_and(|loader| !pending.loader.is_empty() && loader == pending.loader)
+        };
         if !pending.ordinary_document && !(pending.recovering_document && verified && !self.paused) {
             if pending.recovering_document { self.held.push((id.to_string(), pending, body)); }
             return Ok(())

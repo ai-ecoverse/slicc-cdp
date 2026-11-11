@@ -1189,9 +1189,16 @@ impl Cdp {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
         }
-        if matches!(method, "Fetch.getResponseBody" | "Network.getResponseBody" | "Network.getRequestPostData")
-            && session.and_then(|session| self.session_target(session)).is_some_and(|target| self.document_paused(&target))
-            && shield::request_key(params).is_some_and(|id| self.request_state(&id) == Some(false)) { return Ok(checks) }
+        if matches!(method, "Fetch.getResponseBody" | "Network.getResponseBody" | "Network.getRequestPostData") {
+            if let (Some(session), Some(id)) = (session, shield::request_key(params)) {
+                let paused = self.session_target(session).is_some_and(|target| self.document_paused(&target))
+                    && self.request_state(&id) == Some(false);
+                let worker = self.har_owns(session) && self.ordinary_response_body(session, &id);
+                if paused || worker {
+                    return Ok(checks);
+                }
+            }
+        }
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
@@ -2747,7 +2754,8 @@ impl Cdp {
                         .is_some_and(|frame| self.frame_protected(frame));
                 let protected = initiator
                     || self.guard.url(&url)
-                    || self.guard.url(&shield::web_socket_as_http(&url));
+                    || self.guard.url(&shield::web_socket_as_http(&url))
+                    || session.as_ref().is_some_and(|session| self.har_creator_blocked(session));
                 let entry = self.requests.entry(id.to_string()).or_insert(false);
                 *entry = *entry || protected;
             }
@@ -3164,8 +3172,11 @@ impl Cdp {
     }
 
     pub fn ordinary_response_body(&self, session: &str, request_id: &str) -> bool {
-        !self.content_blocked(session) && self.request_state(request_id) == Some(false)
-            && !self.protected_body_requests.contains(request_id) && self.ordinary_network_source(session, request_id).is_some()
+        !self.content_blocked(session)
+            && !self.har_creator_blocked(session)
+            && self.request_state(request_id) == Some(false)
+            && !self.protected_body_requests.contains(request_id)
+            && self.ordinary_network_source(session, request_id).is_some()
     }
 
     pub fn redact_redirect_carriers(&self, headers: &mut Value, source: &str) {
