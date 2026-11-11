@@ -72,6 +72,7 @@ struct Arm {
     context_generation: u64,
     frame_accept_generation: BTreeMap<String, u64>,
     domains: bool,
+    enabling: bool,
     promote_read_at: Option<Instant>,
 }
 
@@ -519,6 +520,8 @@ impl Cdp {
             arm.pending_install_restarts = 0;
             arm.pending_contexts.clear();
             arm.pending_frames.clear();
+            arm.enabling = false;
+            arm.domains = false;
         }
         if let Some(parent) = self.webmcp.parents.get(child).cloned() {
             if let Some(realm) = self.webmcp.contexts.iter().find(|((owner, _), _)| owner == child).map(|(_, context)| (context.frame.clone(), context.loader.clone(), context.unique.clone())) {
@@ -567,7 +570,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_install_restarts: 0, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new(), context_generation: 0, frame_accept_generation: BTreeMap::new(), domains: true, promote_read_at: None });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_install_restarts: 0, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new(), context_generation: 0, frame_accept_generation: BTreeMap::new(), domains: true, enabling: false, promote_read_at: None });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -1190,19 +1193,40 @@ impl Cdp {
         !url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
     }
 
+    fn webmcp_child_still_adoptable(&self, child: &str, parent: Option<&str>) -> bool {
+        if self.blocked.contains(child) { return false; }
+        if self.webmcp.arms.get(child).is_none_or(|arm| arm.revoked) { return false; }
+        if parent.is_some_and(|parent| !self.webmcp_promote_parent_live(parent)) { return false; }
+        !self.webmcp.arms.get(child).and_then(|arm| arm.pending_install).is_some_and(|due| due <= Instant::now())
+    }
+
+    fn webmcp_child_adoption_gate(&mut self, child: &str, parent: Option<&str>) -> Result<(), String> {
+        if self.webmcp_child_still_adoptable(child, parent) { return Ok(()); }
+        self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+        Err(self.refusal())
+    }
+
     fn webmcp_child_enable(&mut self, session: &str) -> Result<(), String> {
         if self.webmcp.arms.get(session).is_some_and(|arm| arm.domains) { return Ok(()); }
-        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.domains = true; }
+        if self.webmcp.arms.get(session).is_some_and(|arm| arm.enabling) { return Ok(()); }
+        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.enabling = true; }
+        let parent = self.webmcp.parents.get(session).cloned();
         let enabled = (|| {
             self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.webmcp_child_adoption_gate(session, parent.as_deref())?;
             self.raw_call("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.webmcp_child_adoption_gate(session, parent.as_deref())?;
             self.raw_call("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.webmcp_child_adoption_gate(session, parent.as_deref())?;
             self.worlds.enable(session);
             self.raw_call("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.webmcp_child_adoption_gate(session, parent.as_deref())?;
+            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.domains = true; }
             Ok(())
         })();
-        if enabled.is_err() {
-            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.domains = false; }
+        if let Some(arm) = self.webmcp.arms.get_mut(session) {
+            arm.enabling = false;
+            if enabled.is_err() { arm.domains = false; }
         }
         enabled
     }
@@ -1240,6 +1264,7 @@ impl Cdp {
             context_generation: 0,
             frame_accept_generation: BTreeMap::new(),
             domains: false,
+            enabling: false,
             promote_read_at: None,
         });
         if enable { self.webmcp_child_enable(session)?; }
@@ -1312,7 +1337,13 @@ impl Cdp {
     fn webmcp_provisional_parked(&self, session: &str) -> bool {
         self.webmcp.parents.contains_key(session)
             && self.webmcp.quarantined.contains(session)
-            && self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked && !arm.domains && arm.admitted == 0)
+            && self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked && !arm.domains && !arm.enabling && arm.admitted == 0)
+    }
+
+    fn webmcp_not_yet_admitted(&self, session: &str) -> bool {
+        self.webmcp.parents.contains_key(session)
+            && self.webmcp.quarantined.contains(session)
+            && self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked && arm.admitted == 0)
     }
 
     fn webmcp_promote_provisional_children(&mut self) {
@@ -1412,7 +1443,7 @@ impl Cdp {
 
     fn webmcp_detach_parked_children(&mut self, parent: &str) {
         let parked = self.webmcp.parents.iter().filter(|(child, owner)| {
-            *owner == parent && (self.webmcp_parked_child(child) || self.webmcp_provisional_parked(child))
+            *owner == parent && self.webmcp_not_yet_admitted(child)
         }).map(|(child, _)| child.clone()).collect::<Vec<_>>();
         for child in parked {
             self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
@@ -1469,13 +1500,18 @@ impl Cdp {
     }
 
     fn webmcp_adopt_install(&mut self, child: &str, parent: &str, until: Instant) -> Result<bool, String> {
+        if self.webmcp.arms.get(child).is_some_and(|arm| arm.enabling) {
+            return Ok(false);
+        }
         let target = self.session_target(child).ok_or_else(|| self.refusal())?;
         let tree = self.webmcp_stable(child, until, |cdp, left| cdp.raw_call("Page.getFrameTree", json!({}), Some(child), left.min(OPTIONAL_STEP)))?;
+        self.webmcp_child_adoption_gate(child, Some(parent))?;
         if !self.webmcp_tree_verified(&tree, None) {
             self.webmcp_progress_pend(child, "", false);
             return Ok(false);
         }
         self.webmcp_child_enable(child)?;
+        self.webmcp_child_adoption_gate(child, Some(parent))?;
         self.main_commit(child, &tree["frameTree"]["frame"]);
         let frame = &tree["frameTree"]["frame"];
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1500,6 +1536,7 @@ impl Cdp {
         }
         self.webmcp_progress_pend(child, &loader, false);
         let Ok(parent_root) = self.webmcp_root_document(parent, until) else {
+            self.webmcp_child_adoption_gate(child, Some(parent))?;
             self.webmcp_progress_pend(child, &loader, false);
             return Ok(false);
         };
@@ -1542,6 +1579,7 @@ impl Cdp {
         if self.webmcp.arms.get(child).is_some_and(|arm| arm.installing.contains(&realm)) {
             return Ok(false);
         }
+        self.webmcp_child_adoption_gate(child, Some(parent))?;
         if let Err(message) = self.webmcp_evaluate(child, id, &context, parent_root, until) {
             if Self::webmcp_foreign_refusal(&message) { return Err(message); }
             self.webmcp_progress_pend(child, &loader, false);

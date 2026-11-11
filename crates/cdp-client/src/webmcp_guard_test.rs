@@ -42,6 +42,11 @@ struct BackendState {
     enabled_runtime: BTreeSet<String>,
     deferred_lifecycle: VecDeque<String>,
     child_get_frame_tree_delay: Option<Duration>,
+    child_get_frame_tree_nth_delay: Option<(usize, Duration)>,
+    child_get_frame_tree_count: usize,
+    inject_before_child_network_enable: Option<Value>,
+    child_network_enable_hook: Option<Rc<RefCell<Option<Box<dyn FnMut()>>>>>,
+    fail_child_page_enable: bool,
 }
 
 impl BackendState {
@@ -194,13 +199,38 @@ impl Transport for Backend {
                 }
                 let session = command["sessionId"].as_str().unwrap_or("");
                 if BackendState::child_session(session) {
+                    state.child_get_frame_tree_count += 1;
+                    let count = state.child_get_frame_tree_count;
                     if let Some(delay) = state.child_get_frame_tree_delay {
                         std::thread::sleep(delay);
+                    }
+                    if let Some((nth, delay)) = state.child_get_frame_tree_nth_delay {
+                        if count == nth {
+                            std::thread::sleep(delay);
+                        }
                     }
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
                     state.tree.clone()
                 }
+            }
+            "Network.enable" => {
+                let session = command["sessionId"].as_str().unwrap_or("");
+                let inject = BackendState::child_session(session).then(|| state.inject_before_child_network_enable.take()).flatten();
+                let hook = BackendState::child_session(session).then(|| state.child_network_enable_hook.clone()).flatten();
+                if let Some(event) = inject {
+                    state.inbox.push_back(event.to_string());
+                }
+                let id = command["id"].clone();
+                drop(state);
+                if let Some(hook) = hook {
+                    if let Some(callback) = hook.borrow_mut().as_mut() {
+                        callback();
+                    }
+                }
+                let mut state = self.0.borrow_mut();
+                state.inbox.push_back(json!({"id":id,"result":{}}).to_string());
+                return Ok(());
             }
             "Target.attachToTarget" => {
                 let target = command["params"]["targetId"].as_str().unwrap_or("");
@@ -208,6 +238,10 @@ impl Transport for Backend {
             }
             "Page.enable" => {
                 let session = command["sessionId"].as_str().unwrap_or("H");
+                if state.fail_child_page_enable && BackendState::child_session(session) {
+                    state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Page.enable failed"}}).to_string());
+                    return Ok(());
+                }
                 state.enabled_page.insert(session.to_string());
                 if state.chrome_shaped_lifecycle && BackendState::child_session(session) {
                     if let Some(tree) = state.oopif_tree.clone() {

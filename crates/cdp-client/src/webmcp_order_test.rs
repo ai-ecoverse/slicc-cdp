@@ -682,3 +682,92 @@ fn provisional_get_frame_tree_reply_after_deadline_settles_without_tools() {
     assert_eq!(shim_evals(&state, "CHILD"), 0);
     assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.admitted == 0));
 }
+
+#[test]
+fn stop_or_parent_revoke_during_child_enable_settles_an_enabling_child() {
+    for stop in [false, true] {
+        let (mut cdp, state) = client();
+        state.borrow_mut().chrome_shaped_lifecycle = true;
+        state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+        let holder = reconcile_holder(&mut cdp);
+        cdp.webmcp_auto_attach(&holder).unwrap();
+        cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+        if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+            arm.promote_read_at = None;
+        }
+        state.borrow_mut().oopif_tree = Some(cross_tree());
+        if stop {
+            let cdp_ptr = Rc::new(RefCell::new(std::ptr::null_mut::<Cdp>()));
+            let hook = Rc::new(RefCell::new(None));
+            {
+                let cdp_ptr = cdp_ptr.clone();
+                let holder = holder.clone();
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let ptr = *cdp_ptr.borrow();
+                    if !ptr.is_null() {
+                        unsafe { (*ptr).stop_webmcp(&holder); }
+                    }
+                }) as Box<dyn FnMut()>);
+            }
+            state.borrow_mut().child_network_enable_hook = Some(hook);
+            *cdp_ptr.borrow_mut() = &mut cdp as *mut Cdp;
+        } else {
+            state.borrow_mut().inject_before_child_network_enable = Some(json!({
+                "method":"Page.frameNavigated",
+                "sessionId":holder,
+                "params":{"frame":{"id":"F","url":"https://catalog.test/vault","securityOrigin":"https://catalog.test","loaderId":"PROTECTED"}}
+            }));
+        }
+        cdp.webmcp_sweep();
+        assert!(cdp.session_blocked("CHILD"), "stop={stop}: enabling child must settle");
+        assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"), "stop={stop}");
+        assert_eq!(shim_evals(&state, "CHILD"), 0, "stop={stop}");
+        assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.admitted == 0 && !arm.domains), "stop={stop}");
+    }
+}
+
+#[test]
+fn adopt_get_frame_tree_reply_after_deadline_settles_without_tools() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().child_get_frame_tree_nth_delay = Some((3, Duration::from_millis(200)));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() + Duration::from_millis(80));
+        arm.promote_read_at = None;
+    }
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"), "adopt's late getFrameTree must settle after the deadline");
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert_eq!(shim_evals(&state, "CHILD"), 0);
+    assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.admitted == 0 && !arm.domains));
+}
+
+#[test]
+fn runtime_enable_reentry_does_not_evaluate_before_page_enable() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().fail_child_page_enable = true;
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.promote_read_at = None;
+    }
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.webmcp_sweep();
+    let child_sent = state.borrow().sent.iter().filter(|command| command["sessionId"] == "CHILD").cloned().collect::<Vec<_>>();
+    let evaluate = child_sent.iter().position(|command| {
+        command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)
+    });
+    let page = child_sent.iter().position(|command| command["method"] == "Page.enable");
+    assert!(evaluate.is_none(), "nested adopt during Runtime.enable must not evaluate the shim: {child_sent:?}");
+    assert!(page.is_some(), "outer enable must still reach Page.enable: {child_sent:?}");
+    assert_eq!(shim_evals(&state, "CHILD"), 0);
+    assert!(cdp.session_blocked("CHILD"));
+}
