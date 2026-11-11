@@ -1,12 +1,20 @@
 #![cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
 
 use cdp_client::discover::{
-    attached_with, read_browsers_cache, version_url, BrowsersCache, CLI_MAX_STDOUT, CLI_TIMEOUT,
+    attached_with, read_browsers_cache, version_url, BrowsersCache, CLI_MAX_STDOUT,
 };
 use serde_json::json;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+const FAKE_SLICC_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn scratch() -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -97,6 +105,7 @@ impl Drop for EnvGuard {
 
 #[test]
 fn two_commands_within_ttl_spawn_slicc_once() {
+    let _lock = env_lock().lock().unwrap();
     let root = scratch();
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -130,10 +139,22 @@ fn two_commands_within_ttl_spawn_slicc_once() {
         let response = cdp_client::net::http_get(url)?;
         Ok::<String, String>(String::from_utf8_lossy(&response.body).into_owned())
     };
-    let first =
-        attached_with(Some(&slicc), Some(&cache), CLI_TIMEOUT, CLI_MAX_STDOUT, &mut probe).unwrap();
-    let second =
-        attached_with(Some(&slicc), Some(&cache), CLI_TIMEOUT, CLI_MAX_STDOUT, &mut probe).unwrap();
+    let first = attached_with(
+        Some(&slicc),
+        Some(&cache),
+        FAKE_SLICC_TIMEOUT,
+        CLI_MAX_STDOUT,
+        &mut probe,
+    )
+    .unwrap();
+    let second = attached_with(
+        Some(&slicc),
+        Some(&cache),
+        FAKE_SLICC_TIMEOUT,
+        CLI_MAX_STDOUT,
+        &mut probe,
+    )
+    .unwrap();
     assert_eq!(first.as_deref(), Some(version_url(port).as_str()));
     assert_eq!(second, first);
     assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 1);
@@ -144,6 +165,7 @@ fn two_commands_within_ttl_spawn_slicc_once() {
 
 #[test]
 fn hanging_slicc_costs_timeout_once_across_commands() {
+    let _lock = env_lock().lock().unwrap();
     let root = scratch();
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
