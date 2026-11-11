@@ -137,7 +137,12 @@ function page(script) {
 
 async function withFake(script, body) {
   const home = await realpath(await mkdtemp(path.join(tmpdir(), 'slicc-input-')));
-  const fake = await fakeCdp({ intercept: page(script) });
+  const fake = await fakeCdp({
+    intercept: page(script),
+    landing: script.landing,
+    childFrames: script.childFrames,
+    onCommand: script.onCommand,
+  });
   fake.targets.push({ targetId: 'TAB', url: 'https://example.test/' });
   try {
     await body(fake, (args) => run(['--cdp', fake.url, ...args], home), home);
@@ -145,6 +150,13 @@ async function withFake(script, body) {
     await fake.close();
     await rm(home, { recursive: true, force: true });
   }
+}
+
+function attachedSessions(fake) {
+  return {
+    attaches: sent(fake, 'Target.attachToTarget').length,
+    detaches: sent(fake, 'Target.detachFromTarget').length,
+  };
 }
 
 const sent = (fake, method) => fake.calls.filter((call) => call.method === method);
@@ -494,6 +506,167 @@ test('mousewheel scrolls a background tab in place and only falls back to bringi
     assert.equal(sent(fake, 'Target.activateTarget').length, 1);
     assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
   });
+});
+
+test('ordinary OOPIF sessions are detached after pointer success and refusal', async () => {
+  const child = {
+    targetId: 'CHILD',
+    type: 'iframe',
+    url: 'https://grid.test/grid.html',
+    parentFrameId: 'TAB',
+  };
+  await withFake(
+    {
+      intercept: (message, reply) => {
+        if (message.method === 'DOM.getNodeForLocation') {
+          const local = message.params.x < 25 || message.params.y < 20;
+          reply(
+            local ? { backendNodeId: 6, frameId: 'CHILD' } : { backendNodeId: 5, frameId: 'TAB' }
+          );
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.backendNodeId === 5) {
+          reply({
+            node: {
+              nodeType: 1,
+              nodeName: 'IFRAME',
+              localName: 'iframe',
+              frameId: 'CHILD',
+              backendNodeId: 5,
+            },
+          });
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.backendNodeId === 6) {
+          reply({ node: { nodeType: 1, nodeName: 'CANVAS', localName: 'canvas' } });
+          return true;
+        }
+        if (message.method === 'DOM.resolveNode' && message.params.backendNodeId === 5) {
+          reply({ object: { type: 'object', subtype: 'node', objectId: 'IFRAME' } });
+          return true;
+        }
+        if (message.method === 'Runtime.callFunctionOn' && message.params.objectId === 'IFRAME') {
+          reply({ result: { type: 'object', value: { x: 8, y: 40 } } });
+          return true;
+        }
+        return false;
+      },
+    },
+    async (fake, pw) => {
+      fake.targets.push(child);
+      const moved = await pw(['mousemove', '30', '40']);
+      assert.equal(moved.code, 0, moved.stderr);
+      assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 1);
+      assert.ok(
+        sent(fake, 'Target.attachToTarget').some((call) => call.params.targetId === 'CHILD')
+      );
+      const afterMove = attachedSessions(fake);
+      assert.equal(afterMove.attaches, afterMove.detaches, JSON.stringify(afterMove));
+    }
+  );
+  await withFake(
+    {
+      hit: { backendNodeId: 5, frameId: 'CHILD' },
+      hitNode: { nodeType: 1, nodeName: 'DIV', localName: 'div' },
+      intercept: (message, reply, fail) => {
+        if (message.method === 'DOM.getFrameOwner') {
+          fail('No node found for given frame');
+          return true;
+        }
+        return false;
+      },
+    },
+    async (fake, pw) => {
+      fake.targets.push(child);
+      const refused = await pw(['mousemove', '30', '40']);
+      assert.equal(refused.code, 1, refused.stderr);
+      assert.match(refused.stderr, /embedded frame/);
+      assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
+      const after = attachedSessions(fake);
+      assert.equal(after.attaches, after.detaches, JSON.stringify(after));
+    }
+  );
+  await withFake(
+    { hitNode: { nodeType: 1, nodeName: 'IFRAME', localName: 'iframe' } },
+    async (fake, pw) => {
+      fake.targets.push(child);
+      const refused = await pw(['mousemove', '30', '40']);
+      assert.equal(refused.code, 1);
+      assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
+      const after = attachedSessions(fake);
+      assert.equal(after.attaches, after.detaches, JSON.stringify(after));
+    }
+  );
+});
+
+test('type and press release the slicc-input object group', async () => {
+  let focuses = 0;
+  const landing = (mode) => {
+    if (mode === 'focus') return focuses++ === 0 ? 'frame' : 'editable';
+    if (mode === 'arm') return 'armed';
+    if (mode === 'read') return ['beforeinput', 'input', 'keydown'];
+    if (mode === 'insert') return 'inserted';
+    if (mode === 'key') return 'pressed';
+    if (mode === 'visible') return 'visible';
+    return 'done';
+  };
+  for (const args of [
+    ['type', 'hello'],
+    ['press', 'a'],
+  ]) {
+    focuses = 0;
+    await withFake(
+      {
+        landing,
+        focusNode: {
+          nodeType: 1,
+          nodeName: 'IFRAME',
+          localName: 'iframe',
+          frameId: 'CHILD',
+          backendNodeId: 5,
+        },
+        childFrames: [
+          {
+            frame: {
+              id: 'CHILD',
+              loaderId: 'L2',
+              url: 'https://grid.test/grid.html',
+              securityOrigin: 'https://grid.test',
+            },
+          },
+        ],
+      },
+      async (fake, pw) => {
+        const result = await pw(args);
+        assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}`);
+        assert.ok(
+          params(fake, 'Runtime.releaseObjectGroup').some(
+            (call) => call.objectGroup === 'slicc-input'
+          ),
+          args.join(' ')
+        );
+      }
+    );
+  }
+  focuses = 0;
+  await withFake(
+    {
+      landing: (mode) => (mode === 'focus' ? 'frame' : 'done'),
+      focusNode: { nodeType: 1, nodeName: 'IFRAME', localName: 'iframe' },
+    },
+    async (fake, pw) => {
+      const result = await pw(['type', 'nope']);
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /keyboard focus is inside an embedded frame/);
+      assert.ok(
+        params(fake, 'Runtime.releaseObjectGroup').some(
+          (call) => call.objectGroup === 'slicc-input'
+        )
+      );
+      assert.equal(sent(fake, 'Input.insertText').length, 0);
+      assert.equal(sent(fake, 'Input.dispatchKeyEvent').length, 0);
+    }
+  );
 });
 
 test('keyboard input is refused while focus is inside an unresolvable frame or a closed shadow root', async () => {

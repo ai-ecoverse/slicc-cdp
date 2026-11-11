@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 const FRAME_OWNERS: &[&str] = &["iframe", "frame", "object", "embed", "fencedframe", "portal"];
 const MAX_DEPTH: usize = 8;
+const INPUT_GROUP: &str = "slicc-input";
 
 pub struct Delivery {
     pub session: String,
@@ -50,18 +51,52 @@ impl Delivery {
 }
 
 pub fn release(cdp: &mut Cdp, delivery: Delivery) {
-    for session in delivery.detach.into_iter().rev() {
+    detach_all(cdp, delivery.detach);
+}
+
+fn detach_all(cdp: &mut Cdp, detach: Vec<String>) {
+    for session in detach.into_iter().rev() {
         crate::cdp::detach(cdp, &session);
+    }
+}
+
+fn finish(cdp: &mut Cdp, detach: Vec<String>, result: Result<Delivery, String>) -> Result<Delivery, String> {
+    match result {
+        Ok(mut delivery) => {
+            delivery.detach = detach;
+            Ok(delivery)
+        }
+        Err(message) => {
+            detach_all(cdp, detach);
+            Err(message)
+        }
     }
 }
 
 pub fn at_point(cdp: &mut Cdp, page: &str, x: f64, y: f64) -> Result<Delivery, String> {
     let refused = || landing::frame_refusal(x, y);
-    walk(cdp, page, x, y, refused)
+    let mut detach = Vec::new();
+    let result = walk(cdp, page, x, y, &mut detach, refused);
+    finish(cdp, detach, result)
 }
 
 pub fn at_focus(cdp: &mut Cdp, page: &str) -> Result<Delivery, String> {
     let refused = || landing::FOCUS_REFUSAL.to_string();
+    struct Group<'a> {
+        cdp: &'a mut Cdp,
+        page: &'a str,
+    }
+    impl Drop for Group<'_> {
+        fn drop(&mut self) {
+            let _ = self.cdp.call(
+                "Runtime.releaseObjectGroup",
+                json!({ "objectGroup": INPUT_GROUP }),
+                Some(self.page),
+            );
+        }
+    }
+    let group = Group { cdp, page };
+    let cdp = &mut *group.cdp;
     let main = main_frame(cdp, page)?;
     let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": main }), Some(page))?;
     let context = world.get("executionContextId").cloned().ok_or_else(refused)?;
@@ -71,7 +106,7 @@ pub fn at_focus(cdp: &mut Cdp, page: &str) -> Result<Delivery, String> {
             "expression": "(() => { let e = document.activeElement; while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement; return e; })()",
             "contextId": context,
             "returnByValue": false,
-            "objectGroup": "slicc-input",
+            "objectGroup": INPUT_GROUP,
         }),
         Some(page),
     )?;
@@ -120,37 +155,45 @@ pub fn at_focus(cdp: &mut Cdp, page: &str) -> Result<Delivery, String> {
     let mut session = page.to_string();
     let mut offset = (0.0, 0.0);
     let mut detach = Vec::new();
-    if open_owner(cdp, page, &mut session, &mut offset, &mut detach, backend, node, &refused)? {
+    let result = if open_owner(cdp, page, &mut session, &mut offset, &mut detach, backend, node, &refused)? {
         let frame = main_frame(cdp, &session)?;
-        return Ok(Delivery {
+        Ok(Delivery {
             session,
             frame,
             input: page.to_string(),
             offset,
             untrusted: false,
-            detach,
-        });
-    }
-    let content = content_frame(node)
-        .map(str::to_string)
-        .or_else(|| owner_frame(cdp, page, backend).ok())
-        .ok_or_else(refused)?;
-    let frame = locate(cdp, page, page, &content)?;
-    admit_frame(cdp, &frame, &refused)?;
-    Ok(Delivery {
-        session: page.to_string(),
-        frame: content,
-        input: page.to_string(),
-        offset,
-        untrusted: false,
-        detach,
-    })
+            detach: Vec::new(),
+        })
+    } else {
+        let content = content_frame(node)
+            .map(str::to_string)
+            .or_else(|| owner_frame(cdp, page, backend).ok())
+            .ok_or_else(refused)?;
+        let frame = locate(cdp, page, page, &content)?;
+        admit_frame(cdp, &frame, &refused)?;
+        Ok(Delivery {
+            session: page.to_string(),
+            frame: content,
+            input: page.to_string(),
+            offset,
+            untrusted: false,
+            detach: Vec::new(),
+        })
+    };
+    finish(cdp, detach, result)
 }
 
-fn walk(cdp: &mut Cdp, page: &str, x: f64, y: f64, refused: impl Fn() -> String + Copy) -> Result<Delivery, String> {
+fn walk(
+    cdp: &mut Cdp,
+    page: &str,
+    x: f64,
+    y: f64,
+    detach: &mut Vec<String>,
+    refused: impl Fn() -> String + Copy,
+) -> Result<Delivery, String> {
     let mut session = page.to_string();
     let mut offset = (0.0, 0.0);
-    let mut detach = Vec::new();
     for _ in 0..MAX_DEPTH {
         let main = main_frame(cdp, &session)?;
         let (lx, ly) = (x - offset.0, y - offset.1);
@@ -163,19 +206,20 @@ fn walk(cdp: &mut Cdp, page: &str, x: f64, y: f64, refused: impl Fn() -> String 
                     input: page.to_string(),
                     offset,
                     untrusted: landing::untrusted(cdp, page)?,
-                    detach,
+                    detach: Vec::new(),
                 });
             }
         };
         if hit.frame != main {
             let frame = locate(cdp, page, &session, &hit.frame).map_err(|_| refused())?;
             admit_frame(cdp, &frame, &refused)?;
-            let node = describe_backend(cdp, &session, hit.backend).map_err(|_| refused())?;
-            if frame_owner(&node) {
-                let backend = node.get("backendNodeId").and_then(Value::as_u64).unwrap_or(hit.backend);
-                if open_owner(cdp, page, &mut session, &mut offset, &mut detach, backend, &node, &refused)? {
-                    continue;
-                }
+            if frame.target.is_some() {
+                let nested = browser::frame_offset(cdp, &session, &hit.frame).map_err(|_| refused())?;
+                offset = (offset.0 + nested.0, offset.1 + nested.1);
+                let (child, _) = browser::open_frame(cdp, &frame).map_err(|_| refused())?;
+                detach.push(child.clone());
+                session = child;
+                continue;
             }
             let nested = browser::frame_offset(cdp, &session, &hit.frame).map_err(|_| refused())?;
             return Ok(Delivery {
@@ -184,7 +228,7 @@ fn walk(cdp: &mut Cdp, page: &str, x: f64, y: f64, refused: impl Fn() -> String 
                 input: page.to_string(),
                 offset: (offset.0 + nested.0, offset.1 + nested.1),
                 untrusted: false,
-                detach,
+                detach: Vec::new(),
             });
         }
         let node = describe_backend(cdp, &session, hit.backend)?;
@@ -195,10 +239,10 @@ fn walk(cdp: &mut Cdp, page: &str, x: f64, y: f64, refused: impl Fn() -> String 
                 input: page.to_string(),
                 offset,
                 untrusted: false,
-                detach,
+                detach: Vec::new(),
             });
         }
-        if open_owner(cdp, page, &mut session, &mut offset, &mut detach, hit.backend, &node, &refused)? {
+        if open_owner(cdp, page, &mut session, &mut offset, detach, hit.backend, &node, &refused)? {
             continue;
         }
         let content = content_frame(&node)
@@ -213,7 +257,7 @@ fn walk(cdp: &mut Cdp, page: &str, x: f64, y: f64, refused: impl Fn() -> String 
             input: page.to_string(),
             offset,
             untrusted: false,
-            detach,
+            detach: Vec::new(),
         });
     }
     Err(refused())
@@ -239,6 +283,7 @@ fn open_owner(
     if frame.target.is_none() {
         return Ok(false);
     }
+    admit_frame(cdp, &frame, refused)?;
     let (child, _) = browser::open_frame(cdp, &frame).map_err(|_| refused())?;
     detach.push(child.clone());
     *session = child;
@@ -246,12 +291,19 @@ fn open_owner(
 }
 
 fn admit_frame(cdp: &mut Cdp, frame: &FrameRec, refused: &impl Fn() -> String) -> Result<(), String> {
-    if frame.target.is_some() {
-        browser::open_frame(cdp, frame).map(|_| ()).map_err(|_| refused())
-    } else if !browser::ordinary_frame_url(cdp.guard(), &frame.url) {
-        Err(refused())
-    } else {
+    if let Some(target) = frame.target.as_deref() {
+        if target == frame.frame_id
+            && browser::ordinary_frame_url(cdp.guard(), &frame.url)
+            && !cdp.is_protected_target(target)
+        {
+            Ok(())
+        } else {
+            Err(refused())
+        }
+    } else if browser::ordinary_frame_url(cdp.guard(), &frame.url) {
         Ok(())
+    } else {
+        Err(refused())
     }
 }
 

@@ -16,18 +16,23 @@ const GRID = `<!doctype html>
 <html><body style="margin:0">
 <canvas id="grid" width="400" height="300" style="display:block;background:#e8eef7"></canvas>
 <textarea id="cell" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0"></textarea>
+<pre id="log" hidden>[]</pre>
 <script>
 const grid = document.getElementById('grid');
 const cell = document.getElementById('cell');
-window.__log = [];
-const note = (type, event) => window.__log.push({
-  type,
-  trusted: event.isTrusted,
-  x: event.clientX,
-  y: event.clientY,
-  key: event.key || null,
-  deltaY: event.deltaY || 0,
-});
+const log = document.getElementById('log');
+const note = (type, event) => {
+  const rows = JSON.parse(log.textContent || '[]');
+  rows.push({
+    type,
+    trusted: event.isTrusted,
+    x: event.clientX,
+    y: event.clientY,
+    key: event.key || null,
+    deltaY: event.deltaY || 0,
+  });
+  log.textContent = JSON.stringify(rows);
+};
 for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click', 'dblclick', 'wheel', 'mousemove']) {
   grid.addEventListener(type, (event) => note(type, event));
 }
@@ -86,7 +91,7 @@ async function childFrame(runner, cwd) {
 
 async function readLog(runner, cwd, frameId) {
   const result = await runner.playwright(
-    ['eval', '--frame', frameId, '(() => JSON.stringify(window.__log || []))()'],
+    ['eval', '--frame', frameId, '(() => document.getElementById("log")?.textContent || "[]")()'],
     cwd
   );
   if (result.code !== 0) {
@@ -101,7 +106,12 @@ async function readLog(runner, cwd, frameId) {
 
 async function clearLog(runner, cwd, frameId) {
   const result = await runner.playwright(
-    ['eval', '--frame', frameId, '(() => { window.__log = []; return "ok"; })()'],
+    [
+      'eval',
+      '--frame',
+      frameId,
+      '(() => { const log = document.getElementById("log"); if (log) log.textContent = "[]"; return "ok"; })()',
+    ],
     cwd
   );
   assert.equal(result.code, 0, result.stderr);
@@ -111,6 +121,18 @@ function trusted(log, type) {
   return log.some((event) => event.type === type && event.trusted === true);
 }
 
+async function iframePoint(runner, cwd) {
+  const result = await runner.playwright(
+    [
+      'eval',
+      '(() => { const r = document.getElementById("app").getBoundingClientRect(); return JSON.stringify({ x: r.x + Math.min(80, r.width / 2), y: r.y + Math.min(90, r.height / 2) }); })()',
+    ],
+    cwd
+  );
+  assert.equal(result.code, 0, result.stderr);
+  return JSON.parse(result.stdout.trim());
+}
+
 async function flow(runner, port) {
   const cwd = await runner.fresh();
   const run = async (args) => {
@@ -118,7 +140,7 @@ async function flow(runner, port) {
     assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}\n${result.stdout}`);
     return result;
   };
-  await run(['open', `http://sheet.test:${port}/top.html`]);
+  await run(['open', '--foreground', `http://sheet.test:${port}/top.html`]);
   let shot = '';
   for (let attempt = 0; attempt < 30 && !/iframe/.test(shot); attempt += 1) {
     if (attempt) await new Promise((resolve) => setTimeout(resolve, 250));
@@ -128,9 +150,14 @@ async function flow(runner, port) {
   const iframe = shot.match(/iframe \[ref=(e\d+)\]/)?.[1];
   assert.ok(iframe, shot);
   const frameId = await childFrame(runner, cwd);
+  const point = await iframePoint(runner, cwd);
+  const x = String(Math.round(point.x));
+  const y = String(Math.round(point.y));
+  const x2 = String(Math.round(point.x + 40));
+  const y2 = String(Math.round(point.y + 30));
 
   await clearLog(runner, cwd, frameId);
-  await run(['mousemove', '80', '90']);
+  await run(['mousemove', x, y]);
   await run(['mousedown']);
   await run(['mouseup']);
   let log = await readLog(runner, cwd, frameId);
@@ -141,21 +168,21 @@ async function flow(runner, port) {
   );
 
   await clearLog(runner, cwd, frameId);
-  await run(['mousemove', '120', '110']);
+  await run(['mousemove', x, y]);
   await run(['mousedown']);
-  await run(['mousemove', '180', '160']);
+  await run(['mousemove', x2, y2]);
   await run(['mouseup']);
   log = await readLog(runner, cwd, frameId);
   assert.ok(trusted(log ?? [], 'mousemove') || trusted(log ?? [], 'mouseup'), JSON.stringify(log));
 
   await clearLog(runner, cwd, frameId);
-  await run(['mousemove', '100', '100']);
+  await run(['mousemove', x, y]);
   await run(['mousewheel', '0', '40']);
   log = await readLog(runner, cwd, frameId);
   assert.ok(trusted(log ?? [], 'wheel'), JSON.stringify(log));
 
   await clearLog(runner, cwd, frameId);
-  await run(['mousemove', '90', '95']);
+  await run(['mousemove', x, y]);
   await run(['mousedown']);
   await run(['mouseup']);
   await run(['type', 'ab']);
@@ -179,7 +206,7 @@ async function flow(runner, port) {
   );
 
   await clearLog(runner, cwd, frameId);
-  await run(['mousemove', '140', '130']);
+  await run(['mousemove', x, y]);
   await run(['mousedown']);
   await run(['mouseup']);
   await run(['mousedown']);

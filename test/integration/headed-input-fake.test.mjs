@@ -233,7 +233,7 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
   });
 
-  test(`${transport}: press lands in place or in front, and frames need the front`, async () => {
+  test(`${transport}: press lands in place or in front; unresolvable frame focus is refused`, async () => {
     await withScene(runner, scene({ reads: [[]], key: 'pressed' }), async (s) => {
       await s.ok(['press', 'Enter']);
       assert.deepEqual(modes(s.state, 'key')[0][1], {

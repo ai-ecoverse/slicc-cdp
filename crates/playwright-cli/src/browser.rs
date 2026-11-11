@@ -671,19 +671,12 @@ pub fn click_ref(
     modifiers: i64,
 ) -> Result<(), String> {
     if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
-        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let expression = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); el.click(); }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
-        let pos = evaluate_in_frame(cdp, session, frame_id, &expression)?;
-        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let point = (frame_offset.0 + fx, frame_offset.1 + fy);
-        let input = input_session(session, rec);
-        let scope = Scope { session, frame: Some(frame_id), input };
-        let gesture = Gesture::Click { button, modifiers };
-        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), gesture, &mut |cdp| dispatch_click(cdp, input, point, button, modifiers));
+        evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        return Ok(());
     }
     if let Some(backend) = rec.backend_node_id {
         click_backend(cdp, session, rec, backend, button, modifiers)?;
@@ -1128,36 +1121,12 @@ pub fn dblclick_ref(
     modifiers: i64,
 ) -> Result<(), String> {
     if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
-        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let expression = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); el.dispatchEvent(new MouseEvent('dblclick', {{ bubbles: true }})); }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
-        let pos = evaluate_in_frame(cdp, session, frame_id, &expression)?;
-        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let point = (frame_offset.0 + fx, frame_offset.1 + fy);
-        let input = input_session(session, rec);
-        let scope = Scope { session, frame: Some(frame_id), input };
-        let gesture = Gesture::Double { button, modifiers };
-        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), gesture, &mut |cdp| {
-            for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
-                cdp.call_for(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": kind,
-                        "x": point.0,
-                        "y": point.1,
-                        "button": button,
-                        "clickCount": count,
-                        "modifiers": modifiers,
-                    }),
-                    Some(input),
-                    landing::INPUT_WAIT,
-                )?;
-            }
-            Ok(())
-        });
+        evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        return Ok(());
     }
     if let Some(backend) = rec.backend_node_id {
         dblclick_backend(cdp, session, rec, backend, button, modifiers)?;
@@ -1225,7 +1194,10 @@ pub fn hover_ref(
 ) -> Result<(), String> {
     if let Some(frame_id) = rec.frame_id.as_deref() {
         let selector = first_selector(&rec.selector);
-        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
+        let frame_offset = match rec.target.as_deref() {
+            Some(_) => ref_frame_offset(cdp, session, rec, frame_id)?,
+            None => frame_element_offset(cdp, session, frame_id)?,
+        };
         let expression = format!(
             "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
@@ -1236,8 +1208,7 @@ pub fn hover_ref(
         let cx = frame_offset.0 + fx;
         let cy = frame_offset.1 + fy;
         let input = input_session(session, rec);
-        let scope = Scope { session, frame: Some(frame_id), input };
-        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), Gesture::Hover, &mut |cdp| move_mouse(cdp, input, (cx, cy)));
+        return move_mouse(cdp, input, (cx, cy));
     }
     if let Some(backend) = rec.backend_node_id {
         hover_backend(cdp, session, backend)?;
@@ -1359,18 +1330,11 @@ pub fn check_ref(
         if pre_parsed.get("checked").and_then(|v| v.as_bool()) == Some(checked) {
             return Ok(false);
         }
-        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let click_expr = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); el.click(); }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
-        let pos = evaluate_in_frame(cdp, session, frame_id, &click_expr)?;
-        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let point = (frame_offset.0 + fx, frame_offset.1 + fy);
-        let input = input_session(session, rec);
-        let scope = Scope { session, frame: Some(frame_id), input };
-        landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), TOGGLE, &mut |cdp| dispatch_click(cdp, input, point, "left", 0))?;
+        evaluate_in_frame(cdp, session, frame_id, &click_expr)?;
         let post_expr = format!(
             "(function() {{ var el = document.querySelector({}); return el ? el.checked : null; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
