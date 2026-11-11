@@ -491,6 +491,7 @@ impl Cdp {
             }
             self.webmcp.handling_gate = false;
         }
+        self.webmcp_promote_provisional_children();
         let now = Instant::now();
         let stale = self.webmcp.arms.iter().filter(|(_, arm)| !arm.revoked && (arm.pending_install.is_some_and(|deadline| deadline <= now) || arm.pending_contexts.values().any(|deadline| *deadline <= now) || arm.pending_frames.values().any(|(_, deadline)| *deadline <= now))).map(|(session, _)| session.clone()).collect::<Vec<_>>();
         for session in stale {
@@ -1298,6 +1299,72 @@ impl Cdp {
             && self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none())
     }
 
+    fn webmcp_provisional_parked(&self, session: &str) -> bool {
+        self.webmcp.parents.contains_key(session)
+            && self.webmcp.quarantined.contains(session)
+            && self.webmcp.arms.get(session).is_some_and(|arm| !arm.revoked && !arm.domains && arm.admitted == 0)
+    }
+
+    fn webmcp_promote_provisional_children(&mut self) {
+        if self.webmcp.handling_gate || self.webmcp.handling_children || self.webmcp.reconciling { return; }
+        let children = self.webmcp.parents.keys().filter(|child| self.webmcp_provisional_parked(child)).cloned().collect::<Vec<_>>();
+        for child in children {
+            self.webmcp_promote_provisional_child(&child);
+        }
+    }
+
+    fn webmcp_promote_provisional_child(&mut self, child: &str) {
+        if !self.webmcp_provisional_parked(child) { return; }
+        let Some(parent) = self.webmcp.parents.get(child).cloned() else { return; };
+        let Some(target) = self.session_target(child) else { return; };
+        if let Some(info) = self.targets.get(&target).cloned() {
+            if self.webmcp_refused_info(&target, &info) {
+                self.webmcp_trace_decision("install", &target, child, "refused");
+                self.protect_target(&target);
+                self.guards.remove(&target);
+                self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+                return;
+            }
+        }
+        let Ok(seed) = self.raw_call("Page.getFrameTree", json!({}), Some(child), OPTIONAL_STEP) else { return; };
+        if !self.webmcp_provisional_parked(child) { return; }
+        let seed_frame = &seed["frameTree"]["frame"];
+        if self.webmcp_seed_refused(seed_frame) {
+            self.main_commit(child, seed_frame);
+            self.protect_target(&target);
+            self.guards.remove(&target);
+            self.webmcp_trace_decision("install", &target, child, "refused");
+            self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            return;
+        }
+        if Self::webmcp_seed_provisional(seed_frame) { return; }
+        let verified = self.webmcp_tree_verified(&seed, None);
+        if !verified {
+            self.webmcp_pend_install(child, "");
+            self.webmcp_trace_decision("install", &target, child, "parked");
+            return;
+        }
+        if let Some(arm) = self.webmcp.arms.get_mut(child) {
+            Self::webmcp_loaders(&seed["frameTree"], &mut arm.loaders);
+        }
+        if let Some(origin) = seed_frame.get("securityOrigin").and_then(Value::as_str) {
+            self.webmcp_remember_child_origin(child, origin);
+        } else if let Some(url) = seed_frame.get("url").and_then(Value::as_str) {
+            if let Ok(parsed) = url::Url::parse(url) {
+                self.webmcp_remember_child_origin(child, &parsed.origin().ascii_serialization());
+            }
+        }
+        match self.webmcp_adopt_install(child, &parent, Instant::now() + OPTIONAL_STEP) {
+            Ok(true) => self.webmcp_trace_decision("install", &target, child, "admitted"),
+            Ok(false) => self.webmcp_trace_decision("install", &target, child, "pending"),
+            Err(message) => {
+                let detail = if message.contains("refused") { "refused" } else if message.contains("deadline") || message.contains("timeout") { "timeout" } else { "failed" };
+                self.webmcp_trace_decision("install", &target, child, detail);
+                self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            }
+        }
+    }
+
     fn webmcp_detach_parked_children(&mut self, parent: &str) {
         let parked = self.webmcp.parents.iter().filter(|(child, owner)| *owner == parent && self.webmcp_parked_child(child)).map(|(child, _)| child.clone()).collect::<Vec<_>>();
         for child in parked {
@@ -1537,8 +1604,19 @@ impl Cdp {
         if let Some(recorded) = self.webmcp.recorded.get_mut(&target) {
             recorded.info = info.clone();
         }
+        self.webmcp_merge_target(&target, &info);
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+        let promote = self.webmcp_refused_info(&target, &info)
+            || url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"));
+        let child = self.guards.get(&target).cloned()
+            .or_else(|| self.webmcp.recorded.get(&target).map(|recorded| recorded.session.clone()));
         self.webmcp.reconcile_dirty.extend(holders);
         self.webmcp_reconcile_pending();
+        if promote {
+            if let Some(child) = child.filter(|child| self.webmcp_provisional_parked(child)) {
+                self.webmcp_promote_provisional_child(&child);
+            }
+        }
     }
 
     fn webmcp_release_recorded(&mut self, owner: &str) {
@@ -1583,6 +1661,7 @@ impl Cdp {
             rounds += 1;
         }
         self.webmcp.reconciling = false;
+        self.webmcp_promote_provisional_children();
         self.webmcp_finish_awaiting_children();
     }
 
@@ -1755,12 +1834,6 @@ impl Cdp {
                         return Err(message);
                     }
                 }
-            } else if seed_provisional {
-                if let Some(arm) = self.webmcp.arms.get_mut(child) {
-                    arm.pending_install = None;
-                    arm.pending_install_loader = None;
-                }
-                self.webmcp_trace_decision("install", target, child, "parked");
             } else {
                 self.webmcp_pend_install(child, "");
                 self.webmcp_trace_decision("install", target, child, "parked");

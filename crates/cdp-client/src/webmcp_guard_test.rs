@@ -1,6 +1,7 @@
 use super::*;
 use crate::cdp::Transport;
 use std::cell::RefCell;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 fn webmcp_shim_install(source: &str) -> bool {
@@ -36,6 +37,10 @@ struct BackendState {
     omit_get_target_parent: bool,
     suppress_runtime_child: bool,
     iframe_targets: Option<Vec<Value>>,
+    chrome_shaped_lifecycle: bool,
+    enabled_page: BTreeSet<String>,
+    enabled_runtime: BTreeSet<String>,
+    deferred_lifecycle: VecDeque<String>,
 }
 
 impl BackendState {
@@ -48,6 +53,44 @@ impl BackendState {
             info["parentFrameId"] = json!(self.get_target_parent.clone().unwrap_or_else(|| "F".into()));
         }
         vec![info]
+    }
+
+    fn child_session(session: &str) -> bool {
+        session.starts_with("CHILD") || session == "TOUCH-IFRAME"
+    }
+
+    fn push_lifecycle(&mut self, session: &str, event: Value) {
+        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        let page = method.starts_with("Page.");
+        let runtime = method.starts_with("Runtime.");
+        let withheld = self.chrome_shaped_lifecycle
+            && Self::child_session(session)
+            && ((page && !self.enabled_page.contains(session)) || (runtime && !self.enabled_runtime.contains(session)));
+        if withheld {
+            self.deferred_lifecycle.push_back(event.to_string());
+        } else {
+            self.inbox.push_back(event.to_string());
+        }
+    }
+
+    fn flush_lifecycle(&mut self, session: &str) {
+        if !self.chrome_shaped_lifecycle { return; }
+        let mut kept = VecDeque::new();
+        while let Some(text) = self.deferred_lifecycle.pop_front() {
+            let Ok(event) = serde_json::from_str::<Value>(&text) else { continue; };
+            let owner = event.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+            let ready = owner == session && (
+                (method.starts_with("Page.") && self.enabled_page.contains(session))
+                    || (method.starts_with("Runtime.") && self.enabled_runtime.contains(session))
+            );
+            if ready {
+                self.inbox.push_back(text);
+            } else {
+                kept.push_back(text);
+            }
+        }
+        self.deferred_lifecycle = kept;
     }
 }
 
@@ -159,8 +202,24 @@ impl Transport for Backend {
                 let target = command["params"]["targetId"].as_str().unwrap_or("");
                 json!({"sessionId": format!("TOUCH-{target}")})
             }
+            "Page.enable" => {
+                let session = command["sessionId"].as_str().unwrap_or("H");
+                state.enabled_page.insert(session.to_string());
+                if state.chrome_shaped_lifecycle && BackendState::child_session(session) {
+                    if let Some(tree) = state.oopif_tree.clone() {
+                        let frame = tree["frameTree"]["frame"].clone();
+                        let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+                        if url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) {
+                            state.push_lifecycle(session, json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":frame}}));
+                        }
+                    }
+                    state.flush_lifecycle(session);
+                }
+                json!({})
+            }
             "Runtime.enable" => {
                 let session = command["sessionId"].as_str().unwrap_or("H");
+                state.enabled_runtime.insert(session.to_string());
                 if session == "CHILD" || session == "CHILD-NEW" || session == "CHILD-OLD" || session == "TOUCH-IFRAME" {
                     if !state.suppress_runtime_child {
                         if let Some(child) = state.runtime_child.clone().or_else(|| {
@@ -169,9 +228,10 @@ impl Transport for Backend {
                                 json!({"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}})
                             })
                         }) {
-                            state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":child}}).to_string());
+                            state.push_lifecycle(session, json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":child}}));
                         }
                     }
+                    state.flush_lifecycle(session);
                     json!({})
                 } else {
                     let mut created = context(&state.current_frame, "https://ordinary.test");
@@ -272,8 +332,8 @@ impl Transport for Backend {
                     let parent = command["sessionId"].as_str().unwrap_or("H");
                     let frame = state.oopif_tree.as_ref().map(|tree| tree["frameTree"]["frame"].clone()).unwrap_or_else(|| json!({"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}));
                     state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":frame["url"].as_str().unwrap_or("https://foreign.test/cross")},"waitingForDebugger":false}}).to_string());
-                    state.inbox.push_back(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":frame.clone()}}).to_string());
-                    state.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}}}}).to_string());
+                    state.push_lifecycle("CHILD", json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":frame.clone()}}));
+                    state.push_lifecycle("CHILD", json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}}}}));
                 }
                 json!({})
             }
@@ -1356,9 +1416,9 @@ fn unverified_child_parks_until_first_commit_then_installs() {
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
     assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
     assert!(!cdp.content_blocked("CHILD"));
-    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()), "unverified blank child must park with no deadline");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "unverified blank child must park with a promote-or-settle deadline");
     cdp.webmcp_sweep();
-    assert!(!cdp.session_blocked("CHILD"), "parked blank child must survive a sweep");
+    assert!(!cdp.session_blocked("CHILD"), "parked blank child must survive a sweep before its deadline");
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
@@ -1394,7 +1454,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     assert!(!cdp.content_blocked("CHILD"), "OOPIF must not be content-blocked before install");
     assert!(!cdp.session_blocked("CHILD"), "OOPIF must not settle as blocked before install");
     assert!(!state.borrow().sent.iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"), "late Option A must not hold the OOPIF");
-    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()), "blank OOPIF must park until first commit");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "blank OOPIF must park with a promote-or-settle deadline");
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"FRAME","parentId":"F","url":"https://foreign.test/cross","securityOrigin":"","loaderId":""}}}));
     assert!(!cdp.webmcp.arms[&holder].revoked, "parent-session iframe navigation must not revoke the root");
     assert!(cdp.webmcp.arms[&holder].pending_frames.is_empty(), "parent-session iframe navigation must not add root pending frames");
@@ -1564,7 +1624,7 @@ fn private_oopif_attach_does_not_touch_protect_or_guard_the_root() {
     assert!(!cdp.session_blocked(&holder));
     assert!(!cdp.content_blocked(&holder));
     assert!(cdp.webmcp_alive(&holder));
-    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()), "blank child parks with no deadline");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_some()), "blank child parks with a promote-or-settle deadline");
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
     assert!(!cdp.session_blocked("CHILD"), "ordinary root navigation must not settle a parked child that attached before frameNavigated");
     assert!(cdp.webmcp.parents.contains_key("CHILD"), "parked child remains parented across ordinary root navigation");
@@ -1590,7 +1650,7 @@ fn parked_child_attached_before_root_navigation_survives_and_installs_once() {
     }
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
-    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_none()));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.admitted == 0 && arm.pending_install.is_some()));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
     assert!(!cdp.session_blocked("CHILD"), "attach-before-navigation parked child must survive root frameNavigated");
     assert!(cdp.webmcp.parents.contains_key("CHILD"));
