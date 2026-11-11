@@ -70,7 +70,7 @@
   "devDependencies": {
     "@ai-ecoverse/slicc-browsers": "1.22.0",
     "@ai-ecoverse/slicc-cdp": "1.43.0",
-    "@ai-ecoverse/slicc-jsh": "0.64.3",
+    "@ai-ecoverse/slicc-jsh": "0.64.4",
     "@ai-ecoverse/slicc-kernel": "1.178.3",
     "@ai-ecoverse/slicc-shared-web": "2.14.2",
     "@ai-ecoverse/wasi-pnpm": "12.9.1-21",
