@@ -965,6 +965,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::{Mutex, OnceLock};
 
+    const FAKE_SLICC_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1334,7 +1336,7 @@ mod tests {
             std::fs::set_permissions(&good, perms).unwrap();
         }
 
-        let from_cli = run_slicc_browsers(Some(&good), CLI_TIMEOUT, CLI_MAX_STDOUT);
+        let from_cli = run_slicc_browsers(Some(&good), FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT);
         assert_eq!(from_cli, SliccBrowsersOutcome::Found(version_url(port)));
 
         let slow = bin.join("slow-slicc");
@@ -1381,7 +1383,7 @@ mod tests {
             std::fs::set_permissions(&bad, perms).unwrap();
         }
         assert_eq!(
-            run_slicc_browsers(Some(&bad), CLI_TIMEOUT, CLI_MAX_STDOUT),
+            run_slicc_browsers(Some(&bad), FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT),
             SliccBrowsersOutcome::Failed
         );
 
@@ -1399,7 +1401,7 @@ mod tests {
             std::fs::set_permissions(&empty, perms).unwrap();
         }
         assert_eq!(
-            run_slicc_browsers(Some(&empty), CLI_TIMEOUT, CLI_MAX_STDOUT),
+            run_slicc_browsers(Some(&empty), FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT),
             SliccBrowsersOutcome::Empty
         );
 
@@ -1413,7 +1415,7 @@ mod tests {
             std::fs::set_permissions(&boom, perms).unwrap();
         }
         assert_eq!(
-            run_slicc_browsers(Some(&boom), CLI_TIMEOUT, CLI_MAX_STDOUT),
+            run_slicc_browsers(Some(&boom), FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT),
             SliccBrowsersOutcome::Failed
         );
 
@@ -1647,7 +1649,7 @@ mod tests {
                 .as_nanos()
         ));
         assert_eq!(
-            run_slicc_browsers(Some(&missing), CLI_TIMEOUT, CLI_MAX_STDOUT),
+            run_slicc_browsers(Some(&missing), FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT),
             SliccBrowsersOutcome::Failed
         );
     }
@@ -1780,7 +1782,7 @@ mod tests {
         let first = attached_with(
             Some(&empty),
             Some(&cache),
-            CLI_TIMEOUT,
+            FAKE_SLICC_TIMEOUT,
             CLI_MAX_STDOUT,
             &mut |_| Err("unused\n".to_string()),
         )
@@ -1794,7 +1796,7 @@ mod tests {
         let second = attached_with(
             Some(&empty),
             Some(&cache),
-            CLI_TIMEOUT,
+            FAKE_SLICC_TIMEOUT,
             CLI_MAX_STDOUT,
             &mut |_| Err("unused\n".to_string()),
         )
@@ -1810,7 +1812,7 @@ mod tests {
         let third = attached_with(
             Some(&empty),
             Some(&cache),
-            CLI_TIMEOUT,
+            FAKE_SLICC_TIMEOUT,
             CLI_MAX_STDOUT,
             &mut |_| Err("unused\n".to_string()),
         )
@@ -1942,7 +1944,7 @@ mod tests {
         let found = attached_with(
             Some(&slicc),
             Some(&cache),
-            CLI_TIMEOUT,
+            FAKE_SLICC_TIMEOUT,
             CLI_MAX_STDOUT,
             &mut |url| {
                 if url == "http://127.0.0.1:1/json/version" {
@@ -1997,7 +1999,7 @@ mod tests {
         let first = attached_with(
             Some(&slicc),
             Some(&cache),
-            CLI_TIMEOUT,
+            FAKE_SLICC_TIMEOUT,
             CLI_MAX_STDOUT,
             &mut probe,
         )
@@ -2005,7 +2007,7 @@ mod tests {
         let second = attached_with(
             Some(&slicc),
             Some(&cache),
-            CLI_TIMEOUT,
+            FAKE_SLICC_TIMEOUT,
             CLI_MAX_STDOUT,
             &mut probe,
         )
