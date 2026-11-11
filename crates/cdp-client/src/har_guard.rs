@@ -48,20 +48,29 @@ impl Cdp {
     }
 
     pub fn har_stop(&mut self, session: &str) {
-        self.har_disarm(session);
-        if self.har.tried.remove(session) {
+        if !self.har.tried.contains(session) && !self.har.armed.contains(session) {
+            return;
+        }
+        let disable = self.raw_call(
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": false,
+                "waitForDebuggerOnStart": false,
+                "flatten": true
+            }),
+            Some(session),
+            OPTIONAL_STEP,
+        );
+        if disable.is_err() {
             let _ = self.raw_call(
-                "Target.setAutoAttach",
-                json!({
-                    "autoAttach": false,
-                    "waitForDebuggerOnStart": false,
-                    "flatten": true,
-                    "filter": [{"type": "worker", "exclude": false}]
-                }),
-                Some(session),
+                "Target.detachFromTarget",
+                json!({ "sessionId": session }),
+                None,
                 OPTIONAL_STEP,
             );
         }
+        self.har.tried.remove(session);
+        self.har_disarm(session);
     }
 
     pub fn har_owns(&self, session: &str) -> bool {
@@ -154,9 +163,12 @@ impl Cdp {
             || self.session_target(owner).is_some_and(|target| {
                 self.is_protected_target(&target) || self.abandoned.contains(&target)
             });
-        let opaque = url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "blob" | "data"));
-        if opaque {
-            return creator_protected;
+        if let Ok(parsed) = url::Url::parse(url) {
+            match parsed.scheme() {
+                "data" => return creator_protected,
+                "blob" => return creator_protected || self.guard.url(url),
+                _ => {}
+            }
         }
         if creator_protected {
             return true;

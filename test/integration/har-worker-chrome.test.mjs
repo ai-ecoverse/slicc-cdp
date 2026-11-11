@@ -44,6 +44,11 @@ async function withWorkerServer(body) {
       </script>`);
       return;
     }
+    if (url.pathname === '/post-stop') {
+      res.setHeader('Content-Type', 'text/html');
+      res.end(`<!doctype html><title>post-stop worker</title><body></body>`);
+      return;
+    }
     res.writeHead(404);
     res.end('missing');
   });
@@ -155,6 +160,56 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
       0,
       JSON.stringify(har)
     );
+  });
+});
+
+test('after har-stop a new dedicated worker runs without staying paused', {
+  timeout: 180000,
+}, async () => {
+  await withWorkerServer(async ({ home, origin, browser, raw, setHeld }) => {
+    const opened = await harCommand(browser.wsUrl, ['tab-new', 'about:blank'], home);
+    assert.equal(opened.code, 0, opened.stderr);
+    const target = opened.stdout.match(/targetId: ([^\]]+)\]/)?.[1];
+    assert.ok(target, opened.stdout);
+    const { sessionId } = await raw.send('Target.attachToTarget', {
+      targetId: target,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, sessionId);
+    await raw.send('Runtime.enable', {}, sessionId);
+    const load = raw.event('Page.loadEventFired', sessionId);
+    await raw.send('Page.navigate', { url: `${origin}/post-stop` }, sessionId);
+    await load.seen;
+    const file = path.join(home, 'post-stop.har');
+    const held = harHolder(browser.wsUrl, ['har-start', '--tab', target, file], home);
+    setHeld(held);
+    await held.event('ready');
+    const stopped = await harCommand(browser.wsUrl, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+    const result = await raw.send(
+      'Runtime.evaluate',
+      {
+        expression: `(() => new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('worker stayed paused')), 1000);
+          const worker = new Worker(URL.createObjectURL(new Blob([
+            "postMessage('alive')"
+          ], { type: 'text/javascript' })));
+          worker.onmessage = (event) => {
+            clearTimeout(timer);
+            resolve(event.data);
+          };
+          worker.onerror = (event) => {
+            clearTimeout(timer);
+            reject(event.error || new Error(event.message || 'worker error'));
+          };
+        }))()`,
+        awaitPromise: true,
+        returnByValue: true,
+      },
+      sessionId
+    );
+    assert.equal(result.result?.value, 'alive', JSON.stringify(result));
   });
 });
 
