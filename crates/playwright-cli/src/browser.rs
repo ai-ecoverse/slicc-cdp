@@ -1208,7 +1208,10 @@ pub fn hover_ref(
         let cx = frame_offset.0 + fx;
         let cy = frame_offset.1 + fy;
         let input = input_session(session, rec);
-        return move_mouse(cdp, input, (cx, cy));
+        let scope = Scope { session, frame: Some(frame_id), input };
+        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), Gesture::Hover, &mut |cdp| {
+            move_mouse(cdp, input, (cx, cy))
+        });
     }
     if let Some(backend) = rec.backend_node_id {
         hover_backend(cdp, session, backend)?;

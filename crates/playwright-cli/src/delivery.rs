@@ -364,7 +364,7 @@ fn node_at(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<Option<Hit>, 
             }
         }
     }
-    let mut last = None;
+    let mut agreed: Option<Hit> = None;
     for (px, py) in points {
         let hit = match cdp.call(
             "DOM.getNodeForLocation",
@@ -383,9 +383,16 @@ fn node_at(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<Option<Hit>, 
             .filter(|id| !id.is_empty())
             .ok_or_else(|| landing::frame_refusal(x, y))?
             .to_string();
-        last = Some(Hit { backend, frame });
+        let next = Hit { backend, frame };
+        if let Some(prior) = &agreed {
+            if prior.frame != next.frame || prior.backend != next.backend {
+                return Err(landing::frame_refusal(x, y));
+            }
+        } else {
+            agreed = Some(next);
+        }
     }
-    Ok(last)
+    Ok(agreed)
 }
 
 fn main_frame(cdp: &mut Cdp, session: &str) -> Result<String, String> {

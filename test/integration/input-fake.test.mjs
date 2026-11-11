@@ -422,6 +422,56 @@ test('pointer input over an unresolvable embedded frame or outside the main docu
       assert.deepEqual(params(fake, 'Input.dispatchMouseEvent')[0].x, 10);
     }
   );
+  await withFake(
+    {
+      metrics: { cssLayoutViewport: { pageX: 100.5, pageY: 40 } },
+      intercept: (message, reply) => {
+        if (message.method !== 'DOM.getNodeForLocation') return false;
+        reply(
+          message.params.x === 110
+            ? { backendNodeId: 5, frameId: 'TAB' }
+            : { backendNodeId: 5, frameId: 'CHILD' }
+        );
+        return true;
+      },
+    },
+    async (fake, pw) => {
+      const result = await pw(['mousemove', '10', '20']);
+      assert.equal(result.code, 1, result.stderr);
+      assert.equal(
+        result.stderr,
+        'slicc: refused: mouse input at (10, 20) would reach an embedded frame\n'
+      );
+      assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
+      assert.deepEqual(
+        params(fake, 'DOM.getNodeForLocation').map((hit) => [hit.x, hit.y]),
+        [
+          [110, 60],
+          [111, 60],
+        ]
+      );
+    }
+  );
+  await withFake(
+    {
+      metrics: { cssLayoutViewport: { pageX: 100.5, pageY: 40 } },
+      intercept: (message, reply) => {
+        if (message.method !== 'DOM.getNodeForLocation') return false;
+        reply(
+          message.params.x === 110
+            ? { backendNodeId: 5, frameId: 'TAB' }
+            : { backendNodeId: 9, frameId: 'TAB' }
+        );
+        return true;
+      },
+    },
+    async (fake, pw) => {
+      const result = await pw(['mousemove', '10', '20']);
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stderr, /embedded frame/);
+      assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
+    }
+  );
   for (const metrics of [{}, { cssLayoutViewport: { pageX: 0 } }]) {
     await withFake({ metrics }, async (fake, pw) => {
       const result = await pw(['mousemove', '10', '20']);
