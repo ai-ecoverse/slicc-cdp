@@ -350,6 +350,14 @@ struct Hit {
     frame: String,
 }
 
+fn resolved_frame(hit_frame: &str, node: &Value) -> Option<String> {
+    if frame_owner(node) {
+        content_frame(node).map(str::to_string)
+    } else {
+        Some(hit_frame.to_string())
+    }
+}
+
 fn node_at(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<Option<Hit>, String> {
     let metrics = cdp.call("Page.getLayoutMetrics", json!({}), Some(session))?;
     let scroll = |key: &str| metrics.pointer(&format!("/cssLayoutViewport/{key}")).and_then(Value::as_f64).filter(|value| value.is_finite());
@@ -364,7 +372,12 @@ fn node_at(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<Option<Hit>, 
             }
         }
     }
-    let mut agreed: Option<Hit> = None;
+    struct Probe {
+        backend: u64,
+        hit_frame: String,
+        resolved: String,
+    }
+    let mut probes: Vec<Probe> = Vec::new();
     for (px, py) in points {
         let hit = match cdp.call(
             "DOM.getNodeForLocation",
@@ -377,22 +390,44 @@ fn node_at(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<Option<Hit>, 
             Err(message) => return Err(message),
         };
         let backend = hit.get("backendNodeId").and_then(Value::as_u64).ok_or_else(|| landing::frame_refusal(x, y))?;
-        let frame = hit
+        let hit_frame = hit
             .get("frameId")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .ok_or_else(|| landing::frame_refusal(x, y))?
             .to_string();
-        let next = Hit { backend, frame };
-        if let Some(prior) = &agreed {
-            if prior.frame != next.frame || prior.backend != next.backend {
-                return Err(landing::frame_refusal(x, y));
-            }
-        } else {
-            agreed = Some(next);
+        let node = describe_backend(cdp, session, backend)?;
+        let resolved = match resolved_frame(&hit_frame, &node) {
+            Some(frame) => frame,
+            None if frame_owner(&node) => owner_frame(cdp, session, backend).map_err(|_| landing::frame_refusal(x, y))?,
+            None => return Err(landing::frame_refusal(x, y)),
+        };
+        if probes.first().is_some_and(|prior| prior.resolved != resolved) {
+            return Err(landing::frame_refusal(x, y));
         }
+        probes.push(Probe {
+            backend,
+            hit_frame,
+            resolved,
+        });
     }
-    Ok(agreed)
+    let Some(first) = probes.first() else {
+        return Ok(None);
+    };
+    let resolved = first.resolved.clone();
+    let chosen = probes
+        .iter()
+        .find(|probe| probe.hit_frame == resolved)
+        .unwrap_or(first);
+    let frame = if chosen.hit_frame == resolved {
+        resolved
+    } else {
+        chosen.hit_frame.clone()
+    };
+    Ok(Some(Hit {
+        backend: chosen.backend,
+        frame,
+    }))
 }
 
 fn main_frame(cdp: &mut Cdp, session: &str) -> Result<String, String> {
@@ -406,7 +441,7 @@ fn main_frame(cdp: &mut Cdp, session: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_frame, frame_owner};
+    use super::{content_frame, frame_owner, resolved_frame};
     use serde_json::json;
 
     #[test]
@@ -421,5 +456,32 @@ mod tests {
         assert_eq!(content_frame(&json!({ "frameId": "CHILD" })), Some("CHILD"));
         assert_eq!(content_frame(&json!({ "frameId": "" })), None);
         assert_eq!(content_frame(&json!({})), None);
+    }
+
+    #[test]
+    fn resolved_frame_keeps_ordinary_hit_frame() {
+        assert_eq!(
+            resolved_frame("TAB", &json!({ "localName": "div" })),
+            Some("TAB".to_string())
+        );
+        assert_eq!(
+            resolved_frame("TAB", &json!({ "localName": "div", "backendNodeId": 9 })),
+            Some("TAB".to_string())
+        );
+    }
+
+    #[test]
+    fn resolved_frame_uses_owner_content_frame() {
+        assert_eq!(
+            resolved_frame(
+                "TAB",
+                &json!({ "localName": "iframe", "frameId": "CHILD", "backendNodeId": 5 })
+            ),
+            Some("CHILD".to_string())
+        );
+        assert_eq!(
+            resolved_frame("TAB", &json!({ "localName": "iframe" })),
+            None
+        );
     }
 }

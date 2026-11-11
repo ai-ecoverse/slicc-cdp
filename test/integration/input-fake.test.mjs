@@ -456,19 +456,76 @@ test('pointer input over an unresolvable embedded frame or outside the main docu
     {
       metrics: { cssLayoutViewport: { pageX: 100.5, pageY: 40 } },
       intercept: (message, reply) => {
-        if (message.method !== 'DOM.getNodeForLocation') return false;
-        reply(
-          message.params.x === 110
-            ? { backendNodeId: 5, frameId: 'TAB' }
-            : { backendNodeId: 9, frameId: 'TAB' }
-        );
-        return true;
+        if (message.method === 'DOM.getNodeForLocation') {
+          reply(
+            message.params.x === 110
+              ? { backendNodeId: 5, frameId: 'TAB' }
+              : { backendNodeId: 9, frameId: 'TAB' }
+          );
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.backendNodeId === 9) {
+          reply({ node: { nodeType: 1, nodeName: 'DIV', localName: 'div', backendNodeId: 9 } });
+          return true;
+        }
+        return false;
+      },
+    },
+    async (fake, pw) => {
+      const result = await pw(['mousemove', '10', '20']);
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 1);
+      assert.deepEqual(
+        params(fake, 'DOM.getNodeForLocation').map((hit) => [hit.x, hit.y]),
+        [
+          [110, 60],
+          [111, 60],
+        ]
+      );
+      assert.deepEqual(
+        [...new Set(params(fake, 'DOM.describeNode').map((call) => call.backendNodeId))].sort(),
+        [5, 9]
+      );
+    }
+  );
+  await withFake(
+    {
+      metrics: { cssLayoutViewport: { pageX: 100.5, pageY: 40 } },
+      intercept: (message, reply) => {
+        if (message.method === 'DOM.getNodeForLocation') {
+          reply(
+            message.params.x === 110
+              ? { backendNodeId: 5, frameId: 'TAB' }
+              : { backendNodeId: 9, frameId: 'TAB' }
+          );
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.backendNodeId === 5) {
+          reply({
+            node: {
+              nodeType: 1,
+              nodeName: 'IFRAME',
+              localName: 'iframe',
+              frameId: 'CHILD',
+              backendNodeId: 5,
+            },
+          });
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.backendNodeId === 9) {
+          reply({ node: { nodeType: 1, nodeName: 'DIV', localName: 'div', backendNodeId: 9 } });
+          return true;
+        }
+        return false;
       },
     },
     async (fake, pw) => {
       const result = await pw(['mousemove', '10', '20']);
       assert.equal(result.code, 1, result.stderr);
-      assert.match(result.stderr, /embedded frame/);
+      assert.equal(
+        result.stderr,
+        'slicc: refused: mouse input at (10, 20) would reach an embedded frame\n'
+      );
       assert.equal(sent(fake, 'Input.dispatchMouseEvent').length, 0);
     }
   );
