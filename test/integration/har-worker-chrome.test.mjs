@@ -30,10 +30,27 @@ async function withWorkerServer(body) {
       res.end('from-worker');
       return;
     }
+    if (url.pathname === '/body') {
+      res.setHeader('Content-Type', 'text/plain');
+      res.end('worker-body-text');
+      return;
+    }
+    if (url.pathname === '/body-worker.js') {
+      res.setHeader('Content-Type', 'text/javascript');
+      res.end(`fetch(${JSON.stringify(`http://127.0.0.1:${server.address().port}/body`)});`);
+      return;
+    }
     if (url.pathname === '/page') {
       res.setHeader('Content-Type', 'text/html');
       res.end(`<!doctype html><title>worker har</title><script>
         new Worker(${JSON.stringify(`http://127.0.0.1:${server.address().port}/worker.js`)});
+      </script>`);
+      return;
+    }
+    if (url.pathname === '/body-page') {
+      res.setHeader('Content-Type', 'text/html');
+      res.end(`<!doctype html><title>worker body har</title><script>
+        new Worker(${JSON.stringify(`http://127.0.0.1:${server.address().port}/body-worker.js`)});
       </script>`);
       return;
     }
@@ -210,6 +227,50 @@ test('after har-stop a new dedicated worker runs without staying paused', {
       sessionId
     );
     assert.equal(result.result?.value, 'alive', JSON.stringify(result));
+  });
+});
+
+test('HAR --content embed includes dedicated-worker response bodies', {
+  timeout: 180000,
+}, async () => {
+  await withWorkerServer(async ({ home, origin, browser, raw, setHeld }) => {
+    const opened = await harCommand(browser.wsUrl, ['tab-new', 'about:blank'], home);
+    assert.equal(opened.code, 0, opened.stderr);
+    const target = opened.stdout.match(/targetId: ([^\]]+)\]/)?.[1];
+    assert.ok(target, opened.stdout);
+    const { sessionId } = await raw.send('Target.attachToTarget', {
+      targetId: target,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, sessionId);
+    const file = path.join(home, 'worker-body.har');
+    const held = harHolder(
+      browser.wsUrl,
+      ['har-start', '--tab', target, '--content', 'embed', file],
+      home
+    );
+    setHeld(held);
+    await held.event('ready');
+    await held.event('paused');
+    const load = raw.event('Page.loadEventFired', sessionId);
+    await raw.send('Page.navigate', { url: `${origin}/body-page` }, sessionId);
+    await load.seen;
+    await held.event('resumed');
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const stopped = await harCommand(browser.wsUrl, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    const ended = await held.ended;
+    assert.equal(ended.code, 0, ended.stderr);
+    const har = JSON.parse(await readFile(file, 'utf8'));
+    const entry = har.log.entries.find((item) => {
+      try {
+        return new URL(item.request.url).pathname === '/body';
+      } catch {
+        return false;
+      }
+    });
+    assert.ok(entry, `missing /body entry: ${JSON.stringify(har)}`);
+    assert.equal(entry.response.content.text, 'worker-body-text', JSON.stringify(entry));
   });
 });
 

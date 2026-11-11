@@ -1189,9 +1189,16 @@ impl Cdp {
             if !self.storage_scope_verified(params) { return Err(self.refusal()) }
             return Ok(checks);
         }
-        if matches!(method, "Fetch.getResponseBody" | "Network.getResponseBody" | "Network.getRequestPostData")
-            && session.and_then(|session| self.session_target(session)).is_some_and(|target| self.document_paused(&target))
-            && shield::request_key(params).is_some_and(|id| self.request_state(&id) == Some(false)) { return Ok(checks) }
+        if matches!(method, "Fetch.getResponseBody" | "Network.getResponseBody" | "Network.getRequestPostData") {
+            if let (Some(session), Some(id)) = (session, shield::request_key(params)) {
+                let paused = self.session_target(session).is_some_and(|target| self.document_paused(&target))
+                    && self.request_state(&id) == Some(false);
+                let worker = self.har_owns(session) && self.ordinary_response_body(session, &id);
+                if paused || worker {
+                    return Ok(checks);
+                }
+            }
+        }
         if matches!(method, "IO.read" | "IO.close") {
             let saved = params.get("handle").and_then(Value::as_str).and_then(|handle| self.streams.get(handle)).cloned();
             let Some((Some(target), Some(expected))) = saved else { return Err(self.refusal()) };
@@ -2762,12 +2769,20 @@ impl Cdp {
                     || params
                         .get("frameId")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|frame| self.frame_protected(frame));
+                        .is_some_and(|frame| self.frame_protected(frame))
+                    || params
+                        .get("initiator")
+                        .is_some_and(|initiator| shield::loaded_urls_protected(&self.guard, initiator));
                 let protected = initiator
                     || self.guard.url(&url)
-                    || self.guard.url(&shield::web_socket_as_http(&url));
+                    || self.guard.url(&shield::web_socket_as_http(&url))
+                    || session.as_ref().is_some_and(|session| self.har_creator_blocked(session));
                 let entry = self.requests.entry(id.to_string()).or_insert(false);
                 *entry = *entry || protected;
+            }
+            if self.network_event_referer_origin_protected(&params) {
+                let entry = self.requests.entry(id.to_string()).or_insert(false);
+                *entry = true;
             }
         }
         if let Some(id) = params.get("requestId").and_then(Value::as_str) {
@@ -3181,9 +3196,63 @@ impl Cdp {
         }
     }
 
+    fn network_referer_origin_name_value(name: &str, value: &str, guard: &crate::protected::Protected) -> bool {
+        matches!(name.to_ascii_lowercase().as_str(), "referer" | "origin")
+            && value != "null"
+            && guard.url(value)
+    }
+
+    fn network_referer_origin_protected(&self, headers: Option<&Value>) -> bool {
+        let Some(headers) = headers else { return false };
+        match headers {
+            Value::Object(fields) => fields.iter().any(|(name, value)| {
+                value.as_str().is_some_and(|text| Self::network_referer_origin_name_value(name, text, &self.guard))
+            }),
+            Value::Array(fields) => fields.iter().any(|field| {
+                field.get("name").and_then(Value::as_str).zip(field.get("value").and_then(Value::as_str))
+                    .is_some_and(|(name, value)| Self::network_referer_origin_name_value(name, value, &self.guard))
+            }),
+            _ => false,
+        }
+    }
+
+    fn network_referer_origin_headers_text_protected(&self, text: Option<&str>) -> bool {
+        text.is_some_and(|text| {
+            text.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    Self::network_referer_origin_name_value(name.trim(), value.trim(), &self.guard)
+                })
+            })
+        })
+    }
+
+    fn network_event_referer_origin_protected(&self, params: &Value) -> bool {
+        self.network_referer_origin_protected(params.get("request").and_then(|request| request.get("headers")))
+            || self.network_referer_origin_protected(params.get("response").and_then(|response| response.get("headers")))
+            || self.network_referer_origin_protected(params.pointer("/redirectResponse/headers"))
+            || self.network_referer_origin_protected(params.get("headers"))
+            || self.network_referer_origin_headers_text_protected(
+                params.get("request").and_then(|request| request.get("headersText")).and_then(Value::as_str),
+            )
+            || self.network_referer_origin_headers_text_protected(
+                params.get("request").and_then(|request| request.get("requestHeadersText")).and_then(Value::as_str),
+            )
+            || self.network_referer_origin_headers_text_protected(params.pointer("/redirectResponse/headersText").and_then(Value::as_str))
+            || self.network_referer_origin_headers_text_protected(params.get("headersText").and_then(Value::as_str))
+            || self.network_referer_origin_headers_text_protected(params.get("requestHeadersText").and_then(Value::as_str))
+    }
+
     pub fn ordinary_response_body(&self, session: &str, request_id: &str) -> bool {
-        !self.content_blocked(session) && self.request_state(request_id) == Some(false)
-            && !self.protected_body_requests.contains(request_id) && self.ordinary_network_source(session, request_id).is_some()
+        !self.content_blocked(session)
+            && !self.har_creator_blocked(session)
+            && self.request_state(request_id) == Some(false)
+            && !self.protected_body_requests.contains(request_id)
+            && !self.protected_request_pages.iter().any(|(peer, id)| {
+                id == request_id
+                    && (peer == session
+                        || self.session_target(session).is_some_and(|target| self.session_target(peer).as_ref() == Some(&target)))
+            })
+            && self.ordinary_network_source(session, request_id).is_some()
     }
 
     pub fn redact_redirect_carriers(&self, headers: &mut Value, source: &str) {
