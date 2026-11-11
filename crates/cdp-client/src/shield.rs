@@ -1699,15 +1699,17 @@ mod tests {
 
         nothing_mentions(&cdp, "SECRETKEY");
         nothing_mentions(&cdp, "COOKIESECRET");
-        for tab in [&seven_tab, &vault_tab] {
-            assert!(cdp.is_protected_target(tab));
-            let closed = cdp.call("Target.closeTarget", json!({ "targetId": tab }), None).unwrap();
-            assert_eq!(closed["success"], json!(true));
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while page_ids(&mut raw).contains(tab.as_str()) {
-                assert!(Instant::now() < deadline, "the closed protected tab is still open");
-                std::thread::sleep(Duration::from_millis(50));
-            }
+        assert!(cdp.is_protected_target(&vault_tab));
+        refused(cdp.call("Target.closeTarget", json!({ "targetId": vault_tab }), None), "close the live vault");
+        assert!(page_ids(&mut raw).contains(vault_tab.as_str()), "the live vault tab was closed");
+        raw.close(&vault_tab);
+        assert!(cdp.is_protected_target(&seven_tab));
+        let closed = cdp.call("Target.closeTarget", json!({ "targetId": seven_tab }), None).unwrap();
+        assert_eq!(closed["success"], json!(true));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while page_ids(&mut raw).contains(seven_tab.as_str()) {
+            assert!(Instant::now() < deadline, "the closed protected tab is still open");
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 

@@ -605,7 +605,13 @@ async function protectedFlow(runner, site, wsUrl) {
       assert.match(curled.stderr, /slicc: refused: /);
       assert.ok((await raw.targetUrl(tab)).includes('SECRET'), 'the protected tab moved');
     }
-    for (const tab of [seven, vault]) await closedTab(['tab-close', '--tab', tab], tab, cwd);
+    await closedTab(['tab-close', '--tab', seven], seven, cwd);
+    await refused(['tab-close', '--tab', vault], cwd);
+    assert.ok(
+      (await raw.targetUrl(vault)).includes('VAULTSECRET'),
+      'the live vault tab was closed'
+    );
+    await raw.send('Target.closeTarget', { targetId: vault });
     for (const url of ['http://vault.sliccy.ai/landing', '//seven.sliccy.ai/x']) {
       const curled = await runner.curl([url], cwd);
       assert.equal(curled.code, 1, curled.stdout);
@@ -659,7 +665,11 @@ async function protectedFlow(runner, site, wsUrl) {
     const requests = await runner.playwright(['requests', '--tab', tab], cwd);
     assert.doesNotMatch(requests.stdout + requests.stderr, /vault|n=refresh/);
     await runner.playwright(['unroute'], cwd);
-    await closedTab(['tab-close'], tab, cwd);
+    if (frame.url === 'chrome-error://chromewebdata/') await closedTab(['tab-close'], tab, cwd);
+    else {
+      await refused(['tab-close'], cwd);
+      await raw.send('Target.closeTarget', { targetId: tab });
+    }
   } finally {
     raw.close();
   }

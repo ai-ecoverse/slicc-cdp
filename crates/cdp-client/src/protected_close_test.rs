@@ -3,13 +3,28 @@ struct TabsBackend {
     sent: std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
 }
 
+const TABS: [(&str, &str, &str); 14] = [
+    ("P", "page", "http://127.0.0.1:8085/?code=SECRETCODE"),
+    ("C", "page", "https://seven.sliccy.ai/os/callback.html"),
+    ("W", "page", "https://www.sliccy.ai/?code=SECRETCODE"),
+    ("G", "page", "https://get.sliccy.ai/os/"),
+    ("N", "page", "https://www.sliccy.ai:8443/os/"),
+    ("O", "page", "https://seven.sliccy.ai/os/"),
+    ("D", "page", "https://seven.sliccy.ai./os/terminal?k=SECRETKEY"),
+    ("M", "page", "https://www.sliccy.ai/os/index.html"),
+    ("L", "page", "http://127.0.0.1:8085/os/"),
+    ("V", "page", "https://vault.sliccy.ai/landing?k=SECRETKEY"),
+    ("X", "page", "https://vault-x.sliccy.ai/"),
+    ("H", "page", "http://vault.sliccy.ai:8080/"),
+    ("U", "browser_ui", "chrome://omnibox-popup.top-chrome/"),
+    ("T", "page", "https://example.test/"),
+];
+const CLOSABLE: [&str; 5] = ["P", "C", "W", "G", "N"];
+const KEPT: [&str; 7] = ["O", "D", "M", "L", "V", "X", "H"];
+
 fn tab_info(target: &str) -> Value {
-    match target {
-        "P" => json!({"targetId":"P","type":"page","url":"http://127.0.0.1:8085/?code=SECRETCODE","title":"SECRETCODE"}),
-        "V" => json!({"targetId":"V","type":"page","url":"https://vault.sliccy.ai/landing?k=SECRETKEY","title":"vault"}),
-        "U" => json!({"targetId":"U","type":"browser_ui","url":"chrome://omnibox-popup.top-chrome/","title":"Omnibox Popup"}),
-        _ => json!({"targetId":target,"type":"page","url":"https://example.test/","title":"ordinary"}),
-    }
+    let (id, kind, url) = TABS.iter().find(|(id, _, _)| *id == target).copied().unwrap_or(("T", "page", "https://example.test/"));
+    json!({"targetId":id,"type":kind,"url":url,"title":if id == "T" { "ordinary" } else { "SECRETTITLE" }})
 }
 
 impl Transport for TabsBackend {
@@ -19,7 +34,7 @@ impl Transport for TabsBackend {
         let target = message["params"]["targetId"].as_str().unwrap_or("T");
         let result = match message["method"].as_str().unwrap() {
             "Target.getTargetInfo" => json!({"targetInfo":tab_info(target)}),
-            "Target.getTargets" => json!({"targetInfos":Value::Array(["P","V","U","T"].map(tab_info).to_vec())}),
+            "Target.getTargets" => json!({"targetInfos":Value::Array(TABS.iter().map(|(id, _, _)| tab_info(id)).collect())}),
             "Target.attachToTarget" => json!({"sessionId":format!("S{target}")}),
             "Target.closeTarget" => json!({"success":true}),
             _ => json!({}),
@@ -46,7 +61,7 @@ fn forwarded(sent: &std::rc::Rc<std::cell::RefCell<Vec<Value>>>, method: &str, t
 
 #[test]
 fn a_protected_tab_can_be_closed_but_not_reached() {
-    for tab in ["P", "V"] {
+    for tab in CLOSABLE {
         let (mut cdp, sent) = tabs_client();
         assert!(cdp.target_protected(tab, false).unwrap(), "{tab}");
         for (method, params) in [
@@ -98,4 +113,34 @@ fn protected_browser_ui_and_unknown_targets_stay_unclosable() {
     cdp.targets.insert("X".into(), json!({"targetId":"X","url":"https://seven.sliccy.ai/"}));
     assert!(cdp.call("Target.closeTarget", json!({"targetId":"X"}), None).unwrap_err().starts_with("slicc: refused:"));
     assert!(!forwarded(&sent, "Target.closeTarget", "X"));
+}
+
+#[test]
+fn a_live_seven_ui_or_vault_page_stays_unclosable() {
+    for tab in KEPT {
+        let (mut cdp, sent) = tabs_client();
+        assert!(cdp.target_protected(tab, false).unwrap(), "{tab}");
+        for (method, params) in [
+            ("Target.closeTarget", json!({"targetId":tab})),
+            ("Target.attachToTarget", json!({"targetId":tab,"flatten":true})),
+        ] {
+            let refused = cdp.call(method, params, None).unwrap_err();
+            assert!(refused.starts_with("slicc: refused:"), "{tab} {method}: {refused}");
+        }
+        assert!(!forwarded(&sent, "Target.closeTarget", tab), "{tab}");
+    }
+}
+
+#[test]
+fn an_error_page_left_by_a_failed_vault_or_seven_ui_load_can_be_closed() {
+    for url in ["https://vault.sliccy.ai/path?secret", "https://seven.sliccy.ai/os/?secret"] {
+        let mut cdp = error_page_client_url(url);
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"type":"BackForwardCacheRestore","frame":{"id":"F","url":url,"securityOrigin":url::Url::parse(url).unwrap().origin().ascii_serialization()}}}));
+        assert!(cdp.is_protected_target("T"), "{url}");
+        assert!(cdp.call("Target.closeTarget", json!({"targetId":"T"}), None).unwrap_err().starts_with("slicc: refused:"), "{url}");
+        error_commit(&mut cdp, url, "://");
+        assert!(cdp.target_protected("T", false).unwrap(), "{url}");
+        assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err().starts_with("slicc: refused:"), "{url}");
+        assert!(cdp.call("Target.closeTarget", json!({"targetId":"T"}), None).is_ok(), "{url}");
+    }
 }

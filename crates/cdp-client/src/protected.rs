@@ -134,6 +134,10 @@ impl Protected {
         origin_of(&url).is_some_and(|origin| self.extra.contains(&origin))
     }
 
+    pub(crate) fn own_origin(&self, text: &str) -> bool {
+        parse(text).and_then(|url| origin_of(&url)).is_some_and(|origin| self.extra.contains(&origin))
+    }
+
     pub fn extension_frame(&self, text: &str) -> bool {
         let Some(url) = parse(text) else { return false };
         self.rules.extension_frames.schemes.iter().any(|item| item == url.scheme())
