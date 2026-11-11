@@ -179,7 +179,6 @@ test('HAR records fetches from a worker that already existed before har-start', 
     const held = harHolder(browser.wsUrl, ['har-start', '--tab', target, file], home);
     setHeld(held);
     await held.event('ready');
-    await held.event('resumed');
     await new Promise((resolve) => setTimeout(resolve, 2000));
     const stopped = await harCommand(browser.wsUrl, ['har-stop'], home);
     assert.equal(stopped.code, 0, stopped.stderr);
