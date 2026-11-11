@@ -2755,16 +2755,16 @@ impl Cdp {
                     || params
                         .get("initiator")
                         .is_some_and(|initiator| shield::loaded_urls_protected(&self.guard, initiator));
-                let headers = self.network_referer_origin_protected(params.get("request").and_then(|request| request.get("headers")))
-                    || self.network_referer_origin_protected(params.get("response").and_then(|response| response.get("headers")))
-                    || self.network_referer_origin_protected(params.get("headers"));
                 let protected = initiator
-                    || headers
                     || self.guard.url(&url)
                     || self.guard.url(&shield::web_socket_as_http(&url))
                     || session.as_ref().is_some_and(|session| self.har_creator_blocked(session));
                 let entry = self.requests.entry(id.to_string()).or_insert(false);
                 *entry = *entry || protected;
+            }
+            if self.network_event_referer_origin_protected(&params) {
+                let entry = self.requests.entry(id.to_string()).or_insert(false);
+                *entry = true;
             }
         }
         if let Some(id) = params.get("requestId").and_then(Value::as_str) {
@@ -3178,21 +3178,50 @@ impl Cdp {
         }
     }
 
+    fn network_referer_origin_name_value(name: &str, value: &str, guard: &crate::protected::Protected) -> bool {
+        matches!(name.to_ascii_lowercase().as_str(), "referer" | "origin")
+            && value != "null"
+            && guard.url(value)
+    }
+
     fn network_referer_origin_protected(&self, headers: Option<&Value>) -> bool {
         let Some(headers) = headers else { return false };
-        let protected = |name: &str, value: &str| {
-            matches!(name.to_ascii_lowercase().as_str(), "referer" | "origin")
-                && value != "null"
-                && self.guard.url(value)
-        };
         match headers {
-            Value::Object(fields) => fields.iter().any(|(name, value)| value.as_str().is_some_and(|text| protected(name, text))),
+            Value::Object(fields) => fields.iter().any(|(name, value)| {
+                value.as_str().is_some_and(|text| Self::network_referer_origin_name_value(name, text, &self.guard))
+            }),
             Value::Array(fields) => fields.iter().any(|field| {
                 field.get("name").and_then(Value::as_str).zip(field.get("value").and_then(Value::as_str))
-                    .is_some_and(|(name, value)| protected(name, value))
+                    .is_some_and(|(name, value)| Self::network_referer_origin_name_value(name, value, &self.guard))
             }),
             _ => false,
         }
+    }
+
+    fn network_referer_origin_headers_text_protected(&self, text: Option<&str>) -> bool {
+        text.is_some_and(|text| {
+            text.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    Self::network_referer_origin_name_value(name.trim(), value.trim(), &self.guard)
+                })
+            })
+        })
+    }
+
+    fn network_event_referer_origin_protected(&self, params: &Value) -> bool {
+        self.network_referer_origin_protected(params.get("request").and_then(|request| request.get("headers")))
+            || self.network_referer_origin_protected(params.get("response").and_then(|response| response.get("headers")))
+            || self.network_referer_origin_protected(params.pointer("/redirectResponse/headers"))
+            || self.network_referer_origin_protected(params.get("headers"))
+            || self.network_referer_origin_headers_text_protected(
+                params.get("request").and_then(|request| request.get("headersText")).and_then(Value::as_str),
+            )
+            || self.network_referer_origin_headers_text_protected(
+                params.get("request").and_then(|request| request.get("requestHeadersText")).and_then(Value::as_str),
+            )
+            || self.network_referer_origin_headers_text_protected(params.pointer("/redirectResponse/headersText").and_then(Value::as_str))
+            || self.network_referer_origin_headers_text_protected(params.get("headersText").and_then(Value::as_str))
+            || self.network_referer_origin_headers_text_protected(params.get("requestHeadersText").and_then(Value::as_str))
     }
 
     pub fn ordinary_response_body(&self, session: &str, request_id: &str) -> bool {

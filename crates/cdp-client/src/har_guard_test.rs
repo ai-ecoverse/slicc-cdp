@@ -766,3 +766,157 @@ fn worker_initiator_stack_marks_request_protected() {
     );
     assert_worker_body_refused(&mut cdp, "WORKER", "STACK");
 }
+
+#[test]
+fn worker_extra_info_referer_and_origin_mark_request_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSent",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA",
+            "loaderId": "",
+            "documentURL": "https://ordinary.test/worker.js",
+            "type": "Fetch",
+            "request": {"url": "https://ordinary.test/body", "method": "GET", "headers": {}}
+        }
+    }));
+    assert_eq!(cdp.request_state("EXTRA"), Some(false));
+    assert!(cdp.ordinary_response_body("WORKER", "EXTRA"));
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSentExtraInfo",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA",
+            "headers": {"Referer": "https://seven.sliccy.ai/secret"}
+        }
+    }));
+    assert_eq!(cdp.request_state("EXTRA"), Some(true));
+    assert!(!cdp.ordinary_response_body("WORKER", "EXTRA"));
+    cdp.absorb(json!({
+        "method": "Network.responseReceivedExtraInfo",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA2",
+            "statusCode": 200,
+            "headers": {"Origin": "https://catalog.test/"}
+        }
+    }));
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSent",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA2",
+            "loaderId": "",
+            "documentURL": "https://ordinary.test/worker.js",
+            "type": "Fetch",
+            "request": {"url": "https://ordinary.test/body2", "method": "GET", "headers": {}}
+        }
+    }));
+    assert_worker_body_refused(&mut cdp, "WORKER", "EXTRA2");
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSent",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA3",
+            "loaderId": "",
+            "documentURL": "https://ordinary.test/worker.js",
+            "type": "Fetch",
+            "request": {"url": "https://ordinary.test/body3", "method": "GET", "headers": {}}
+        }
+    }));
+    cdp.absorb(json!({
+        "method": "Network.responseReceived",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA3",
+            "response": {"url": "https://ordinary.test/body3", "status": 200, "headers": {}, "mimeType": "text/plain"}
+        }
+    }));
+    assert_eq!(cdp.request_state("EXTRA3"), Some(false));
+    cdp.absorb(json!({
+        "method": "Network.responseReceivedExtraInfo",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "EXTRA3",
+            "statusCode": 200,
+            "headers": {"Origin": "https://catalog.test/"}
+        }
+    }));
+    assert_eq!(cdp.request_state("EXTRA3"), Some(true));
+    assert!(!cdp.ordinary_response_body("WORKER", "EXTRA3"));
+}
+
+#[test]
+fn worker_redirect_response_referer_marks_request_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSent",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "REDIRRESP",
+            "loaderId": "",
+            "documentURL": "https://ordinary.test/worker.js",
+            "type": "Fetch",
+            "request": {"url": "https://ordinary.test/next", "method": "GET", "headers": {}},
+            "redirectResponse": {
+                "url": "https://ordinary.test/start",
+                "status": 302,
+                "headers": {"Referer": "https://seven.sliccy.ai/secret"}
+            }
+        }
+    }));
+    assert_worker_body_refused(&mut cdp, "WORKER", "REDIRRESP");
+}
+
+#[test]
+fn worker_headers_text_referer_marks_request_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSent",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "TEXT",
+            "loaderId": "",
+            "documentURL": "https://ordinary.test/worker.js",
+            "type": "Fetch",
+            "request": {
+                "url": "https://ordinary.test/body",
+                "method": "GET",
+                "headers": {},
+                "headersText": "GET /body HTTP/1.1\r\nReferer: https://seven.sliccy.ai/secret\r\n\r\n"
+            }
+        }
+    }));
+    assert_worker_body_refused(&mut cdp, "WORKER", "TEXT");
+}
+
+#[test]
+fn worker_extra_info_after_loading_finished_still_blocks_body() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch(&mut cdp, "WORKER", "LATE", "https://ordinary.test/body");
+    assert_eq!(cdp.request_state("LATE"), Some(false));
+    assert!(cdp.ordinary_response_body("WORKER", "LATE"));
+    cdp.absorb(json!({
+        "method": "Network.requestWillBeSentExtraInfo",
+        "sessionId": "WORKER",
+        "params": {
+            "requestId": "LATE",
+            "headers": {"Referer": "https://seven.sliccy.ai/secret"}
+        }
+    }));
+    assert_eq!(cdp.request_state("LATE"), Some(true));
+    assert!(!cdp.ordinary_response_body("WORKER", "LATE"));
+    assert!(cdp
+        .call(
+            "Network.getResponseBody",
+            json!({"requestId": "LATE"}),
+            Some("WORKER")
+        )
+        .unwrap_err()
+        .starts_with("slicc: refused:"));
+}

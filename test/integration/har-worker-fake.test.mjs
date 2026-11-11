@@ -95,10 +95,22 @@ function workerNetwork(workerEmit, id, url, options = {}) {
     wallTime: 1700000000,
     documentURL: 'https://example.test/worker.js',
     type: 'Fetch',
-    request: { url, method: 'GET', headers: options.headers ?? {} },
+    request: {
+      url,
+      method: 'GET',
+      headers: options.headers ?? {},
+      ...(options.headersText ? { headersText: options.headersText } : {}),
+    },
   };
   if (options.initiator) params.initiator = options.initiator;
+  if (options.redirectResponse) params.redirectResponse = options.redirectResponse;
   workerEmit('Network.requestWillBeSent', params);
+  if (options.extraInfoBeforeResponse) {
+    workerEmit('Network.requestWillBeSentExtraInfo', {
+      requestId: id,
+      headers: options.extraInfoBeforeResponse,
+    });
+  }
   workerEmit('Network.responseReceived', {
     requestId: id,
     timestamp: 1.1,
@@ -111,7 +123,22 @@ function workerNetwork(workerEmit, id, url, options = {}) {
       encodedDataLength: 13,
     },
   });
-  workerEmit('Network.loadingFinished', { requestId: id, timestamp: 1.2 });
+  if (options.extraInfoAfterResponse) {
+    workerEmit('Network.requestWillBeSentExtraInfo', {
+      requestId: id,
+      headers: options.extraInfoAfterResponse,
+    });
+  }
+  if (options.responseExtraInfo) {
+    workerEmit('Network.responseReceivedExtraInfo', {
+      requestId: id,
+      statusCode: 200,
+      headers: options.responseExtraInfo,
+    });
+  }
+  if (!options.skipLoadingFinished) {
+    workerEmit('Network.loadingFinished', { requestId: id, timestamp: 1.2 });
+  }
 }
 
 test('HAR admits a dedicated worker, enables Network, and records its fetch', async () => {
@@ -561,6 +588,97 @@ test('HAR --content embed omits worker bodies with protected Referer, Origin, or
       ]) {
         assert.equal(byUrl[url]?.response.content.text, undefined, url);
       }
+      assert.deepEqual(
+        backend.calls
+          .filter((call) => call.method === 'Network.getResponseBody')
+          .map((call) => call.params.requestId),
+        ['OK']
+      );
+      const stopped = await harCommand(backend.url, ['har-stop'], home);
+      assert.equal(stopped.code, 0, stopped.stderr);
+      assert.equal((await held.ended).code, 0);
+    },
+    { flags: ['--content', 'embed'] }
+  );
+});
+
+test('HAR --content embed omits worker bodies when protected Referer or Origin arrives only via ExtraInfo, redirectResponse.headers, or headersText', async () => {
+  await workerFixture(
+    async ({ home, backend, tab, file, held, emitters }) => {
+      const { pageEmit, workerEmit } = await admitWorker(backend, emitters, held);
+      workerNetwork(workerEmit, 'EXTRA', 'https://example.test/extra', {
+        extraInfoAfterResponse: { Referer: 'https://seven.sliccy.ai/secret' },
+      });
+      workerNetwork(workerEmit, 'EXTRAORG', 'https://example.test/extra-origin', {
+        extraInfoAfterResponse: { Origin: 'https://seven.sliccy.ai' },
+      });
+      workerNetwork(workerEmit, 'REDIRRESP', 'https://example.test/redirect-next', {
+        redirectResponse: {
+          url: 'https://example.test/redirect-start',
+          status: 302,
+          headers: { Referer: 'https://seven.sliccy.ai/secret' },
+        },
+      });
+      workerNetwork(workerEmit, 'TEXT', 'https://example.test/headers-text', {
+        headersText:
+          'GET /headers-text HTTP/1.1\r\nReferer: https://seven.sliccy.ai/secret\r\n\r\n',
+      });
+      workerNetwork(workerEmit, 'OK', 'https://example.test/ok-shapes');
+      pageEmit('Page.frameNavigated', {
+        frame: {
+          id: 'TAB',
+          loaderId: tab.loaderId,
+          url: tab.url,
+          securityOrigin: 'https://example.test',
+        },
+      });
+      await held.event('checkpoint', (event) => event.entries >= 1);
+      const har = JSON.parse(await readFile(file, 'utf8'));
+      const byUrl = Object.fromEntries(har.log.entries.map((entry) => [entry.request.url, entry]));
+      assert.equal(byUrl['https://example.test/ok-shapes']?.response.content.text, 'ordinary-body');
+      for (const url of [
+        'https://example.test/extra',
+        'https://example.test/extra-origin',
+        'https://example.test/redirect-next',
+        'https://example.test/headers-text',
+      ]) {
+        assert.equal(byUrl[url]?.response.content.text, undefined, url);
+      }
+      assert.deepEqual(
+        backend.calls
+          .filter((call) => call.method === 'Network.getResponseBody')
+          .map((call) => call.params.requestId),
+        ['OK']
+      );
+      const stopped = await harCommand(backend.url, ['har-stop'], home);
+      assert.equal(stopped.code, 0, stopped.stderr);
+      assert.equal((await held.ended).code, 0);
+    },
+    { flags: ['--content', 'embed'] }
+  );
+});
+
+test('HAR --content embed refuses ExtraInfo that arrives after responseReceived and before loadingFinished', async () => {
+  await workerFixture(
+    async ({ home, backend, tab, file, held, emitters }) => {
+      const { pageEmit, workerEmit } = await admitWorker(backend, emitters, held);
+      workerNetwork(workerEmit, 'ORDER', 'https://example.test/order', {
+        extraInfoAfterResponse: { Referer: 'https://seven.sliccy.ai/secret' },
+      });
+      workerNetwork(workerEmit, 'OK', 'https://example.test/order-ok');
+      pageEmit('Page.frameNavigated', {
+        frame: {
+          id: 'TAB',
+          loaderId: tab.loaderId,
+          url: tab.url,
+          securityOrigin: 'https://example.test',
+        },
+      });
+      await held.event('checkpoint', (event) => event.entries >= 1);
+      const har = JSON.parse(await readFile(file, 'utf8'));
+      const byUrl = Object.fromEntries(har.log.entries.map((entry) => [entry.request.url, entry]));
+      assert.equal(byUrl['https://example.test/order']?.response.content.text, undefined);
+      assert.equal(byUrl['https://example.test/order-ok']?.response.content.text, 'ordinary-body');
       assert.deepEqual(
         backend.calls
           .filter((call) => call.method === 'Network.getResponseBody')
