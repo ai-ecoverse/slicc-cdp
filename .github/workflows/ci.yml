@@ -198,10 +198,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: rustup toolchain install "$(awk -F '"' '/^channel = / { print $2 }' rust-toolchain.toml)" --profile minimal --target "$TARGET"
 
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - if: matrix.target == 'aarch64-unknown-linux-musl'
+      - if: endsWith(matrix.target, '-unknown-linux-musl')
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build
@@ -210,7 +207,7 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: |
           build=cargo
-          [ "$TARGET" = aarch64-unknown-linux-musl ] && build=cross
+          case "$TARGET" in *-unknown-linux-musl) build=cross ;; esac
           "$build" build --locked --release --target "$TARGET" -p slicc-cdp -p curlwright
           ext=
           [ "$RUNNER_OS" = Windows ] && ext=.exe
