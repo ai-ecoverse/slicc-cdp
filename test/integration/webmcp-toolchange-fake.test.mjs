@@ -101,15 +101,15 @@ async function unavailableChild(backend, held, targetInfo) {
   await released;
 }
 
-async function scenario(options, check, args) {
+async function scenario(options, check, args, expect = { code: 0 }) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-webmcp-toolchange-'));
   const backend = await webmcpBackend(options);
   const held = holder(backend.url, cwd, args);
   try {
     await held.next((value) => value.event === 'ready', 0);
     await check({ backend, cwd, held });
-    held.child.stdin.end();
-    assert.equal(await held.ended, 0, held.stderr());
+    if (held.child.exitCode === null) held.child.stdin.end();
+    assert.equal(await held.ended, expect.code, held.stderr());
     assert.ok(backend.calls.every((call) => call.method !== 'Runtime.addBinding'));
   } finally {
     held.child.kill('SIGKILL');
@@ -404,7 +404,10 @@ test('fake: refused navigation traces contain only sanitized frame evidence and 
       assert.equal(JSON.stringify(reported).includes('private'), false);
       assert.equal(JSON.stringify(reported).includes('secret'), false);
       assert.equal(JSON.stringify(reported).includes('foreign.test'), false);
-    }
+      assert.equal(await held.ended, 1, held.stderr());
+    },
+    undefined,
+    { code: 1 }
   );
 });
 
