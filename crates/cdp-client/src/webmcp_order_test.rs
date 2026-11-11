@@ -636,3 +636,49 @@ fn provisional_child_frame_tree_reread_is_rate_limited() {
     cdp.webmcp_sweep();
     assert_eq!(trees(&state), after_attach + 1, "a re-read is allowed once the 250ms gate elapses");
 }
+
+#[test]
+fn stop_webmcp_detaches_a_provisional_child_before_the_next_sweep() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.domains && arm.pending_install.is_some()));
+    let before = state.borrow().sent.len();
+    cdp.stop_webmcp(&holder);
+    assert!(cdp.session_blocked("CHILD"), "stop must detach and block a provisional park");
+    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert!(child_enables(&state, "CHILD").is_empty());
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.promote_read_at = None;
+    }
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"));
+    assert!(child_enables(&state, "CHILD").is_empty(), "post-stop sweep must not enable a provisional child: {:?}", child_enables(&state, "CHILD"));
+    assert_eq!(shim_evals(&state, "CHILD"), 0);
+    assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.revoked || !arm.domains));
+}
+
+#[test]
+fn provisional_get_frame_tree_reply_after_deadline_settles_without_tools() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().child_get_frame_tree_delay = Some(Duration::from_millis(120));
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(Instant::now() + Duration::from_millis(40));
+        arm.promote_read_at = None;
+    }
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"), "an in-flight getFrameTree that returns after the deadline must settle");
+    assert!(child_enables(&state, "CHILD").is_empty(), "late reply must not enable domains: {:?}", child_enables(&state, "CHILD"));
+    assert_eq!(shim_evals(&state, "CHILD"), 0);
+    assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.admitted == 0));
+}

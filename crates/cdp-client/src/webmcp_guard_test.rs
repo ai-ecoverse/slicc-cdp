@@ -41,6 +41,7 @@ struct BackendState {
     enabled_page: BTreeSet<String>,
     enabled_runtime: BTreeSet<String>,
     deferred_lifecycle: VecDeque<String>,
+    child_get_frame_tree_delay: Option<Duration>,
 }
 
 impl BackendState {
@@ -192,7 +193,10 @@ impl Transport for Backend {
                     return Ok(());
                 }
                 let session = command["sessionId"].as_str().unwrap_or("");
-                if session.starts_with("CHILD") || session == "TOUCH-IFRAME" {
+                if BackendState::child_session(session) {
+                    if let Some(delay) = state.child_get_frame_tree_delay {
+                        std::thread::sleep(delay);
+                    }
                     if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
                 } else {
                     state.tree.clone()

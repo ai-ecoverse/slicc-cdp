@@ -1192,13 +1192,19 @@ impl Cdp {
 
     fn webmcp_child_enable(&mut self, session: &str) -> Result<(), String> {
         if self.webmcp.arms.get(session).is_some_and(|arm| arm.domains) { return Ok(()); }
-        self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
-        self.raw_call("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
-        self.raw_call("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
-        self.worlds.enable(session);
-        self.raw_call("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.domains = true; }
-        Ok(())
+        let enabled = (|| {
+            self.raw_call("Network.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.raw_call("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.raw_call("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            self.worlds.enable(session);
+            self.raw_call("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
+            Ok(())
+        })();
+        if enabled.is_err() {
+            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.domains = false; }
+        }
+        enabled
     }
 
     fn webmcp_child_arm(&mut self, session: &str, seed: &Value, parent_direct: bool, enable: bool) -> Result<String, String> {
@@ -1325,10 +1331,18 @@ impl Cdp {
         }
     }
 
+    fn webmcp_promote_parent_live(&self, parent: &str) -> bool {
+        self.webmcp.arms.get(parent).is_some_and(|arm| !arm.revoked)
+    }
+
     fn webmcp_promote_provisional_child(&mut self, child: &str) {
         if !self.webmcp_provisional_parked(child) { return; }
         let Some(parent) = self.webmcp.parents.get(child).cloned() else { return; };
         let Some(target) = self.session_target(child) else { return; };
+        if !self.webmcp_promote_parent_live(&parent) {
+            self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            return;
+        }
         let now = Instant::now();
         if self.webmcp.arms.get(child).and_then(|arm| arm.pending_install).is_some_and(|due| due <= now) {
             return;
@@ -1349,6 +1363,15 @@ impl Cdp {
             arm.promote_read_at = Some(now);
         }
         let Ok(seed) = self.raw_call("Page.getFrameTree", json!({}), Some(child), OPTIONAL_STEP) else { return; };
+        let now = Instant::now();
+        if self.blocked.contains(child)
+            || self.webmcp.arms.get(child).is_none_or(|arm| arm.revoked)
+            || !self.webmcp_promote_parent_live(&parent)
+            || self.webmcp.arms.get(child).and_then(|arm| arm.pending_install).is_some_and(|due| due <= now)
+        {
+            self.webmcp_settle_child(child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
+            return;
+        }
         if !self.webmcp_provisional_parked(child) { return; }
         let seed_frame = &seed["frameTree"]["frame"];
         if self.webmcp_seed_refused(seed_frame) {
@@ -1388,7 +1411,9 @@ impl Cdp {
     }
 
     fn webmcp_detach_parked_children(&mut self, parent: &str) {
-        let parked = self.webmcp.parents.iter().filter(|(child, owner)| *owner == parent && self.webmcp_parked_child(child)).map(|(child, _)| child.clone()).collect::<Vec<_>>();
+        let parked = self.webmcp.parents.iter().filter(|(child, owner)| {
+            *owner == parent && (self.webmcp_parked_child(child) || self.webmcp_provisional_parked(child))
+        }).map(|(child, _)| child.clone()).collect::<Vec<_>>();
         for child in parked {
             self.webmcp_settle_child(&child, "a cross-origin child could not verify its document; synchronous registration before installation is unavailable");
         }
