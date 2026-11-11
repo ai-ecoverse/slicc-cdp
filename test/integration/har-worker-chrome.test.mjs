@@ -64,17 +64,7 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
     await raw.send('Page.navigate', { url: `${origin}/page` }, sessionId);
     await load.seen;
     await held.event('resumed');
-    const deadline = Date.now() + 15000;
-    let ordinary;
-    for (;;) {
-      ordinary = JSON.parse(await readFile(file, 'utf8').catch(() => '{"log":{"entries":[]}}'));
-      if (ordinary.log.entries.some((entry) => entry.request.url === `${origin}/from-worker`))
-        break;
-      if (Date.now() >= deadline) {
-        throw new Error(`worker fetch missing: ${JSON.stringify(ordinary)}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     const beforeProtected = held.events().filter((event) => event.event === 'paused').length;
     const commit = raw.event('Page.frameNavigated', sessionId, (params) => !params.frame.parentId);
     await raw.send('Page.navigate', { url: `http://seven.sliccy.ai:${port}/protected` }, sessionId);
@@ -83,15 +73,30 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
       'paused',
       () => held.events().filter((event) => event.event === 'paused').length > beforeProtected
     );
+    await raw
+      .send(
+        'Runtime.evaluate',
+        {
+          expression: `try { new Worker(${JSON.stringify(`${origin}/worker.js`)}) } catch (error) { null }`,
+          awaitPromise: true,
+        },
+        sessionId
+      )
+      .catch(() => null);
     await new Promise((resolve) => setTimeout(resolve, 500));
     const stopped = await harCommand(browser.wsUrl, ['har-stop'], home);
     assert.equal(stopped.code, 0, stopped.stderr);
     const ended = await held.ended;
     assert.equal(ended.code, 0, ended.stderr);
     const har = JSON.parse(await readFile(file, 'utf8'));
+    const urls = har.log.entries.map((entry) => entry.request.url);
     assert.ok(
-      har.log.entries.some((entry) => entry.request.url === `${origin}/from-worker`),
-      JSON.stringify(har)
+      urls.some((url) => url === `${origin}/worker.js`),
+      `missing worker script: ${JSON.stringify(har)}`
+    );
+    assert.ok(
+      urls.some((url) => url === `${origin}/from-worker`),
+      `missing worker fetch: ${JSON.stringify(har)}`
     );
     assert.equal(
       har.log.entries.filter((entry) => {

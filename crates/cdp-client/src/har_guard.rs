@@ -1,8 +1,10 @@
 use super::{Cdp, OPTIONAL_STEP};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 const WORKER_NOTICE: &str = "har-start: dedicated worker traffic is not captured on this CDP route\n";
+const WORKER_STEP: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(super) struct Har {
@@ -22,7 +24,7 @@ impl Cdp {
         }
         let params = json!({
             "autoAttach": true,
-            "waitForDebuggerOnStart": false,
+            "waitForDebuggerOnStart": true,
             "flatten": true,
             "filter": [{"type": "worker", "exclude": false}]
         });
@@ -112,15 +114,32 @@ impl Cdp {
             self.har_release_worker(&child);
             return true;
         }
+        let deadline = Instant::now() + WORKER_STEP;
         let target = info.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
         let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
         if !target.is_empty() {
             self.targets.insert(target.clone(), info.clone());
             self.session_targets.insert(child.clone(), target);
         }
-        if self
-            .raw_call("Network.enable", json!({}), Some(&child), OPTIONAL_STEP)
-            .is_err()
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero()
+            || self
+                .raw_call("Network.enable", json!({}), Some(&child), left)
+                .is_err()
+        {
+            self.har_release_worker(&child);
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero()
+            || self
+                .raw_call(
+                    "Runtime.runIfWaitingForDebugger",
+                    json!({}),
+                    Some(&child),
+                    left,
+                )
+                .is_err()
         {
             self.har_release_worker(&child);
             return true;
@@ -179,8 +198,7 @@ impl Cdp {
                 .map(|(worker, _)| worker.clone())
                 .collect();
             for child in children {
-                self.har.workers.remove(&child);
-                self.har.urls.remove(&child);
+                self.har_release_worker(&child);
             }
             self.har.armed.remove(session);
             self.har.tried.remove(session);

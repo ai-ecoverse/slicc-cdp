@@ -11,6 +11,7 @@ struct BackendState {
     inbox: VecDeque<String>,
     sent: Vec<Value>,
     refuse_auto_attach: bool,
+    fail_network_enable: bool,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -21,7 +22,7 @@ impl Transport for Backend {
         let mut state = self.0.borrow_mut();
         state.sent.push(command.clone());
         let method = command["method"].as_str().unwrap_or("");
-        let result = match method {
+        match method {
             "Target.setAutoAttach" => {
                 if state.refuse_auto_attach {
                     state.inbox.push_back(
@@ -30,12 +31,20 @@ impl Transport for Backend {
                     );
                     return Ok(());
                 }
-                json!({})
             }
-            "Network.enable" | "Target.detachFromTarget" => json!({}),
-            _ => json!({}),
-        };
-        state.inbox.push_back(json!({"id":command["id"],"result":result}).to_string());
+            "Network.enable" => {
+                if state.fail_network_enable {
+                    state.inbox.push_back(
+                        json!({"id":command["id"],"error":{"message":"Network.enable failed"}})
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+            }
+            "Runtime.runIfWaitingForDebugger" | "Target.detachFromTarget" => {}
+            _ => {}
+        }
+        state.inbox.push_back(json!({"id":command["id"],"result":{}}).to_string());
         Ok(())
     }
 
@@ -69,9 +78,16 @@ fn worker_attach(owner: &str, session: &str, url: &str) -> Value {
         "params": {
             "sessionId": session,
             "targetInfo": {"targetId": format!("W-{session}"), "type": "worker", "url": url},
-            "waitingForDebugger": false
+            "waitingForDebugger": true
         }
     })
+}
+
+fn methods_after(state: &Rc<RefCell<BackendState>>, before: usize) -> Vec<String> {
+    state.borrow().sent[before..]
+        .iter()
+        .filter_map(|command| command["method"].as_str().map(str::to_string))
+        .collect()
 }
 
 fn drain(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>) {
@@ -85,21 +101,30 @@ fn drain(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>) {
 }
 
 #[test]
-fn admitted_worker_gets_network_enable_and_is_owned() {
+fn admitted_worker_enables_network_before_run_if_waiting() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
     assert!(cdp.har.armed.contains("H"));
+    assert!(
+        state.borrow().sent.iter().any(|command| {
+            command["method"] == "Target.setAutoAttach"
+                && command["params"]["waitForDebuggerOnStart"] == true
+        }),
+        "{:?}",
+        state.borrow().sent
+    );
     let before = state.borrow().sent.len();
     cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
     drain(&mut cdp, &state);
     assert!(cdp.har_owns("WORKER"));
-    assert!(
-        state.borrow().sent[before..]
-            .iter()
-            .any(|command| command["method"] == "Network.enable" && command["sessionId"] == "WORKER"),
-        "{:?}",
-        &state.borrow().sent[before..]
-    );
+    let methods = methods_after(&state, before);
+    let enable = methods.iter().position(|method| method == "Network.enable");
+    let resume = methods
+        .iter()
+        .position(|method| method == "Runtime.runIfWaitingForDebugger");
+    assert!(enable.is_some(), "{methods:?}");
+    assert!(resume.is_some(), "{methods:?}");
+    assert!(enable.unwrap() < resume.unwrap(), "{methods:?}");
     assert!(
         !cdp.events().iter().any(|event| event["method"] == "Target.attachedToTarget"
             && event["params"]["sessionId"] == "WORKER"),
@@ -108,19 +133,20 @@ fn admitted_worker_gets_network_enable_and_is_owned() {
 }
 
 #[test]
-fn worker_of_protected_page_is_detached_without_network_enable() {
+fn worker_of_protected_page_is_detached_without_enable_or_resume() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
     cdp.blocked.insert("H".into());
     let before = state.borrow().sent.len();
     cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
     assert!(!cdp.har_owns("WORKER"));
+    let methods = methods_after(&state, before);
+    assert!(!methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
     assert!(
-        !state.borrow().sent[before..]
+        !methods
             .iter()
-            .any(|command| command["method"] == "Network.enable"),
-        "{:?}",
-        &state.borrow().sent[before..]
+            .any(|method| method == "Runtime.runIfWaitingForDebugger"),
+        "{methods:?}"
     );
     assert!(
         state.borrow().sent[before..]
@@ -144,10 +170,12 @@ fn blob_worker_of_protected_page_is_detached_without_network_enable() {
         "blob:https://ordinary.test/1",
     ));
     assert!(!cdp.har_owns("BLOB"));
+    let methods = methods_after(&state, before);
+    assert!(!methods.iter().any(|method| method == "Network.enable"));
     assert!(
-        !state.borrow().sent[before..]
+        !methods
             .iter()
-            .any(|command| command["method"] == "Network.enable")
+            .any(|method| method == "Runtime.runIfWaitingForDebugger")
     );
     assert!(
         state.borrow().sent[before..]
@@ -161,15 +189,45 @@ fn blob_worker_of_protected_page_is_detached_without_network_enable() {
 fn blob_worker_of_ordinary_page_is_admitted() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
+    let before = state.borrow().sent.len();
     cdp.absorb(worker_attach(
         "H",
         "BLOB",
         "blob:https://ordinary.test/1",
     ));
     assert!(cdp.har_owns("BLOB"));
-    assert!(state.borrow().sent.iter().any(|command| {
-        command["method"] == "Network.enable" && command["sessionId"] == "BLOB"
-    }));
+    let methods = methods_after(&state, before);
+    let enable = methods.iter().position(|method| method == "Network.enable");
+    let resume = methods
+        .iter()
+        .position(|method| method == "Runtime.runIfWaitingForDebugger");
+    assert!(enable.is_some() && resume.is_some() && enable.unwrap() < resume.unwrap(), "{methods:?}");
+}
+
+#[test]
+fn failed_network_enable_still_releases_the_worker() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().fail_network_enable = true;
+    cdp.har_auto_attach("H").unwrap();
+    let before = state.borrow().sent.len();
+    cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
+    assert!(!cdp.har_owns("WORKER"));
+    let methods = methods_after(&state, before);
+    assert!(methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "Runtime.runIfWaitingForDebugger"),
+        "{methods:?}"
+    );
+    assert!(
+        state.borrow().sent[before..]
+            .iter()
+            .any(|command| command["method"] == "Target.detachFromTarget"
+                && command["params"]["sessionId"] == "WORKER"),
+        "{:?}",
+        &state.borrow().sent[before..]
+    );
 }
 
 #[test]
@@ -212,19 +270,29 @@ fn extension_style_refusal_emits_notice_and_leaves_recording_possible() {
 }
 
 #[test]
-fn stop_detaches_workers_and_disables_auto_attach() {
+fn stop_releases_all_workers_and_disables_auto_attach() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
     cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
+    cdp.absorb(worker_attach("H", "WORKER-2", "https://ordinary.test/other.js"));
     assert!(cdp.har_owns("WORKER"));
+    assert!(cdp.har_owns("WORKER-2"));
     let before = state.borrow().sent.len();
     cdp.har_stop("H");
     assert!(!cdp.har_owns("WORKER"));
+    assert!(!cdp.har_owns("WORKER-2"));
     assert!(!cdp.har.armed.contains("H"));
     let after = &state.borrow().sent[before..];
     assert!(
         after.iter().any(|command| {
             command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "WORKER"
+        }),
+        "{after:?}"
+    );
+    assert!(
+        after.iter().any(|command| {
+            command["method"] == "Target.detachFromTarget"
+                && command["params"]["sessionId"] == "WORKER-2"
         }),
         "{after:?}"
     );
@@ -248,10 +316,12 @@ fn unknown_worker_url_fails_closed() {
     let before = state.borrow().sent.len();
     cdp.absorb(worker_attach("H", "EMPTY", ""));
     assert!(!cdp.har_owns("EMPTY"));
+    let methods = methods_after(&state, before);
+    assert!(!methods.iter().any(|method| method == "Network.enable"));
     assert!(
-        !state.borrow().sent[before..]
+        !methods
             .iter()
-            .any(|command| command["method"] == "Network.enable")
+            .any(|method| method == "Runtime.runIfWaitingForDebugger")
     );
 }
 
@@ -260,7 +330,7 @@ fn client_issued_auto_attach_remains_refused() {
     let (mut cdp, _state) = client();
     let refused = cdp.call(
         "Target.setAutoAttach",
-        json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"worker","exclude":false}]}),
+        json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"worker","exclude":false}]}),
         Some("H"),
     );
     assert!(refused.as_ref().is_err_and(|message| message.contains("auto-attach")), "{refused:?}");

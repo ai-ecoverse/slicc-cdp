@@ -52,6 +52,7 @@ test('HAR admits a dedicated worker, enables Network, and records its fetch', as
           (call) =>
             call.method === 'Target.setAutoAttach' &&
             call.params?.autoAttach === true &&
+            call.params?.waitForDebuggerOnStart === true &&
             Array.isArray(call.params?.filter) &&
             call.params.filter.some((item) => item.type === 'worker' && item.exclude === false)
         ),
@@ -66,6 +67,7 @@ test('HAR admits a dedicated worker, enables Network, and records its fetch', as
     );
     const pageEmit = emitters.get(pageSession);
     assert.ok(pageEmit, `missing emitter for ${pageSession}`);
+    const beforeAttach = backend.calls.length;
     pageEmit('Target.attachedToTarget', {
       sessionId: 'WORKER',
       targetInfo: {
@@ -73,15 +75,23 @@ test('HAR admits a dedicated worker, enables Network, and records its fetch', as
         type: 'worker',
         url: 'https://example.test/worker.js',
       },
-      waitingForDebugger: false,
+      waitingForDebugger: true,
     });
     await waitFor(
       () =>
         backend.calls.some(
-          (call) => call.method === 'Network.enable' && call.sessionId === 'WORKER'
+          (call) => call.method === 'Runtime.runIfWaitingForDebugger' && call.sessionId === 'WORKER'
         ),
-      'worker Network.enable'
+      'worker runIfWaitingForDebugger'
     );
+    const afterAttach = backend.calls.slice(beforeAttach);
+    const enableAt = afterAttach.findIndex(
+      (call) => call.method === 'Network.enable' && call.sessionId === 'WORKER'
+    );
+    const resumeAt = afterAttach.findIndex(
+      (call) => call.method === 'Runtime.runIfWaitingForDebugger' && call.sessionId === 'WORKER'
+    );
+    assert.ok(enableAt >= 0 && resumeAt >= 0 && enableAt < resumeAt, JSON.stringify(afterAttach));
     const workerEmit = emitters.get('WORKER');
     assert.ok(workerEmit, 'worker session emitter');
     workerEmit('Network.requestWillBeSent', {
@@ -167,7 +177,7 @@ test('HAR detaches a worker of a protected page without Network.enable', async (
         type: 'worker',
         url: 'https://ordinary.test/worker.js',
       },
-      waitingForDebugger: false,
+      waitingForDebugger: true,
     });
     await held.event('paused');
     await waitFor(
@@ -185,6 +195,15 @@ test('HAR detaches a worker of a protected page without Network.enable', async (
       !backend.calls
         .slice(before)
         .some((call) => call.method === 'Network.enable' && call.sessionId === 'PROTECTED-WORKER')
+    );
+    assert.ok(
+      !backend.calls
+        .slice(before)
+        .some(
+          (call) =>
+            call.method === 'Runtime.runIfWaitingForDebugger' &&
+            call.sessionId === 'PROTECTED-WORKER'
+        )
     );
   });
 });
@@ -215,7 +234,7 @@ test('HAR detaches a blob worker created by a protected page', async () => {
         type: 'worker',
         url: 'blob:https://seven.sliccy.ai/1',
       },
-      waitingForDebugger: false,
+      waitingForDebugger: true,
     });
     await held.event('paused');
     await waitFor(
@@ -232,6 +251,14 @@ test('HAR detaches a blob worker created by a protected page', async () => {
       !backend.calls
         .slice(before)
         .some((call) => call.method === 'Network.enable' && call.sessionId === 'BLOB-WORKER')
+    );
+    assert.ok(
+      !backend.calls
+        .slice(before)
+        .some(
+          (call) =>
+            call.method === 'Runtime.runIfWaitingForDebugger' && call.sessionId === 'BLOB-WORKER'
+        )
     );
   });
 });
