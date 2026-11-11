@@ -204,7 +204,7 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
   }
 
-  test(`${transport}: a click into an embedded frame is refused`, async () => {
+  test(`${transport}: a click whose untrusted fallback still hits an unresolvable frame is refused`, async () => {
     await withScene(runner, scene({ pointer: 'frame', others: [sevenTab] }), async (s) => {
       const result = await s.run(['click', s.ref]);
       assert.equal(result.code, 1);
@@ -233,7 +233,7 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
   });
 
-  test(`${transport}: press lands in place or in front, and frames need the front`, async () => {
+  test(`${transport}: press lands in place or in front; unresolvable frame focus is refused`, async () => {
     await withScene(runner, scene({ reads: [[]], key: 'pressed' }), async (s) => {
       await s.ok(['press', 'Enter']);
       assert.deepEqual(modes(s.state, 'key')[0][1], {
@@ -249,10 +249,18 @@ for (const [transport, runner] of Object.entries(runners)) {
       assert.equal(s.state.activated.at(-1), 'SEVEN');
     });
     await withScene(runner, scene({ focus: 'frame', others: [sevenTab] }), async (s) => {
-      await s.ok(['press', 'a']);
-      await s.ok(['type', 'b']);
-      assert.equal(s.state.activated.length, 4);
-      assert.deepEqual(modes(s.state, 'arm'), []);
+      for (const args of [
+        ['press', 'a'],
+        ['type', 'b'],
+      ]) {
+        const result = await s.run(args);
+        assert.equal(result.code, 1, args.join(' '));
+        assert.match(
+          result.stderr,
+          /slicc: refused: keyboard focus is inside an embedded frame or a closed shadow root/
+        );
+      }
+      assert.deepEqual(s.state.activated, []);
     });
   });
 }
@@ -308,11 +316,16 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
     await withScene(runner, scene({ focus: 'frame' }), async (s) => {
       s.state.front = own(s);
-      await s.ok(['press', 'a']);
+      const result = await s.run(['press', 'a']);
+      assert.equal(result.code, 1);
+      assert.match(
+        result.stderr,
+        /slicc: refused: keyboard focus is inside an embedded frame or a closed shadow root/
+      );
       assert.deepEqual(s.state.activated, []);
       assert.equal(
         s.fake.calls.filter((call) => call.method === 'Input.dispatchKeyEvent').length,
-        2
+        0
       );
     });
   });

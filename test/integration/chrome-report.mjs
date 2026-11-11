@@ -48,6 +48,7 @@ export const CHROME_FILES = new Set(
     'har-worker-chrome',
     'headed-input',
     'input',
+    'input-oopif-chrome',
     'kernel-session',
     'launch',
     'page-tools',

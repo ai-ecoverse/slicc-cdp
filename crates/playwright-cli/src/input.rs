@@ -3,8 +3,9 @@ use crate::args::{Invocation, Output};
 use crate::browser;
 use crate::cdp::Cdp;
 use crate::commands::{resolve_target, with_ref};
+use crate::delivery::{self, Delivery};
 use crate::keys::{self, Key};
-use crate::landing::{self, Motion, Scope, Step};
+use crate::landing::{self, Motion, Step};
 use crate::sanitize;
 use crate::session::Session;
 use crate::snapshot::RefRec;
@@ -14,12 +15,10 @@ use std::path::{Component, Path, PathBuf};
 
 const COMMANDS: &[&str] = &["resize", "keydown", "keyup", "mousemove", "mousedown", "mouseup", "mousewheel", "drop"];
 const BUTTONS: &[&str] = &["left", "right", "middle"];
-const FRAME_OWNERS: &[&str] = &["iframe", "frame", "object", "embed", "fencedframe", "portal"];
 const MAX_DROP_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_SIZE: f64 = 10_000_000.0;
 const MAX_KEYS: usize = 64;
 const GROUP: &str = "slicc-input";
-const FOCUS: &str = "(() => { let e = document.activeElement; while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement; return e; })()";
 const INNER: &str = "[innerWidth, innerHeight]";
 const DROP: &str = "function(payloads, data) { if (!this.isConnected || this.nodeType !== 1) return 'error:notconnected'; this.scrollIntoView({block:'center',inline:'center'}); const r = this.getBoundingClientRect(); const point = {x:r.x+r.width/2,y:r.y+r.height/2}; const dt = new DataTransfer(); for (const p of payloads) { const bytes = Uint8Array.from(atob(p.buffer), (c) => c.charCodeAt(0)); dt.items.add(new File([bytes], p.name, { type: p.mimeType, lastModified: p.lastModifiedMs })); } for (const entry of data) dt.setData(entry.mimeType, entry.value); const make = (type) => new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: point.x, clientY: point.y, dataTransfer: dt }); this.dispatchEvent(make('dragenter')); const over = make('dragover'); this.dispatchEvent(over); if (!over.defaultPrevented) { this.dispatchEvent(make('dragleave')); return 'not-accepted'; } this.dispatchEvent(make('drop')); return 'accepted'; }";
 const NOT_ACCEPTED: &str = "Error: Drop target did not accept the drop \u{2014} its dragover handler did not call preventDefault()\n";
@@ -241,19 +240,23 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
         "keyup" => key_up(cdp, session, &key_name(invocation)?, pointer),
         "mousemove" => {
             let (x, y) = numbers(invocation, ["x", "y"])?;
-            admit_point(cdp, session, x, y)?;
+            let delivery = delivery::at_point(cdp, session, x, y)?;
             let mut next = pointer.clone();
             next.x = x;
             next.y = y;
             let motion = pointer.motion(&next, "move", "none");
-            landing::mouse(cdp, &Scope::page(session), command, &motion, true, &mut |cdp| mouse(cdp, session, "mouseMoved", &next, &next.last, None))?;
+            let local = delivery.shift_motion(&motion);
+            let scope = delivery.scope();
+            let result = landing::mouse(cdp, &scope, command, &local, true, &mut |cdp| mouse(cdp, &delivery.input, "mouseMoved", &next, &next.last, None));
+            delivery::release(cdp, delivery);
+            result?;
             *pointer = next;
             Ok(code(&format!("// Move mouse to ({}, {})\nawait page.mouse.move({}, {});", js(x), js(y), js(x), js(y))))
         }
         "mousedown" | "mouseup" => {
             let chosen = button(invocation, command)?;
             let name = chosen.clone().unwrap_or_else(|| "left".to_string());
-            admit_point(cdp, session, pointer.x, pointer.y)?;
+            let delivery = delivery::at_point(cdp, session, pointer.x, pointer.y)?;
             let mut next = pointer.clone();
             let (kind, verb) = if command == "mousedown" {
                 next.last = name.clone();
@@ -267,9 +270,22 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
                 ("mouseReleased", "up")
             };
             let motion = pointer.motion(&next, verb, &name);
-            let scope = Scope::page(session);
-            let mut send = |cdp: &mut Cdp| mouse(cdp, session, kind, &next, &name, Some(1));
-            let placed = if command == "mouseup" && pointer.placed { landing::placed(cdp, &scope, command, &motion, &mut send)? } else { landing::mouse(cdp, &scope, command, &motion, true, &mut send)? };
+            let local = delivery.shift_motion(&motion);
+            let scope = delivery.scope();
+            let mut send = |cdp: &mut Cdp| mouse(cdp, &delivery.input, kind, &next, &name, Some(1));
+            let placed = if command == "mouseup" && pointer.placed {
+                landing::placed(cdp, &scope, command, &local, &mut send)
+            } else {
+                landing::mouse(cdp, &scope, command, &local, true, &mut send)
+            };
+            let placed = match placed {
+                Ok(placed) => placed,
+                Err(message) => {
+                    delivery::release(cdp, delivery);
+                    return Err(message);
+                }
+            };
+            delivery::release(cdp, delivery);
             next.placed = command == "mousedown" && placed;
             *pointer = next;
             let options = chosen.map(|name| format!("{{\n  button: {}\n}}", quoted(&name))).unwrap_or_default();
@@ -277,8 +293,10 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
         }
         "mousewheel" => {
             let (dx, dy) = numbers(invocation, ["dx", "dy"])?;
-            let untrusted = admit_point(cdp, session, pointer.x, pointer.y)?;
-            wheel(cdp, session, pointer, (dx, dy), untrusted)?;
+            let delivery = delivery::at_point(cdp, session, pointer.x, pointer.y)?;
+            let result = wheel(cdp, session, pointer, &delivery, (dx, dy));
+            delivery::release(cdp, delivery);
+            result?;
             Ok(code(&format!("// Scroll mouse wheel\nawait page.mouse.wheel({}, {});", js(dx), js(dy))))
         }
         _ => {
@@ -290,7 +308,8 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
 }
 
 fn visible(cdp: &mut Cdp, session: &str, waited: std::time::Duration) -> Result<bool, String> {
-    let frame = main_frame(cdp, session)?;
+    let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
+    let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| BACKGROUND.to_string())?;
     let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
     let context = world.get("executionContextId").cloned().ok_or_else(|| BACKGROUND.to_string())?;
     let deadline = std::time::Instant::now() + waited;
@@ -306,17 +325,17 @@ fn visible(cdp: &mut Cdp, session: &str, waited: std::time::Duration) -> Result<
     }
 }
 
-fn synthetic_wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, (dx, dy): (f64, f64)) -> Result<bool, String> {
-    let frame = main_frame(cdp, session)?;
-    let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
+fn synthetic_wheel(cdp: &mut Cdp, delivery: &Delivery, pointer: &Pointer, (dx, dy): (f64, f64)) -> Result<bool, String> {
+    let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": delivery.frame }), Some(&delivery.session))?;
     let Some(context) = world.get("executionContextId").cloned() else { return Ok(false) };
+    let (x, y) = delivery.local((pointer.x, pointer.y));
     let held = |name: &str| pointer.modifiers.iter().any(|known| known == name);
-    let arguments = json!([pointer.x, pointer.y, dx, dy, held("Alt"), held("Control"), held("Meta"), held("Shift"), pointer.buttons_mask()]);
+    let arguments = json!([x, y, dx, dy, held("Alt"), held("Control"), held("Meta"), held("Shift"), pointer.buttons_mask()]);
     let expression = format!("({SYNTHETIC_WHEEL})(...{arguments})");
-    let scrolled = cdp.call("Runtime.evaluate", json!({ "expression": expression, "contextId": context, "returnByValue": true }), Some(session))?;
+    let scrolled = cdp.call("Runtime.evaluate", json!({ "expression": expression, "contextId": context, "returnByValue": true }), Some(&delivery.session))?;
     match scrolled.pointer("/result/value").and_then(Value::as_str).filter(|_| scrolled.get("exceptionDetails").is_none()) {
         Some("scrolled" | "prevented") => Ok(true),
-        Some("frame") => Err(format!("slicc: refused: mouse input at ({}, {}) would reach an embedded frame\n", js(pointer.x), js(pointer.y))),
+        Some("frame") => Err(landing::frame_refusal(pointer.x, pointer.y)),
         _ => Ok(false),
     }
 }
@@ -327,15 +346,15 @@ fn trusted_wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, (dx, dy): (f64
     Ok(())
 }
 
-fn wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, delta: (f64, f64), untrusted: bool) -> Result<(), String> {
-    if !untrusted && visible(cdp, session, std::time::Duration::ZERO)? {
-        return trusted_wheel(cdp, session, pointer, delta);
+fn wheel(cdp: &mut Cdp, session: &str, pointer: &Pointer, delivery: &Delivery, delta: (f64, f64)) -> Result<(), String> {
+    if !delivery.untrusted && visible(cdp, session, std::time::Duration::ZERO)? {
+        return trusted_wheel(cdp, &delivery.input, pointer, delta);
     }
-    if synthetic_wheel(cdp, session, pointer, delta)? {
+    if synthetic_wheel(cdp, delivery, pointer, delta)? {
         return Ok(());
     }
     let front = cdp.bring_forward(session).map_err(|_| BACKGROUND.to_string())?;
-    let result = visible(cdp, session, FOREGROUND_WAIT).and_then(|shown| if shown { trusted_wheel(cdp, session, pointer, delta) } else { Err(BACKGROUND.to_string()) });
+    let result = visible(cdp, session, FOREGROUND_WAIT).and_then(|shown| if shown { trusted_wheel(cdp, &delivery.input, pointer, delta) } else { Err(BACKGROUND.to_string()) });
     let restored = cdp.restore_front(front);
     result.and(restored)
 }
@@ -382,7 +401,7 @@ fn key_down(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> R
     if keys::MODIFIERS.contains(&key.key.as_str()) {
         add(&mut next.modifiers, &key.key);
     }
-    admit_focus(cdp, session)?;
+    let delivery = delivery::at_focus(cdp, session)?;
     let commands = if mac { keys::mac_commands(&key.code, &next.modifiers) } else { Vec::new() };
     let params = json!({
         "type": if key.text.is_empty() { "rawKeyDown" } else { "keyDown" },
@@ -398,7 +417,10 @@ fn key_down(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> R
         "isKeypad": key.location == keys::KEYPAD,
     });
     let stroke = stroke(&key, next.modifiers_mask(), false, repeat);
-    landing::stroke(cdp, session, &stroke, &mut |cdp| dispatch_key(cdp, session, &params))?;
+    let scope = delivery.scope();
+    let result = landing::stroke(cdp, &scope, &stroke, &mut |cdp| dispatch_key(cdp, &delivery.input, &params));
+    delivery::release(cdp, delivery);
+    result?;
     *pointer = next;
     Ok(code(&format!("await page.keyboard.down({});", quoted(raw))))
 }
@@ -411,7 +433,7 @@ fn key_up(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> Res
         next.modifiers.retain(|held| held != &key.key);
     }
     next.keys.retain(|held| held != &key.code);
-    admit_focus(cdp, session)?;
+    let delivery = delivery::at_focus(cdp, session)?;
     let params = json!({
         "type": "keyUp",
         "modifiers": next.modifiers_mask(),
@@ -422,7 +444,10 @@ fn key_up(cdp: &mut Cdp, session: &str, raw: &str, pointer: &mut Pointer) -> Res
         "isKeypad": key.location == keys::KEYPAD,
     });
     let stroke = stroke(&key, next.modifiers_mask(), true, false);
-    landing::stroke(cdp, session, &stroke, &mut |cdp| dispatch_key(cdp, session, &params))?;
+    let scope = delivery.scope();
+    let result = landing::stroke(cdp, &scope, &stroke, &mut |cdp| dispatch_key(cdp, &delivery.input, &params));
+    delivery::release(cdp, delivery);
+    result?;
     *pointer = next;
     Ok(code(&format!("await page.keyboard.up({});", quoted(raw))))
 }
@@ -437,81 +462,13 @@ fn dispatch_key(cdp: &mut Cdp, session: &str, params: &Value) -> Result<(), Stri
     Ok(())
 }
 
-fn main_frame(cdp: &mut Cdp, session: &str) -> Result<String, String> {
-    let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
-    tree.pointer("/frameTree/frame/id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)
-        .ok_or_else(|| cdp.unverified())
-}
-
-fn frame_owner(node: &Value) -> bool {
-    let name = node.get("localName").or_else(|| node.get("nodeName")).and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
-    FRAME_OWNERS.contains(&name.as_str())
-}
-
-fn admit_point(cdp: &mut Cdp, session: &str, x: f64, y: f64) -> Result<bool, String> {
-    let refused = || format!("slicc: refused: mouse input at ({}, {}) would reach an embedded frame\n", js(x), js(y));
-    let frame = main_frame(cdp, session)?;
-    let metrics = cdp.call("Page.getLayoutMetrics", json!({}), Some(session))?;
-    let scroll = |key: &str| metrics.pointer(&format!("/cssLayoutViewport/{key}")).and_then(Value::as_f64).filter(|value| value.is_finite());
-    let (Some(left), Some(top)) = (scroll("pageX"), scroll("pageY")) else {
-        return Err(refused());
-    };
-    let mut points: Vec<(i64, i64)> = Vec::new();
-    for px in [(x + left).floor(), (x + left).ceil()] {
-        for py in [(y + top).floor(), (y + top).ceil()] {
-            if px.abs() <= i32::MAX as f64 && py.abs() <= i32::MAX as f64 && !points.contains(&(px as i64, py as i64)) {
-                points.push((px as i64, py as i64));
-            }
-        }
-    }
-    for (px, py) in points {
-        let hit = match cdp.call("DOM.getNodeForLocation", json!({ "x": px, "y": py, "includeUserAgentShadowDOM": false, "ignorePointerEventsNone": false }), Some(session)) {
-            Ok(hit) => hit,
-            Err(message) if message.contains("No node found at given location") && !message.contains("slicc:") => continue,
-            Err(message) if message.ends_with("wasn't found\n") && landing::untrusted(cdp, session)? => return Ok(true),
-            Err(message) => return Err(message),
-        };
-        let backend = hit.get("backendNodeId").and_then(Value::as_u64).ok_or_else(refused)?;
-        if hit.get("frameId").and_then(Value::as_str) != Some(frame.as_str()) {
-            return Err(refused());
-        }
-        let node = cdp.call("DOM.describeNode", json!({ "backendNodeId": backend }), Some(session))?;
-        if node.get("node").is_none_or(frame_owner) {
-            return Err(refused());
-        }
-    }
-    Ok(false)
-}
-
-fn admit_focus(cdp: &mut Cdp, session: &str) -> Result<(), String> {
-    let refused = || landing::FOCUS_REFUSAL.to_string();
-    let frame = main_frame(cdp, session)?;
-    let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
-    let context = world.get("executionContextId").cloned().ok_or_else(refused)?;
-    let focused = cdp.call("Runtime.evaluate", json!({ "expression": FOCUS, "contextId": context, "returnByValue": false, "objectGroup": GROUP }), Some(session))?;
-    if focused.get("exceptionDetails").is_some() {
-        return Err(refused());
-    }
-    let remote = focused.get("result").cloned().unwrap_or(Value::Null);
-    if remote.get("subtype").and_then(Value::as_str) == Some("null") {
-        return Ok(());
-    }
-    let object = remote.get("objectId").cloned().filter(|_| remote.get("subtype").and_then(Value::as_str) == Some("node")).ok_or_else(refused)?;
-    let node = cdp.call("DOM.describeNode", json!({ "objectId": object }), Some(session))?;
-    let node = node.get("node").ok_or_else(refused)?;
-    let closed = node.get("shadowRoots").and_then(Value::as_array).is_some_and(|roots| roots.iter().any(|root| root.get("shadowRootType").and_then(Value::as_str).is_none_or(|kind| !matches!(kind, "open" | "user-agent"))));
-    if frame_owner(node) || closed {
-        return Err(refused());
-    }
-    Ok(())
-}
-
 fn resize(cdp: &mut Cdp, session: &str, width: u64, height: u64) -> Result<(), String> {
     let window = cdp.call("Browser.getWindowForTarget", json!({}), Some(session))?;
     let id = window.get("windowId").and_then(Value::as_i64).ok_or("Error: Browser.getWindowForTarget returned no windowId\n".to_string())?;
     let outer = |key: &str| window.pointer(&format!("/bounds/{key}")).and_then(Value::as_f64);
-    let frame = main_frame(cdp, session)?;
-    let inner = browser::evaluate_in_frame(cdp, session, &frame, INNER)?;
+    let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
+    let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| cdp.unverified())?;
+    let inner = browser::evaluate_in_frame(cdp, session, frame, INNER)?;
     let viewport = |index: usize| inner.value.get(index).and_then(Value::as_f64);
     let inset = |outer: Option<f64>, inner: Option<f64>| match (outer, inner) {
         (Some(outer), Some(inner)) if outer.is_finite() && inner.is_finite() && outer > inner => (outer - inner).round() as u64,

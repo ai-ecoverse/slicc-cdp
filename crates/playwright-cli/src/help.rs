@@ -588,14 +588,14 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 if name == "keydown" { "Press a key down on the keyboard" } else { "Press a key up on the keyboard" },
                 "",
-                "Held keys and modifiers are kept per tab in the saved session. Refused while focus is inside an iframe or a closed shadow root.",
+                "Held keys and modifiers are kept per tab in the saved session. Delivered into the focused ordinary frame when focus is inside one. Refused while focus is inside a protected or unverified frame or a closed shadow root.",
             ],
             &[("<key>", "name of the key to press or a character to generate, such as `arrowleft` or `a`")],
             &[],
         ),
         "mousemove" => page(
             "mousemove <x> <y>",
-            &["Move mouse to a given position", "", "The pointer position and held buttons are kept per tab in the saved session. Refused over an iframe or other embedded frame."],
+            &["Move mouse to a given position", "", "The pointer position and held buttons are kept per tab in the saved session. Delivered into the ordinary frame under the point. Refused over a protected or unverified frame."],
             &[("<x>", "x coordinate"), ("<y>", "y coordinate")],
             &[],
         ),
@@ -604,14 +604,14 @@ fn implemented_page(name: &str) -> Option<String> {
             &[
                 if name == "mousedown" { "Press mouse down" } else { "Press mouse up" },
                 "",
-                "Uses the position from the last mousemove on this tab. Refused over an iframe or other embedded frame.",
+                "Uses the position from the last mousemove on this tab. Delivered into the ordinary frame under the point. Refused over a protected or unverified frame.",
             ],
             &[("[button]", "button to press, defaults to left")],
             &[],
         ),
         "mousewheel" => page(
             "mousewheel <dx> <dy>",
-            &["Scroll mouse wheel", "", "Scrolls at the position from the last mousemove on this tab. Refused over an iframe or other embedded frame. A background tab is scrolled in place with an untrusted wheel event, because Chrome never answers trusted wheel events there."],
+            &["Scroll mouse wheel", "", "Scrolls at the position from the last mousemove on this tab. Delivered into the ordinary frame under the point. Refused over a protected or unverified frame. A background tab is scrolled in place with an untrusted wheel event, because Chrome never answers trusted wheel events there."],
             &[("<dx>", "x delta"), ("<dy>", "y delta")],
             &[],
         ),

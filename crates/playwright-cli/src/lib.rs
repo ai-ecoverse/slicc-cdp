@@ -7,6 +7,7 @@ mod commands;
 mod connect;
 mod cookie_headers;
 mod cookies;
+mod delivery;
 mod discover;
 mod dialog_holder;
 #[cfg(test)]

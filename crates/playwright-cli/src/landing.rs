@@ -26,6 +26,7 @@ impl<'a> Scope<'a> {
 pub enum Anchor<'a> {
     Backend(u64),
     Selector(&'a str),
+    Point,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -219,6 +220,11 @@ fn pointer_on(cdp: &mut Cdp, scope: &Scope, context: &Value, anchor: &Anchor, ar
             args["selector"] = json!(selector);
             run(cdp, scope, context, "pointer", args, Duration::from_secs(30))?
         }
+        Anchor::Point => {
+            let mut args = args;
+            args["selector"] = json!(".__slicc_missing__");
+            run(cdp, scope, context, "pointer", args, Duration::from_secs(30))?
+        }
         Anchor::Backend(backend) => {
             let resolved = cdp.call("DOM.resolveNode", json!({ "backendNodeId": backend, "executionContextId": context, "objectGroup": GROUP }), Some(scope.session))?;
             let object = resolved.pointer("/object/objectId").and_then(Value::as_str).ok_or_else(|| format!("could not resolve backend node {backend}\n"))?.to_string();
@@ -335,33 +341,36 @@ pub fn pointer(cdp: &mut Cdp, scope: &Scope, anchor: &Anchor, point: (f64, f64),
     }
 }
 
-pub fn text(cdp: &mut Cdp, session: &str, text: &str, trusted: Trusted) -> Result<(), String> {
-    let scope = Scope::page(session);
-    let context = context(cdp, &scope)?;
-    match mode(cdp, &scope, &context, "focus", json!({}))?.as_str() {
-        "frame" => return forward(cdp, &scope, &context, "type", None, trusted),
+pub fn focus_frame(cdp: &mut Cdp, scope: &Scope) -> Result<bool, String> {
+    let context = context(cdp, scope)?;
+    Ok(mode(cdp, scope, &context, "focus", json!({}))? == "frame")
+}
+
+pub fn text(cdp: &mut Cdp, scope: &Scope, text: &str, trusted: Trusted) -> Result<(), String> {
+    let context = context(cdp, scope)?;
+    match mode(cdp, scope, &context, "focus", json!({}))?.as_str() {
+        "frame" => return forward(cdp, scope, &context, "type", None, trusted),
         "editable" => {}
         _ => return Err(NOT_EDITABLE.to_string()),
     }
     let kinds = ["beforeinput", "input"];
-    if landed(cdp, &scope, &context, &kinds, trusted)? || mode(cdp, &scope, &context, "insert", json!({ "text": text }))? == "inserted" {
+    if landed(cdp, scope, &context, &kinds, trusted)? || mode(cdp, scope, &context, "insert", json!({ "text": text }))? == "inserted" {
         return Ok(());
     }
-    forward(cdp, &scope, &context, "type", Some(&kinds), trusted)
+    forward(cdp, scope, &context, "type", Some(&kinds), trusted)
 }
 
-pub fn key(cdp: &mut Cdp, session: &str, keyed: &Keyed, trusted: Trusted) -> Result<(), String> {
-    let scope = Scope::page(session);
-    let context = context(cdp, &scope)?;
-    if mode(cdp, &scope, &context, "focus", json!({}))? == "frame" {
-        return forward(cdp, &scope, &context, "press", None, trusted);
+pub fn key(cdp: &mut Cdp, scope: &Scope, keyed: &Keyed, trusted: Trusted) -> Result<(), String> {
+    let context = context(cdp, scope)?;
+    if mode(cdp, scope, &context, "focus", json!({}))? == "frame" {
+        return forward(cdp, scope, &context, "press", None, trusted);
     }
     let kinds = ["keydown"];
     let args = json!({ "key": keyed.key, "code": keyed.code, "text": keyed.text, "modifiers": keyed.modifiers });
-    if landed(cdp, &scope, &context, &kinds, trusted)? || mode(cdp, &scope, &context, "key", args)? == "pressed" {
+    if landed(cdp, scope, &context, &kinds, trusted)? || mode(cdp, scope, &context, "key", args)? == "pressed" {
         return Ok(());
     }
-    forward(cdp, &scope, &context, "press", Some(&kinds), trusted)
+    forward(cdp, scope, &context, "press", Some(&kinds), trusted)
 }
 
 pub fn mouse(cdp: &mut Cdp, scope: &Scope, verb: &str, motion: &Motion, in_place: bool, trusted: Trusted) -> Result<bool, String> {
@@ -400,19 +409,18 @@ fn replay(cdp: &mut Cdp, scope: &Scope, context: &Value, verb: &str, rest: &Moti
     }
 }
 
-pub fn stroke(cdp: &mut Cdp, session: &str, stroke: &Stroke, trusted: Trusted) -> Result<(), String> {
-    let scope = Scope::page(session);
-    let context = context(cdp, &scope)?;
+pub fn stroke(cdp: &mut Cdp, scope: &Scope, stroke: &Stroke, trusted: Trusted) -> Result<(), String> {
+    let context = context(cdp, scope)?;
     let (verb, phase) = if stroke.up { ("keyup", "up") } else { ("keydown", "down") };
     let kinds = [verb];
-    if landed(cdp, &scope, &context, &kinds, trusted)? {
+    if landed(cdp, scope, &context, &kinds, trusted)? {
         return Ok(());
     }
     let keyed = &stroke.keyed;
     let args = json!({ "key": keyed.key, "code": keyed.code, "text": keyed.text, "modifiers": keyed.modifiers, "phase": phase, "repeat": stroke.repeat, "location": stroke.location });
-    match mode(cdp, &scope, &context, "key", args)?.as_str() {
+    match mode(cdp, scope, &context, "key", args)?.as_str() {
         "pressed" => Ok(()),
         "frame" => Err(FOCUS_REFUSAL.to_string()),
-        _ => forward(cdp, &scope, &context, verb, Some(&kinds), trusted),
+        _ => forward(cdp, scope, &context, verb, Some(&kinds), trusted),
     }
 }

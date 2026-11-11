@@ -188,6 +188,18 @@ async function rawInput(pw, raw, tab, seven) {
   await clear();
   await pw(['mousemove', '70', '50']);
   await until(() => inTab(raw, tab, 'window.moved'), 'src:0', 'mousemove');
+  await inTab(
+    raw,
+    tab,
+    "document.body.insertAdjacentHTML('beforeend', '<div id=\"a\" style=\"position:absolute;left:0;top:220px;width:100px;height:40px;background:#cfc\"></div><div id=\"b\" style=\"position:absolute;left:100px;top:220px;width:100px;height:40px;background:#ccf\"></div>'); document.getElementById('a').addEventListener('mousemove', (event) => { window.edge = 'a'; }, true); document.getElementById('b').addEventListener('mousemove', (event) => { window.edge = 'b'; }, true); window.edge = '';"
+  );
+  await pw(['mousemove', '99.5', '240']);
+  await until(
+    () => inTab(raw, tab, 'window.edge'),
+    (id) => id === 'a' || id === 'b',
+    'fractional border between adjacent divs'
+  );
+  await pw(['mousemove', '70', '50']);
   await inTab(raw, tab, 'getSelection().removeAllRanges()');
   await pw(['mousedown']);
   await pw(['mousemove', '350', '50']);
