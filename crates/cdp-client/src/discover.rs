@@ -3,7 +3,11 @@ use std::time::Duration;
 
 pub const CLI_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const CLI_MAX_STDOUT: usize = 1_000_000;
+pub const POSITIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+pub const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
+const CACHE_FILE: &str = "browsers-discovery.json";
+const CACHE_SCHEMA: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEnv {
@@ -97,13 +101,10 @@ pub fn pick_cli_endpoint(entries: &[Value]) -> Option<String> {
 }
 
 pub fn parse_browsers_json(text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    let object = value.as_object()?;
-    if object.get("schema").and_then(Value::as_u64) != Some(1) {
-        return None;
+    match browsers_json_outcome(text) {
+        SliccBrowsersOutcome::Found(url) => Some(url),
+        SliccBrowsersOutcome::Empty | SliccBrowsersOutcome::Failed => None,
     }
-    let entries = object.get("entries")?.as_array()?;
-    pick_cli_endpoint(entries)
 }
 
 pub fn parse_active_port(text: &str) -> Option<(u16, String)> {
@@ -177,16 +178,305 @@ pub fn attached(
     Ok(None)
 }
 
+pub fn accept_cached_version_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if !loopback_host(host) {
+        return false;
+    }
+    if parsed.path() != "/json/version" {
+        return false;
+    }
+    parsed.port().is_some()
+}
+
+pub fn browsers_discovery_cache_path(env: &HostEnv) -> String {
+    let windows = env.platform == "windows";
+    join_parts(
+        windows,
+        &[
+            config_dir(env),
+            "slicc".to_string(),
+            "playwright-cli".to_string(),
+            CACHE_FILE.to_string(),
+        ],
+    )
+}
+
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
 pub fn attached(
     probe: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
-    if let Some(url) = run_slicc_browsers(None, CLI_TIMEOUT, CLI_MAX_STDOUT) {
-        return Ok(Some(url));
+    let env = current_env();
+    let cache = browsers_discovery_cache_path(&env);
+    attached_with(None, Some(std::path::Path::new(&cache)), CLI_TIMEOUT, CLI_MAX_STDOUT, probe)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+pub fn attached_with(
+    program: Option<&std::path::Path>,
+    cache_path: Option<&std::path::Path>,
+    timeout: Duration,
+    max_stdout: usize,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = cache_path {
+        match read_browsers_cache(path, std::time::SystemTime::now()) {
+            BrowsersCache::Positive(url) if accept_cached_version_url(&url) => {
+                if cached_endpoint_live(&url, probe) {
+                    return Ok(Some(url));
+                }
+                let _ = std::fs::remove_file(path);
+            }
+            BrowsersCache::Negative | BrowsersCache::Empty => {
+                let env = current_env();
+                let roots = slicc_profile_roots(&env);
+                return from_devtools_active_port(&env, &DiskFs, &roots, probe);
+            }
+            BrowsersCache::Positive(_) | BrowsersCache::Miss => {}
+        }
+    }
+    match run_slicc_browsers(program, timeout, max_stdout) {
+        SliccBrowsersOutcome::Found(url) => {
+            if let Some(path) = cache_path {
+                if accept_cached_version_url(&url) {
+                    let _ = write_browsers_cache(path, CacheRecord::Positive(url.clone()));
+                }
+            }
+            return Ok(Some(url));
+        }
+        SliccBrowsersOutcome::Empty => {
+            if let Some(path) = cache_path {
+                let _ = write_browsers_cache(path, CacheRecord::Empty);
+            }
+        }
+        SliccBrowsersOutcome::Failed => {
+            if let Some(path) = cache_path {
+                let _ = write_browsers_cache(path, CacheRecord::Failed);
+            }
+        }
     }
     let env = current_env();
     let roots = slicc_profile_roots(&env);
     from_devtools_active_port(&env, &DiskFs, &roots, probe)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SliccBrowsersOutcome {
+    Found(String),
+    Empty,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowsersCache {
+    Miss,
+    Positive(String),
+    Empty,
+    Negative,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheRecord {
+    Positive(String),
+    Empty,
+    Failed,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+pub fn read_browsers_cache(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+) -> BrowsersCache {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return BrowsersCache::Miss,
+    };
+    if !cache_file_trusted(&meta, now) {
+        return BrowsersCache::Miss;
+    }
+    let modified = match meta.modified() {
+        Ok(modified) => modified,
+        Err(_) => return BrowsersCache::Miss,
+    };
+    if modified > now {
+        return BrowsersCache::Miss;
+    }
+    let age = match now.duration_since(modified) {
+        Ok(age) => age,
+        Err(_) => return BrowsersCache::Miss,
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return BrowsersCache::Miss,
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return BrowsersCache::Miss,
+    };
+    let object = match value.as_object() {
+        Some(object) => object,
+        None => return BrowsersCache::Miss,
+    };
+    if object.get("schema").and_then(Value::as_u64) != Some(CACHE_SCHEMA) {
+        return BrowsersCache::Miss;
+    }
+    match object.get("url") {
+        Some(Value::Null) => {
+            let kind = object.get("kind").and_then(Value::as_str).unwrap_or("failed");
+            match kind {
+                "empty" => {
+                    if age > POSITIVE_CACHE_TTL {
+                        return BrowsersCache::Miss;
+                    }
+                    BrowsersCache::Empty
+                }
+                "failed" => {
+                    if age > NEGATIVE_CACHE_TTL {
+                        return BrowsersCache::Miss;
+                    }
+                    BrowsersCache::Negative
+                }
+                _ => BrowsersCache::Miss,
+            }
+        }
+        Some(Value::String(url)) => {
+            if age > POSITIVE_CACHE_TTL {
+                return BrowsersCache::Miss;
+            }
+            if !accept_cached_version_url(url) {
+                return BrowsersCache::Miss;
+            }
+            BrowsersCache::Positive(url.clone())
+        }
+        _ => BrowsersCache::Miss,
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+pub fn write_browsers_cache(path: &std::path::Path, record: CacheRecord) -> Result<(), String> {
+    if let CacheRecord::Positive(ref url) = record {
+        if !accept_cached_version_url(url) {
+            return Err("cache: refusing non-loopback version URL\n".to_string());
+        }
+    }
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|err| format!("cache: {err}\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o700);
+            let _ = std::fs::set_permissions(dir, mode.clone());
+            if let Some(parent) = dir.parent() {
+                let _ = std::fs::set_permissions(parent, mode);
+            }
+        }
+    }
+    let body = match &record {
+        CacheRecord::Positive(url) => format!(
+            "{{\"schema\":{CACHE_SCHEMA},\"url\":{}}}",
+            serde_json::to_string(url).unwrap_or_else(|_| "null".to_string())
+        ),
+        CacheRecord::Empty => {
+            format!("{{\"schema\":{CACHE_SCHEMA},\"url\":null,\"kind\":\"empty\"}}")
+        }
+        CacheRecord::Failed => {
+            format!("{{\"schema\":{CACHE_SCHEMA},\"url\":null,\"kind\":\"failed\"}}")
+        }
+    };
+    let staged = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    write_private_file(&staged, &body)?;
+    match std::fs::rename(&staged, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&staged);
+            Err(format!("cache: {err}\n"))
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+fn write_private_file(path: &std::path::Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|err| format!("cache: {err}\n"))?;
+        let written = file
+            .write_all(body.as_bytes())
+            .map_err(|err| format!("cache: {err}\n"));
+        drop(file);
+        if written.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        written
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, body).map_err(|err| format!("cache: {err}\n"))
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+fn cache_file_trusted(meta: &std::fs::Metadata, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    if modified > now {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return false;
+        }
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+fn cached_endpoint_live(
+    url: &str,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> bool {
+    let Ok(body) = probe(url) else {
+        return false;
+    };
+    let Ok(ws) = crate::connect::websocket_url_from_version(&body) else {
+        return false;
+    };
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(port) = parsed.port() else {
+        return false;
+    };
+    accept_loopback_ws(&ws, port)
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
@@ -194,7 +484,7 @@ pub fn run_slicc_browsers(
     program: Option<&std::path::Path>,
     timeout: Duration,
     max_stdout: usize,
-) -> Option<String> {
+) -> SliccBrowsersOutcome {
     use std::io::Read;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
@@ -239,14 +529,14 @@ pub fn run_slicc_browsers(
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return None,
+        Err(_) => return SliccBrowsersOutcome::Failed,
     };
     let deadline = Instant::now() + timeout;
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
             kill_and_reap(&mut child);
-            return None;
+            return SliccBrowsersOutcome::Failed;
         }
     };
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, ()>>();
@@ -278,15 +568,36 @@ pub fn run_slicc_browsers(
         Ok(Ok(buf)) => buf,
         Ok(Err(())) | Err(_) => {
             kill_and_reap(&mut child);
-            return None;
+            return SliccBrowsersOutcome::Failed;
         }
     };
-    let status = wait_deadline(&mut child, deadline)?;
+    let Some(status) = wait_deadline(&mut child, deadline) else {
+        return SliccBrowsersOutcome::Failed;
+    };
     if !status.success() || buf.len() > max_stdout {
-        return None;
+        return SliccBrowsersOutcome::Failed;
     }
     let text = String::from_utf8_lossy(&buf);
-    parse_browsers_json(&text)
+    browsers_json_outcome(&text)
+}
+
+fn browsers_json_outcome(text: &str) -> SliccBrowsersOutcome {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return SliccBrowsersOutcome::Failed;
+    };
+    let Some(object) = value.as_object() else {
+        return SliccBrowsersOutcome::Failed;
+    };
+    if object.get("schema").and_then(Value::as_u64) != Some(1) {
+        return SliccBrowsersOutcome::Failed;
+    }
+    let Some(entries) = object.get("entries").and_then(Value::as_array) else {
+        return SliccBrowsersOutcome::Failed;
+    };
+    match pick_cli_endpoint(entries) {
+        Some(url) => SliccBrowsersOutcome::Found(url),
+        None => SliccBrowsersOutcome::Empty,
+    }
 }
 
 fn endpoint_candidates(entries: &[Value]) -> Vec<CliCandidate> {
@@ -1024,7 +1335,7 @@ mod tests {
         }
 
         let from_cli = run_slicc_browsers(Some(&good), CLI_TIMEOUT, CLI_MAX_STDOUT);
-        assert_eq!(from_cli.as_deref(), Some(version_url(port).as_str()));
+        assert_eq!(from_cli, SliccBrowsersOutcome::Found(version_url(port)));
 
         let slow = bin.join("slow-slicc");
         std::fs::write(&slow, "#!/bin/sh\n/bin/sleep 5\n").unwrap();
@@ -1037,7 +1348,7 @@ mod tests {
         }
         assert_eq!(
             run_slicc_browsers(Some(&slow), Duration::from_millis(200), CLI_MAX_STDOUT),
-            None
+            SliccBrowsersOutcome::Failed
         );
 
         #[cfg(unix)]
@@ -1051,7 +1362,7 @@ mod tests {
             let started = std::time::Instant::now();
             assert_eq!(
                 run_slicc_browsers(Some(&closed), Duration::from_millis(200), CLI_MAX_STDOUT),
-                None
+                SliccBrowsersOutcome::Failed
             );
             assert!(
                 started.elapsed() < Duration::from_millis(800),
@@ -1071,7 +1382,25 @@ mod tests {
         }
         assert_eq!(
             run_slicc_browsers(Some(&bad), CLI_TIMEOUT, CLI_MAX_STDOUT),
-            None
+            SliccBrowsersOutcome::Failed
+        );
+
+        let empty = bin.join("empty-slicc");
+        std::fs::write(
+            &empty,
+            "#!/bin/sh\nprintf '%s' '{\"schema\":1,\"entries\":[]}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&empty).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&empty, perms).unwrap();
+        }
+        assert_eq!(
+            run_slicc_browsers(Some(&empty), CLI_TIMEOUT, CLI_MAX_STDOUT),
+            SliccBrowsersOutcome::Empty
         );
 
         let boom = bin.join("boom-slicc");
@@ -1085,7 +1414,7 @@ mod tests {
         }
         assert_eq!(
             run_slicc_browsers(Some(&boom), CLI_TIMEOUT, CLI_MAX_STDOUT),
-            None
+            SliccBrowsersOutcome::Failed
         );
 
         let host = HostEnv {
@@ -1319,7 +1648,420 @@ mod tests {
         ));
         assert_eq!(
             run_slicc_browsers(Some(&missing), CLI_TIMEOUT, CLI_MAX_STDOUT),
-            None
+            SliccBrowsersOutcome::Failed
         );
+    }
+
+    #[test]
+    fn accept_cached_version_url_rejects_remote_and_non_version_paths() {
+        assert!(accept_cached_version_url("http://127.0.0.1:9401/json/version"));
+        assert!(accept_cached_version_url("http://localhost:9401/json/version"));
+        assert!(!accept_cached_version_url("http://10.0.0.9:9401/json/version"));
+        assert!(!accept_cached_version_url("https://127.0.0.1:9401/json/version"));
+        assert!(!accept_cached_version_url("ws://127.0.0.1:9401/devtools/browser/x"));
+        assert!(!accept_cached_version_url("http://127.0.0.1/json/version"));
+        assert!(!accept_cached_version_url("http://127.0.0.1:9401/json/list"));
+    }
+
+    #[test]
+    fn browsers_discovery_cache_path_sits_beside_sessions() {
+        let darwin = browsers_discovery_cache_path(&env("macos"));
+        assert_eq!(
+            darwin,
+            "/Users/me/Library/Application Support/slicc/playwright-cli/browsers-discovery.json"
+        );
+        let mut linux = env("linux");
+        linux.xdg_config_home = Some("/home/me/.config".to_string());
+        assert_eq!(
+            browsers_discovery_cache_path(&linux),
+            "/home/me/.config/slicc/playwright-cli/browsers-discovery.json"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    fn cache_scratch() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "slicc-cdp-browsers-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    fn make_fake_slicc(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn browsers_cache_positive_ttl_expires_and_failed_outlives_positive() {
+        let scratch = cache_scratch();
+        let cache = scratch.join(CACHE_FILE);
+        let url = "http://127.0.0.1:9401/json/version";
+        write_browsers_cache(&cache, CacheRecord::Positive(url.to_string())).unwrap();
+        let now = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        assert_eq!(
+            read_browsers_cache(&cache, now + Duration::from_millis(100)),
+            BrowsersCache::Positive(url.to_string())
+        );
+        assert_eq!(
+            read_browsers_cache(&cache, now + POSITIVE_CACHE_TTL + Duration::from_millis(1)),
+            BrowsersCache::Miss
+        );
+        write_browsers_cache(&cache, CacheRecord::Failed).unwrap();
+        let now = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        assert_eq!(
+            read_browsers_cache(&cache, now + POSITIVE_CACHE_TTL + Duration::from_secs(1)),
+            BrowsersCache::Negative
+        );
+        assert_eq!(
+            read_browsers_cache(&cache, now + NEGATIVE_CACHE_TTL + Duration::from_millis(1)),
+            BrowsersCache::Miss
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn empty_listing_cache_uses_positive_ttl_not_failed_ttl() {
+        let scratch = cache_scratch();
+        let cache = scratch.join(CACHE_FILE);
+        write_browsers_cache(&cache, CacheRecord::Empty).unwrap();
+        let now = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        assert_eq!(
+            read_browsers_cache(&cache, now + Duration::from_millis(100)),
+            BrowsersCache::Empty
+        );
+        assert_eq!(
+            read_browsers_cache(&cache, now + POSITIVE_CACHE_TTL + Duration::from_millis(1)),
+            BrowsersCache::Miss
+        );
+        write_browsers_cache(&cache, CacheRecord::Failed).unwrap();
+        let now = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        assert_eq!(
+            read_browsers_cache(&cache, now + POSITIVE_CACHE_TTL + Duration::from_secs(1)),
+            BrowsersCache::Negative
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn empty_slicc_listing_is_cached_short_so_a_later_browser_is_seen_quickly() {
+        let _guard = env_lock().lock().unwrap();
+        let scratch = cache_scratch();
+        let home = scratch.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = EnvGuard::isolate(&home);
+        let cache = scratch.join(CACHE_FILE);
+        let count = scratch.join("count");
+        let empty = make_fake_slicc(
+            &scratch,
+            "empty-slicc",
+            &format!(
+                "#!/bin/sh\nprintf . >> '{}' || true\nprintf '%s' '{{\"schema\":1,\"entries\":[]}}'\n",
+                count.display()
+            ),
+        );
+        let first = attached_with(
+            Some(&empty),
+            Some(&cache),
+            CLI_TIMEOUT,
+            CLI_MAX_STDOUT,
+            &mut |_| Err("unused\n".to_string()),
+        )
+        .unwrap();
+        assert_eq!(first, None);
+        assert_eq!(
+            read_browsers_cache(&cache, std::time::SystemTime::now()),
+            BrowsersCache::Empty
+        );
+        assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 1);
+        let second = attached_with(
+            Some(&empty),
+            Some(&cache),
+            CLI_TIMEOUT,
+            CLI_MAX_STDOUT,
+            &mut |_| Err("unused\n".to_string()),
+        )
+        .unwrap();
+        assert_eq!(second, None);
+        assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 1);
+        let past = std::time::SystemTime::now() - POSITIVE_CACHE_TTL - Duration::from_secs(1);
+        filetime_set(&cache, past);
+        assert_eq!(
+            read_browsers_cache(&cache, std::time::SystemTime::now()),
+            BrowsersCache::Miss
+        );
+        let third = attached_with(
+            Some(&empty),
+            Some(&cache),
+            CLI_TIMEOUT,
+            CLI_MAX_STDOUT,
+            &mut |_| Err("unused\n".to_string()),
+        )
+        .unwrap();
+        assert_eq!(third, None);
+        assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn browsers_cache_ignores_future_mtime_wrong_mode_and_remote_url() {
+        let scratch = cache_scratch();
+        let cache = scratch.join(CACHE_FILE);
+        write_browsers_cache(
+            &cache,
+            CacheRecord::Positive("http://127.0.0.1:9401/json/version".to_string()),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now();
+        let future = now + Duration::from_secs(60);
+        let past = now - Duration::from_secs(1);
+        filetime_set(&cache, future);
+        assert_eq!(read_browsers_cache(&cache, now), BrowsersCache::Miss);
+        filetime_set(&cache, past);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(read_browsers_cache(&cache, now), BrowsersCache::Miss);
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            write_browsers_cache(
+                &cache,
+                CacheRecord::Positive("http://10.0.0.9:9401/json/version".to_string()),
+            )
+            .unwrap_err()
+            .as_str(),
+            "cache: refusing non-loopback version URL\n"
+        );
+        std::fs::write(
+            &cache,
+            r#"{"schema":1,"url":"http://10.0.0.9:9401/json/version"}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        filetime_set(&cache, past);
+        assert_eq!(read_browsers_cache(&cache, now), BrowsersCache::Miss);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    struct EnvGuard {
+        home: Option<std::ffi::OsString>,
+        xdg: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    impl EnvGuard {
+        fn isolate(home: &std::path::Path) -> Self {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                xdg: std::env::var_os("XDG_CONFIG_HOME"),
+            };
+            std::env::set_var("HOME", home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+            guard
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn stale_cached_endpoint_is_dropped_and_slicc_runs_once_more() {
+        let _guard = env_lock().lock().unwrap();
+        let scratch = cache_scratch();
+        let home = scratch.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = EnvGuard::isolate(&home);
+        let cache = scratch.join(CACHE_FILE);
+        let count = scratch.join("count");
+        let (port, join, stop) = serve_version("/devtools/browser/live");
+        let doc = json!({
+            "schema": 1,
+            "entries": [endpoint(port, 1, true, Some("/tmp/x"), "127.0.0.1")]
+        })
+        .to_string()
+        .replace('\'', "");
+        let slicc = make_fake_slicc(
+            &scratch,
+            "slicc",
+            &format!(
+                "#!/bin/sh\nprintf . >> '{}' || true\nprintf '%s' '{doc}'\n",
+                count.display()
+            ),
+        );
+        write_browsers_cache(
+            &cache,
+            CacheRecord::Positive("http://127.0.0.1:1/json/version".to_string()),
+        )
+        .unwrap();
+        let found = attached_with(
+            Some(&slicc),
+            Some(&cache),
+            CLI_TIMEOUT,
+            CLI_MAX_STDOUT,
+            &mut |url| {
+                if url == "http://127.0.0.1:1/json/version" {
+                    return Err("connection refused\n".to_string());
+                }
+                let response = crate::net::http_get(url)?;
+                Ok(String::from_utf8_lossy(&response.body).into_owned())
+            },
+        )
+        .unwrap();
+        assert_eq!(found.as_deref(), Some(version_url(port).as_str()));
+        let calls = std::fs::read_to_string(&count).unwrap().len();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            read_browsers_cache(&cache, std::time::SystemTime::now()),
+            BrowsersCache::Positive(version_url(port))
+        );
+        let _ = stop.send(());
+        let _ = join.join();
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn two_attached_calls_within_positive_ttl_spawn_slicc_once() {
+        let _guard = env_lock().lock().unwrap();
+        let scratch = cache_scratch();
+        let home = scratch.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = EnvGuard::isolate(&home);
+        let cache = scratch.join(CACHE_FILE);
+        let count = scratch.join("count");
+        let (port, join, stop) = serve_version("/devtools/browser/live");
+        let doc = json!({
+            "schema": 1,
+            "entries": [endpoint(port, 1, true, Some("/tmp/x"), "127.0.0.1")]
+        })
+        .to_string()
+        .replace('\'', "");
+        let slicc = make_fake_slicc(
+            &scratch,
+            "slicc",
+            &format!(
+                "#!/bin/sh\nprintf . >> '{}' || true\nprintf '%s' '{doc}'\n",
+                count.display()
+            ),
+        );
+        let mut probe = |url: &str| {
+            let response = crate::net::http_get(url)?;
+            Ok(String::from_utf8_lossy(&response.body).into_owned())
+        };
+        let first = attached_with(
+            Some(&slicc),
+            Some(&cache),
+            CLI_TIMEOUT,
+            CLI_MAX_STDOUT,
+            &mut probe,
+        )
+        .unwrap();
+        let second = attached_with(
+            Some(&slicc),
+            Some(&cache),
+            CLI_TIMEOUT,
+            CLI_MAX_STDOUT,
+            &mut probe,
+        )
+        .unwrap();
+        assert_eq!(first.as_deref(), Some(version_url(port).as_str()));
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 1);
+        let _ = stop.send(());
+        let _ = join.join();
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+    #[test]
+    fn hanging_slicc_is_cached_negative_so_second_call_skips_timeout() {
+        let _guard = env_lock().lock().unwrap();
+        let scratch = cache_scratch();
+        let home = scratch.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = EnvGuard::isolate(&home);
+        let cache = scratch.join(CACHE_FILE);
+        let count = scratch.join("count");
+        let slicc = make_fake_slicc(
+            &scratch,
+            "slicc",
+            &format!(
+                "#!/bin/sh\nprintf . >> '{}' || true\n/bin/sleep 5\n",
+                count.display()
+            ),
+        );
+        let timeout = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let first = attached_with(Some(&slicc), Some(&cache), timeout, CLI_MAX_STDOUT, &mut |_| {
+            Err("unused\n".to_string())
+        })
+        .unwrap();
+        let first_elapsed = started.elapsed();
+        assert_eq!(first, None);
+        assert!(first_elapsed >= timeout);
+        assert!(first_elapsed < Duration::from_millis(800));
+        assert_eq!(
+            read_browsers_cache(&cache, std::time::SystemTime::now()),
+            BrowsersCache::Negative
+        );
+        let started = std::time::Instant::now();
+        let second = attached_with(Some(&slicc), Some(&cache), timeout, CLI_MAX_STDOUT, &mut |_| {
+            Err("unused\n".to_string())
+        })
+        .unwrap();
+        assert_eq!(second, None);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "negative cache still waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

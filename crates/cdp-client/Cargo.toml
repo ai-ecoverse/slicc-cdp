@@ -31,6 +31,10 @@ path = "../../test/integration/webmcp-stage1.rs"
 name = "guard-domain-premise"
 path = "../../test/integration/guard-domain-premise.rs"
 
+[[test]]
+name = "browsers-discovery-cache"
+path = "../../test/integration/browsers-discovery-cache.rs"
+
 [dependencies]
 getrandom = "0.4"
 serde_json = "1"
