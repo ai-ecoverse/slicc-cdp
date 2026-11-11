@@ -8,9 +8,7 @@ import { chromeTest as test } from './chrome-policy.mjs';
 import { harCommand, harHolder } from './har-support.mjs';
 import './watchdog.mjs';
 
-test('HAR records dedicated worker fetches and excludes workers of protected pages', {
-  timeout: 180000,
-}, async () => {
+async function withWorkerServer(body) {
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-har-worker-chrome-'));
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
@@ -18,6 +16,13 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
     if (url.pathname === '/worker.js') {
       res.setHeader('Content-Type', 'text/javascript');
       res.end(`fetch(${JSON.stringify(`http://127.0.0.1:${server.address().port}/from-worker`)});`);
+      return;
+    }
+    if (url.pathname === '/interval-worker.js') {
+      res.setHeader('Content-Type', 'text/javascript');
+      res.end(
+        `setInterval(() => fetch(${JSON.stringify(`http://127.0.0.1:${server.address().port}/from-worker`)} + '?' + Date.now()), 300);`
+      );
       return;
     }
     if (url.pathname === '/from-worker') {
@@ -29,6 +34,13 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
       res.setHeader('Content-Type', 'text/html');
       res.end(`<!doctype html><title>worker har</title><script>
         new Worker(${JSON.stringify(`http://127.0.0.1:${server.address().port}/worker.js`)});
+      </script>`);
+      return;
+    }
+    if (url.pathname === '/interval-page') {
+      res.setHeader('Content-Type', 'text/html');
+      res.end(`<!doctype html><title>interval worker har</title><script>
+        new Worker(${JSON.stringify(`http://127.0.0.1:${server.address().port}/interval-worker.js`)});
       </script>`);
       return;
     }
@@ -47,6 +59,39 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
       '--no-proxy-server',
     ]);
     raw = await rawSocket(browser.wsUrl);
+    await body({
+      home,
+      origin,
+      port,
+      browser,
+      raw,
+      getHeld: () => held,
+      setHeld: (value) => {
+        held = value;
+      },
+    });
+  } catch (error) {
+    const output = held?.output();
+    throw new Error(
+      [
+        error.message,
+        `holder stdout:\n${output?.stdout ?? ''}`,
+        `holder stderr:\n${output?.stderr ?? ''}`,
+      ].join('\n')
+    );
+  } finally {
+    held?.child.kill('SIGKILL');
+    raw?.close?.();
+    await browser?.close?.();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
+test('HAR records dedicated worker fetches and excludes workers of protected pages', {
+  timeout: 180000,
+}, async () => {
+  await withWorkerServer(async ({ home, origin, port, browser, raw, setHeld }) => {
     const opened = await harCommand(browser.wsUrl, ['tab-new', 'about:blank'], home);
     assert.equal(opened.code, 0, opened.stderr);
     const target = opened.stdout.match(/targetId: ([^\]]+)\]/)?.[1];
@@ -57,7 +102,8 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
     });
     await raw.send('Page.enable', {}, sessionId);
     const file = path.join(home, 'worker.har');
-    held = harHolder(browser.wsUrl, ['har-start', '--tab', target, file], home);
+    const held = harHolder(browser.wsUrl, ['har-start', '--tab', target, file], home);
+    setHeld(held);
     await held.event('ready');
     await held.event('paused');
     const load = raw.event('Page.loadEventFired', sessionId);
@@ -109,20 +155,46 @@ test('HAR records dedicated worker fetches and excludes workers of protected pag
       0,
       JSON.stringify(har)
     );
-  } catch (error) {
-    const output = held?.output();
-    throw new Error(
-      [
-        error.message,
-        `holder stdout:\n${output?.stdout ?? ''}`,
-        `holder stderr:\n${output?.stderr ?? ''}`,
-      ].join('\n')
+  });
+});
+
+test('HAR records fetches from a worker that already existed before har-start', {
+  timeout: 180000,
+}, async () => {
+  await withWorkerServer(async ({ home, origin, browser, raw, setHeld }) => {
+    const opened = await harCommand(browser.wsUrl, ['tab-new', 'about:blank'], home);
+    assert.equal(opened.code, 0, opened.stderr);
+    const target = opened.stdout.match(/targetId: ([^\]]+)\]/)?.[1];
+    assert.ok(target, opened.stdout);
+    const { sessionId } = await raw.send('Target.attachToTarget', {
+      targetId: target,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, sessionId);
+    const load = raw.event('Page.loadEventFired', sessionId);
+    await raw.send('Page.navigate', { url: `${origin}/interval-page` }, sessionId);
+    await load.seen;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const file = path.join(home, 'existing-worker.har');
+    const held = harHolder(browser.wsUrl, ['har-start', '--tab', target, file], home);
+    setHeld(held);
+    await held.event('ready');
+    await held.event('resumed');
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const stopped = await harCommand(browser.wsUrl, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    const ended = await held.ended;
+    assert.equal(ended.code, 0, ended.stderr);
+    const har = JSON.parse(await readFile(file, 'utf8'));
+    assert.ok(
+      har.log.entries.some((entry) => {
+        try {
+          return new URL(entry.request.url).pathname === '/from-worker';
+        } catch {
+          return false;
+        }
+      }),
+      `missing existing-worker fetch: ${JSON.stringify(har)}`
     );
-  } finally {
-    held?.child.kill('SIGKILL');
-    raw?.close?.();
-    await browser?.close?.();
-    await new Promise((resolve) => server.close(resolve));
-    await rm(home, { recursive: true, force: true });
-  }
+  });
 });

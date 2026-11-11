@@ -12,6 +12,7 @@ struct BackendState {
     sent: Vec<Value>,
     refuse_auto_attach: bool,
     fail_network_enable: bool,
+    early_attaches: Vec<Value>,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -24,6 +25,10 @@ impl Transport for Backend {
         let method = command["method"].as_str().unwrap_or("");
         match method {
             "Target.setAutoAttach" => {
+                let early = std::mem::take(&mut state.early_attaches);
+                for attach in early {
+                    state.inbox.push_back(attach.to_string());
+                }
                 if state.refuse_auto_attach {
                     state.inbox.push_back(
                         json!({"id":command["id"],"error":{"message":"slicc: refused: Target.setAutoAttach is not supported: attach to each target"}})
@@ -71,14 +76,14 @@ fn client() -> (Cdp, Rc<RefCell<BackendState>>) {
     (cdp, state)
 }
 
-fn worker_attach(owner: &str, session: &str, url: &str) -> Value {
+fn worker_attach(owner: &str, session: &str, url: &str, waiting: bool) -> Value {
     json!({
         "method": "Target.attachedToTarget",
         "sessionId": owner,
         "params": {
             "sessionId": session,
             "targetInfo": {"targetId": format!("W-{session}"), "type": "worker", "url": url},
-            "waitingForDebugger": true
+            "waitingForDebugger": waiting
         }
     })
 }
@@ -114,7 +119,12 @@ fn admitted_worker_enables_network_before_run_if_waiting() {
         state.borrow().sent
     );
     let before = state.borrow().sent.len();
-    cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
+    cdp.absorb(worker_attach(
+        "H",
+        "WORKER",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
     drain(&mut cdp, &state);
     assert!(cdp.har_owns("WORKER"));
     let methods = methods_after(&state, before);
@@ -133,12 +143,124 @@ fn admitted_worker_enables_network_before_run_if_waiting() {
 }
 
 #[test]
+fn already_running_worker_gets_network_enable_without_resume() {
+    let (mut cdp, state) = client();
+    cdp.har_auto_attach("H").unwrap();
+    let before = state.borrow().sent.len();
+    cdp.absorb(worker_attach(
+        "H",
+        "RUNNING",
+        "https://ordinary.test/worker.js",
+        false,
+    ));
+    assert!(cdp.har_owns("RUNNING"));
+    let methods = methods_after(&state, before);
+    assert!(methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "Runtime.runIfWaitingForDebugger"),
+        "{methods:?}"
+    );
+}
+
+#[test]
+fn early_attaches_during_set_auto_attach_are_consumed_and_judged() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().early_attaches = vec![
+        worker_attach("H", "EARLY", "https://ordinary.test/worker.js", false),
+        worker_attach("H", "WAITING", "https://ordinary.test/other.js", true),
+        worker_attach("H", "BAD", "https://seven.sliccy.ai/worker.js", true),
+    ];
+    let before = state.borrow().sent.len();
+    cdp.har_auto_attach("H").unwrap();
+    assert!(cdp.har.armed.contains("H"));
+    assert!(cdp.har_owns("EARLY"));
+    assert!(cdp.har_owns("WAITING"));
+    assert!(!cdp.har_owns("BAD"));
+    let methods = methods_after(&state, before);
+    let early_enable = methods.iter().position(|method| method == "Network.enable");
+    assert!(early_enable.is_some(), "{methods:?}");
+    assert!(
+        state.borrow().sent[before..].iter().any(|command| {
+            command["method"] == "Network.enable" && command["sessionId"] == "EARLY"
+        }),
+        "{:?}",
+        &state.borrow().sent[before..]
+    );
+    assert!(
+        !state.borrow().sent[before..].iter().any(|command| {
+            command["method"] == "Runtime.runIfWaitingForDebugger" && command["sessionId"] == "EARLY"
+        }),
+        "{:?}",
+        &state.borrow().sent[before..]
+    );
+    let waiting_enable = state.borrow().sent[before..]
+        .iter()
+        .position(|command| command["method"] == "Network.enable" && command["sessionId"] == "WAITING");
+    let waiting_resume = state.borrow().sent[before..]
+        .iter()
+        .position(|command| {
+            command["method"] == "Runtime.runIfWaitingForDebugger" && command["sessionId"] == "WAITING"
+        });
+    assert!(waiting_enable.is_some() && waiting_resume.is_some(), "{methods:?}");
+    assert!(waiting_enable.unwrap() < waiting_resume.unwrap(), "{methods:?}");
+    assert!(
+        state.borrow().sent[before..].iter().any(|command| {
+            command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "BAD"
+        }),
+        "{:?}",
+        &state.borrow().sent[before..]
+    );
+    assert!(
+        !cdp.events().iter().any(|event| event["method"] == "Target.attachedToTarget"
+            && matches!(
+                event["params"]["sessionId"].as_str(),
+                Some("EARLY" | "WAITING" | "BAD")
+            )),
+        "early attaches must be consumed"
+    );
+}
+
+#[test]
+fn refused_set_auto_attach_releases_early_workers_and_disarms() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().refuse_auto_attach = true;
+    state.borrow_mut().early_attaches = vec![
+        worker_attach("H", "EARLY", "https://ordinary.test/worker.js", false),
+        worker_attach("H", "WAITING", "https://ordinary.test/other.js", true),
+    ];
+    cdp.har_auto_attach("H").unwrap();
+    assert!(!cdp.har.armed.contains("H"));
+    assert!(!cdp.har_owns("EARLY"));
+    assert!(!cdp.har_owns("WAITING"));
+    assert!(
+        state.borrow().sent.iter().any(|command| {
+            command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "EARLY"
+        })
+    );
+    assert!(
+        state.borrow().sent.iter().any(|command| {
+            command["method"] == "Target.detachFromTarget"
+                && command["params"]["sessionId"] == "WAITING"
+        })
+    );
+    let notices = cdp.take_notices().join("");
+    assert!(notices.contains("dedicated worker traffic is not captured"), "{notices}");
+}
+
+#[test]
 fn worker_of_protected_page_is_detached_without_enable_or_resume() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
     cdp.blocked.insert("H".into());
     let before = state.borrow().sent.len();
-    cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
+    cdp.absorb(worker_attach(
+        "H",
+        "WORKER",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
     assert!(!cdp.har_owns("WORKER"));
     let methods = methods_after(&state, before);
     assert!(!methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
@@ -168,6 +290,7 @@ fn blob_worker_of_protected_page_is_detached_without_network_enable() {
         "H",
         "BLOB",
         "blob:https://ordinary.test/1",
+        true,
     ));
     assert!(!cdp.har_owns("BLOB"));
     let methods = methods_after(&state, before);
@@ -194,6 +317,7 @@ fn blob_worker_of_ordinary_page_is_admitted() {
         "H",
         "BLOB",
         "blob:https://ordinary.test/1",
+        true,
     ));
     assert!(cdp.har_owns("BLOB"));
     let methods = methods_after(&state, before);
@@ -210,7 +334,12 @@ fn failed_network_enable_still_releases_the_worker() {
     state.borrow_mut().fail_network_enable = true;
     cdp.har_auto_attach("H").unwrap();
     let before = state.borrow().sent.len();
-    cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
+    cdp.absorb(worker_attach(
+        "H",
+        "WORKER",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
     assert!(!cdp.har_owns("WORKER"));
     let methods = methods_after(&state, before);
     assert!(methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
@@ -240,7 +369,12 @@ fn attach_on_unarmed_session_is_not_consumed() {
     );
     cdp.har_auto_attach("H").unwrap();
     let before = cdp.events().len();
-    cdp.absorb(worker_attach("OTHER", "FOREIGN", "https://ordinary.test/worker.js"));
+    cdp.absorb(worker_attach(
+        "OTHER",
+        "FOREIGN",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
     assert!(!cdp.har_owns("FOREIGN"));
     assert!(
         !state.borrow().sent.iter().any(|command| {
@@ -265,7 +399,12 @@ fn extension_style_refusal_emits_notice_and_leaves_recording_possible() {
     assert!(!cdp.har.armed.contains("H"));
     let notices = cdp.take_notices().join("");
     assert!(notices.contains("dedicated worker traffic is not captured"), "{notices}");
-    cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
+    cdp.absorb(worker_attach(
+        "H",
+        "WORKER",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
     assert!(!cdp.har_owns("WORKER"));
 }
 
@@ -273,8 +412,18 @@ fn extension_style_refusal_emits_notice_and_leaves_recording_possible() {
 fn stop_releases_all_workers_and_disables_auto_attach() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
-    cdp.absorb(worker_attach("H", "WORKER", "https://ordinary.test/worker.js"));
-    cdp.absorb(worker_attach("H", "WORKER-2", "https://ordinary.test/other.js"));
+    cdp.absorb(worker_attach(
+        "H",
+        "WORKER",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
+    cdp.absorb(worker_attach(
+        "H",
+        "WORKER-2",
+        "https://ordinary.test/other.js",
+        true,
+    ));
     assert!(cdp.har_owns("WORKER"));
     assert!(cdp.har_owns("WORKER-2"));
     let before = state.borrow().sent.len();
@@ -314,7 +463,7 @@ fn unknown_worker_url_fails_closed() {
     let (mut cdp, state) = client();
     cdp.har_auto_attach("H").unwrap();
     let before = state.borrow().sent.len();
-    cdp.absorb(worker_attach("H", "EMPTY", ""));
+    cdp.absorb(worker_attach("H", "EMPTY", "", true));
     assert!(!cdp.har_owns("EMPTY"));
     let methods = methods_after(&state, before);
     assert!(!methods.iter().any(|method| method == "Network.enable"));
