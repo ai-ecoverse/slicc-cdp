@@ -39,7 +39,10 @@ for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click', 'dblclick', 
 for (const type of ['keydown', 'keyup', 'beforeinput', 'input']) {
   cell.addEventListener(type, (event) => note(type, event));
 }
-grid.addEventListener('mousedown', () => cell.focus());
+grid.addEventListener('mousedown', (event) => {
+  event.preventDefault();
+  cell.focus({ preventScroll: true });
+});
 </script>
 </body></html>`;
 
@@ -198,7 +201,9 @@ async function flow(runner, port) {
   );
 
   await clearLog(runner, cwd, frameId);
-  await run(['click', iframe]);
+  shot = (await run(['snapshot'])).stdout;
+  const iframeAgain = shot.match(/iframe \[ref=(e\d+)\]/)?.[1] ?? iframe;
+  await run(['click', iframeAgain]);
   log = await readLog(runner, cwd, frameId);
   assert.ok(
     log?.some((event) => event.trusted),

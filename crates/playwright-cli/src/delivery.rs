@@ -97,91 +97,88 @@ pub fn at_focus(cdp: &mut Cdp, page: &str) -> Result<Delivery, String> {
     }
     let group = Group { cdp, page };
     let cdp = &mut *group.cdp;
-    let main = main_frame(cdp, page)?;
-    let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": main }), Some(page))?;
-    let context = world.get("executionContextId").cloned().ok_or_else(refused)?;
-    let focused = cdp.call(
-        "Runtime.evaluate",
-        json!({
-            "expression": "(() => { let e = document.activeElement; while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement; return e; })()",
-            "contextId": context,
-            "returnByValue": false,
-            "objectGroup": INPUT_GROUP,
-        }),
-        Some(page),
-    )?;
-    if focused.get("exceptionDetails").is_some() {
-        return Err(refused());
-    }
-    let remote = focused.get("result").cloned().unwrap_or(Value::Null);
-    if remote.get("subtype").and_then(Value::as_str) == Some("null") {
-        return Ok(Delivery {
-            session: page.to_string(),
-            frame: main,
-            input: page.to_string(),
-            offset: (0.0, 0.0),
-            untrusted: false,
-            detach: Vec::new(),
-        });
-    }
-    let object = remote
-        .get("objectId")
-        .cloned()
-        .filter(|_| remote.get("subtype").and_then(Value::as_str) == Some("node"))
-        .ok_or_else(refused)?;
-    let node = cdp.call("DOM.describeNode", json!({ "objectId": object }), Some(page))?;
-    let node = node.get("node").ok_or_else(refused)?;
-    let closed = node.get("shadowRoots").and_then(Value::as_array).is_some_and(|roots| {
-        roots.iter().any(|root| {
-            root.get("shadowRootType")
-                .and_then(Value::as_str)
-                .is_none_or(|kind| !matches!(kind, "open" | "user-agent"))
-        })
-    });
-    if closed {
-        return Err(refused());
-    }
-    if !frame_owner(node) {
-        return Ok(Delivery {
-            session: page.to_string(),
-            frame: main,
-            input: page.to_string(),
-            offset: (0.0, 0.0),
-            untrusted: false,
-            detach: Vec::new(),
-        });
-    }
-    let backend = node.get("backendNodeId").and_then(Value::as_u64).ok_or_else(refused)?;
+    let mut detach = Vec::new();
+    let result = focus_walk(cdp, page, &mut detach, refused);
+    finish(cdp, detach, result)
+}
+
+fn focus_walk(
+    cdp: &mut Cdp,
+    page: &str,
+    detach: &mut Vec<String>,
+    refused: impl Fn() -> String + Copy,
+) -> Result<Delivery, String> {
     let mut session = page.to_string();
     let mut offset = (0.0, 0.0);
-    let mut detach = Vec::new();
-    let result = if open_owner(cdp, page, &mut session, &mut offset, &mut detach, backend, node, &refused)? {
-        let frame = main_frame(cdp, &session)?;
-        Ok(Delivery {
-            session,
-            frame,
-            input: page.to_string(),
-            offset,
-            untrusted: false,
-            detach: Vec::new(),
-        })
-    } else {
+    let mut frame = main_frame(cdp, &session)?;
+    for _ in 0..MAX_DEPTH {
+        let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(&session))?;
+        let context = world.get("executionContextId").cloned().ok_or_else(refused)?;
+        let focused = cdp.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": "(() => { let e = document.activeElement; while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement; return e; })()",
+                "contextId": context,
+                "returnByValue": false,
+                "objectGroup": INPUT_GROUP,
+            }),
+            Some(&session),
+        )?;
+        if focused.get("exceptionDetails").is_some() {
+            return Err(refused());
+        }
+        let remote = focused.get("result").cloned().unwrap_or(Value::Null);
+        if remote.get("subtype").and_then(Value::as_str) == Some("null") {
+            return Ok(Delivery {
+                session,
+                frame,
+                input: page.to_string(),
+                offset,
+                untrusted: false,
+                detach: Vec::new(),
+            });
+        }
+        let object = remote
+            .get("objectId")
+            .cloned()
+            .filter(|_| remote.get("subtype").and_then(Value::as_str) == Some("node"))
+            .ok_or_else(refused)?;
+        let node = cdp.call("DOM.describeNode", json!({ "objectId": object }), Some(&session))?;
+        let node = node.get("node").ok_or_else(refused)?;
+        let closed = node.get("shadowRoots").and_then(Value::as_array).is_some_and(|roots| {
+            roots.iter().any(|root| {
+                root.get("shadowRootType")
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| !matches!(kind, "open" | "user-agent"))
+            })
+        });
+        if closed {
+            return Err(refused());
+        }
+        if !frame_owner(node) {
+            return Ok(Delivery {
+                session,
+                frame,
+                input: page.to_string(),
+                offset,
+                untrusted: false,
+                detach: Vec::new(),
+            });
+        }
+        let backend = node.get("backendNodeId").and_then(Value::as_u64).ok_or_else(refused)?;
+        if open_owner(cdp, page, &mut session, &mut offset, detach, backend, node, &refused)? {
+            frame = main_frame(cdp, &session)?;
+            continue;
+        }
         let content = content_frame(node)
             .map(str::to_string)
-            .or_else(|| owner_frame(cdp, page, backend).ok())
+            .or_else(|| owner_frame(cdp, &session, backend).ok())
             .ok_or_else(refused)?;
-        let frame = locate(cdp, page, page, &content)?;
-        admit_frame(cdp, &frame, &refused)?;
-        Ok(Delivery {
-            session: page.to_string(),
-            frame: content,
-            input: page.to_string(),
-            offset,
-            untrusted: false,
-            detach: Vec::new(),
-        })
-    };
-    finish(cdp, detach, result)
+        let found = locate(cdp, page, &session, &content)?;
+        admit_frame(cdp, &found, &refused)?;
+        frame = content;
+    }
+    Err(refused())
 }
 
 fn walk(

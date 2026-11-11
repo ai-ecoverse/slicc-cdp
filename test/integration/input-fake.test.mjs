@@ -601,6 +601,7 @@ test('ordinary OOPIF sessions are detached after pointer success and refusal', a
 
 test('type and press release the slicc-input object group', async () => {
   let focuses = 0;
+  let focusEvals = 0;
   const landing = (mode) => {
     if (mode === 'focus') return focuses++ === 0 ? 'frame' : 'editable';
     if (mode === 'arm') return 'armed';
@@ -615,15 +616,46 @@ test('type and press release the slicc-input object group', async () => {
     ['press', 'a'],
   ]) {
     focuses = 0;
+    focusEvals = 0;
     await withFake(
       {
         landing,
-        focusNode: {
-          nodeType: 1,
-          nodeName: 'IFRAME',
-          localName: 'iframe',
-          frameId: 'CHILD',
-          backendNodeId: 5,
+        intercept: (message, reply) => {
+          if (message.params?.expression?.startsWith('(() => { let e = document.activeElement')) {
+            focusEvals += 1;
+            reply({
+              result: {
+                type: 'object',
+                subtype: 'node',
+                objectId: focusEvals === 1 ? 'FOCUSED' : 'CELL',
+              },
+            });
+            return true;
+          }
+          if (message.method === 'DOM.describeNode' && message.params.objectId === 'FOCUSED') {
+            reply({
+              node: {
+                nodeType: 1,
+                nodeName: 'IFRAME',
+                localName: 'iframe',
+                frameId: 'CHILD',
+                backendNodeId: 5,
+              },
+            });
+            return true;
+          }
+          if (message.method === 'DOM.describeNode' && message.params.objectId === 'CELL') {
+            reply({
+              node: {
+                nodeType: 1,
+                nodeName: 'TEXTAREA',
+                localName: 'textarea',
+                backendNodeId: 6,
+              },
+            });
+            return true;
+          }
+          return false;
         },
         childFrames: [
           {
@@ -665,6 +697,96 @@ test('type and press release the slicc-input object group', async () => {
       );
       assert.equal(sent(fake, 'Input.insertText').length, 0);
       assert.equal(sent(fake, 'Input.dispatchKeyEvent').length, 0);
+    }
+  );
+});
+
+test('type reaches an editable focused inside an ordinary OOPIF', async () => {
+  let focuses = 0;
+  let focusEvals = 0;
+  const landing = (mode) => {
+    if (mode === 'focus') return focuses++ === 0 ? 'frame' : 'editable';
+    if (mode === 'arm') return 'armed';
+    if (mode === 'read') return ['beforeinput', 'input'];
+    if (mode === 'insert') return 'inserted';
+    if (mode === 'visible') return 'visible';
+    return 'done';
+  };
+  await withFake(
+    {
+      landing,
+      intercept: (message, reply) => {
+        if (message.params?.expression?.startsWith('(() => { let e = document.activeElement')) {
+          focusEvals += 1;
+          reply({
+            result: {
+              type: 'object',
+              subtype: 'node',
+              objectId: focusEvals === 1 ? 'IFRAME' : 'CELL',
+            },
+          });
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.objectId === 'IFRAME') {
+          reply({
+            node: {
+              nodeType: 1,
+              nodeName: 'IFRAME',
+              localName: 'iframe',
+              frameId: 'CHILD',
+              backendNodeId: 5,
+            },
+          });
+          return true;
+        }
+        if (message.method === 'DOM.describeNode' && message.params.objectId === 'CELL') {
+          reply({
+            node: {
+              nodeType: 1,
+              nodeName: 'TEXTAREA',
+              localName: 'textarea',
+              backendNodeId: 6,
+            },
+          });
+          return true;
+        }
+        if (message.method === 'DOM.resolveNode' && message.params.backendNodeId === 5) {
+          reply({ object: { type: 'object', subtype: 'node', objectId: 'IFRAME_OBJ' } });
+          return true;
+        }
+        if (
+          message.method === 'Runtime.callFunctionOn' &&
+          message.params.objectId === 'IFRAME_OBJ'
+        ) {
+          reply({ result: { type: 'object', value: { x: 8, y: 40 } } });
+          return true;
+        }
+        return false;
+      },
+    },
+    async (fake, pw) => {
+      fake.targets.push({
+        targetId: 'CHILD',
+        type: 'iframe',
+        url: 'https://grid.test/grid.html',
+        parentFrameId: 'TAB',
+      });
+      const result = await pw(['type', 'ab']);
+      assert.equal(result.code, 0, result.stderr);
+      assert.ok(
+        sent(fake, 'Input.insertText').length >= 1 ||
+          sent(fake, 'Input.dispatchKeyEvent').length >= 1
+      );
+      assert.ok(
+        sent(fake, 'Target.attachToTarget').some((call) => call.params.targetId === 'CHILD')
+      );
+      assert.ok(
+        params(fake, 'Runtime.releaseObjectGroup').some(
+          (call) => call.objectGroup === 'slicc-input'
+        )
+      );
+      const after = attachedSessions(fake);
+      assert.equal(after.attaches, after.detaches, JSON.stringify(after));
     }
   );
 });
