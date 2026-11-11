@@ -359,7 +359,7 @@ test('mouse commands keep the pointer, buttons and held modifiers between invoca
   });
 });
 
-test('pointer input over an embedded frame or outside the main document is refused', async () => {
+test('pointer input over an unresolvable embedded frame or outside the main document is refused', async () => {
   for (const script of [
     { hitNode: { nodeType: 1, nodeName: 'IFRAME', localName: 'iframe' } },
     { hitNode: { nodeType: 1, nodeName: 'EMBED', localName: 'embed' } },
@@ -496,7 +496,7 @@ test('mousewheel scrolls a background tab in place and only falls back to bringi
   });
 });
 
-test('keyboard input is refused while focus is inside a frame or a closed shadow root', async () => {
+test('keyboard input is refused while focus is inside an unresolvable frame or a closed shadow root', async () => {
   for (const script of [
     { focusNode: { nodeType: 1, nodeName: 'IFRAME', localName: 'iframe' } },
     { focusNode: { nodeType: 1, nodeName: 'OBJECT' } },

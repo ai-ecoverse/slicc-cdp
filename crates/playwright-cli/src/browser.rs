@@ -426,7 +426,13 @@ fn link_remote(frames: &mut Vec<FrameRec>, mut remote: Vec<FrameRec>) {
 }
 
 fn remote_url(guard: &cdp_client::protected::Protected, url: &str) -> bool {
-    url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) && !guard.url(url)
+    ordinary_frame_url(guard, url)
+}
+
+pub(crate) fn ordinary_frame_url(guard: &cdp_client::protected::Protected, url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+        && !guard.url(url)
+        && !guard.extension_frame(url)
 }
 
 pub fn open_frame(cdp: &mut Cdp, frame: &FrameRec) -> Result<(String, Vec<FrameRec>), String> {
@@ -665,15 +671,22 @@ pub fn click_ref(
     modifiers: i64,
 ) -> Result<(), String> {
     if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
+        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let expression = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); el.click(); }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
-        evaluate_in_frame(cdp, session, frame_id, &expression)?;
-        return Ok(());
+        let pos = evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let point = (frame_offset.0 + fx, frame_offset.1 + fy);
+        let input = input_session(session, rec);
+        let scope = Scope { session, frame: Some(frame_id), input };
+        let gesture = Gesture::Click { button, modifiers };
+        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), gesture, &mut |cdp| dispatch_click(cdp, input, point, button, modifiers));
     }
     if let Some(backend) = rec.backend_node_id {
-        click_backend(cdp, session, backend, button, modifiers)?;
+        click_backend(cdp, session, rec, backend, button, modifiers)?;
         return Ok(());
     }
     if !rec.selector.is_empty() {
@@ -693,6 +706,7 @@ pub fn click_ref(
 fn click_backend(
     cdp: &mut Cdp,
     session: &str,
+    rec: &RefRec,
     backend: u64,
     button: &str,
     modifiers: i64,
@@ -734,7 +748,55 @@ fn click_backend(
     }
     let point = center(&value);
     let gesture = Gesture::Click { button, modifiers };
-    landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), point, gesture, &mut |cdp| dispatch_click(cdp, session, point, button, modifiers))
+    pointer_at(cdp, session, rec, backend, point, gesture, &mut |cdp, input| {
+        dispatch_click(cdp, input, point, button, modifiers)
+    })
+}
+
+fn delivery_anchor<'a>(session: &str, delivery: &crate::delivery::Delivery, backend: u64) -> Anchor<'a> {
+    if delivery.session == session && delivery.offset == (0.0, 0.0) {
+        Anchor::Backend(backend)
+    } else {
+        Anchor::Point
+    }
+}
+
+fn frame_owner_node(node: &Value) -> bool {
+    let name = node
+        .get("localName")
+        .or_else(|| node.get("nodeName"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(name.as_str(), "iframe" | "frame" | "object" | "embed" | "fencedframe" | "portal")
+}
+
+fn pointer_at(
+    cdp: &mut Cdp,
+    session: &str,
+    rec: &RefRec,
+    backend: u64,
+    point: (f64, f64),
+    gesture: Gesture<'_>,
+    trusted: &mut dyn FnMut(&mut Cdp, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let described = cdp.call("DOM.describeNode", json!({ "backendNodeId": backend }), Some(session))?;
+    let owner = described.get("node").is_some_and(frame_owner_node);
+    if !owner {
+        return landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), point, gesture, &mut |cdp| {
+            trusted(cdp, session)
+        });
+    }
+    let page = input_session(session, rec);
+    let delivery = crate::delivery::at_point(cdp, page, point.0, point.1)?;
+    let local = delivery.local(point);
+    let scope = delivery.scope();
+    let anchor = delivery_anchor(session, &delivery, backend);
+    let result = landing::pointer(cdp, &scope, &anchor, local, gesture, &mut |cdp| {
+        trusted(cdp, &delivery.input)
+    });
+    crate::delivery::release(cdp, delivery);
+    result
 }
 
 fn center(value: &Value) -> (f64, f64) {
@@ -841,13 +903,33 @@ pub fn insert_text(cdp: &mut Cdp, session: &str, text: &str) -> Result<(), Strin
 }
 
 pub fn type_text(cdp: &mut Cdp, session: &str, text: &str) -> Result<(), String> {
-    landing::text(cdp, session, text, &mut |cdp| insert_text(cdp, session, text))
+    keyed_in(cdp, session, |cdp, scope, input| {
+        landing::text(cdp, scope, text, &mut |cdp| insert_text(cdp, input, text))
+    })
 }
 
 pub fn press_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> {
     let (key_name, code, _, text, modifiers) = key_info(key);
     let keyed = landing::Keyed { key: &key_name, code: &code, text: text.as_deref(), modifiers };
-    landing::key(cdp, session, &keyed, &mut |cdp| dispatch_key(cdp, session, key))
+    keyed_in(cdp, session, |cdp, scope, input| {
+        landing::key(cdp, scope, &keyed, &mut |cdp| dispatch_key(cdp, input, key))
+    })
+}
+
+fn keyed_in(
+    cdp: &mut Cdp,
+    session: &str,
+    body: impl FnOnce(&mut Cdp, &Scope, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let page = Scope::page(session);
+    if landing::focus_frame(cdp, &page)? {
+        let delivery = crate::delivery::at_focus(cdp, session)?;
+        let scope = delivery.scope();
+        let result = body(cdp, &scope, &delivery.input);
+        crate::delivery::release(cdp, delivery);
+        return result;
+    }
+    body(cdp, &page, session)
 }
 
 fn dispatch_key(cdp: &mut Cdp, session: &str, key: &str) -> Result<(), String> {
@@ -1046,15 +1128,39 @@ pub fn dblclick_ref(
     modifiers: i64,
 ) -> Result<(), String> {
     if let (Some(frame_id), selector) = (rec.frame_id.as_deref(), first_selector(&rec.selector)) {
+        let frame_offset = ref_frame_offset(cdp, session, rec, frame_id)?;
         let expression = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); el.dispatchEvent(new MouseEvent('dblclick', {{ bubbles: true }})); }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
-        evaluate_in_frame(cdp, session, frame_id, &expression)?;
-        return Ok(());
+        let pos = evaluate_in_frame(cdp, session, frame_id, &expression)?;
+        let fx = pos.value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let fy = pos.value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let point = (frame_offset.0 + fx, frame_offset.1 + fy);
+        let input = input_session(session, rec);
+        let scope = Scope { session, frame: Some(frame_id), input };
+        let gesture = Gesture::Double { button, modifiers };
+        return landing::pointer(cdp, &scope, &Anchor::Selector(selector), (fx, fy), gesture, &mut |cdp| {
+            for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
+                cdp.call_for(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": kind,
+                        "x": point.0,
+                        "y": point.1,
+                        "button": button,
+                        "clickCount": count,
+                        "modifiers": modifiers,
+                    }),
+                    Some(input),
+                    landing::INPUT_WAIT,
+                )?;
+            }
+            Ok(())
+        });
     }
     if let Some(backend) = rec.backend_node_id {
-        dblclick_backend(cdp, session, backend, button, modifiers)?;
+        dblclick_backend(cdp, session, rec, backend, button, modifiers)?;
         return Ok(());
     }
     Err("element has no backend node\n".to_string())
@@ -1063,6 +1169,7 @@ pub fn dblclick_ref(
 fn dblclick_backend(
     cdp: &mut Cdp,
     session: &str,
+    rec: &RefRec,
     backend: u64,
     button: &str,
     modifiers: i64,
@@ -1089,21 +1196,21 @@ fn dblclick_backend(
         Some(session),
     )?;
     let value = box_result.pointer("/result/value").cloned().unwrap_or(Value::Null);
-    let (cx, cy) = center(&value);
+    let point = center(&value);
     let gesture = Gesture::Double { button, modifiers };
-    landing::pointer(cdp, &Scope::page(session), &Anchor::Backend(backend), (cx, cy), gesture, &mut |cdp| {
+    pointer_at(cdp, session, rec, backend, point, gesture, &mut |cdp, input| {
         for (kind, count) in [("mousePressed", 1), ("mouseReleased", 1), ("mousePressed", 2), ("mouseReleased", 2)] {
             cdp.call_for(
                 "Input.dispatchMouseEvent",
                 json!({
                     "type": kind,
-                    "x": cx,
-                    "y": cy,
+                    "x": point.0,
+                    "y": point.1,
                     "button": button,
                     "clickCount": count,
                     "modifiers": modifiers,
                 }),
-                Some(session),
+                Some(input),
                 landing::INPUT_WAIT,
             )?;
         }
@@ -1420,6 +1527,10 @@ fn element_center(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f6
     Ok((x + ox, y + oy))
 }
 
+pub(crate) fn frame_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<(f64, f64), String> {
+    frame_element_offset(cdp, session, frame_id)
+}
+
 fn frame_element_offset(cdp: &mut Cdp, session: &str, frame_id: &str) -> Result<(f64, f64), String> {
     let result = cdp.call(
         "DOM.getFrameOwner",
@@ -1459,6 +1570,10 @@ fn remote_offset(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<(f64, f64
 
 fn input_session<'a>(session: &'a str, rec: &'a RefRec) -> &'a str {
     rec.page.as_deref().unwrap_or(session)
+}
+
+pub(crate) fn owner_point(cdp: &mut Cdp, session: &str, backend: u64) -> Result<(f64, f64), String> {
+    owner_offset(cdp, session, backend)
 }
 
 fn owner_offset(cdp: &mut Cdp, session: &str, backend: u64) -> Result<(f64, f64), String> {

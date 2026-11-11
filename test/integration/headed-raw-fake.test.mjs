@@ -434,7 +434,7 @@ for (const [transport, runner] of Object.entries(runners)) {
     });
   });
 
-  test(`${transport}: raw input or a drag that would reach a frame is refused`, async () => {
+  test(`${transport}: raw input or a drag whose untrusted fallback still hits an unresolvable frame is refused`, async () => {
     await withScene(
       runner,
       scene({ mouse: 'frame:0', key: 'frame', reads: [[], []] }),
