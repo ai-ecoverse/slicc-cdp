@@ -276,6 +276,20 @@ export async function webmcpBackend({
         return true;
       }
       if (method === 'Target.setAutoAttach') {
+        if (
+          params.autoAttach === false &&
+          Array.isArray(params.filter) &&
+          params.filter.length > 0
+        ) {
+          send({
+            id,
+            error: {
+              code: -32602,
+              message: 'Target filter should be empty when disabling auto-attach',
+            },
+          });
+          return true;
+        }
         if (params.autoAttach && sessions.get(sessionId) === 'TAB') {
           autoParents.add(sessionId);
           if (!attachDuringRearm) attachOopifs(sessionId);

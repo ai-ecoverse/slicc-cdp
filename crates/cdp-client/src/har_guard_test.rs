@@ -29,6 +29,15 @@ impl Transport for Backend {
                 for attach in early {
                     state.inbox.push_back(attach.to_string());
                 }
+                let auto_attach = command["params"]["autoAttach"].as_bool() == Some(true);
+                let filter = command["params"].get("filter").and_then(Value::as_array);
+                if !auto_attach && filter.is_some_and(|items| !items.is_empty()) {
+                    state.inbox.push_back(
+                        json!({"id":command["id"],"error":{"message":"Target filter should be empty when disabling auto-attach"}})
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
                 if state.refuse_auto_attach {
                     state.inbox.push_back(
                         json!({"id":command["id"],"error":{"message":"slicc: refused: Target.setAutoAttach is not supported: attach to each target"}})
@@ -450,11 +459,85 @@ fn stop_releases_all_workers_and_disables_auto_attach() {
             command["method"] == "Target.setAutoAttach"
                 && command["params"]["autoAttach"] == false
                 && command["sessionId"] == "H"
-                && command["params"]["filter"]
-                    .as_array()
-                    .is_some_and(|filter| filter.iter().any(|item| item["type"] == "worker"))
+                && !command["params"]
+                    .get("filter")
+                    .and_then(Value::as_array)
+                    .is_some_and(|filter| !filter.is_empty())
         }),
         "{after:?}"
+    );
+}
+
+#[test]
+fn after_stop_a_new_worker_is_never_stranded() {
+    let (mut cdp, state) = client();
+    cdp.har_auto_attach("H").unwrap();
+    let before_stop = state.borrow().sent.len();
+    cdp.har_stop("H");
+    assert!(!cdp.har.armed.contains("H"));
+    assert!(
+        state.borrow().sent[before_stop..].iter().any(|command| {
+            command["method"] == "Target.setAutoAttach"
+                && command["params"]["autoAttach"] == false
+                && !command["params"]
+                    .get("filter")
+                    .and_then(Value::as_array)
+                    .is_some_and(|filter| !filter.is_empty())
+        }),
+        "{:?}",
+        &state.borrow().sent[before_stop..]
+    );
+    let before = state.borrow().sent.len();
+    cdp.absorb(worker_attach(
+        "H",
+        "LATE",
+        "https://ordinary.test/worker.js",
+        true,
+    ));
+    assert!(!cdp.har_owns("LATE"));
+    let methods = methods_after(&state, before);
+    assert!(!methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "Runtime.runIfWaitingForDebugger"),
+        "{methods:?}"
+    );
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "Target.detachFromTarget"),
+        "{methods:?}"
+    );
+}
+
+#[test]
+fn protected_blob_worker_of_ordinary_page_is_refused() {
+    let (mut cdp, state) = client();
+    cdp.har_auto_attach("H").unwrap();
+    let before = state.borrow().sent.len();
+    cdp.absorb(worker_attach(
+        "H",
+        "BLOB",
+        "blob:https://lars.sliccy.ai/x",
+        true,
+    ));
+    assert!(!cdp.har_owns("BLOB"));
+    let methods = methods_after(&state, before);
+    assert!(!methods.iter().any(|method| method == "Network.enable"), "{methods:?}");
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "Runtime.runIfWaitingForDebugger"),
+        "{methods:?}"
+    );
+    assert!(
+        state.borrow().sent[before..]
+            .iter()
+            .any(|command| command["method"] == "Target.detachFromTarget"
+                && command["params"]["sessionId"] == "BLOB"),
+        "{:?}",
+        &state.borrow().sent[before..]
     );
 }
 

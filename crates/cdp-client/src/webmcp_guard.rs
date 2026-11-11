@@ -538,7 +538,7 @@ impl Cdp {
         let debug = self.webmcp.arms.get(session).is_some_and(|arm| !arm.plain);
         self.webmcp_detach_parked_children(session);
         if self.webmcp.arms.contains_key(session) {
-            let _ = self.raw_call("Target.setAutoAttach", json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe","exclude":false}]}), Some(session), OPTIONAL_STEP);
+            let _ = self.raw_call("Target.setAutoAttach", json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}), Some(session), OPTIONAL_STEP);
         }
         self.webmcp_revoke(session);
         if debug {

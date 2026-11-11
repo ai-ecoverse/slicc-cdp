@@ -254,6 +254,12 @@ impl Transport for Backend {
                 json!({})
             }
             "Target.setAutoAttach" => {
+                let auto_attach = command["params"]["autoAttach"].as_bool() == Some(true);
+                let filter = command["params"].get("filter").and_then(Value::as_array);
+                if !auto_attach && filter.is_some_and(|items| !items.is_empty()) {
+                    state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Target filter should be empty when disabling auto-attach"}}).to_string());
+                    return Ok(());
+                }
                 if state.refuse_auto_attach {
                     state.inbox.push_back(json!({"id":command["id"],"error":{"message":"slicc: refused: Target.setAutoAttach is not supported: attach to each target"}}).to_string());
                     return Ok(());
@@ -936,6 +942,27 @@ fn lower_only_overrides_never_raise_the_stage1_defaults() {
     assert_eq!(cdp.webmcp.id_cap(), 7);
     assert_eq!(cdp.webmcp.pending_count_cap(), 5);
     assert_eq!(cdp.webmcp.pending_bytes_cap(), 11);
+}
+
+#[test]
+fn stop_webmcp_disables_auto_attach_without_a_filter() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    cdp.webmcp_auto_attach("H").unwrap();
+    let before = state.borrow().sent.len();
+    cdp.stop_webmcp("H");
+    assert!(
+        state.borrow().sent[before..].iter().any(|command| {
+            command["method"] == "Target.setAutoAttach"
+                && command["params"]["autoAttach"] == false
+                && command["params"]["waitForDebuggerOnStart"] == false
+                && command["params"]["flatten"] == true
+                && command["sessionId"] == "H"
+                && command["params"].get("filter").is_none()
+        }),
+        "{:?}",
+        &state.borrow().sent[before..]
+    );
 }
 
 #[test]

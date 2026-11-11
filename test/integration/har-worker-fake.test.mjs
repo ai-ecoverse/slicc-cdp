@@ -263,6 +263,59 @@ test('HAR detaches a blob worker created by a protected page', async () => {
   });
 });
 
+test('after har-stop a newly created worker is never paused or stranded', async () => {
+  await workerFixture(async ({ home, backend, emitters, held }) => {
+    await waitFor(
+      () =>
+        backend.calls.some(
+          (call) => call.method === 'Target.setAutoAttach' && call.params?.autoAttach === true
+        ),
+      'worker setAutoAttach'
+    );
+    const pageSession = backend.calls.find(
+      (call) => call.method === 'Target.setAutoAttach' && call.params?.autoAttach === true
+    )?.sessionId;
+    const pageEmit = emitters.get(pageSession);
+    assert.ok(pageEmit, `missing emitter for ${pageSession}`);
+    const stopped = await harCommand(backend.url, ['har-stop'], home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.equal((await held.ended).code, 0);
+    assert.ok(
+      backend.calls.some(
+        (call) =>
+          call.method === 'Target.setAutoAttach' &&
+          call.params?.autoAttach === false &&
+          call.sessionId === pageSession &&
+          !(Array.isArray(call.params?.filter) && call.params.filter.length > 0)
+      ),
+      'auto-attach disabled without a filter'
+    );
+    const before = backend.calls.length;
+    pageEmit('Target.attachedToTarget', {
+      sessionId: 'LATE-WORKER',
+      targetInfo: {
+        targetId: 'LATE-WORKER-TARGET',
+        type: 'worker',
+        url: 'https://example.test/late.js',
+      },
+      waitingForDebugger: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const after = backend.calls.slice(before);
+    assert.ok(
+      !after.some((call) => call.method === 'Network.enable' && call.sessionId === 'LATE-WORKER'),
+      JSON.stringify(after)
+    );
+    assert.ok(
+      !after.some(
+        (call) =>
+          call.method === 'Runtime.runIfWaitingForDebugger' && call.sessionId === 'LATE-WORKER'
+      ),
+      JSON.stringify(after)
+    );
+  });
+});
+
 test('extension-style setAutoAttach refusal prints one notice and keeps page recording', async () => {
   await workerFixture(
     async ({ home, backend, file, held, emitters }) => {

@@ -318,6 +318,19 @@ export async function fakeCdp({
             });
           return answer({ sessionId: session });
         }
+        case 'Target.setAutoAttach': {
+          const filter = params.filter;
+          if (params.autoAttach === false && Array.isArray(filter) && filter.length > 0) {
+            return send({
+              id,
+              error: {
+                code: -32602,
+                message: 'Target filter should be empty when disabling auto-attach',
+              },
+            });
+          }
+          return answer({});
+        }
         case 'Target.detachFromTarget':
           sessions.delete(params.sessionId);
           sessionSends.delete(params.sessionId);
