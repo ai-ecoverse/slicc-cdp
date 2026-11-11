@@ -264,6 +264,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "A foreground holder: stdin EOF or har-stop ends recording. JSON ready, paused, resumed, checkpoint and stopped events include recordingId and path.",
                 "Writes atomically on main-frame navigation and stop. Capture pauses on protected or unknown documents and resumes on ordinary documents.",
                 "Protected and unknown requests and redirect hops are excluded; protected redirect carriers are redacted. Bodies are omitted by default.",
+                "Dedicated workers of the recorded page are captured through the guard when the CDP route allows Target.setAutoAttach; service and shared workers are out of scope. Extension routes that refuse auto-attach keep page recording and print one notice.",
                 "record opens a new tab (about:blank by default) and writes <user-config>/slicc/playwright-cli/recordings/<recordingId>/recording.har beside saved sessions. Filters are URL globs, never JavaScript.",
             ],
             &[("<file>", "HAR output file (har-start)"), ("[url]", "ordinary http(s) URL to open in a new tab (record)")],
