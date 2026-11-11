@@ -13,6 +13,7 @@ struct BackendState {
     refuse_auto_attach: bool,
     fail_network_enable: bool,
     early_attaches: Vec<Value>,
+    flip_creator_on_body: bool,
 }
 
 struct Backend(Rc<RefCell<BackendState>>);
@@ -56,6 +57,23 @@ impl Transport for Backend {
                 }
             }
             "Network.getResponseBody" => {
+                if state.flip_creator_on_body {
+                    state.inbox.push_back(
+                        json!({
+                            "method": "Page.frameNavigated",
+                            "sessionId": "H",
+                            "params": {
+                                "frame": {
+                                    "id": "F",
+                                    "loaderId": "P",
+                                    "url": "https://seven.sliccy.ai/",
+                                    "securityOrigin": "https://seven.sliccy.ai"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    );
+                }
                 state.inbox.push_back(
                     json!({"id":command["id"],"result":{"body":"worker-body","base64Encoded":false}})
                         .to_string(),
@@ -588,16 +606,31 @@ fn admit_worker(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>, session: &str)
 }
 
 fn worker_fetch(cdp: &mut Cdp, session: &str, id: &str, url: &str) {
+    worker_fetch_with(cdp, session, id, url, json!({}), None);
+}
+
+fn worker_fetch_with(
+    cdp: &mut Cdp,
+    session: &str,
+    id: &str,
+    url: &str,
+    headers: Value,
+    initiator: Option<Value>,
+) {
+    let mut params = json!({
+        "requestId": id,
+        "loaderId": "",
+        "documentURL": "https://ordinary.test/worker.js",
+        "type": "Fetch",
+        "request": {"url": url, "method": "GET", "headers": headers}
+    });
+    if let Some(initiator) = initiator {
+        params["initiator"] = initiator;
+    }
     cdp.absorb(json!({
         "method": "Network.requestWillBeSent",
         "sessionId": session,
-        "params": {
-            "requestId": id,
-            "loaderId": "",
-            "documentURL": "https://ordinary.test/worker.js",
-            "type": "Fetch",
-            "request": {"url": url, "method": "GET", "headers": {}}
-        }
+        "params": params
     }));
     cdp.absorb(json!({
         "method": "Network.responseReceived",
@@ -612,6 +645,17 @@ fn worker_fetch(cdp: &mut Cdp, session: &str, id: &str, url: &str) {
         "sessionId": session,
         "params": {"requestId": id, "timestamp": 1.2}
     }));
+}
+
+fn assert_worker_body_refused(cdp: &mut Cdp, session: &str, id: &str) {
+    assert_eq!(cdp.request_state(id), Some(true), "{id}");
+    assert!(!cdp.ordinary_response_body(session, id), "{id}");
+    assert!(
+        cdp.call("Network.getResponseBody", json!({"requestId": id}), Some(session))
+            .unwrap_err()
+            .starts_with("slicc: refused:"),
+        "{id}"
+    );
 }
 
 #[test]
@@ -685,4 +729,77 @@ fn worker_bodies_stop_after_creator_becomes_protected() {
         )
         .unwrap_err()
         .starts_with("slicc: refused:"));
+}
+
+#[test]
+fn worker_referer_header_marks_request_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch_with(
+        &mut cdp,
+        "WORKER",
+        "REF",
+        "https://ordinary.test/body",
+        json!({"Referer": "https://seven.sliccy.ai/secret"}),
+        None,
+    );
+    assert_worker_body_refused(&mut cdp, "WORKER", "REF");
+}
+
+#[test]
+fn worker_origin_header_marks_request_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch_with(
+        &mut cdp,
+        "WORKER",
+        "ORG",
+        "https://ordinary.test/body",
+        json!({"Origin": "https://seven.sliccy.ai"}),
+        None,
+    );
+    assert_worker_body_refused(&mut cdp, "WORKER", "ORG");
+}
+
+#[test]
+fn worker_initiator_stack_marks_request_protected() {
+    let (mut cdp, state) = client();
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch_with(
+        &mut cdp,
+        "WORKER",
+        "STACK",
+        "https://ordinary.test/body",
+        json!({}),
+        Some(json!({
+            "type": "script",
+            "stack": {
+                "callFrames": [{
+                    "url": "https://seven.sliccy.ai/x.js",
+                    "lineNumber": 0,
+                    "columnNumber": 0
+                }]
+            }
+        })),
+    );
+    assert_worker_body_refused(&mut cdp, "WORKER", "STACK");
+}
+
+#[test]
+fn worker_body_call_sees_creator_flip_before_reply() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().flip_creator_on_body = true;
+    admit_worker(&mut cdp, &state, "WORKER");
+    worker_fetch(&mut cdp, "WORKER", "RACE", "https://ordinary.test/body");
+    assert!(cdp.ordinary_response_body("WORKER", "RACE"));
+    let body = cdp.call(
+        "Network.getResponseBody",
+        json!({"requestId": "RACE"}),
+        Some("WORKER"),
+    );
+    assert!(
+        body.is_err() || !cdp.ordinary_response_body("WORKER", "RACE"),
+        "creator flip during body read must leave the request unembeddable: {body:?}"
+    );
+    assert!(!cdp.ordinary_response_body("WORKER", "RACE"));
 }

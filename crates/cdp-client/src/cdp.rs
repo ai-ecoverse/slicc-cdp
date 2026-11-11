@@ -2751,8 +2751,15 @@ impl Cdp {
                     || params
                         .get("frameId")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|frame| self.frame_protected(frame));
+                        .is_some_and(|frame| self.frame_protected(frame))
+                    || params
+                        .get("initiator")
+                        .is_some_and(|initiator| shield::loaded_urls_protected(&self.guard, initiator));
+                let headers = self.network_referer_origin_protected(params.get("request").and_then(|request| request.get("headers")))
+                    || self.network_referer_origin_protected(params.get("response").and_then(|response| response.get("headers")))
+                    || self.network_referer_origin_protected(params.get("headers"));
                 let protected = initiator
+                    || headers
                     || self.guard.url(&url)
                     || self.guard.url(&shield::web_socket_as_http(&url))
                     || session.as_ref().is_some_and(|session| self.har_creator_blocked(session));
@@ -3171,11 +3178,33 @@ impl Cdp {
         }
     }
 
+    fn network_referer_origin_protected(&self, headers: Option<&Value>) -> bool {
+        let Some(headers) = headers else { return false };
+        let protected = |name: &str, value: &str| {
+            matches!(name.to_ascii_lowercase().as_str(), "referer" | "origin")
+                && value != "null"
+                && self.guard.url(value)
+        };
+        match headers {
+            Value::Object(fields) => fields.iter().any(|(name, value)| value.as_str().is_some_and(|text| protected(name, text))),
+            Value::Array(fields) => fields.iter().any(|field| {
+                field.get("name").and_then(Value::as_str).zip(field.get("value").and_then(Value::as_str))
+                    .is_some_and(|(name, value)| protected(name, value))
+            }),
+            _ => false,
+        }
+    }
+
     pub fn ordinary_response_body(&self, session: &str, request_id: &str) -> bool {
         !self.content_blocked(session)
             && !self.har_creator_blocked(session)
             && self.request_state(request_id) == Some(false)
             && !self.protected_body_requests.contains(request_id)
+            && !self.protected_request_pages.iter().any(|(peer, id)| {
+                id == request_id
+                    && (peer == session
+                        || self.session_target(session).is_some_and(|target| self.session_target(peer).as_ref() == Some(&target)))
+            })
             && self.ordinary_network_source(session, request_id).is_some()
     }
 

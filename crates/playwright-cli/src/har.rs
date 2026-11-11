@@ -575,7 +575,9 @@ impl Holder {
         let body_session = if pending.worker { pending.session.as_str() } else { self.session.as_deref().unwrap_or("") };
         let can_embed = self.embed && verified && !self.paused && !body_session.is_empty() && cdp.ordinary_response_body(body_session, id);
         let content = if can_embed && body {
-            cdp.call_for("Network.getResponseBody", json!({"requestId":id}), Some(body_session), Duration::from_secs(2)).ok()
+            cdp.call_for("Network.getResponseBody", json!({"requestId":id}), Some(body_session), Duration::from_secs(2))
+                .ok()
+                .filter(|_| !self.paused && cdp.ordinary_response_body(body_session, id))
         } else { None };
         self.entries.push(entry(cdp, &pending, content.as_ref(), self.credentials, can_embed && pending.ordinary_document, self.minimal));
         Ok(())
