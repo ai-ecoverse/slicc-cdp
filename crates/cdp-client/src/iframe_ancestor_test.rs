@@ -520,7 +520,6 @@ fn mid_distinct_frame_id_cuts_child_when_middle_navigates_to_seven() {
     });
     cdp.frame_parents.insert("MIDFRAME".into(), "FRAME".into());
     cdp.frames.insert("MIDFRAME".into(), vec!["about:blank".into()]);
-    cdp.bind_orphan_iframe_frames();
     let attached = cdp.call("Target.attachToTarget", json!({"targetId":"CHILD","flatten":true}), None).unwrap();
     let session = attached["sessionId"].as_str().unwrap().to_string();
     cdp.call("Network.enable", json!({}), Some(&session)).unwrap();

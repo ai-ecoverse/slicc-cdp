@@ -219,7 +219,7 @@ fn replay_xhr_is_refused_without_a_correlated_interception_identity() {
     assert!(refused(cdp.call("Network.replayXHR", json!({ "requestId": "X1" }), Some("S"))));
     cdp.absorb(pause("P1", "Y1", "https://app.example/flip", "XHR"));
     cdp.absorb(hop("P2", "Y1", "https://seven.sliccy.ai/private", "P1"));
-    assert_eq!(fetch_calls(&log), [plain("P1"), plain("P2")]);
+    assert_eq!(fetch_calls(&log), [plain("P1"), failed("P2")]);
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn response_rewrites_classify_locations_with_the_effective_status_and_headers() 
     cdp.call("Fetch.continueResponse", json!({ "requestId": "R3" }), Some("S")).unwrap();
     assert!(!cdp.issued.chains.contains(&("S".to_string(), "N3".to_string())));
     cdp.absorb(hop("R4", "N3", "https://seven.sliccy.ai/", "R3"));
-    assert_eq!(fetch_calls(&log).last().unwrap(), &plain("R4"));
+    assert_eq!(fetch_calls(&log).last().unwrap(), &failed("R4"));
 }
 
 #[test]
