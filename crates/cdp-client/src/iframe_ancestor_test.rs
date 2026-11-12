@@ -832,7 +832,7 @@ fn one_frame_two_targets_refuses_child_not_bound_to_seven() {
 }
 
 #[test]
-fn root_keeps_sessions_drains_queued_pause_and_refuses_fetch_disable() {
+fn root_keeps_sessions_continues_queued_pause_without_detach() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
     cdp.targets.insert("PAGE".into(), page.clone());
@@ -867,9 +867,27 @@ fn root_keeps_sessions_drains_queued_pause_and_refuses_fetch_disable() {
     assert!(cdp.session_blocked(&session));
     assert!(cdp.is_protected_target("PAGE"));
     assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == session));
-    assert!(sent.borrow().iter().any(|command| command["method"] == "Fetch.failRequest" && command["params"]["requestId"] == "R-HELD"));
+    assert!(sent.borrow().iter().any(|command| {
+        command["method"] == "Fetch.continueRequest"
+            && command["params"]["requestId"] == "R-HELD"
+            && command["params"].as_object().is_some_and(|object| object.keys().all(|key| key == "requestId"))
+    }), "page-own pause must continue unmodified: {:?}", sent.borrow());
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.failRequest" && command["params"]["requestId"] == "R-HELD"));
     assert!(cdp.paused.iter().all(|paused| paused.request_id != "R-HELD"));
-    assert!(cdp.call("Fetch.disable", json!({}), Some(&session)).is_err());
+    assert!(cdp.call("Fetch.fulfillRequest", json!({"requestId":"R-NEW","responseCode":200}), Some(&session)).is_err());
+    cdp.absorb(json!({
+        "method":"Fetch.requestPaused",
+        "sessionId":session,
+        "params":{
+            "requestId":"R-NEW",
+            "request":{"url":"https://ordinary.test/next","method":"GET","headers":{}},
+            "resourceType":"XHR",
+            "frameId":"PAGE"
+        }
+    }));
+    assert!(sent.borrow().iter().any(|command| {
+        command["method"] == "Fetch.continueRequest" && command["params"]["requestId"] == "R-NEW"
+    }));
 }
 
 #[test]

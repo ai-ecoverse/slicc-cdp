@@ -2656,11 +2656,24 @@ impl Cdp {
         }
     }
 
-    fn drain_session_pauses(&mut self, session_id: &str) {
+    fn session_keeps_page_live(&self, session_id: &str) -> bool {
+        self.session_target(session_id).is_some_and(|target| {
+            self.targets.get(&target).is_some_and(|info| {
+                matches!(info.get("type").and_then(Value::as_str), Some("page") | Some("tab"))
+            })
+        })
+    }
+
+    fn drain_session_pauses(&mut self, session_id: &str, cut: bool) {
         let queued: Vec<Paused> = self.paused.drain(..).collect();
         for paused in queued {
             if paused.session_id == session_id {
-                self.answer_protected(&paused);
+                if cut {
+                    self.answer_protected(&paused);
+                } else {
+                    self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
+                    self.continue_plain(&paused.session_id, &paused.request_id);
+                }
             } else {
                 self.paused.push_back(paused);
             }
@@ -2671,18 +2684,22 @@ impl Cdp {
     fn block(&mut self, session_id: &str) {
         let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
         self.webmcp_trace_decision("block", &target, session_id, "block session");
+        let keep_live = self.session_keeps_page_live(session_id);
         let newly_blocked = self.blocked.insert(session_id.to_string());
         if self.webmcp_is_paused(session_id) {
             self.webmcp.deferred.insert(session_id.to_string());
             self.webmcp_revoke(session_id);
-            self.drain_session_pauses(session_id);
+            self.drain_session_pauses(session_id, !keep_live);
             return;
         }
         self.webmcp_revoke(session_id);
         if let Some(target) = self.session_targets.get(session_id) {
             self.protected_targets.insert(target.clone());
         }
-        self.drain_session_pauses(session_id);
+        self.drain_session_pauses(session_id, !keep_live);
+        if keep_live {
+            return;
+        }
         if newly_blocked && !self.executing_sessions.contains(session_id) {
             self.detach_blocked(session_id);
         }
@@ -3288,7 +3305,7 @@ impl Cdp {
                     self.block(&session);
                 } else {
                     self.blocked.insert(session.clone());
-                    self.drain_session_pauses(&session);
+                    self.drain_session_pauses(&session, false);
                 }
             }
             let workers: Vec<String> = self
@@ -3388,6 +3405,12 @@ impl Cdp {
 
     fn answer_protected(&mut self, paused: &Paused) {
         self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
+        if self.session_keeps_page_live(&paused.session_id)
+            && (self.blocked.contains(&paused.session_id) || paused.resource_type != "Document")
+        {
+            self.continue_plain(&paused.session_id, &paused.request_id);
+            return;
+        }
         self.settle(&paused.session_id, &paused.request_id);
         let _ = self.send(
             "Fetch.failRequest",
@@ -4786,6 +4809,11 @@ impl Cdp {
                 }
                 return;
             }
+            if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
+                self.fail_seen_network(&value);
+                self.continue_plain(&paused.session_id, &paused.request_id);
+                return;
+            }
             if self.session_subtree_protected(&paused.session_id) {
                 self.answer_protected(&paused);
                 return;
@@ -4827,6 +4855,11 @@ impl Cdp {
     }
 
     fn decide_inline(&mut self, paused: Paused) {
+        if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
+            self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
+            self.continue_plain(&paused.session_id, &paused.request_id);
+            return;
+        }
         if self.session_subtree_protected(&paused.session_id) {
             self.answer_protected(&paused);
             return;
@@ -4837,6 +4870,11 @@ impl Cdp {
             return;
         };
         let decision = decider(&paused);
+        if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
+            self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
+            self.continue_plain(&paused.session_id, &paused.request_id);
+            return;
+        }
         if self.session_subtree_protected(&paused.session_id) {
             self.answer_protected(&paused);
             return;
@@ -4851,6 +4889,11 @@ impl Cdp {
                 (method, params, false)
             }
         };
+        if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
+            self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
+            self.continue_plain(&paused.session_id, &paused.request_id);
+            return;
+        }
         if self.session_subtree_protected(&paused.session_id) {
             self.answer_protected(&paused);
             return;
@@ -5124,6 +5167,7 @@ fn kept_security_origin(guard: &Protected, url: &str, origin: &str) -> bool {
 
 fn harmless(method: &str, params: &Value) -> bool {
     match method {
+        "Fetch.disable" => true,
         "Fetch.continueRequest" => params
             .as_object()
             .is_some_and(|object| object.keys().all(|key| key == "requestId")),
@@ -6371,19 +6415,23 @@ mod tests {
     }
 
     #[test]
-    fn fetch_disable_on_an_already_blocked_session_is_refused() {
+    fn a_harmless_call_on_an_already_blocked_session_still_waits_for_its_reply() {
         let mut cdp = pending(|message| match message["method"].as_str() {
             Some("Runtime.evaluate") => vec![json!({
                 "method": "Page.frameNavigated",
                 "sessionId": "S",
                 "params": { "frame": { "id": "F", "url": "https://seven.sliccy.ai/os/" } }
             })],
+            Some("Fetch.disable") => vec![
+                json!({ "method": "Page.lifecycleEvent", "sessionId": "S", "params": { "name": "load" } }),
+                json!({ "id": message["id"], "result": {} }),
+            ],
             _ => vec![],
         });
         let _ = evaluate(&mut cdp);
         assert!(cdp.session_blocked("S"));
         let disabled = cdp.call_for("Fetch.disable", json!({}), Some("S"), Duration::from_secs(30));
-        assert!(disabled.is_err(), "{disabled:?}");
+        assert_eq!(disabled.unwrap(), json!({}));
     }
 
     #[test]
