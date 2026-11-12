@@ -1118,21 +1118,25 @@ fn child_detached(state: &Rc<RefCell<BackendState>>) -> bool {
     state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD")
 }
 
-fn expect_parked_then_settled(run: &mut CheckpointRun, from: usize) -> Result<(), String> {
-    let pending = run.cdp.webmcp.arms.get("CHILD").and_then(|arm| arm.pending_install);
+fn expect_parked_for_late_origin(run: &mut CheckpointRun, from: usize) -> Result<(), String> {
     let domains = run.cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.domains);
-    if run.cdp.session_blocked("CHILD") {
-        return expect_settled(run, from, false);
-    }
-    if pending.is_none() { return Err("not-requested park has no deadline".into()); }
+    let pending = run.cdp.webmcp.arms.get("CHILD").and_then(|arm| arm.pending_install);
+    let park = run.cdp.webmcp.arms.get("CHILD").and_then(|arm| arm.pending_install_park);
+    if run.cdp.session_blocked("CHILD") { return Err("not-requested child settled before a late origin request".into()); }
     if domains { return Err("not-requested park sits with domains enabled".into()); }
+    if pending.is_some() || park.is_some() { return Err("not-requested park kept a settling deadline".into()); }
     if !enables_since(&run.state, from).is_empty() { return Err(format!("enabled after disturbance: {:?}", enables_since(&run.state, from))); }
     if shim_evals(&run.state, "CHILD") != 0 { return Err("shim sent for not-requested child".into()); }
-    if let Some(arm) = run.cdp.webmcp.arms.get_mut("CHILD") {
-        arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
-    }
     run.cdp.webmcp_sweep();
-    expect_settled(run, from, false)
+    if run.cdp.session_blocked("CHILD") { return Err("sweep settled a lazy not-requested park".into()); }
+    run.cdp.webmcp_request_origins(&["https://unrequested.test".into()]);
+    run.cdp.webmcp_sweep();
+    run.cdp.webmcp_install_children();
+    if run.cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted) != Some(1) {
+        return Err(format!("late origin request did not admit; admitted={:?}", run.cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted)));
+    }
+    if shim_evals(&run.state, "CHILD") != 1 { return Err(format!("late origin request shim evaluates={}", shim_evals(&run.state, "CHILD"))); }
+    Ok(())
 }
 
 fn expect_settled(run: &CheckpointRun, from: usize, shim_allowed: bool) -> Result<(), String> {
@@ -1163,14 +1167,11 @@ fn adopt_path_checkpoint_interleavings_settle_or_admit() {
     let mut failed = Vec::new();
     let mut total = 1usize;
     {
-        let label = "finding2-not-requested-parks-with-deadline";
+        let label = "finding2-not-requested-parks-for-late-origin";
         total += 1;
         let mut run = run_checkpoint_case(unrequested_tree(), None, None);
-        if let Err(reason) = expect_parked_then_settled(&mut run, 0) {
+        if let Err(reason) = expect_parked_for_late_origin(&mut run, 0) {
             failed.push(format!("{label}: {reason}"));
-        }
-        if !child_enables(&run.state, "CHILD").is_empty() {
-            failed.push(format!("{label}: not-requested child enabled {:?}", child_enables(&run.state, "CHILD")));
         }
     }
     for (index, point) in points.iter().enumerate() {
@@ -1187,7 +1188,7 @@ fn adopt_path_checkpoint_interleavings_settle_or_admit() {
                 failed.push(format!("{label}: disturbance never fired; trace={:?}", run.trace));
                 continue;
             };
-            let outcome = if parks { expect_parked_then_settled(&mut run, from) } else { expect_settled(&run, from, index >= evaluate) };
+            let outcome = if parks { expect_parked_for_late_origin(&mut run, from) } else { expect_settled(&run, from, index >= evaluate) };
             if let Err(reason) = outcome {
                 failed.push(format!("{label}: {reason} notices={}", run.cdp.take_notices().join("|")));
             }

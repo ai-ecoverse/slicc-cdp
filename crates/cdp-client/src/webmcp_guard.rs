@@ -1148,8 +1148,8 @@ impl Cdp {
         });
         let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
         self.webmcp.paused.remove(session);
-        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.pending_install = None; arm.pending_install_loader = None; arm.pending_install_park = None; }
         if let Err(message) = admitted {
+            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.pending_install = None; arm.pending_install_loader = None; arm.pending_install_park = None; }
             if Self::webmcp_foreign_refusal(&message) {
                 let _ = self.webmcp_enter_plain(session, &message, true).and_then(|_| self.webmcp_install_current(session));
             }
@@ -1160,6 +1160,9 @@ impl Cdp {
     }
 
     fn webmcp_mark_admitted(&mut self, session: &str, id: i64, expected: &Context, started: Instant) -> Result<(), String> {
+        if self.webmcp.parents.contains_key(session) {
+            self.webmcp_child_admissible(session)?;
+        }
         let target = self.session_target(session).ok_or_else(|| self.refusal())?;
         let context = self.webmcp.contexts.get(&(session.to_string(), id)).filter(|context| *context == expected).cloned().ok_or_else(|| self.refusal())?;
         let root = self.documents.get(&target).is_some_and(|document| document.frame_id == context.frame);
@@ -1278,7 +1281,10 @@ impl Cdp {
         if origin.is_empty() || origin == "null" || !self.webmcp.requested_origins.contains(&origin) {
             if domains { return Err(self.webmcp_child_refuse(child)); }
             if let Some(arm) = self.webmcp.arms.get_mut(child) {
-                if arm.pending_install.is_none() { arm.pending_install = arm.pending_install_park; }
+                arm.pending_install = None;
+                arm.pending_install_loader = None;
+                arm.pending_install_park = None;
+                arm.pending_install_restarts = 0;
             }
             return Ok(false);
         }
