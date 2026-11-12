@@ -4443,25 +4443,23 @@ fn storage_content(method: &str) -> bool {
 }
 
 fn kept_document(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return guard.url(text) };
+    let Some(mut url) = guard.peel(text) else { return true };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    if url.set_host(Some(&host)).is_err() { return true }
+    if url.set_username("").is_err() || url.set_password(None).is_err() { return true }
     if host.strip_suffix(".sliccy.ai").is_some_and(|label| label == "vault" || label.starts_with("vault-")) { return true }
-    if url.set_host(Some(&host)).is_err() { return false }
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    let seven = guard.own_origin(url.as_str()) || seven_page(url.as_str());
+    let seven = guard.own_origin(url.as_str()) || seven_host(url.as_str());
     seven && url.path().starts_with("/os/") && url.path() != "/os/callback.html"
 }
 
 fn seven_or_extra_host(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return false };
+    let Some(mut url) = guard.peel(text) else { return true };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
-    if url.set_host(Some(&host)).is_err() { return false }
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    guard.own_origin(url.as_str()) || seven_page(url.as_str())
+    if url.set_host(Some(&host)).is_err() { return true }
+    if url.set_username("").is_err() || url.set_password(None).is_err() { return true }
+    guard.own_origin(url.as_str()) || seven_host(url.as_str())
 }
 
 fn opaque_document(url: &str) -> bool {

@@ -19,8 +19,8 @@ const TABS: [(&str, &str, &str); 14] = [
     ("U", "browser_ui", "chrome://omnibox-popup.top-chrome/"),
     ("T", "page", "https://example.test/"),
 ];
-const CLOSABLE: [&str; 5] = ["P", "C", "W", "G", "N"];
-const KEPT: [&str; 7] = ["O", "D", "M", "L", "V", "X", "H"];
+const CLOSABLE: [&str; 4] = ["P", "C", "W", "G"];
+const KEPT: [&str; 8] = ["O", "D", "M", "L", "V", "X", "H", "N"];
 
 fn tab_info(target: &str) -> Value {
     let (id, kind, url) = TABS.iter().find(|(id, _, _)| *id == target).copied().unwrap_or(("T", "page", "https://example.test/"));
@@ -369,6 +369,29 @@ fn seven_ui_with_userinfo_stays_unclosable() {
     let (mut cdp, sent, _, _) = close_probe(url);
     assert!(cdp.target_protected("T", false).unwrap(), "{url}");
     refuse_close(&mut cdp, &sent, url);
+}
+
+#[test]
+fn userinfo_on_kept_origins_stays_unclosable() {
+    for url in [
+        "http://user:pass@127.0.0.1:8085/os/index.html",
+        "http://user:pass@seven.sliccy.ai:9443/os/",
+        "https://user:pass@seven.sliccy.ai/os/index.html",
+        "http://user:pass@vault.sliccy.ai:8080/secret",
+        "https://user:pass@vault.sliccy.ai/app?k=SECRET",
+    ] {
+        let (mut cdp, sent, _, _) = close_probe(url);
+        assert!(cdp.target_protected("T", false).unwrap(), "{url}");
+        refuse_close(&mut cdp, &sent, url);
+    }
+}
+
+#[test]
+fn userinfo_on_seven_callback_stays_closable() {
+    let url = "https://user:pass@seven.sliccy.ai/os/callback.html?code=SECRET";
+    let (mut cdp, sent, _, _) = close_probe(url);
+    assert!(cdp.target_protected("T", false).unwrap(), "{url}");
+    allow_close(&mut cdp, &sent, url);
 }
 
 #[test]
