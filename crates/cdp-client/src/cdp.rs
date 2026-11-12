@@ -1720,7 +1720,9 @@ impl Cdp {
     }
 
     fn closable_tab(&mut self, target_id: &str) -> Option<bool> {
-        let Some((url, doc)) = self.refresh_close_proof(target_id) else { return None };
+        let Some((url, doc)) = self.refresh_close_proof(target_id)? else {
+            return Some(false);
+        };
         if doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url)) {
             self.protect_target(target_id);
             return Some(false);
@@ -1732,7 +1734,7 @@ impl Cdp {
         let kept_now = kept_document(&self.guard, &url)
             || kept_document(&self.guard, &doc.url)
             || kept_security_origin(&self.guard, &doc.url, &doc.origin)
-            || (opaque_document(&doc.url) || non_http_document(&doc.url)) && doc.previous;
+            || inheriting_document(&self.guard, &doc.url) && doc.previous;
         if !kept_now {
             return Some(true);
         }
@@ -1755,19 +1757,30 @@ impl Cdp {
         }
     }
 
-    fn refresh_close_proof(&mut self, target_id: &str) -> Option<(String, MainDocument)> {
-        let info = self
-            .raw_call("Target.getTargetInfo", json!({ "targetId": target_id }), None, DOCUMENT_CHECK)
-            .ok()
-            .and_then(|found| found.get("targetInfo").cloned())
-            .filter(Value::is_object)?;
+    fn refresh_close_proof(&mut self, target_id: &str) -> Option<Option<(String, MainDocument)>> {
+        let info = match self.raw_call("Target.getTargetInfo", json!({ "targetId": target_id }), None, DOCUMENT_CHECK) {
+            Ok(found) => found.get("targetInfo").cloned().filter(Value::is_object),
+            Err(_) => return Some(None),
+        };
+        let Some(info) = info else { return Some(None) };
+        self.targets.insert(target_id.to_string(), info.clone());
         if info.get("type").and_then(Value::as_str) != Some("page") {
             return None;
         }
-        self.targets.insert(target_id.to_string(), info.clone());
         let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-        let frame = self.read_close_frame(target_id)?;
-        let frame_id = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?.to_string();
+        let kept_info = kept_document(&self.guard, &url);
+        let Some(frame) = self.read_close_frame(target_id) else {
+            if kept_info {
+                self.protect_target(target_id);
+            }
+            return Some(None);
+        };
+        let Some(frame_id) = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string) else {
+            if kept_info {
+                self.protect_target(target_id);
+            }
+            return Some(None);
+        };
         let frame_url = format!(
             "{}{}",
             frame.get("url").and_then(Value::as_str).unwrap_or(""),
@@ -1790,7 +1803,7 @@ impl Cdp {
             probed,
         };
         self.documents.insert(target_id.to_string(), doc.clone());
-        Some((url, doc))
+        Some(Some((url, doc)))
     }
 
     fn read_close_frame(&mut self, target: &str) -> Option<Value> {
@@ -4294,9 +4307,13 @@ fn non_http_document(url: &str) -> bool {
     !matches!(parsed.scheme(), "http" | "https")
 }
 
+fn inheriting_document(guard: &Protected, url: &str) -> bool {
+    opaque_document(url) || non_http_document(url) || guard.inheriting(url)
+}
+
 fn kept_security_origin(guard: &Protected, url: &str, origin: &str) -> bool {
     kept_document(guard, origin)
-        || (opaque_document(url) || non_http_document(url)) && seven_or_extra_host(guard, origin)
+        || inheriting_document(guard, url) && seven_or_extra_host(guard, origin)
 }
 
 fn harmless(method: &str, params: &Value) -> bool {

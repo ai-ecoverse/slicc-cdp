@@ -345,6 +345,15 @@ mod tests {
                     }]
                 }),
                 "Target.getTargets" => json!({ "targetInfos": [] }),
+                "Target.getTargetInfo" => {
+                    let target = params.get("targetId").and_then(Value::as_str).unwrap_or("TAB1");
+                    let (url, title) = if pages {
+                        ("https://app.example/", "App")
+                    } else {
+                        ("about:blank", "")
+                    };
+                    json!({"targetInfo":{"targetId":target,"type":"page","url":url,"title":title}})
+                }
                 "Target.createTarget" => json!({ "targetId": "TAB1" }),
                 "Target.attachToTarget" => {
                     let calls = log.lock().unwrap();
