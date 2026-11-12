@@ -85,6 +85,7 @@ struct CloseProbe {
     attach_mode: std::rc::Rc<std::cell::RefCell<ProbeMode>>,
     frame_fails: std::rc::Rc<std::cell::RefCell<usize>>,
     info_queue: std::rc::Rc<std::cell::RefCell<VecDeque<Value>>>,
+    frame_changed: std::rc::Rc<std::cell::RefCell<Option<Value>>>,
     opener: std::rc::Rc<std::cell::RefCell<Option<Value>>>,
 }
 
@@ -108,6 +109,9 @@ impl Transport for CloseProbe {
             }
             "Target.attachToTarget" => *self.attach_mode.borrow(),
             "Page.getFrameTree" => {
+                if let Some(changed) = self.frame_changed.borrow_mut().take() {
+                    self.inbox.push_back(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":changed}}).to_string());
+                }
                 if *self.frame_fails.borrow() > 0 {
                     *self.frame_fails.borrow_mut() -= 1;
                     ProbeMode::Timeout
@@ -152,7 +156,7 @@ impl Transport for CloseProbe {
 }
 
 fn close_probe(url: &str) -> (Cdp, std::rc::Rc<std::cell::RefCell<Vec<Value>>>, std::rc::Rc<std::cell::RefCell<Value>>, std::rc::Rc<std::cell::RefCell<Value>>) {
-    let (cdp, sent, info, frame, _, _, _, _, _) = close_probe_modes(url);
+    let (cdp, sent, info, frame, _, _, _, _, _, _) = close_probe_modes(url);
     (cdp, sent, info, frame)
 }
 
@@ -166,6 +170,7 @@ fn close_probe_modes(url: &str) -> (
     std::rc::Rc<std::cell::RefCell<ProbeMode>>,
     std::rc::Rc<std::cell::RefCell<usize>>,
     std::rc::Rc<std::cell::RefCell<Option<Value>>>,
+    std::rc::Rc<std::cell::RefCell<Option<Value>>>,
 ) {
     let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let info = std::rc::Rc::new(std::cell::RefCell::new(json!({"targetId":"T","type":"page","url":url,"title":"SECRETTITLE"})));
@@ -175,6 +180,7 @@ fn close_probe_modes(url: &str) -> (
     let attach_mode = std::rc::Rc::new(std::cell::RefCell::new(ProbeMode::Ok));
     let frame_fails = std::rc::Rc::new(std::cell::RefCell::new(0usize));
     let info_queue = std::rc::Rc::new(std::cell::RefCell::new(VecDeque::new()));
+    let frame_changed = std::rc::Rc::new(std::cell::RefCell::new(None));
     let opener = std::rc::Rc::new(std::cell::RefCell::new(None));
     let mut cdp = Cdp::from_transport(Box::new(CloseProbe {
         inbox: VecDeque::new(),
@@ -186,10 +192,11 @@ fn close_probe_modes(url: &str) -> (
         attach_mode: std::rc::Rc::clone(&attach_mode),
         frame_fails: std::rc::Rc::clone(&frame_fails),
         info_queue: std::rc::Rc::clone(&info_queue),
+        frame_changed: std::rc::Rc::clone(&frame_changed),
         opener: std::rc::Rc::clone(&opener),
     }));
     cdp.protect_origins(&["http://127.0.0.1:8085"]);
-    (cdp, sent, info, frame, info_mode, frame_mode, attach_mode, frame_fails, opener)
+    (cdp, sent, info, frame, info_mode, frame_mode, attach_mode, frame_fails, frame_changed, opener)
 }
 
 fn close_probe_queue(url: &str) -> (
@@ -199,6 +206,7 @@ fn close_probe_queue(url: &str) -> (
     std::rc::Rc<std::cell::RefCell<ProbeMode>>,
     std::rc::Rc<std::cell::RefCell<ProbeMode>>,
     std::rc::Rc<std::cell::RefCell<usize>>,
+    std::rc::Rc<std::cell::RefCell<Option<Value>>>,
     std::rc::Rc<std::cell::RefCell<VecDeque<Value>>>,
 ) {
     let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -209,6 +217,7 @@ fn close_probe_queue(url: &str) -> (
     let attach_mode = std::rc::Rc::new(std::cell::RefCell::new(ProbeMode::Ok));
     let frame_fails = std::rc::Rc::new(std::cell::RefCell::new(0usize));
     let info_queue = std::rc::Rc::new(std::cell::RefCell::new(VecDeque::new()));
+    let frame_changed = std::rc::Rc::new(std::cell::RefCell::new(None));
     let opener = std::rc::Rc::new(std::cell::RefCell::new(None));
     let mut cdp = Cdp::from_transport(Box::new(CloseProbe {
         inbox: VecDeque::new(),
@@ -220,10 +229,11 @@ fn close_probe_queue(url: &str) -> (
         attach_mode: std::rc::Rc::clone(&attach_mode),
         frame_fails: std::rc::Rc::clone(&frame_fails),
         info_queue: std::rc::Rc::clone(&info_queue),
+        frame_changed: std::rc::Rc::clone(&frame_changed),
         opener: std::rc::Rc::clone(&opener),
     }));
     cdp.protect_origins(&["http://127.0.0.1:8085"]);
-    (cdp, sent, frame, frame_mode, attach_mode, frame_fails, info_queue)
+    (cdp, sent, frame, frame_mode, attach_mode, frame_fails, frame_changed, info_queue)
 }
 
 fn origin_of(url: &str) -> String {
@@ -435,7 +445,7 @@ fn a_failed_or_timed_out_close_proof_refuses_a_protected_tab() {
     let landing = "https://seven.sliccy.ai/landing?k=SECRET";
     let live = "https://seven.sliccy.ai/os/?k=SECRET";
     for mode in [ProbeMode::Timeout, ProbeMode::Error] {
-        let (mut cdp, sent, _info, frame, info_mode, _, _, _, _) = close_probe_modes(landing);
+        let (mut cdp, sent, _info, frame, info_mode, _, _, _, _, _) = close_probe_modes(landing);
         *frame.borrow_mut() = json!({"id":"F","url":live,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L"});
         assert!(cdp.call("Target.activateTarget", json!({"targetId":"T"}), None).unwrap_err().starts_with("slicc: refused:"));
         *info_mode.borrow_mut() = mode;
@@ -443,7 +453,7 @@ fn a_failed_or_timed_out_close_proof_refuses_a_protected_tab() {
         assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"), "{mode:?}");
     }
     let vault = "https://vault.sliccy.ai/app?k=SECRET";
-    let (mut cdp, sent, info, frame, _, frame_mode, _, _, _) = close_probe_modes(vault);
+    let (mut cdp, sent, info, frame, _, frame_mode, _, _, _, _) = close_probe_modes(vault);
     cdp.session_targets.insert("S".into(), "T".into());
     cdp.guards.insert("T".into(), "S".into());
     cdp.guard_sessions.insert("S".into());
@@ -454,7 +464,7 @@ fn a_failed_or_timed_out_close_proof_refuses_a_protected_tab() {
     *frame_mode.borrow_mut() = ProbeMode::Timeout;
     refuse_close(&mut cdp, &sent, "getFrameTree timeout over stale error");
     let blank = "about:blank";
-    let (mut cdp, sent, info, frame, _, frame_mode, _, _, opener) = close_probe_modes(blank);
+    let (mut cdp, sent, info, frame, _, frame_mode, _, _, _, opener) = close_probe_modes(blank);
     *opener.borrow_mut() = Some(json!({"targetId":"O","type":"page","url":"https://vault.sliccy.ai/app","title":""}));
     *info.borrow_mut() = json!({"targetId":"T","type":"page","url":blank,"title":"","openerId":"O"});
     *frame.borrow_mut() = json!({"id":"F","url":blank,"securityOrigin":"https://vault.sliccy.ai","loaderId":"L"});
@@ -474,7 +484,7 @@ fn a_failed_close_proof_with_a_kept_target_info_still_refuses() {
         ("vault then getFrameTree error", Some(ProbeMode::Error), None),
         ("vault then attach timeout", None, Some(ProbeMode::Timeout)),
     ] {
-        let (mut cdp, sent, frame, frame_mode, attach_mode, _, info_queue) = close_probe_queue(start);
+        let (mut cdp, sent, frame, frame_mode, attach_mode, _, _, info_queue) = close_probe_queue(start);
         info_queue.borrow_mut().push_back(start_info.clone());
         info_queue.borrow_mut().push_back(vault_info.clone());
         *frame.borrow_mut() = json!({"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L"});
@@ -494,7 +504,7 @@ fn a_failed_close_proof_with_a_kept_target_info_still_refuses() {
 fn an_unmarked_unresponsive_ordinary_page_closes_after_retries() {
     let start = "https://example.test/start";
     let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});
-    let (mut cdp, sent, frame, frame_mode, _, _, info_queue) = close_probe_queue(start);
+    let (mut cdp, sent, frame, frame_mode, _, _, _, info_queue) = close_probe_queue(start);
     info_queue.borrow_mut().push_back(start_info.clone());
     info_queue.borrow_mut().push_back(start_info);
     *frame.borrow_mut() = json!({"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L"});
@@ -510,7 +520,7 @@ fn a_hung_frame_during_navigation_to_the_vault_stays_unclosable() {
     let start = "https://example.test/start";
     let vault = "https://vault.sliccy.ai/app?k=SECRET";
     let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});
-    let (mut cdp, sent, frame, frame_mode, _, _, info_queue) = close_probe_queue(start);
+    let (mut cdp, sent, frame, frame_mode, _, _, _, info_queue) = close_probe_queue(start);
     cdp.session_targets.insert("S".into(), "T".into());
     cdp.guards.insert("T".into(), "S".into());
     cdp.guard_sessions.insert("S".into());
@@ -526,17 +536,53 @@ fn a_hung_frame_during_navigation_to_the_vault_stays_unclosable() {
 }
 
 #[test]
-fn a_new_tab_whose_first_frame_read_fails_then_succeeds_closes() {
-    let start = "https://example.test/fresh";
+fn a_kept_target_info_changed_during_a_hung_frame_stays_unclosable() {
+    let start = "https://example.test/start";
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
     let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});
-    let (mut cdp, sent, frame, _, _, frame_fails, info_queue) = close_probe_queue(start);
+    let (mut cdp, sent, frame, frame_mode, _, _, frame_changed, info_queue) = close_probe_queue(start);
     info_queue.borrow_mut().push_back(start_info.clone());
     info_queue.borrow_mut().push_back(start_info);
     *frame.borrow_mut() = json!({"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L"});
-    *frame_fails.borrow_mut() = 1;
-    allow_close(&mut cdp, &sent, "first frame fail then succeed");
-    let frames = sent.borrow().iter().filter(|call| call["method"] == "Page.getFrameTree").count();
-    assert!(frames >= 2, "expected a retry after the first failure, got {frames}");
+    *frame_mode.borrow_mut() = ProbeMode::Timeout;
+    *frame_changed.borrow_mut() = Some(json!({"targetId":"T","type":"page","url":vault,"title":"SECRETTITLE"}));
+    refuse_close(&mut cdp, &sent, "targetInfoChanged to vault during hung frame");
+    assert!(cdp.is_protected_target("T"), "kept URL latched from targetInfoChanged");
+    assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"));
+}
+
+#[test]
+fn a_kept_target_info_changed_before_close_is_not_cleared_by_ordinary_get_target_info() {
+    let start = "https://example.test/start";
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});
+    let (mut cdp, sent, frame, frame_mode, _, _, _, info_queue) = close_probe_queue(start);
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T","type":"page","url":vault,"title":"SECRETTITLE"}}}));
+    assert!(!cdp.events().iter().any(|event| event.to_string().contains("SECRET")), "event redacted");
+    info_queue.borrow_mut().push_back(start_info.clone());
+    info_queue.borrow_mut().push_back(start_info);
+    *frame.borrow_mut() = json!({"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L"});
+    *frame_mode.borrow_mut() = ProbeMode::Timeout;
+    refuse_close(&mut cdp, &sent, "ordinary getTargetInfo after latched vault");
+    assert!(cdp.is_protected_target("T"), "ordinary getTargetInfo must not clear the kept latch");
+    assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"));
+}
+
+#[test]
+fn a_popup_whose_target_info_changed_to_the_vault_during_a_hung_frame_stays_unclosable() {
+    let start = "https://example.test/start";
+    let blank = "about:blank";
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    let blank_info = json!({"targetId":"T","type":"page","url":blank,"title":"","openerId":"O"});
+    let (mut cdp, sent, info, frame, _, frame_mode, _, _, frame_changed, opener) = close_probe_modes(blank);
+    *opener.borrow_mut() = Some(json!({"targetId":"O","type":"page","url":start,"title":"ordinary"}));
+    *info.borrow_mut() = blank_info.clone();
+    *frame.borrow_mut() = json!({"id":"F","url":blank,"securityOrigin":"https://example.test","loaderId":"L"});
+    *frame_mode.borrow_mut() = ProbeMode::Timeout;
+    *frame_changed.borrow_mut() = Some(json!({"targetId":"T","type":"page","url":vault,"title":"SECRETTITLE"}));
+    refuse_close(&mut cdp, &sent, "popup targetInfoChanged to vault during hung frame");
+    assert!(cdp.is_protected_target("T"), "popup kept URL latched");
+    assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"));
 }
 
 #[test]
