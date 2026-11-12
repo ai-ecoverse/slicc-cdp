@@ -449,6 +449,54 @@ fn about_blank_with_a_kept_security_origin_stays_unclosable() {
 }
 
 #[test]
+fn about_blank_popup_with_vault_opener_and_opaque_origin_stays_unclosable() {
+    let blank = "about:blank";
+    let vault = "http://vault.sliccy.ai:9443/blank-open?n=tag";
+    let (mut cdp, sent, info, frame, _, _, _, _, _, opener) = close_probe_modes(blank);
+    *opener.borrow_mut() = Some(json!({"targetId":"O","type":"page","url":vault,"title":"SECRETTITLE"}));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":blank,"title":"","openerId":"O"});
+    *frame.borrow_mut() = json!({"id":"F","url":blank,"securityOrigin":"://","loaderId":"L"});
+    refuse_close(&mut cdp, &sent, "blank with vault opener and :// origin");
+    assert!(cdp.is_protected_target("T"));
+}
+
+#[test]
+fn about_blank_popup_with_vault_opener_stays_unclosable_when_frame_read_fails() {
+    let blank = "about:blank";
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    for mode in [ProbeMode::Timeout, ProbeMode::Error] {
+        let (mut cdp, sent, info, frame, _, frame_mode, _, _, _, opener) = close_probe_modes(blank);
+        *opener.borrow_mut() = Some(json!({"targetId":"O","type":"page","url":vault,"title":"SECRETTITLE"}));
+        *info.borrow_mut() = json!({"targetId":"T","type":"page","url":blank,"title":"","openerId":"O"});
+        *frame.borrow_mut() = json!({"id":"F","url":blank,"securityOrigin":"://","loaderId":"L"});
+        *frame_mode.borrow_mut() = mode;
+        refuse_close(&mut cdp, &sent, &format!("blank vault opener frame {mode:?}"));
+        assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"), "{mode:?}");
+    }
+}
+
+#[test]
+fn empty_popup_with_kept_opener_frame_stays_unclosable() {
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    let (mut cdp, sent, info, frame) = close_probe("");
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":"","title":"","openerFrameId":"OF"});
+    *frame.borrow_mut() = json!({"id":"F","url":"","securityOrigin":"://","loaderId":"L"});
+    cdp.frames.insert("OF".into(), vec![vault.to_string(), "https://vault.sliccy.ai".into()]);
+    refuse_close(&mut cdp, &sent, "empty url with kept openerFrameId");
+    assert!(cdp.is_protected_target("T"));
+}
+
+#[test]
+fn about_blank_popup_with_ordinary_opener_stays_closable() {
+    let blank = "about:blank";
+    let (mut cdp, sent, info, frame, _, _, _, _, _, opener) = close_probe_modes(blank);
+    *opener.borrow_mut() = Some(json!({"targetId":"O","type":"page","url":"https://example.test/start","title":"ordinary"}));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":blank,"title":"","openerId":"O"});
+    *frame.borrow_mut() = json!({"id":"F","url":blank,"securityOrigin":"://","loaderId":"L"});
+    allow_close(&mut cdp, &sent, "blank with ordinary opener");
+}
+
+#[test]
 fn intended_protected_closes_still_work_after_kept_hardening() {
     for url in [
         "http://127.0.0.1:8085/?code=SECRET",
