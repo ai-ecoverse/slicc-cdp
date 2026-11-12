@@ -49,10 +49,10 @@ struct BackendState {
     fail_child_page_enable: bool,
     replace_oopif_tree_on_child_page_enable: Option<Value>,
     after_child_page_enable: bool,
-    delay_first_holder_get_frame_tree_after_child_page_enable: Option<Duration>,
-    delay_first_child_get_frame_tree_after_page_enable: Option<Duration>,
-    delay_nth_child_get_frame_tree_after_page_enable: Option<(usize, Duration)>,
-    child_get_frame_tree_after_page_enable_count: usize,
+    delay_holder_get_frame_tree_after_child_page_enable: Option<Duration>,
+    delay_child_get_frame_tree_after_load_network: Option<Duration>,
+    pending_observe_tree_delay: bool,
+    get_frame_tree_delay_hook: Option<Rc<RefCell<Option<Box<dyn FnMut()>>>>>,
 }
 
 impl BackendState {
@@ -204,37 +204,54 @@ impl Transport for Backend {
                     return Ok(());
                 }
                 let session = command["sessionId"].as_str().unwrap_or("");
+                let mut delay = None;
                 if BackendState::child_session(session) {
                     state.child_get_frame_tree_count += 1;
                     let count = state.child_get_frame_tree_count;
-                    if let Some(delay) = state.child_get_frame_tree_delay {
-                        std::thread::sleep(delay);
+                    if let Some(wait) = state.child_get_frame_tree_delay {
+                        delay = Some(wait);
                     }
-                    if let Some((nth, delay)) = state.child_get_frame_tree_nth_delay {
-                        if count == nth {
-                            std::thread::sleep(delay);
+                    if let Some((nth, wait)) = state.child_get_frame_tree_nth_delay {
+                        if count == nth { delay = Some(wait); }
+                    }
+                    if state.pending_observe_tree_delay {
+                        if let Some(wait) = state.delay_child_get_frame_tree_after_load_network.take() {
+                            state.pending_observe_tree_delay = false;
+                            delay = Some(wait);
                         }
                     }
-                    if state.after_child_page_enable {
-                        state.child_get_frame_tree_after_page_enable_count += 1;
-                        let after = state.child_get_frame_tree_after_page_enable_count;
-                        if let Some(delay) = state.delay_first_child_get_frame_tree_after_page_enable.take() {
-                            std::thread::sleep(delay);
+                    let tree = if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() };
+                    let hook = delay.as_ref().and_then(|_| state.get_frame_tree_delay_hook.clone());
+                    let id = command["id"].clone();
+                    drop(state);
+                    if let Some(wait) = delay {
+                        if let Some(hook) = hook {
+                            if let Some(callback) = hook.borrow_mut().as_mut() { callback(); }
                         }
-                        if let Some((nth, delay)) = state.delay_nth_child_get_frame_tree_after_page_enable {
-                            if after == nth {
-                                std::thread::sleep(delay);
-                            }
-                        }
+                        std::thread::sleep(wait);
                     }
-                    if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
+                    let mut state = self.0.borrow_mut();
+                    state.inbox.push_back(json!({"id":id,"result":tree}).to_string());
+                    return Ok(());
                 } else {
                     if state.after_child_page_enable {
-                        if let Some(delay) = state.delay_first_holder_get_frame_tree_after_child_page_enable.take() {
-                            std::thread::sleep(delay);
+                        if let Some(wait) = state.delay_holder_get_frame_tree_after_child_page_enable.take() {
+                            delay = Some(wait);
                         }
                     }
-                    state.tree.clone()
+                    let tree = state.tree.clone();
+                    let hook = delay.as_ref().and_then(|_| state.get_frame_tree_delay_hook.clone());
+                    let id = command["id"].clone();
+                    drop(state);
+                    if let Some(wait) = delay {
+                        if let Some(hook) = hook {
+                            if let Some(callback) = hook.borrow_mut().as_mut() { callback(); }
+                        }
+                        std::thread::sleep(wait);
+                    }
+                    let mut state = self.0.borrow_mut();
+                    state.inbox.push_back(json!({"id":id,"result":tree}).to_string());
+                    return Ok(());
                 }
             }
             "Network.enable" => {
@@ -354,15 +371,21 @@ impl Transport for Backend {
                     return Ok(());
                 }
             },
-            "Network.loadNetworkResource" => match state.load_network_headers.as_ref() {
-                Some(Value::Null) => json!({"resource":{"success":true}}),
-                Some(headers) => {
-                    let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
-                    let mut clean = headers.clone();
-                    if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
-                    json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+            "Network.loadNetworkResource" => {
+                let session = command["sessionId"].as_str().unwrap_or("");
+                if BackendState::child_session(session) && state.delay_child_get_frame_tree_after_load_network.is_some() {
+                    state.pending_observe_tree_delay = true;
                 }
-                None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+                match state.load_network_headers.as_ref() {
+                    Some(Value::Null) => json!({"resource":{"success":true}}),
+                    Some(headers) => {
+                        let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
+                        let mut clean = headers.clone();
+                        if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
+                        json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+                    }
+                    None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+                }
             },
             "Debugger.resume" => {
                 if state.context_race == "resume" && state.api {

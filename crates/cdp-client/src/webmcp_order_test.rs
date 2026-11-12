@@ -849,19 +849,39 @@ fn runtime_enable_reentry_does_not_evaluate_before_page_enable() {
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted > 0 && !arm.enabling));
 }
 
+fn short_deadline_on_delayed_frame_tree(cdp: &mut Cdp, state: &Rc<RefCell<BackendState>>) {
+    let cdp_ptr = Rc::new(RefCell::new(std::ptr::null_mut::<Cdp>()));
+    let hook = Rc::new(RefCell::new(None));
+    {
+        let cdp_ptr = cdp_ptr.clone();
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let ptr = *cdp_ptr.borrow();
+            if !ptr.is_null() {
+                unsafe {
+                    if let Some(arm) = (*ptr).webmcp.arms.get_mut("CHILD") {
+                        arm.pending_install = Some(Instant::now() + Duration::from_millis(40));
+                    }
+                }
+            }
+        }) as Box<dyn FnMut()>);
+    }
+    state.borrow_mut().get_frame_tree_delay_hook = Some(hook);
+    *cdp_ptr.borrow_mut() = cdp as *mut Cdp;
+}
+
 #[test]
 fn deadline_during_post_enable_parent_root_read_settles_without_shim() {
     let (mut cdp, state) = client();
     state.borrow_mut().chrome_shaped_lifecycle = true;
-    state.borrow_mut().delay_first_holder_get_frame_tree_after_child_page_enable = Some(Duration::from_millis(200));
+    state.borrow_mut().delay_holder_get_frame_tree_after_child_page_enable = Some(Duration::from_millis(200));
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
     let holder = reconcile_holder(&mut cdp);
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
     if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
-        arm.pending_install = Some(Instant::now() + Duration::from_millis(80));
         arm.promote_read_at = None;
     }
+    short_deadline_on_delayed_frame_tree(&mut cdp, &state);
     state.borrow_mut().oopif_tree = Some(cross_tree());
     cdp.webmcp_sweep();
     assert!(cdp.session_blocked("CHILD"), "deadline during parent root read must settle");
@@ -874,15 +894,15 @@ fn deadline_during_post_enable_parent_root_read_settles_without_shim() {
 fn deadline_during_post_enable_child_policy_read_settles_without_shim() {
     let (mut cdp, state) = client();
     state.borrow_mut().chrome_shaped_lifecycle = true;
-    state.borrow_mut().delay_nth_child_get_frame_tree_after_page_enable = Some((3, Duration::from_millis(200)));
+    state.borrow_mut().delay_child_get_frame_tree_after_load_network = Some(Duration::from_millis(200));
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
     let holder = reconcile_holder(&mut cdp);
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
     if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
-        arm.pending_install = Some(Instant::now() + Duration::from_millis(80));
         arm.promote_read_at = None;
     }
+    short_deadline_on_delayed_frame_tree(&mut cdp, &state);
     state.borrow_mut().oopif_tree = Some(cross_tree());
     cdp.webmcp_sweep();
     assert!(cdp.session_blocked("CHILD"), "deadline during post-enable child tree read must settle");

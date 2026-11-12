@@ -62,6 +62,7 @@ struct Arm {
     pending_contexts: BTreeMap<i64, Instant>,
     pending_install: Option<Instant>,
     pending_install_loader: Option<String>,
+    pending_install_park: Option<Instant>,
     pending_install_restarts: u8,
     pending_frames: BTreeMap<String, (String, Instant)>,
     accepted: BTreeSet<(String, String, String)>,
@@ -517,6 +518,7 @@ impl Cdp {
         if let Some(arm) = self.webmcp.arms.get_mut(child) {
             arm.pending_install = None;
             arm.pending_install_loader = None;
+            arm.pending_install_park = None;
             arm.pending_install_restarts = 0;
             arm.pending_contexts.clear();
             arm.pending_frames.clear();
@@ -570,7 +572,7 @@ impl Cdp {
         let source = format!("const {bridge} = {shim};");
         let mut loaders = BTreeMap::new();
         Self::webmcp_loaders(&seed["frameTree"], &mut loaders);
-        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_install_restarts: 0, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new(), context_generation: 0, frame_accept_generation: BTreeMap::new(), domains: true, enabling: false, promote_read_at: None });
+        self.webmcp.arms.insert(session.to_string(), Arm { source, bridge: bridge.clone(), identifier: None, conversion: None, plain: false, direct_child_attach: false, root_identity: None, pending_children: BTreeMap::new(), child_done: BTreeSet::new(), admitted: 0, revoked: false, revoked_at: None, revoked_reason: None, pending_contexts: BTreeMap::new(), pending_install: None, pending_install_loader: None, pending_install_park: None, pending_install_restarts: 0, pending_frames: BTreeMap::new(), accepted: BTreeSet::new(), installing: BTreeSet::new(), loaders, documents: BTreeMap::new(), parked_origin: String::new(), context_generation: 0, frame_accept_generation: BTreeMap::new(), domains: true, enabling: false, promote_read_at: None });
         self.call_for("Runtime.disable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Runtime.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
         self.call_for("Page.enable", json!({}), Some(session), DOCUMENT_CHECK)?;
@@ -968,7 +970,7 @@ impl Cdp {
             })
         });
         if converted.is_err() {
-            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.conversion = None; arm.pending_install = None; arm.pending_install_loader = None; }
+            if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.conversion = None; arm.pending_install = None; arm.pending_install_loader = None; arm.pending_install_park = None; }
             let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
         }
         self.webmcp.paused.remove(session);
@@ -1131,7 +1133,7 @@ impl Cdp {
         });
         let _ = self.raw_call("Debugger.resume", json!({}), Some(session), DOCUMENT_CHECK);
         self.webmcp.paused.remove(session);
-        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.pending_install = None; arm.pending_install_loader = None; }
+        if let Some(arm) = self.webmcp.arms.get_mut(session) { arm.pending_install = None; arm.pending_install_loader = None; arm.pending_install_park = None; }
         if let Err(message) = admitted {
             if Self::webmcp_foreign_refusal(&message) {
                 let _ = self.webmcp_enter_plain(session, &message, true).and_then(|_| self.webmcp_install_current(session));
@@ -1150,6 +1152,7 @@ impl Cdp {
         if root { arm.root_identity = Some((target.clone(), context.clone())); }
         arm.pending_install = None;
         arm.pending_install_loader = None;
+        arm.pending_install_park = None;
         arm.pending_install_restarts = 0;
         arm.pending_contexts.remove(&id);
         arm.pending_frames.remove(&context.frame);
@@ -1269,6 +1272,7 @@ impl Cdp {
             pending_contexts: BTreeMap::new(),
             pending_install: None,
             pending_install_loader: None,
+            pending_install_park: None,
             pending_install_restarts: 0,
             pending_frames: BTreeMap::new(),
             accepted: BTreeSet::new(),
@@ -1373,7 +1377,9 @@ impl Cdp {
         let Some(arm) = self.webmcp.arms.get_mut(child) else { return; };
         if arm.revoked || arm.admitted > 0 { return; }
         if arm.pending_install.is_none() {
-            arm.pending_install = Some(Instant::now() + PROVISIONAL_PARK);
+            let park = Instant::now() + PROVISIONAL_PARK;
+            arm.pending_install = Some(park);
+            arm.pending_install_park = Some(park);
         }
     }
 
@@ -1503,7 +1509,11 @@ impl Cdp {
         let Some(arm) = self.webmcp.arms.get_mut(child) else { return; };
         if arm.revoked || arm.admitted > 0 { return; }
         if !loader.is_empty() { arm.pending_install_loader = Some(loader.to_string()); }
-        let due = Instant::now() + DOCUMENT_CHECK;
+        if arm.pending_install_park.is_none() {
+            arm.pending_install_park = Some(Instant::now() + PROVISIONAL_PARK);
+        }
+        let step = Instant::now() + DOCUMENT_CHECK;
+        let due = arm.pending_install_park.map(|park| step.min(park)).unwrap_or(step);
         if arm.pending_install.is_none() {
             arm.pending_install = Some(due);
             return;
@@ -1547,6 +1557,7 @@ impl Cdp {
             if let Some(arm) = self.webmcp.arms.get_mut(child) {
                 arm.pending_install = None;
                 arm.pending_install_loader = None;
+                arm.pending_install_park = None;
             }
             return Ok(false);
         }
