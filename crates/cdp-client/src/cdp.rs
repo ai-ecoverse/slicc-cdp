@@ -1051,12 +1051,10 @@ impl Cdp {
                         match self.closable_tab(&target) {
                             Some(true) => {}
                             Some(false) => {
-                                let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
-                                return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                                return Err(self.close_refusal(&target));
                             }
                             None if protected => {
-                                let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
-                                return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                                return Err(self.close_refusal(&target));
                             }
                             None => {}
                         }
@@ -1719,6 +1717,15 @@ impl Cdp {
         self.guard.target(url, previous, opener)
     }
 
+    fn close_refusal(&self, target: &str) -> String {
+        let url = self.targets.get(target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+        if self.protected_targets.contains(target) || kept_document(&self.guard, url) {
+            format!("{}\n", self.guard.refusal_for_url(url))
+        } else {
+            self.unverified()
+        }
+    }
+
     fn closable_tab(&mut self, target_id: &str) -> Option<bool> {
         let Some((url, doc)) = self.refresh_close_proof(target_id)? else {
             return Some(false);
@@ -1758,6 +1765,9 @@ impl Cdp {
     }
 
     fn refresh_close_proof(&mut self, target_id: &str) -> Option<Option<(String, MainDocument)>> {
+        let marked = self.protected_targets.contains(target_id);
+        let prior_url = self.targets.get(target_id).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("").to_string();
+        let prior_kept = kept_document(&self.guard, &prior_url);
         let info = match self.raw_call("Target.getTargetInfo", json!({ "targetId": target_id }), None, DOCUMENT_CHECK) {
             Ok(found) => found.get("targetInfo").cloned().filter(Value::is_object),
             Err(_) => return Some(None),
@@ -1768,18 +1778,51 @@ impl Cdp {
             return None;
         }
         let url = info.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-        let kept_info = kept_document(&self.guard, &url);
-        let Some(frame) = self.read_close_frame(target_id) else {
+        let kept_info = prior_kept || kept_document(&self.guard, &url);
+        let fail_closed = marked || kept_info;
+        let Some(frame) = self.read_close_frame_with_retries(target_id, fail_closed) else {
             if kept_info {
                 self.protect_target(target_id);
+                return Some(None);
             }
-            return Some(None);
+            if marked {
+                return Some(None);
+            }
+            return Some(Some((
+                url,
+                MainDocument {
+                    frame_id: String::new(),
+                    url: String::new(),
+                    origin: String::new(),
+                    unreachable_url: String::new(),
+                    navigating: false,
+                    navigation_url: String::new(),
+                    previous: false,
+                    probed: false,
+                },
+            )));
         };
         let Some(frame_id) = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string) else {
             if kept_info {
                 self.protect_target(target_id);
             }
-            return Some(None);
+            return if fail_closed {
+                Some(None)
+            } else {
+                Some(Some((
+                    url,
+                    MainDocument {
+                        frame_id: String::new(),
+                        url: String::new(),
+                        origin: String::new(),
+                        unreachable_url: String::new(),
+                        navigating: false,
+                        navigation_url: String::new(),
+                        previous: false,
+                        probed: false,
+                    },
+                )))
+            };
         };
         let frame_url = format!(
             "{}{}",
@@ -1787,6 +1830,9 @@ impl Cdp {
             frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")
         );
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
+        if kept_security_origin(&self.guard, &frame_url, &origin) {
+            self.protect_target(target_id);
+        }
         let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
         let previous = self.documents.get(target_id).map(|doc| doc.previous).unwrap_or(false);
         let navigating = self.documents.get(target_id).map(|doc| doc.navigating).unwrap_or(false);
@@ -1806,7 +1852,28 @@ impl Cdp {
         Some(Some((url, doc)))
     }
 
-    fn read_close_frame(&mut self, target: &str) -> Option<Value> {
+    fn read_close_frame_with_retries(&mut self, target: &str, fail_closed: bool) -> Option<Value> {
+        if fail_closed {
+            return self.read_close_frame(target, DOCUMENT_CHECK);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut left = 3u8;
+        loop {
+            let span = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(350));
+            if span.is_zero() {
+                return None;
+            }
+            if let Some(frame) = self.read_close_frame(target, span) {
+                return Some(frame);
+            }
+            left = left.saturating_sub(1);
+            if left == 0 || Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+
+    fn read_close_frame(&mut self, target: &str, timeout: Duration) -> Option<Value> {
         let existing = self.guards.get(target).cloned().or_else(|| self.runtime_sessions.get(target).cloned()).or_else(|| {
             self.session_targets
                 .iter()
@@ -1822,7 +1889,7 @@ impl Cdp {
                     "Target.attachToTarget",
                     json!({ "targetId": target, "flatten": true }),
                     None,
-                    DOCUMENT_CHECK,
+                    timeout,
                 );
                 self.guarding.remove(target);
                 self.probing.remove(target);
@@ -1839,12 +1906,12 @@ impl Cdp {
             }
         };
         let frame = self
-            .raw_call("Page.getFrameTree", json!({}), Some(&session), DOCUMENT_CHECK)
+            .raw_call("Page.getFrameTree", json!({}), Some(&session), timeout)
             .ok()
             .and_then(|tree| tree.pointer("/frameTree/frame").cloned())
             .filter(|frame| frame.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()));
         if temporary {
-            let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session.clone() }), None, DOCUMENT_CHECK);
+            let _ = self.raw_call("Target.detachFromTarget", json!({ "sessionId": session.clone() }), None, timeout.min(DOCUMENT_CHECK));
             self.guard_sessions.remove(&session);
             self.session_targets.remove(&session);
         }
