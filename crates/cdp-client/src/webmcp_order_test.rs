@@ -1198,6 +1198,50 @@ fn adopt_path_checkpoint_interleavings_settle_or_admit() {
 }
 
 #[test]
+fn unrequested_park_target_info_refused_shapes_settle() {
+    for url in ["chrome-error://chromewebdata/", "data:text/html,hi"] {
+        let (mut cdp, state) = client();
+        state.borrow_mut().chrome_shaped_lifecycle = true;
+        state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+        let holder = reconcile_holder(&mut cdp);
+        cdp.webmcp_auto_attach(&holder).unwrap();
+        cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+        if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+            arm.promote_read_at = None;
+        }
+        state.borrow_mut().oopif_tree = Some(unrequested_tree());
+        cdp.webmcp_sweep();
+        assert!(!cdp.session_blocked("CHILD"), "{url}");
+        assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.domains && arm.pending_install.is_none() && arm.pending_install_park.is_none()), "{url}");
+        assert!(cdp.webmcp.quarantined.contains("CHILD"), "{url}");
+        assert_eq!(shim_evals(&state, "CHILD"), 0, "{url}");
+        let origin = if url.starts_with("data:") { "null" } else { "://" };
+        state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":url,"securityOrigin":origin,"loaderId":"E"}}}));
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"IFRAME","type":"iframe","url":url,"parentFrameId":"F"}}}));
+        assert!(cdp.session_blocked("CHILD"), "refused targetInfoChanged must settle parked child: {url}");
+        assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"), "{url}");
+        assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| !arm.domains && arm.admitted == 0), "{url}");
+        assert_eq!(shim_evals(&state, "CHILD"), 0, "{url}");
+    }
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.promote_read_at = None;
+    }
+    state.borrow_mut().oopif_tree = Some(unrequested_tree());
+    cdp.webmcp_sweep();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://unrequested.test/other","parentFrameId":"F"}}}));
+    assert!(!cdp.session_blocked("CHILD"), "ordinary unrequested URL must stay parked");
+    assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.domains && arm.admitted == 0));
+    assert!(cdp.webmcp.quarantined.contains("CHILD"));
+    assert_eq!(shim_evals(&state, "CHILD"), 0);
+}
+
+#[test]
 fn mark_admitted_child_gate_settles_when_park_is_already_due() {
     let (mut cdp, state) = client();
     state.borrow_mut().chrome_shaped_lifecycle = true;

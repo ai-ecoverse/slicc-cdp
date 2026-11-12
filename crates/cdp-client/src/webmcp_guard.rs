@@ -1789,16 +1789,24 @@ impl Cdp {
         }
         self.webmcp_merge_target(&target, &info);
         let url = info.get("url").and_then(Value::as_str).unwrap_or("");
-        let promote = self.webmcp_refused_info(&target, &info)
-            || url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"));
+        let refuse = self.webmcp_refused_info(&target, &info);
+        let promote = refuse || url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"));
         let child = self.guards.get(&target).cloned()
             .or_else(|| self.webmcp.recorded.get(&target).map(|recorded| recorded.session.clone()));
         if let Some(child) = child.as_deref().filter(|child| self.webmcp_not_yet_admitted(child)) {
             self.webmcp_mark_tree_dirty(child);
         }
+        if refuse {
+            if let Some(child) = child.clone().filter(|child| self.webmcp_provisional_parked(child)) {
+                if let Some(arm) = self.webmcp.arms.get_mut(&child) {
+                    arm.promote_read_at = None;
+                }
+                self.webmcp_promote_provisional_child(&child);
+            }
+        }
         self.webmcp.reconcile_dirty.extend(holders);
         self.webmcp_reconcile_pending();
-        if promote {
+        if promote && !refuse {
             if let Some(child) = child.filter(|child| self.webmcp_provisional_parked(child)) {
                 if let Some(arm) = self.webmcp.arms.get_mut(&child) {
                     arm.promote_read_at = None;
@@ -1866,7 +1874,15 @@ impl Cdp {
 
     fn webmcp_refused_info(&self, target: &str, info: &Value) -> bool {
         let url = info.get("url").and_then(Value::as_str).unwrap_or("");
-        self.guard.url(url) || self.guard.extension_frame(url) || self.is_protected_target(target) || self.info_protected(info, &[])
+        if matches!(url, "" | "about:blank" | "about:srcdoc") {
+            return self.guard.url(url) || self.guard.extension_frame(url) || self.is_protected_target(target) || self.info_protected(info, &[]);
+        }
+        self.guard.url(url)
+            || self.guard.extension_frame(url)
+            || self.is_protected_target(target)
+            || self.info_protected(info, &[])
+            || self.guard.error_page_url(url)
+            || !url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
     }
 
     fn webmcp_reconcile_once(&mut self, holder: &str) {
