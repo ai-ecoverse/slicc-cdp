@@ -168,6 +168,7 @@ struct Recorded {
     count: i64,
     code: String,
     at: Instant,
+    wall: u64,
 }
 
 struct Holder {
@@ -202,7 +203,7 @@ impl Holder {
                 let _ = cdp.call("Runtime.evaluate", json!({"expression":DISPOSE,"contextId":id,"returnByValue":true}), Some(&self.session));
             }
         }
-        let codes: Vec<String> = self.actions.iter().map(|action| action.code.clone()).collect();
+        let codes = self.codes();
         let reason = match &end {
             Ok(End::Input) => "stdin",
             Ok(End::Stop) => "stop",
@@ -318,7 +319,7 @@ impl Holder {
         let recent = self.actions.last().filter(|last| matches!(last.name.as_str(), "click" | "press" | "fill") && last.at.elapsed() <= SIGNAL);
         let repeated = self.actions.last().is_some_and(|last| last.name == "navigate" && last.code == code);
         if recent.is_none() && !repeated {
-            self.push(Recorded { name: "navigate".into(), locator: String::new(), count: 0, code, at: Instant::now() });
+            self.push(Recorded { name: "navigate".into(), locator: String::new(), count: 0, code, at: Instant::now(), wall: now_ms() });
         }
     }
 
@@ -334,6 +335,23 @@ impl Holder {
             }
         }
         Ok(true)
+    }
+
+    fn codes(&self) -> Vec<String> {
+        let ledger = crate::intent::entries();
+        let mut previous = None;
+        self.actions
+            .iter()
+            .map(|action| {
+                let found = crate::intent::attribute(&ledger, &self.target, action.wall).map(|entry| entry.intent.clone());
+                let code = match &found {
+                    Some(intent) if previous.as_ref() != Some(intent) => format!("// {intent}\n{}", action.code),
+                    _ => action.code.clone(),
+                };
+                previous = found;
+                code
+            })
+            .collect()
     }
 
     fn push(&mut self, action: Recorded) {
@@ -387,7 +405,9 @@ fn recorded(item: &Value) -> Option<Recorded> {
         "setInputFiles" => format!("setInputFiles({})", strings(&item["files"])?),
         _ => return None,
     };
-    Some(Recorded { name: name.to_string(), code: format!("await page.{locator}.{call};"), locator, count, at: Instant::now() })
+    let now = now_ms();
+    let wall = item["at"].as_u64().filter(|at| at.abs_diff(now) <= STALE_MS).unwrap_or(now);
+    Some(Recorded { name: name.to_string(), code: format!("await page.{locator}.{call};"), locator, count, at: Instant::now(), wall })
 }
 
 fn strings(value: &Value) -> Option<String> {

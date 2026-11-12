@@ -171,7 +171,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     };
     let mut holder = Holder {
         files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
-        entries: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
+        entries: Vec::new(), walls: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
         embed: invocation.flags.get("content").is_some_and(|value| value == "embed"),
         minimal: invocation.flags.get("mode").is_some_and(|value| value == "minimal"),
         credentials: invocation.flags.get("include-credentials").is_some_and(|value| value == "true"),
@@ -258,6 +258,7 @@ struct Holder {
     seen: usize,
     paused: bool,
     entries: Vec<Value>,
+    walls: Vec<Option<u64>>,
     pending: BTreeMap<String, Pending>,
     failed: BTreeMap<String, Pending>,
     held: Vec<(String, Pending, bool)>,
@@ -273,9 +274,22 @@ impl Holder {
         json!({"event":event,"recordingId":self.id,"tab":self.target,"path":self.path,"entries":self.entries.len()})
     }
 
-    fn checkpoint(&self, cdp: &Cdp) -> Result<(), String> {
+    fn checkpoint(&mut self, cdp: &Cdp) -> Result<(), String> {
+        self.annotate();
         let entries: Vec<_> = self.entries.iter().filter(|entry| ordinary(cdp.guard(), text(&entry["request"], "url")) && ordinary(cdp.guard(), text(&entry["response"], "_url"))).cloned().collect();
         atomic(&self.path, &json!({"log":{"version":"1.2","creator":{"name":"SLICC playwright-cli","version":env!("PLAYWRIGHT_CLI_VERSION")},"entries":entries}}))
+    }
+
+    fn annotate(&mut self) {
+        if self.walls.iter().all(Option::is_none) { return }
+        let ledger = crate::intent::entries();
+        for (entry, wall) in self.entries.iter_mut().zip(self.walls.iter_mut()) {
+            let Some(at) = *wall else { continue };
+            if let Some(found) = crate::intent::attribute(&ledger, &self.target, at) {
+                entry["comment"] = json!(found.intent);
+                *wall = None;
+            }
+        }
     }
 
     fn beat(&self) -> Result<(), String> {
@@ -580,6 +594,7 @@ impl Holder {
                 .filter(|_| !self.paused && cdp.ordinary_response_body(body_session, id))
         } else { None };
         self.entries.push(entry(cdp, &pending, content.as_ref(), self.credentials, can_embed && pending.ordinary_document, self.minimal));
+        self.walls.push((pending.wall > 0.0).then_some((pending.wall * 1000.0) as u64));
         Ok(())
     }
 }

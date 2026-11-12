@@ -1,11 +1,23 @@
 use crate::args::Output;
 use crate::cdp::{self, Cdp};
+use crate::intent;
 
 pub struct Report {
     note: cdp::ActionNote,
     started: bool,
     ended: bool,
     active: bool,
+    intent: Option<Intent>,
+}
+
+struct Intent {
+    text: String,
+    deferred: bool,
+    entry: Option<intent::Entry>,
+    checked: bool,
+    since: u64,
+    fallback: Option<String>,
+    quiet: bool,
 }
 
 impl Report {
@@ -28,6 +40,7 @@ impl Report {
                     started: false,
                     ended: false,
                     active: false,
+                    intent: None,
                 };
             }
         };
@@ -40,6 +53,32 @@ impl Report {
             started: false,
             ended: false,
             active: true,
+            intent: None,
+        }
+    }
+
+    pub fn with_intent(mut self, command: &str, text: Option<&str>) -> Self {
+        self.intent = intent::acts_on_page(command).then(|| Intent {
+            text: text.unwrap_or_default().to_string(),
+            deferred: intent::deferred(command),
+            entry: None,
+            checked: false,
+            since: intent::now_ms(),
+            fallback: None,
+            quiet: false,
+        });
+        self
+    }
+
+    pub fn fallback_tab(&mut self, tab: Option<&str>) {
+        if let Some(intent) = self.intent.as_mut() {
+            intent.fallback = tab.map(str::to_string);
+        }
+    }
+
+    pub fn skip_overlay(&mut self) {
+        if let Some(intent) = self.intent.as_mut() {
+            intent.quiet = true;
         }
     }
 
@@ -75,6 +114,7 @@ impl Report {
     }
 
     pub fn begin(&mut self, cdp: &mut Cdp) {
+        self.running(cdp);
         if !self.active || self.started || self.ended {
             return;
         }
@@ -83,6 +123,7 @@ impl Report {
     }
 
     pub fn finish(&mut self, cdp: &mut Cdp, output: &Output) {
+        self.linger(cdp);
         if !self.active || self.ended {
             return;
         }
@@ -95,6 +136,41 @@ impl Report {
             self.note.end_params(output.code == 0, &output.stderr),
             None,
         );
+    }
+
+    fn running(&mut self, cdp: &mut Cdp) {
+        let Some(tab) = self.note.tab.clone() else { return };
+        let Some(intent) = self.intent.as_mut().filter(|intent| !intent.checked) else { return };
+        intent.checked = true;
+        if intent.text.is_empty() && !intent::touched(&intent::recent(intent.since), &tab, intent.since) {
+            return;
+        }
+        let entry = intent::Entry { id: intent::fresh_id(intent.since), tab: tab.clone(), intent: intent.text.clone(), start: intent.since, end: None };
+        intent::note(&entry);
+        intent.entry = Some(entry);
+        if !intent.deferred && !intent.text.is_empty() {
+            intent::show(cdp, &tab, &intent.text, intent::RUNNING_MS);
+        }
+    }
+
+    fn linger(&mut self, cdp: &mut Cdp) {
+        let tab = self.note.tab.clone();
+        let Some(intent) = self.intent.take() else { return };
+        let Some(tab) = tab.or_else(|| intent.fallback.clone()) else { return };
+        let now = intent::now_ms();
+        let same = intent.entry.as_ref().is_some_and(|entry| entry.tab == tab);
+        if let Some(mut entry) = intent.entry {
+            entry.end = Some(now);
+            intent::note(&entry);
+        }
+        let silent = intent.text.is_empty();
+        if !same && (!silent || !intent.checked && intent::touched(&intent::recent(intent.since), &tab, intent.since)) {
+            let start = intent.since;
+            intent::note(&intent::Entry { id: intent::fresh_id(start), tab: tab.clone(), intent: intent.text.clone(), start, end: Some(now) });
+        }
+        if !silent && !intent.quiet {
+            intent::show(cdp, &tab, &intent.text, intent::LINGER_MS);
+        }
     }
 }
 

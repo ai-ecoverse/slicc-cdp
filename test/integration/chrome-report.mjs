@@ -49,6 +49,7 @@ export const CHROME_FILES = new Set(
     'headed-input',
     'input',
     'input-oopif-chrome',
+    'intent-chrome',
     'kernel-session',
     'launch',
     'page-tools',

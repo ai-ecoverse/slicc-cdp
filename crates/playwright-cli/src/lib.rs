@@ -17,6 +17,7 @@ mod har;
 mod har_lease;
 mod help;
 mod input;
+mod intent;
 mod keys;
 mod landing;
 mod launch;
@@ -63,6 +64,7 @@ pub fn execute_in(
             if invocation.session.is_none() {
                 invocation.session = session_env.map(str::to_string);
             }
+            invocation.intent = intent::choose(invocation.intent.as_deref(), std::env::var("SLICC_INTENT").ok().as_deref());
             invocation
         }
         Err(output) => return output,
