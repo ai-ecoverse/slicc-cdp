@@ -536,6 +536,20 @@ fn a_hung_frame_during_navigation_to_the_vault_stays_unclosable() {
 }
 
 #[test]
+fn a_new_tab_whose_first_frame_read_fails_then_succeeds_closes() {
+    let start = "https://example.test/fresh";
+    let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});
+    let (mut cdp, sent, frame, _, _, frame_fails, _, info_queue) = close_probe_queue(start);
+    info_queue.borrow_mut().push_back(start_info.clone());
+    info_queue.borrow_mut().push_back(start_info);
+    *frame.borrow_mut() = json!({"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L"});
+    *frame_fails.borrow_mut() = 1;
+    allow_close(&mut cdp, &sent, "first frame fail then succeed");
+    let frames = sent.borrow().iter().filter(|call| call["method"] == "Page.getFrameTree").count();
+    assert!(frames >= 2, "expected a retry after the first failure, got {frames}");
+}
+
+#[test]
 fn a_kept_target_info_changed_during_a_hung_frame_stays_unclosable() {
     let start = "https://example.test/start";
     let vault = "https://vault.sliccy.ai/app?k=SECRET";
