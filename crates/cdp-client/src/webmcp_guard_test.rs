@@ -61,7 +61,7 @@ impl BackendState {
         if let Some(targets) = &self.iframe_targets { return targets.clone(); }
         let Some(tree) = &self.oopif_tree else { return Vec::new(); };
         let url = tree["frameTree"]["frame"]["url"].as_str().filter(|url| url.starts_with("http")).unwrap_or("https://foreign.test/cross");
-        let mut info = json!({"targetId":"IFRAME","type":"iframe","url":url});
+        let mut info = json!({"targetId":"IFRAME","type":"iframe","url":url,"parentFrameId":"F"});
         if !self.omit_get_target_parent {
             info["parentFrameId"] = json!(self.get_target_parent.clone().unwrap_or_else(|| "F".into()));
         }
@@ -439,7 +439,7 @@ impl Backend {
                 if state.buffer_child_lifecycle_on_auto_attach {
                     let parent = command["sessionId"].as_str().unwrap_or("H");
                     let frame = state.oopif_tree.as_ref().map(|tree| tree["frameTree"]["frame"].clone()).unwrap_or_else(|| json!({"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}));
-                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":frame["url"].as_str().unwrap_or("https://foreign.test/cross")},"waitingForDebugger":false}}).to_string());
+                    state.inbox.push_back(json!({"method":"Target.attachedToTarget","sessionId":parent,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":frame["url"].as_str().unwrap_or("https://foreign.test/cross"),"parentFrameId":"F"},"waitingForDebugger":false}}).to_string());
                     state.push_lifecycle("CHILD", json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":frame.clone()}}));
                     state.push_lifecycle("CHILD", json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":frame["securityOrigin"],"auxData":{"frameId":frame["id"],"isDefault":true}}}}));
                 }
@@ -470,12 +470,17 @@ impl Backend {
             }
             "Target.getTargetInfo" => {
                 let id = command["params"]["targetId"].as_str().unwrap_or("IFRAME");
-                let mut info = json!({"targetId":id,"type":"iframe","url":"https://foreign.test/cross"});
-                if !state.omit_get_target_parent {
-                    let parent = state.get_target_parent.clone().unwrap_or_else(|| "F".into());
-                    info["parentFrameId"] = json!(parent);
+                if id == "T" || id == "T2" {
+                    let url = state.tree["frameTree"]["frame"]["url"].clone();
+                    json!({"targetInfo":json!({"targetId":id,"type":"page","url":url})})
+                } else {
+                    let mut info = json!({"targetId":id,"type":"iframe","url":"https://foreign.test/cross"});
+                    if !state.omit_get_target_parent {
+                        let parent = state.get_target_parent.clone().unwrap_or_else(|| "F".into());
+                        info["parentFrameId"] = json!(parent);
+                    }
+                    json!({"targetInfo":info})
                 }
-                json!({"targetInfo":info})
             }
             _ => json!({}),
         };
@@ -492,6 +497,7 @@ fn client() -> (Cdp, Rc<RefCell<BackendState>>) {
     cdp.guards.insert("T".into(), "G".into());
     cdp.guard_sessions.insert("G".into());
     cdp.targets.insert("T".into(), json!({"targetId":"T","type":"page","url":"https://ordinary.test/"}));
+    cdp.page_scope_owners.insert("F".into(), "T".into());
     cdp.main_commit("G", &state.borrow().tree["frameTree"]["frame"]);
     (cdp, state)
 }
@@ -807,7 +813,7 @@ fn holder_protected_child_frame_never_installs() {
 fn holder_protected_oopif_is_detached_without_injection_or_tool_access() {
     let (mut cdp, state) = client();
     cdp.start_webmcp("H").unwrap();
-    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://seven.sliccy.ai/"},"waitingForDebugger":true})));
+    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://seven.sliccy.ai/","parentFrameId":"F"},"waitingForDebugger":true})));
     assert!(cdp.take_webmcp_children().is_empty());
     assert!(cdp.session_blocked("CHILD"));
     assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Page.addScriptToEvaluateOnNewDocument"));
@@ -1058,6 +1064,7 @@ fn flooding_session_does_not_starve_another_holders_root_install() {
     cdp.guards.insert("T2".into(), "G2".into());
     cdp.guard_sessions.insert("G2".into());
     cdp.targets.insert("T2".into(), json!({"targetId":"T2","type":"page","url":"https://ordinary.test/"}));
+    cdp.page_scope_owners.insert("F".into(), "T2".into());
     cdp.main_commit("G2", &state.borrow().tree["frameTree"]["frame"]);
     let installs_before = state.borrow().sent.iter().filter(|command| command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)).count();
     assert!(cdp.start_webmcp_for("H2", true).is_ok());
@@ -1136,7 +1143,7 @@ fn direct_auto_attach_marks_the_arm_and_refused_or_attested_routes_stay_detach_o
     cdp.webmcp_auto_attach("H").unwrap();
     assert!(cdp.webmcp.arms["H"].direct_child_attach);
     assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.setAutoAttach" && command["params"]["waitForDebuggerOnStart"] == false));
-    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":false})));
+    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":false})));
     assert!(cdp.webmcp_child_evidence() || cdp.webmcp.parents.contains_key("CHILD") || cdp.session_blocked("CHILD"));
 
     let (mut guarded, state) = client();
@@ -1145,7 +1152,7 @@ fn direct_auto_attach_marks_the_arm_and_refused_or_attested_routes_stay_detach_o
     guarded.webmcp_auto_attach("H").unwrap();
     assert!(!guarded.webmcp.arms["H"].direct_child_attach);
     let before = state.borrow().sent.len();
-    guarded.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":false})));
+    guarded.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":false})));
     assert!(guarded.session_blocked("CHILD"));
     assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.detachFromTarget"));
     assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
@@ -1187,7 +1194,7 @@ fn extension_frame_and_protected_oopif_never_install_on_direct() {
         cdp.start_webmcp_for("H", true).unwrap();
         cdp.webmcp_auto_attach("H").unwrap();
         cdp.webmcp_request_origins(&["https://foreign.test".into(), "https://seven.sliccy.ai".into()]);
-        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":url},"waitingForDebugger":true})));
+        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":url,"parentFrameId":"F"},"waitingForDebugger":true})));
         assert!(cdp.take_webmcp_children().is_empty());
         assert!(cdp.session_blocked("CHILD"));
         assert!(!state.borrow().sent.iter().any(|command| command["sessionId"] == "CHILD" && command["method"] == "Runtime.evaluate" && command["params"]["expression"].as_str().is_some_and(webmcp_shim_install)));
@@ -1222,7 +1229,7 @@ fn existing_oopifs_are_adopted_only_after_set_auto_attach_succeeds() {
     cdp.start_webmcp_for("H", true).unwrap();
     let holder = cdp.webmcp_session("H").to_string();
     let before = state.borrow().sent.len();
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"EARLY","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":true}}));
     assert!(!cdp.session_blocked("EARLY"));
     assert!(cdp.webmcp.recorded.is_empty(), "attaches before direct_child_attach are never consumed");
     assert!(!cdp.webmcp.parents.contains_key("EARLY") && !cdp.webmcp.arms.contains_key("EARLY"), "no adoption before setAutoAttach succeeds");
@@ -1245,7 +1252,7 @@ fn refused_auto_attach_or_route_hint_keeps_cross_origin_off() {
     state.borrow_mut().refuse_auto_attach = true;
     refused.webmcp_auto_attach("H").unwrap();
     assert!(!refused.webmcp.arms["H"].direct_child_attach);
-    refused.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    refused.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":true})));
     assert!(refused.session_blocked("CHILD"));
     assert!(refused.take_webmcp_children().is_empty());
 
@@ -1255,7 +1262,7 @@ fn refused_auto_attach_or_route_hint_keeps_cross_origin_off() {
         state.borrow_mut().route = Some(route.into());
         cdp.webmcp_auto_attach("H").unwrap();
         assert!(!cdp.webmcp.arms["H"].direct_child_attach, "{route}");
-        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":true})));
         assert!(cdp.session_blocked("CHILD"), "{route}");
         assert!(cdp.take_webmcp_children().is_empty(), "{route}");
     }
@@ -1268,7 +1275,7 @@ fn cross_origin_child_deadline_or_failure_leaves_the_root_holder_ready() {
     cdp.webmcp_auto_attach("H").unwrap();
     assert!(cdp.webmcp.arms["H"].direct_child_attach);
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+    cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":true})));
     assert!(cdp.webmcp_alive("H"));
     assert!(!cdp.webmcp.arms["H"].revoked);
     if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
@@ -1299,7 +1306,7 @@ fn rematching_the_same_child_realm_does_not_raise_admitted() {
         arm.pending_install = None;
     }
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     let admitted = cdp.webmcp.arms.get("CHILD").map(|arm| arm.admitted).unwrap_or(0);
     assert!(admitted >= 1);
@@ -1329,7 +1336,7 @@ fn reinstall_child_client() -> (Cdp, Rc<RefCell<BackendState>>, String) {
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/a"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/a","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.accepted.contains(&("FRAME".into(), "L1".into(), "CROSS-CTX".into()))));
     (cdp, state, holder)
 }
@@ -1407,7 +1414,7 @@ fn adopt_install_and_finish_awaiting_evaluate_the_same_realm_once() {
         arm.pending_install = None;
     }
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| arm.admitted == 1));
     let shim_evals = || state.borrow().sent.iter().filter(|command| {
@@ -1457,7 +1464,7 @@ fn child_arm_enables_network_before_page_and_observes_policy_before_shim() {
     }
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     let before = state.borrow().sent.len();
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     let child_sent = state.borrow().sent[before..].iter().filter(|command| command["sessionId"] == "CHILD").cloned().collect::<Vec<_>>();
     let network = child_sent.iter().position(|command| command["method"] == "Network.enable");
     let page = child_sent.iter().position(|command| command["method"] == "Page.enable");
@@ -1492,7 +1499,7 @@ fn start_time_requested_origin_installs_when_default_context_appears() {
         arm.pending_install = None;
     }
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.admitted == 0));
     state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"CHILD","params":{"frame":{"id":"FRAME","url":"https://foreign.test/cross","securityOrigin":"https://foreign.test","loaderId":"CROSS"}}}));
@@ -1517,7 +1524,7 @@ fn unverified_child_parks_until_first_commit_then_installs() {
     assert!(cdp.webmcp.arms[&holder].direct_child_attach);
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     let before = state.borrow().sent.len();
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
     assert!(!cdp.content_blocked("CHILD"));
     assert!(cdp.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "unverified blank child must park with a promote-or-settle deadline");
@@ -1550,7 +1557,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
     }
     assert!(cdp.webmcp.arms[&holder].admitted > 0);
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(cdp.webmcp_alive(&holder), "root must stay ready while adopting an OOPIF");
     assert!(!cdp.webmcp.arms[&holder].revoked);
     assert!(cdp.webmcp.arms[&holder].pending_contexts.is_empty(), "root pendingContexts must not count the child: {:?}", cdp.webmcp.arms[&holder].pending_contexts);
@@ -1590,7 +1597,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
         arm.pending_install = None;
     }
     let before = state.borrow().sent.len();
-    late.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    late.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(late.webmcp.arms.get("CHILD").is_some_and(|arm| !arm.revoked && arm.pending_install.is_none()), "verified unrequested child must park with no deadline");
     assert!(late.webmcp.quarantined.contains("CHILD"));
     assert!(
@@ -1637,7 +1644,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
         arm.pending_frames.clear();
         arm.pending_install = None;
     }
-    rooted.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    rooted.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(rooted.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_none()));
     rooted.absorb(json!({"method":"Page.frameNavigated","sessionId":holder,"params":{"frame":{"id":"F","url":"https://ordinary.test/next","securityOrigin":"https://ordinary.test","loaderId":"NEXT"}}}));
     assert!(!rooted.session_blocked("CHILD") && rooted.webmcp.parents.contains_key("CHILD"), "ordinary root navigation must keep parked children of the new document");
@@ -1677,7 +1684,7 @@ fn oopif_private_auto_attach_installs_without_content_blocking_the_root() {
         arm.pending_install = None;
     }
     missing.webmcp_request_origins(&["https://foreign.test".into()]);
-    missing.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    missing.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(missing.webmcp.arms.get("CHILD").is_some_and(|arm| arm.pending_install.is_some()), "context miss must restore the install deadline");
     if let Some(arm) = missing.webmcp.arms.get_mut("CHILD") {
         arm.pending_install = Some(Instant::now() - Duration::from_secs(1));
@@ -1709,7 +1716,7 @@ fn private_oopif_attach_does_not_touch_protect_or_guard_the_root() {
     let root_content = cdp.content_blocked(&holder);
     let root_protected = cdp.protected_targets.contains("T");
     let page_document = cdp.documents.get("T").map(|document| document.url.clone());
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"about:blank","parentFrameId":"F"},"waitingForDebugger":false}}));
     let after_attach = state.borrow().sent[before..].to_vec();
     assert!(
         !after_attach.iter().any(|command| {
@@ -1906,7 +1913,7 @@ fn policy_child(configure: impl FnOnce(&mut BackendState)) -> Cdp {
         arm.pending_install = None;
     }
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     cdp
 }
@@ -1923,7 +1930,7 @@ fn load_network_resource_is_credentialless_and_stores_fetched_source() {
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"CHILD","params":{"context":{"id":9,"uniqueId":"CROSS-CTX","origin":"https://foreign.test","auxData":{"frameId":"FRAME","isDefault":true}}}}));
     let load = state.borrow().sent.iter().find(|command| command["method"] == "Network.loadNetworkResource").cloned().expect("loadNetworkResource");
     assert_eq!(load["params"]["options"]["includeCredentials"], false);
@@ -1976,7 +1983,7 @@ fn fetched_policy_is_dropped_when_committed_origin_changed_during_fetch() {
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     let _ = cdp.webmcp_observe_child_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "https://foreign.test/cross");
     assert!(policy_document(&cdp).is_none());
 }
@@ -1992,7 +1999,7 @@ fn get_version_failure_keeps_cross_origin_off() {
         assert!(!cdp.webmcp.arms["H"].direct_child_attach, "{mode}");
         assert!(cdp.webmcp_route_attested_snapshot(), "{mode}");
         assert!(!state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.setAutoAttach"), "{mode}");
-        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/"},"waitingForDebugger":true})));
+        cdp.absorb(event("Target.attachedToTarget", json!({"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/","parentFrameId":"F"},"waitingForDebugger":true})));
         assert!(cdp.session_blocked("CHILD"), "{mode}");
     }
 }
@@ -2005,7 +2012,7 @@ fn later_route_hint_clears_direct_attach_and_detaches_children() {
     let holder = cdp.webmcp_session("H").to_string();
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
-    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross","parentFrameId":"F"},"waitingForDebugger":false}}));
     assert!(cdp.webmcp.arms[&holder].direct_child_attach);
     cdp.webmcp_set_route_attested(true);
     assert!(!cdp.webmcp.arms[&holder].direct_child_attach);
