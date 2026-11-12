@@ -2164,9 +2164,6 @@ impl Cdp {
             frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")
         );
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
-        if kept_security_origin(&self.guard, &frame_url, &origin) {
-            self.protect_target(target_id);
-        }
         let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
         let previous = self.documents.get(target_id).map(|doc| doc.previous).unwrap_or(false);
         let navigating = self.documents.get(target_id).map(|doc| doc.navigating).unwrap_or(false);
@@ -2182,6 +2179,9 @@ impl Cdp {
             previous,
             probed,
         };
+        if self.close_proof_kept(target_id, &url, &doc) {
+            self.protect_target(target_id);
+        }
         self.clear_kept_url_latch_if_fresh_unkept(target_id, &url, &doc);
         self.documents.insert(target_id.to_string(), doc.clone());
         self.note_iframe_own_frame(target_id, &frame_id);
@@ -2189,16 +2189,19 @@ impl Cdp {
     }
 
     fn failed_close_frame(&mut self, target_id: &str, url: &str) -> Option<Option<(String, MainDocument)>> {
+        let inheriting = inheriting_document(&self.guard, url);
+        let opener_kept = inheriting && self.kept_opener_of(target_id);
         if self.close_fail_closed(target_id) {
             if self.kept_url_latch.contains(target_id) || kept_document(&self.guard, url)
                 || self.targets.get(target_id).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|now| kept_document(&self.guard, now))
+                || opener_kept
             {
                 self.protect_target(target_id);
             }
             return Some(None);
         }
         let stand_in = self.stand_in_close_document(target_id);
-        if self.stand_in_close_kept(&stand_in) {
+        if self.stand_in_close_kept(target_id, url, &stand_in) || opener_kept {
             self.protect_target(target_id);
             return Some(None);
         }
@@ -2219,10 +2222,10 @@ impl Cdp {
         }
     }
 
-    fn stand_in_close_kept(&self, doc: &MainDocument) -> bool {
+    fn stand_in_close_kept(&mut self, target_id: &str, info_url: &str, doc: &MainDocument) -> bool {
         doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url))
             || kept_security_origin(&self.guard, &doc.url, &doc.origin)
-            || inheriting_document(&self.guard, &doc.url) && doc.previous
+            || self.inheriting_close_kept(target_id, info_url, doc)
     }
 
     fn read_close_frame_with_retries(&mut self, target: &str, fail_closed: bool) -> Option<Value> {

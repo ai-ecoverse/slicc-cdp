@@ -232,3 +232,13 @@ fn seven_pages_are_only_seven_labels_on_https() {
         assert!(!super::seven_page(url), "{url}");
     }
 }
+
+#[test]
+fn seven_hosts_allow_any_http_scheme_and_port_without_userinfo() {
+    for url in ["http://seven.sliccy.ai:9443/os/", "https://seven.sliccy.ai:8443/", "http://a-1.sliccy.ai/x"] {
+        assert!(super::seven_host(url), "{url}");
+    }
+    for url in ["https://u:p@seven.sliccy.ai/", "https://vault.sliccy.ai/", "https://get.sliccy.ai/os/", "ftp://seven.sliccy.ai/"] {
+        assert!(!super::seven_host(url), "{url}");
+    }
+}
