@@ -19,8 +19,28 @@ const formPage = `<!doctype html><title>Order</title>
 <input placeholder="Name">
 <a href="http://seven.sliccy.ai/os/">Seven</a>`;
 
+const hostilePage = `<!doctype html><title>Hostile</title><button>Bait</button><script>
+window.__leak = [];
+const attach = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function (options) {
+  window.__leak.push('patched');
+  return attach.call(this, { ...options, mode: 'open' });
+};
+customElements.define('x-slicc-intent', class extends HTMLElement {
+  constructor() { super(); this.internals = this.attachInternals(); }
+  connectedCallback() { window.__leak.push('upgraded:' + (this.internals.shadowRoot?.innerHTML ?? '')); }
+});
+customElements.define('x-slicc-highlight', class extends HTMLElement {
+  constructor() { super(); this.internals = this.attachInternals(); }
+});
+const read = (node) => [node.localName, node.shadowRoot?.innerHTML, node.textContent, node.innerText, node.getHTML?.({ serializableShadowRoots: true }), [...(node.attributes ?? [])].map((a) => a.value).join('|')].join('#');
+new MutationObserver((records) => {
+  for (const record of records) for (const node of record.addedNodes) if (node.nodeType === 1) window.__leak.push(read(node));
+}).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+</script>`;
+
 const STATE = `(() => {
-  const hosts = Array.from(document.documentElement.children).filter((node) => node.localName === 'x-slicc-intent');
+  const hosts = Array.from(document.documentElement.children).filter((node) => node.localName === 'div' && node.hasAttribute('data-slicc-intent'));
   const host = hosts[0];
   return {
     count: hosts.length,
@@ -41,6 +61,7 @@ function site() {
     };
     if (/sliccy\.ai/.test(host)) return send('text/html', '<!doctype html><title>Seven</title>');
     if (url.pathname === '/form') return send('text/html', formPage);
+    if (url.pathname === '/hostile') return send('text/html', hostilePage);
     if (url.pathname.startsWith('/api/')) return send('text/plain', 'ok');
     res.writeHead(404);
     res.end();
@@ -81,16 +102,23 @@ async function overlay(raw, sessionId) {
   if (!state.count) return { ...state, text: null, mode: null };
   const { root: tree } = await raw.send('DOM.getDocument', { depth: -1, pierce: true }, sessionId);
   const find = (node) =>
-    node.localName === 'x-slicc-intent' ? node : (node.children ?? []).map(find).find(Boolean);
+    node.localName === 'div' && node.attributes?.includes('data-slicc-intent')
+      ? node
+      : (node.children ?? []).map(find).find(Boolean);
   const host = find(tree);
   assert.ok(host, 'the overlay went away while it was read');
   const texts = [];
+  const labels = [];
   const walk = (node) => {
-    if (node.nodeType === 3) texts.push(node.nodeValue);
+    if (node.nodeType === 3 && node.parentId && !node.nodeValue.includes('{'))
+      texts.push(node.nodeValue);
+    const at = (node.attributes ?? []).indexOf('data-text');
+    if (at >= 0 && at % 2 === 0) labels.push(node.attributes[at + 1]);
     for (const child of [...(node.shadowRoots ?? []), ...(node.children ?? [])]) walk(child);
   };
   walk(host);
-  return { ...state, text: texts.join(''), mode: host.shadowRoots?.[0]?.shadowRootType ?? null };
+  assert.deepEqual(texts, [], 'the overlay holds no text nodes');
+  return { ...state, text: labels.join(''), mode: host.shadowRoots?.[0]?.shadowRootType ?? null };
 }
 
 async function count(raw, sessionId) {
@@ -167,7 +195,13 @@ async function attach(raw, targetId) {
 async function overlayFlow(runner, server, raw) {
   const cwd = await runner.fresh();
   const pw = (args) => runner.playwright(args, cwd);
-  const opened = await pw(['open', `${server.origin}/form`, '--intent', 'Opening the order form']);
+  const opened = await pw([
+    'open',
+    `${server.origin}/form`,
+    '--foreground',
+    '--intent',
+    'Opening the order form',
+  ]);
   ok(opened, 'open');
   const tab = opened.stdout.match(/targetId: ([0-9A-F]+)/)?.[1];
   assert.ok(tab, opened.stdout);
@@ -330,6 +364,42 @@ async function nativeFlows(t, runner, server, browser, raw) {
     assert.equal(comment('/api/order'), 'Placing the order');
     assert.equal(comment('/api/late'), undefined);
     assert.equal(comment('/api/after'), 'Fetching again');
+  });
+
+  await t.test('a hostile page cannot read the intent', async () => {
+    const opened = await runner.playwright(
+      ['open', `${server.origin}/hostile`, '--foreground'],
+      cwd
+    );
+    ok(opened, 'open hostile');
+    const hostile = opened.stdout.match(/targetId: ([0-9A-F]+)/)?.[1];
+    const hostileSession = await attach(raw, hostile);
+    const secret = 'Guessing the hidden secret';
+    const snapshot = await runner.playwright(['snapshot', '--tab', hostile], cwd);
+    const bait = refOf(snapshot.stdout, 'button', 'Bait');
+    ok(
+      await runner.playwright(['hover', bait, '--tab', hostile, '--intent', secret], cwd),
+      'hover'
+    );
+    assert.equal((await overlay(raw, hostileSession)).text, secret);
+    const probe = await raw.send(
+      'Runtime.evaluate',
+      {
+        expression: `(() => { const found = [${JSON.stringify(secret)}, 'hidden secret', 'Guessing'].map((word) => { getSelection().removeAllRanges(); return window.find(word); }); return { found, leak: window.__leak, text: document.documentElement.innerText }; })()`,
+        returnByValue: true,
+      },
+      hostileSession
+    );
+    const { found, leak, text } = probe.result.value;
+    assert.deepEqual(found, [false, false, false]);
+    assert.ok(
+      leak.some((item) => item.startsWith('div#')),
+      JSON.stringify(leak)
+    );
+    assert.ok(!leak.includes('patched'), JSON.stringify(leak));
+    assert.ok(!leak.some((item) => item.startsWith('upgraded')), JSON.stringify(leak));
+    assert.doesNotMatch(JSON.stringify(leak) + text, /Guessing|secret/);
+    await gone(raw, hostileSession, 'hostile');
   });
 
   await t.test('nothing is injected into a protected page', async () => {

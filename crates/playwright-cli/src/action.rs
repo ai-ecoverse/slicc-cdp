@@ -12,7 +12,7 @@ pub struct Report {
 
 struct Intent {
     text: String,
-    captures: bool,
+    deferred: bool,
     entry: Option<intent::Entry>,
     checked: bool,
     since: u64,
@@ -60,7 +60,7 @@ impl Report {
     pub fn with_intent(mut self, command: &str, text: Option<&str>) -> Self {
         self.intent = intent::acts_on_page(command).then(|| Intent {
             text: text.unwrap_or_default().to_string(),
-            captures: intent::captures(command),
+            deferred: intent::deferred(command),
             entry: None,
             checked: false,
             since: intent::now_ms(),
@@ -148,7 +148,7 @@ impl Report {
         let entry = intent::Entry { id: intent::fresh_id(intent.since), tab: tab.clone(), intent: intent.text.clone(), start: intent.since, end: None };
         intent::note(&entry);
         intent.entry = Some(entry);
-        if !intent.captures && !intent.text.is_empty() {
+        if !intent.deferred && !intent.text.is_empty() {
             intent::show(cdp, &tab, &intent.text, intent::RUNNING_MS);
         }
     }
