@@ -268,16 +268,15 @@ fn an_armed_session_keeps_page_traffic_live_and_disable_releases_what_it_held() 
 }
 
 #[test]
-fn disabling_an_unarmed_or_blocked_session_still_disables() {
+fn disabling_an_unarmed_session_still_disables_but_blocked_refuses() {
     let (mut cdp, log) = wire(Box::new(answer));
     cdp.call("Fetch.disable", json!({}), Some("S")).unwrap();
     start(&mut cdp, &log, json!([{ "urlPattern": "*" }]));
     cdp.call("Fetch.continueRequest", json!({ "requestId": "R1", "url": "https://app.example/hop" }), Some("S")).unwrap();
+    let _ = fetch_calls(&log);
     cdp.blocked.insert("S".into());
-    let _ = cdp.call("Fetch.disable", json!({}), Some("S"));
-    let calls = fetch_calls(&log);
-    assert_eq!(calls.last().unwrap().0, "Fetch.disable");
-    assert!(cdp.issued.armed.is_empty());
+    assert!(cdp.call("Fetch.disable", json!({}), Some("S")).is_err());
+    assert!(fetch_calls(&log).is_empty(), "blocked Fetch.disable must not reach the wire");
 }
 
 #[test]
