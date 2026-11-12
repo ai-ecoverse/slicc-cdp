@@ -601,7 +601,6 @@ impl Cdp {
             if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
                 if self.blocked.contains(session)
                     || self.detaching.values().any(|have| have == session)
-                    || !self.session_targets.contains_key(session) && !self.guard_sessions.contains(session)
                 {
                     return Ok(json!({}));
                 }

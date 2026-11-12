@@ -1146,3 +1146,36 @@ fn ordinary_oopif_parent_tab_is_clear() {
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"CHILD","flatten":true}), None);
     assert!(attach.is_ok(), "ordinary OOPIF attach must work: {attach:?}");
 }
+
+#[test]
+fn client_detach_forwards_auto_attached_page_and_skips_blocked_twice() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({"targetId":"CHILD","type":"iframe","url":"https://foreign.test/grid","parentFrameId":"PAGE","browserContextId":"CTX"});
+    let (mut cdp, _, sent) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.targets.insert("CHILD".into(), child.clone());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"AUTO-PAGE","targetInfo":page,"waitingForDebugger":false}
+    }));
+    assert!(!cdp.session_targets.contains_key("AUTO-PAGE"));
+    assert!(!cdp.guard_sessions.contains("AUTO-PAGE"));
+    sent.borrow_mut().clear();
+    assert!(cdp.call("Target.detachFromTarget", json!({"sessionId":"AUTO-PAGE"}), None).is_ok());
+    let page_detaches = sent.borrow().iter().filter(|command| {
+        command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "AUTO-PAGE"
+    }).count();
+    assert_eq!(page_detaches, 1, "auto-attached page detach must reach the wire: {:?}", sent.borrow());
+
+    let attached = cdp.call("Target.attachToTarget", json!({"targetId":"CHILD","flatten":true}), None).unwrap();
+    let child_session = attached["sessionId"].as_str().unwrap().to_string();
+    cdp.block(&child_session);
+    assert!(cdp.session_blocked(&child_session));
+    sent.borrow_mut().clear();
+    assert!(cdp.call("Target.detachFromTarget", json!({"sessionId":child_session}), None).is_ok());
+    assert!(
+        !sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"),
+        "blocked descendant must not detach twice: {:?}",
+        sent.borrow()
+    );
+}
