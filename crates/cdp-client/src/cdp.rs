@@ -2657,10 +2657,15 @@ impl Cdp {
     }
 
     fn session_keeps_page_live(&self, session_id: &str) -> bool {
+        !self.session_is_cuttable_descendant(session_id)
+    }
+
+    fn session_is_cuttable_descendant(&self, session_id: &str) -> bool {
         self.session_target(session_id).is_some_and(|target| {
-            self.targets.get(&target).is_some_and(|info| {
-                matches!(info.get("type").and_then(Value::as_str), Some("page") | Some("tab"))
-            })
+            matches!(
+                self.targets.get(&target).and_then(|info| info.get("type")).and_then(Value::as_str),
+                Some("iframe" | "worker" | "service_worker" | "shared_worker")
+            )
         })
     }
 
@@ -2684,28 +2689,40 @@ impl Cdp {
     fn block(&mut self, session_id: &str) {
         let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
         self.webmcp_trace_decision("block", &target, session_id, "block session");
-        let keep_live = self.session_keeps_page_live(session_id);
+        let cut = self.session_is_cuttable_descendant(session_id);
         let newly_blocked = self.blocked.insert(session_id.to_string());
         if self.webmcp_is_paused(session_id) {
             self.webmcp.deferred.insert(session_id.to_string());
             self.webmcp_revoke(session_id);
-            self.drain_session_pauses(session_id, !keep_live);
+            self.drain_session_pauses(session_id, cut);
             return;
         }
         self.webmcp_revoke(session_id);
         if let Some(target) = self.session_targets.get(session_id) {
             self.protected_targets.insert(target.clone());
         }
-        self.drain_session_pauses(session_id, !keep_live);
-        if keep_live {
+        self.drain_session_pauses(session_id, cut);
+        if !cut {
             return;
         }
         if newly_blocked && !self.executing_sessions.contains(session_id) {
-            self.detach_blocked(session_id);
+            self.detach_blocked(session_id, "block-cuttable");
         }
     }
 
-    fn detach_blocked(&mut self, session_id: &str) {
+    fn detach_blocked(&mut self, session_id: &str, reason: &str) {
+        if std::env::var_os("SLICC_TRACE_DETACH").is_some() || std::env::var_os("CI").is_some() {
+            let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
+            let kind = self
+                .targets
+                .get(&target)
+                .and_then(|info| info.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            eprintln!(
+                "slicc-trace-detach reason={reason} session={session_id} target={target} type={kind}"
+            );
+        }
         let _ = self.send("Fetch.disable", json!({}), Some(session_id));
         let _ = self.send(
             "Target.detachFromTarget",
@@ -3773,13 +3790,10 @@ impl Cdp {
                                 })));
                     let cut = match kind {
                         "worker" | "service_worker" | "shared_worker" => {
-                            self.target_own_protected(info, &[])
-                                || self.worker_opener_protected(info, &[])
-                                || opener_cut
+                            self.worker_opener_protected(info, &[]) || opener_cut
                         }
                         "iframe" => {
-                            self.target_own_protected(info, &[])
-                                || matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Protected)
+                            matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Protected)
                                 || opener_cut
                         }
                         _ => false,
@@ -4395,7 +4409,9 @@ impl Cdp {
         let result = self.raw_call_wait(method, params, session_id, timeout, pinned);
         if let Some(session) = active {
             self.executing_sessions.remove(session);
-            if self.blocked.contains(session) { self.detach_blocked(session); }
+            if self.blocked.contains(session) && self.session_is_cuttable_descendant(session) {
+                self.detach_blocked(session, "raw-call-blocked-cuttable");
+            }
         }
         result
     }

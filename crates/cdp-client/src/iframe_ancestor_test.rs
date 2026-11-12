@@ -832,6 +832,34 @@ fn one_frame_two_targets_refuses_child_not_bound_to_seven() {
 }
 
 #[test]
+fn top_level_page_protect_blocks_without_detach_even_if_unbound() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.session_targets.insert("PS".into(), "PAGE".into());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "PAGE".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    let seven = json!({"targetId":"PAGE","type":"page","url":"https://seven.sliccy.ai/os/","browserContextId":"CTX"});
+    browser.borrow_mut().infos = vec![seven.clone()];
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":seven}}));
+    cdp.main_commit("PS", &json!({"id":"PAGE","url":"https://seven.sliccy.ai/os/","securityOrigin":"https://seven.sliccy.ai","loaderId":"L7"}));
+    assert!(cdp.session_blocked("PS"));
+    assert!(cdp.is_protected_target("PAGE"));
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"));
+    cdp.block("UNKNOWN");
+    assert!(cdp.session_blocked("UNKNOWN"));
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"));
+}
+
+#[test]
 fn root_keeps_sessions_continues_queued_pause_without_detach() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
