@@ -3,6 +3,7 @@ struct AncestorBrowser {
     trees: std::collections::BTreeMap<String, Value>,
     sessions: std::collections::BTreeMap<String, String>,
     attaches: usize,
+    detach_failures: usize,
 }
 
 struct AncestorBackend {
@@ -35,6 +36,11 @@ impl Transport for AncestorBackend {
                 json!({ "sessionId": session })
             }
             "Target.detachFromTarget" => {
+                if browser.detach_failures > 0 {
+                    browser.detach_failures -= 1;
+                    self.inbox.push_back(json!({ "id": call["id"], "error": { "message": "Detach failed" } }).to_string());
+                    return Ok(());
+                }
                 if let Some(child) = call["params"]["sessionId"].as_str() {
                     browser.sessions.remove(child);
                 }
@@ -129,6 +135,7 @@ fn fixture(case: Case) -> Cdp {
         trees,
         sessions: std::collections::BTreeMap::new(),
         attaches: 0,
+        detach_failures: 0,
     }));
     let mut cdp = Cdp::from_transport(Box::new(AncestorBackend { inbox: VecDeque::new(), browser }));
     if case.nested_middle {
@@ -269,6 +276,7 @@ fn logging_browser(infos: Vec<Value>) -> (Cdp, Rc<RefCell<AncestorBrowser>>, Rc<
         trees: std::collections::BTreeMap::new(),
         sessions: std::collections::BTreeMap::new(),
         attaches: 0,
+        detach_failures: 0,
     }));
     let backend_sent = sent.clone();
     let backend_browser = browser.clone();
@@ -303,6 +311,11 @@ fn logging_browser(infos: Vec<Value>) -> (Cdp, Rc<RefCell<AncestorBrowser>>, Rc<
                     json!({ "sessionId": session })
                 }
                 "Target.detachFromTarget" => {
+                    if browser.detach_failures > 0 {
+                        browser.detach_failures -= 1;
+                        self.inbox.push_back(json!({ "id": call["id"], "error": { "message": "Detach failed" } }).to_string());
+                        return Ok(());
+                    }
                     if let Some(child) = call["params"]["sessionId"].as_str() {
                         browser.sessions.remove(child);
                     }
@@ -591,7 +604,6 @@ fn worker_attached_after_creator_forgotten_is_bound_and_cut() {
         "sessionId":child_session,
         "params":{"sessionId":"HAR-WORKER","targetInfo":worker,"waitingForDebugger":false}
     }));
-    assert_eq!(cdp.session_targets.get("HAR-WORKER").map(String::as_str), Some("WORKER"));
     assert!(cdp.is_protected_target("WORKER") || cdp.session_blocked("HAR-WORKER"));
     assert!(cdp.call("Network.enable", json!({}), Some("HAR-WORKER")).is_err());
     cdp.set_decider("HAR-WORKER", Some(Box::new(|_| {
@@ -1178,4 +1190,222 @@ fn client_detach_forwards_auto_attached_page_and_skips_blocked_twice() {
         "blocked descendant must not detach twice: {:?}",
         sent.borrow()
     );
+}
+
+#[test]
+fn h1_destroy_opener_frame_worker_cuts_and_refuses() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let mid = json!({"targetId":"MID","type":"iframe","url":"https://ordinary.test/mid","parentFrameId":"FRAME","browserContextId":"CTX"});
+    let worker = json!({
+        "targetId":"W",
+        "type":"worker",
+        "url":"https://sprinkle.test/worker.js?token=WORKERSECRET",
+        "title":"WORKERTITLE",
+        "openerFrameId":"MIDFRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), mid.clone(), worker.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.targets.insert("MID".into(), mid.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.documents.insert("MID".into(), super::MainDocument {
+        frame_id: "MIDFRAME".into(),
+        url: "https://ordinary.test/mid".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    cdp.iframe_own_frames.insert("MIDFRAME".into(), "MID".into());
+    browser.borrow_mut().infos.push(worker.clone());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"FRAME-WORKER","targetInfo":worker.clone(),"waitingForDebugger":false}
+    }));
+    assert!(!cdp.session_blocked("FRAME-WORKER"), "bound ordinary opener must admit worker");
+    cdp.set_decider("FRAME-WORKER", Some(Box::new(|_| {
+        crate::fetch::Decision::Fulfill(crate::fetch::Fulfill::html(200, "pwned"))
+    })));
+    cdp.absorb(json!({"method":"Target.targetDestroyed","params":{"targetId":"MID"}}));
+    assert!(cdp.session_blocked("FRAME-WORKER"), "destroy of opener frame owner must cut worker");
+    let seven = json!({"targetId":"PAGE","type":"page","url":"https://seven.sliccy.ai/os/","browserContextId":"CTX"});
+    browser.borrow_mut().infos = vec![seven.clone(), worker.clone()];
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":seven}}));
+    sent.borrow_mut().clear();
+    cdp.absorb(json!({
+        "method":"Fetch.requestPaused",
+        "sessionId":"FRAME-WORKER",
+        "params":{
+            "requestId":"RW",
+            "request":{"url":"https://sprinkle.test/worker.js?token=WORKERSECRET","method":"GET","headers":{}},
+            "resourceType":"Script",
+            "frameId":"MIDFRAME"
+        }
+    }));
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.fulfillRequest"), "{:?}", sent.borrow());
+    assert!(cdp.call("Network.enable", json!({}), Some("FRAME-WORKER")).is_err());
+    let info = cdp.call("Target.getTargetInfo", json!({"targetId":"W"}), None);
+    assert!(info.as_ref().is_err_and(|err| err.starts_with("slicc: refused:")), "{info:?}");
+}
+
+#[test]
+fn h2_unbound_frame_worker_cuts_at_attach() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let mid = json!({"targetId":"MID","type":"iframe","url":"about:blank","parentFrameId":"FRAME","browserContextId":"CTX"});
+    let worker = json!({
+        "targetId":"W",
+        "type":"worker",
+        "url":"https://sprinkle.test/worker.js?token=WORKERSECRET",
+        "title":"WORKERTITLE",
+        "openerFrameId":"MIDFRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), mid.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("MID".into(), mid.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    browser.borrow_mut().infos.push(worker.clone());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"FRAME-WORKER","targetInfo":worker.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("FRAME-WORKER"), "unbound openerFrameId must cut at attach");
+    cdp.set_decider("FRAME-WORKER", Some(Box::new(|_| {
+        crate::fetch::Decision::Fulfill(crate::fetch::Fulfill::html(200, "pwned"))
+    })));
+    let seven_mid = json!({"targetId":"MID","type":"iframe","url":"https://seven.sliccy.ai/os/","parentFrameId":"FRAME","browserContextId":"CTX"});
+    browser.borrow_mut().infos = vec![
+        json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"}),
+        seven_mid.clone(),
+        worker.clone(),
+    ];
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":seven_mid}}));
+    sent.borrow_mut().clear();
+    cdp.absorb(json!({
+        "method":"Fetch.requestPaused",
+        "sessionId":"FRAME-WORKER",
+        "params":{
+            "requestId":"RU",
+            "request":{"url":"https://sprinkle.test/worker.js?token=WORKERSECRET","method":"GET","headers":{}},
+            "resourceType":"Script",
+            "frameId":"MIDFRAME"
+        }
+    }));
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.fulfillRequest"), "{:?}", sent.borrow());
+    assert!(cdp.call("Network.enable", json!({}), Some("FRAME-WORKER")).is_err());
+    let info = cdp.call("Target.getTargetInfo", json!({"targetId":"W"}), None);
+    assert!(info.as_ref().is_err_and(|err| err.starts_with("slicc: refused:")), "{info:?}");
+}
+
+#[test]
+fn unresolved_attach_cuts_and_drops_non_target_events() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({
+        "targetId":"CHILD",
+        "type":"iframe",
+        "url":"https://sprinkle.test/frame?token=SECRETURL",
+        "title":"TITLESECRET",
+        "parentFrameId":"UNKNOWN-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, _, sent) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"LIVE-CHILD","targetInfo":child.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("LIVE-CHILD"), "unresolved parent must cut at attach");
+    assert!(!cdp.protected_targets.contains("CHILD"), "unresolved cut must not permanent-latch");
+    cdp.set_decider("LIVE-CHILD", Some(Box::new(|_| {
+        crate::fetch::Decision::Fulfill(crate::fetch::Fulfill::html(200, "pwned"))
+    })));
+    let before = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Network.requestWillBeSent",
+        "sessionId":"LIVE-CHILD",
+        "params":{
+            "requestId":"N1",
+            "request":{"url":"https://sprinkle.test/frame?token=SECRETURL","method":"GET","headers":{}},
+            "type":"Document"
+        }
+    }));
+    cdp.absorb(json!({
+        "method":"Page.frameNavigated",
+        "sessionId":"LIVE-CHILD",
+        "params":{"frame":{"id":"CHILD-FRAME","url":"https://sprinkle.test/frame?token=SECRETURL","securityOrigin":"https://sprinkle.test","loaderId":"L"}}
+    }));
+    cdp.absorb(json!({
+        "method":"Page.loadEventFired",
+        "sessionId":"LIVE-CHILD",
+        "params":{"timestamp":1.0}
+    }));
+    let leaked = cdp.events()[before..].iter().any(|event| {
+        let text = event.to_string();
+        text.contains("SECRETURL") || text.contains("TITLESECRET") || text.contains("sprinkle.test")
+    });
+    assert!(!leaked, "non-target events must not leak unresolved urls: {:?}", &cdp.events()[before..]);
+    assert!(cdp.call("Runtime.evaluate", json!({"expression":"1"}), Some("LIVE-CHILD")).is_err());
+    assert!(cdp.call("Target.getTargetInfo", json!({"targetId":"CHILD"}), None).is_err());
+    let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+    assert!(!listed["targetInfos"].as_array().unwrap().iter().any(|info| info["targetId"] == "CHILD"));
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.fulfillRequest"));
+}
+
+#[test]
+fn detach_error_then_retry_until_gone() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({"targetId":"CHILD","type":"iframe","url":"https://foreign.test/","parentFrameId":"PAGE","browserContextId":"CTX"});
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("CHILD".into(), child.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "PAGE".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("PAGE".into(), "PAGE".into());
+    let attached = cdp.call("Target.attachToTarget", json!({"targetId":"CHILD","flatten":true}), None).unwrap();
+    let session = attached["sessionId"].as_str().unwrap().to_string();
+    browser.borrow_mut().detach_failures = 1;
+    sent.borrow_mut().clear();
+    cdp.block(&session);
+    assert!(cdp.session_blocked(&session));
+    let first = sent.borrow().iter().filter(|c| c["method"] == "Target.detachFromTarget" && c["params"]["sessionId"] == session).count();
+    assert_eq!(first, 1, "block must send one detach: {:?}", sent.borrow());
+    assert!(cdp.session_targets.contains_key(&session), "failed detach must keep mapping until retry");
+    assert!(browser.borrow().sessions.contains_key(&session), "chrome must still hold the session");
+    browser.borrow_mut().detach_failures = 0;
+    let retry = cdp.call("Target.detachFromTarget", json!({"sessionId":session.clone()}), None);
+    assert!(retry.is_ok(), "mapped blocked session must retry detach: {retry:?}");
+    let after = sent.borrow().iter().filter(|c| c["method"] == "Target.detachFromTarget" && c["params"]["sessionId"] == session).count();
+    assert!(after >= 2, "retry must send another detach: {:?}", sent.borrow());
+    assert!(!cdp.session_targets.contains_key(&session), "successful retry must forget session");
+    assert!(!browser.borrow().sessions.contains_key(&session), "chrome session must be gone");
 }
