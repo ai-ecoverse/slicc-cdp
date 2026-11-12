@@ -2679,20 +2679,7 @@ impl Cdp {
     fn abandon(&mut self, target_id: &str) {
         self.webmcp_trace_decision("abandon", target_id, "", "abandon target");
         self.abandoned.insert(target_id.to_string());
-        self.protected_targets.insert(target_id.to_string());
-        if let Some(doc) = self.documents.get_mut(target_id) {
-            doc.previous = true;
-        }
-        let sessions: Vec<String> = self
-            .session_targets
-            .iter()
-            .filter(|(_, have)| have.as_str() == target_id)
-            .map(|(session, _)| session.clone())
-            .collect();
-        for session in sessions {
-            self.deciders.remove(&session);
-            self.blocked.insert(session);
-        }
+        self.protect_target(target_id);
     }
 
     fn adopt_guard_attach(&mut self, value: &Value) {
@@ -2752,9 +2739,7 @@ impl Cdp {
             }
         }
         self.deciders.remove(session_id);
-        if !self.executing_sessions.contains(session_id) {
-            self.detach_blocked(session_id);
-        }
+        if !self.executing_sessions.contains(session_id) { self.detach_blocked(session_id); }
     }
 
     fn detach_blocked(&mut self, session_id: &str) {
@@ -3774,8 +3759,7 @@ impl Cdp {
                 let child = params.get("sessionId").and_then(Value::as_str).unwrap_or("");
                 if let Some(info) = params.get("targetInfo") {
                     let target = info.get("targetId").and_then(Value::as_str).unwrap_or("");
-                    if !child.is_empty() && !target.is_empty() {
-                        self.session_targets.insert(child.to_string(), target.to_string());
+                    if !target.is_empty() {
                         self.targets.insert(target.to_string(), info.clone());
                         self.bind_proven_iframe_frames();
                     }
@@ -3806,6 +3790,9 @@ impl Cdp {
                         _ => false,
                     };
                     if cut {
+                        if !child.is_empty() && !target.is_empty() {
+                            self.session_targets.insert(child.to_string(), target.to_string());
+                        }
                         if !target.is_empty() {
                             self.protect_target(target);
                         }
@@ -3903,13 +3890,8 @@ impl Cdp {
                 }
             }
             if let Some(child) = value.pointer("/params/sessionId").and_then(|v| v.as_str()) {
-                if self.guard_sessions.contains(child) {
-                    return true;
-                }
-                if self.blocked.contains(child)
-                    && method != "Target.attachedToTarget"
-                    && !(method == "Target.detachedFromTarget" && self.detached_ordinary.contains(child))
-                {
+                if self.guard_sessions.contains(child) || self.blocked.contains(child)
+                    && !(method == "Target.detachedFromTarget" && self.detached_ordinary.contains(child)) {
                     return true;
                 }
             }
@@ -4416,9 +4398,7 @@ impl Cdp {
         let result = self.raw_call_wait(method, params, session_id, timeout, pinned);
         if let Some(session) = active {
             self.executing_sessions.remove(session);
-            if self.blocked.contains(session) {
-                self.detach_blocked(session);
-            }
+            if self.blocked.contains(session) { self.detach_blocked(session); }
         }
         result
     }
