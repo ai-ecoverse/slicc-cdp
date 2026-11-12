@@ -457,16 +457,22 @@ fn a_restored_protected_seven_document_that_is_not_the_live_ui_can_be_closed() {
     let (mut cdp, sent, info, frame) = close_probe(history);
     cdp.session_targets.insert("S".into(), "T".into());
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"}}}));
-    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":"https://seven.sliccy.ai","name":"","uniqueId":"U0","auxData":{"isDefault":true,"frameId":"F","type":"default"}}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":failed,"loaderId":"L1"}}}));
     assert!(cdp.is_protected_target("T"));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/blank","securityOrigin":"https://example.test","loaderId":"L2"}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"type":"BackForwardCacheRestore","frame":{"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"}}}));
+    cdp.session_targets.insert("S".into(), "T".into());
+    cdp.blocked.insert("S".into());
+    cdp.detaching.clear();
     cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":2,"origin":"https://seven.sliccy.ai","name":"","uniqueId":"U1","auxData":{"isDefault":true,"frameId":"F","type":"default"}}}}));
+    assert!(cdp.context_proofs.values().any(|proof| proof.default && proof.origin == "https://seven.sliccy.ai"), "default context proof recorded");
+    assert_eq!(cdp.session_targets.get("S").map(String::as_str), Some("T"), "close probe reuses the attached session");
     *info.borrow_mut() = json!({"targetId":"T","type":"page","url":history,"title":"SECRETTITLE"});
     *frame.borrow_mut() = json!({"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"});
     assert!(cdp.is_protected_target("T"));
     assert!(cdp.documents.get("T").is_some_and(|doc| doc.previous), "restore keeps previous");
     assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err().starts_with("slicc: refused:"));
+    assert!(cdp.context_proofs.values().any(|proof| proof.default && proof.origin == "https://seven.sliccy.ai"), "default context proof survives until close");
+    assert_eq!(cdp.session_targets.get("S").map(String::as_str), Some("T"));
     allow_close(&mut cdp, &sent, history);
 }
