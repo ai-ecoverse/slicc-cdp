@@ -449,3 +449,22 @@ fn nine_nested_view_source_wrappers_around_the_vault_stay_unclosable() {
     assert!(!refused.contains("SECRET"), "{refused}");
     refuse_close(&mut cdp, &sent, &url);
 }
+
+#[test]
+fn a_restored_protected_seven_document_that_is_not_the_live_ui_can_be_closed() {
+    let history = "https://seven.sliccy.ai/doc?n=history";
+    let failed = "https://seven.sliccy.ai/doc/path-secret?query-secret=x#fragment-secret";
+    let (mut cdp, sent, info, frame) = close_probe(history);
+    cdp.session_targets.insert("S".into(), "T".into());
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"}}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":failed,"loaderId":"L1"}}}));
+    assert!(cdp.is_protected_target("T"));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/blank","securityOrigin":"https://example.test","loaderId":"L2"}}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"type":"BackForwardCacheRestore","frame":{"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"}}}));
+    *info.borrow_mut() = json!({"targetId":"T","type":"page","url":history,"title":"SECRETTITLE"});
+    *frame.borrow_mut() = json!({"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"});
+    assert!(cdp.is_protected_target("T"));
+    assert!(cdp.documents.get("T").is_some_and(|doc| doc.previous), "restore keeps previous");
+    assert!(cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap_err().starts_with("slicc: refused:"));
+    allow_close(&mut cdp, &sent, history);
+}

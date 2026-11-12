@@ -1732,7 +1732,7 @@ impl Cdp {
         let kept_now = kept_document(&self.guard, &url)
             || kept_document(&self.guard, &doc.url)
             || kept_security_origin(&self.guard, &doc.url, &doc.origin)
-            || doc.previous;
+            || (opaque_document(&doc.url) || non_http_document(&doc.url)) && doc.previous;
         if !kept_now {
             return Some(true);
         }
@@ -1794,10 +1794,16 @@ impl Cdp {
     }
 
     fn read_close_frame(&mut self, target: &str) -> Option<Value> {
-        let existing = self.guards.get(target).cloned().or_else(|| self.runtime_sessions.get(target).cloned());
+        let existing = self.guards.get(target).cloned().or_else(|| self.runtime_sessions.get(target).cloned()).or_else(|| {
+            self.session_targets
+                .iter()
+                .find(|(_, owner)| owner.as_str() == target)
+                .map(|(session, _)| session.clone())
+        });
         let (session, temporary) = match existing {
             Some(session) => (session, false),
             None => {
+                self.probing.insert(target.to_string());
                 self.guarding.insert(target.to_string());
                 let attached = self.raw_call(
                     "Target.attachToTarget",
@@ -1806,6 +1812,7 @@ impl Cdp {
                     DOCUMENT_CHECK,
                 );
                 self.guarding.remove(target);
+                self.probing.remove(target);
                 let session = attached
                     .ok()
                     .and_then(|value| value.get("sessionId").and_then(Value::as_str).map(str::to_string))
