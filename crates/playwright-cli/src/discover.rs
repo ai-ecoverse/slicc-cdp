@@ -3603,6 +3603,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            intent: None,
             help: false,
             command_help: false,
             version: false,

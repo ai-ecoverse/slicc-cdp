@@ -213,6 +213,8 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
         Ok(target) => target,
         Err(message) => return Output::err(message),
     };
+    report.tab(&target);
+    report.begin(cdp);
     let session = match browser::watch_attach(cdp, state, &target) {
         Ok(session) => session,
         Err(message) => return Output::err(message),

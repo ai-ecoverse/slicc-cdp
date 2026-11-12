@@ -280,6 +280,7 @@ globalThis.sliccRecorder = (api) => {
     } finally {
       api.endAriaCaches();
     }
+    action.at = Date.now();
     queue.push(action);
     for (const wake of waiters.splice(0)) wake();
   };

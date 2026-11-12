@@ -108,6 +108,11 @@ pub(crate) fn recording_har(id: &str) -> Option<PathBuf> {
     )
 }
 
+pub(crate) fn intents_dir() -> Option<PathBuf> {
+    let root = config_root()?;
+    Path::new(&root).is_absolute().then(|| Path::new(&root).join("slicc").join("playwright-cli").join("intents"))
+}
+
 pub fn load_in(session_name: Option<&str>, cwd: Option<&Path>) -> Session {
     let session_name = session_name.filter(|name| !name.is_empty());
     let mut sess = path_named(session_name, cwd)

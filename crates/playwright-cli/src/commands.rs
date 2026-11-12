@@ -156,7 +156,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         }
         None => {}
     }
-    let mut report = action::Report::for_command(command);
+    let mut report = action::Report::for_command(command).with_intent(command, invocation.intent.as_deref());
     let result = match command {
         "open" | "tab-new" => cmd_open(&mut cdp, &mut state, invocation, &mut report, &mut started),
         "close" | "tab-close" => cmd_close(&mut cdp, &mut state, invocation, &mut report),
@@ -201,9 +201,12 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         _ if crate::page_tools::is_command(command) => crate::page_tools::run(&mut cdp, &mut state, invocation, &mut report),
         _ => Output::err(format!("playwright-cli {command}: not implemented yet\n")),
     };
+    let fallback = invocation.flags.get("tab").or(state.current.as_ref()).filter(|_| result.code == 0);
+    report.fallback_tab(fallback.map(String::as_str));
     if cdp.navigation_away_pending() {
         let mut result = result;
         for notice in cdp.take_notices() { result.stderr.push_str(&notice); }
+        report.skip_overlay();
         report.finish(&mut cdp, &result);
         let result = match cdp.finish_navigation_away() {
             Ok(target) if result.code == 0 => {
@@ -922,6 +925,7 @@ fn capture(
     }
     let full =
         flag_true(&invocation.flags, "fullPage") || flag_true(&invocation.flags, "full-page");
+    crate::intent::clear(cdp, session, target);
     let mut bytes = browser::screenshot(cdp, session, full, clip)?;
     if let Some(max) = invocation.flags.get("max-width") {
         let max = max
@@ -1832,6 +1836,7 @@ fn cmd_pdf(
         Ok(session) => session,
         Err(message) => return Output::err(message),
     };
+    crate::intent::clear(cdp, &session, &target);
     let result = browser::print_to_pdf(cdp, &session);
     let watched = browser::watch_detach(cdp, state, &target, &session);
     match result {

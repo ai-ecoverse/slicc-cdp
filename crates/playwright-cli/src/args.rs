@@ -13,6 +13,7 @@ pub struct Invocation {
     pub runtime: Option<String>,
     pub session: Option<String>,
     pub full_urls: bool,
+    pub intent: Option<String>,
     pub help: bool,
     pub command_help: bool,
     pub version: bool,
@@ -65,6 +66,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     let mut help = false;
     let mut version = false;
     let mut full_urls = false;
+    let mut intent = None;
     let mut index = 0;
     while index < args.len() {
         let token = &args[index];
@@ -88,6 +90,16 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         if token == "--full-urls" {
             full_urls = true;
             index += 1;
+            continue;
+        }
+        if let Some(value) = inline_value(token, "--intent") {
+            intent = Some(value);
+            index += 1;
+            continue;
+        }
+        if token == "--intent" {
+            intent = args.get(index + 1).cloned().or(intent);
+            index += 2;
             continue;
         }
         if let Some(value) = inline_value(token, "--cdp") {
@@ -174,6 +186,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             runtime,
             session,
             full_urls,
+            intent,
             help: help || command.is_none(),
             command_help: false,
             version,
@@ -197,6 +210,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             runtime,
             session,
             full_urls,
+            intent,
             help,
             command_help,
             version,
@@ -264,6 +278,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         runtime,
         session,
         full_urls,
+        intent,
         help,
         command_help,
         version,
@@ -413,5 +428,24 @@ mod tests {
     fn session_empty_value_is_accepted() {
         let invocation = parse(&["--session=".into(), "snapshot".into()]).unwrap();
         assert_eq!(invocation.session.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn intent_is_global_in_both_forms() {
+        let spaced = parse(&["click".into(), "e5".into(), "--intent".into(), "Filling the order form".into()]).unwrap();
+        assert_eq!(spaced.intent.as_deref(), Some("Filling the order form"));
+        assert_eq!(spaced.positionals, vec!["e5"]);
+        let inline = parse(&["--intent=Reading the page".into(), "snapshot".into()]).unwrap();
+        assert_eq!(inline.intent.as_deref(), Some("Reading the page"));
+        assert_eq!(inline.command.as_deref(), Some("snapshot"));
+        let empty = parse(&["snapshot".into(), "--intent=".into()]).unwrap();
+        assert_eq!(empty.intent.as_deref(), Some(""));
+        let missing = parse(&["snapshot".into(), "--intent".into()]).unwrap();
+        assert_eq!(missing.intent, None);
+        assert_eq!(missing.command.as_deref(), Some("snapshot"));
+        let literal = parse(&["type".into(), "--".into(), "--intent".into(), "x".into()]).unwrap();
+        assert_eq!(literal.intent, None);
+        assert_eq!(literal.positionals, vec!["--intent", "x"]);
+        assert_eq!(parse(&["tab-list".into()]).unwrap().intent, None);
     }
 }

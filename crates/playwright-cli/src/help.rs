@@ -162,6 +162,10 @@ pub fn global_help() -> String {
         "--full-urls",
         "print URLs without redacting query strings (may expose login tokens)",
     ));
+    lines.push(row(
+        "--intent <text>",
+        "what the command is for, shown on the tab and written into recordings and HAR comments (env: SLICC_INTENT)",
+    ));
     lines.push(row("-h, --help", "show help"));
     lines.push(row("-V, --version", "print the version"));
     lines.join("\n")
