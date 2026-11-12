@@ -637,6 +637,8 @@ fn ordinary_recommit_clears_descendant_latch() {
     let ordinary = json!({"targetId":"PARENT","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     browser.borrow_mut().infos = vec![ordinary.clone(), child.clone(), worker.clone()];
     cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":ordinary}}));
+    cdp.session_targets.insert("PS".into(), "PARENT".into());
+    cdp.blocked.remove("PS");
     cdp.main_commit("PS", &json!({"id":"PARENT","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"L3"}));
     assert!(!cdp.is_protected_target("CHILD"), "child latch must clear after ordinary recommit");
     assert!(!cdp.is_protected_target("W"), "worker latch must clear with opener iframe");
@@ -832,7 +834,7 @@ fn one_frame_two_targets_refuses_child_not_bound_to_seven() {
 }
 
 #[test]
-fn top_level_page_protect_blocks_without_detach_even_if_unbound() {
+fn top_level_page_protect_detaches_like_main() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
     cdp.targets.insert("PAGE".into(), page);
@@ -853,14 +855,13 @@ fn top_level_page_protect_blocks_without_detach_even_if_unbound() {
     cdp.main_commit("PS", &json!({"id":"PAGE","url":"https://seven.sliccy.ai/os/","securityOrigin":"https://seven.sliccy.ai","loaderId":"L7"}));
     assert!(cdp.session_blocked("PS"));
     assert!(cdp.is_protected_target("PAGE"));
-    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"));
-    cdp.block("UNKNOWN");
-    assert!(cdp.session_blocked("UNKNOWN"));
-    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"));
+    assert!(sent.borrow().iter().any(|command| {
+        command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "PS"
+    }));
 }
 
 #[test]
-fn top_level_page_protected_document_continues_without_fail() {
+fn top_level_page_protected_document_fails_like_main() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, _browser, sent) = logging_browser(vec![page.clone()]);
     cdp.targets.insert("PAGE".into(), page);
@@ -889,16 +890,12 @@ fn top_level_page_protected_document_continues_without_fail() {
         }
     }));
     assert!(sent.borrow().iter().any(|command| {
-        command["method"] == "Fetch.continueRequest"
-            && command["params"]["requestId"] == "R-DOC"
-            && command["params"].as_object().is_some_and(|object| object.keys().all(|key| key == "requestId"))
-    }), "page Document must continue plainly: {:?}", sent.borrow());
-    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.failRequest"));
-    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"));
+        command["method"] == "Fetch.failRequest" && command["params"]["requestId"] == "R-DOC"
+    }), "page Document must failRequest like main: {:?}", sent.borrow());
 }
 
 #[test]
-fn root_keeps_sessions_continues_queued_pause_without_detach() {
+fn page_commit_seven_detaches_and_continues_queued_non_document() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
     cdp.targets.insert("PAGE".into(), page.clone());
@@ -932,32 +929,17 @@ fn root_keeps_sessions_continues_queued_pause_without_detach() {
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":session.clone(),"params":{"frame":{"id":"PAGE","url":"https://seven.sliccy.ai/os/","securityOrigin":"https://seven.sliccy.ai","loaderId":"L7"}}}));
     assert!(cdp.session_blocked(&session));
     assert!(cdp.is_protected_target("PAGE"));
-    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == session));
     assert!(sent.borrow().iter().any(|command| {
-        command["method"] == "Fetch.continueRequest"
-            && command["params"]["requestId"] == "R-HELD"
-            && command["params"].as_object().is_some_and(|object| object.keys().all(|key| key == "requestId"))
-    }), "page-own pause must continue unmodified: {:?}", sent.borrow());
-    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.failRequest" && command["params"]["requestId"] == "R-HELD"));
-    assert!(cdp.paused.iter().all(|paused| paused.request_id != "R-HELD"));
+        command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == session
+    }));
+    assert!(sent.borrow().iter().any(|command| {
+        command["method"] == "Fetch.continueRequest" && command["params"]["requestId"] == "R-HELD"
+    }));
     assert!(cdp.call("Fetch.fulfillRequest", json!({"requestId":"R-NEW","responseCode":200}), Some(&session)).is_err());
-    cdp.absorb(json!({
-        "method":"Fetch.requestPaused",
-        "sessionId":session,
-        "params":{
-            "requestId":"R-NEW",
-            "request":{"url":"https://ordinary.test/next","method":"GET","headers":{}},
-            "resourceType":"XHR",
-            "frameId":"PAGE"
-        }
-    }));
-    assert!(sent.borrow().iter().any(|command| {
-        command["method"] == "Fetch.continueRequest" && command["params"]["requestId"] == "R-NEW"
-    }));
 }
 
 #[test]
-fn protected_subtree_fails_every_paused_resource_type() {
+fn protected_ancestor_detaches_descendant_and_refuses_client_fetch() {
     let parent = json!({"targetId":"PARENT","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let child = json!({"targetId":"CHILD","type":"iframe","url":"https://sprinkle.test/frame","parentFrameId":"PARENT","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![parent.clone(), child.clone()]);
@@ -980,21 +962,10 @@ fn protected_subtree_fails_every_paused_resource_type() {
     browser.borrow_mut().infos = vec![seven.clone(), child];
     cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":seven}}));
     assert!(cdp.session_blocked(&session) || cdp.is_protected_target("CHILD"));
-    for (request_id, resource_type) in [("R-DOC", "Document"), ("R-SCRIPT", "Script"), ("R-XHR", "XHR")] {
-        cdp.absorb(json!({
-            "method":"Fetch.requestPaused",
-            "sessionId":session,
-            "params":{
-                "requestId":request_id,
-                "request":{"url":"https://sprinkle.test/x","method":"GET","headers":{}},
-                "resourceType":resource_type,
-                "frameId":"CHILD"
-            }
-        }));
-    }
-    let sent_cmds = sent.borrow().clone();
-    let fails: Vec<_> = sent_cmds.iter().filter(|command| command["method"] == "Fetch.failRequest").collect();
-    let continues: Vec<_> = sent_cmds.iter().filter(|command| command["method"] == "Fetch.continueRequest").collect();
-    assert!(fails.len() >= 3, "every pause must failRequest: fails={fails:?} continues={continues:?}");
-    assert!(continues.is_empty(), "must not continueRequest on protected subtree: {continues:?}");
+    assert!(sent.borrow().iter().any(|command| {
+        command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == session
+    }));
+    assert!(cdp.call("Fetch.fulfillRequest", json!({"requestId":"R1","responseCode":200}), Some(&session)).is_err());
+    assert!(cdp.call("Fetch.continueRequest", json!({"requestId":"R1"}), Some(&session)).is_err());
+    assert!(cdp.call("Fetch.disable", json!({}), Some(&session)).is_err());
 }

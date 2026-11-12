@@ -958,8 +958,18 @@ mod tests {
             .filter(|item| item["method"] == "Fetch.continueRequest")
             .map(|item| item["params"]["requestId"].as_str().unwrap())
             .collect();
-        assert_eq!(continued, ["R1", "R2", "R3"], "{continued:?}");
-        assert!(!sent.iter().any(|item| item["method"] == "Fetch.failRequest"), "{sent:?}");
+        assert_eq!(continued, ["R2"]);
+        let failed: Vec<(&str, &str)> = sent
+            .iter()
+            .filter(|item| item["method"] == "Fetch.failRequest")
+            .map(|item| {
+                (
+                    item["params"]["requestId"].as_str().unwrap(),
+                    item["params"]["errorReason"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(failed, [("R1", "BlockedByClient"), ("R3", "BlockedByClient")]);
         assert!(sent.iter().all(|item| item["params"].get("url").is_none()));
         assert_eq!(cdp.events().len(), 1);
         assert_eq!(cdp.events()[0]["params"]["responseHeaders"][0]["value"], "https://vault.sliccy.ai");
@@ -982,7 +992,7 @@ mod tests {
             })),
         );
         cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
-        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.continueRequest"]);
+        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.failRequest"]);
     }
 
     fn auth_event(session: &str, id: &str, url: &str) -> Value {
@@ -1170,15 +1180,12 @@ mod tests {
         while cdp.pump(Instant::now() + Duration::from_millis(10)).unwrap() {}
         assert!(cdp.session_blocked("S"));
         assert!(!cdp.has_decider("S"));
-        assert!(!methods(&log).iter().any(|method| *method == "Target.detachFromTarget"), "{:?}", methods(&log));
-        assert!(log.borrow().iter().any(|command| {
-            command["method"] == "Fetch.continueRequest"
-                && command["params"]["requestId"] == "R1"
-                && command["params"].as_object().is_some_and(|object| object.keys().all(|key| key == "requestId"))
-        }), "{:?}", log.borrow());
-        assert!(!methods(&log).iter().any(|method| *method == "Fetch.failRequest"), "{:?}", methods(&log));
+        assert_eq!(
+            methods(&log),
+            ["Fetch.disable", "Target.detachFromTarget", "Fetch.continueRequest"]
+        );
+        assert!(log.borrow()[2]["params"].get("headers").is_none());
         assert!(cdp.events().is_empty(), "{:?}", cdp.events());
-        assert!(cdp.next_paused(Some("S"), Duration::ZERO).is_err());
         assert!(cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap_err().starts_with("slicc: refused"));
     }
 

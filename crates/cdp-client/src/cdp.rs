@@ -929,10 +929,7 @@ impl Cdp {
         }
         if session_id.is_some_and(|session| self.dialog_sessions.contains(session)) { return Err(self.refusal()) }
         if let Some(session) = session_id {
-            if matches!(method, "Fetch.fulfillRequest" | "Fetch.continueRequest" | "Fetch.continueResponse" | "Fetch.continueWithAuth")
-                && self.session_is_cuttable_descendant(session)
-                && self.session_subtree_protected(session)
-            {
+            if self.session_is_cuttable_descendant(session) && self.session_subtree_protected(session) {
                 return Err(self.refusal());
             }
             if self.blocked.contains(session) && !harmless(method, params) {
@@ -2026,11 +2023,7 @@ impl Cdp {
     }
 
     fn clear_kept_url_latch_if_fresh_unkept(&mut self, target: &str, info_url: &str, doc: &MainDocument) {
-        let kept = kept_document(&self.guard, info_url)
-            || kept_document(&self.guard, &doc.url)
-            || kept_security_origin(&self.guard, &doc.url, &doc.origin)
-            || doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url))
-            || inheriting_document(&self.guard, &doc.url) && doc.previous;
+        let kept = self.close_proof_kept(target, info_url, doc);
         if !kept {
             self.kept_url_latch.remove(target);
         }
@@ -2039,6 +2032,71 @@ impl Cdp {
     fn close_fail_closed(&self, target: &str) -> bool {
         let url = self.targets.get(target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
         self.protected_targets.contains(target) || self.kept_url_latch.contains(target) || kept_document(&self.guard, url)
+    }
+
+    fn close_proof_kept(&mut self, target_id: &str, info_url: &str, doc: &MainDocument) -> bool {
+        kept_document(&self.guard, info_url)
+            || kept_document(&self.guard, &doc.url)
+            || kept_security_origin(&self.guard, &doc.url, &doc.origin)
+            || doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url))
+            || self.inheriting_close_kept(target_id, info_url, doc)
+    }
+
+    fn inheriting_close_kept(&mut self, target_id: &str, info_url: &str, doc: &MainDocument) -> bool {
+        let inheriting = inheriting_document(&self.guard, info_url) || inheriting_document(&self.guard, &doc.url);
+        inheriting && (doc.previous || self.kept_opener_of(target_id))
+    }
+
+    fn kept_opener_of(&mut self, target_id: &str) -> bool {
+        let info = self.targets.get(target_id).cloned();
+        let Some(info) = info else { return false };
+        if let Some(opener_id) = info.get("openerId").and_then(Value::as_str).filter(|id| !id.is_empty() && *id != target_id).map(str::to_string) {
+            if self.target_matches_kept_rule(&opener_id) {
+                return true;
+            }
+        }
+        if let Some(frame_id) = info.get("openerFrameId").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string) {
+            if self.frame_matches_kept_rule(&frame_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn target_matches_kept_rule(&mut self, target_id: &str) -> bool {
+        if self.kept_url_latch.contains(target_id) {
+            return true;
+        }
+        if let Some(doc) = self.documents.get(target_id).cloned() {
+            if kept_document(&self.guard, &doc.url)
+                || kept_security_origin(&self.guard, &doc.url, &doc.origin)
+                || doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url))
+                || inheriting_document(&self.guard, &doc.url) && doc.previous
+            {
+                return true;
+            }
+        }
+        if self.targets.get(target_id).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| kept_document(&self.guard, url)) {
+            return true;
+        }
+        match self.raw_call("Target.getTargetInfo", json!({ "targetId": target_id }), None, DOCUMENT_CHECK) {
+            Ok(found) => {
+                let info = found.get("targetInfo").cloned().filter(Value::is_object);
+                let Some(info) = info else { return true };
+                self.targets.insert(target_id.to_string(), info.clone());
+                let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+                self.latch_kept_target_url(target_id, url);
+                kept_document(&self.guard, url)
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn frame_matches_kept_rule(&self, frame_id: &str) -> bool {
+        let Some(known) = self.frames.get(frame_id) else { return false };
+        let url = known.first().map(String::as_str).unwrap_or("");
+        let origin = known.get(1).map(String::as_str).unwrap_or("");
+        kept_document(&self.guard, url) || kept_security_origin(&self.guard, url, origin)
     }
 
     fn closable_tab(&mut self, target_id: &str) -> Option<bool> {
@@ -2053,10 +2111,7 @@ impl Cdp {
             self.protect_target(target_id);
             return Some(false);
         }
-        let kept_now = kept_document(&self.guard, &url)
-            || kept_document(&self.guard, &doc.url)
-            || kept_security_origin(&self.guard, &doc.url, &doc.origin)
-            || inheriting_document(&self.guard, &doc.url) && doc.previous;
+        let kept_now = self.close_proof_kept(target_id, &url, &doc);
         if !kept_now {
             return Some(true);
         }
@@ -2065,7 +2120,10 @@ impl Cdp {
             self.protect_target(target_id);
             return Some(false);
         }
-        if kept_document(&self.guard, &doc.url) || kept_security_origin(&self.guard, &doc.url, &doc.origin) {
+        if kept_document(&self.guard, &doc.url)
+            || kept_security_origin(&self.guard, &doc.url, &doc.origin)
+            || (inheriting_document(&self.guard, &url) || inheriting_document(&self.guard, &doc.url)) && self.kept_opener_of(target_id)
+        {
             self.protect_target(target_id);
             return Some(false);
         }
@@ -2657,10 +2715,6 @@ impl Cdp {
         }
     }
 
-    fn session_keeps_page_live(&self, session_id: &str) -> bool {
-        !self.session_is_cuttable_descendant(session_id)
-    }
-
     fn session_is_cuttable_descendant(&self, session_id: &str) -> bool {
         self.session_target(session_id).is_some_and(|target| {
             matches!(
@@ -2670,48 +2724,37 @@ impl Cdp {
         })
     }
 
-    fn drain_session_pauses(&mut self, session_id: &str, cut: bool) {
-        let queued: Vec<Paused> = self.paused.drain(..).collect();
-        for paused in queued {
-            if paused.session_id == session_id {
-                if cut {
-                    self.answer_protected(&paused);
-                } else {
-                    self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
-                    self.continue_plain(&paused.session_id, &paused.request_id);
-                }
-            } else {
-                self.paused.push_back(paused);
-            }
-        }
-    }
-
-    #[track_caller]
     fn block(&mut self, session_id: &str) {
         let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
         self.webmcp_trace_decision("block", &target, session_id, "block session");
-        let cut = self.session_is_cuttable_descendant(session_id);
         let newly_blocked = self.blocked.insert(session_id.to_string());
         if self.webmcp_is_paused(session_id) {
             self.webmcp.deferred.insert(session_id.to_string());
             self.webmcp_revoke(session_id);
-            self.drain_session_pauses(session_id, cut);
+            return;
+        }
+        if !newly_blocked && !self.webmcp.deferred.remove(session_id) {
             return;
         }
         self.webmcp_revoke(session_id);
         if let Some(target) = self.session_targets.get(session_id) {
             self.protected_targets.insert(target.clone());
         }
-        self.drain_session_pauses(session_id, cut);
-        if !cut {
-            return;
+        let queued: Vec<Paused> = self.paused.drain(..).collect();
+        for paused in queued {
+            if paused.session_id == session_id {
+                self.answer_protected(&paused);
+            } else {
+                self.paused.push_back(paused);
+            }
         }
-        if newly_blocked && !self.executing_sessions.contains(session_id) {
-            self.detach_blocked(session_id, "block-cuttable");
+        self.deciders.remove(session_id);
+        if !self.executing_sessions.contains(session_id) {
+            self.detach_blocked(session_id);
         }
     }
 
-    fn detach_blocked(&mut self, session_id: &str, _reason: &str) {
+    fn detach_blocked(&mut self, session_id: &str) {
         let _ = self.send("Fetch.disable", json!({}), Some(session_id));
         let _ = self.send(
             "Target.detachFromTarget",
@@ -2765,20 +2808,7 @@ impl Cdp {
             self.protect_target(&target);
         } else if !self.abandoned.contains(&target) {
             self.protected_targets.remove(&target);
-            self.restore_ordinary_ancestor_sessions(&target);
             self.rejudge_descendants_after_ordinary(&target);
-        }
-    }
-
-    fn restore_ordinary_ancestor_sessions(&mut self, target: &str) {
-        let sessions: Vec<String> = self
-            .session_targets
-            .iter()
-            .filter(|(_, have)| have.as_str() == target)
-            .map(|(session, _)| session.clone())
-            .collect();
-        for session in sessions {
-            self.blocked.remove(&session);
         }
     }
 
@@ -3267,9 +3297,6 @@ impl Cdp {
         if self.frame_protected(&paused.frame_id) {
             return true;
         }
-        if self.session_subtree_protected(&paused.session_id) {
-            return true;
-        }
         if self
             .session_target(&paused.session_id)
             .is_some_and(|target| self.protected_targets.contains(&target))
@@ -3285,12 +3312,9 @@ impl Cdp {
 
     #[track_caller]
     fn protect_target(&mut self, target_id: &str) {
-        let root_keeps_sessions = self.targets.get(target_id).is_some_and(|info| {
-            matches!(info.get("type").and_then(Value::as_str), Some("page") | Some("tab"))
-        });
-        let mut pending = vec![(target_id.to_string(), !root_keeps_sessions)];
+        let mut pending = vec![target_id.to_string()];
         let mut seen = BTreeSet::new();
-        while let Some((current, cut_sessions)) = pending.pop() {
+        while let Some(current) = pending.pop() {
             if !seen.insert(current.clone()) {
                 continue;
             }
@@ -3306,13 +3330,7 @@ impl Cdp {
                 .map(|(session, _)| session.clone())
                 .collect();
             for session in sessions {
-                self.deciders.remove(&session);
-                if cut_sessions {
-                    self.block(&session);
-                } else {
-                    self.blocked.insert(session.clone());
-                    self.drain_session_pauses(&session, false);
-                }
+                self.block(&session);
             }
             let workers: Vec<String> = self
                 .har
@@ -3327,8 +3345,7 @@ impl Cdp {
             pending.extend(
                 self.descendant_target_ids(&current)
                     .into_iter()
-                    .filter(|id| !seen.contains(id))
-                    .map(|id| (id, true)),
+                    .filter(|id| !seen.contains(id)),
             );
         }
     }
@@ -3411,16 +3428,16 @@ impl Cdp {
 
     fn answer_protected(&mut self, paused: &Paused) {
         self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
-        if self.session_keeps_page_live(&paused.session_id) {
-            self.continue_plain(&paused.session_id, &paused.request_id);
-            return;
-        }
         self.settle(&paused.session_id, &paused.request_id);
-        let _ = self.send(
-            "Fetch.failRequest",
-            json!({ "requestId": paused.request_id, "errorReason": "BlockedByClient" }),
-            Some(&paused.session_id),
-        );
+        if paused.resource_type == "Document" {
+            let _ = self.send(
+                "Fetch.failRequest",
+                json!({ "requestId": paused.request_id, "errorReason": "BlockedByClient" }),
+                Some(&paused.session_id),
+            );
+        } else {
+            self.continue_plain(&paused.session_id, &paused.request_id);
+        }
     }
 
     fn continue_plain(&mut self, session_id: &str, request_id: &str) {
@@ -3780,7 +3797,7 @@ impl Cdp {
                             self.worker_opener_protected(info, &[]) || opener_cut
                         }
                         "iframe" => {
-                            matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Protected)
+                            !matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Clear)
                                 || opener_cut
                         }
                         _ => false,
@@ -4396,8 +4413,8 @@ impl Cdp {
         let result = self.raw_call_wait(method, params, session_id, timeout, pinned);
         if let Some(session) = active {
             self.executing_sessions.remove(session);
-            if self.blocked.contains(session) && self.session_is_cuttable_descendant(session) {
-                self.detach_blocked(session, "raw-call-blocked-cuttable");
+            if self.blocked.contains(session) {
+                self.detach_blocked(session);
             }
         }
         result
@@ -4812,15 +4829,6 @@ impl Cdp {
                 }
                 return;
             }
-            if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
-                self.fail_seen_network(&value);
-                self.continue_plain(&paused.session_id, &paused.request_id);
-                return;
-            }
-            if self.session_subtree_protected(&paused.session_id) {
-                self.answer_protected(&paused);
-                return;
-            }
             if protected {
                 if redirect && !authority_protected && self.visible_redirect(&mut value) {
                     self.events.push(value);
@@ -4858,12 +4866,7 @@ impl Cdp {
     }
 
     fn decide_inline(&mut self, paused: Paused) {
-        if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
-            self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
-            self.continue_plain(&paused.session_id, &paused.request_id);
-            return;
-        }
-        if self.session_subtree_protected(&paused.session_id) {
+        if self.blocked.contains(&paused.session_id) {
             self.answer_protected(&paused);
             return;
         }
@@ -4873,15 +4876,6 @@ impl Cdp {
             return;
         };
         let decision = decider(&paused);
-        if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
-            self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
-            self.continue_plain(&paused.session_id, &paused.request_id);
-            return;
-        }
-        if self.session_subtree_protected(&paused.session_id) {
-            self.answer_protected(&paused);
-            return;
-        }
         let (method, params, issued) = match fetch::command(&self.guard, &paused, &decision)
             .and_then(|(method, params)| self.client_issued(method, &params, Some(&paused.session_id)).map(|issued| (method, params, issued))) {
             Ok(command) => command,
@@ -4892,15 +4886,6 @@ impl Cdp {
                 (method, params, false)
             }
         };
-        if self.blocked.contains(&paused.session_id) && self.session_keeps_page_live(&paused.session_id) {
-            self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
-            self.continue_plain(&paused.session_id, &paused.request_id);
-            return;
-        }
-        if self.session_subtree_protected(&paused.session_id) {
-            self.answer_protected(&paused);
-            return;
-        }
         if issued {
             if let Err(message) = self.issue(&params, &paused.session_id) {
                 self.fetch_errors.push(message);
@@ -5127,26 +5112,28 @@ fn storage_content(method: &str) -> bool {
         || matches!(method, "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota")
 }
 
+fn kept_parse_failure(text: &str) -> bool {
+    !matches!(text, "" | "null" | "://")
+}
+
 fn kept_document(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return guard.url(text) };
+    let Some(mut url) = guard.peel(text) else { return kept_parse_failure(text) };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    if url.set_host(Some(&host)).is_err() { return kept_parse_failure(text) }
+    if url.set_username("").is_err() || url.set_password(None).is_err() { return kept_parse_failure(text) }
     if host.strip_suffix(".sliccy.ai").is_some_and(|label| label == "vault" || label.starts_with("vault-")) { return true }
-    if url.set_host(Some(&host)).is_err() { return false }
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    let seven = guard.own_origin(url.as_str()) || seven_page(url.as_str());
+    let seven = guard.own_origin(url.as_str()) || seven_host(url.as_str());
     seven && url.path().starts_with("/os/") && url.path() != "/os/callback.html"
 }
 
 fn seven_or_extra_host(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return false };
+    let Some(mut url) = guard.peel(text) else { return kept_parse_failure(text) };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
-    if url.set_host(Some(&host)).is_err() { return false }
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    guard.own_origin(url.as_str()) || seven_page(url.as_str())
+    if url.set_host(Some(&host)).is_err() { return kept_parse_failure(text) }
+    if url.set_username("").is_err() || url.set_password(None).is_err() { return kept_parse_failure(text) }
+    guard.own_origin(url.as_str()) || seven_host(url.as_str())
 }
 
 fn opaque_document(url: &str) -> bool {
