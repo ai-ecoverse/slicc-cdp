@@ -1197,7 +1197,8 @@ impl Cdp {
         let target = self.session_target(child).unwrap_or_default();
         self.webmcp_trace_decision("release", &target, child, "detachFromTarget");
         let _ = self.raw_call("Target.detachFromTarget", json!({"sessionId":child}), None, DOCUMENT_CHECK);
-        self.blocked.insert(child.to_string());
+        self.unresolved_cuts.insert(child.to_string());
+        self.forget_session(child);
     }
 
     fn webmcp_seed_provisional(frame: &Value) -> bool {

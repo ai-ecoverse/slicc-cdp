@@ -1409,3 +1409,98 @@ fn detach_error_then_retry_until_gone() {
     assert!(!cdp.session_targets.contains_key(&session), "successful retry must forget session");
     assert!(!browser.borrow().sessions.contains_key(&session), "chrome session must be gone");
 }
+
+#[test]
+fn unresolved_cut_forgets_when_ancestor_resolves_clear() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({
+        "targetId":"OOPIF",
+        "type":"iframe",
+        "url":"https://foreign.test/excel",
+        "parentFrameId":"NESTED",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    browser.borrow_mut().detach_failures = 3;
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"S-OLD","targetInfo":child.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("S-OLD"));
+    assert!(!cdp.protected_targets.contains("OOPIF"));
+    assert!(cdp.is_protected_target("OOPIF") || cdp.session_targets.contains_key("S-OLD"));
+    cdp.page_scope_owners.insert("NESTED".into(), "PAGE".into());
+    cdp.release_cleared_unresolved_sessions();
+    assert!(!cdp.is_protected_target("OOPIF"), "clear ancestor must drop non-latched cut");
+    assert!(!cdp.session_targets.contains_key("S-OLD"));
+    assert!(!cdp.session_blocked("S-OLD"));
+    let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
+    assert!(attach.is_ok(), "ordinary OOPIF must attach after clear: {attach:?}");
+}
+
+#[test]
+fn in_flight_detach_is_not_reported_ok_while_mapped() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({"targetId":"CHILD","type":"iframe","url":"https://foreign.test/","parentFrameId":"PAGE","browserContextId":"CTX"});
+    let (mut cdp, _, _) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("CHILD".into(), child);
+    cdp.session_targets.insert("S-CHILD".into(), "CHILD".into());
+    cdp.blocked.insert("S-CHILD".into());
+    cdp.detaching.insert(99, "S-CHILD".into());
+    let result = cdp.call("Target.detachFromTarget", json!({"sessionId":"S-CHILD"}), None);
+    assert!(result.is_err(), "in-flight detach must not report Ok while mapped: {result:?}");
+    assert!(cdp.session_targets.contains_key("S-CHILD"));
+}
+
+#[test]
+fn refused_auto_attach_does_not_remap_blocked_session() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({
+        "targetId":"OOPIF",
+        "type":"iframe",
+        "url":"https://foreign.test/excel",
+        "parentFrameId":"NESTED",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, _, _) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    cdp.unresolved_cuts.insert("CHILD".into());
+    cdp.forget_session("CHILD");
+    assert!(cdp.session_blocked("CHILD"));
+    assert!(!cdp.session_targets.contains_key("CHILD"));
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"CHILD","targetInfo":child.clone(),"waitingForDebugger":false}
+    }));
+    assert!(!cdp.session_targets.contains_key("CHILD"), "blocked refused attach must not remap");
+    assert!(!cdp.protected_targets.contains("OOPIF"));
+    cdp.page_scope_owners.insert("NESTED".into(), "PAGE".into());
+    cdp.release_cleared_unresolved_sessions();
+    assert!(!cdp.is_protected_target("OOPIF"));
+    let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
+    assert!(attach.is_ok(), "cleared ordinary OOPIF must attach: {attach:?}");
+}
