@@ -941,3 +941,44 @@ fn frame_navigated_during_page_enable_settles_refused_live_documents() {
         assert!(!cdp.protected_targets.contains("IFRAME"), "{refused}");
     }
 }
+
+#[test]
+fn pending_install_park_caps_frame_navigated_restarts_at_provisional_park() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    let park = Instant::now() + Duration::from_millis(80);
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.pending_install = Some(park);
+        arm.pending_install_park = Some(park);
+        arm.pending_install_restarts = 0;
+        arm.promote_read_at = None;
+    }
+    for index in 0..3 {
+        cdp.absorb(json!({
+            "method":"Page.frameNavigated",
+            "sessionId":"CHILD",
+            "params":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":format!("RESTART-{index}")}}
+        }));
+        let arm = cdp.webmcp.arms.get("CHILD").expect("child arm");
+        let due = arm.pending_install.expect("pending install");
+        let cap = arm.pending_install_park.expect("pending install park");
+        assert!(due <= cap, "restart must not extend past the provisional park ceiling");
+    }
+    std::thread::sleep(Duration::from_millis(120));
+    for index in 3..8 {
+        cdp.absorb(json!({
+            "method":"Page.frameNavigated",
+            "sessionId":"CHILD",
+            "params":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":format!("RESTART-{index}")}}
+        }));
+    }
+    cdp.webmcp_sweep();
+    assert!(cdp.session_blocked("CHILD"), "after the provisional park ceiling, further frameNavigated restarts must settle");
+    assert!(state.borrow().sent.iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert_eq!(shim_evals(&state, "CHILD"), 0);
+    assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.admitted == 0 && !arm.domains));
+}
