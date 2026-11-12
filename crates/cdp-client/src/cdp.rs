@@ -1825,34 +1825,46 @@ impl Cdp {
         }
     }
 
-    fn bind_orphan_iframe_frames(&mut self) {
-        let iframes: Vec<(String, String)> = self
+    fn bind_proven_iframe_frames(&mut self) {
+        let iframes: Vec<String> = self
             .targets
             .iter()
             .filter(|(_, info)| info.get("type").and_then(Value::as_str) == Some("iframe"))
-            .filter_map(|(id, info)| {
-                let parent = info.get("parentFrameId").and_then(Value::as_str).filter(|id| !id.is_empty())?;
-                Some((id.clone(), parent.to_string()))
-            })
+            .map(|(id, _)| id.clone())
             .collect();
-        for (target, parent) in iframes {
-            if self.iframe_own_frames.values().any(|owner| owner == &target) {
-                continue;
-            }
+        for target in iframes {
+            self.note_iframe_own_frame(&target, &target);
             if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
                 self.note_iframe_own_frame(&target, &frame);
-                continue;
-            }
-            let orphans: Vec<String> = self
-                .frame_parents
-                .iter()
-                .filter(|(frame, have)| have.as_str() == parent && !self.iframe_own_frames.contains_key(*frame))
-                .map(|(frame, _)| frame.clone())
-                .collect();
-            if orphans.len() == 1 {
-                self.note_iframe_own_frame(&target, &orphans[0]);
             }
         }
+    }
+
+    fn frame_known_page_or_bound(&self, frame: &str, all: &[Value]) -> bool {
+        if self.iframe_own_frames.contains_key(frame) {
+            return true;
+        }
+        if self.documents.values().any(|doc| doc.frame_id == frame) {
+            return true;
+        }
+        if self.page_scope_owners.contains_key(frame) {
+            return true;
+        }
+        if self.document_versions.keys().any(|(_, id)| id == frame) {
+            return true;
+        }
+        if self.webmcp_frame_owner(frame).is_some() {
+            return true;
+        }
+        all.iter()
+            .chain(self.targets.values())
+            .any(|item| {
+                item.get("targetId").and_then(Value::as_str) == Some(frame)
+                    && matches!(item.get("type").and_then(Value::as_str), Some("page" | "tab" | "iframe"))
+            })
+            || self.targets.get(frame).is_some_and(|info| {
+                matches!(info.get("type").and_then(Value::as_str), Some("page" | "tab" | "iframe"))
+            })
     }
 
     fn frame_owner_target(&self, frame: &str, all: &[Value]) -> Option<String> {
@@ -1877,8 +1889,14 @@ impl Cdp {
             .and_then(|item| item.get("targetId").and_then(Value::as_str).map(str::to_string))
     }
 
+    fn frames_entry_protected(&self, frame: &str) -> bool {
+        self.frames
+            .get(frame)
+            .is_some_and(|urls| urls.iter().any(|text| self.guard.url(text)))
+    }
+
     fn iframe_frame_protected(&self, frame: &str, all: &[Value]) -> Option<bool> {
-        if self.protected_targets.contains(frame) {
+        if self.protected_targets.contains(frame) || self.frames_entry_protected(frame) {
             return Some(true);
         }
         if let Some(found) = self.iframe_target_for_frame(frame, all) {
@@ -1895,12 +1913,10 @@ impl Cdp {
                     return Some(true);
                 }
             }
-            return Some(false);
-        }
-        if let Some(urls) = self.frames.get(frame) {
-            if urls.iter().any(|text| self.guard.url(text)) {
+            if self.frames_entry_protected(frame) {
                 return Some(true);
             }
+            return Some(false);
         }
         None
     }
@@ -1927,6 +1943,9 @@ impl Cdp {
             }
             if let Some(true) = self.iframe_frame_protected(parent, all) {
                 return AncestorState::Protected;
+            }
+            if !self.frame_known_page_or_bound(parent, all) {
+                return AncestorState::Unresolved;
             }
             if let Some(owner) = self.frame_owner_target(parent, all) {
                 if self.protected_targets.contains(&owner) {
@@ -2637,23 +2656,7 @@ impl Cdp {
         }
     }
 
-    #[track_caller]
-    fn block(&mut self, session_id: &str) {
-        let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
-        self.webmcp_trace_decision("block", &target, session_id, "block session");
-        let newly_blocked = self.blocked.insert(session_id.to_string());
-        if self.webmcp_is_paused(session_id) {
-            self.webmcp.deferred.insert(session_id.to_string());
-            self.webmcp_revoke(session_id);
-            return;
-        }
-        if !newly_blocked && !self.webmcp.deferred.remove(session_id) {
-            return;
-        }
-        self.webmcp_revoke(session_id);
-        if let Some(target) = self.session_targets.get(session_id) {
-            self.protected_targets.insert(target.clone());
-        }
+    fn drain_session_pauses(&mut self, session_id: &str) {
         let queued: Vec<Paused> = self.paused.drain(..).collect();
         for paused in queued {
             if paused.session_id == session_id {
@@ -2662,7 +2665,27 @@ impl Cdp {
                 self.paused.push_back(paused);
             }
         }
-        if !self.executing_sessions.contains(session_id) { self.detach_blocked(session_id); }
+    }
+
+    #[track_caller]
+    fn block(&mut self, session_id: &str) {
+        let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
+        self.webmcp_trace_decision("block", &target, session_id, "block session");
+        let newly_blocked = self.blocked.insert(session_id.to_string());
+        if self.webmcp_is_paused(session_id) {
+            self.webmcp.deferred.insert(session_id.to_string());
+            self.webmcp_revoke(session_id);
+            self.drain_session_pauses(session_id);
+            return;
+        }
+        self.webmcp_revoke(session_id);
+        if let Some(target) = self.session_targets.get(session_id) {
+            self.protected_targets.insert(target.clone());
+        }
+        self.drain_session_pauses(session_id);
+        if newly_blocked && !self.executing_sessions.contains(session_id) {
+            self.detach_blocked(session_id);
+        }
     }
 
     fn detach_blocked(&mut self, session_id: &str) {
@@ -2750,12 +2773,16 @@ impl Cdp {
     }
 
     fn rejudge_descendants_after_ordinary(&mut self, ancestor: &str) {
-        let descendants: Vec<String> = self
+        let mut pending: Vec<String> = self
             .descendant_target_ids(ancestor)
             .into_iter()
             .filter(|id| self.protected_targets.contains(id))
             .collect();
-        for id in descendants {
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             self.protected_targets.remove(&id);
             if let Some(doc) = self.documents.get_mut(&id) {
                 doc.previous = false;
@@ -2766,6 +2793,17 @@ impl Cdp {
                 self.protect_target(&id);
             } else {
                 self.drop_cleared_descendant_sessions(&id);
+                let workers: Vec<String> = self
+                    .targets
+                    .iter()
+                    .filter(|(worker, info)| {
+                        self.protected_targets.contains(*worker)
+                            && matches!(info.get("type").and_then(Value::as_str), Some("worker" | "service_worker" | "shared_worker"))
+                            && info.get("openerId").and_then(Value::as_str) == Some(id.as_str())
+                    })
+                    .map(|(worker, _)| worker.clone())
+                    .collect();
+                pending.extend(workers);
             }
         }
     }
@@ -3130,7 +3168,49 @@ impl Cdp {
                 self.note_iframe_own_frame(&target, root);
             }
         }
-        self.bind_orphan_iframe_frames();
+        self.bind_proven_iframe_frames();
+    }
+
+    fn protect_bound_frame_owner(&mut self, frame: &str) {
+        let owner = self
+            .iframe_own_frames
+            .get(frame)
+            .cloned()
+            .or_else(|| {
+                self.targets
+                    .get(frame)
+                    .filter(|info| info.get("type").and_then(Value::as_str) == Some("iframe"))
+                    .map(|_| frame.to_string())
+            })
+            .or_else(|| {
+                self.documents
+                    .iter()
+                    .find(|(id, doc)| {
+                        doc.frame_id == frame
+                            && self.targets.get(*id).is_some_and(|info| info.get("type").and_then(Value::as_str) == Some("iframe"))
+                    })
+                    .map(|(id, _)| id.clone())
+            });
+        if let Some(owner) = owner {
+            self.protect_target(&owner);
+        } else {
+            self.protect_unbound_frame_descendants(frame);
+        }
+    }
+
+    fn protect_unbound_frame_descendants(&mut self, frame: &str) {
+        let children: Vec<String> = self
+            .targets
+            .iter()
+            .filter(|(_, info)| {
+                info.get("type").and_then(Value::as_str) == Some("iframe")
+                    && info.get("parentFrameId").and_then(Value::as_str) == Some(frame)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in children {
+            self.protect_target(&id);
+        }
     }
 
     fn note_parent(&mut self, frame_id: &str, parent: &str) {
@@ -3207,7 +3287,8 @@ impl Cdp {
                 if cut_sessions {
                     self.block(&session);
                 } else {
-                    self.blocked.insert(session);
+                    self.blocked.insert(session.clone());
+                    self.drain_session_pauses(&session);
                 }
             }
             let workers: Vec<String> = self
@@ -3548,6 +3629,9 @@ impl Cdp {
                     }
                     self.frame_versions.insert(id.to_string(), self.frame_epoch);
                     self.frame_sessions.entry(session.clone()).or_default().insert(id.to_string());
+                    if frame.get("parentId").is_some() && (self.guard.url(&url) || self.guard.url(&origin)) {
+                        self.protect_bound_frame_owner(id);
+                    }
                 }
                 if frame.get("parentId").is_none() {
                     self.main_commit(&session, &frame);
@@ -3608,7 +3692,7 @@ impl Cdp {
                     if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
                         self.note_iframe_own_frame(&target, &frame);
                     }
-                    self.bind_orphan_iframe_frames();
+                    self.bind_proven_iframe_frames();
                 }
                 if self.info_protected(&info, &[]) && !self.probing.contains(&target) && self.should_latch_protected(&info, &[]) {
                     let navigating = self.documents.get(&target).is_some_and(|doc| doc.navigating);
@@ -3646,7 +3730,7 @@ impl Cdp {
                     if !child.is_empty() && !target.is_empty() {
                         self.session_targets.insert(child.to_string(), target.to_string());
                         self.targets.insert(target.to_string(), info.clone());
-                        self.bind_orphan_iframe_frames();
+                        self.bind_proven_iframe_frames();
                     }
                     let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
                     let opener = info.get("openerId").and_then(Value::as_str).unwrap_or("");
@@ -5040,7 +5124,6 @@ fn kept_security_origin(guard: &Protected, url: &str, origin: &str) -> bool {
 
 fn harmless(method: &str, params: &Value) -> bool {
     match method {
-        "Fetch.disable" => true,
         "Fetch.continueRequest" => params
             .as_object()
             .is_some_and(|object| object.keys().all(|key| key == "requestId")),
@@ -6288,23 +6371,19 @@ mod tests {
     }
 
     #[test]
-    fn a_harmless_call_on_an_already_blocked_session_still_waits_for_its_reply() {
+    fn fetch_disable_on_an_already_blocked_session_is_refused() {
         let mut cdp = pending(|message| match message["method"].as_str() {
             Some("Runtime.evaluate") => vec![json!({
                 "method": "Page.frameNavigated",
                 "sessionId": "S",
                 "params": { "frame": { "id": "F", "url": "https://seven.sliccy.ai/os/" } }
             })],
-            Some("Fetch.disable") => vec![
-                json!({ "method": "Page.lifecycleEvent", "sessionId": "S", "params": { "name": "load" } }),
-                json!({ "id": message["id"], "result": {} }),
-            ],
             _ => vec![],
         });
         let _ = evaluate(&mut cdp);
         assert!(cdp.session_blocked("S"));
         let disabled = cdp.call_for("Fetch.disable", json!({}), Some("S"), Duration::from_secs(30));
-        assert_eq!(disabled.unwrap(), json!({}));
+        assert!(disabled.is_err(), "{disabled:?}");
     }
 
     #[test]
