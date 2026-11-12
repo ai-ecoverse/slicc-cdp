@@ -12,12 +12,10 @@ pub struct Report {
 
 struct Intent {
     text: String,
-    deferred: bool,
     entry: Option<intent::Entry>,
     checked: bool,
     since: u64,
     fallback: Option<String>,
-    quiet: bool,
 }
 
 impl Report {
@@ -58,14 +56,15 @@ impl Report {
     }
 
     pub fn with_intent(mut self, command: &str, text: Option<&str>) -> Self {
+        if self.active {
+            self.note.intent = text.filter(|text| !text.is_empty()).map(str::to_string);
+        }
         self.intent = intent::acts_on_page(command).then(|| Intent {
             text: text.unwrap_or_default().to_string(),
-            deferred: intent::deferred(command),
             entry: None,
             checked: false,
             since: intent::now_ms(),
             fallback: None,
-            quiet: false,
         });
         self
     }
@@ -73,12 +72,6 @@ impl Report {
     pub fn fallback_tab(&mut self, tab: Option<&str>) {
         if let Some(intent) = self.intent.as_mut() {
             intent.fallback = tab.map(str::to_string);
-        }
-    }
-
-    pub fn skip_overlay(&mut self) {
-        if let Some(intent) = self.intent.as_mut() {
-            intent.quiet = true;
         }
     }
 
@@ -114,7 +107,7 @@ impl Report {
     }
 
     pub fn begin(&mut self, cdp: &mut Cdp) {
-        self.running(cdp);
+        self.running();
         if !self.active || self.started || self.ended {
             return;
         }
@@ -123,7 +116,7 @@ impl Report {
     }
 
     pub fn finish(&mut self, cdp: &mut Cdp, output: &Output) {
-        self.linger(cdp);
+        self.close();
         if !self.active || self.ended {
             return;
         }
@@ -138,7 +131,7 @@ impl Report {
         );
     }
 
-    fn running(&mut self, cdp: &mut Cdp) {
+    fn running(&mut self) {
         let Some(tab) = self.note.tab.clone() else { return };
         let Some(intent) = self.intent.as_mut().filter(|intent| !intent.checked) else { return };
         intent.checked = true;
@@ -148,12 +141,9 @@ impl Report {
         let entry = intent::Entry { id: intent::fresh_id(intent.since), tab: tab.clone(), intent: intent.text.clone(), start: intent.since, end: None };
         intent::note(&entry);
         intent.entry = Some(entry);
-        if !intent.deferred && !intent.text.is_empty() {
-            intent::show(cdp, &tab, &intent.text, intent::RUNNING_MS);
-        }
     }
 
-    fn linger(&mut self, cdp: &mut Cdp) {
+    fn close(&mut self) {
         let tab = self.note.tab.clone();
         let Some(intent) = self.intent.take() else { return };
         let Some(tab) = tab.or_else(|| intent.fallback.clone()) else { return };
@@ -167,9 +157,6 @@ impl Report {
         if !same && (!silent || !intent.checked && intent::touched(&intent::recent(intent.since), &tab, intent.since)) {
             let start = intent.since;
             intent::note(&intent::Entry { id: intent::fresh_id(start), tab: tab.clone(), intent: intent.text.clone(), start, end: Some(now) });
-        }
-        if !silent && !intent.quiet {
-            intent::show(cdp, &tab, &intent.text, intent::LINGER_MS);
         }
     }
 }
@@ -607,6 +594,39 @@ mod tests {
             log.iter()
                 .filter_map(|message| message.get("method").and_then(|item| item.as_str()))
                 .collect()
+        }
+
+        #[test]
+        fn the_action_start_carries_the_cleaned_intent() {
+            let root = std::env::temp_dir().join(format!("slicc-action-intent-{}", std::process::id()));
+            let (labelled_dir, plain_dir, list_dir) = (root.join("labelled"), root.join("plain"), root.join("list"));
+            for dir in [&labelled_dir, &plain_dir, &list_dir] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            let labelled = Peer::start(SliccReply::NotFound, true);
+            let plain = Peer::start(SliccReply::NotFound, true);
+            let listed = Peer::start(SliccReply::NotFound, true);
+            let started = Instant::now();
+            let left = run(&labelled_dir, labelled.port, &["open", "http://a.test/", "--intent", "Opening\u{202e} the\u{200b}\n page"]);
+            let right = run(&plain_dir, plain.port, &["open", "http://a.test/", "--intent="]);
+            assert_pair(&left, &right, started);
+            assert_eq!(left.code, 0);
+            labelled.wait_actions(2);
+            plain.wait_actions(2);
+            let log = labelled.log.lock().unwrap().clone();
+            let sent = actions(&log);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0]["params"]["phase"], "start");
+            assert_eq!(sent[0]["params"]["kind"], "open");
+            assert_eq!(sent[0]["params"]["intent"], "Opening the page");
+            assert_eq!(sent[1]["params"]["phase"], "end");
+            assert!(sent[1]["params"].get("intent").is_none());
+            let log = plain.log.lock().unwrap().clone();
+            assert!(actions(&log).iter().all(|message| message["params"].get("intent").is_none()));
+            let list = run(&list_dir, listed.port, &["tab-list", "--intent", "Listing"]);
+            assert_eq!(list.code, 0, "{}", list.stderr);
+            assert!(actions(&listed.log.lock().unwrap()).is_empty());
+            let _ = std::fs::remove_dir_all(root);
         }
 
         #[test]

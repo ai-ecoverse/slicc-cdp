@@ -56,6 +56,7 @@ pub struct Options {
     pub version: bool,
     pub cdp: Option<String>,
     pub runtime: Option<String>,
+    pub intent: Option<String>,
     pub sign_key: Option<String>,
     pub signature_agent: Option<String>,
     pub signature_agent_legacy: bool,
@@ -113,6 +114,7 @@ fn empty_options() -> Options {
         version: false,
         cdp: None,
         runtime: None,
+        intent: None,
         sign_key: None,
         signature_agent: None,
         signature_agent_legacy: false,
@@ -187,6 +189,7 @@ fn takes_value(name: &str) -> bool {
             | "frame"
             | "cdp"
             | "runtime"
+            | "intent"
             | "sign-key"
             | "signature-agent"
     )
@@ -346,6 +349,7 @@ fn apply_option(
         "frame" => opts.frame = Some(owned(value)),
         "cdp" => opts.cdp = Some(owned(value)),
         "runtime" => opts.runtime = Some(owned(value)),
+        "intent" => opts.intent = Some(owned(value)),
         "sign-key" => opts.sign_key = Some(owned(value)),
         "signature-agent" => opts.signature_agent = Some(owned(value)),
         "signature-agent-legacy" => opts.signature_agent_legacy = true,
@@ -520,6 +524,15 @@ mod tests {
 
     fn err(args: &[&str]) -> Stop {
         parse(&words(args)).unwrap_err()
+    }
+
+    #[test]
+    fn intent_takes_both_forms() {
+        assert_eq!(ok(&["--intent", "Checking the API", "https://a.example/"]).intent.as_deref(), Some("Checking the API"));
+        assert_eq!(ok(&["--intent=Reading", "https://a.example/"]).intent.as_deref(), Some("Reading"));
+        assert_eq!(ok(&["--intent=", "https://a.example/"]).intent.as_deref(), Some(""));
+        assert_eq!(ok(&["https://a.example/"]).intent, None);
+        assert!(err(&["https://a.example/", "--intent"]).message.contains("requires a value"));
     }
 
     #[test]

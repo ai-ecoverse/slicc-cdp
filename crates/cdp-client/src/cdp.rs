@@ -4579,6 +4579,7 @@ pub struct ActionNote {
     pub length: Option<u64>,
     pub method: Option<String>,
     pub agent: Option<String>,
+    pub intent: Option<String>,
 }
 
 impl ActionNote {
@@ -4597,6 +4598,7 @@ impl ActionNote {
         }
         insert_text(&mut params, "method", self.method.as_deref());
         insert_text(&mut params, "agent", self.agent.as_deref());
+        insert_text(&mut params, "intent", self.intent.as_deref());
         Value::Object(params)
     }
 
@@ -5849,6 +5851,12 @@ mod tests {
             })
         );
         assert!(failed.get("agent").is_none());
+        assert!(failed.get("intent").is_none());
+        let labelled = ActionNote { intent: Some("Signing in".to_string()), ..click.clone() };
+        assert_eq!(labelled.start_params()["intent"], "Signing in");
+        assert_eq!(labelled.start_params()["kind"], "click");
+        assert!(labelled.end_params(true, "").get("intent").is_none());
+        assert!(click.start_params().get("intent").is_none());
         assert!(failed.get("kind").is_none());
         assert!(failed.get("target").is_none());
         let open = ActionNote {

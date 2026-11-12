@@ -31,6 +31,8 @@ Tab selection:
                              origin. Any other case exits 2 and lists --tab
       --frame <frameId>      Run in a child frame of that tab
       --full-urls            Print URLs without redacting query strings (may expose login tokens)
+      --intent <text>        What the request is for, shown in SLICC's recent
+                             actions (env: SLICC_INTENT)
 
 Web Bot Auth signing (off unless --sign-key is given):
       --sign-key <file>      Sign every request and redirect hop with this

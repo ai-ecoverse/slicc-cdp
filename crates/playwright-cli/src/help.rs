@@ -164,7 +164,7 @@ pub fn global_help() -> String {
     ));
     lines.push(row(
         "--intent <text>",
-        "what the command is for, shown on the tab and written into recordings and HAR comments (env: SLICC_INTENT)",
+        "what the command is for, sent with SLICC's Slicc.action and written into recordings and HAR comments (env: SLICC_INTENT)",
     ));
     lines.push(row("-h, --help", "show help"));
     lines.push(row("-V, --version", "print the version"));
