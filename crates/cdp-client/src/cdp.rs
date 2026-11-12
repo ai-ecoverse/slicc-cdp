@@ -1725,7 +1725,7 @@ impl Cdp {
             self.protect_target(target_id);
             return Some(false);
         }
-        if self.default_context_kept(target_id) {
+        if self.default_context_kept(target_id, &doc.url) {
             self.protect_target(target_id);
             return Some(false);
         }
@@ -1838,7 +1838,7 @@ impl Cdp {
         frame
     }
 
-    fn default_context_kept(&self, target: &str) -> bool {
+    fn default_context_kept(&self, target: &str, document_url: &str) -> bool {
         let sessions: BTreeSet<&str> = self
             .session_targets
             .iter()
@@ -1848,7 +1848,7 @@ impl Cdp {
             .chain(self.runtime_sessions.get(target).map(String::as_str))
             .collect();
         self.context_proofs.iter().any(|((owner, _), proof)| {
-            sessions.contains(owner.as_str()) && proof.default && self.guard.url(&proof.origin)
+            sessions.contains(owner.as_str()) && proof.default && kept_security_origin(&self.guard, document_url, &proof.origin)
         })
     }
 

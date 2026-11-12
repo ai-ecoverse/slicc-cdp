@@ -457,10 +457,12 @@ fn a_restored_protected_seven_document_that_is_not_the_live_ui_can_be_closed() {
     let (mut cdp, sent, info, frame) = close_probe(history);
     cdp.session_targets.insert("S".into(), "T".into());
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":1,"origin":"https://seven.sliccy.ai","name":"","uniqueId":"U0","auxData":{"isDefault":true,"frameId":"F","type":"default"}}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"chrome-error://chromewebdata/","securityOrigin":"://","unreachableUrl":failed,"loaderId":"L1"}}}));
     assert!(cdp.is_protected_target("T"));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":"https://example.test/blank","securityOrigin":"https://example.test","loaderId":"L2"}}}));
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"type":"BackForwardCacheRestore","frame":{"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"}}}));
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":"S","params":{"context":{"id":2,"origin":"https://seven.sliccy.ai","name":"","uniqueId":"U1","auxData":{"isDefault":true,"frameId":"F","type":"default"}}}}));
     *info.borrow_mut() = json!({"targetId":"T","type":"page","url":history,"title":"SECRETTITLE"});
     *frame.borrow_mut() = json!({"id":"F","url":history,"securityOrigin":"https://seven.sliccy.ai","loaderId":"L0"});
     assert!(cdp.is_protected_target("T"));
