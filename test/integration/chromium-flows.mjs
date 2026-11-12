@@ -611,6 +611,15 @@ async function protectedFlow(runner, site, wsUrl) {
       (await raw.targetUrl(vault)).includes('VAULTSECRET'),
       'the live vault tab was closed'
     );
+    const viewSource = await raw.open(
+      'view-source:http://vault.sliccy.ai/landing?k=VIEWSOURCESECRET'
+    );
+    await refused(['tab-close', '--tab', viewSource], cwd);
+    assert.ok(
+      (await raw.targetUrl(viewSource)).includes('VIEWSOURCESECRET'),
+      'the view-source vault tab was closed'
+    );
+    await raw.send('Target.closeTarget', { targetId: viewSource });
     await raw.send('Target.closeTarget', { targetId: vault });
     for (const url of ['http://vault.sliccy.ai/landing', '//seven.sliccy.ai/x']) {
       const curled = await runner.curl([url], cwd);

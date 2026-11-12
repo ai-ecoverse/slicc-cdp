@@ -314,6 +314,10 @@ impl Protected {
         parse(&format!("{}://{rest}", self.rules.about_scheme)).unwrap_or(url)
     }
 
+    pub(crate) fn peel(&self, text: &str) -> Option<Url> {
+        self.unwrap(parse(text))
+    }
+
     fn unwrap(&self, mut url: Option<Url>) -> Option<Url> {
         let mut depth = 0;
         while let Some(current) = url.as_ref() {
