@@ -112,14 +112,29 @@ fn seven_rules() -> &'static slicc_browsers::Seven {
     SEVEN.get_or_init(|| slicc_browsers::catalog().seven)
 }
 
-pub fn seven_page(text: &str) -> bool {
-    let Ok(url) = url::Url::parse(text) else { return false };
-    let rules = seven_rules();
-    if url.scheme() != rules.origin_scheme || !url.username().is_empty() || url.password().is_some() || url.port().is_some() { return false }
-    let Some(label) = url.host_str().and_then(|host| host.strip_suffix(".sliccy.ai")) else { return false };
+fn seven_label(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let Some(label) = host.strip_suffix(".sliccy.ai") else { return false };
     let bytes = label.as_bytes();
     !bytes.is_empty() && bytes.len() <= 63
         && bytes.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
         && bytes[0] != b'-' && bytes[bytes.len() - 1] != b'-'
-        && rules.is_seven_label(label)
+        && seven_rules().is_seven_label(label)
+}
+
+pub fn seven_host(text: &str) -> bool {
+    let Ok(url) = url::Url::parse(text) else { return false };
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    url.host_str().is_some_and(seven_label)
+}
+
+pub fn seven_page(text: &str) -> bool {
+    let Ok(url) = url::Url::parse(text) else { return false };
+    let rules = seven_rules();
+    if url.scheme() != rules.origin_scheme || !url.username().is_empty() || url.password().is_some() || url.port().is_some() {
+        return false;
+    }
+    url.host_str().is_some_and(seven_label)
 }
