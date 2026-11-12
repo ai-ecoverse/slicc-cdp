@@ -1872,6 +1872,21 @@ impl Cdp {
         Some((frame, loader))
     }
 
+    pub(super) fn webmcp_frame_owner(&self, frame: &str) -> Option<String> {
+        for (session, arm) in &self.webmcp.arms {
+            if arm.root_identity.as_ref().is_some_and(|(_, context)| context.frame == frame)
+                || arm.loaders.contains_key(frame)
+                || arm.documents.contains_key(frame)
+                || arm.pending_frames.contains_key(frame)
+            {
+                if let Some(owner) = self.session_target(session) {
+                    return Some(owner);
+                }
+            }
+        }
+        None
+    }
+
     fn webmcp_refused_info(&self, target: &str, info: &Value) -> bool {
         let url = info.get("url").and_then(Value::as_str).unwrap_or("");
         if matches!(url, "" | "about:blank" | "about:srcdoc") {

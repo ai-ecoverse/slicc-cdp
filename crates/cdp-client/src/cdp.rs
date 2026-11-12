@@ -1733,6 +1733,26 @@ impl Cdp {
         self.guard.target(url, previous, opener)
     }
 
+    fn frame_owner_target(&self, frame: &str, all: &[Value]) -> Option<String> {
+        if let Some((owner, _)) = self.documents.iter().find(|(_, doc)| doc.frame_id == frame) {
+            return Some(owner.clone());
+        }
+        if let Some(page) = self.page_scope_owners.get(frame) {
+            return Some(page.clone());
+        }
+        if let Some((owner, _)) = self.document_versions.keys().find(|(_, id)| id == frame) {
+            return Some(owner.clone());
+        }
+        if let Some(owner) = self.webmcp_frame_owner(frame) {
+            return Some(owner);
+        }
+        all
+            .iter()
+            .chain(self.targets.values())
+            .find(|item| item.get("targetId").and_then(Value::as_str) == Some(frame))
+            .and_then(|item| item.get("targetId").and_then(Value::as_str).map(str::to_string))
+    }
+
     fn iframe_ancestor_protected(&self, info: &Value, all: &[Value]) -> bool {
         if info.get("type").and_then(Value::as_str) != Some("iframe") {
             return false;
@@ -1750,33 +1770,42 @@ impl Cdp {
                     return true;
                 }
             }
-            let found = all
-                .iter()
-                .chain(self.targets.values())
-                .find(|item| item.get("targetId").and_then(Value::as_str) == Some(parent));
-            if let Some(found) = found {
-                if self.protected_targets.contains(parent) || self.target_own_protected(found, all) {
+            if let Some(owner) = self.frame_owner_target(parent, all) {
+                if self.protected_targets.contains(&owner) {
                     return true;
                 }
-                if found.get("type").and_then(Value::as_str) == Some("iframe") {
-                    parent = match found.get("parentFrameId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
-                        Some(next) => next,
-                        None => return true,
-                    };
-                    continue;
+                if let Some(doc) = self.documents.get(&owner) {
+                    if self.guard.url(&doc.url) || self.guard.url(&doc.origin) || doc.previous {
+                        return true;
+                    }
                 }
-                return false;
-            }
-            if let Some((owner, doc)) = self.documents.iter().find(|(_, doc)| doc.frame_id == parent) {
-                if self.protected_targets.contains(owner.as_str())
-                    || self.guard.url(&doc.url)
-                    || self.guard.url(&doc.origin)
-                    || doc.previous
-                    || self.targets.get(owner).is_some_and(|owner_info| self.target_own_protected(owner_info, all))
-                {
-                    return true;
+                let found = all
+                    .iter()
+                    .chain(self.targets.values())
+                    .find(|item| item.get("targetId").and_then(Value::as_str) == Some(owner.as_str()));
+                if let Some(found) = found {
+                    if self.target_own_protected(found, all) {
+                        return true;
+                    }
+                    if found.get("type").and_then(Value::as_str) == Some("iframe") {
+                        match found.get("parentFrameId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                            Some(next) if next != parent => {
+                                parent = next;
+                                continue;
+                            }
+                            Some(_) => return false,
+                            None => return true,
+                        }
+                    }
+                    return false;
                 }
-                return false;
+                return self.guard.url(
+                    self.targets
+                        .get(&owner)
+                        .and_then(|info| info.get("url"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
             }
             if let Some(next) = self.frame_parents.get(parent) {
                 parent = next.as_str();
