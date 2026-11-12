@@ -42,6 +42,18 @@ struct BackendState {
     enabled_runtime: BTreeSet<String>,
     deferred_lifecycle: VecDeque<String>,
     child_get_frame_tree_delay: Option<Duration>,
+    child_get_frame_tree_nth_delay: Option<(usize, Duration)>,
+    child_get_frame_tree_count: usize,
+    inject_before_child_network_enable: Option<Value>,
+    child_network_enable_hook: Option<Rc<RefCell<Option<Box<dyn FnMut()>>>>>,
+    fail_child_page_enable: bool,
+    replace_oopif_tree_on_child_page_enable: Option<Value>,
+    after_child_page_enable: bool,
+    delay_holder_get_frame_tree_after_child_page_enable: Option<Duration>,
+    delay_child_get_frame_tree_after_load_network: Option<Duration>,
+    pending_observe_tree_delay: bool,
+    get_frame_tree_delay_hook: Option<Rc<RefCell<Option<Box<dyn FnMut()>>>>>,
+    after_command_hook: Option<Rc<RefCell<Option<Box<dyn FnMut(&str, &str)>>>>>,
 }
 
 impl BackendState {
@@ -177,6 +189,26 @@ fn frame(url: &str) -> Value {
 impl Transport for Backend {
     fn send_text(&mut self, text: &str) -> Result<(), String> {
         let command: Value = serde_json::from_str(text).unwrap();
+        self.handle_command(text)?;
+        let hook = self.0.borrow().after_command_hook.clone();
+        if let Some(hook) = hook {
+            if let Ok(mut slot) = hook.try_borrow_mut() {
+                if let Some(callback) = slot.as_mut() {
+                    callback(command["sessionId"].as_str().unwrap_or(""), command["method"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+        Ok(self.0.borrow_mut().inbox.pop_front())
+    }
+}
+
+impl Backend {
+    fn handle_command(&mut self, text: &str) -> Result<(), String> {
+        let command: Value = serde_json::from_str(text).unwrap();
         let mut state = self.0.borrow_mut();
         state.sent.push(command.clone());
         let method = command["method"].as_str().unwrap();
@@ -193,14 +225,73 @@ impl Transport for Backend {
                     return Ok(());
                 }
                 let session = command["sessionId"].as_str().unwrap_or("");
+                let mut delay = None;
                 if BackendState::child_session(session) {
-                    if let Some(delay) = state.child_get_frame_tree_delay {
-                        std::thread::sleep(delay);
+                    state.child_get_frame_tree_count += 1;
+                    let count = state.child_get_frame_tree_count;
+                    if let Some(wait) = state.child_get_frame_tree_delay {
+                        delay = Some(wait);
                     }
-                    if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() }
+                    if let Some((nth, wait)) = state.child_get_frame_tree_nth_delay {
+                        if count == nth { delay = Some(wait); }
+                    }
+                    if state.pending_observe_tree_delay {
+                        if let Some(wait) = state.delay_child_get_frame_tree_after_load_network.take() {
+                            state.pending_observe_tree_delay = false;
+                            delay = Some(wait);
+                        }
+                    }
+                    let tree = if let Some(tree) = state.oopif_tree.clone() { tree } else { state.tree.clone() };
+                    let hook = delay.as_ref().and_then(|_| state.get_frame_tree_delay_hook.clone());
+                    let id = command["id"].clone();
+                    drop(state);
+                    if let Some(wait) = delay {
+                        if let Some(hook) = hook {
+                            if let Some(callback) = hook.borrow_mut().as_mut() { callback(); }
+                        }
+                        std::thread::sleep(wait);
+                    }
+                    let mut state = self.0.borrow_mut();
+                    state.inbox.push_back(json!({"id":id,"result":tree}).to_string());
+                    return Ok(());
                 } else {
-                    state.tree.clone()
+                    if state.after_child_page_enable {
+                        if let Some(wait) = state.delay_holder_get_frame_tree_after_child_page_enable.take() {
+                            delay = Some(wait);
+                        }
+                    }
+                    let tree = state.tree.clone();
+                    let hook = delay.as_ref().and_then(|_| state.get_frame_tree_delay_hook.clone());
+                    let id = command["id"].clone();
+                    drop(state);
+                    if let Some(wait) = delay {
+                        if let Some(hook) = hook {
+                            if let Some(callback) = hook.borrow_mut().as_mut() { callback(); }
+                        }
+                        std::thread::sleep(wait);
+                    }
+                    let mut state = self.0.borrow_mut();
+                    state.inbox.push_back(json!({"id":id,"result":tree}).to_string());
+                    return Ok(());
                 }
+            }
+            "Network.enable" => {
+                let session = command["sessionId"].as_str().unwrap_or("");
+                let inject = BackendState::child_session(session).then(|| state.inject_before_child_network_enable.take()).flatten();
+                let hook = BackendState::child_session(session).then(|| state.child_network_enable_hook.clone()).flatten();
+                if let Some(event) = inject {
+                    state.inbox.push_back(event.to_string());
+                }
+                let id = command["id"].clone();
+                drop(state);
+                if let Some(hook) = hook {
+                    if let Some(callback) = hook.borrow_mut().as_mut() {
+                        callback();
+                    }
+                }
+                let mut state = self.0.borrow_mut();
+                state.inbox.push_back(json!({"id":id,"result":{}}).to_string());
+                return Ok(());
             }
             "Target.attachToTarget" => {
                 let target = command["params"]["targetId"].as_str().unwrap_or("");
@@ -208,14 +299,21 @@ impl Transport for Backend {
             }
             "Page.enable" => {
                 let session = command["sessionId"].as_str().unwrap_or("H");
+                if state.fail_child_page_enable && BackendState::child_session(session) {
+                    state.inbox.push_back(json!({"id":command["id"],"error":{"message":"Page.enable failed"}}).to_string());
+                    return Ok(());
+                }
+                if BackendState::child_session(session) {
+                    if let Some(tree) = state.replace_oopif_tree_on_child_page_enable.take() {
+                        state.oopif_tree = Some(tree);
+                    }
+                    state.after_child_page_enable = true;
+                }
                 state.enabled_page.insert(session.to_string());
                 if state.chrome_shaped_lifecycle && BackendState::child_session(session) {
                     if let Some(tree) = state.oopif_tree.clone() {
                         let frame = tree["frameTree"]["frame"].clone();
-                        let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
-                        if url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https")) {
-                            state.push_lifecycle(session, json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":frame}}));
-                        }
+                        state.push_lifecycle(session, json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":frame}}));
                     }
                     state.flush_lifecycle(session);
                 }
@@ -294,15 +392,21 @@ impl Transport for Backend {
                     return Ok(());
                 }
             },
-            "Network.loadNetworkResource" => match state.load_network_headers.as_ref() {
-                Some(Value::Null) => json!({"resource":{"success":true}}),
-                Some(headers) => {
-                    let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
-                    let mut clean = headers.clone();
-                    if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
-                    json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+            "Network.loadNetworkResource" => {
+                let session = command["sessionId"].as_str().unwrap_or("");
+                if BackendState::child_session(session) && state.delay_child_get_frame_tree_after_load_network.is_some() {
+                    state.pending_observe_tree_delay = true;
                 }
-                None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+                match state.load_network_headers.as_ref() {
+                    Some(Value::Null) => json!({"resource":{"success":true}}),
+                    Some(headers) => {
+                        let status = headers.get("__status").and_then(Value::as_u64).unwrap_or(200);
+                        let mut clean = headers.clone();
+                        if let Some(object) = clean.as_object_mut() { object.remove("__status"); }
+                        json!({"resource":{"success":true,"httpStatusCode":status,"headers":clean}})
+                    }
+                    None => json!({"resource":{"success":true,"httpStatusCode":200,"headers":{"permissions-policy":state.child_policy.clone().unwrap_or_else(|| "tools=*".into())}}}),
+                }
             },
             "Debugger.resume" => {
                 if state.context_race == "resume" && state.api {
@@ -377,10 +481,6 @@ impl Transport for Backend {
         };
         state.inbox.push_back(json!({"id":command["id"],"result":result}).to_string());
         Ok(())
-    }
-
-    fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
-        Ok(self.0.borrow_mut().inbox.pop_front())
     }
 }
 
@@ -1877,7 +1977,7 @@ fn fetched_policy_is_dropped_when_committed_origin_changed_during_fetch() {
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
-    cdp.webmcp_observe_child_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "https://foreign.test/cross");
+    let _ = cdp.webmcp_observe_child_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "https://foreign.test/cross");
     assert!(policy_document(&cdp).is_none());
 }
 
