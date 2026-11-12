@@ -506,6 +506,26 @@ fn an_unmarked_unresponsive_ordinary_page_closes_after_retries() {
 }
 
 #[test]
+fn a_hung_frame_during_navigation_to_the_vault_stays_unclosable() {
+    let start = "https://example.test/start";
+    let vault = "https://vault.sliccy.ai/app?k=SECRET";
+    let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});
+    let (mut cdp, sent, frame, frame_mode, _, _, info_queue) = close_probe_queue(start);
+    cdp.session_targets.insert("S".into(), "T".into());
+    cdp.guards.insert("T".into(), "S".into());
+    cdp.guard_sessions.insert("S".into());
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"S","params":{"frame":{"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L0"}}}));
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":"S","params":{"frameId":"F","url":vault,"navigationType":"differentDocument"}}));
+    assert!(cdp.documents.get("T").is_some_and(|doc| doc.navigating && doc.navigation_url == vault), "navigation state recorded");
+    info_queue.borrow_mut().push_back(start_info.clone());
+    info_queue.borrow_mut().push_back(start_info);
+    *frame.borrow_mut() = json!({"id":"F","url":start,"securityOrigin":"https://example.test","loaderId":"L0"});
+    *frame_mode.borrow_mut() = ProbeMode::Timeout;
+    refuse_close(&mut cdp, &sent, "hung while navigating to vault");
+    assert!(!sent.borrow().iter().any(|call| call["method"] == "Target.closeTarget"));
+}
+
+#[test]
 fn a_new_tab_whose_first_frame_read_fails_then_succeeds_closes() {
     let start = "https://example.test/fresh";
     let start_info = json!({"targetId":"T","type":"page","url":start,"title":"ordinary"});

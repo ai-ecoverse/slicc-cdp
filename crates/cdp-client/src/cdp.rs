@@ -1788,41 +1788,26 @@ impl Cdp {
             if marked {
                 return Some(None);
             }
-            return Some(Some((
-                url,
-                MainDocument {
-                    frame_id: String::new(),
-                    url: String::new(),
-                    origin: String::new(),
-                    unreachable_url: String::new(),
-                    navigating: false,
-                    navigation_url: String::new(),
-                    previous: false,
-                    probed: false,
-                },
-            )));
+            let stand_in = self.stand_in_close_document(target_id);
+            if self.stand_in_close_kept(&stand_in) {
+                self.protect_target(target_id);
+                return Some(None);
+            }
+            return Some(Some((url, stand_in)));
         };
         let Some(frame_id) = frame.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string) else {
             if kept_info {
                 self.protect_target(target_id);
             }
-            return if fail_closed {
-                Some(None)
-            } else {
-                Some(Some((
-                    url,
-                    MainDocument {
-                        frame_id: String::new(),
-                        url: String::new(),
-                        origin: String::new(),
-                        unreachable_url: String::new(),
-                        navigating: false,
-                        navigation_url: String::new(),
-                        previous: false,
-                        probed: false,
-                    },
-                )))
-            };
+            if fail_closed {
+                return Some(None);
+            }
+            let stand_in = self.stand_in_close_document(target_id);
+            if self.stand_in_close_kept(&stand_in) {
+                self.protect_target(target_id);
+                return Some(None);
+            }
+            return Some(Some((url, stand_in)));
         };
         let frame_url = format!(
             "{}{}",
@@ -1850,6 +1835,26 @@ impl Cdp {
         };
         self.documents.insert(target_id.to_string(), doc.clone());
         Some(Some((url, doc)))
+    }
+
+    fn stand_in_close_document(&self, target_id: &str) -> MainDocument {
+        let known = self.documents.get(target_id);
+        MainDocument {
+            frame_id: String::new(),
+            url: String::new(),
+            origin: known.map(|doc| doc.origin.clone()).unwrap_or_default(),
+            unreachable_url: String::new(),
+            navigating: known.map(|doc| doc.navigating).unwrap_or(false),
+            navigation_url: known.map(|doc| doc.navigation_url.clone()).unwrap_or_default(),
+            previous: known.map(|doc| doc.previous).unwrap_or(false),
+            probed: known.map(|doc| doc.probed).unwrap_or(false),
+        }
+    }
+
+    fn stand_in_close_kept(&self, doc: &MainDocument) -> bool {
+        doc.navigating && (doc.navigation_url.is_empty() || kept_document(&self.guard, &doc.navigation_url))
+            || kept_security_origin(&self.guard, &doc.url, &doc.origin)
+            || inheriting_document(&self.guard, &doc.url) && doc.previous
     }
 
     fn read_close_frame_with_retries(&mut self, target: &str, fail_closed: bool) -> Option<Value> {
