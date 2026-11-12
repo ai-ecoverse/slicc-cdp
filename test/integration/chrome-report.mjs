@@ -57,6 +57,7 @@ export const CHROME_FILES = new Set(
     'page-scope-filtered-parent-chrome',
     'plant',
     'privileged-ui',
+    'protected-iframe-ancestor-chrome',
     'real-extension',
     'recording',
     'redirect-navigation',

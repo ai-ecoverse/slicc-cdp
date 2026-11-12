@@ -10,7 +10,7 @@ const WORKER_STEP: Duration = Duration::from_secs(1);
 pub(super) struct Har {
     armed: BTreeSet<String>,
     tried: BTreeSet<String>,
-    workers: BTreeMap<String, String>,
+    pub(super) workers: BTreeMap<String, String>,
     urls: BTreeMap<String, String>,
 }
 
@@ -169,9 +169,23 @@ impl Cdp {
             return true;
         }
         let creator_protected = self.content_blocked(owner)
+            || self.session_subtree_protected(owner)
             || self.session_target(owner).is_some_and(|target| {
-                self.is_protected_target(&target) || self.abandoned.contains(&target)
-            });
+                self.is_protected_target(&target)
+                    || self.abandoned.contains(&target)
+                    || self.targets.get(&target).is_some_and(|creator| {
+                        self.info_protected(creator, &[]) || self.iframe_ancestor_protected(creator, &[])
+                    })
+            })
+            || info
+                .get("openerId")
+                .and_then(Value::as_str)
+                .is_some_and(|opener| {
+                    self.protected_targets.contains(opener)
+                        || self.targets.get(opener).is_some_and(|creator| {
+                            self.info_protected(creator, &[]) || self.iframe_ancestor_protected(creator, &[])
+                        })
+                });
         if let Ok(parsed) = url::Url::parse(url) {
             match parsed.scheme() {
                 "data" => return creator_protected,
@@ -186,10 +200,11 @@ impl Cdp {
             || self.guard.extension_frame(url)
             || self.guard.error_page_url(url)
             || self.guard.target(url, false, crate::protected::Opener::Unknown)
+            || self.worker_opener_protected(info, &[])
             || url::Url::parse(url).is_err()
     }
 
-    fn har_release_worker(&mut self, child: &str) {
+    pub(super) fn har_release_worker(&mut self, child: &str) {
         self.har.workers.remove(child);
         self.har.urls.remove(child);
         let _ = self.send(

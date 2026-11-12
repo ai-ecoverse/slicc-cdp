@@ -90,12 +90,20 @@ test('Chrome: protected-page srcdoc and cross-site OOPIF children stay unlistabl
       Boolean,
       'protected parent page'
     );
+    const attached = await raw.send('Target.attachToTarget', {
+      targetId: parent.targetId,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, attached.sessionId);
+    const tree = await raw.send('Page.getFrameTree', {}, attached.sessionId);
+    const parentFrameId = tree.frameTree.frame.id;
+    await raw.send('Target.detachFromTarget', { sessionId: attached.sessionId });
     const children = await until(
       async () => {
         const listed = (await raw.send('Target.getTargets', { filter: [{}] })).targetInfos.filter(
           (target) =>
             target.type === 'iframe' &&
-            target.parentFrameId === parent.targetId &&
+            (target.parentFrameId === parentFrameId || target.parentFrameId === parent.targetId) &&
             (target.url === 'about:srcdoc' || String(target.url || '').includes('foreign.test'))
         );
         return listed.length >= 2 ? listed : null;
@@ -112,14 +120,12 @@ test('Chrome: protected-page srcdoc and cross-site OOPIF children stay unlistabl
         /srcdoc-secret|cross-secret|foreign\.test|about:srcdoc/
       );
     }
-    const frames = await runner.playwright(['frames'], cwd);
-    assert.notEqual(frames.code, 0);
-    assert.match(frames.stderr, /slicc: refused:/);
     for (const child of children) {
+      const frames = await runner.playwright(['frames', '--tab', child.targetId], cwd);
+      assert.notEqual(frames.code, 0, child.url);
+      assert.match(frames.stderr, /slicc: refused:/);
       assert.doesNotMatch(frames.stdout + frames.stderr, new RegExp(child.targetId));
       assert.doesNotMatch(frames.stdout + frames.stderr, /srcdoc-secret|cross-secret/);
-    }
-    for (const child of children) {
       const evalResult = await runner.playwright(
         ['eval', '--tab', child.targetId, 'document.documentElement.outerHTML'],
         cwd
