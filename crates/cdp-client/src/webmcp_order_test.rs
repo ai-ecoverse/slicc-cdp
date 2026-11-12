@@ -1197,3 +1197,62 @@ fn adopt_path_checkpoint_interleavings_settle_or_admit() {
     assert!(failed.is_empty(), "checkpoint interleavings failing {}/{}:\n{}", failed.len(), total, failed.join("\n"));
 }
 
+#[test]
+fn mark_admitted_child_gate_settles_when_park_is_already_due() {
+    let (mut cdp, state) = client();
+    state.borrow_mut().chrome_shaped_lifecycle = true;
+    state.borrow_mut().oopif_tree = Some(json!({"frameTree":{"frame":{"id":"FRAME","url":"about:blank","securityOrigin":"","loaderId":""}}}));
+    let holder = reconcile_holder(&mut cdp);
+    cdp.webmcp_auto_attach(&holder).unwrap();
+    cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":&holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"","parentFrameId":"F"},"waitingForDebugger":false}}));
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.promote_read_at = None;
+    }
+    state.borrow_mut().oopif_tree = Some(cross_tree());
+    cdp.webmcp_sweep();
+    let (id, context) = cdp.webmcp.contexts.iter().find(|((owner, _), _)| owner == "CHILD").map(|((_, id), context)| (*id, context.clone())).expect("child context after promote");
+    if let Some(arm) = cdp.webmcp.arms.get_mut("CHILD") {
+        arm.accepted.clear();
+        arm.admitted = 0;
+        let past = Instant::now() - Duration::from_secs(1);
+        arm.pending_install = Some(past);
+        arm.pending_install_park = Some(past);
+    }
+    cdp.webmcp.quarantined.insert("CHILD".into());
+    let before = state.borrow().sent.len();
+    let result = cdp.webmcp_mark_admitted("CHILD", id, &context, Instant::now());
+    assert!(result.is_err(), "mark_admitted gate must refuse an already-due park");
+    assert!(cdp.session_blocked("CHILD"), "due park inside mark_admitted must settle");
+    assert!(state.borrow().sent[before..].iter().any(|command| command["method"] == "Target.detachFromTarget" && command["params"]["sessionId"] == "CHILD"));
+    assert!(cdp.webmcp.arms.get("CHILD").is_none_or(|arm| arm.admitted == 0));
+}
+
+#[test]
+fn pause_mark_admitted_failure_keeps_pending_for_installer_deadline_sweep() {
+    let (mut cdp, state) = client();
+    cdp.start_webmcp_for("H", true).unwrap();
+    let past = Instant::now() - Duration::from_secs(1);
+    if let Some(arm) = cdp.webmcp.arms.get_mut("H") {
+        arm.pending_install = Some(past);
+        arm.pending_install_park = Some(past);
+    }
+    let pointer = Rc::new(std::cell::Cell::new(std::ptr::null_mut::<Cdp>()));
+    let hook = Rc::new(RefCell::new(None));
+    {
+        let pointer = pointer.clone();
+        *hook.borrow_mut() = Some(Box::new(move |session: &str, method: &str| {
+            if method != "Debugger.resume" || session != "H" { return; }
+            let ptr = pointer.get();
+            if ptr.is_null() { return; }
+            unsafe { (*ptr).webmcp.contexts.retain(|(owner, _), _| owner != "H"); }
+        }) as Box<dyn FnMut(&str, &str)>);
+    }
+    state.borrow_mut().after_command_hook = Some(hook);
+    pointer.set(&mut cdp as *mut Cdp);
+    cdp.absorb(paused());
+    pointer.set(std::ptr::null_mut());
+    assert!(cdp.webmcp.arms.get("H").is_some_and(|arm| !arm.revoked && arm.pending_install.is_some()), "discarded mark_admitted failure after pause evaluate must keep pending_install");
+    cdp.webmcp_sweep();
+    assert!(cdp.webmcp.arms.get("H").is_some_and(|arm| arm.revoked && arm.revoked_reason == Some("installer deadline")), "kept pending_install must fail closed on sweep");
+}
+
