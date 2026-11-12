@@ -53,6 +53,7 @@ struct BackendState {
     delay_child_get_frame_tree_after_load_network: Option<Duration>,
     pending_observe_tree_delay: bool,
     get_frame_tree_delay_hook: Option<Rc<RefCell<Option<Box<dyn FnMut()>>>>>,
+    after_command_hook: Option<Rc<RefCell<Option<Box<dyn FnMut(&str, &str)>>>>>,
 }
 
 impl BackendState {
@@ -187,6 +188,26 @@ fn frame(url: &str) -> Value {
 
 impl Transport for Backend {
     fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let command: Value = serde_json::from_str(text).unwrap();
+        self.handle_command(text)?;
+        let hook = self.0.borrow().after_command_hook.clone();
+        if let Some(hook) = hook {
+            if let Ok(mut slot) = hook.try_borrow_mut() {
+                if let Some(callback) = slot.as_mut() {
+                    callback(command["sessionId"].as_str().unwrap_or(""), command["method"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+        Ok(self.0.borrow_mut().inbox.pop_front())
+    }
+}
+
+impl Backend {
+    fn handle_command(&mut self, text: &str) -> Result<(), String> {
         let command: Value = serde_json::from_str(text).unwrap();
         let mut state = self.0.borrow_mut();
         state.sent.push(command.clone());
@@ -460,10 +481,6 @@ impl Transport for Backend {
         };
         state.inbox.push_back(json!({"id":command["id"],"result":result}).to_string());
         Ok(())
-    }
-
-    fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
-        Ok(self.0.borrow_mut().inbox.pop_front())
     }
 }
 
@@ -1960,7 +1977,7 @@ fn fetched_policy_is_dropped_when_committed_origin_changed_during_fetch() {
     cdp.webmcp_auto_attach(&holder).unwrap();
     cdp.webmcp_request_origins(&["https://foreign.test".into()]);
     cdp.absorb(json!({"method":"Target.attachedToTarget","sessionId":holder,"params":{"sessionId":"CHILD","targetInfo":{"targetId":"IFRAME","type":"iframe","url":"https://foreign.test/cross"},"waitingForDebugger":false}}));
-    cdp.webmcp_observe_child_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "https://foreign.test/cross");
+    let _ = cdp.webmcp_observe_child_policy("CHILD", "FRAME", "CROSS", "https://foreign.test", "https://foreign.test/cross");
     assert!(policy_document(&cdp).is_none());
 }
 
