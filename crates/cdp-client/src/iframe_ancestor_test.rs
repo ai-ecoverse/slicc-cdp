@@ -860,6 +860,44 @@ fn top_level_page_protect_blocks_without_detach_even_if_unbound() {
 }
 
 #[test]
+fn top_level_page_protected_document_continues_without_fail() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let (mut cdp, _browser, sent) = logging_browser(vec![page.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "PAGE".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    let attached = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
+    let session = attached["sessionId"].as_str().unwrap().to_string();
+    cdp.call("Fetch.enable", json!({"patterns":[{"urlPattern":"*"}]}), Some(&session)).unwrap();
+    sent.borrow_mut().clear();
+    cdp.absorb(json!({
+        "method":"Fetch.requestPaused",
+        "sessionId":session,
+        "params":{
+            "requestId":"R-DOC",
+            "request":{"url":"https://seven.sliccy.ai/doc","method":"GET","headers":{}},
+            "resourceType":"Document",
+            "frameId":"PAGE"
+        }
+    }));
+    assert!(sent.borrow().iter().any(|command| {
+        command["method"] == "Fetch.continueRequest"
+            && command["params"]["requestId"] == "R-DOC"
+            && command["params"].as_object().is_some_and(|object| object.keys().all(|key| key == "requestId"))
+    }), "page Document must continue plainly: {:?}", sent.borrow());
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Fetch.failRequest"));
+    assert!(!sent.borrow().iter().any(|command| command["method"] == "Target.detachFromTarget"));
+}
+
+#[test]
 fn root_keeps_sessions_continues_queued_pause_without_detach() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);

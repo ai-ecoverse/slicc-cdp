@@ -145,10 +145,7 @@ test('Chrome: protected-page srcdoc and cross-site OOPIF children stay unlistabl
       assert.doesNotMatch(goto.stdout + goto.stderr, /srcdoc-secret|cross-secret/);
     }
     const harFile = path.join(await mkdtemp(path.join(tmpdir(), 'slicc-iframe-har-')), 'out.har');
-    const har = await runner.playwright(
-      ['har-start', '--tab', children[0].targetId, '--path', harFile],
-      cwd
-    );
+    const har = await runner.playwright(['har-start', '--tab', children[0].targetId, harFile], cwd);
     assert.notEqual(har.code, 0);
     assert.match(har.stderr, /slicc: refused:/);
     assert.doesNotMatch(har.stdout + har.stderr, /srcdoc-secret|cross-secret|foreign\.test/);

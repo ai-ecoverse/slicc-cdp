@@ -958,18 +958,8 @@ mod tests {
             .filter(|item| item["method"] == "Fetch.continueRequest")
             .map(|item| item["params"]["requestId"].as_str().unwrap())
             .collect();
-        assert_eq!(continued, ["R2"], "{continued:?}");
-        let failed: Vec<(&str, &str)> = sent
-            .iter()
-            .filter(|item| item["method"] == "Fetch.failRequest")
-            .map(|item| {
-                (
-                    item["params"]["requestId"].as_str().unwrap(),
-                    item["params"]["errorReason"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(failed, [("R1", "BlockedByClient"), ("R3", "BlockedByClient")]);
+        assert_eq!(continued, ["R1", "R2", "R3"], "{continued:?}");
+        assert!(!sent.iter().any(|item| item["method"] == "Fetch.failRequest"), "{sent:?}");
         assert!(sent.iter().all(|item| item["params"].get("url").is_none()));
         assert_eq!(cdp.events().len(), 1);
         assert_eq!(cdp.events()[0]["params"]["responseHeaders"][0]["value"], "https://vault.sliccy.ai");
@@ -992,7 +982,7 @@ mod tests {
             })),
         );
         cdp.call("Runtime.evaluate", json!({}), Some("S")).unwrap();
-        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.failRequest"]);
+        assert_eq!(methods(&log), ["Runtime.evaluate", "Fetch.continueRequest"]);
     }
 
     fn auth_event(session: &str, id: &str, url: &str) -> Value {

@@ -930,6 +930,7 @@ impl Cdp {
         if session_id.is_some_and(|session| self.dialog_sessions.contains(session)) { return Err(self.refusal()) }
         if let Some(session) = session_id {
             if matches!(method, "Fetch.fulfillRequest" | "Fetch.continueRequest" | "Fetch.continueResponse" | "Fetch.continueWithAuth")
+                && self.session_is_cuttable_descendant(session)
                 && self.session_subtree_protected(session)
             {
                 return Err(self.refusal());
@@ -2710,19 +2711,7 @@ impl Cdp {
         }
     }
 
-    fn detach_blocked(&mut self, session_id: &str, reason: &str) {
-        if std::env::var_os("SLICC_TRACE_DETACH").is_some() || std::env::var_os("CI").is_some() {
-            let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
-            let kind = self
-                .targets
-                .get(&target)
-                .and_then(|info| info.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            eprintln!(
-                "slicc-trace-detach reason={reason} session={session_id} target={target} type={kind}"
-            );
-        }
+    fn detach_blocked(&mut self, session_id: &str, _reason: &str) {
         let _ = self.send("Fetch.disable", json!({}), Some(session_id));
         let _ = self.send(
             "Target.detachFromTarget",
@@ -3422,9 +3411,7 @@ impl Cdp {
 
     fn answer_protected(&mut self, paused: &Paused) {
         self.fail_seen_network(&json!({"sessionId":paused.session_id,"params":{"networkId":paused.network_id,"requestId":paused.request_id}}));
-        if self.session_keeps_page_live(&paused.session_id)
-            && (self.blocked.contains(&paused.session_id) || paused.resource_type != "Document")
-        {
+        if self.session_keeps_page_live(&paused.session_id) {
             self.continue_plain(&paused.session_id, &paused.request_id);
             return;
         }
