@@ -4442,23 +4442,27 @@ fn storage_content(method: &str) -> bool {
         || matches!(method, "Storage.clearDataForOrigin" | "Storage.clearDataForStorageKey" | "Storage.getUsageAndQuota")
 }
 
+fn kept_parse_failure(text: &str) -> bool {
+    !matches!(text, "" | "null" | "://")
+}
+
 fn kept_document(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return true };
+    let Some(mut url) = guard.peel(text) else { return kept_parse_failure(text) };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
-    if url.set_host(Some(&host)).is_err() { return true }
-    if url.set_username("").is_err() || url.set_password(None).is_err() { return true }
+    if url.set_host(Some(&host)).is_err() { return kept_parse_failure(text) }
+    if url.set_username("").is_err() || url.set_password(None).is_err() { return kept_parse_failure(text) }
     if host.strip_suffix(".sliccy.ai").is_some_and(|label| label == "vault" || label.starts_with("vault-")) { return true }
     let seven = guard.own_origin(url.as_str()) || seven_host(url.as_str());
     seven && url.path().starts_with("/os/") && url.path() != "/os/callback.html"
 }
 
 fn seven_or_extra_host(guard: &Protected, text: &str) -> bool {
-    let Some(mut url) = guard.peel(text) else { return true };
+    let Some(mut url) = guard.peel(text) else { return kept_parse_failure(text) };
     if !matches!(url.scheme(), "http" | "https") { return false }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
-    if url.set_host(Some(&host)).is_err() { return true }
-    if url.set_username("").is_err() || url.set_password(None).is_err() { return true }
+    if url.set_host(Some(&host)).is_err() { return kept_parse_failure(text) }
+    if url.set_username("").is_err() || url.set_password(None).is_err() { return kept_parse_failure(text) }
     guard.own_origin(url.as_str()) || seven_host(url.as_str())
 }
 
