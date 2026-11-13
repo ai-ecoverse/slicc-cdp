@@ -7,13 +7,14 @@ pub struct Report {
 }
 
 impl Report {
-    pub fn request(method: &str, url: &str) -> Self {
+    pub fn request(method: &str, url: &str, intent: Option<String>) -> Self {
         Self {
             note: ActionNote {
                 kind: "request".to_string(),
                 method: Some(method.to_string()),
                 url: Some(url.to_string()),
                 agent: cdp::slicc_agent(),
+                intent,
                 ..ActionNote::default()
             },
             started: false,

@@ -156,7 +156,8 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(cdp) => cdp,
         Err(message) => return Output::plain(message, 1),
     };
-    let mut report = action::Report::request(&request.method, &request.url);
+    let intent = cdp_client::intent::choose(opts.intent.as_deref(), std::env::var("SLICC_INTENT").ok().as_deref());
+    let mut report = action::Report::request(&request.method, &request.url, intent);
     let (target, tab_page_url) = match tab::resolve_tab_with_url(&mut cdp, &request.url, opts.tab.as_deref(), opts.full_urls) {
         Ok(result) => result,
         Err(stop) => {

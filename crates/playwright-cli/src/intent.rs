@@ -1,17 +1,13 @@
-use crate::browser;
-use crate::cdp::{self, Cdp};
 use crate::session;
 use serde_json::{json, Value};
 use std::fs;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const MAX_CHARS: usize = 120;
-pub const LINGER_MS: u64 = 1500;
+pub use cdp_client::intent::{choose, clean};
+
 pub const RUNNING_MS: u64 = 60000;
 pub const GRACE_MS: u64 = 1000;
 const KEEP_MS: u64 = 600000;
-const CALL: Duration = Duration::from_millis(500);
-const WORLD: &str = "slicc-intent";
 
 const PAGE_COMMANDS: &[&str] = &[
     "open", "tab-new", "goto", "navigate", "go-back", "go-forward", "reload", "click", "dblclick", "fill", "type", "press",
@@ -20,118 +16,12 @@ const PAGE_COMMANDS: &[&str] = &[
     "webmcp-call",
 ];
 
-const SHOW: &str = "function(text, ms) { const doc = document; const root = doc.documentElement; if (!root) return false; for (const old of Array.from(root.children)) if (old.localName === 'div' && old.hasAttribute('data-slicc-intent')) old.remove(); const host = doc.createElement('div'); host.setAttribute('data-slicc-intent', ''); host.setAttribute('popover', 'manual'); host.setAttribute('aria-hidden', 'true'); host.setAttribute('inert', ''); host.style.cssText = 'position:fixed!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;border:none!important;overflow:visible!important;pointer-events:none!important;background:transparent!important;display:block!important;visibility:visible!important;opacity:1!important;transform:none!important;z-index:2147483647!important'; const shadow = host.attachShadow({ mode: 'closed' }); const style = doc.createElement('style'); style.textContent = 'span{all:initial;position:absolute;left:50%;bottom:16px;transform:translateX(-50%);box-sizing:border-box;max-width:calc(100% - 32px);padding:6px 14px;border:1px solid #6fa8dc;border-radius:999px;background:rgba(24,24,27,0.88);color:#fff;font:500 13px/1.4 system-ui,-apple-system,\"Segoe UI\",sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;unicode-bidi:plaintext;box-shadow:0 2px 8px rgba(0,0,0,0.25);pointer-events:none;user-select:none}span::before{content:attr(data-text)}'; const label = doc.createElement('span'); label.setAttribute('data-text', text); shadow.append(style, label); root.appendChild(host); try { host.showPopover(); } catch {} setTimeout(() => host.remove(), ms); return true; }";
-
-const HIDE: &str = "function() { const root = document.documentElement; if (!root) return false; for (const old of Array.from(root.children)) if (old.localName === 'div' && old.hasAttribute('data-slicc-intent')) old.remove(); return true; }";
-
 pub fn acts_on_page(command: &str) -> bool {
     PAGE_COMMANDS.contains(&command)
 }
 
-pub fn deferred(command: &str) -> bool {
-    matches!(command, "screenshot" | "pdf" | "eval" | "eval-file" | "fetch" | "webmcp-call")
-}
-
-pub fn choose(flag: Option<&str>, env: Option<&str>) -> Option<String> {
-    match flag {
-        Some(flag) => clean(flag),
-        None => env.and_then(clean),
-    }
-}
-
-pub fn clean(raw: &str) -> Option<String> {
-    let kept: String = raw
-        .chars()
-        .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
-        .filter(|ch| !ch.is_control() && !hidden(*ch))
-        .collect();
-    let joined = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut: String = joined.chars().take(MAX_CHARS).collect();
-    let cut = cut.trim_end();
-    (!cut.is_empty()).then(|| cut.to_string())
-}
-
-fn hidden(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x00AD
-            | 0x0600..=0x0605
-            | 0x061C
-            | 0x06DD
-            | 0x070F
-            | 0x0890..=0x0891
-            | 0x08E2
-            | 0x115F..=0x1160
-            | 0x180B..=0x180F
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x2060..=0x206F
-            | 0x3164
-            | 0xFE00..=0xFE0F
-            | 0xFEFF
-            | 0xFFA0
-            | 0xFFF9..=0xFFFB
-            | 0xFFFE..=0xFFFF
-            | 0x110BD
-            | 0x110CD
-            | 0x13430..=0x1343F
-            | 0x1BCA0..=0x1BCA3
-            | 0x1D173..=0x1D17A
-            | 0xE0000..=0xE0FFF
-    )
-}
-
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_millis() as u64).unwrap_or(0)
-}
-
-pub fn show(cdp: &mut Cdp, tab: &str, text: &str, ms: u64) {
-    let _ = on_tab(cdp, tab, SHOW, json!([{ "value": text }, { "value": ms }]));
-}
-
-pub fn clear(cdp: &mut Cdp, session: &str, tab: &str) {
-    let now = now_ms();
-    if showing(&recent(now), tab, now) {
-        let _ = apply(cdp, session, HIDE, json!([]));
-    }
-}
-
-fn showing(entries: &[Entry], tab: &str, now: u64) -> bool {
-    entries.iter().any(|entry| entry.tab == tab && !entry.intent.is_empty() && entry.until() + LINGER_MS + GRACE_MS >= now)
-}
-
-fn on_tab(cdp: &mut Cdp, tab: &str, declaration: &str, arguments: Value) -> Result<(), String> {
-    if cdp.is_protected_target(tab) {
-        return Err(format!("{}\n", cdp.guard().refusal()));
-    }
-    let session = cdp::attach(cdp, tab)?;
-    let result = apply(cdp, &session, declaration, arguments);
-    cdp::detach(cdp, &session);
-    result
-}
-
-fn apply(cdp: &mut Cdp, session: &str, declaration: &str, arguments: Value) -> Result<(), String> {
-    let refusal = format!("{}\n", cdp.guard().refusal());
-    let document = main_document(cdp, session).ok_or_else(|| refusal.clone())?;
-    let world = cdp.call_for("Page.createIsolatedWorld", json!({ "frameId": document.0, "worldName": WORLD }), Some(session), CALL)?;
-    let context = world.get("executionContextId").cloned().ok_or_else(|| refusal.clone())?;
-    if main_document(cdp, session).as_ref() != Some(&document) {
-        return Err(refusal);
-    }
-    let params = json!({ "executionContextId": context, "functionDeclaration": declaration, "arguments": arguments, "returnByValue": true });
-    cdp.call_for("Runtime.callFunctionOn", params, Some(session), CALL).map(|_| ())
-}
-
-fn main_document(cdp: &mut Cdp, session: &str) -> Option<(String, String)> {
-    if cdp.content_blocked(session) {
-        return None;
-    }
-    let tree = cdp.call_for("Page.getFrameTree", json!({}), Some(session), CALL).ok()?;
-    let frame = tree.pointer("/frameTree/frame")?;
-    let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    let (id, loader) = (text("id"), text("loaderId"));
-    let ordinary = !id.is_empty() && !loader.is_empty() && text("unreachableUrl").is_empty() && browser::ordinary_frame_url(cdp.guard(), &text("url"));
-    ordinary.then_some((id, loader))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,37 +123,6 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_flag_wins_over_the_environment() {
-        assert_eq!(choose(Some("Filling the order form"), Some("Reading mail")).as_deref(), Some("Filling the order form"));
-        assert_eq!(choose(None, Some("Reading mail")).as_deref(), Some("Reading mail"));
-        assert_eq!(choose(Some(""), Some("Reading mail")), None);
-        assert_eq!(choose(Some("\u{200b}"), Some("Reading mail")), None);
-        assert_eq!(choose(None, None), None);
-        assert_eq!(choose(None, Some("  ")), None);
-    }
-
-    #[test]
-    fn cleaning_drops_controls_and_format_characters_and_collapses_whitespace() {
-        assert_eq!(clean("  Filling\tthe\n\norder\r\nform  ").as_deref(), Some("Filling the order form"));
-        assert_eq!(clean("Filling\u{202e}mrof\u{202c} the form").as_deref(), Some("Fillingmrof the form"));
-        assert_eq!(clean("Fil\u{200b}ling\u{200d} the\u{feff} \u{2066}form\u{2069}").as_deref(), Some("Filling the form"));
-        assert_eq!(clean("Reading\u{2028}// injected\u{2029}code").as_deref(), Some("Reading // injected code"));
-        assert_eq!(clean("Reading\u{0085}\u{0007}\u{001b}[31mred").as_deref(), Some("Reading [31mred"));
-        assert_eq!(clean("Tag\u{e0041}\u{e0042}ged").as_deref(), Some("Tagged"));
-        assert_eq!(clean("Écrire le café ✓").as_deref(), Some("Écrire le café ✓"));
-        assert_eq!(clean("\u{200b}\u{200e}\n"), None);
-    }
-
-    #[test]
-    fn cleaning_cuts_long_intents_on_character_boundaries() {
-        let long = "é".repeat(500);
-        let cut = clean(&long).unwrap();
-        assert_eq!(cut.chars().count(), MAX_CHARS);
-        let spaced = format!("{} tail", "a".repeat(MAX_CHARS - 1));
-        assert_eq!(clean(&spaced).unwrap(), "a".repeat(MAX_CHARS - 1));
-    }
-
-    #[test]
     fn page_commands_exclude_tab_bookkeeping() {
         for command in ["click", "fill", "type", "press", "select", "check", "goto", "open", "eval", "screenshot", "snapshot"] {
             assert!(acts_on_page(command), "{command}");
@@ -306,9 +165,6 @@ mod tests {
         assert!(touched(&entries, "T", 2000 + GRACE_MS));
         assert!(!touched(&entries, "T", 2001 + GRACE_MS));
         assert!(!touched(&entries, "U", 1500));
-        assert!(showing(&entries, "T", 2000 + LINGER_MS + GRACE_MS));
-        assert!(!showing(&entries, "T", 2001 + LINGER_MS + GRACE_MS));
-        assert!(!showing(&entries, "U", 1500));
         assert_eq!(attribute(&entries, "T", 2100).map(|entry| entry.id.as_str()), Some("a"));
         assert_eq!(attribute(&entries, "T", 2300), None);
         assert_eq!(attribute(&entries, "T", 2500), None);

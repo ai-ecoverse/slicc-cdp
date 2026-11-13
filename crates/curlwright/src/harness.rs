@@ -663,6 +663,23 @@ fn request_actions_keep_origin_and_path_only() {
 }
 
 #[test]
+fn the_request_action_start_carries_the_cleaned_intent() {
+    let running = serve_mode(one_page(), SliccReply::Silent);
+    let output = run_at(running.port, &["--intent", "Checking\u{202e} the\u{200b}\n profile", "https://app.example/form"]);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let actions = wait_actions(&running, 2);
+    assert_eq!(actions[0].params["phase"], "start");
+    assert_eq!(actions[0].params["kind"], "request");
+    assert_eq!(actions[0].params["intent"], "Checking the profile");
+    assert!(actions[1].params.get("intent").is_none());
+    let plain = serve_mode(one_page(), SliccReply::Silent);
+    let quiet = run_at(plain.port, &["--intent=", "https://app.example/form"]);
+    assert_eq!(quiet.code, 0, "{}", quiet.stderr);
+    assert_eq!(quiet.stdout, output.stdout);
+    assert!(wait_actions(&plain, 2).iter().all(|call| call.params.get("intent").is_none()));
+}
+
+#[test]
 fn a_foreign_tab_reports_not_allowed_without_the_secret_url() {
     let pages = vec![PageSpec {
         target_id: "OTHER".into(),

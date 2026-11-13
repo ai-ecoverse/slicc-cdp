@@ -8,6 +8,7 @@ pub mod fetch;
 #[cfg(test)]
 mod frames_test;
 pub mod hash;
+pub mod intent;
 pub mod net;
 pub mod ports;
 pub mod protected;
