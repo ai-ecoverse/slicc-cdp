@@ -1926,6 +1926,42 @@ impl Cdp {
         }
     }
 
+    fn unbound_protected_iframe_shadows_owner(&self, frame: &str, all: &[Value]) -> bool {
+        if self.iframe_own_frames.contains_key(frame)
+            || self.documents.values().any(|doc| doc.frame_id == frame)
+            || all.iter().chain(self.targets.values()).any(|item| {
+                item.get("targetId").and_then(Value::as_str) == Some(frame)
+                    && item.get("type").and_then(Value::as_str) == Some("iframe")
+            })
+        {
+            return false;
+        }
+        let Some(page) = self.page_scope_owners.get(frame) else {
+            return false;
+        };
+        all.iter().chain(self.targets.values()).any(|info| {
+            if info.get("type").and_then(Value::as_str) != Some("iframe") {
+                return false;
+            }
+            let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() || id == frame {
+                return false;
+            }
+            let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+            let protected = self.protected_targets.contains(id)
+                || self.kept_url_latch.contains(id)
+                || self.guard.url(url)
+                || kept_document(&self.guard, url);
+            if !protected {
+                return false;
+            }
+            let iframe_parent = info.get("parentFrameId").and_then(Value::as_str).unwrap_or("");
+            iframe_parent == page
+                || self.page_scope_owners.get(iframe_parent).map(String::as_str) == Some(page.as_str())
+                || self.documents.get(page.as_str()).is_some_and(|doc| doc.frame_id == iframe_parent)
+        })
+    }
+
     fn frame_known_page_or_bound(&self, frame: &str, all: &[Value]) -> bool {
         if self.iframe_own_frames.contains_key(frame) {
             return true;
@@ -1934,7 +1970,7 @@ impl Cdp {
             return true;
         }
         if self.page_scope_owners.contains_key(frame) {
-            return true;
+            return !self.unbound_protected_iframe_shadows_owner(frame, all);
         }
         if self.document_versions.keys().any(|(_, id)| id == frame) {
             return true;
@@ -1961,7 +1997,9 @@ impl Cdp {
             return Some(owner.clone());
         }
         if let Some(page) = self.page_scope_owners.get(frame) {
-            return Some(page.clone());
+            if !self.unbound_protected_iframe_shadows_owner(frame, all) {
+                return Some(page.clone());
+            }
         }
         if let Some((owner, _)) = self.document_versions.keys().find(|(_, id)| id == frame) {
             return Some(owner.clone());

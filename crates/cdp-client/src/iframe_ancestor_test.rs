@@ -1714,3 +1714,183 @@ fn scenario_c_stale_page_scope_owner_cannot_unblock_inner() {
         command.get("sessionId").and_then(Value::as_str) == Some("S-INNER") && command["method"] == "Network.enable"
     }));
 }
+
+#[test]
+fn stale_page_scope_owner_cannot_admit_inner_under_unbound_seven() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let seven = json!({
+        "targetId":"SEVEN",
+        "type":"iframe",
+        "url":"https://seven.sliccy.ai/os/",
+        "parentFrameId":"FRAME",
+        "browserContextId":"CTX"
+    });
+    let inner = json!({
+        "targetId":"INNER",
+        "type":"iframe",
+        "url":"https://foreign.test/cell",
+        "parentFrameId":"SEVEN-FRAME",
+        "browserContextId":"CTX"
+    });
+    let worker = json!({
+        "targetId":"IW",
+        "type":"worker",
+        "url":"https://foreign.test/worker.js",
+        "openerFrameId":"SEVEN-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), seven.clone(), inner.clone(), worker.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.targets.insert("SEVEN".into(), seven.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    cdp.frames.insert("SEVEN-FRAME".into(), vec!["about:blank".into(), "https://ordinary.test".into()]);
+    browser.borrow_mut().detach_failures = 8;
+    browser.borrow_mut().sessions.insert("S-INNER".into(), "INNER".into());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"S-INNER","targetInfo":inner.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("S-INNER"));
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":seven.clone()}
+    }));
+    assert!(cdp.protected_targets.contains("SEVEN"));
+    assert!(cdp.session_blocked("S-INNER"));
+    cdp.page_scope_owners.insert("SEVEN-FRAME".into(), "PAGE".into());
+    let attach = cdp.call("Target.attachToTarget", json!({"targetId":"INNER","flatten":true}), None);
+    assert!(attach.is_err(), "stale owner must not admit INNER under unbound seven: {attach:?}");
+    sent.borrow_mut().clear();
+    browser.borrow_mut().infos.push(worker.clone());
+    let worker_attach = cdp.call("Target.attachToTarget", json!({"targetId":"IW","flatten":true}), None);
+    assert!(worker_attach.is_err(), "stale owner must not admit worker under unbound seven: {worker_attach:?}");
+}
+
+#[test]
+fn unbound_seven_without_stale_owner_refuses_inner_attach() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let seven = json!({
+        "targetId":"SEVEN",
+        "type":"iframe",
+        "url":"https://seven.sliccy.ai/os/",
+        "parentFrameId":"FRAME",
+        "browserContextId":"CTX"
+    });
+    let inner = json!({
+        "targetId":"INNER",
+        "type":"iframe",
+        "url":"https://foreign.test/cell",
+        "parentFrameId":"SEVEN-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), seven.clone(), inner.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("SEVEN".into(), seven.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    browser.borrow_mut().infos = vec![
+        json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"}),
+        seven.clone(),
+        inner.clone(),
+    ];
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":seven}
+    }));
+    assert!(cdp.protected_targets.contains("SEVEN"));
+    let attach = cdp.call("Target.attachToTarget", json!({"targetId":"INNER","flatten":true}), None);
+    assert!(attach.is_err(), "unbound seven without stale owner must refuse INNER: {attach:?}");
+}
+
+#[test]
+fn bound_seven_frame_refuses_inner_even_with_stale_owner() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let seven = json!({
+        "targetId":"SEVEN",
+        "type":"iframe",
+        "url":"https://seven.sliccy.ai/os/",
+        "parentFrameId":"FRAME",
+        "browserContextId":"CTX"
+    });
+    let inner = json!({
+        "targetId":"INNER",
+        "type":"iframe",
+        "url":"https://foreign.test/cell",
+        "parentFrameId":"SEVEN-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), seven.clone(), inner.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("SEVEN".into(), seven.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    cdp.page_scope_owners.insert("SEVEN-FRAME".into(), "PAGE".into());
+    cdp.iframe_own_frames.insert("SEVEN-FRAME".into(), "SEVEN".into());
+    browser.borrow_mut().infos = vec![
+        json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"}),
+        seven.clone(),
+        inner.clone(),
+    ];
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":seven}
+    }));
+    assert!(cdp.protected_targets.contains("SEVEN"));
+    let attach = cdp.call("Target.attachToTarget", json!({"targetId":"INNER","flatten":true}), None);
+    assert!(attach.is_err(), "bound seven frame must refuse INNER despite stale owner: {attach:?}");
+}
+
+#[test]
+fn har_release_worker_detach_is_not_ok_while_chrome_holds_session() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let worker = json!({
+        "targetId":"W",
+        "type":"worker",
+        "url":"https://foreign.test/worker.js",
+        "openerId":"PAGE",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), worker.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("W".into(), worker);
+    browser.borrow_mut().detach_failures = 5;
+    browser.borrow_mut().sessions.insert("S-HAR".into(), "W".into());
+    cdp.session_targets.insert("S-HAR".into(), "W".into());
+    cdp.har.workers.insert("S-HAR".into(), "PAGE".into());
+    cdp.har_release_worker("S-HAR");
+    assert!(cdp.session_blocked("S-HAR"));
+    assert!(cdp.session_targets.contains_key("S-HAR"), "must keep map until Chrome confirms detach");
+    assert!(browser.borrow().sessions.contains_key("S-HAR"));
+    let detach = cdp.call("Target.detachFromTarget", json!({"sessionId":"S-HAR"}), None);
+    assert!(detach.is_err(), "har release must not report Ok while chrome still holds the session: {detach:?}");
+    assert!(browser.borrow().sessions.contains_key("S-HAR"));
+    assert!(cdp.call("Network.enable", json!({}), Some("S-HAR")).is_err());
+}

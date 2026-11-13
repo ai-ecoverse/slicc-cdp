@@ -207,13 +207,14 @@ impl Cdp {
     pub(super) fn har_release_worker(&mut self, child: &str) {
         self.har.workers.remove(child);
         self.har.urls.remove(child);
-        let _ = self.send(
-            "Target.detachFromTarget",
-            json!({ "sessionId": child }),
-            None,
-        );
         self.blocked.insert(child.to_string());
-        self.session_targets.remove(child);
+        if !self.detaching.values().any(|have| have == child) {
+            let _ = self.send(
+                "Target.detachFromTarget",
+                json!({ "sessionId": child }),
+                None,
+            );
+        }
     }
 
     fn har_disarm(&mut self, session: &str) {
