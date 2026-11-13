@@ -1869,6 +1869,46 @@ fn bound_seven_frame_refuses_inner_even_with_stale_owner() {
 }
 
 #[test]
+fn extension_iframe_does_not_shadow_ordinary_page_scope_owner() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let ext = json!({
+        "targetId":"EXT",
+        "type":"iframe",
+        "url":"chrome-extension://fixture/frame.html",
+        "parentFrameId":"FRAME",
+        "browserContextId":"CTX"
+    });
+    let nested = json!({
+        "targetId":"NESTED-EXT",
+        "type":"iframe",
+        "url":"chrome-extension://fixture/nested.html",
+        "parentFrameId":"EXT-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), ext.clone(), nested.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.targets.insert("EXT".into(), ext.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    cdp.page_scope_owners.insert("EXT-FRAME".into(), "PAGE".into());
+    browser.borrow_mut().infos = vec![page.clone(), ext.clone(), nested.clone()];
+    assert!(!cdp.unbound_protected_iframe_shadows_owner("EXT-FRAME", &[]));
+    let info = cdp.call("Target.getTargetInfo", json!({"targetId":"NESTED-EXT"}), None);
+    assert!(info.is_ok(), "extension nested getTargetInfo must not refuse as unresolved: {info:?}");
+    let listed = info.unwrap();
+    assert_eq!(listed["targetInfo"]["targetId"], "NESTED-EXT");
+}
+
+#[test]
 fn har_release_worker_detach_is_not_ok_while_chrome_holds_session() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let worker = json!({

@@ -1948,6 +1948,9 @@ impl Cdp {
                 return false;
             }
             let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+            if self.guard.extension_frame(url) {
+                return false;
+            }
             let protected = self.protected_targets.contains(id)
                 || self.kept_url_latch.contains(id)
                 || self.guard.url(url)
