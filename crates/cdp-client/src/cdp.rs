@@ -467,10 +467,11 @@ impl Cdp {
 
     pub fn is_protected_target(&self, target_id: &str) -> bool {
         self.protected_targets.contains(target_id)
-            || self
-                .session_targets
-                .iter()
-                .any(|(session, target)| target == target_id && self.blocked.contains(session))
+            || self.session_targets.iter().any(|(session, target)| {
+                target == target_id
+                    && self.blocked.contains(session)
+                    && !self.unresolved_cuts.contains(session)
+            })
     }
 
     pub fn set_decider(&mut self, session_id: &str, decider: Option<Decider>) {
@@ -610,17 +611,17 @@ impl Cdp {
                     }
                 }
                 let mapped = self.session_targets.contains_key(session) || self.guard_sessions.contains(session);
-                if self.blocked.contains(session) && !mapped {
-                    return Ok(json!({}));
-                }
                 if self.detaching.values().any(|have| have == session) {
                     return Err("Target.detachFromTarget: detach still pending\n".into());
                 }
-                if self.blocked.contains(session)
-                    && mapped
-                    && self.detach_attempts.get(session).copied().unwrap_or(0) >= 3
-                {
-                    return Err(self.refusal());
+                if mapped {
+                    if self.blocked.contains(session)
+                        && self.detach_attempts.get(session).copied().unwrap_or(0) >= 3
+                    {
+                        return Err(self.refusal());
+                    }
+                } else if self.blocked.contains(session) {
+                    return Ok(json!({}));
                 }
             }
         }
@@ -1907,7 +1908,6 @@ impl Cdp {
         }
         if self.targets.get(target).is_some_and(|info| info.get("type").and_then(Value::as_str) == Some("iframe")) {
             self.iframe_own_frames.insert(frame.to_string(), target.to_string());
-            self.release_cleared_unresolved_sessions();
         }
     }
 
@@ -1923,42 +1923,6 @@ impl Cdp {
             if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
                 self.note_iframe_own_frame(&target, &frame);
             }
-        }
-        self.release_cleared_unresolved_sessions();
-    }
-
-    pub(super) fn release_cleared_unresolved_sessions(&mut self) {
-        let sessions: Vec<String> = self
-            .session_targets
-            .iter()
-            .filter_map(|(session, owner)| {
-                if !self.blocked.contains(session) || self.protected_targets.contains(owner) {
-                    return None;
-                }
-                let info = self.targets.get(owner)?;
-                let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
-                let clear = match kind {
-                    "iframe" => matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Clear),
-                    "worker" | "service_worker" | "shared_worker" => !self.worker_opener_protected(info, &[]),
-                    _ => false,
-                };
-                clear.then(|| session.clone())
-            })
-            .collect();
-        for session in sessions {
-            if !self.detaching.values().any(|have| have == &session) {
-                let _ = self.send(
-                    "Target.detachFromTarget",
-                    json!({ "sessionId": session }),
-                    None,
-                );
-            }
-            self.session_targets.remove(&session);
-            self.blocked.remove(&session);
-            self.unresolved_cuts.remove(&session);
-            self.detach_attempts.remove(&session);
-            self.detaching.retain(|_, have| have != &session);
-            self.deciders.remove(&session);
         }
     }
 
@@ -2959,14 +2923,11 @@ impl Cdp {
             .map(|(session, _)| session.clone())
             .collect();
         for session in sessions {
-            self.session_targets.remove(&session);
-            self.blocked.remove(&session);
-            self.unresolved_cuts.remove(&session);
-            self.detach_attempts.remove(&session);
-            self.detaching.retain(|_, have| have != &session);
-            self.deciders.remove(&session);
+            self.unresolved_cuts.insert(session.clone());
+            if !self.detaching.values().any(|have| have == &session) {
+                self.detach_blocked(&session);
+            }
         }
-        self.release_cleared_unresolved_sessions();
     }
 
     fn rejudge_descendants_after_ordinary(&mut self, ancestor: &str) {
@@ -3907,10 +3868,6 @@ impl Cdp {
                 if !target.is_empty() {
                     self.targets.insert(target.clone(), info.clone());
                     self.latch_kept_target_url(&target, url);
-                    if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
-                        self.note_iframe_own_frame(&target, &frame);
-                    }
-                    self.bind_proven_iframe_frames();
                 }
                 if self.info_protected(&info, &[]) && !self.probing.contains(&target) && self.should_latch_protected(&info, &[]) {
                     let navigating = self.documents.get(&target).is_some_and(|doc| doc.navigating);
@@ -3935,6 +3892,12 @@ impl Cdp {
                 }
                 if self.guard.url(url) {
                     self.protect_descendant_targets(&target);
+                }
+                if !target.is_empty() {
+                    if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
+                        self.note_iframe_own_frame(&target, &frame);
+                    }
+                    self.bind_proven_iframe_frames();
                 }
                 if self.discovery_hidden_iframe(&info, &[]) || self.worker_opener_unresolved(&info, &[]) {
                     value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));

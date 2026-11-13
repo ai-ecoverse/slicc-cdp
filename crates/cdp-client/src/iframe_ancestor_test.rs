@@ -1411,7 +1411,7 @@ fn detach_error_then_retry_until_gone() {
 }
 
 #[test]
-fn unresolved_cut_forgets_when_ancestor_resolves_clear() {
+fn unresolved_cut_keeps_live_session_blocked_but_admits_fresh_attach() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let child = json!({
         "targetId":"OOPIF",
@@ -1433,21 +1433,25 @@ fn unresolved_cut_forgets_when_ancestor_resolves_clear() {
         probed: false,
     });
     cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
-    browser.borrow_mut().detach_failures = 3;
+    browser.borrow_mut().detach_failures = 8;
+    browser.borrow_mut().sessions.insert("S-OLD".into(), "OOPIF".into());
     cdp.absorb(json!({
         "method":"Target.attachedToTarget",
         "params":{"sessionId":"S-OLD","targetInfo":child.clone(),"waitingForDebugger":false}
     }));
     assert!(cdp.session_blocked("S-OLD"));
     assert!(!cdp.protected_targets.contains("OOPIF"));
-    assert!(cdp.is_protected_target("OOPIF") || cdp.session_targets.contains_key("S-OLD"));
     cdp.page_scope_owners.insert("NESTED".into(), "PAGE".into());
-    cdp.release_cleared_unresolved_sessions();
-    assert!(!cdp.is_protected_target("OOPIF"), "clear ancestor must drop non-latched cut");
-    assert!(!cdp.session_targets.contains_key("S-OLD"));
-    assert!(!cdp.session_blocked("S-OLD"));
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":page}
+    }));
+    assert!(cdp.session_blocked("S-OLD"), "live unresolved cut must stay blocked");
+    assert!(cdp.session_targets.contains_key("S-OLD") || browser.borrow().sessions.contains_key("S-OLD"));
+    assert!(!cdp.is_protected_target("OOPIF"), "unresolved cut must not latch the target");
+    assert!(cdp.call("Network.enable", json!({}), Some("S-OLD")).is_err());
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
-    assert!(attach.is_ok(), "ordinary OOPIF must attach after clear: {attach:?}");
+    assert!(attach.is_ok(), "fresh attach of ordinary target must be admitted: {attach:?}");
 }
 
 #[test]
@@ -1466,6 +1470,28 @@ fn in_flight_detach_is_not_reported_ok_while_mapped() {
 }
 
 #[test]
+fn failed_detach_forget_is_not_reported_ok_while_chrome_holds_session() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({"targetId":"OOPIF","type":"iframe","url":"https://foreign.test/excel","parentFrameId":"PAGE","browserContextId":"CTX"});
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("OOPIF".into(), child.clone());
+    browser.borrow_mut().detach_failures = 5;
+    browser.borrow_mut().sessions.insert("S-WEB".into(), "OOPIF".into());
+    cdp.session_targets.insert("S-WEB".into(), "OOPIF".into());
+    cdp.unresolved_cuts.insert("S-WEB".into());
+    cdp.blocked.insert("S-WEB".into());
+    let first = cdp.call("Target.detachFromTarget", json!({"sessionId":"S-WEB"}), None);
+    assert!(first.is_err() || browser.borrow().sessions.contains_key("S-WEB"));
+    assert!(browser.borrow().sessions.contains_key("S-WEB"), "chrome must still hold the session");
+    assert!(cdp.session_targets.contains_key("S-WEB") || cdp.session_blocked("S-WEB"));
+    sent.borrow_mut().clear();
+    let second = cdp.call("Target.detachFromTarget", json!({"sessionId":"S-WEB"}), None);
+    assert!(second.is_err(), "detach must not report Ok while chrome still holds the session: {second:?}");
+    assert!(browser.borrow().sessions.contains_key("S-WEB"));
+}
+
+#[test]
 fn refused_auto_attach_does_not_remap_blocked_session() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let child = json!({
@@ -1476,7 +1502,7 @@ fn refused_auto_attach_does_not_remap_blocked_session() {
         "browserContextId":"CTX"
     });
     let (mut cdp, _, _) = logging_browser(vec![page.clone(), child.clone()]);
-    cdp.targets.insert("PAGE".into(), page);
+    cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
         url: "https://ordinary.test/".into(),
@@ -1489,9 +1515,7 @@ fn refused_auto_attach_does_not_remap_blocked_session() {
     });
     cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
     cdp.unresolved_cuts.insert("CHILD".into());
-    cdp.forget_session("CHILD");
-    assert!(cdp.session_blocked("CHILD"));
-    assert!(!cdp.session_targets.contains_key("CHILD"));
+    cdp.blocked.insert("CHILD".into());
     cdp.absorb(json!({
         "method":"Target.attachedToTarget",
         "params":{"sessionId":"CHILD","targetInfo":child.clone(),"waitingForDebugger":false}
@@ -1499,8 +1523,194 @@ fn refused_auto_attach_does_not_remap_blocked_session() {
     assert!(!cdp.session_targets.contains_key("CHILD"), "blocked refused attach must not remap");
     assert!(!cdp.protected_targets.contains("OOPIF"));
     cdp.page_scope_owners.insert("NESTED".into(), "PAGE".into());
-    cdp.release_cleared_unresolved_sessions();
+    cdp.note_iframe_own_frame("OOPIF", "OOPIF");
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":page}
+    }));
     assert!(!cdp.is_protected_target("OOPIF"));
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
     assert!(attach.is_ok(), "cleared ordinary OOPIF must attach: {attach:?}");
+}
+
+#[test]
+fn scenario_a_seven_own_url_stays_blocked_when_ancestor_clears() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({
+        "targetId":"OOPIF",
+        "type":"iframe",
+        "url":"https://seven.sliccy.ai/os/",
+        "parentFrameId":"NESTED",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), child.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    browser.borrow_mut().detach_failures = 8;
+    browser.borrow_mut().sessions.insert("S-OLD".into(), "OOPIF".into());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"S-OLD","targetInfo":child.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("S-OLD"));
+    assert!(!cdp.protected_targets.contains("OOPIF"));
+    cdp.guards.insert("PAGE".into(), "PAGE-S".into());
+    cdp.session_targets.insert("PAGE-S".into(), "PAGE".into());
+    cdp.absorb(json!({
+        "method":"Page.frameNavigated",
+        "params":{"frame":{"id":"NESTED","parentId":"FRAME","url":"about:blank","securityOrigin":"https://ordinary.test","loaderId":"L1"}},
+        "sessionId":"PAGE-S"
+    }));
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":page}
+    }));
+    assert!(cdp.session_blocked("S-OLD"), "seven-origin live session must stay blocked");
+    assert!(browser.borrow().sessions.contains_key("S-OLD"));
+    sent.borrow_mut().clear();
+    assert!(cdp.call("Network.enable", json!({}), Some("S-OLD")).is_err());
+    assert!(cdp.call("Page.navigate", json!({"url":"https://foreign.test/hijack"}), Some("S-OLD")).is_err());
+    assert!(cdp.call("Fetch.enable", json!({}), Some("S-OLD")).is_err());
+    assert!(!sent.borrow().iter().any(|command| {
+        command.get("sessionId").and_then(Value::as_str) == Some("S-OLD")
+            && matches!(command["method"].as_str(), Some("Network.enable" | "Page.navigate" | "Fetch.enable"))
+    }), "refused commands must not reach the wire: {:?}", sent.borrow());
+}
+
+#[test]
+fn scenario_b_unblocked_sessions_cannot_survive_protect_flip() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({
+        "targetId":"OOPIF",
+        "type":"iframe",
+        "url":"https://foreign.test/excel",
+        "parentFrameId":"NESTED",
+        "browserContextId":"CTX"
+    });
+    let worker = json!({
+        "targetId":"W",
+        "type":"worker",
+        "url":"https://foreign.test/worker.js",
+        "openerFrameId":"OOPIF-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), child.clone(), worker.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    browser.borrow_mut().detach_failures = 8;
+    browser.borrow_mut().sessions.insert("S-OLD".into(), "OOPIF".into());
+    browser.borrow_mut().sessions.insert("S-WORKER".into(), "W".into());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"S-OLD","targetInfo":child.clone(),"waitingForDebugger":false}
+    }));
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"S-WORKER","targetInfo":worker.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("S-OLD"));
+    assert!(cdp.session_blocked("S-WORKER"));
+    cdp.page_scope_owners.insert("NESTED".into(), "PAGE".into());
+    cdp.page_scope_owners.insert("OOPIF-FRAME".into(), "PAGE".into());
+    cdp.iframe_own_frames.insert("OOPIF-FRAME".into(), "OOPIF".into());
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":page.clone()}
+    }));
+    assert!(cdp.session_blocked("S-OLD"));
+    assert!(cdp.session_blocked("S-WORKER"));
+    let seven = json!({"targetId":"PAGE","type":"page","url":"https://seven.sliccy.ai/os/","browserContextId":"CTX"});
+    browser.borrow_mut().infos = vec![seven.clone(), child.clone(), worker.clone()];
+    cdp.guards.insert("PAGE".into(), "PAGE-S".into());
+    cdp.session_targets.insert("PAGE-S".into(), "PAGE".into());
+    cdp.absorb(json!({
+        "method":"Page.frameNavigated",
+        "params":{"frame":{"id":"FRAME","url":"https://seven.sliccy.ai/os/","securityOrigin":"https://seven.sliccy.ai","loaderId":"L2"}},
+        "sessionId":"PAGE-S"
+    }));
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":seven}
+    }));
+    assert!(cdp.protected_targets.contains("PAGE") || cdp.documents.get("PAGE").is_some_and(|doc| doc.previous));
+    assert!(cdp.session_blocked("S-OLD"), "iframe session must stay blocked after protect flip");
+    assert!(cdp.session_blocked("S-WORKER"), "worker session must stay blocked after protect flip");
+    sent.borrow_mut().clear();
+    assert!(cdp.call("Network.enable", json!({}), Some("S-OLD")).is_err());
+    assert!(cdp.call("Network.enable", json!({}), Some("S-WORKER")).is_err());
+    assert!(cdp.call("Page.navigate", json!({"url":"https://foreign.test/hijack"}), Some("S-OLD")).is_err());
+}
+
+#[test]
+fn scenario_c_stale_page_scope_owner_cannot_unblock_inner() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let seven = json!({
+        "targetId":"SEVEN",
+        "type":"iframe",
+        "url":"https://seven.sliccy.ai/os/",
+        "parentFrameId":"FRAME",
+        "browserContextId":"CTX"
+    });
+    let inner = json!({
+        "targetId":"INNER",
+        "type":"iframe",
+        "url":"https://foreign.test/cell",
+        "parentFrameId":"SEVEN-FRAME",
+        "browserContextId":"CTX"
+    });
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone(), seven.clone(), inner.clone()]);
+    cdp.targets.insert("PAGE".into(), page.clone());
+    cdp.targets.insert("SEVEN".into(), seven.clone());
+    cdp.documents.insert("PAGE".into(), super::MainDocument {
+        frame_id: "FRAME".into(),
+        url: "https://ordinary.test/".into(),
+        origin: "https://ordinary.test".into(),
+        unreachable_url: String::new(),
+        navigating: false,
+        navigation_url: String::new(),
+        previous: false,
+        probed: false,
+    });
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    cdp.frames.insert("SEVEN-FRAME".into(), vec!["about:blank".into(), "https://ordinary.test".into()]);
+    browser.borrow_mut().detach_failures = 8;
+    browser.borrow_mut().sessions.insert("S-INNER".into(), "INNER".into());
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget",
+        "params":{"sessionId":"S-INNER","targetInfo":inner.clone(),"waitingForDebugger":false}
+    }));
+    assert!(cdp.session_blocked("S-INNER"));
+    cdp.page_scope_owners.insert("SEVEN-FRAME".into(), "PAGE".into());
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":page}
+    }));
+    assert!(cdp.session_blocked("S-INNER"), "stale owner Clear must not unblock live session");
+    assert!(!cdp.protected_targets.contains("INNER"));
+    assert!(browser.borrow().sessions.contains_key("S-INNER"));
+    sent.borrow_mut().clear();
+    assert!(cdp.call("Network.enable", json!({}), Some("S-INNER")).is_err());
+    assert!(!sent.borrow().iter().any(|command| {
+        command.get("sessionId").and_then(Value::as_str) == Some("S-INNER") && command["method"] == "Network.enable"
+    }));
 }
