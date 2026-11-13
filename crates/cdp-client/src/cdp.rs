@@ -467,10 +467,11 @@ impl Cdp {
 
     pub fn is_protected_target(&self, target_id: &str) -> bool {
         self.protected_targets.contains(target_id)
-            || self
-                .session_targets
-                .iter()
-                .any(|(session, target)| target == target_id && self.blocked.contains(session))
+            || self.session_targets.iter().any(|(session, target)| {
+                target == target_id
+                    && self.blocked.contains(session)
+                    && !self.unresolved_cuts.contains(session)
+            })
     }
 
     pub fn set_decider(&mut self, session_id: &str, decider: Option<Decider>) {
@@ -610,17 +611,17 @@ impl Cdp {
                     }
                 }
                 let mapped = self.session_targets.contains_key(session) || self.guard_sessions.contains(session);
-                if self.blocked.contains(session) && !mapped {
-                    return Ok(json!({}));
-                }
                 if self.detaching.values().any(|have| have == session) {
-                    return Ok(json!({}));
+                    return Err("Target.detachFromTarget: detach still pending\n".into());
                 }
-                if self.blocked.contains(session)
-                    && mapped
-                    && self.detach_attempts.get(session).copied().unwrap_or(0) >= 3
-                {
-                    return Err(self.refusal());
+                if mapped {
+                    if self.blocked.contains(session)
+                        && self.detach_attempts.get(session).copied().unwrap_or(0) >= 3
+                    {
+                        return Err(self.refusal());
+                    }
+                } else if self.blocked.contains(session) {
+                    return Ok(json!({}));
                 }
             }
         }
@@ -1925,6 +1926,45 @@ impl Cdp {
         }
     }
 
+    fn unbound_protected_iframe_shadows_owner(&self, frame: &str, all: &[Value]) -> bool {
+        if self.iframe_own_frames.contains_key(frame)
+            || self.documents.values().any(|doc| doc.frame_id == frame)
+            || all.iter().chain(self.targets.values()).any(|item| {
+                item.get("targetId").and_then(Value::as_str) == Some(frame)
+                    && item.get("type").and_then(Value::as_str) == Some("iframe")
+            })
+        {
+            return false;
+        }
+        let Some(page) = self.page_scope_owners.get(frame) else {
+            return false;
+        };
+        all.iter().chain(self.targets.values()).any(|info| {
+            if info.get("type").and_then(Value::as_str) != Some("iframe") {
+                return false;
+            }
+            let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() || id == frame {
+                return false;
+            }
+            let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+            if self.guard.extension_frame(url) {
+                return false;
+            }
+            let protected = self.protected_targets.contains(id)
+                || self.kept_url_latch.contains(id)
+                || self.guard.url(url)
+                || kept_document(&self.guard, url);
+            if !protected {
+                return false;
+            }
+            let iframe_parent = info.get("parentFrameId").and_then(Value::as_str).unwrap_or("");
+            iframe_parent == page
+                || self.page_scope_owners.get(iframe_parent).map(String::as_str) == Some(page.as_str())
+                || self.documents.get(page.as_str()).is_some_and(|doc| doc.frame_id == iframe_parent)
+        })
+    }
+
     fn frame_known_page_or_bound(&self, frame: &str, all: &[Value]) -> bool {
         if self.iframe_own_frames.contains_key(frame) {
             return true;
@@ -1933,7 +1973,7 @@ impl Cdp {
             return true;
         }
         if self.page_scope_owners.contains_key(frame) {
-            return true;
+            return !self.unbound_protected_iframe_shadows_owner(frame, all);
         }
         if self.document_versions.keys().any(|(_, id)| id == frame) {
             return true;
@@ -1960,7 +2000,9 @@ impl Cdp {
             return Some(owner.clone());
         }
         if let Some(page) = self.page_scope_owners.get(frame) {
-            return Some(page.clone());
+            if !self.unbound_protected_iframe_shadows_owner(frame, all) {
+                return Some(page.clone());
+            }
         }
         if let Some((owner, _)) = self.document_versions.keys().find(|(_, id)| id == frame) {
             return Some(owner.clone());
@@ -2810,6 +2852,14 @@ impl Cdp {
 
     fn cut_unresolved_session(&mut self, session_id: &str) {
         self.unresolved_cuts.insert(session_id.to_string());
+        if self.blocked.contains(session_id) {
+            if self.session_targets.contains_key(session_id)
+                && !self.detaching.values().any(|have| have == session_id)
+            {
+                self.detach_blocked(session_id);
+            }
+            return;
+        }
         self.block_session(session_id, false);
     }
 
@@ -2914,8 +2964,10 @@ impl Cdp {
             .map(|(session, _)| session.clone())
             .collect();
         for session in sessions {
-            self.session_targets.remove(&session);
-            self.deciders.remove(&session);
+            self.unresolved_cuts.insert(session.clone());
+            if !self.detaching.values().any(|have| have == &session) {
+                self.detach_blocked(&session);
+            }
         }
     }
 
@@ -3857,10 +3909,6 @@ impl Cdp {
                 if !target.is_empty() {
                     self.targets.insert(target.clone(), info.clone());
                     self.latch_kept_target_url(&target, url);
-                    if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
-                        self.note_iframe_own_frame(&target, &frame);
-                    }
-                    self.bind_proven_iframe_frames();
                 }
                 if self.info_protected(&info, &[]) && !self.probing.contains(&target) && self.should_latch_protected(&info, &[]) {
                     let navigating = self.documents.get(&target).is_some_and(|doc| doc.navigating);
@@ -3886,6 +3934,12 @@ impl Cdp {
                 if self.guard.url(url) {
                     self.protect_descendant_targets(&target);
                 }
+                if !target.is_empty() {
+                    if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
+                        self.note_iframe_own_frame(&target, &frame);
+                    }
+                    self.bind_proven_iframe_frames();
+                }
                 if self.discovery_hidden_iframe(&info, &[]) || self.worker_opener_unresolved(&info, &[]) {
                     value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));
                 } else if self.info_protected(&info, &[]) || self.discovery_redacted(&info) {
@@ -3908,6 +3962,7 @@ impl Cdp {
                     if matches!(kind, "iframe" | "worker" | "service_worker" | "shared_worker")
                         && !child.is_empty()
                         && !target.is_empty()
+                        && !self.blocked.contains(child)
                     {
                         self.session_targets.insert(child.to_string(), target.to_string());
                     }

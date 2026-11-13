@@ -230,6 +230,10 @@ impl Cdp {
                 !ordinary_error && (self.guard.url(&frame[1]) || self.guard.url(&frame[2]))
             }) { return Err(self.refusal()) }
         for (id, owner_page) in next_owners { self.page_scope_owners.insert(id, owner_page); }
+        for (target, root) in &target_roots {
+            self.note_iframe_own_frame(target, root);
+            self.note_iframe_own_frame(target, target);
+        }
         if held.is_empty() { self.extension_frames.remove(&page); } else { self.extension_frames.insert(page.clone(), held); }
         for (id, evidence) in &frames {
             self.frames.insert(id.clone(), vec![evidence[1].clone(), evidence[2].clone()]);
