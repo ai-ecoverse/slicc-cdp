@@ -24,6 +24,8 @@ const BLANK_DOCUMENT: &str = "<html></html>";
 
 const WEB_SCRIPT: &str = r#"(request) => {
   const origin = location.origin;
+  if (origin !== request.expected)
+    return { origin };
   const storage = request.kind === 'local' ? localStorage : sessionStorage;
   if (request.op === 'list') {
     const items = [];
@@ -102,11 +104,12 @@ fn web(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command: &st
     let key = invocation.positionals.first().map(String::as_str).unwrap_or("");
     let value = invocation.positionals.get(1).map(String::as_str).unwrap_or("");
     let page = cookies::target(cdp, invocation, state)?;
+    let expected = web_origin(cdp.guard(), &page.url).ok_or_else(|| refusal(cdp.guard(), &page.url))?;
     let session = cdp::attach(cdp, &page.target_id)?;
-    let request = json!({ "kind": kind, "op": op, "key": key, "value": value });
+    let request = json!({ "kind": kind, "op": op, "key": key, "value": value, "expected": expected });
     let result = evaluate(cdp, &session, &format!("({WEB_SCRIPT})({request})"));
     cdp::detach(cdp, &session);
-    let result = admitted(cdp.guard(), result?, None)?;
+    let result = admitted(cdp.guard(), result?, Some(&expected))?;
     Ok(match op {
         "list" => {
             let lines: Vec<String> = items(&result).into_iter().map(|(name, value)| format!("{name}={value}")).collect();
@@ -143,9 +146,17 @@ fn evaluate(cdp: &mut Cdp, session: &str, expression: &str) -> Result<Value, Str
 fn admitted(guard: &Protected, result: Value, expected: Option<&str>) -> Result<Value, String> {
     let origin = result.get("origin").and_then(Value::as_str).unwrap_or("");
     if web_origin(guard, origin).as_deref() != Some(origin) || expected.is_some_and(|expected| expected != origin) {
-        return Err(format!("{}\n", guard.refusal_for_url(origin)));
+        return Err(refusal(guard, origin));
     }
     Ok(result)
+}
+
+fn refusal(guard: &Protected, origin: &str) -> String {
+    if guard.credential_url(origin) {
+        format!("{}\n", guard.credential_refusal())
+    } else {
+        format!("{}\n", guard.refusal_for_url(origin))
+    }
 }
 
 fn web_origin(guard: &Protected, text: &str) -> Option<String> {
@@ -204,7 +215,7 @@ fn save(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Result<S
 
 fn collect(cdp: &mut Cdp, target: &str, origin: &str) -> Result<Vec<(String, String)>, String> {
     let session = cdp::attach(cdp, target)?;
-    let request = json!({ "kind": "local", "op": "list" });
+    let request = json!({ "kind": "local", "op": "list", "expected": origin });
     let result = evaluate(cdp, &session, &format!("({WEB_SCRIPT})({request})"));
     cdp::detach(cdp, &session);
     let result = admitted(cdp.guard(), result?, Some(origin))?;
@@ -364,7 +375,7 @@ fn plan(guard: &Protected, state: &Value) -> Result<Plan, String> {
             }
         }
         let Some(normalized) = web_origin(guard, origin) else {
-            return Err(format!("{}\n", guard.refusal_for_url(origin)));
+            return Err(refusal(guard, origin));
         };
         let mut entries = Vec::new();
         for (item, pair) in list(entry.get("localStorage"), &format!("{at}.localStorage"))?.iter().enumerate() {
@@ -456,6 +467,9 @@ fn cookie_params(guard: &Protected, cookie: &Value, at: &str) -> Result<Value, S
     }
     if let Some(site) = partition {
         params["partitionKey"] = json!({ "topLevelSite": site, "hasCrossSiteAncestor": ancestor.unwrap_or(true) });
+    }
+    if shield::credential_cookie_refused(guard, &params) {
+        return Err(format!("{}\n", guard.credential_refusal()));
     }
     if shield::cookie_protected(guard, &params) {
         return Err(cdp::COOKIES.to_string());

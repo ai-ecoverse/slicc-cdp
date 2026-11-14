@@ -1048,6 +1048,11 @@ impl Cdp {
                 }
             }
         }
+        if shield::cookie_method(method) && shield::credential_cookie_refused(&self.guard, params)
+            || shield::storage_domain(method) && shield::names_credential_storage(&self.guard, params)
+        {
+            return Err(format!("{}\n", self.guard.credential_refusal()));
+        }
         if shield::cookie_method(method) && shield::cookie_refused(&self.guard, params) {
             return Err(COOKIES.into());
         }
@@ -4547,6 +4552,9 @@ impl Cdp {
         if value.get("sliccHide").and_then(Value::as_bool) == Some(true) {
             return;
         }
+        if shield::credential_storage_event(&self.guard, &value) || shield::audit_cookie_hidden(&self.guard, &value) {
+            return;
+        }
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         let session = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
         if !method.is_empty()
@@ -4627,12 +4635,19 @@ impl Cdp {
                 if let Some(cookies) = value.pointer("/params/associatedCookies").and_then(Value::as_array) {
                     self.trace_cookies.extend(cookies.iter().filter_map(|item| item.get("cookie").cloned()));
                 }
+                if shield::credential_associated(&self.guard, &value["params"]) {
+                    shield::strip_credential_cookies(&self.guard, &mut value["params"], false);
+                }
                 shield::strip_protected_associated(&self.guard, &mut value);
                 if self.requests.get(&id) != Some(&false) {
                     self.held.entry(id).or_default().push(value);
                     return;
                 }
             }
+        }
+        if self.credential_cookie_event(&value) {
+            let fetch = value["method"].as_str().is_some_and(|method| method.starts_with("Fetch."));
+            shield::strip_credential_cookies(&self.guard, &mut value["params"], fetch);
         }
         if !terminal { self.visible_network(&value); }
         self.events.push(value);
@@ -4643,6 +4658,20 @@ impl Cdp {
                 }
             }
         }
+    }
+
+    fn credential_cookie_event(&self, value: &Value) -> bool {
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        if !method.starts_with("Network.") && !method.starts_with("Fetch.") { return false }
+        let params = &value["params"];
+        let mut urls: Vec<String> = ["/request/url", "/response/url", "/redirectResponse/url", "/url"].iter()
+            .filter_map(|pointer| params.pointer(pointer).and_then(Value::as_str)).map(str::to_string).collect();
+        for key in ["requestId", "networkId"] {
+            if let Some(id) = params.get(key).and_then(Value::as_str) {
+                urls.extend(self.request_resources.get(id).into_iter().flatten().map(|(_, url)| url.clone()));
+            }
+        }
+        shield::credential_cookie_event(&self.guard, params, &urls)
     }
 
     fn renderer_crashed(&self, session: Option<&str>, target: Option<&str>) -> bool {
@@ -5100,6 +5129,7 @@ impl Cdp {
                 && self.ordinary_redirect_url(&paused.url)).then(|| paused.url.clone());
             shield::redact_strings(&self.guard, &mut value);
             if let Some(url) = ordinary_url { value["params"]["request"]["url"] = json!(url); }
+            if self.credential_cookie_event(&value) { shield::strip_credential_cookies(&self.guard, &mut value["params"], true); }
             paused = Paused::from_event(&value).unwrap();
             self.requests.insert(paused.request_id.clone(), loaded_protected || initiated);
             if let Some(network) = &paused.network_id {
@@ -5351,7 +5381,9 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
     }
     match method {
         "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
-        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable" => None,
+        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable"
+        | "Storage.getSharedStorageEntries" | "Storage.getSharedStorageMetadata" | "Storage.getInterestGroupDetails" | "Storage.getTrustTokens"
+        | "Storage.getAffectedUrlsForThirdPartyCookieMetadata" | "Storage.trackCacheStorageForOrigin" | "Storage.trackIndexedDBForStorageKey" => None,
         "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.awaitPromise" | "Runtime.compileScript" | "Runtime.runScript"
         | "Runtime.getProperties" | "Runtime.getExceptionDetails" | "Runtime.queryObjects" | "Runtime.globalLexicalScopeNames" | "Runtime.getHeapUsage" | "Runtime.discardConsoleEntries"
         | "DOM.collectClassNamesFromSubtree" | "DOM.copyTo" | "DOM.describeNode" | "DOM.focus" | "DOM.getAttributes" | "DOM.getBoxModel" | "DOM.getContentQuads"
@@ -5812,6 +5844,7 @@ mod tests {
     include!("protected_close_test.rs");
     include!("page_scope_retry_test.rs");
     include!("iframe_ancestor_test.rs");
+    include!("credential_origins_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

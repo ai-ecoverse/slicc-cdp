@@ -4,6 +4,7 @@ use crate::cdp::{self, Cdp};
 use crate::commands::resolve_target;
 use crate::sanitize;
 use crate::session::Session;
+use cdp_client::protected::{canonical_cookie_domain, Protected};
 use serde_json::{json, Value};
 
 const COMMANDS: &[&str] = &["cookie-list", "cookie-get", "cookie-set", "cookie-delete", "cookie-clear"];
@@ -44,7 +45,7 @@ pub fn run(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
 
 fn execute(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command: &str) -> Result<String, String> {
     if matches!(command, "cookie-list" | "cookie-set") && invocation.flags.get("domain").is_some_and(|domain| cdp.guard().cookie_scope(domain)) {
-        return Err(cdp::COOKIES.to_string());
+        return Err(refusal(cdp.guard(), invocation.flags.get("domain").map(String::as_str).unwrap_or("")));
     }
     let page = target(cdp, invocation, state)?;
     let mut set = None;
@@ -54,7 +55,7 @@ fn execute(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, command:
             return Err(NO_PAIR.to_string());
         }
         if cdp.guard().cookie_scope(&domain) {
-            return Err(cdp::COOKIES.to_string());
+            return Err(refusal(cdp.guard(), &domain));
         }
         set = Some(domain);
     }
@@ -236,6 +237,14 @@ pub(crate) fn target(cdp: &mut Cdp, invocation: &Invocation, state: &mut Session
         _ => resolve_target(cdp, invocation, state, &pages, false)?,
     };
     Ok(pages.into_iter().find(|page| page.target_id == id).unwrap_or(PageInfo { target_id: id, url: String::new(), title: String::new() }))
+}
+
+fn refusal(guard: &Protected, domain: &str) -> String {
+    if canonical_cookie_domain(domain).is_some_and(|domain| guard.credential_cookie_domain(&domain)) {
+        format!("{}\n", guard.credential_refusal())
+    } else {
+        cdp::COOKIES.to_string()
+    }
 }
 
 fn hostname(url: &str) -> String {

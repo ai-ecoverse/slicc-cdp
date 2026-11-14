@@ -566,7 +566,7 @@ pub fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
         }
     }
     if let Some(url) = cookie.get("url").and_then(|v| v.as_str()) {
-        if url_protected(guard, url) || host_of(url).is_some_and(|host| guard.cookie_domain(&host))
+        if url_protected(guard, url) || host_of(url).is_some_and(|host| guard.cookie_domain(&host)) || guard.credential_cookie_url(url)
         {
             return true;
         }
@@ -624,6 +624,136 @@ pub fn cookie_refused(guard: &Protected, params: &Value) -> bool {
     match params.get("cookies").and_then(|v| v.as_array()) {
         Some(cookies) => cookies.iter().any(|cookie| cookie_protected(guard, cookie)),
         None => cookie_protected(guard, params),
+    }
+}
+
+fn credential_cookie(guard: &Protected, cookie: &Value) -> bool {
+    cookie.get("domain").and_then(Value::as_str).is_some_and(|domain| guard.credential_cookie_domain(domain))
+        || cookie.get("url").and_then(Value::as_str).is_some_and(|url| guard.credential_cookie_url(url))
+        || match cookie.get("partitionKey") {
+            Some(Value::String(site)) => guard.credential_site(site),
+            Some(key) => key.get("topLevelSite").and_then(Value::as_str).is_some_and(|site| guard.credential_site(site)),
+            None => false,
+        }
+}
+
+pub fn credential_cookie_refused(guard: &Protected, params: &Value) -> bool {
+    match params.get("cookies").and_then(Value::as_array) {
+        Some(cookies) => cookies.iter().any(|cookie| credential_cookie(guard, cookie)),
+        None => credential_cookie(guard, params),
+    }
+}
+
+pub fn storage_domain(method: &str) -> bool {
+    ["Storage.", "IndexedDB.", "CacheStorage.", "DOMStorage.", "FileSystem."].iter().any(|prefix| method.starts_with(prefix))
+}
+
+pub fn names_credential_storage(guard: &Protected, value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(|item| names_credential_storage(guard, item)),
+        Value::Object(map) => map.iter().any(|(key, item)| {
+            if FREE_FORM.contains(&key.as_str()) {
+                return false;
+            }
+            match item.as_str() {
+                Some(text) => match key.as_str() {
+                    "storageKey" => guard.credential_storage_key(text),
+                    "cacheId" => guard.credential_storage_key(text.split('|').next().unwrap_or("")),
+                    "topLevelSite" => guard.credential_site(text),
+                    _ => ORIGIN_KEYS.contains(&key.as_str()) && (guard.credential_url(text) || guard.credential_url(&web_socket_as_http(text))),
+                },
+                None => names_credential_storage(guard, item),
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn cookie_issue_hidden(guard: &Protected, details: &Value) -> bool {
+    let urls = [details.pointer("/request/url"), details.get("cookieUrl")];
+    let urls: Vec<&str> = urls.into_iter().flatten().filter_map(Value::as_str).collect();
+    let domain = details.pointer("/cookie/domain").and_then(Value::as_str);
+    let line = details.get("rawCookieLine").and_then(Value::as_str).unwrap_or("");
+    let attributes: Vec<&str> = line.split(';').skip(1).filter_map(|attribute| {
+        let (name, value) = attribute.trim().split_once('=')?;
+        name.trim().eq_ignore_ascii_case("domain").then_some(value.trim())
+    }).collect();
+    if urls.is_empty() && domain.is_none() && attributes.is_empty() {
+        return true;
+    }
+    urls.iter().any(|url| guard.cookie_url(&web_socket_as_http(url)))
+        || domain.is_some_and(|domain| guard.cookie_scope(domain))
+        || attributes.iter().any(|domain| guard.cookie_scope(domain))
+}
+
+pub fn audit_cookie_hidden(guard: &Protected, event: &Value) -> bool {
+    if event.get("method").and_then(Value::as_str) != Some("Audits.issueAdded") {
+        return false;
+    }
+    let Some(details) = event.pointer("/params/issue/details").and_then(Value::as_object) else { return false };
+    details.iter().any(|(kind, detail)| {
+        (kind == "cookieIssueDetails" || ["cookie", "rawCookieLine", "cookieUrl"].iter().any(|key| detail.get(*key).is_some()))
+            && cookie_issue_hidden(guard, detail)
+    })
+}
+
+pub fn credential_storage_event(guard: &Protected, event: &Value) -> bool {
+    event.get("method").and_then(Value::as_str).is_some_and(storage_domain)
+        && event.get("params").is_some_and(|params| names_credential_storage(guard, params))
+}
+
+fn cookie_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cookie") || name.eq_ignore_ascii_case("set-cookie")
+}
+
+fn redact_cookie_lines(text: &str) -> String {
+    text.split_inclusive('\n').map(|line| match line.split_once(':') {
+        Some((name, _)) if cookie_header(name.trim()) => {
+            let ending = &line[line.trim_end_matches(['\r', '\n']).len()..];
+            format!("{name}: [redacted]{ending}")
+        }
+        _ => line.to_string(),
+    }).collect()
+}
+
+pub fn credential_associated(guard: &Protected, params: &Value) -> bool {
+    params.get("associatedCookies").and_then(Value::as_array).into_iter().flatten()
+        .any(|item| item.get("cookie").is_some_and(|cookie| credential_cookie(guard, cookie)))
+        || params.pointer("/cookiePartitionKey/topLevelSite").and_then(Value::as_str).is_some_and(|site| guard.credential_site(site))
+}
+
+pub fn credential_cookie_event(guard: &Protected, params: &Value, urls: &[String]) -> bool {
+    urls.is_empty() || urls.iter().any(|url| guard.credential_cookie_url(&web_socket_as_http(url))) || credential_associated(guard, params)
+}
+
+pub fn strip_credential_cookies(guard: &Protected, value: &mut Value, remove: bool) {
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| !item.get("name").and_then(Value::as_str).is_some_and(cookie_header));
+            for item in items.iter_mut() {
+                strip_credential_cookies(guard, item, remove);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["associatedCookies", "blockedCookies", "exemptedCookies"] {
+                if let Some(Value::Array(items)) = map.get_mut(key) {
+                    items.retain(|item| item.get("cookie").is_some_and(|cookie| !cookie_protected(guard, cookie)));
+                }
+            }
+            if remove {
+                map.retain(|key, item| !(cookie_header(key) && item.is_string()));
+            }
+            for (key, item) in map.iter_mut() {
+                if cookie_header(key) && item.is_string() {
+                    *item = Value::String("[redacted]".to_string());
+                } else if let Some(text) = item.as_str().filter(|_| matches!(key.as_str(), "headersText" | "requestHeadersText")) {
+                    *item = Value::String(redact_cookie_lines(text));
+                } else if !FREE_FORM.contains(&key.as_str()) || key == "headers" {
+                    strip_credential_cookies(guard, item, remove);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
