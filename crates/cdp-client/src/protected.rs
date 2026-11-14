@@ -111,7 +111,9 @@ impl Protected {
     }
 
     pub fn credential_storage_key(&self, key: &str) -> bool {
-        self.credential_url(key.split('^').next().unwrap_or(""))
+        let mut parts = key.split('^');
+        self.credential_url(parts.next().unwrap_or(""))
+            || parts.filter_map(|part| part.strip_prefix('0')).any(|site| self.credential_site(site))
     }
 
     pub fn refusal(&self) -> &str {
@@ -707,7 +709,11 @@ mod tests {
             assert!(!guard.credential_storage_key(url), "{url}");
             assert!(!guard.storage_key(url), "{url}");
         }
-        assert!(!guard.storage_key("https://example.test/^0https://adobelogin.com"));
+        assert!(guard.storage_key("https://example.test/^0https://adobelogin.com"));
+        assert!(guard.credential_storage_key("https://widget.example.test/^0https://ims-na1.adobelogin.com^31"));
+        assert!(!guard.credential_storage_key("https://example.test/^0https://adobe.com"));
+        assert!(!guard.credential_storage_key("https://example.test/^0https://evil-adobelogin.com"));
+        assert!(!guard.storage_key("https://example.test/^0https://adobe.com"));
         for domain in [".adobelogin.com", "adobelogin.com", "ims-na1.adobelogin.com", ".ims-na1.adobelogin.com", "IMS-NA1-STG1.ADOBELOGIN.COM."] {
             assert!(guard.credential_cookie_domain(domain), "{domain}");
             assert!(guard.cookie_domain(domain) && guard.cookie_scope(domain), "{domain}");
