@@ -3020,6 +3020,12 @@ impl Cdp {
         self.document_state_chain(target, content, scope, &mut BTreeSet::new())
     }
 
+    fn frame_owned_elsewhere(&self, frame: &str, target: &str) -> bool {
+        self.documents.iter().any(|(owner, doc)| owner != target && doc.frame_id == frame)
+            || self.iframe_own_frames.get(frame).is_some_and(|owner| owner != target)
+            || frame != target && self.targets.contains_key(frame)
+    }
+
     fn iframe_owner_unsafe(&self, owner: &str, url: &str) -> bool {
         self.protected_targets.contains(owner)
             || self.kept_url_latch.contains(owner)
@@ -3035,7 +3041,7 @@ impl Cdp {
                     || self.guard.extension_frame(listed)
             })
             || self.documents.get(owner).is_some_and(|doc| {
-                doc.previous || doc.navigating || self.guard.url(&doc.url) || self.guard.url(&doc.origin)
+                self.guard.url(&doc.url) || self.guard.url(&doc.origin)
                     || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()
             })
     }
@@ -4097,7 +4103,7 @@ impl Cdp {
                         }
                     }
                     for (owner, frame) in self.document_versions.keys() {
-                        if owner == target {
+                        if owner == target && !self.frame_owned_elsewhere(frame, target) {
                             owned_frames.insert(frame.clone());
                         }
                     }
