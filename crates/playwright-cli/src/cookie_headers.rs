@@ -9,7 +9,7 @@ fn field<'a>(value: &'a Value, name: &str) -> &'a str {
     value.get(name).and_then(Value::as_str).unwrap_or("")
 }
 
-pub fn scopes(request: &NetRequest, jar: &Value) -> Vec<Value> {
+pub fn scopes(guard: &Protected, request: &NetRequest, jar: &Value) -> Vec<Value> {
     let cookies = jar.get("cookies").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut scopes = Vec::new();
     for (headers, response) in [(&request.request_headers, false), (&request.response_headers, true)] {
@@ -37,7 +37,7 @@ pub fn scopes(request: &NetRequest, jar: &Value) -> Vec<Value> {
                     }
                     (domain, path)
                 } else { continue; };
-                if !Protected::default().cookie_scope(&domain) {
+                if !guard.cookie_scope(&domain) {
                     scopes.push(json!({ "header": if response { "set-cookie" } else { "cookie" }, "name": name, "domain": domain, "path": path }));
                 }
             }
@@ -64,11 +64,11 @@ pub fn hydrate(cdp: &mut Cdp, target: &str, request: &mut NetRequest, command: &
     let result = cdp.call("Network.getAllCookies", json!({}), Some(&session));
     cdp::detach(cdp, &session);
     let jar = result?;
-    if current { request.cookie_scopes.extend(current_scopes(request, &jar)); }
-    Ok(fill(request, &jar, command))
+    if current { request.cookie_scopes.extend(current_scopes(cdp.guard(), request, &jar)); }
+    Ok(fill(cdp.guard(), request, &jar, command))
 }
 
-pub fn current_scopes(request: &NetRequest, jar: &Value) -> Vec<Value> {
+pub fn current_scopes(guard: &Protected, request: &NetRequest, jar: &Value) -> Vec<Value> {
     let Ok(url) = url::Url::parse(&request.url) else { return Vec::new(); };
     let host = url.host_str().unwrap_or_default();
     jar.get("cookies").and_then(Value::as_array).into_iter().flatten().filter_map(|cookie| {
@@ -76,14 +76,14 @@ pub fn current_scopes(request: &NetRequest, jar: &Value) -> Vec<Value> {
         let path = field(cookie, "path");
         let matches_domain = host == domain || field(cookie, "domain").starts_with('.') && host.ends_with(&format!(".{domain}"));
         let matches_path = url.path() == path || url.path().strip_prefix(path).is_some_and(|rest| path.ends_with('/') || rest.starts_with('/'));
-        if !matches_domain || !matches_path || path.is_empty() || Protected::default().cookie_scope(&domain)
+        if !matches_domain || !matches_path || path.is_empty() || guard.cookie_scope(&domain)
             || cookie.get("secure").and_then(Value::as_bool) == Some(true) && url.scheme() != "https"
         { return None; }
         Some(json!({ "header": "cookie", "name": field(cookie, "name"), "domain": field(cookie, "domain"), "path": path }))
     }).collect()
 }
 
-pub fn fill(request: &mut NetRequest, jar: &Value, command: &str) -> bool {
+pub fn fill(guard: &Protected, request: &mut NetRequest, jar: &Value, command: &str) -> bool {
     let cookies = jar.get("cookies").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut restored = false;
     for (headers, response) in [(&mut request.request_headers, false), (&mut request.response_headers, true)] {
@@ -92,9 +92,9 @@ pub fn fill(request: &mut NetRequest, jar: &Value, command: &str) -> bool {
             if !header.eq_ignore_ascii_case(if response { "set-cookie" } else { "cookie" }) { continue; }
             let mut values = Vec::new();
             for scope in request.cookie_scopes.iter().filter(|scope| field(scope, "header").eq_ignore_ascii_case(header)) {
-                if Protected::default().cookie_scope(field(scope, "domain")) { continue; }
+                if guard.cookie_scope(field(scope, "domain")) { continue; }
                 let cookie = cookies.iter().find(|cookie| {
-                    !Protected::default().cookie_scope(field(cookie, "domain"))
+                    !guard.cookie_scope(field(cookie, "domain"))
                         && field(cookie, "name") == field(scope, "name") && field(cookie, "path") == field(scope, "path")
                         && field(cookie, "domain") == field(scope, "domain")
                         && cookie.get("partitionKey").is_none()

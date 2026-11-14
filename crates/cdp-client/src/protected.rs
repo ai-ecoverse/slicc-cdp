@@ -15,6 +15,20 @@ pub struct Protected {
     rules: ProtectedOrigins,
     extra: Vec<String>,
     extra_hosts: Vec<String>,
+    credential: Vec<String>,
+    credential_refusal: String,
+}
+
+const STAND_IN_CREDENTIAL_ORIGINS: &[&str] = &["https://ims-na1.adobelogin.com", "https://ims-na1-stg1.adobelogin.com"];
+const STAND_IN_CREDENTIAL_REFUSAL: &str = "slicc: refused: this origin holds sign-in credentials";
+
+fn credential_rules() -> &'static (Vec<String>, String) {
+    static RULES: OnceLock<(Vec<String>, String)> = OnceLock::new();
+    RULES.get_or_init(|| (STAND_IN_CREDENTIAL_ORIGINS.iter().map(|origin| origin.to_string()).collect(), STAND_IN_CREDENTIAL_REFUSAL.to_string()))
+}
+
+fn credential_hosts(origins: &[String]) -> Vec<String> {
+    origins.iter().filter_map(|text| parse(text)).map(|url| host_of(&url)).filter(|host| !host.is_empty()).collect()
 }
 
 fn catalog_rules() -> &'static ProtectedOrigins {
@@ -48,11 +62,56 @@ impl Protected {
             .filter(|url| url.host_str().is_some_and(|host| !host.is_empty()))
             .map(host_of)
             .collect();
+        let (origins, refusal) = credential_rules();
         Self {
             rules,
             extra,
             extra_hosts,
+            credential: credential_hosts(origins),
+            credential_refusal: refusal.clone(),
         }
+    }
+
+    pub fn with_credential_origins(mut self, origins: &[&str], refusal: &str) -> Self {
+        self.credential = credential_hosts(&origins.iter().map(|origin| origin.to_string()).collect::<Vec<_>>());
+        self.credential_refusal = refusal.to_string();
+        self
+    }
+
+    pub fn credential_refusal(&self) -> &str {
+        &self.credential_refusal
+    }
+
+    pub fn credential_url(&self, text: &str) -> bool {
+        self.unwrap(parse(text)).is_some_and(|url| matches!(url.scheme(), "http" | "https") && self.credential.contains(&host_of(&url)))
+    }
+
+    fn covers_credential(&self, domain: &str) -> bool {
+        !domain.is_empty() && self.credential.iter().any(|host| under(host, domain))
+    }
+
+    pub fn credential_cookie_domain(&self, domain: &str) -> bool {
+        let domain = domain.to_ascii_lowercase();
+        let domain = domain.strip_prefix('.').unwrap_or(&domain);
+        self.covers_credential(domain.strip_suffix('.').unwrap_or(domain))
+    }
+
+    pub fn credential_site(&self, text: &str) -> bool {
+        parse(text).is_some_and(|url| self.covers_credential(&host_of(&url)))
+    }
+
+    pub fn credential_cookie_url(&self, text: &str) -> bool {
+        let Some(url) = self.unwrap(parse(text)) else { return false };
+        let host = host_of(&url);
+        if !matches!(url.host(), Some(url::Host::Domain(_))) {
+            return false;
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        (0..labels.len().saturating_sub(1)).any(|at| self.covers_credential(&labels[at..].join(".")))
+    }
+
+    pub fn credential_storage_key(&self, key: &str) -> bool {
+        self.credential_url(key.split('^').next().unwrap_or(""))
     }
 
     pub fn refusal(&self) -> &str {
@@ -207,6 +266,10 @@ impl Protected {
     }
 
     pub fn cookie_domain(&self, domain: &str) -> bool {
+        self.protected_cookie_domain(domain) || self.credential_cookie_domain(domain)
+    }
+
+    fn protected_cookie_domain(&self, domain: &str) -> bool {
         let mut domain = domain.to_ascii_lowercase();
         if let Some(rest) = domain.strip_prefix('.') {
             domain = rest.to_string();
@@ -244,13 +307,17 @@ impl Protected {
             return self.cookie_domain(&host);
         }
         let labels: Vec<&str> = host.split('.').collect();
-        (0..labels.len()).any(|at| self.cookie_scope(&labels[at..].join(".")))
+        (0..labels.len()).any(|at| {
+            let suffix = labels[at..].join(".");
+            canonical_cookie_domain(&suffix).is_none_or(|name| self.protected_cookie_domain(&name))
+                || at + 1 < labels.len() && self.credential_cookie_domain(&suffix)
+        })
     }
 
     pub fn storage_key(&self, key: &str) -> bool {
         let mut parts = key.split('^');
         let first = parts.next().unwrap_or("");
-        if self.url_read_only(first) {
+        if self.url_read_only(first) || self.credential_storage_key(key) {
             return true;
         }
         parts
@@ -605,6 +672,74 @@ mod tests {
                 "{vector:?}"
             );
         }
+    }
+
+    #[test]
+    fn credential_origins_follow_the_catalog_rule_exactly() {
+        let guard = Protected::default();
+        for url in [
+            "https://ims-na1.adobelogin.com",
+            "https://ims-na1.adobelogin.com/ims/authorize?x=1#f",
+            "http://ims-na1.adobelogin.com:8443/",
+            "https://IMS-NA1.ADOBELOGIN.COM./",
+            "https://ims-na1-stg1.adobelogin.com/",
+            "blob:https://ims-na1.adobelogin.com/id",
+        ] {
+            assert!(guard.credential_url(url), "{url}");
+            assert!(guard.credential_storage_key(&format!("{url}^31")), "{url}");
+            assert!(guard.storage_key(url), "{url}");
+        }
+        for url in [
+            "https://x.ims-na1.adobelogin.com/",
+            "https://adobelogin.com/",
+            "https://evil-adobelogin.com/",
+            "https://adobelogin.com.evil.test/",
+            "https://example.test/",
+            "https://www.adobe.com/",
+            "https://auth.services.adobe.com/",
+            "https://adobeid-na1.services.adobe.com/",
+            "https://notadobe.com/",
+            "wss://ims-na1.adobelogin.com/",
+            "ftp://ims-na1.adobelogin.com/",
+            "not a url",
+        ] {
+            assert!(!guard.credential_url(url), "{url}");
+            assert!(!guard.credential_storage_key(url), "{url}");
+            assert!(!guard.storage_key(url), "{url}");
+        }
+        assert!(!guard.storage_key("https://example.test/^0https://adobelogin.com"));
+        for domain in [".adobelogin.com", "adobelogin.com", "ims-na1.adobelogin.com", ".ims-na1.adobelogin.com", "IMS-NA1-STG1.ADOBELOGIN.COM."] {
+            assert!(guard.credential_cookie_domain(domain), "{domain}");
+            assert!(guard.cookie_domain(domain) && guard.cookie_scope(domain), "{domain}");
+        }
+        for domain in ["x.ims-na1.adobelogin.com", "evil-adobelogin.com", "adobelogin.com.evil.test", "example.test", ".adobe.com", "adobe.com", "auth.services.adobe.com", ".adobeid-na1.services.adobe.com", "www.adobe.com", "notadobe.com", "", "."] {
+            assert!(!guard.credential_cookie_domain(domain), "{domain}");
+            assert!(!guard.cookie_domain(domain), "{domain}");
+        }
+        assert!(guard.credential_site("https://adobelogin.com"));
+        assert!(guard.credential_site("https://ims-na1.adobelogin.com"));
+        assert!(!guard.credential_site("https://adobe.com"));
+        assert!(!guard.credential_site("https://example.test"));
+        assert!(!guard.credential_site("https://evil-adobelogin.com"));
+        for url in ["https://auth.adobelogin.com/", "https://x.ims-na1.adobelogin.com/", "https://ims-na1.adobelogin.com/", "https://adobelogin.com/"] {
+            assert!(guard.credential_cookie_url(url) && guard.cookie_url(url), "{url}");
+        }
+        for url in ["https://example.com/", "https://shop.example.test/", "https://evil-adobelogin.com/", "https://adobelogin.com.evil.test/", "https://www.adobe.com/", "https://auth.services.adobe.com/", "https://127.0.0.1/"] {
+            assert!(!guard.credential_cookie_url(url), "{url}");
+            assert!(!guard.cookie_url(url), "{url}");
+        }
+        assert!(guard.cookie_scope("com"));
+        assert!(!guard.cookie_url("https://www.example.com/"));
+        for url in ["https://ims-na1.adobelogin.com/ims/authorize", "https://ims-na1-stg1.adobelogin.com/", "https://auth.services.adobe.com/", "https://adobeid-na1.services.adobe.com/"] {
+            assert!(!guard.url(url) && !guard.url_read_only(url) && !guard.unparseable(url), "{url}");
+            assert!(!guard.target(url, false, Opener::None), "{url}");
+            assert!(!guard.pattern(&format!("{url}*")), "{url}");
+        }
+        assert!(!guard.redaction_host("ims-na1.adobelogin.com") && !guard.redaction_host("auth.services.adobe.com"));
+        let custom = Protected::default().with_credential_origins(&["https://idp.example.test"], "custom refusal");
+        assert_eq!(custom.credential_refusal(), "custom refusal");
+        assert!(custom.credential_url("https://idp.example.test/"));
+        assert!(!custom.credential_url("https://ims-na1.adobelogin.com/"));
     }
 
     #[test]
