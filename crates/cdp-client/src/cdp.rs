@@ -5381,7 +5381,9 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
     }
     match method {
         "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
-        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable" => None,
+        | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable"
+        | "Storage.getSharedStorageEntries" | "Storage.getSharedStorageMetadata" | "Storage.getInterestGroupDetails" | "Storage.getTrustTokens"
+        | "Storage.getAffectedUrlsForThirdPartyCookieMetadata" | "Storage.trackCacheStorageForOrigin" | "Storage.trackIndexedDBForStorageKey" => None,
         "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.awaitPromise" | "Runtime.compileScript" | "Runtime.runScript"
         | "Runtime.getProperties" | "Runtime.getExceptionDetails" | "Runtime.queryObjects" | "Runtime.globalLexicalScopeNames" | "Runtime.getHeapUsage" | "Runtime.discardConsoleEntries"
         | "DOM.collectClassNamesFromSubtree" | "DOM.copyTo" | "DOM.describeNode" | "DOM.focus" | "DOM.getAttributes" | "DOM.getBoxModel" | "DOM.getContentQuads"
