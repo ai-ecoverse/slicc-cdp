@@ -190,6 +190,8 @@ fn credential_storage_commands_are_refused_and_ordinary_storage_stays_readable()
     for (method, params) in [
         ("DOMStorage.getDOMStorageItems", json!({"storageId":{"securityOrigin":IDP,"isLocalStorage":true}})),
         ("DOMStorage.getDOMStorageItems", json!({"storageId":{"storageKey":key,"isLocalStorage":false}})),
+        ("DOMStorage.getDOMStorageItems", json!({"storageId":{"storageKey":"https://widget.example.test/^0https://adobelogin.com","isLocalStorage":true}})),
+        ("IndexedDB.requestDatabaseNames", json!({"storageKey":"https://widget.example.test/^0https://ims-na1.adobelogin.com^31"})),
         ("DOMStorage.setDOMStorageItem", json!({"storageId":{"securityOrigin":"https://IMS-NA1.ADOBELOGIN.COM.:8443","isLocalStorage":true},"key":"k","value":"v"})),
         ("DOMStorage.clear", json!({"storageId":{"securityOrigin":"http://ims-na1-stg1.adobelogin.com","isLocalStorage":true}})),
         ("IndexedDB.requestDatabaseNames", json!({"securityOrigin":IDP})),
@@ -222,6 +224,7 @@ fn credential_storage_commands_are_refused_and_ordinary_storage_stays_readable()
         ("IndexedDB.requestDatabaseNames", json!({"storageKey":"https://evil-adobelogin.com/"})),
         ("IndexedDB.requestDatabaseNames", json!({"storageKey":"https://adobelogin.com.evil.test/"})),
         ("CacheStorage.requestCacheNames", json!({"securityOrigin":"https://example.test"})),
+        ("IndexedDB.requestDatabaseNames", json!({"storageKey":"https://widget.example.test/^0https://adobe.com"})),
         ("DOMStorage.getDOMStorageItems", json!({"storageId":{"securityOrigin":ADOBE_AUTH,"isLocalStorage":true}})),
         ("IndexedDB.requestDatabaseNames", json!({"storageKey":format!("{ADOBE_ID}/")})),
         ("Storage.getUsageAndQuota", json!({"origin":"https://example.test"})),
@@ -239,6 +242,7 @@ fn storage_events_naming_a_credential_origin_are_dropped() {
         json!({"method":"Storage.cacheStorageContentUpdated","params":{"origin":IDP,"storageKey":key,"bucketId":"b","cacheName":"IDP_STORAGE_SECRET"}}),
         json!({"method":"Storage.indexedDBContentUpdated","params":{"origin":IDP_STAGE,"storageKey":format!("{IDP_STAGE}/"),"bucketId":"b","databaseName":"IDP_STORAGE_SECRET","objectStoreName":"o"}}),
         json!({"method":"Storage.sharedStorageAccessed","params":{"accessTime":1,"type":"documentSet","mainFrameId":"F","ownerOrigin":IDP,"params":{"key":"IDP_STORAGE_SECRET"}}}),
+        json!({"method":"Storage.indexedDBContentUpdated","params":{"origin":"https://widget.example.test","storageKey":"https://widget.example.test/^0https://adobelogin.com","bucketId":"b","databaseName":"IDP_STORAGE_SECRET","objectStoreName":"o"}}),
     ] {
         let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
         cdp.absorb(event.clone());
