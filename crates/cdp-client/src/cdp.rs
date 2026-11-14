@@ -52,6 +52,7 @@ pub const BATCH_LIMIT: usize = 512;
 const BATCH_WAIT: Duration = Duration::from_secs(30);
 const OPTIONAL_STEP: Duration = Duration::from_secs(10);
 const DOCUMENT_CHECK: Duration = Duration::from_secs(2);
+const DOCUMENT_CHAIN_DEPTH: usize = 8;
 const WAITER_SLICE: Duration = Duration::from_millis(5);
 const AUTO_ATTACH: &str = "slicc: refused: auto-attach is not supported by slicc-cdp\n";
 const FLATTEN: &str = "slicc: refused: attach with flatten: true\n";
@@ -3016,6 +3017,31 @@ impl Cdp {
     }
 
     fn document_state_for(&mut self, target: &str, content: bool, scope: Option<&str>) -> Option<DocumentState> {
+        self.document_state_chain(target, content, scope, &mut BTreeSet::new())
+    }
+
+    fn iframe_owner_unsafe(&self, owner: &str, url: &str) -> bool {
+        self.protected_targets.contains(owner)
+            || self.kept_url_latch.contains(owner)
+            || self.guard.url(url)
+            || kept_document(&self.guard, url)
+            || self.guard.extension_frame(url)
+            || self.guard.error_page_url(url)
+            || self.targets.get(owner).is_none_or(|info| {
+                let listed = info.get("url").and_then(Value::as_str).unwrap_or("");
+                self.target_own_protected(info, &[])
+                    || self.guard.url(listed)
+                    || kept_document(&self.guard, listed)
+                    || self.guard.extension_frame(listed)
+            })
+            || self.documents.get(owner).is_some_and(|doc| {
+                doc.previous || doc.navigating || self.guard.url(&doc.url) || self.guard.url(&doc.origin)
+                    || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()
+            })
+    }
+
+    fn document_state_chain(&mut self, target: &str, content: bool, scope: Option<&str>, chain: &mut BTreeSet<String>) -> Option<DocumentState> {
+        if !chain.insert(target.to_string()) || chain.len() > DOCUMENT_CHAIN_DEPTH { return None }
         self.unplaceable.set(false);
         let Some(guard) = self.guards.get(target).cloned() else {
             if self.protected_targets.contains(target) { return None }
@@ -3056,13 +3082,29 @@ impl Cdp {
             let info = info.get("targetInfo")?;
             if info.get("targetId").and_then(Value::as_str) != Some(target) || info.get("type").and_then(Value::as_str) != Some("iframe")
                 || info.get("parentFrameId").and_then(Value::as_str) != Some(parent) { return None }
-            let owner = self.guards.keys().find(|owner| owner.as_str() != target && self.targets.get(*owner).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("page")
-                && self.documents.get(*owner).is_some_and(|doc| doc.frame_id == parent)).cloned()?;
+            let page = self.guards.keys().find(|owner| owner.as_str() != target && self.targets.get(*owner).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("page")
+                && self.documents.get(*owner).is_some_and(|doc| doc.frame_id == parent)).cloned();
+            let owner = match page {
+                Some(owner) => owner,
+                None => {
+                    let owners: Vec<String> = self.guards.keys().filter(|owner| owner.as_str() != target && !chain.contains(owner.as_str())
+                        && self.targets.get(*owner).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("iframe")
+                        && (owner.as_str() == parent || self.documents.get(*owner).is_some_and(|doc| doc.frame_id == parent))).cloned().collect();
+                    let [owner] = owners.as_slice() else { return None };
+                    owner.clone()
+                }
+            };
+            let iframe_owner = self.targets.get(&owner).and_then(|info| info.get("type")).and_then(Value::as_str) == Some("iframe");
             let parent_guard = self.guards.get(&owner)?.clone();
             let parent_tree = self.raw_call("Page.getFrameTree", json!({}), Some(&parent_guard), DOCUMENT_CHECK).ok()?;
+            if self.guards.get(&owner) != Some(&parent_guard) { return None }
             let parent_frame = parent_tree.pointer("/frameTree/frame")?;
-            if parent_frame.get("id").and_then(Value::as_str) != Some(parent) || parent_frame.get("parentId").is_some() { return None }
-            frames = self.document_state_for(&owner, true, Some(parent))?.frames;
+            if parent_frame.get("id").and_then(Value::as_str) != Some(parent) { return None }
+            if iframe_owner {
+                let url = parent_frame.get("url").and_then(Value::as_str).unwrap_or("");
+                if parent_frame.get("parentId").and_then(Value::as_str).is_none_or(str::is_empty) || self.iframe_owner_unsafe(&owner, url) { return None }
+            } else if parent_frame.get("parentId").is_some() { return None }
+            frames = self.document_state_chain(&owner, true, Some(parent), chain)?.frames;
         }
         if !self.placed_frames(node, &mut frames, content, parent) {
             #[cfg(test)]
@@ -5812,6 +5854,7 @@ mod tests {
     include!("protected_close_test.rs");
     include!("page_scope_retry_test.rs");
     include!("iframe_ancestor_test.rs");
+    include!("nested_oopif_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
