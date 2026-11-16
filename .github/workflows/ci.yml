@@ -30,6 +30,7 @@ jobs:
         **/*security*.test.*
         **/browser-message.test.*
         **/cargo.test.*
+        **/eval-*.test.*
         **/catalog-*.test.*
         **/cdp-proxy.test.*
         **/chrome-attribution.test.*

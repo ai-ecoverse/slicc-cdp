@@ -176,6 +176,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             cmd_request(&mut cdp, &mut state, invocation, command)
         }
         "har-start" | "record" => crate::har::hold(&mut cdp, &mut state, invocation, &endpoint),
+        "eval-attach" => crate::eval_attach::hold(&mut cdp, &mut state, invocation),
         "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
         _ if crate::recording::is_start(command) => crate::recording::hold(&mut cdp, &mut state, invocation),
         "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),

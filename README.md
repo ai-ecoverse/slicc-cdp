@@ -106,6 +106,37 @@ When the debugger is refused because another extension runs scripts in an otherw
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
 
+## Eval attachment holder
+
+```sh
+playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --tab <targetId> [--world main|isolated]
+playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --host '*.example.com'
+playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --match '*://*.example.com/app/*' --match 'https://other.example/*'
+playwright-cli -s shim eval-detach [attachmentId]
+```
+
+`eval-attach <file>` reads a UTF-8 JavaScript body and runs it with a lexical `send(payload)` function. For example, `send({title: document.title})` sends one message. Functions registered by the body can call `send` later. The source is read once per holder and is installed once per matching top-frame document through ordinary guarded `Runtime.evaluate`, pinned to a verified execution context's unique ID and loader. The normal eval gates apply to installation and queue reads, including page and protected-origin checks. The evaluated wrapper also checks the verified URL before executing the body or draining, so a same-document URL race fails closed. Child frames are refused: there is no `--frame` option and child contexts never receive the script. Existing WebMCP commands and their guard are unchanged.
+
+Choose exactly one scope: `--tab <targetId>`, `--host <exact-host|*.example.com>`, or repeatable `--match <scheme://host/path-glob>`. Host wildcards include the apex and subdomains. Match schemes are `http`, `https`, or `*` (both); hosts are exact, `*`, or `*.example.com`; `*` in the path matches any characters, including `/`. Matching includes the query and ignores the fragment. Ports are ignored; port literals in patterns are rejected. Exact host spelling is lowercase ASCII/punycode. Host/match installation covers HTTP(S) documents. A pattern naming a protected origin is refused before connecting; broad wildcards still pass through the document guard. Matching tabs are discovered through the guarded page list about every 250 ms. Protected targets hidden by that list are never installed; an explicit tab or a watched target that becomes protected reports a refusal without its URL.
+
+Installation happens after the holder observes the top frame's default execution context and verifies the frame tree. This is watchdog timing, not a parse-time startup hook: the page's own scripts may already have run. `document-ready` always has `early: false`. `--early` is reserved for a possible future capability and is currently rejected. No persistent new-document script, binding, debugger pause, or shim capability is requested.
+
+`--world main` is the default. `--world isolated` uses `Page.createIsolatedWorld`; the page cannot read or forge that world's queue. Main-world messages can be forged or changed by the page. All payloads are untrusted page data. `send` serializes immediately with `JSON.stringify`; non-serializable values follow its usual behavior (including throwing on cycles/BigInt). Each queue holds at most 256 messages of at most 65,536 serialized UTF-16 code units each; excess messages are dropped. The holder drains about every 100 ms, with guarded evaluation and backpressure affecting timing. Relayed serialized messages are additionally limited to 65,536 UTF-8 bytes. Control characters are JSON escaped so every event occupies one stdout line.
+
+This is a foreground held lease, supported on plain Chrome over `--cdp` and in the kernel WASI build. Keep stdin open with a pipe. Closing stdin or running `eval-detach [attachmentId]` in the same working directory and CLI session stops future installs and message relaying. Already-running scripts and their callbacks remain until their document unloads. There is one holder per CLI session; use distinct `-s` names for independent attachments. An optional ID must match the session's lease. Detach waits for acknowledgement and prints the same final event as the holder. A killed holder's stale lease is reclaimable after five seconds using the same native lock/kernel process-identity checks as HAR.
+
+Stdout is NDJSON with these stable fields. Every event has `event: string` and `attachmentId: string` (an opaque `eval-` identifier). IDs refer to CDP targets, frames, and loaders, not CLI tab indexes.
+
+| `event` | Additional fields and types |
+| --- | --- |
+| `ready` | `world: "main" | "isolated"`, `early: false`; lease is held and observation is starting, even if no document matches yet |
+| `document-ready` | `tab: string`, `frameId: string`, `loaderId: string`, `url: string`, `world: "main" | "isolated"`, `early: false`; script body evaluated successfully |
+| `refused` | `tab: string`, `reason: "guard" | "unverified-context" | "installation" | "relay"`; non-fatal, no URL or exception text; repeated checks of the same refused document are suppressed, and opaque guard-blocked intervals are coalesced |
+| `message` | `tab: string`, `frameId: string`, `loaderId: string`, `payload: JSON value`; attribution is the installation's document, and the payload is untrusted |
+| `stopped` | `reason: "stdin" | "detach" | "error"`; final event before exit |
+
+A refused installation or thrown synchronous script body reports `refused` and does not retry that execution context. Navigation supplies a new context and can be installed normally. Browser/transport failures terminate the holder with `stopped`/`error` and a nonzero exit. Each installation records an `eval` action with `--intent`/`SLICC_INTENT`; the long-running holder itself is not a page action.
+
 ## Foreground dialog holder
 
 Start `playwright-cli --cdp "$CDP" -s "$SESSION" dialog-hold --tab "$TAB"` before triggering dialogs, keep its stdin open, and wait for its newline JSON `ready` event. This uses the same selected session and user config directory as other commands; there is no daemon or mailbox relay, and no prompt text is saved. Standalone `dialog-accept` and `dialog-dismiss` remain unchanged and do not relay into the holder.
