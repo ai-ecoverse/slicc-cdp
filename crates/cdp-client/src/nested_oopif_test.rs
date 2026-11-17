@@ -3,6 +3,7 @@ struct NestBrowser {
     trees: std::collections::BTreeMap<String, Value>,
     sessions: std::collections::BTreeMap<String, String>,
     attaches: usize,
+    once: std::collections::BTreeMap<String, Value>,
 }
 
 struct NestBackend {
@@ -84,7 +85,10 @@ impl Transport for NestBackend {
                 }
                 json!({})
             }
-            "Page.getFrameTree" => browser.trees.get(&owner).cloned().unwrap_or_else(|| json!({ "frameTree": { "frame": { "id": owner, "url": "about:blank", "securityOrigin": "://", "loaderId": "L" } } })),
+            "Page.getFrameTree" => match browser.once.remove(&owner) {
+                Some(tree) => tree,
+                None => browser.trees.get(&owner).cloned().unwrap_or_else(|| json!({ "frameTree": { "frame": { "id": owner, "url": "about:blank", "securityOrigin": "://", "loaderId": "L" } } })),
+            },
             "Page.getResourceTree" => {
                 let tree = browser.trees.get(&owner).cloned().unwrap_or(json!({ "frameTree": { "frame": {} } }));
                 json!({ "frameTree": { "frame": tree["frameTree"]["frame"], "resources": [] } })
@@ -160,6 +164,7 @@ fn nest_browser(levels: &[NestLevel]) -> (Cdp, std::rc::Rc<std::cell::RefCell<Ne
         trees: levels.iter().map(|level| (level.target.to_string(), nest_tree(level))).collect(),
         sessions: std::collections::BTreeMap::new(),
         attaches: 0,
+        once: std::collections::BTreeMap::new(),
     }));
     let cdp = Cdp::from_transport(Box::new(NestBackend { inbox: VecDeque::new(), browser: browser.clone() }));
     (cdp, browser)
@@ -877,4 +882,48 @@ fn nested_oopif_mid_navigating_voids_the_proof() {
 #[test]
 fn nested_oopif_mid_previous_voids_the_proof() {
     nest_latched_inner_unverified(|cdp| { cdp.documents.get_mut("MID").unwrap().previous = true; });
+}
+
+fn nest_mid_document(change: impl FnOnce(&mut super::MainDocument)) {
+    nest_latched_inner_unverified(|cdp| change(cdp.documents.get_mut("MID").unwrap()));
+}
+
+#[test]
+fn nested_oopif_mid_document_url_on_seven_voids_the_proof() {
+    nest_mid_document(|doc| doc.url = NEST_SEVEN.into());
+}
+
+#[test]
+fn nested_oopif_mid_document_origin_on_seven_voids_the_proof() {
+    nest_mid_document(|doc| doc.origin = "https://seven.sliccy.ai".into());
+}
+
+#[test]
+fn nested_oopif_mid_masked_error_document_voids_the_proof() {
+    nest_mid_document(|doc| {
+        doc.url = "chrome-error://chromewebdata/".into();
+        doc.origin = "://".into();
+        doc.unreachable_url = String::new();
+    });
+}
+
+#[test]
+fn nested_oopif_mid_ordinary_error_document_voids_the_proof() {
+    nest_mid_document(|doc| {
+        doc.url = "chrome-error://chromewebdata/".into();
+        doc.origin = "://".into();
+        doc.unreachable_url = NEST_MID.into();
+    });
+}
+
+#[test]
+fn nested_oopif_mid_fresh_read_on_seven_voids_the_proof_even_if_the_next_read_is_ordinary() {
+    for url in [NEST_SEVEN, "https://seven.sliccy.ai/login", NEST_VAULT, "chrome-error://chromewebdata/", "chrome-extension://abcdefghijklmnopabcdefghijklmnop/frame.html"] {
+        let (mut cdp, browser, _) = nest_ordinary_attached();
+        browser.borrow_mut().once.insert("MID".into(), nest_tree(&nest_level("MID", "iframe", "MID", "TOP", url)));
+        let inner = nest_client_sessions(&cdp, &browser, "INNER");
+        assert!(inner.iter().all(|session| !cdp.session_blocked(session)));
+        assert!(cdp.document_state_for("INNER", true, None).is_none(), "a {url} read of the mid must void the proof");
+        assert!(browser.borrow().once.is_empty(), "the proof must have read the mid tree");
+    }
 }
