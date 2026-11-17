@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import browser, { REFUSAL } from '../../packages/sliccy-browser/src/browser.js';
 import {
   cookieProtected,
+  credentialCookie,
   dropProtectedCookies,
   isProtectedUrl,
 } from '../../packages/sliccy-browser/src/guard.js';
@@ -736,6 +737,60 @@ test('cookie after eval-created seven iframe still drops protected cookies', asy
     assert.equal(page.url, 'https://example.test/');
     assert.equal(await browser.cookie(tab, 'seven_session'), null);
     assert.equal(await browser.cookie(tab, 'ok'), 'allowed');
+  });
+});
+
+test('credential-origin cookies are withheld by cookieProtected and cookie() on an IdP tab', async () => {
+  for (const cookie of [
+    { domain: 'ims-na1.adobelogin.com' },
+    { domain: '.adobelogin.com' },
+    { domain: 'IMS-NA1-STG1.ADOBELOGIN.COM.' },
+    { url: 'https://ims-na1.adobelogin.com:8443/x' },
+    { url: 'https://auth.adobelogin.com/' },
+    { domain: 'widget.example.test', partitionKey: { topLevelSite: 'https://adobelogin.com' } },
+  ]) {
+    assert.equal(credentialCookie(cookie), true, JSON.stringify(cookie));
+    assert.equal(cookieProtected(cookie), true, JSON.stringify(cookie));
+  }
+  for (const cookie of [
+    { domain: 'x.ims-na1.adobelogin.com' },
+    { domain: 'evil-adobelogin.com' },
+    { domain: 'adobelogin.com.evil.test' },
+    { domain: '.adobe.com' },
+    { domain: 'auth.services.adobe.com' },
+    { url: 'https://www.example.com/' },
+    { domain: 'widget.example.test', partitionKey: { topLevelSite: 'https://adobe.com' } },
+  ]) {
+    assert.equal(credentialCookie(cookie), false, JSON.stringify(cookie));
+    assert.equal(cookieProtected(cookie), false, JSON.stringify(cookie));
+  }
+  const idp = {
+    targetId: 'IDP',
+    url: 'https://ims-na1.adobelogin.com/ims/authorize/v2',
+    title: 'Sign in',
+  };
+  const fake = await fakeCdp({
+    answers: {
+      ...guardedAnswers(),
+      'Target.getTargets': { targetInfos: [idp, ok].map(info) },
+      'Network.getCookies': {
+        cookies: [
+          { name: 'host', value: 'idp-secret', domain: 'ims-na1.adobelogin.com', path: '/' },
+          { name: 'parent', value: 'idp-parent', domain: '.adobelogin.com', path: '/' },
+          { name: 'adobe', value: 'adobe-kept', domain: '.adobe.com', path: '/' },
+        ],
+      },
+    },
+    intercept: guardedIntercept,
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'ims-na1.adobelogin.com' });
+    assert.equal(tab?.targetId, 'IDP');
+    assert.equal(await browser.eval(tab, '1'), 'leaked');
+    assert.equal(await browser.cookie(tab, 'host'), null);
+    assert.equal(await browser.cookie(tab, 'parent'), null);
+    assert.equal(await browser.cookie(tab, 'adobe'), 'adobe-kept');
   });
 });
 

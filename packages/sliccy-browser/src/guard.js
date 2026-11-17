@@ -5,6 +5,57 @@ export const REFUSAL = PROTECTED_ORIGINS.refusal;
 
 const guard = protectedOrigins(PROTECTED_ORIGINS);
 
+export const CREDENTIAL_ORIGINS = [
+  'https://ims-na1.adobelogin.com',
+  'https://ims-na1-stg1.adobelogin.com',
+];
+
+const credentialHosts = CREDENTIAL_ORIGINS.map((origin) => new URL(origin).hostname);
+
+function coversCredential(domain) {
+  return domain.length > 0 && credentialHosts.some((host) => under(host, domain));
+}
+
+function credentialDomain(text) {
+  const domain = text.toLowerCase().replace(/^\./u, '').replace(/\.$/u, '');
+  return coversCredential(domain);
+}
+
+function credentialSite(text) {
+  try {
+    return coversCredential(hostOf(text));
+  } catch {
+    return false;
+  }
+}
+
+function credentialUrl(text) {
+  let host;
+  try {
+    host = hostOf(asHttp(text));
+  } catch {
+    return false;
+  }
+  if (host.startsWith('[') || /^[0-9.]+$/u.test(host)) return false;
+  const labels = host.split('.');
+  for (let at = 0; at < labels.length - 1; at += 1) {
+    if (coversCredential(labels.slice(at).join('.'))) return true;
+  }
+  return false;
+}
+
+export function credentialCookie(cookie) {
+  if (!cookie || typeof cookie !== 'object') return true;
+  if (typeof cookie.domain === 'string' && credentialDomain(cookie.domain)) return true;
+  if (typeof cookie.url === 'string' && credentialUrl(cookie.url)) return true;
+  const key = cookie.partitionKey;
+  if (typeof key === 'string') return credentialSite(key);
+  if (key && typeof key === 'object' && typeof key.topLevelSite === 'string') {
+    return credentialSite(key.topLevelSite);
+  }
+  return false;
+}
+
 function under(host, domain) {
   return host === domain || host.endsWith(`.${domain}`);
 }
@@ -66,6 +117,7 @@ function siteProtected(site) {
 
 export function cookieProtected(cookie) {
   if (!cookie || typeof cookie !== 'object') return true;
+  if (credentialCookie(cookie)) return true;
   if (typeof cookie.domain === 'string' && guard.cookieDomain(cookie.domain)) return true;
   if (typeof cookie.url === 'string') {
     if (isProtectedUrl(cookie.url)) return true;
