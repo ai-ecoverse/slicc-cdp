@@ -3024,7 +3024,8 @@ impl Cdp {
                     || self.guard.extension_frame(listed)
             })
             || self.documents.get(owner).is_some_and(|doc| {
-                self.guard.url(&doc.url) || self.guard.url(&doc.origin) || self.guard.error_page_url(&doc.url)
+                self.guard.url(&doc.url) || self.guard.url(&doc.origin)
+                    || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty()
             })
     }
 

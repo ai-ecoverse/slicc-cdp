@@ -927,3 +927,29 @@ fn nested_oopif_mid_fresh_read_on_seven_voids_the_proof_even_if_the_next_read_is
         assert!(browser.borrow().once.is_empty(), "the proof must have read the mid tree");
     }
 }
+
+fn nest_navigating_unreachable(url: &str) {
+    let (mut cdp, browser, _) = nest_ordinary_attached();
+    {
+        let doc = cdp.documents.get_mut("MID").unwrap();
+        doc.url = url.into();
+        doc.unreachable_url = NEST_SEVEN.into();
+        doc.previous = false;
+        doc.navigating = true;
+        doc.navigation_url = NEST_MID.into();
+    }
+    assert!(!cdp.protected_targets.contains("MID"));
+    let inner = nest_client_sessions(&cdp, &browser, "INNER");
+    assert!(!inner.is_empty() && inner.iter().all(|session| !cdp.session_blocked(session)));
+    assert!(cdp.document_state_for("INNER", true, None).is_none(), "a mid whose unreachable URL is on seven must void the proof");
+}
+
+#[test]
+fn nested_oopif_mid_navigating_with_protected_unreachable_voids_the_proof() {
+    nest_navigating_unreachable(NEST_MID);
+}
+
+#[test]
+fn nested_oopif_mid_navigating_from_empty_url_with_protected_unreachable_voids_the_proof() {
+    nest_navigating_unreachable("");
+}
