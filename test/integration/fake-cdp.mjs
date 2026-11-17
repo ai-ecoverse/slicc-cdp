@@ -570,6 +570,7 @@ export async function fakeCdp({
               ...worlds.filter((item) => item.auxData.frameId !== params.frameId),
               world,
             ];
+          event('Runtime.executionContextCreated', { context: world });
           return answer({ executionContextId: world.id });
         }
         case 'Accessibility.getFullAXTree':

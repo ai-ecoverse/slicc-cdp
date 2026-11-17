@@ -13,6 +13,9 @@ mod dialog_holder;
 #[cfg(test)]
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
+mod eval_attach;
+mod eval_lease;
+mod eval_scope;
 mod har;
 mod har_lease;
 mod help;
@@ -115,6 +118,10 @@ pub fn execute_in(
     }
     if command == "network-state-set" {
         return page_tools::network_state_set(&invocation, cdp_env);
+    }
+    if command == "eval-detach" { return eval_lease::detach(&invocation); }
+    if command == "eval-attach" {
+        if let Err(message) = eval_attach::precheck(&invocation) { return Output::err(message); }
     }
     if let Some(message) = har::precheck(&invocation) {
         return Output::err(message);

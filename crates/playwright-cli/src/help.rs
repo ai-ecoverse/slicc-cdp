@@ -107,6 +107,10 @@ pub fn global_help() -> String {
         row("recording-start", "start recording user actions"),
         row("recording-stop", "stop recording user actions and print them as playwright code"),
         String::new(),
+        "Eval attachments (SLICC):".to_string(),
+        row("eval-attach <file>", "hold guarded eval on matching top-frame documents"),
+        row("eval-detach [id]", "stop this session's eval attachment holder"),
+        String::new(),
         "HAR recording (SLICC):".to_string(),
         row("har-start <file>", "hold a guarded HAR 1.2 recording"),
         row("har-stop", "stop this session's HAR holder"),
@@ -260,6 +264,17 @@ fn implemented_page(name: &str) -> Option<String> {
             ],
             &[],
             &[],
+        ),
+        "eval-attach" => page(
+            "eval-attach <file> (--tab <id> | --host <pattern> | --match <url-glob>...) [--world main|isolated]",
+            &["Hold an eval script on matching top-frame documents (SLICC extension)", "Runs a JavaScript body with lexical send(payload) through ordinary guarded Runtime.evaluate. Child frames are refused; normal eval gates apply.", "No early installation: document-ready has early:false. A future --early is reserved and currently rejected.", "Foreground holder; keep stdin open. EOF or eval-detach stops future installs and relaying; running scripts remain until document unload.", "NDJSON events: ready, document-ready, refused, message, stopped. Payloads are untrusted page data. Refusals omit URLs.", "One attachment per CLI session; use -s to hold independent leases."],
+            &[("<file>", "UTF-8 JavaScript body; send(payload) accepts JSON-serializable data")],
+            &[("--tab <id>", "one explicit target"), ("--host <pattern>", "exact host or *.example.com (includes apex)"), ("--match <url-glob>", "repeatable scheme://host/path; * matches any path characters"), ("--world <main|isolated>", "main by default; isolated hides the queue from page scripts")],
+        ),
+        "eval-detach" => page(
+            "eval-detach [attachmentId]",
+            &["Stop this session's eval attachment holder", "An optional attachmentId must match. Waits for the holder and prints its stopped NDJSON event."],
+            &[], &[],
         ),
         "har-start" | "record" => page(
             if name == "record" { "record [url] [--filter=<glob>]" } else { "har-start <file>" },
