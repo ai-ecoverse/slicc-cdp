@@ -339,3 +339,137 @@ fn credential_origin_pages_stay_drivable() {
         assert_eq!(crate::shield::redact_text(&guard, &url).0, url);
     }
 }
+
+fn ordinary_request(cdp: &mut Cdp, id: &str, url: &str) {
+    cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":id,"type":"XHR","documentURL":"https://shop.example.test/","request":{"url":url,"method":"GET","headers":{}}}}));
+}
+
+fn line_entry(list: &str, line: &str) -> Value {
+    match list {
+        "associatedCookies" => json!({"blockedReasons":[],"cookieLine":line}),
+        "blockedCookies" => json!({"blockedReasons":["SameSiteLax"],"cookieLine":line}),
+        _ => json!({"exemptionReason":"None","cookieLine":line}),
+    }
+}
+
+fn extra_lists(method: &str, list: &str, entries: Vec<Value>) -> Value {
+    let mut params = json!({"requestId":"R","headers":{}});
+    if method == "Network.responseReceivedExtraInfo" { params["statusCode"] = json!(200); }
+    params[list] = Value::Array(entries);
+    json!({"method":method,"sessionId":"S","params":params})
+}
+
+fn kept_lines() -> Vec<&'static str> {
+    vec![
+        "adobe=ADOBE_LINE_KEPT; Domain=.adobe.com; Path=/",
+        "sid=ORDINARY_LINE_KEPT; Domain=shop.example.test",
+        "plain=PLAIN_LINE_KEPT; Path=/",
+        "quoted=QUOTED_LINE_KEPT; Domain=\"example.test\"",
+        "repeated=REPEATED_LINE_KEPT; Domain=example.test; domain=shop.example.test",
+    ]
+}
+
+#[test]
+fn cookie_lines_in_every_extra_info_list_are_dropped_when_their_domain_covers_a_credential_or_protected_host() {
+    let hidden = [
+        "id=LINE_SECRET; Domain=.adobelogin.com; Path=/; Secure",
+        "id=LINE_SECRET; Domain=\".adobelogin.com\"",
+        "id=LINE_SECRET; DOMAIN=.ADOBELOGIN.COM",
+        "id=LINE_SECRET; Domain=adobelogin.com.",
+        "id=LINE_SECRET; Domain = ims-na1.adobelogin.com",
+        "id=LINE_SECRET; Domain=example.test; Domain=.adobelogin.com",
+        "id=LINE_SECRET; Domain=.adobelogin.com; Domain=example.test",
+        "id=LINE_SECRET; Domain=sliccy.ai",
+        "LINE_SECRET; Domain=example.test",
+        "=LINE_SECRET; Domain=example.test",
+        "id=LINE_SECRET\nother; Domain=example.test",
+    ];
+    for method in ["Network.requestWillBeSentExtraInfo", "Network.responseReceivedExtraInfo"] {
+        for list in ["associatedCookies", "blockedCookies", "exemptedCookies"] {
+            for line in hidden {
+                let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+                ordinary_request(&mut cdp, "R", "https://shop.example.test/api");
+                let mut entries: Vec<Value> = kept_lines().into_iter().map(|kept| line_entry(list, kept)).collect();
+                entries.push(line_entry(list, line));
+                cdp.absorb(extra_lists(method, list, entries));
+                let text = serde_json::to_string(cdp.events()).unwrap();
+                assert!(!text.contains("LINE_SECRET"), "{method} {list} {line:?}: {text}");
+                let delivered = cdp.events().iter().find(|event| event["method"] == method).unwrap_or_else(|| panic!("{method} {list} {line:?}: {text}"));
+                assert_eq!(delivered["params"][list].as_array().unwrap().len(), kept_lines().len(), "{method} {list} {line:?}: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn cookie_objects_and_malformed_entries_in_every_extra_info_list_fail_closed() {
+    for list in ["associatedCookies", "blockedCookies", "exemptedCookies"] {
+        for entry in [
+            json!({"blockedReasons":[],"cookie":{"name":"id","value":"ENTRY_SECRET","domain":".adobelogin.com","path":"/"}}),
+            json!({"blockedReasons":[],"cookie":{"name":"id","value":"ENTRY_SECRET","domain":"seven.sliccy.ai","path":"/"}}),
+            json!({"blockedReasons":[],"cookie":{"name":"id","value":"ENTRY_SECRET","domain":"widget.example.test","path":"/","partitionKey":{"topLevelSite":"https://adobelogin.com","hasCrossSiteAncestor":true}}}),
+            json!({"blockedReasons":[],"cookie":{"name":"id","value":"ENTRY_SECRET","path":"/"}}),
+            json!({"blockedReasons":[],"cookie":{"name":"id","value":"ENTRY_SECRET","domain":"shop.example.test"},"cookieLine":"id=ENTRY_SECRET; Domain=.adobelogin.com"}),
+            json!({"blockedReasons":[],"cookieLine":["id=ENTRY_SECRET"]}),
+            json!({"blockedReasons":[],"note":"ENTRY_SECRET"}),
+        ] {
+            let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+            ordinary_request(&mut cdp, "R", "https://shop.example.test/api");
+            let kept = json!({"blockedReasons":[],"cookie":{"name":"sid","value":"ORDINARY_OBJECT_KEPT","domain":"shop.example.test","path":"/"}});
+            cdp.absorb(extra_lists("Network.responseReceivedExtraInfo", list, vec![kept, entry.clone()]));
+            let text = serde_json::to_string(cdp.events()).unwrap();
+            assert!(!text.contains("ENTRY_SECRET") && text.contains("ORDINARY_OBJECT_KEPT"), "{list} {entry}: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_cookie_line_without_domain_is_judged_by_the_request_host() {
+    for (url, kept) in [("https://shop.example.test/api", true), ("https://ims-na1.adobelogin.com/ims/check", false), ("https://seven.sliccy.ai/x", false)] {
+        for list in ["associatedCookies", "blockedCookies", "exemptedCookies"] {
+            let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+            ordinary_request(&mut cdp, "R", url);
+            cdp.absorb(extra_lists("Network.responseReceivedExtraInfo", list, vec![line_entry(list, "host=HOST_ONLY_VALUE; Path=/")]));
+            let text = serde_json::to_string(cdp.events()).unwrap();
+            assert_eq!(text.contains("HOST_ONLY_VALUE"), kept, "{url} {list}: {text}");
+        }
+    }
+    let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+    cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"S","params":{"requestId":"UNKNOWN","statusCode":200,"headers":{},"blockedCookies":[line_entry("blockedCookies", "host=UNKNOWN_BASE_VALUE")]}}));
+    assert!(!serde_json::to_string(cdp.events()).unwrap().contains("UNKNOWN_BASE_VALUE"));
+}
+
+#[test]
+fn set_cookie_domain_attributes_are_parsed_quoted_dotted_and_repeated() {
+    let guard = crate::protected::Protected::default();
+    let base = "https://shop.example.test/api";
+    for line in [
+        "a=b; Domain=\".adobelogin.com\"",
+        "a=b; DOMAIN=.ADOBELOGIN.COM.",
+        "a=b; Domain=adobelogin.com.",
+        "a=b; Domain=example.test; Domain=.adobelogin.com",
+        "a=b; domain=sliccy.ai; Domain=example.test",
+        "a=b; Domain=\"sliccy.ai\"",
+    ] {
+        assert!(crate::shield::set_cookie_hidden(&guard, line, base), "{line}");
+    }
+    for line in ["a=b; Domain=\"example.test\"", "a=b; Domain=.adobe.com", "a=b; Domain=example.test.; Domain=shop.example.test", "a=b; Path=/"] {
+        assert!(!crate::shield::set_cookie_hidden(&guard, line, base), "{line}");
+    }
+}
+
+#[test]
+fn audit_raw_cookie_lines_follow_the_same_parse() {
+    let issue = |details: Value| json!({"method":"Audits.issueAdded","sessionId":"S","params":{"issue":{"code":"CookieIssue","details":{"cookieIssueDetails":details}}}});
+    let url = json!({"requestId":"R","url":"https://shop.example.test/api"});
+    for line in ["RAW_SECRET", "=RAW_SECRET", "id=RAW_SECRET; Domain=\".adobelogin.com\"", "id=RAW_SECRET; Domain=example.test; DOMAIN=ADOBELOGIN.COM."] {
+        let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+        cdp.absorb(issue(json!({"request":url,"rawCookieLine":line,"operation":"SetCookie"})));
+        assert!(cdp.events().is_empty(), "{line}: {:?}", cdp.events());
+    }
+    for line in ["id=RAW_KEPT; Domain=\"example.test\"", "id=RAW_KEPT; Domain=.adobe.com"] {
+        let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+        cdp.absorb(issue(json!({"request":url,"rawCookieLine":line,"operation":"SetCookie"})));
+        assert_eq!(cdp.events().len(), 1, "{line}");
+    }
+}

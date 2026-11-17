@@ -687,11 +687,11 @@ fn cookie_issue_hidden(guard: &Protected, details: &Value) -> bool {
     let urls = [details.pointer("/request/url"), details.get("cookieUrl")];
     let urls: Vec<&str> = urls.into_iter().flatten().filter_map(Value::as_str).collect();
     let domain = details.pointer("/cookie/domain").and_then(Value::as_str);
-    let line = details.get("rawCookieLine").and_then(Value::as_str).unwrap_or("");
-    let attributes: Vec<&str> = line.split(';').skip(1).filter_map(|attribute| {
-        let (name, value) = attribute.trim().split_once('=')?;
-        name.trim().eq_ignore_ascii_case("domain").then_some(value.trim())
-    }).collect();
+    let raw = details.get("rawCookieLine");
+    if raw.is_some_and(|line| line.as_str().is_none_or(|line| !cookie_line_usable(line))) {
+        return true;
+    }
+    let attributes = domain_attributes(raw.and_then(Value::as_str).unwrap_or(""));
     if urls.is_empty() && domain.is_none() && attributes.is_empty() {
         return true;
     }
@@ -777,21 +777,65 @@ pub fn drop_protected_cookies(guard: &Protected, result: &mut Value) {
     }
 }
 
+fn domain_attributes(line: &str) -> Vec<String> {
+    line.split(';').skip(1).filter_map(|attribute| {
+        let (name, value) = attribute.split_once('=')?;
+        name.trim().eq_ignore_ascii_case("domain").then(|| {
+            let value = value.trim();
+            value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).unwrap_or(value).trim().to_string()
+        })
+    }).collect()
+}
+
+fn cookie_line_usable(line: &str) -> bool {
+    !line.is_empty() && line.lines().all(|line| {
+        line.split(';').next().and_then(|pair| pair.split_once('=')).is_some_and(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+    })
+}
+
+fn line_scope_hidden(guard: &Protected, line: &str, base: &str) -> bool {
+    let domains = domain_attributes(line);
+    if domains.is_empty() {
+        host_of(&web_socket_as_http(base)).is_none_or(|host| guard.cookie_scope(&host))
+    } else {
+        domains.iter().any(|domain| guard.cookie_scope(domain))
+    }
+}
+
 pub fn set_cookie_hidden(guard: &Protected, value: &str, base: &str) -> bool {
-    if guard.url(base) {
+    guard.url(base) || value.lines().any(|line| line_scope_hidden(guard, line, base))
+}
+
+pub fn cookie_line_hidden(guard: &Protected, line: &str, base: &str) -> bool {
+    !cookie_line_usable(line) || set_cookie_hidden(guard, line, base)
+}
+
+fn cookie_entry_hidden(guard: &Protected, item: &Value, bases: &[String]) -> bool {
+    let cookie = item.get("cookie");
+    let line = item.get("cookieLine");
+    if cookie.is_none() && line.is_none() {
         return true;
     }
-    value.lines().any(|line| {
-        let domains: Vec<&str> = line.split(';').skip(1).filter_map(|attribute| {
-            let (name, value) = attribute.trim().split_once('=')?;
-            name.trim().eq_ignore_ascii_case("domain").then_some(value.trim())
-        }).collect();
-        if domains.is_empty() {
-            host_of(base).is_none_or(|host| guard.cookie_scope(&host))
-        } else {
-            domains.iter().any(|domain| guard.cookie_scope(domain))
+    if cookie.is_some_and(|cookie| ["name", "value", "domain"].iter().any(|key| cookie.get(*key).and_then(Value::as_str).is_none()) || cookie_protected(guard, cookie)) {
+        return true;
+    }
+    match line {
+        None => false,
+        Some(Value::String(text)) if bases.is_empty() => cookie_line_hidden(guard, text, ""),
+        Some(Value::String(text)) => bases.iter().any(|base| cookie_line_hidden(guard, text, base)),
+        Some(_) => true,
+    }
+}
+
+pub fn strip_cookie_lists(guard: &Protected, params: &mut Value, bases: &[String]) {
+    let Some(map) = params.as_object_mut() else { return };
+    for key in ["associatedCookies", "blockedCookies", "exemptedCookies"] {
+        match map.get_mut(key) {
+            Some(Value::Array(items)) => items.retain(|item| !cookie_entry_hidden(guard, item, bases)),
+            Some(other) if !other.is_null() => *other = Value::Array(Vec::new()),
+            _ => {}
         }
-    })
+    }
 }
 
 fn cookie_line_parseable(line: &str) -> bool {
@@ -1073,19 +1117,6 @@ pub fn redact_cookie_events(guard: &Protected, events: &mut Vec<Value>, jar: &Va
     });
 }
 
-pub fn strip_protected_associated(guard: &Protected, event: &mut Value) {
-    if let Some(cookies) = event
-        .pointer_mut("/params/associatedCookies")
-        .and_then(|v| v.as_array_mut())
-    {
-        cookies.retain(|item| {
-            !item
-                .get("cookie")
-                .is_some_and(|cookie| cookie_protected(guard, cookie))
-        });
-    }
-}
-
 pub fn redacted(info: &Value) -> Value {
     let mut out = info.clone();
     let url = info.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -1178,6 +1209,34 @@ mod tests {
             &guard,
             &json!({ "value": { "origin": "https://seven.sliccy.ai" } })
         ));
+    }
+
+    #[test]
+    fn cookie_lists_judge_a_domainless_line_by_every_request_base() {
+        let guard = Protected::default();
+        let lists = |line: &str| json!({"associatedCookies":[{"cookieLine":line}],"blockedCookies":[{"cookieLine":line}],"exemptedCookies":[{"cookieLine":line}],"other":[{"cookieLine":line}]});
+        for (bases, kept) in [
+            (vec!["https://shop.example.test/api".to_string()], true),
+            (vec!["wss://shop.example.test/socket".to_string()], true),
+            (vec!["https://ims-na1.adobelogin.com/ims".to_string()], false),
+            (vec!["https://shop.example.test/".to_string(), "https://ims-na1.adobelogin.com/".to_string()], false),
+            (vec!["https://seven.sliccy.ai/".to_string()], false),
+            (vec!["not a url".to_string()], false),
+            (vec![], false),
+        ] {
+            let mut params = lists("host=VALUE; Path=/");
+            strip_cookie_lists(&guard, &mut params, &bases);
+            for key in ["associatedCookies", "blockedCookies", "exemptedCookies"] {
+                assert_eq!(params[key].as_array().unwrap().len(), usize::from(kept), "{bases:?} {key}");
+            }
+            assert_eq!(params["other"].as_array().unwrap().len(), 1);
+        }
+        let mut params = json!({"blockedCookies":"id=VALUE; Domain=.adobelogin.com"});
+        strip_cookie_lists(&guard, &mut params, &[]);
+        assert_eq!(params["blockedCookies"], json!([]));
+        for (line, hidden) in [("a=b", false), ("a=b; Domain=.adobelogin.com", true), ("a", true), ("a=", true), ("=b", true), ("", true), ("a=b\nc", true)] {
+            assert_eq!(cookie_line_hidden(&guard, line, "https://shop.example.test/"), hidden, "{line:?}");
+        }
     }
 
     #[test]

@@ -4668,15 +4668,18 @@ impl Cdp {
             }
             self.hand(&session, id);
         }
-        if method.ends_with("ExtraInfo") {
+        let extra = method.ends_with("ExtraInfo");
+        let bases = self.event_urls(&value);
+        let credential_lists = shield::credential_associated(&self.guard, &value["params"]);
+        if let Some(params) = value.get_mut("params") { shield::strip_cookie_lists(&self.guard, params, &bases); }
+        if extra {
             if let Some(id) = id.clone() {
                 if let Some(cookies) = value.pointer("/params/associatedCookies").and_then(Value::as_array) {
                     self.trace_cookies.extend(cookies.iter().filter_map(|item| item.get("cookie").cloned()));
                 }
-                if shield::credential_associated(&self.guard, &value["params"]) {
+                if credential_lists {
                     shield::strip_credential_cookies(&self.guard, &mut value["params"], false);
                 }
-                shield::strip_protected_associated(&self.guard, &mut value);
                 if self.requests.get(&id) != Some(&false) {
                     self.held.entry(id).or_default().push(value);
                     return;
@@ -4701,6 +4704,10 @@ impl Cdp {
     fn credential_cookie_event(&self, value: &Value) -> bool {
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if !method.starts_with("Network.") && !method.starts_with("Fetch.") { return false }
+        shield::credential_cookie_event(&self.guard, &value["params"], &self.event_urls(value))
+    }
+
+    fn event_urls(&self, value: &Value) -> Vec<String> {
         let params = &value["params"];
         let mut urls: Vec<String> = ["/request/url", "/response/url", "/redirectResponse/url", "/url"].iter()
             .filter_map(|pointer| params.pointer(pointer).and_then(Value::as_str)).map(str::to_string).collect();
@@ -4709,7 +4716,7 @@ impl Cdp {
                 urls.extend(self.request_resources.get(id).into_iter().flatten().map(|(_, url)| url.clone()));
             }
         }
-        shield::credential_cookie_event(&self.guard, params, &urls)
+        urls
     }
 
     fn renderer_crashed(&self, session: Option<&str>, target: Option<&str>) -> bool {
