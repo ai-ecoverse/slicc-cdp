@@ -473,3 +473,22 @@ fn audit_raw_cookie_lines_follow_the_same_parse() {
         assert_eq!(cdp.events().len(), 1, "{line}");
     }
 }
+
+#[test]
+fn cookies_seen_only_in_extra_info_still_scrub_console_and_header_values_on_the_next_cookie_read() {
+    for (domain, secret) in [(".adobelogin.com", "TRACE_IDP_SECRET"), ("seven.sliccy.ai", "TRACE_SEVEN_SECRET")] {
+        let mut cdp = Cdp::from_transport(Box::new(CookieJarBackend { inbox: VecDeque::new(), jar: json!([]) }));
+        cdp.fixture_session("S");
+        ordinary_request(&mut cdp, "R", "https://shop.example.test/api");
+        cdp.absorb(json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":"S","params":{"requestId":"R","headers":{},
+            "associatedCookies":[{"blockedReasons":[],"cookie":{"name":"sid","value":secret,"domain":domain,"path":"/"}}]}}));
+        cdp.absorb(json!({"method":"Runtime.consoleAPICalled","sessionId":"S","params":{"type":"log","executionContextId":1,"timestamp":1.0,"args":[{"type":"string","value":format!("token {secret}")}]}}));
+        cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"R2","type":"XHR","documentURL":"https://shop.example.test/","request":{"url":"https://shop.example.test/next","method":"GET","headers":{"Cookie":format!("sid={secret}")}}}}));
+        let before = serde_json::to_string(cdp.events()).unwrap();
+        assert!(before.contains(secret), "{domain}: the fixture must queue the value: {before}");
+        cdp.call("Network.getAllCookies", json!({}), Some("S")).unwrap();
+        let after = serde_json::to_string(cdp.events()).unwrap();
+        assert!(!after.contains(secret), "{domain}: {after}");
+        assert!(after.contains("https://shop.example.test/next") && after.contains("[redacted]"), "{domain}: {after}");
+    }
+}

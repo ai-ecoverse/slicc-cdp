@@ -4669,14 +4669,16 @@ impl Cdp {
             self.hand(&session, id);
         }
         let extra = method.ends_with("ExtraInfo");
+        if extra && id.is_some() {
+            if let Some(cookies) = value.pointer("/params/associatedCookies").and_then(Value::as_array) {
+                self.trace_cookies.extend(cookies.iter().filter_map(|item| item.get("cookie").cloned()));
+            }
+        }
         let bases = self.event_urls(&value);
         let credential_lists = shield::credential_associated(&self.guard, &value["params"]);
         if let Some(params) = value.get_mut("params") { shield::strip_cookie_lists(&self.guard, params, &bases); }
         if extra {
             if let Some(id) = id.clone() {
-                if let Some(cookies) = value.pointer("/params/associatedCookies").and_then(Value::as_array) {
-                    self.trace_cookies.extend(cookies.iter().filter_map(|item| item.get("cookie").cloned()));
-                }
                 if credential_lists {
                     shield::strip_credential_cookies(&self.guard, &mut value["params"], false);
                 }
