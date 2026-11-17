@@ -112,6 +112,8 @@ fn persistent_capabilities_are_refused_for_calls_and_notifications() {
         ("Input.setIgnoreInputEvents", json!({"ignore":true})),
         ("Security.setIgnoreCertificateErrors", json!({"ignore":true})),
         ("Debugger.setInstrumentationBreakpoint", json!({"instrumentation":"beforeScriptExecution"})),
+        ("Debugger.enable", json!({})),
+        ("Debugger.pause", json!({})),
         ("Debugger.setBreakpointByUrl", json!({"lineNumber":0,"urlRegex":".*"})),
         ("Runtime.setCustomObjectFormatterEnabled", json!({"enabled":true})),
         ("Overlay.setShowPaintRects", json!({"result":true})),
@@ -126,6 +128,18 @@ fn persistent_capabilities_are_refused_for_calls_and_notifications() {
         assert!(cdp.notify(method, params, Some("S")).unwrap_err().starts_with("slicc: refused:"), "{method}");
         assert!(!state.borrow().sent.iter().any(|command| command["method"] == method), "{method} reached the transport");
     }
+}
+
+#[test]
+fn eval_attach_early_ownership_never_admits_public_debugger_or_persistent_calls() {
+    let (mut cdp, state) = persistent_client();
+    cdp.eval_early.arms.insert("S".into(), Default::default());
+    for method in ["Debugger.enable", "Debugger.pause", "Debugger.setInstrumentationBreakpoint", "Runtime.addBinding", "Page.addScriptToEvaluateOnNewDocument"] {
+        assert!(cdp.call(method, json!({}), Some("S")).is_err(), "{method}");
+        assert!(cdp.notify(method, json!({}), Some("S")).is_err(), "{method}");
+        assert!(!state.borrow().sent.iter().any(|command| command["method"] == method));
+    }
+    assert!(!cdp.eval_attach_early_paused("S", "unverified"));
 }
 
 #[test]

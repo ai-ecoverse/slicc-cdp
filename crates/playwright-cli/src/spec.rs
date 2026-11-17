@@ -95,7 +95,7 @@ static SPECS: &[Spec] = &[
     spec("unroute", &["pattern"], false, &[], true, RefMode::None),
     spec("generate-locator", &["target"], false, &[("tab", S)], true, RefMode::Element),
     spec("highlight", &["target"], false, &[("tab", S), ("hide", B), ("style", S)], true, RefMode::Element),
-    spec("eval-attach", &["file"], false, &[("tab", S), ("host", S), ("match", S), ("world", S)], true, RefMode::None),
+    spec("eval-attach", &["file"], false, &[("tab", S), ("host", S), ("match", S), ("world", S), ("early", B)], true, RefMode::None),
     spec("eval-detach", &["attachmentId"], false, &[], true, RefMode::None),
     spec("eval-file", &["path"], false, &[("tab", S), ("frame", S), ("output", S), ("filename", S)], true, RefMode::None),
     spec("navigate", &["url"], false, &[("tab", S), ("teleport-start", S), ("teleport-return", S), ("timeout", S), ("teleport-runtime", S)], true, RefMode::None),

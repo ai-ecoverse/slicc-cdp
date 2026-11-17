@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 #[path = "webmcp_guard.rs"]
 mod webmcp_guard;
+#[path = "eval_early.rs"]
+mod eval_early;
 #[path = "har_guard.rs"]
 mod har_guard;
 #[path = "page_scope.rs"]
@@ -209,6 +211,7 @@ pub struct Cdp {
     documents: BTreeMap<String, MainDocument>,
     unobserved: BTreeSet<String>,
     webmcp: webmcp_guard::Webmcp,
+    eval_early: eval_early::Early,
     har: har_guard::Har,
     waiting_calls: BTreeSet<i64>,
     call_replies: BTreeMap<i64, Value>,
@@ -342,6 +345,7 @@ impl Cdp {
             documents: BTreeMap::new(),
             unobserved: BTreeSet::new(),
             webmcp: webmcp_guard::Webmcp::default(),
+            eval_early: eval_early::Early::default(),
             har: har_guard::Har::default(),
             waiting_calls: BTreeSet::new(),
             call_replies: BTreeMap::new(),
@@ -4726,6 +4730,7 @@ impl Cdp {
         pinned: bool,
     ) -> Result<Value, String> {
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
+        self.eval_attach_early_admit_execution(method, session_id)?;
         let id = self.send(method, params, session_id)?;
         self.waiting_calls.insert(id);
         let result = self.raw_reply(method, id, session_id, timeout, pinned);
@@ -4840,6 +4845,7 @@ impl Cdp {
     }
 
     pub fn pump(&mut self, deadline: Instant) -> Result<bool, String> {
+        self.eval_attach_early_sweep();
         self.webmcp_sweep();
         let result = match self.recv(deadline)? {
             Some(text) => {
@@ -4990,6 +4996,7 @@ impl Cdp {
         self.worlds.event(&json!({"method":"Target.detachedFromTarget","params":{"sessionId":session}}), &self.guard);
         self.issued.forget(session);
         self.webmcp.forget(session);
+        self.eval_early.arms.remove(session);
         self.har_forget(session);
     }
 
@@ -5033,6 +5040,7 @@ impl Cdp {
         if self.har_event(&value) {
             return;
         }
+        if self.eval_attach_early_event(&value) { return; }
         if self.webmcp_event(&value) {
             return;
         }
