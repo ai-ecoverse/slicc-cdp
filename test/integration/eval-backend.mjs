@@ -91,7 +91,7 @@ export async function evalBackend(options = {}) {
           auxData: { frameId: target.targetId, isDefault: true },
         },
       });
-      if (armed.has(session)) {
+      if (armed.has(session) && !options.noScripts) {
         const scriptId = `script:${loaderId}`;
         scripts.set(session, scriptId);
         if (options.missFirstPause)

@@ -8,12 +8,13 @@ import { evalCommand as command, evalHolder as holder } from './eval-support.mjs
 import './watchdog.mjs';
 
 for (const world of ['main', 'isolated']) {
-  for (const mode of ['owned', 'missed', 'miss-first', 'resumed']) {
+  for (const mode of ['owned', 'missed', 'miss-first', 'resumed', 'scriptless']) {
     const missPause = mode !== 'owned';
     test(`eval-attach early fake ${world}: ${mode} pause`, async () => {
       const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-early-fake-'));
       const backend = await evalBackend({
         missPause: mode === 'missed',
+        noScripts: mode === 'scriptless',
         missFirstPause: mode === 'miss-first',
         resumeBeforeEval: mode === 'resumed',
       });

@@ -22,6 +22,11 @@ for (const world of ['main', 'isolated']) {
           res.end();
           return;
         }
+        if (req.url === '/static') {
+          res.setHeader('Content-Type', 'text/html');
+          res.end('<!doctype html><p>no scripts</p>');
+          return;
+        }
         res.setHeader('Content-Type', 'text/html');
         res.end(
           '<!doctype html><html><head><script>document.documentElement.dataset.observed = document.documentElement.dataset.attached || "missing"; globalThis.headRan = true;</script></head><body>early fixture</body></html>'
@@ -98,6 +103,16 @@ for (const world of ['main', 'isolated']) {
         });
         await held.event('message', (event) => event.payload.early === true);
         await held.event('message', (event) => event.payload.later === true);
+        loaded = raw.event('Page.loadEventFired', sessionId);
+        await raw.send('Page.navigate', { url: `${origin}/static` }, sessionId);
+        await loaded.seen;
+        await held.event(
+          'refused',
+          (event) =>
+            event.reason === 'late' &&
+            held.events().filter((item) => item.event === 'refused').length === 2
+        );
+        assert.deepEqual(await inspect(), { marker: false });
         const before = held.events().filter((event) => event.event === 'refused').length;
         loaded = raw.event('Page.loadEventFired', sessionId);
         await raw.send('Page.navigate', { url: `${origin}/redirect` }, sessionId).catch((error) => {

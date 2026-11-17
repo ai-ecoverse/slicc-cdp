@@ -68,7 +68,7 @@ impl Cdp {
     }
 
     pub fn eval_attach_early_waiting(&self, session: &str, unique: &str) -> bool {
-        self.eval_early.arms.get(session).is_some_and(|arm| !arm.seen.contains(unique) && arm.pending.get(unique).is_some_and(|until| !arm.first_scripts.contains_key(unique) || Instant::now() < *until) || arm.conversion.as_ref().is_some_and(|(context, until)| context == unique && Instant::now() < *until))
+        self.eval_early.arms.get(session).is_some_and(|arm| !arm.seen.contains(unique) && arm.pending.get(unique).is_some_and(|until| Instant::now() < *until) || arm.conversion.as_ref().is_some_and(|(context, until)| context == unique && Instant::now() < *until))
     }
 
     pub fn eval_attach_early_finish(&mut self, session: &str) {
@@ -145,7 +145,6 @@ impl Cdp {
                         if let Some(unique) = arm.contexts.get(&id).and_then(|context| context["uniqueId"].as_str()) {
                             if arm.first_scripts.len() < 4096 && !arm.first_scripts.contains_key(unique) {
                                 arm.first_scripts.insert(unique.to_string(), script.to_string());
-                                if let Some(until) = arm.pending.get_mut(unique) { *until = Instant::now() + Duration::from_secs(1); }
                             }
                         }
                     }
