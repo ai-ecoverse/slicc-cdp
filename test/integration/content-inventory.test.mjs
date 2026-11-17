@@ -12,6 +12,7 @@ const events = new Set([
   'CSS.styleSheetAdded',
   'DOM.documentUpdated',
   'Debugger.paused',
+  'Debugger.resumed',
   'Debugger.scriptFailedToParse',
   'Debugger.scriptParsed',
   'Fetch.authRequired',

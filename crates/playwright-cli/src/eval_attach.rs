@@ -32,9 +32,13 @@ pub(crate) fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) 
     let source = match fs::read_to_string(path) { Ok(source) => source, Err(error) => return Output::err(format!("eval-attach: cannot read script: {error}\n")) };
     let lease = match AttachmentLease::claim(invocation) { Ok(lease) => lease, Err(message) => return Output::err(message) };
     let world = invocation.flags.get("world").map(String::as_str).unwrap_or("main");
-    let mut holder = Holder { scope, source, world, tabs: BTreeMap::new(), refused: BTreeMap::new(), key: format!("__slicc_{}", lease.id.replace('-', "_")), invocation, state, id: &lease.id };
+    let early = invocation.flags.contains_key("early");
+    let mut holder = Holder { scope, source, world, early, tabs: BTreeMap::new(), refused: BTreeMap::new(), key: format!("__slicc_{}", lease.id.replace('-', "_")), invocation, state, id: &lease.id };
     let result = holder.run(cdp, &lease);
-    for tab in holder.tabs.values() { cdp::detach(cdp, &tab.session); }
+    for tab in holder.tabs.values() {
+        if early { cdp.eval_attach_early_stop(&tab.session); }
+        cdp::detach(cdp, &tab.session);
+    }
     let reason = result.as_deref().unwrap_or("error");
     let finished = lease.finish(reason).and_then(emit);
     match result.and(finished.map(|_| String::new())) { Ok(_) => Output::ok(""), Err(message) => Output::err(message) }
@@ -43,6 +47,7 @@ pub(crate) fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) 
 struct Tab {
     session: String,
     seen: usize,
+    finish_early: bool,
     contexts: BTreeMap<i64, Value>,
     attempted: BTreeMap<String, Option<Installed>>,
     installed: Option<Installed>,
@@ -60,6 +65,7 @@ struct Holder<'a> {
     scope: Scope,
     source: String,
     world: &'a str,
+    early: bool,
     tabs: BTreeMap<String, Tab>,
     refused: BTreeMap<String, String>,
     key: String,
@@ -77,7 +83,7 @@ impl Holder<'_> {
 
     fn run(&mut self, cdp: &mut Cdp, lease: &AttachmentLease) -> Result<String, String> {
         let mut input = crate::webmcp_polyfill::input()?;
-        emit(json!({"event":"ready","attachmentId":self.id,"world":self.world,"early":false}))?;
+        emit(json!({"event":"ready","attachmentId":self.id,"world":self.world,"early":self.early}))?;
         let mut discovery = Instant::now() - Duration::from_millis(250);
         loop {
             if let Err(mpsc::TryRecvError::Disconnected) = input() { return Ok("stdin".into()) }
@@ -89,8 +95,11 @@ impl Holder<'_> {
             let targets: Vec<_> = self.tabs.keys().cloned().collect();
             for target in targets {
                 let mut tab = self.tabs.remove(&target).unwrap();
-                self.tick(cdp, &target, &mut tab)?;
+                let result = self.tick(cdp, &target, &mut tab);
+                if self.early && tab.finish_early { cdp.eval_attach_early_finish(&tab.session); }
+                tab.finish_early = false;
                 self.tabs.insert(target, tab);
+                result?;
             }
             cdp.pump(Instant::now() + Duration::from_millis(100))?;
             for notice in cdp.take_notices() { eprint!("{notice}"); }
@@ -105,6 +114,7 @@ impl Holder<'_> {
         for target in removed {
             let tab = self.tabs.remove(&target).unwrap();
             if cdp.is_protected_target(&target) { self.refuse(&target, "blocked", "guard")?; }
+            if self.early { cdp.eval_attach_early_stop(&tab.session); }
             cdp::detach(cdp, &tab.session);
         }
         let candidates: Vec<_> = if let Scope::Tab(target) = &self.scope { vec![target.clone()] }
@@ -121,13 +131,16 @@ impl Holder<'_> {
                 if self.state.owned.contains(&target) {
                     if let Some(proof) = self.state.created_blanks.get(&target) { cdp.restore_created_blank(&target, proof); }
                 }
+                if self.early {
+                    if let Err(message) = cdp.eval_attach_early_arm(&session) { cdp::detach(cdp, &session); return Err(message) }
+                }
                 for method in ["Page.enable", "Runtime.enable", "Network.enable"] {
                     if let Err(message) = cdp.call(method, json!({}), Some(&session)) { cdp::detach(cdp, &session); return Err(message) }
                 }
                 Ok(session)
             });
             match attached {
-                Ok(session) => { self.tabs.insert(target, Tab { session, seen, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None }); }
+                Ok(session) => { self.tabs.insert(target, Tab { session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None }); }
                 Err(_) => self.refuse(&target, "blocked", "guard")?,
             }
         }
@@ -138,14 +151,21 @@ impl Holder<'_> {
         absorb(cdp, tab);
         let tree = match cdp.call("Page.getFrameTree", json!({}), Some(&tab.session)) {
             Ok(tree) => tree,
-            Err(_) => { tab.installed = None; return self.refuse(target, "blocked", "guard") }
+            Err(_) => { tab.installed = None; tab.finish_early = true; return self.refuse(target, "blocked", "guard") }
         };
+        absorb(cdp, tab);
         let frame = &tree["frameTree"]["frame"];
         let frame_id = text(frame, "id");
         let loader = text(frame, "loaderId");
         let url = text(frame, "url");
+        if cdp.guard().url(url) || cdp.guard().url(text(frame, "unreachableUrl")) {
+            tab.installed = None;
+            tab.finish_early = true;
+            return self.refuse(target, loader, "guard");
+        }
         if frame_id.is_empty() || loader.is_empty() || frame.get("parentId").is_some() || !self.scope.matches(target, url) {
             tab.installed = None;
+            tab.finish_early = true;
             return Ok(());
         }
         let default = tab.contexts.values().find(|context| context["auxData"]["isDefault"] == true && context["auxData"]["frameId"] == frame_id).cloned();
@@ -154,6 +174,14 @@ impl Holder<'_> {
         if unique.is_empty() { return self.refuse(target, loader, "unverified-context") }
         if tab.installed.as_ref().is_some_and(|installed| installed.default != unique || installed.loader != loader) { tab.installed = None; }
         if !tab.attempted.contains_key(unique) {
+            if self.early {
+                if cdp.eval_attach_early_waiting(&tab.session, unique) { return Ok(()) }
+                tab.finish_early = true;
+                if !cdp.eval_attach_early_paused(&tab.session, unique) {
+                    tab.attempted.insert(unique.to_string(), None);
+                    return self.refuse(target, unique, "late");
+                }
+            }
             tab.attempted.insert(unique.to_string(), None);
             let context = if self.world == "isolated" {
                 let created = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame_id,"worldName":self.key}), Some(&tab.session));
@@ -169,17 +197,23 @@ impl Holder<'_> {
                     return self.refuse(target, unique, "unverified-context");
                 }
             }
+            if self.early && !cdp.eval_attach_early_paused(&tab.session, unique) { return self.refuse(target, unique, "late") }
             let mut report = Report::for_command("eval").with_intent("eval", self.invocation.intent.as_deref());
             report.tab(target);
             report.begin(cdp);
-            let installed = evaluate(cdp, &tab.session, context, &self.install_source(url));
+            let installed = if self.early {
+                cdp.eval_attach_early_evaluate(&tab.session, unique, json!({"expression":self.install_source(url),"uniqueContextId":context,"returnByValue":true})).and_then(evaluated)
+            } else { evaluate(cdp, &tab.session, context, &self.install_source(url)) };
             let outcome = match &installed { Ok(Value::Bool(true)) => Output::ok(""), _ => Output::err("eval-attach: installation refused or script threw\n") };
             report.finish(cdp, &outcome);
-            if !matches!(installed, Ok(Value::Bool(true))) { return self.refuse(target, unique, "installation") }
+            if !matches!(installed, Ok(Value::Bool(true))) {
+                let reason = if installed.as_ref().err().is_some_and(|message| message == "eval-attach: late\n") { "late" } else { "installation" };
+                return self.refuse(target, unique, reason);
+            }
             tab.installed = Some(Installed { context: context.to_string(), default: unique.to_string(), frame: frame_id.to_string(), loader: loader.to_string() });
             tab.attempted.insert(unique.to_string(), tab.installed.clone());
             self.refused.remove(target);
-            emit(json!({"event":"document-ready","attachmentId":self.id,"tab":target,"frameId":frame_id,"loaderId":loader,"url":url,"world":self.world,"early":false}))?;
+            emit(json!({"event":"document-ready","attachmentId":self.id,"tab":target,"frameId":frame_id,"loaderId":loader,"url":url,"world":self.world,"early":self.early}))?;
         }
         tab.installed = tab.attempted.get(unique).cloned().flatten().filter(|installed| installed.loader == loader);
         let Some(installed) = &tab.installed else { return Ok(()) };
@@ -206,6 +240,10 @@ impl Holder<'_> {
 
 fn evaluate(cdp: &mut Cdp, session: &str, context: &str, source: &str) -> Result<Value, String> {
     let value = cdp.call("Runtime.evaluate", json!({"expression":source,"uniqueContextId":context,"returnByValue":true}), Some(session))?;
+    evaluated(value)
+}
+
+fn evaluated(value: Value) -> Result<Value, String> {
     if value.get("exceptionDetails").is_some() { return Err("eval-attach: script threw\n".into()) }
     Ok(value["result"]["value"].clone())
 }

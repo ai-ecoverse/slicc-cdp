@@ -8,6 +8,67 @@ import { evalCommand as command, evalHolder as holder } from './eval-support.mjs
 import './watchdog.mjs';
 
 for (const world of ['main', 'isolated']) {
+  for (const mode of ['owned', 'missed', 'miss-first', 'resumed', 'scriptless']) {
+    const missPause = mode !== 'owned';
+    test(`eval-attach early fake ${world}: ${mode} pause`, async () => {
+      const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-early-fake-'));
+      const backend = await evalBackend({
+        missPause: mode === 'missed',
+        noScripts: mode === 'scriptless',
+        missFirstPause: mode === 'miss-first',
+        resumeBeforeEval: mode === 'resumed',
+      });
+      const tab = { targetId: 'TAB', url: 'https://example.test/initial', loaderId: 'L' };
+      backend.targets.push(tab);
+      await writeFile(path.join(home, 'shim.js'), 'send({arbitrary: "early source"});');
+      const held = holder(
+        backend.url,
+        ['eval-attach', 'shim.js', '--tab', 'TAB', '--world', world, '--early'],
+        home
+      );
+      try {
+        assert.equal((await held.event('ready')).early, true);
+        await held.event('refused', (event) => event.reason === 'late');
+        backend.navigate(tab, 'https://example.test/next', 'NEXT');
+        if (missPause) {
+          await held.event(
+            'refused',
+            () => held.events().filter((event) => event.event === 'refused').length === 2
+          );
+          assert.equal(held.events().filter((event) => event.event === 'document-ready').length, 0);
+        } else {
+          const ready = await held.event('document-ready');
+          assert.equal(ready.early, true);
+          assert.equal(ready.loaderId, 'NEXT');
+          assert.deepEqual((await held.event('message')).payload, { arbitrary: 'early source' });
+        }
+        held.child.stdin.end();
+        assert.equal((await held.ended).code, 0);
+        const installs = backend.calls.filter((call) =>
+          call.params?.expression?.startsWith('(() => { const queue = [];')
+        );
+        assert.equal(installs.length, missPause ? 0 : 1);
+        assert.equal(
+          backend.calls.filter(
+            (call) => call.method === 'Slicc.action' && call.params.phase === 'start'
+          ).length,
+          mode === 'resumed' ? 1 : installs.length
+        );
+        assert.ok(
+          !backend.calls.some((call) =>
+            ['Page.addScriptToEvaluateOnNewDocument', 'Runtime.addBinding'].includes(call.method)
+          )
+        );
+      } finally {
+        held.child.kill('SIGKILL');
+        await backend.close();
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+for (const world of ['main', 'isolated']) {
   test(`eval-attach fake ${world}: navigation, new tabs, scope misses, send and detach`, async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-fake-'));
     const backend = await evalBackend();
@@ -138,14 +199,13 @@ test('eval-attach fake: repeatable URL matching, protected document refusal and 
   }
 });
 
-test('eval-attach precheck rejects protected scopes, child frames and early capability', async () => {
+test('eval-attach precheck rejects protected scopes and child frames', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-precheck-'));
   try {
     for (const flags of [
       ['--host', '*.sliccy.ai'],
       ['--match', 'https://seven.sliccy.ai/*'],
       ['--tab', 'T', '--frame', 'F'],
-      ['--tab', 'T', '--early'],
       ['--tab', 'T', '--host', 'example.test'],
       ['--tab', 'T', '--world', 'unknown'],
     ]) {

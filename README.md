@@ -109,7 +109,7 @@ When the debugger is refused because another extension runs scripts in an otherw
 ## Eval attachment holder
 
 ```sh
-playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --tab <targetId> [--world main|isolated]
+playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --tab <targetId> [--world main|isolated] [--early]
 playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --host '*.example.com'
 playwright-cli --cdp <browser-url> -s shim eval-attach shim.js --match '*://*.example.com/app/*' --match 'https://other.example/*'
 playwright-cli -s shim eval-detach [attachmentId]
@@ -119,7 +119,11 @@ playwright-cli -s shim eval-detach [attachmentId]
 
 Choose exactly one scope: `--tab <targetId>`, `--host <exact-host|*.example.com>`, or repeatable `--match <scheme://host/path-glob>`. Host wildcards include the apex and subdomains. Match schemes are `http`, `https`, or `*` (both); hosts are exact, `*`, or `*.example.com`; `*` in the path matches any characters, including `/`. Matching includes the query and ignores the fragment. Ports are ignored; port literals in patterns are rejected. Exact host spelling is lowercase ASCII/punycode. Host/match installation covers HTTP(S) documents. A pattern naming a protected origin is refused before connecting; broad wildcards still pass through the document guard. Matching tabs are discovered through the guarded page list about every 250 ms. Protected targets hidden by that list are never installed; an explicit tab or a watched target that becomes protected reports a refusal without its URL.
 
-Installation happens after the holder observes the top frame's default execution context and verifies the frame tree. This is watchdog timing, not a parse-time startup hook: the page's own scripts may already have run. `document-ready` always has `early: false`. `--early` is reserved for a possible future capability and is currently rejected. No persistent new-document script, binding, debugger pause, or shim capability is requested.
+By default installation happens after the holder observes the top frame's default execution context and verifies the frame tree; page scripts may already have run, and events report `early: false`. Add `--early` with any scope and either world to finish the synchronous script body before the first parser-inserted inline head script. The holder arms `Debugger.setInstrumentationBreakpoint` (`beforeScriptExecution`), converts the instrumentation pause to an owned debugger pause, verifies the document through the normal guards, evaluates, then resumes. Async callbacks and promises are not awaited. Only this explicit flag admits caller-supplied pre-script code; the existing WebMCP holder and pinned shim are unchanged. No `Page.addScriptToEvaluateOnNewDocument` or `Runtime.addBinding` is used.
+
+With `--early`, existing documents, newly discovered tabs whose first script already ran, missed pauses, documents whose first script does not arrive within one second of context creation (including script-less pages), and documents that cannot be verified within the one-second pause deadline are refused (`reason: "late"` or a guard/context refusal). There is no late fallback. `ready` reports the requested mode, not successful installation or a barrier for every tab: wait for the initial refusal before navigating a watched existing tab. A new matching tab may be discovered too late; subsequent matching navigations are watched while the holder is attached. Server redirects are checked against the committed document, including redirects into protected origins.
+
+For `--world isolated --early`, `Page.createIsolatedWorld` creates the attachment's world while the first main-world script remains paused. Its unique context and document loader are verified before evaluation and resume. A successful `document-ready` with `early: true` guarantees the isolated body finished before that page script; DOM changes are visible to it, while JavaScript globals remain isolated. If world creation or verification cannot complete under the pause, the document is refused.
 
 `--world main` is the default. `--world isolated` uses `Page.createIsolatedWorld`; the page cannot read or forge that world's queue. Main-world messages can be forged or changed by the page. All payloads are untrusted page data. `send` serializes immediately with `JSON.stringify`; non-serializable values follow its usual behavior (including throwing on cycles/BigInt). Each queue holds at most 256 messages of at most 65,536 serialized UTF-16 code units each; excess messages are dropped. The holder drains about every 100 ms, with guarded evaluation and backpressure affecting timing. Relayed serialized messages are additionally limited to 65,536 UTF-8 bytes. Control characters are JSON escaped so every event occupies one stdout line.
 
@@ -129,9 +133,9 @@ Stdout is NDJSON with these stable fields. Every event has `event: string` and `
 
 | `event` | Additional fields and types |
 | --- | --- |
-| `ready` | `world: "main" | "isolated"`, `early: false`; lease is held and observation is starting, even if no document matches yet |
-| `document-ready` | `tab: string`, `frameId: string`, `loaderId: string`, `url: string`, `world: "main" | "isolated"`, `early: false`; script body evaluated successfully |
-| `refused` | `tab: string`, `reason: "guard" | "unverified-context" | "installation" | "relay"`; non-fatal, no URL or exception text; repeated checks of the same refused document are suppressed, and opaque guard-blocked intervals are coalesced |
+| `ready` | `world: "main" | "isolated"`, `early: boolean`; requested `--early` mode; lease is held and observation is starting, even if no document matches yet |
+| `document-ready` | `tab: string`, `frameId: string`, `loaderId: string`, `url: string`, `world: "main" | "isolated"`, `early: boolean`; true only for a verified pre-script install; script body evaluated successfully |
+| `refused` | `tab: string`, `reason: "guard" | "unverified-context" | "installation" | "relay" | "late"`; non-fatal, no URL or exception text; repeated checks of the same refused document are suppressed, and opaque guard-blocked intervals are coalesced |
 | `message` | `tab: string`, `frameId: string`, `loaderId: string`, `payload: JSON value`; attribution is the installation's document, and the payload is untrusted |
 | `stopped` | `reason: "stdin" | "detach" | "error"`; final event before exit |
 

@@ -26,6 +26,11 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);
     let network_state = set(&["Network.emulateNetworkConditions"]);
     let inventory = [&document, &observation, &request, &origin, &target, &internal, &debugger_control, &debugger_persistent, &window, &network_state];
+    for (method, _, place) in sent().into_iter().filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs")) {
+        if debugger_persistent.contains(&method) || debugger_control.contains(&method) {
+            assert!(place.starts_with("crates/cdp-client/src/webmcp_guard.rs:") || place.starts_with("crates/cdp-client/src/eval_early.rs:"), "persistent debugger capability widened at {place}");
+        }
+    }
     let mut methods: BTreeSet<String> = sent().into_iter()
         .filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs"))
         .map(|(method, _, _)| method)
@@ -57,6 +62,18 @@ fn production_cdp_methods_have_a_lifetime_classification() {
                 let guard = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
                 assert!(guard.contains("self.verify_page_scope(session_id)?;"));
                 assert!(guard.contains("debugger_lifetime(method) != Some(DebuggerLifetime::Persistent)"));
+                let early = fs::read_to_string(root().join("crates/cdp-client/src/eval_early.rs")).unwrap();
+                assert!(early.contains("pub fn eval_attach_early_arm("));
+                assert!(early.contains("call_guarded_for(\"Debugger.setInstrumentationBreakpoint\""));
+                assert!(early.contains("eval_attach_early_admit_execution") && early.contains("!self.eval_attach_early_paused(session, default)"));
+                assert!(!early.contains("Runtime.addBinding") && !early.contains("Page.addScriptToEvaluateOnNewDocument"));
+                let holder = fs::read_to_string(root().join("crates/playwright-cli/src/eval_attach.rs")).unwrap();
+                assert!(holder.contains("invocation.flags.contains_key(\"early\")"));
+                assert!(holder.contains("if self.early {\n                    if let Err(message) = cdp.eval_attach_early_arm(&session)"));
+                assert!(holder.contains("!cdp.eval_attach_early_paused(&tab.session, unique)"));
+                for (place, source) in sources() {
+                    if !place.contains("_test.rs") && (source.contains(".eval_attach_early_arm(") || source.contains(".eval_attach_early_evaluate(")) { assert_eq!(place, "crates/playwright-cli/src/eval_attach.rs"); }
+                }
                 continue;
             }
             if window.contains(method) {
