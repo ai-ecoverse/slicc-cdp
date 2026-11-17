@@ -1,4 +1,4 @@
-use super::{Cdp, OPTIONAL_STEP};
+use super::{Cdp, Listing, OPTIONAL_STEP};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -174,7 +174,7 @@ impl Cdp {
                 self.is_protected_target(&target)
                     || self.abandoned.contains(&target)
                     || self.targets.get(&target).is_some_and(|creator| {
-                        self.info_protected(creator, &[]) || self.iframe_ancestor_protected(creator, &[])
+                        self.info_protected(creator, &[]) || self.iframe_ancestor_protected(creator, &Listing::NONE)
                     })
             })
             || info
@@ -183,7 +183,7 @@ impl Cdp {
                 .is_some_and(|opener| {
                     self.protected_targets.contains(opener)
                         || self.targets.get(opener).is_some_and(|creator| {
-                            self.info_protected(creator, &[]) || self.iframe_ancestor_protected(creator, &[])
+                            self.info_protected(creator, &[]) || self.iframe_ancestor_protected(creator, &Listing::NONE)
                         })
                 });
         if let Ok(parsed) = url::Url::parse(url) {
@@ -200,7 +200,7 @@ impl Cdp {
             || self.guard.extension_frame(url)
             || self.guard.error_page_url(url)
             || self.guard.target(url, false, crate::protected::Opener::Unknown)
-            || self.worker_opener_protected(info, &[])
+            || self.worker_opener_protected(info, &Listing::NONE)
             || url::Url::parse(url).is_err()
     }
 

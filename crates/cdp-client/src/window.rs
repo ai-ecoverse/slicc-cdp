@@ -25,12 +25,13 @@ impl Cdp {
         }
         self.document_state_for(&target, true, None).ok_or_else(|| self.document_refusal())?;
         let listed = self.raw_call("Target.getTargets", json!({}), None, DOCUMENT_CHECK)?;
-        let infos = listed.get("targetInfos").and_then(Value::as_array).cloned().ok_or_else(|| self.refusal())?;
+        let all = listed.get("targetInfos").and_then(Value::as_array).cloned().ok_or_else(|| self.refusal())?;
+        let infos = Listing::new(&all);
         let text = |info: &Value, key: &str| info.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-        let own = infos.iter().find(|info| text(info, "targetId") == target).ok_or_else(|| self.refusal())?;
+        let own = all.iter().find(|info| text(info, "targetId") == target).ok_or_else(|| self.refusal())?;
         if text(own, "type") != "page" || self.info_protected(own, &infos) { return Err(self.refusal()) }
         let context = text(own, "browserContextId");
-        for info in &infos {
+        for info in &all {
             if text(info, "targetId") == target || WINDOWLESS.contains(&text(info, "type").as_str()) || top_chrome(info) { continue }
             let other = text(info, "browserContextId");
             if !context.is_empty() && !other.is_empty() && other != context { continue }

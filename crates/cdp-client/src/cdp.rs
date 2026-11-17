@@ -19,10 +19,13 @@ mod document_order;
 mod navigation_away;
 #[path = "issued.rs"]
 mod issued;
+#[path = "targets.rs"]
+mod targets;
 #[cfg(test)]
 #[path = "unplaceable_test.rs"]
 mod unplaceable_test;
 pub(crate) use issued::target_refusal;
+use targets::{FrameOwners, Infos, Listing, Targets};
 
 pub trait Transport {
     fn send_text(&mut self, text: &str) -> Result<(), String>;
@@ -157,7 +160,7 @@ pub struct Cdp {
     pending_page_events: VecDeque<Value>,
     runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
-    iframe_own_frames: BTreeMap<String, String>,
+    iframe_own_frames: FrameOwners,
     extension_frames: BTreeMap<String, Vec<String>>,
     page_scope_epochs: BTreeMap<String, u64>,
     page_scope_unknown: u64,
@@ -198,7 +201,7 @@ pub struct Cdp {
     paused_documents: BTreeSet<(String, String)>,
     executing_sessions: BTreeSet<String>,
     contexts: BTreeSet<String>,
-    targets: BTreeMap<String, Value>,
+    targets: Targets,
     worlds: Worlds,
     frames: BTreeMap<String, Vec<String>>,
     frame_parents: BTreeMap<String, String>,
@@ -290,7 +293,7 @@ impl Cdp {
             pending_page_events: VecDeque::new(),
             runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
-            iframe_own_frames: BTreeMap::new(),
+            iframe_own_frames: FrameOwners::default(),
             extension_frames: BTreeMap::new(),
             page_scope_epochs: BTreeMap::new(),
             page_scope_unknown: 0,
@@ -331,7 +334,7 @@ impl Cdp {
             paused_documents: BTreeSet::new(),
             executing_sessions: BTreeSet::new(),
             contexts: BTreeSet::new(),
-            targets: BTreeMap::new(),
+            targets: Targets::default(),
             worlds: Worlds::default(),
             frames: BTreeMap::new(),
             frame_parents: BTreeMap::new(),
@@ -436,6 +439,7 @@ impl Cdp {
 
     pub fn protect_origins(&mut self, extra_origins: &[&str]) {
         self.guard = Protected::new(extra_origins);
+        self.targets.forget_verdicts();
     }
 
     pub fn take_notices(&mut self) -> Vec<String> {
@@ -1087,7 +1091,7 @@ impl Cdp {
         if method == "Target.getTargetInfo" {
             if let Some(target) = params.get("targetId").and_then(Value::as_str) {
                 if let Some(info) = self.targets.get(target).cloned() {
-                    if self.discovery_hidden_iframe(&info, &[]) || self.worker_opener_unresolved(&info, &[]) {
+                    if self.discovery_hidden_iframe(&info, &Listing::NONE) || self.worker_opener_unresolved(&info, &Listing::NONE) {
                         return Err(self.refusal());
                     }
                 }
@@ -1665,14 +1669,15 @@ impl Cdp {
                     }
                 }
                 let mut out = Vec::new();
+                let listing = Listing::new(&infos);
                 for info in &infos {
-                    let redacted = self.redact(info, &infos);
-                    let url = info.get("url").and_then(Value::as_str).unwrap_or("");
-                    if self.discovery_hidden_iframe(info, &infos) || self.worker_opener_protected(info, &infos) {
+                    let redacted = self.redact(info, &listing);
+                    if self.discovery_hidden_iframe(info, &listing) || self.worker_opener_protected(info, &listing) {
                         continue;
                     }
+                    let verdicts = self.targets.verdicts(info, &self.guard);
                     if !(self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))
-                        || self.guard.unparseable(url) && self.guard.url(url)) {
+                        || verdicts.unparseable && verdicts.protected) {
                         out.push(redacted);
                     }
                 }
@@ -1683,11 +1688,11 @@ impl Cdp {
                     let target = info.get("targetId").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     self.targets.insert(target.clone(), info.clone());
                     self.probe_error(&info)?;
-                    if self.discovery_hidden_iframe(&info, &[]) || self.worker_opener_unresolved(&info, &[]) {
+                    if self.discovery_hidden_iframe(&info, &Listing::NONE) || self.worker_opener_unresolved(&info, &Listing::NONE) {
                         return Err(self.refusal());
                     }
                     let protected = self.info_protected(&info, &[]);
-                    if protected && self.should_latch_protected(&info, &[]) {
+                    if protected && self.should_latch_protected(&info, &Listing::NONE) {
                         let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
                         if !self.documents.contains_key(&target)
                             || matches!(kind, "iframe" | "worker" | "service_worker" | "shared_worker")
@@ -1713,11 +1718,10 @@ impl Cdp {
     }
 
     fn discovery_redacted(&self, info: &Value) -> bool {
-        self.guard.error_redaction()
-            && self.guard.url(info.get("url").and_then(Value::as_str).unwrap_or(""))
+        self.guard.error_redaction() && self.targets.verdicts(info, &self.guard).protected
     }
 
-    fn should_latch_protected(&self, info: &Value, all: &[Value]) -> bool {
+    fn should_latch_protected(&self, info: &Value, all: &Listing) -> bool {
         if self.target_own_protected(info, all) {
             return true;
         }
@@ -1727,7 +1731,7 @@ impl Cdp {
         matches!(self.iframe_ancestor_state(info, all), AncestorState::Protected)
     }
 
-    fn redact(&mut self, info: &Value, all: &[Value]) -> Value {
+    fn redact(&mut self, info: &Value, all: &Listing) -> Value {
         let protected = self.info_protected(info, all);
         if protected {
             if let Some(target) = info.get("targetId").and_then(Value::as_str) {
@@ -1747,13 +1751,17 @@ impl Cdp {
         }
     }
 
-    pub(super) fn info_protected(&self, info: &Value, all: &[Value]) -> bool {
+    pub(super) fn info_protected<A: Infos + ?Sized>(&self, info: &Value, all: &A) -> bool {
+        all.listing(|all| self.info_protected_in(info, all))
+    }
+
+    fn info_protected_in(&self, info: &Value, all: &Listing) -> bool {
         self.target_own_protected(info, all)
             || self.iframe_ancestor_protected(info, all)
             || self.worker_opener_protected(info, all)
     }
 
-    pub(super) fn worker_opener_protected(&self, info: &Value, all: &[Value]) -> bool {
+    pub(super) fn worker_opener_protected(&self, info: &Value, all: &Listing) -> bool {
         let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
         if !matches!(kind, "worker" | "service_worker" | "shared_worker") {
             return false;
@@ -1762,10 +1770,7 @@ impl Cdp {
             if self.protected_targets.contains(opener) {
                 return true;
             }
-            let found = all
-                .iter()
-                .chain(self.targets.values())
-                .find(|item| item.get("targetId").and_then(Value::as_str) == Some(opener));
+            let found = all.first(opener).or_else(|| self.targets.by_id(opener));
             if found.is_some_and(|found| {
                 self.target_own_protected(found, all)
                     || self.iframe_ancestor_protected(found, all)
@@ -1788,7 +1793,7 @@ impl Cdp {
                     || self.targets.get(&owner).is_some_and(|found| {
                         self.target_own_protected(found, all) || self.iframe_ancestor_protected(found, all)
                     })
-                    || all.iter().find(|item| item.get("targetId").and_then(Value::as_str) == Some(owner.as_str())).is_some_and(|found| {
+                    || all.first(&owner).is_some_and(|found| {
                         self.target_own_protected(found, all) || self.iframe_ancestor_protected(found, all)
                     })
                     || self.documents.get(&owner).is_some_and(|doc| {
@@ -1798,7 +1803,7 @@ impl Cdp {
         }
     }
 
-    fn worker_opener_unresolved(&self, info: &Value, all: &[Value]) -> bool {
+    fn worker_opener_unresolved(&self, info: &Value, all: &Listing) -> bool {
         let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
         if !matches!(kind, "worker" | "service_worker" | "shared_worker") {
             return false;
@@ -1815,13 +1820,13 @@ impl Cdp {
         }
     }
 
-    fn frame_owner_live(&self, owner: &str, all: &[Value]) -> bool {
+    fn frame_owner_live(&self, owner: &str, all: &Listing) -> bool {
         self.targets.contains_key(owner)
             || self.documents.contains_key(owner)
-            || all.iter().any(|item| item.get("targetId").and_then(Value::as_str) == Some(owner))
+            || all.first(owner).is_some()
     }
 
-    fn target_own_protected(&self, info: &Value, all: &[Value]) -> bool {
+    fn target_own_protected(&self, info: &Value, all: &Listing) -> bool {
         if self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or("")) {
             return true;
         }
@@ -1850,10 +1855,7 @@ impl Cdp {
             .filter(|v| !v.is_empty())
         {
             None => Opener::None,
-            Some(opener) => match all
-                .iter()
-                .find(|item| item.get("targetId").and_then(|v| v.as_str()) == Some(opener))
-            {
+            Some(opener) => match all.first(opener) {
                 Some(found) if found.get("targetId") == info.get("targetId") => Opener::Unknown,
                 Some(found) if self.info_protected(found, &[]) => Opener::Protected,
                 Some(_) => Opener::Unprotected,
@@ -1870,16 +1872,12 @@ impl Cdp {
                 },
             },
         };
-        self.guard.target(url, previous, opener)
+        self.targets.verdicts(info, &self.guard).target(previous, opener)
     }
 
-    fn iframe_target_for_frame<'a>(&'a self, frame: &str, all: &'a [Value]) -> Option<&'a Value> {
+    fn iframe_target_for_frame<'a>(&'a self, frame: &str, all: &Listing<'a>) -> Option<&'a Value> {
         if let Some(owner) = self.iframe_own_frames.get(frame) {
-            if let Some(found) = all
-                .iter()
-                .chain(self.targets.values())
-                .find(|item| item.get("targetId").and_then(Value::as_str) == Some(owner.as_str()))
-            {
+            if let Some(found) = all.first(owner).or_else(|| self.targets.by_id(owner)) {
                 if found.get("type").and_then(Value::as_str) == Some("iframe") {
                     return Some(found);
                 }
@@ -1889,17 +1887,10 @@ impl Cdp {
             doc.frame_id == frame
                 && self.targets.get(*id).is_some_and(|info| info.get("type").and_then(Value::as_str) == Some("iframe"))
         }) {
-            return all
-                .iter()
-                .chain(self.targets.values())
-                .find(|item| item.get("targetId").and_then(Value::as_str) == Some(owner.as_str()));
+            return all.first(owner).or_else(|| self.targets.by_id(owner));
         }
-        all.iter()
-            .chain(self.targets.values())
-            .find(|item| {
-                item.get("targetId").and_then(Value::as_str) == Some(frame)
-                    && item.get("type").and_then(Value::as_str) == Some("iframe")
-            })
+        let iframe = |item: &&Value| item.get("type").and_then(Value::as_str) == Some("iframe");
+        all.with_id(frame).find(iframe).or_else(|| self.targets.with_id(frame).find(iframe))
     }
 
     fn note_iframe_own_frame(&mut self, target: &str, frame: &str) {
@@ -1912,34 +1903,36 @@ impl Cdp {
     }
 
     fn bind_proven_iframe_frames(&mut self) {
-        let iframes: Vec<String> = self
-            .targets
+        let documents = self
+            .documents
             .iter()
-            .filter(|(_, info)| info.get("type").and_then(Value::as_str) == Some("iframe"))
-            .map(|(id, _)| id.clone())
+            .filter(|(target, doc)| {
+                !target.is_empty()
+                    && !doc.frame_id.is_empty()
+                    && self.targets.get(target).is_some_and(|info| info.get("type").and_then(Value::as_str) == Some("iframe"))
+            })
+            .map(|(target, doc)| (target.clone(), doc.frame_id.clone()))
             .collect();
-        for target in iframes {
-            self.note_iframe_own_frame(&target, &target);
-            if let Some(frame) = self.documents.get(&target).map(|doc| doc.frame_id.clone()).filter(|frame| !frame.is_empty()) {
-                self.note_iframe_own_frame(&target, &frame);
-            }
-        }
+        self.iframe_own_frames.bind(&mut self.targets, documents);
     }
 
-    fn unbound_protected_iframe_shadows_owner(&self, frame: &str, all: &[Value]) -> bool {
+    fn unbound_protected_iframe_shadows_owner<A: Infos + ?Sized>(&self, frame: &str, all: &A) -> bool {
+        all.listing(|all| self.unbound_protected_iframe_shadows_owner_in(frame, all))
+    }
+
+    fn unbound_protected_iframe_shadows_owner_in(&self, frame: &str, all: &Listing) -> bool {
+        let iframe = |item: &Value| item.get("type").and_then(Value::as_str) == Some("iframe");
         if self.iframe_own_frames.contains_key(frame)
             || self.documents.values().any(|doc| doc.frame_id == frame)
-            || all.iter().chain(self.targets.values()).any(|item| {
-                item.get("targetId").and_then(Value::as_str) == Some(frame)
-                    && item.get("type").and_then(Value::as_str) == Some("iframe")
-            })
+            || all.with_id(frame).any(iframe)
+            || self.targets.with_id(frame).any(iframe)
         {
             return false;
         }
         let Some(page) = self.page_scope_owners.get(frame) else {
             return false;
         };
-        all.iter().chain(self.targets.values()).any(|info| {
+        all.iframes().chain(self.targets.iframe_values()).any(|info| {
             if info.get("type").and_then(Value::as_str) != Some("iframe") {
                 return false;
             }
@@ -1947,14 +1940,14 @@ impl Cdp {
             if id.is_empty() || id == frame {
                 return false;
             }
-            let url = info.get("url").and_then(Value::as_str).unwrap_or("");
-            if self.guard.extension_frame(url) {
+            let verdicts = self.targets.verdicts(info, &self.guard);
+            if verdicts.extension_frame {
                 return false;
             }
             let protected = self.protected_targets.contains(id)
                 || self.kept_url_latch.contains(id)
-                || self.guard.url(url)
-                || kept_document(&self.guard, url);
+                || verdicts.protected
+                || verdicts.kept;
             if !protected {
                 return false;
             }
@@ -1965,7 +1958,7 @@ impl Cdp {
         })
     }
 
-    fn frame_known_page_or_bound(&self, frame: &str, all: &[Value]) -> bool {
+    fn frame_known_page_or_bound(&self, frame: &str, all: &Listing) -> bool {
         if self.iframe_own_frames.contains_key(frame) {
             return true;
         }
@@ -1981,18 +1974,15 @@ impl Cdp {
         if self.webmcp_frame_owner(frame).is_some() {
             return true;
         }
-        all.iter()
-            .chain(self.targets.values())
-            .any(|item| {
-                item.get("targetId").and_then(Value::as_str) == Some(frame)
-                    && matches!(item.get("type").and_then(Value::as_str), Some("page" | "tab" | "iframe"))
-            })
+        let placed = |item: &Value| matches!(item.get("type").and_then(Value::as_str), Some("page" | "tab" | "iframe"));
+        all.with_id(frame).any(placed)
+            || self.targets.with_id(frame).any(placed)
             || self.targets.get(frame).is_some_and(|info| {
                 matches!(info.get("type").and_then(Value::as_str), Some("page" | "tab" | "iframe"))
             })
     }
 
-    fn frame_owner_target(&self, frame: &str, all: &[Value]) -> Option<String> {
+    fn frame_owner_target(&self, frame: &str, all: &Listing) -> Option<String> {
         if let Some(found) = self.iframe_target_for_frame(frame, all) {
             return found.get("targetId").and_then(Value::as_str).map(str::to_string);
         }
@@ -2010,9 +2000,8 @@ impl Cdp {
         if let Some(owner) = self.webmcp_frame_owner(frame) {
             return Some(owner);
         }
-        all.iter()
-            .chain(self.targets.values())
-            .find(|item| item.get("targetId").and_then(Value::as_str) == Some(frame))
+        all.first(frame)
+            .or_else(|| self.targets.by_id(frame))
             .and_then(|item| item.get("targetId").and_then(Value::as_str).map(str::to_string))
     }
 
@@ -2022,7 +2011,7 @@ impl Cdp {
             .is_some_and(|urls| urls.iter().any(|text| self.guard.url(text)))
     }
 
-    fn iframe_frame_protected(&self, frame: &str, all: &[Value]) -> Option<bool> {
+    fn iframe_frame_protected(&self, frame: &str, all: &Listing) -> Option<bool> {
         if self.protected_targets.contains(frame) || self.frames_entry_protected(frame) {
             return Some(true);
         }
@@ -2031,8 +2020,7 @@ impl Cdp {
             if self.protected_targets.contains(target) {
                 return Some(true);
             }
-            let url = found.get("url").and_then(Value::as_str).unwrap_or("");
-            if self.guard.url(url) || self.target_own_protected(found, all) {
+            if self.targets.verdicts(found, &self.guard).protected || self.target_own_protected(found, all) {
                 return Some(true);
             }
             if let Some(doc) = self.documents.get(target) {
@@ -2048,15 +2036,15 @@ impl Cdp {
         None
     }
 
-    fn iframe_ancestor_unresolved(&self, info: &Value, all: &[Value]) -> bool {
+    fn iframe_ancestor_unresolved(&self, info: &Value, all: &Listing) -> bool {
         matches!(self.iframe_ancestor_state(info, all), AncestorState::Unresolved)
     }
 
-    pub(super) fn iframe_ancestor_protected(&self, info: &Value, all: &[Value]) -> bool {
+    pub(super) fn iframe_ancestor_protected(&self, info: &Value, all: &Listing) -> bool {
         !matches!(self.iframe_ancestor_state(info, all), AncestorState::Clear)
     }
 
-    fn iframe_ancestor_state(&self, info: &Value, all: &[Value]) -> AncestorState {
+    fn iframe_ancestor_state(&self, info: &Value, all: &Listing) -> AncestorState {
         if info.get("type").and_then(Value::as_str) != Some("iframe") {
             return AncestorState::Clear;
         }
@@ -2083,10 +2071,7 @@ impl Cdp {
                         return AncestorState::Protected;
                     }
                 }
-                let found = all
-                    .iter()
-                    .chain(self.targets.values())
-                    .find(|item| item.get("targetId").and_then(Value::as_str) == Some(owner.as_str()));
+                let found = all.first(&owner).or_else(|| self.targets.by_id(&owner));
                 if let Some(found) = found {
                     if self.target_own_protected(found, all) {
                         return AncestorState::Protected;
@@ -2106,13 +2091,7 @@ impl Cdp {
                 if !self.targets.contains_key(&owner) {
                     return AncestorState::Unresolved;
                 }
-                return if self.guard.url(
-                    self.targets
-                        .get(&owner)
-                        .and_then(|info| info.get("url"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                ) {
+                return if self.targets.get(&owner).is_some_and(|info| self.targets.verdicts(info, &self.guard).protected) {
                     AncestorState::Protected
                 } else {
                     AncestorState::Clear
@@ -2126,7 +2105,7 @@ impl Cdp {
         }
     }
 
-    fn discovery_hidden_iframe(&self, info: &Value, all: &[Value]) -> bool {
+    fn discovery_hidden_iframe(&self, info: &Value, all: &Listing) -> bool {
         info.get("type").and_then(Value::as_str) == Some("iframe") && self.iframe_ancestor_protected(info, all)
     }
 
@@ -2521,10 +2500,10 @@ impl Cdp {
         } else {
             self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))
                 || self.guard.target(&url, false, opener)
-                || self.iframe_ancestor_protected(&info, &[])
-                || self.worker_opener_protected(&info, &[])
+                || self.iframe_ancestor_protected(&info, &Listing::NONE)
+                || self.worker_opener_protected(&info, &Listing::NONE)
         };
-        if protected && self.should_latch_protected(&info, &[]) {
+        if protected && self.should_latch_protected(&info, &Listing::NONE) {
             let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
             if !self.documents.contains_key(target_id)
                 || matches!(kind, "iframe" | "worker" | "service_worker" | "shared_worker")
@@ -2986,7 +2965,7 @@ impl Cdp {
             if let Some(doc) = self.documents.get_mut(&id) {
                 doc.previous = false;
             }
-            let protected = self.targets.get(&id).cloned().is_some_and(|info| self.should_latch_protected(&info, &[]))
+            let protected = self.targets.get(&id).cloned().is_some_and(|info| self.should_latch_protected(&info, &Listing::NONE))
                 || self.documents.get(&id).is_some_and(|doc| self.guard.url(&doc.url) || self.guard.url(&doc.origin));
             if protected {
                 self.protect_target(&id);
@@ -3167,7 +3146,7 @@ impl Cdp {
     fn probe_candidate(&self, info: &Value) -> bool {
         let text = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or("");
         let target = text("targetId");
-        !target.is_empty() && text("type") == "page" && text("openerId").is_empty() && (self.guard.url(text("url")) || self.guard.error_page_url(text("url"))) && !self.guard.unparseable(text("url"))
+        !target.is_empty() && text("type") == "page" && text("openerId").is_empty() && { let verdicts = self.targets.verdicts(info, &self.guard); (verdicts.protected || self.guard.error_page_url(text("url"))) && !verdicts.unparseable }
             && !self.documents.contains_key(target) && !self.abandoned.contains(target) && !self.guards.contains_key(target)
     }
 
@@ -3519,7 +3498,7 @@ impl Cdp {
                 } else if let Some(frame) = info.get("openerFrameId").and_then(Value::as_str).filter(|id| !id.is_empty()) {
                     if frame == ancestor
                         || self.iframe_own_frames.get(frame).is_some_and(|owner| owner == ancestor)
-                        || self.frame_owner_target(frame, &[]).as_deref() == Some(ancestor)
+                        || self.frame_owner_target(frame, &Listing::NONE).as_deref() == Some(ancestor)
                         || self.worker_opener_frame_reaches(frame, ancestor)
                     {
                         out.push(id.clone());
@@ -3537,10 +3516,10 @@ impl Cdp {
         if self.iframe_own_frames.get(frame).is_some_and(|owner| owner == ancestor) {
             return true;
         }
-        if self.frame_owner_target(frame, &[]).as_deref() == Some(ancestor) {
+        if self.frame_owner_target(frame, &Listing::NONE).as_deref() == Some(ancestor) {
             return true;
         }
-        if let Some(owner) = self.frame_owner_target(frame, &[]) {
+        if let Some(owner) = self.frame_owner_target(frame, &Listing::NONE) {
             if let Some(found) = self.targets.get(&owner) {
                 if found.get("type").and_then(Value::as_str) == Some("iframe") {
                     return self.iframe_ancestor_reaches(found, ancestor);
@@ -3570,7 +3549,7 @@ impl Cdp {
             if self.iframe_own_frames.get(parent).is_some_and(|owner| owner == ancestor) {
                 return true;
             }
-            if let Some(owner) = self.frame_owner_target(parent, &[]) {
+            if let Some(owner) = self.frame_owner_target(parent, &Listing::NONE) {
                 if owner == ancestor {
                     return true;
                 }
@@ -3588,7 +3567,7 @@ impl Cdp {
                 parent = next.as_str();
                 continue;
             }
-            if let Some(found) = self.iframe_target_for_frame(parent, &[]) {
+            if let Some(found) = self.iframe_target_for_frame(parent, &Listing::NONE) {
                 if found.get("targetId").and_then(Value::as_str) == Some(ancestor) {
                     return true;
                 }
@@ -3910,28 +3889,29 @@ impl Cdp {
                     self.targets.insert(target.clone(), info.clone());
                     self.latch_kept_target_url(&target, url);
                 }
-                if self.info_protected(&info, &[]) && !self.probing.contains(&target) && self.should_latch_protected(&info, &[]) {
+                let verdicts = self.targets.verdicts(&info, &self.guard);
+                if self.info_protected(&info, &[]) && !self.probing.contains(&target) && self.should_latch_protected(&info, &Listing::NONE) {
                     let navigating = self.documents.get(&target).is_some_and(|doc| doc.navigating);
                     let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
                     if !self.documents.contains_key(&target) {
                         if !self.probe_candidate(&info) {
                             self.protect_target(&target);
-                        } else if self.guard.url(url) {
+                        } else if verdicts.protected {
                             self.protect_descendant_targets(&target);
                         }
-                    } else if self.guard.url(url) && !navigating {
+                    } else if verdicts.protected && !navigating {
                         if matches!(kind, "iframe" | "worker" | "service_worker" | "shared_worker") {
                             self.protect_target(&target);
                         } else {
                             self.protect_descendant_targets(&target);
                         }
-                    } else if self.guard.url(url) {
+                    } else if verdicts.protected {
                         self.protect_descendant_targets(&target);
                     }
-                } else if self.guard.url(url) && !self.probing.contains(&target) {
+                } else if verdicts.protected && !self.probing.contains(&target) {
                     self.protect_descendant_targets(&target);
                 }
-                if self.guard.url(url) {
+                if verdicts.protected {
                     self.protect_descendant_targets(&target);
                 }
                 if !target.is_empty() {
@@ -3940,11 +3920,11 @@ impl Cdp {
                     }
                     self.bind_proven_iframe_frames();
                 }
-                if self.discovery_hidden_iframe(&info, &[]) || self.worker_opener_unresolved(&info, &[]) {
+                if self.discovery_hidden_iframe(&info, &Listing::NONE) || self.worker_opener_unresolved(&info, &Listing::NONE) {
                     value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));
                 } else if self.info_protected(&info, &[]) || self.discovery_redacted(&info) {
                     value["params"]["targetInfo"] = shield::redacted(&info);
-                } else if !self.documents.contains_key(&target) && !self.guard.target(url, false, Opener::Unknown)
+                } else if !self.documents.contains_key(&target) && !verdicts.target(false, Opener::Unknown)
                     && !self.abandoned.contains(&target)
                 {
                     self.protected_targets.remove(&target);
@@ -3971,28 +3951,28 @@ impl Cdp {
                     let opener_cut = (!opener.is_empty()
                         && (self.protected_targets.contains(opener)
                             || self.targets.get(opener).is_some_and(|found| {
-                                self.target_own_protected(found, &[])
+                                self.target_own_protected(found, &Listing::NONE)
                                     || self.protected_targets.contains(opener)
-                                    || !matches!(self.iframe_ancestor_state(found, &[]), AncestorState::Clear)
+                                    || !matches!(self.iframe_ancestor_state(found, &Listing::NONE), AncestorState::Clear)
                             })))
                         || (!opener_frame.is_empty()
-                            && (self.iframe_frame_protected(opener_frame, &[]) == Some(true)
-                                || self.frame_owner_target(opener_frame, &[]).map(|owner| {
-                                    !self.frame_owner_live(&owner, &[])
+                            && (self.iframe_frame_protected(opener_frame, &Listing::NONE) == Some(true)
+                                || self.frame_owner_target(opener_frame, &Listing::NONE).map(|owner| {
+                                    !self.frame_owner_live(&owner, &Listing::NONE)
                                         || self.protected_targets.contains(&owner)
                                         || self.targets.get(&owner).is_some_and(|found| {
-                                            self.target_own_protected(found, &[])
-                                                || self.iframe_ancestor_protected(found, &[])
+                                            self.target_own_protected(found, &Listing::NONE)
+                                                || self.iframe_ancestor_protected(found, &Listing::NONE)
                                         })
                                 }).unwrap_or(true)));
                     let ancestor = if kind == "iframe" {
-                        self.iframe_ancestor_state(info, &[])
+                        self.iframe_ancestor_state(info, &Listing::NONE)
                     } else {
                         AncestorState::Clear
                     };
                     let cut = match kind {
                         "worker" | "service_worker" | "shared_worker" => {
-                            self.worker_opener_protected(info, &[]) || opener_cut
+                            self.worker_opener_protected(info, &Listing::NONE) || opener_cut
                         }
                         "iframe" => {
                             !matches!(ancestor, AncestorState::Clear) || opener_cut
@@ -4003,8 +3983,8 @@ impl Cdp {
                         let latch = match kind {
                             "iframe" => matches!(ancestor, AncestorState::Protected) || opener_cut,
                             "worker" | "service_worker" | "shared_worker" => {
-                                self.worker_opener_protected(info, &[]) && !self.worker_opener_unresolved(info, &[])
-                                    || opener_cut && !self.worker_opener_unresolved(info, &[])
+                                self.worker_opener_protected(info, &Listing::NONE) && !self.worker_opener_unresolved(info, &Listing::NONE)
+                                    || opener_cut && !self.worker_opener_unresolved(info, &Listing::NONE)
                             }
                             _ => false,
                         };
@@ -4020,23 +4000,23 @@ impl Cdp {
                             }
                         }
                         if matches!(kind, "worker" | "service_worker" | "shared_worker")
-                            || self.discovery_hidden_iframe(info, &[])
-                            || self.worker_opener_unresolved(info, &[])
+                            || self.discovery_hidden_iframe(info, &Listing::NONE)
+                            || self.worker_opener_unresolved(info, &Listing::NONE)
                         {
                             value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));
                         } else {
                             value["params"]["targetInfo"] = shield::redacted(info);
                         }
-                    } else if self.discovery_hidden_iframe(info, &[])
-                        || self.worker_opener_unresolved(info, &[])
+                    } else if self.discovery_hidden_iframe(info, &Listing::NONE)
+                        || self.worker_opener_unresolved(info, &Listing::NONE)
                     {
-                        let _ = self.redact(info, &[]);
+                        let _ = self.redact(info, &Listing::NONE);
                         value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));
                     } else {
                         value["params"]["targetInfo"] = if info.get("targetId").and_then(Value::as_str).is_some_and(|target| self.probing.contains(target)) {
                             shield::redacted(info)
                         } else {
-                            self.redact(info, &[])
+                            self.redact(info, &Listing::NONE)
                         };
                     }
                 }
@@ -4087,8 +4067,8 @@ impl Cdp {
                             let opener_frame = info.get("openerFrameId").and_then(Value::as_str).unwrap_or("");
                             if owned_frames.contains(parent)
                                 || owned_frames.contains(opener_frame)
-                                || !matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Clear)
-                                || self.worker_opener_protected(info, &[])
+                                || !matches!(self.iframe_ancestor_state(info, &Listing::NONE), AncestorState::Clear)
+                                || self.worker_opener_protected(info, &Listing::NONE)
                             {
                                 Some(session.clone())
                             } else {
@@ -4534,8 +4514,8 @@ impl Cdp {
             self.targets.get(&target).is_some_and(|info| {
                 let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
                 match kind {
-                    "iframe" => !matches!(self.iframe_ancestor_state(info, &[]), AncestorState::Clear),
-                    "worker" | "service_worker" | "shared_worker" => self.worker_opener_protected(info, &[]),
+                    "iframe" => !matches!(self.iframe_ancestor_state(info, &Listing::NONE), AncestorState::Clear),
+                    "worker" | "service_worker" | "shared_worker" => self.worker_opener_protected(info, &Listing::NONE),
                     _ => false,
                 }
             })
@@ -5812,6 +5792,7 @@ mod tests {
     include!("protected_close_test.rs");
     include!("page_scope_retry_test.rs");
     include!("iframe_ancestor_test.rs");
+    include!("target_scale_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

@@ -13,7 +13,8 @@ impl Cdp {
         let infos = self.front_infos()?;
         let text = |info: &Value, key: &str| info.get(key).and_then(Value::as_str).unwrap_or("").to_string();
         let mine = infos.iter().find(|info| text(info, "targetId") == own).cloned().ok_or_else(|| self.refusal())?;
-        if text(&mine, "type") != "page" || self.info_protected(&mine, &infos) { return Err(self.refusal()) }
+        let listing = Listing::new(&infos);
+        if text(&mine, "type") != "page" || self.info_protected(&mine, &listing) { return Err(self.refusal()) }
         let context = text(&mine, "browserContextId");
         let window = self.front_window(&own).map_err(|_| self.refusal())?;
         if self.front_visible(&own) != Some(false) { return Err(self.refusal()) }
@@ -26,7 +27,7 @@ impl Cdp {
             if id == own || kind == "iframe" || WINDOWLESS.contains(&kind.as_str()) || top_chrome(info) { continue }
             let other = text(info, "browserContextId");
             if !context.is_empty() && !other.is_empty() && other != context { continue }
-            let open = !id.is_empty() && url::Url::parse(&text(info, "url")).is_ok() && !self.protected_targets.contains(&id) && !self.info_protected(info, &infos);
+            let open = !id.is_empty() && url::Url::parse(&text(info, "url")).is_ok() && !self.protected_targets.contains(&id) && !self.info_protected(info, &listing);
             let same = match self.front_window(&id) {
                 Ok(found) => found == window,
                 Err(_) if open || kind != "page" => continue,

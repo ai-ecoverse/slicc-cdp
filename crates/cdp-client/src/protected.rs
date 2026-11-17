@@ -190,10 +190,14 @@ impl Protected {
     }
 
     pub fn target(&self, text: &str, previous: bool, opener: Opener) -> bool {
-        if self.inheriting(text) {
+        Self::target_judged(self.inheriting(text), || self.url(text), previous, opener)
+    }
+
+    pub fn target_judged(inheriting: bool, url: impl FnOnce() -> bool, previous: bool, opener: Opener) -> bool {
+        if inheriting {
             return previous || matches!(opener, Opener::Protected | Opener::Unknown);
         }
-        self.url(text)
+        url()
     }
 
     pub fn target_with_document(&self, text: &str, previous: bool, opener: Opener, document_url: Option<&str>, unreachable_url: Option<&str>, navigating: bool) -> bool {

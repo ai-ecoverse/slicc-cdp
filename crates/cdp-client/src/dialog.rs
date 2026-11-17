@@ -18,10 +18,11 @@ impl Cdp {
     pub fn dialog_targets(&mut self) -> Result<Vec<String>, String> {
         let result = self.raw_call("Target.getTargets", json!({}), None, DOCUMENT_CHECK)?;
         let infos = result.get("targetInfos").and_then(Value::as_array).ok_or_else(|| self.refusal())?;
+        let listing = Listing::new(infos);
         Ok(infos.iter().filter(|info| {
             info.get("type").and_then(Value::as_str) == Some("page")
                 && info.get("url").and_then(Value::as_str).is_some_and(|url| self.dialog_url(url))
-                && !self.info_protected(info, infos)
+                && !self.info_protected(info, &listing)
         }).filter_map(|info| info.get("targetId").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)).collect())
     }
 
