@@ -1725,12 +1725,13 @@ impl Cdp {
 
     fn webmcp_merge_target(&mut self, target: &str, info: &Value) {
         if target.is_empty() { return; }
-        let entry = self.targets.entry(target.to_string()).or_insert_with(|| info.clone());
+        let mut entry = self.targets.get(target).cloned().unwrap_or_else(|| info.clone());
         if let (Some(stored), Some(fresh)) = (entry.as_object_mut(), info.as_object()) {
             for key in ["type", "url", "parentFrameId"] {
                 if let Some(value) = fresh.get(key) { stored.insert(key.into(), value.clone()); }
             }
         }
+        self.targets.insert(target.to_string(), entry);
     }
 
     fn webmcp_reconcile_eligible(&self, holder: &str) -> bool {
