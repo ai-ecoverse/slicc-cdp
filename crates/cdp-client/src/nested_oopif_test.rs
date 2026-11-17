@@ -712,7 +712,7 @@ impl Flow {
 
     fn frame_event_for(&self, inner: &str, mid: &str) -> bool {
         self.cdp.events()[self.from..].iter().any(|event| {
-            event["method"].as_str().is_some_and(|method| method.starts_with("Page.frame"))
+            matches!(event["method"].as_str(), Some("Page.frameAttached" | "Page.frameNavigated" | "Page.frameDetached"))
                 && (event["params"]["frameId"] == inner || event["params"]["frame"]["id"] == inner
                     || event["params"]["parentFrameId"] == mid || event["params"]["frame"]["parentId"] == mid)
         })
