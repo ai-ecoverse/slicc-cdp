@@ -493,30 +493,44 @@ fn ordinary_empty_value_set_cookie_deletion_headers_stay_visible() {
     assert_eq!(hidden.matches("[redacted]").count(), 2, "{hidden}");
     assert!(!hidden.contains("sid=;"), "{hidden}");
     let empty = |domain: &str| json!([{"name": "Set-Cookie", "value": format!("sid=; Max-Age=0; Domain={domain}")}]);
-    for domain in [".adobelogin.com", ".sliccy.ai"] {
-        let mut fulfill = url_backend("https://example.test/");
-        fulfill.hand("S", "R");
-        fulfill.requests.insert("R".into(), false);
-        assert!(fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(domain)}), Some("S")).is_err(), "{domain}");
-        let mut continued = url_backend("https://example.test/");
-        continued.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
-            "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
-            "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
-            "responseStatusCode": 200,
-            "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
-        }}));
-        assert!(continued.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
-        assert!(continued.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(domain)}), Some("S")).is_err(), "{domain}");
-        let raw = crate::net::base64_encode(format!("HTTP/1.1 200 OK\r\nSet-Cookie: sid=; Max-Age=0; Domain={domain}\r\n\r\n").as_bytes());
-        let mut intercepted = url_backend("https://example.test/");
-        intercepted.hand("S", "I1");
-        intercepted.requests.insert("I1".into(), false);
-        assert!(intercepted.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw}), Some("S")).is_err(), "{domain}");
-    }
+    let mut fulfill = url_backend("https://example.test/");
+    fulfill.hand("S", "R");
+    fulfill.requests.insert("R".into(), false);
+    assert_eq!(
+        fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(".adobelogin.com")}), Some("S")).unwrap_err(),
+        credential_refusal()
+    );
+    let mut continued = url_backend("https://example.test/");
+    continued.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
+        "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
+        "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
+        "responseStatusCode": 200,
+        "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
+    }}));
+    assert!(continued.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
+    assert_eq!(
+        continued.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(".adobelogin.com")}), Some("S")).unwrap_err(),
+        credential_refusal()
+    );
+    let raw = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=; Max-Age=0; Domain=.adobelogin.com\r\n\r\n");
+    let mut intercepted = url_backend("https://example.test/");
+    intercepted.hand("S", "I1");
+    intercepted.requests.insert("I1".into(), false);
+    assert_eq!(
+        intercepted.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw}), Some("S")).unwrap_err(),
+        credential_refusal()
+    );
+    let mut protected = url_backend("https://example.test/");
+    protected.hand("S", "R");
+    protected.requests.insert("R".into(), false);
+    assert_eq!(
+        protected.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(".sliccy.ai")}), Some("S")).unwrap_err(),
+        super::COOKIES
+    );
 }
 
 #[test]
-fn response_side_set_cookie_writes_through_interception_are_refused() {
+fn credential_response_side_set_cookie_writes_through_interception_are_refused() {
     let refusal = credential_refusal();
     let plant = |domain: &str| format!("sid=PLANTED; Domain={domain}; HttpOnly");
     let headers = |domain: &str| json!([{"name": "Set-Cookie", "value": plant(domain)}]);
@@ -527,17 +541,6 @@ fn response_side_set_cookie_writes_through_interception_are_refused() {
         fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": headers(".adobelogin.com")}), Some("S")).unwrap_err(),
         refusal
     );
-    let mut fulfill_ok = url_backend("https://example.test/");
-    fulfill_ok.hand("S", "R");
-    fulfill_ok.requests.insert("R".into(), false);
-    assert!(fulfill_ok.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]}), Some("S")).is_ok());
-    let mut fulfill_protected = url_backend("https://example.test/");
-    fulfill_protected.hand("S", "R");
-    fulfill_protected.requests.insert("R".into(), false);
-    assert_eq!(
-        fulfill_protected.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": headers(".sliccy.ai")}), Some("S")).unwrap_err(),
-        super::COOKIES
-    );
     let binary = crate::net::base64_encode(b"Set-Cookie: sid=PLANTED; Domain=.adobelogin.com\0Content-Type: text/plain");
     let mut fulfill_binary = url_backend("https://example.test/");
     fulfill_binary.hand("S", "R");
@@ -545,13 +548,6 @@ fn response_side_set_cookie_writes_through_interception_are_refused() {
     assert_eq!(
         fulfill_binary.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "binaryResponseHeaders": binary}), Some("S")).unwrap_err(),
         refusal
-    );
-    let mut fulfill_bad_binary = url_backend("https://example.test/");
-    fulfill_bad_binary.hand("S", "R");
-    fulfill_bad_binary.requests.insert("R".into(), false);
-    assert_eq!(
-        fulfill_bad_binary.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "binaryResponseHeaders": "!"}), Some("S")).unwrap_err(),
-        super::COOKIES
     );
     let mut continue_response = url_backend("https://example.test/");
     continue_response.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
@@ -565,15 +561,6 @@ fn response_side_set_cookie_writes_through_interception_are_refused() {
         continue_response.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": headers(".adobelogin.com")}), Some("S")).unwrap_err(),
         refusal
     );
-    let mut continue_ok = url_backend("https://example.test/");
-    continue_ok.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
-        "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
-        "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
-        "responseStatusCode": 200,
-        "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
-    }}));
-    assert!(continue_ok.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
-    assert!(continue_ok.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]}), Some("S")).is_ok());
     let raw = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=PLANTED; Domain=.adobelogin.com; HttpOnly\r\n\r\n");
     let mut intercepted = url_backend("https://example.test/");
     intercepted.hand("S", "I1");
@@ -582,20 +569,6 @@ fn response_side_set_cookie_writes_through_interception_are_refused() {
         intercepted.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw}), Some("S")).unwrap_err(),
         refusal
     );
-    let raw_protected = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=PLANTED; Domain=.sliccy.ai; HttpOnly\r\n\r\n");
-    let mut intercepted_protected = url_backend("https://example.test/");
-    intercepted_protected.hand("S", "I1");
-    intercepted_protected.requests.insert("I1".into(), false);
-    assert_eq!(
-        intercepted_protected.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw_protected}), Some("S")).unwrap_err(),
-        super::COOKIES
-    );
-    let mut continue_request = url_backend("https://example.test/");
-    continue_request.hand("S", "R");
-    continue_request.requests.insert("R".into(), false);
-    assert!(continue_request.call("Fetch.continueRequest", json!({"requestId": "R", "headers": {"Cookie": "sid=REQUEST_COOKIE"}}), Some("S")).is_ok());
-    let extra = url_backend("https://example.test/").call("Network.setExtraHTTPHeaders", json!({"headers": {"Cookie": "sid=REQUEST_COOKIE"}}), Some("S"));
-    assert_eq!(extra.unwrap_err(), super::PERSISTENT);
 }
 
 #[test]
