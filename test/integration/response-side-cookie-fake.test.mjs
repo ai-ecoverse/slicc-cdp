@@ -222,6 +222,24 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
     });
     assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', cookie2OrdinaryId));
 
+    const cookie2CredentialId = await enable('Request');
+    const fromCookie2Credential = backend.calls.length;
+    await assert.rejects(
+      send('Fetch.fulfillRequest', {
+        requestId: cookie2CredentialId,
+        responseCode: 200,
+        responseHeaders: [{ name: 'Set-Cookie2', value: plant('.adobelogin.com') }],
+      }),
+      /this origin holds sign-in credentials/
+    );
+    assert.equal(
+      backend.calls
+        .slice(fromCookie2Credential)
+        .some((call) => call.method === 'Fetch.fulfillRequest'),
+      false,
+      'credential Set-Cookie2 plant must not reach the backend'
+    );
+
     await assert.rejects(
       send('Network.setRequestInterception', { patterns: [] }),
       /slicc: refused:/

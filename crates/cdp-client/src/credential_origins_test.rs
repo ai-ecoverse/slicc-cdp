@@ -572,6 +572,145 @@ fn credential_response_side_set_cookie_writes_through_interception_are_refused()
 }
 
 #[test]
+fn credential_response_side_set_cookie2_writes_through_interception_are_refused() {
+    let refusal = credential_refusal();
+    let plant = |domain: &str| format!("sid=PLANTED; Domain={domain}; HttpOnly");
+    for domain in [".adobelogin.com", "ims-na1.adobelogin.com", "ims-na1-stg1.adobelogin.com"] {
+        let line = plant(domain);
+        for name in ["Set-Cookie2", "SET-COOKIE2", "set-Cookie2", " Set-Cookie2 "] {
+            let mut fulfill = url_backend("https://example.test/");
+            fulfill.hand("S", "R");
+            fulfill.requests.insert("R".into(), false);
+            assert_eq!(
+                fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": name, "value": &line}]}), Some("S")).unwrap_err(),
+                refusal,
+                "fulfill array {name:?} {domain}"
+            );
+            let mut cont = url_backend("https://example.test/");
+            cont.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
+                "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
+                "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
+                "responseStatusCode": 200,
+                "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
+            }}));
+            assert!(cont.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
+            assert_eq!(
+                cont.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": name, "value": &line}]}), Some("S")).unwrap_err(),
+                refusal,
+                "continueResponse array {name:?} {domain}"
+            );
+        }
+        let binary = crate::net::base64_encode(format!("Set-Cookie2: {line}\0Content-Type: text/plain").as_bytes());
+        let mut fulfill_binary = url_backend("https://example.test/");
+        fulfill_binary.hand("S", "R");
+        fulfill_binary.requests.insert("R".into(), false);
+        assert_eq!(
+            fulfill_binary.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "binaryResponseHeaders": binary}), Some("S")).unwrap_err(),
+            refusal,
+            "fulfill binary {domain}"
+        );
+        let binary_mixed = crate::net::base64_encode(format!("SET-COOKIE2: {line}\0Content-Type: text/plain").as_bytes());
+        let mut fulfill_binary_mixed = url_backend("https://example.test/");
+        fulfill_binary_mixed.hand("S", "R");
+        fulfill_binary_mixed.requests.insert("R".into(), false);
+        assert_eq!(
+            fulfill_binary_mixed.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "binaryResponseHeaders": binary_mixed}), Some("S")).unwrap_err(),
+            refusal,
+            "fulfill binary SET-COOKIE2 {domain}"
+        );
+        let raw = crate::net::base64_encode(format!("HTTP/1.1 200 OK\r\nSet-Cookie2: {line}\r\n\r\n").as_bytes());
+        let mut intercepted = url_backend("https://example.test/");
+        intercepted.hand("S", "I1");
+        intercepted.requests.insert("I1".into(), false);
+        assert_eq!(
+            intercepted.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw}), Some("S")).unwrap_err(),
+            refusal,
+            "raw {domain}"
+        );
+        let raw_mixed = crate::net::base64_encode(format!("HTTP/1.1 200 OK\r\nset-Cookie2: {line}\r\n\r\n").as_bytes());
+        let mut intercepted_mixed = url_backend("https://example.test/");
+        intercepted_mixed.hand("S", "I1");
+        intercepted_mixed.requests.insert("I1".into(), false);
+        assert_eq!(
+            intercepted_mixed.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw_mixed}), Some("S")).unwrap_err(),
+            refusal,
+            "raw set-Cookie2 {domain}"
+        );
+        let mut headers_map = url_backend("https://example.test/");
+        headers_map.hand("S", "I1");
+        headers_map.requests.insert("I1".into(), false);
+        assert_eq!(
+            headers_map.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "headers": {"Set-Cookie2": &line}}), Some("S")).unwrap_err(),
+            refusal,
+            "headers map {domain}"
+        );
+        let mut headers_map_mixed = url_backend("https://example.test/");
+        headers_map_mixed.hand("S", "I1");
+        headers_map_mixed.requests.insert("I1".into(), false);
+        assert_eq!(
+            headers_map_mixed.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "headers": {"SET-COOKIE2": &line}}), Some("S")).unwrap_err(),
+            refusal,
+            "headers map SET-COOKIE2 {domain}"
+        );
+    }
+    for line in [
+        "a=b; Domain=\".adobelogin.com\"",
+        "a=b; DOMAIN=.ADOBELOGIN.COM.",
+        "a=b; Domain=adobelogin.com.",
+        "a=b; Domain=example.test; Domain=.adobelogin.com",
+        "a=b; Domain=\"ims-na1.adobelogin.com\"",
+        "a=b; DOMAIN=IMS-NA1-STG1.ADOBELOGIN.COM.",
+        "a=b; Domain=example.test; Domain=ims-na1.adobelogin.com",
+    ] {
+        let mut fulfill = url_backend("https://example.test/");
+        fulfill.hand("S", "R");
+        fulfill.requests.insert("R".into(), false);
+        assert_eq!(
+            fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": "Set-Cookie2", "value": line}]}), Some("S")).unwrap_err(),
+            refusal,
+            "{line}"
+        );
+        let mut cont = url_backend("https://example.test/");
+        cont.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
+            "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
+            "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
+        }}));
+        assert!(cont.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
+        assert_eq!(
+            cont.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": "Set-Cookie2", "value": line}]}), Some("S")).unwrap_err(),
+            refusal,
+            "continueResponse {line}"
+        );
+        let raw = crate::net::base64_encode(format!("HTTP/1.1 200 OK\r\nSet-Cookie2: {line}\r\n\r\n").as_bytes());
+        let mut intercepted = url_backend("https://example.test/");
+        intercepted.hand("S", "I1");
+        intercepted.requests.insert("I1".into(), false);
+        assert_eq!(
+            intercepted.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw}), Some("S")).unwrap_err(),
+            refusal,
+            "raw {line}"
+        );
+    }
+    for line in ["sid=ok; Domain=example.test; Path=/", "sid=ok; Domain=.adobe.com; Path=/"] {
+        let mut fulfill = url_backend("https://example.test/");
+        fulfill.hand("S", "R");
+        fulfill.requests.insert("R".into(), false);
+        assert!(fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": "Set-Cookie2", "value": line}]}), Some("S")).is_ok(), "{line}");
+    }
+    let mut deletion = url_backend("https://example.test/");
+    deletion.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
+        "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
+        "request": {"url": "https://shop.example.test/api", "method": "GET", "headers": {}},
+        "responseStatusCode": 200,
+        "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
+    }}));
+    assert!(deletion.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
+    assert!(deletion.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": [{"name": "Set-Cookie2", "value": "sid=; Max-Age=0; Path=/"}]}), Some("S")).is_ok());
+}
+
+#[test]
 fn audit_raw_cookie_lines_follow_the_same_parse() {
     let issue = |details: Value| json!({"method":"Audits.issueAdded","sessionId":"S","params":{"issue":{"code":"CookieIssue","details":{"cookieIssueDetails":details}}}});
     let url = json!({"requestId":"R","url":"https://shop.example.test/api"});
