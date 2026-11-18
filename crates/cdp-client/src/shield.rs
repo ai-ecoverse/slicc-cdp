@@ -789,7 +789,10 @@ fn domain_attributes(line: &str) -> Vec<String> {
 
 fn cookie_line_usable(line: &str) -> bool {
     !line.is_empty() && line.lines().all(|line| {
-        line.split(';').next().and_then(|pair| pair.split_once('=')).is_some_and(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+        line.split(';').next().and_then(|pair| pair.split_once('=')).is_some_and(|(name, value)| {
+            let name = name.trim();
+            !name.is_empty() && !value.trim().is_empty() && !name.eq_ignore_ascii_case("domain")
+        })
     })
 }
 
@@ -802,8 +805,18 @@ fn line_scope_hidden(guard: &Protected, line: &str, base: &str) -> bool {
     }
 }
 
+fn credential_line_scope(guard: &Protected, line: &str, base: &str) -> bool {
+    let domains = domain_attributes(line);
+    if domains.is_empty() {
+        guard.credential_cookie_url(base)
+            || host_of(&web_socket_as_http(base)).is_none_or(|host| guard.credential_cookie_domain(&host))
+    } else {
+        domains.iter().any(|domain| guard.credential_cookie_domain(domain))
+    }
+}
+
 pub fn set_cookie_hidden(guard: &Protected, value: &str, base: &str) -> bool {
-    guard.url(base) || value.lines().any(|line| line_scope_hidden(guard, line, base))
+    !cookie_line_usable(value) || guard.url(base) || value.lines().any(|line| line_scope_hidden(guard, line, base))
 }
 
 pub fn cookie_line_hidden(guard: &Protected, line: &str, base: &str) -> bool {
@@ -892,7 +905,7 @@ fn header_set_cookies(fields: Option<&Value>) -> Option<Vec<String>> {
 
 fn http_header_block(text: &str) -> &str {
     let mut cut = text.len();
-    for sep in ["\r\n\r\n", "\n\r\n", "\n\n"] {
+    for sep in ["\r\n\r\n", "\r\n\n", "\n\r\n", "\n\n"] {
         if let Some(at) = text.find(sep) {
             cut = cut.min(at);
         }
@@ -1030,6 +1043,13 @@ fn response_set_cookie_lines(method: &str, params: &Value) -> Option<Vec<String>
         }
         _ => Some(Vec::new()),
     }
+}
+
+pub fn credential_response_cookie_refused(guard: &Protected, method: &str, params: &Value, base: &str) -> bool {
+    response_set_cookie_lines(method, params)
+        .unwrap_or_default()
+        .iter()
+        .any(|line| cookie_line_parseable(line) && credential_line_scope(guard, line, base))
 }
 
 pub fn response_cookie_refused(guard: &Protected, method: &str, params: &Value, base: &str) -> bool {

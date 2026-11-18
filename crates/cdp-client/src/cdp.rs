@@ -1067,6 +1067,9 @@ impl Cdp {
         }
         if shield::response_cookie_writer(method) {
             let base = self.issued.request_url(session_id, &shield::request_key(params).unwrap_or_default());
+            if shield::credential_response_cookie_refused(&self.guard, method, params, &base) {
+                return Err(format!("{}\n", self.guard.credential_refusal()));
+            }
             if shield::response_cookie_refused(&self.guard, method, params, &base) {
                 return Err(COOKIES.into());
             }

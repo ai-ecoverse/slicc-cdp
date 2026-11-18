@@ -525,11 +525,7 @@ fn parse(text: &str) -> Option<Url> {
 }
 
 fn host_of(url: &Url) -> String {
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    match host.strip_suffix('.') {
-        Some(stripped) => stripped.to_string(),
-        None => host,
-    }
+    url.host_str().unwrap_or("").to_ascii_lowercase().trim_end_matches('.').to_string()
 }
 
 fn origin_of(url: &Url) -> Option<String> {
@@ -688,12 +684,24 @@ mod tests {
             "https://ims-na1.adobelogin.com/ims/authorize?x=1#f",
             "http://ims-na1.adobelogin.com:8443/",
             "https://IMS-NA1.ADOBELOGIN.COM./",
+            "https://ims-na1.adobelogin.com../",
+            "https://ims-na1.adobelogin.com.../",
             "https://ims-na1-stg1.adobelogin.com/",
             "blob:https://ims-na1.adobelogin.com/id",
         ] {
             assert!(guard.credential_url(url), "{url}");
             assert!(guard.credential_storage_key(&format!("{url}^31")), "{url}");
             assert!(guard.storage_key(url), "{url}");
+        }
+        for origin in [
+            "https://ims-na1.adobelogin.com../",
+            "https://ims-na1.adobelogin.com.../",
+        ] {
+            assert!(guard.credential_url(origin), "{origin}");
+            assert!(guard.credential_site(origin), "{origin}");
+            assert!(guard.credential_storage_key(origin), "{origin}");
+            assert!(guard.credential_storage_key(&format!("https://widget.example.test/^0{origin}")), "{origin}");
+            assert!(guard.credential_site(&origin.replace("https://ims-na1.adobelogin.com", "https://adobelogin.com")), "{origin}");
         }
         for url in [
             "https://x.ims-na1.adobelogin.com/",
