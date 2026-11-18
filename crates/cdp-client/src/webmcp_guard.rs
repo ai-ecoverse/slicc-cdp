@@ -834,6 +834,19 @@ impl Cdp {
         eprintln!("webmcp-polyfill: {trace}");
     }
 
+    pub fn eval_attach_document(&mut self, session: &str, frame: &str) -> Result<Value, String> {
+        let epoch = self.frame_epoch;
+        let tree = self.call("Page.getFrameTree", json!({}), Some(session))?;
+        if epoch != self.frame_epoch || !self.webmcp_tree_verified(&tree, Some(frame)) || self.content_blocked(session) {
+            return Err(self.refusal());
+        }
+        Self::webmcp_frame(&tree["frameTree"], frame).cloned().ok_or_else(|| self.refusal())
+    }
+
+    pub fn eval_attach_cross_origin_available(&mut self) -> bool {
+        !self.webmcp_route_attested()
+    }
+
     fn webmcp_frame_refusal(&self, frame: &Value) -> Option<&'static str> {
         let text = |key: &str| frame.get(key).and_then(Value::as_str).unwrap_or("");
         if text("url").is_empty() { return Some("empty document URL"); }

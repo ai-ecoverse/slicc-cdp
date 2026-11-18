@@ -14,6 +14,7 @@ mod dialog_holder;
 #[path = "../../../test/integration/document-client.rs"]
 mod document_client;
 mod eval_attach;
+mod eval_frames;
 mod eval_lease;
 mod eval_scope;
 mod har;

@@ -108,7 +108,7 @@ pub fn global_help() -> String {
         row("recording-stop", "stop recording user actions and print them as playwright code"),
         String::new(),
         "Eval attachments (SLICC):".to_string(),
-        row("eval-attach <file>", "hold guarded eval on matching top-frame documents"),
+        row("eval-attach <file>", "hold guarded eval on matching documents"),
         row("eval-detach [id]", "stop this session's eval attachment holder"),
         String::new(),
         "HAR recording (SLICC):".to_string(),
@@ -228,7 +228,9 @@ fn implemented_page(name: &str) -> Option<String> {
             &[("<path>", "file with the JavaScript to evaluate")],
             &[
                 ("--tab <targetId>", "tab to run in"),
-                ("--frame <frameId>", "frame to run in, in an isolated world"),
+                ("--frame <frameId>", "frame to run in; isolated unless --attachment selects its installed realm"),
+                ("--attachment <id>", "call this session’s live attachment; requires --frame and --loader"),
+                ("--loader <loaderId>", "document loader from document-ready; stale documents are refused"),
                 ("--output <path>", "save the result to a file (alias: --filename)"),
             ],
         ),
@@ -266,10 +268,10 @@ fn implemented_page(name: &str) -> Option<String> {
             &[],
         ),
         "eval-attach" => page(
-            "eval-attach <file> (--tab <id> | --host <pattern> | --match <url-glob>...) [--world main|isolated] [--early]",
-            &["Hold an eval script on matching top-frame documents (SLICC extension)", "Runs a JavaScript body with lexical send(payload) through ordinary guarded Runtime.evaluate. Child frames are refused; normal eval gates apply.", "--early: finish the synchronous body before the first inline head script, using a guarded instrumentation pause. Existing/missed documents and pages with no first script within one second are refused as late; no late fallback. ready reports the requested mode; document-ready early:true confirms installation. Isolated worlds are created and verified while the page script is paused; async callbacks are not awaited.", "Foreground holder; keep stdin open. EOF or eval-detach stops future installs and relaying; running scripts remain until document unload.", "NDJSON events: ready, document-ready, refused, message, stopped. Payloads are untrusted page data. Refusals omit URLs.", "One attachment per CLI session; use -s to hold independent leases."],
+            "eval-attach <file> (--tab <id> | --host <pattern> | --match <url-glob>...) [--world main|isolated] [--early] [--frames <origin|same-origin>]...",
+            &["Hold an eval script on matching documents (SLICC extension)", "Runs a JavaScript body with lexical send(payload) through ordinary guarded Runtime.evaluate. Repeatable --frames opts into child origins at any depth. Protected children and ancestors stay refused. Cross-origin children are unavailable on WASI and guarded routes.", "--early: finish the synchronous body before the first inline head script, using a guarded instrumentation pause. Existing/missed documents and pages with no first script within one second are refused as late; no late fallback. ready reports the requested mode; document-ready early:true confirms top-frame installation. Children always install late and report early:false. Isolated worlds are created and verified while the page script is paused; async callbacks are not awaited.", "Foreground holder; keep stdin open. EOF or eval-detach stops future installs and relaying; running scripts remain until document unload.", "NDJSON events: ready, document-ready, refused, message, stopped. Document events carry frameId; children add origin and parentFrameId. Child readiness/messages include ancestors, allow, srcOrigin, permissionsPolicy and toolsAllowed; null means unknown. Payloads are untrusted page data. Refusals omit URLs. Call the installed realm with eval or eval-file --attachment <id> --frame <id> --loader <id>.", "One attachment per CLI session; use -s to hold independent leases."],
             &[("<file>", "UTF-8 JavaScript body; send(payload) accepts JSON-serializable data")],
-            &[("--tab <id>", "one explicit target"), ("--host <pattern>", "exact host or *.example.com (includes apex)"), ("--match <url-glob>", "repeatable scheme://host/path; * matches any path characters"), ("--world <main|isolated>", "main by default; isolated hides the queue from page scripts"), ("--early", "verified pre-script installation; missed or unverified documents are refused")],
+            &[("--tab <id>", "one explicit target"), ("--host <pattern>", "exact host or *.example.com (includes apex)"), ("--match <url-glob>", "repeatable scheme://host/path; * matches any path characters"), ("--frames <origin|same-origin>", "repeatable HTTP(S) origin without path, credentials or wildcards; same-origin uses the top origin"), ("--world <main|isolated>", "main by default; isolated hides the queue from page scripts"), ("--early", "verified pre-script installation; missed or unverified documents are refused")],
         ),
         "eval-detach" => page(
             "eval-detach [attachmentId]",
@@ -381,7 +383,7 @@ fn implemented_page(name: &str) -> Option<String> {
         ),
         "eval" => page(
             "eval <func> [target]",
-            &["Evaluate JavaScript expression on page or element"],
+            &["Evaluate JavaScript expression on page or element", "With --attachment, --frame and --loader, call a live attachment’s installed realm; changed documents are refused."],
             &[
                 (
                     "<func>",
@@ -390,6 +392,10 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("[target]", "exact target element reference from the page snapshot, or a unique element selector"),
             ],
             &[
+                ("--tab <targetId>", "top tab to run in"),
+                ("--frame <frameId>", "isolated frame world unless --attachment selects its installed realm"),
+                ("--attachment <id>", "live attachment in this CLI session; requires --frame and --loader"),
+                ("--loader <loaderId>", "document loader from document-ready"),
                 (
                     "--filename",
                     "save evaluation result to a file instead of returning it in the response.",

@@ -37,6 +37,10 @@ impl AttachmentLease {
         Ok(Self { id, record, stop, _lease: lease })
     }
 
+    pub(crate) fn publish(&self, documents: Vec<Value>) -> Result<(), String> {
+        session::write_private(&self.record, &json!({"attachmentId":self.id,"state":"attached","documents":documents}).to_string())
+    }
+
     pub(crate) fn stopping(&self) -> bool {
         fs::read_to_string(&self.stop).is_ok_and(|id| id == self.id)
     }
@@ -68,4 +72,14 @@ pub(crate) fn detach(invocation: &Invocation) -> Output {
         if Instant::now() >= deadline { return Output::err("eval-detach: holder did not answer\n") }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+pub(crate) fn context(invocation: &Invocation, target: &str, frame: &str) -> Result<Value, String> {
+    let (record, _) = paths(invocation)?;
+    let found = read(&record).filter(|_| inspect(&record).alive).ok_or_else(|| "eval: attachment holder is unavailable\n".to_string())?;
+    let id = invocation.flags.get("attachment").ok_or("eval: missing --attachment\n")?;
+    let loader = invocation.flags.get("loader").ok_or("eval: --attachment requires --loader from document-ready\n")?;
+    if found["attachmentId"].as_str() != Some(id) { return Err("eval: attachmentId does not belong to this session\n".into()); }
+    found["documents"].as_array().and_then(|documents| documents.iter().find(|document| document["tab"] == target && document["frameId"] == frame && document["loaderId"].as_str() == Some(loader))).cloned()
+        .ok_or_else(|| "eval: attachment document is unavailable or changed\n".into())
 }
