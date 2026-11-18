@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   mandatory,
   published,
+  requiredCapabilities,
   runCapabilities,
   validCapabilitySkip,
   verdictProblems,
@@ -95,4 +96,20 @@ test('a mandatory row that skipped is never accepted', () => {
   const vector = published.vectors.find((entry) => entry.id === id);
   const skipped = row(vector, vector.targets[0], 'skip', 'not-supported:stockSetup');
   assert.equal(verdictProblems([skipped]).length, 1);
+});
+
+test('the signInHold skip is accepted only for the sign-in hold vectors', () => {
+  const holds = published.vectors.filter((vector) =>
+    requiredCapabilities(vector).has('signInHold')
+  );
+  assert.ok(holds.length > 0, 'the published set has sign-in hold vectors');
+  for (const vector of holds) {
+    assert.match(vector.id, /^C7\.sign-in-hold\./);
+    const skipped = row(vector, vector.targets[0], 'skip', 'not-supported:signInHold');
+    assert.equal(validCapabilitySkip(vector, skipped), true, vector.id);
+  }
+  assert.equal(runCapabilities.signInHold, undefined);
+  const skipped = row(plain, plain.targets[0], 'skip', 'not-supported:signInHold');
+  assert.equal(validCapabilitySkip(plain, skipped), false);
+  assert.notDeepEqual(verdictProblems([skipped]), []);
 });
