@@ -28,7 +28,7 @@ fn credential_rules() -> &'static (Vec<String>, String) {
 }
 
 fn credential_hosts(origins: &[String]) -> Vec<String> {
-    origins.iter().filter_map(|text| parse(text)).map(|url| host_of(&url)).filter(|host| !host.is_empty()).collect()
+    origins.iter().filter_map(|text| parse(text)).map(|url| credential_host_of(&url)).filter(|host| !host.is_empty()).collect()
 }
 
 fn catalog_rules() -> &'static ProtectedOrigins {
@@ -83,7 +83,7 @@ impl Protected {
     }
 
     pub fn credential_url(&self, text: &str) -> bool {
-        self.unwrap(parse(text)).is_some_and(|url| matches!(url.scheme(), "http" | "https") && self.credential.contains(&host_of(&url)))
+        self.unwrap(parse(text)).is_some_and(|url| matches!(url.scheme(), "http" | "https") && self.credential.contains(&credential_host_of(&url)))
     }
 
     fn covers_credential(&self, domain: &str) -> bool {
@@ -93,16 +93,16 @@ impl Protected {
     pub fn credential_cookie_domain(&self, domain: &str) -> bool {
         let domain = domain.to_ascii_lowercase();
         let domain = domain.strip_prefix('.').unwrap_or(&domain);
-        self.covers_credential(domain.strip_suffix('.').unwrap_or(domain))
+        self.covers_credential(domain.trim_end_matches('.'))
     }
 
     pub fn credential_site(&self, text: &str) -> bool {
-        parse(text).is_some_and(|url| self.covers_credential(&host_of(&url)))
+        parse(text).is_some_and(|url| self.covers_credential(&credential_host_of(&url)))
     }
 
     pub fn credential_cookie_url(&self, text: &str) -> bool {
         let Some(url) = self.unwrap(parse(text)) else { return false };
-        let host = host_of(&url);
+        let host = credential_host_of(&url);
         if !matches!(url.host(), Some(url::Host::Domain(_))) {
             return false;
         }
@@ -525,6 +525,14 @@ fn parse(text: &str) -> Option<Url> {
 }
 
 fn host_of(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    match host.strip_suffix('.') {
+        Some(stripped) => stripped.to_string(),
+        None => host,
+    }
+}
+
+fn credential_host_of(url: &Url) -> String {
     url.host_str().unwrap_or("").to_ascii_lowercase().trim_end_matches('.').to_string()
 }
 
@@ -673,6 +681,23 @@ mod tests {
                 vector.protected,
                 "{vector:?}"
             );
+        }
+    }
+
+    #[test]
+    fn page_urls_with_multiple_trailing_dots_stay_unprotected_for_seven_and_the_vault() {
+        let guard = Protected::default();
+        for url in [
+            "https://sliccy.ai../app",
+            "https://seven.sliccy.ai../",
+            "https://vault.sliccy.ai../",
+            "https://sliccy.ai.../",
+            "https://seven.sliccy.ai.../x",
+            "https://vault.sliccy.ai.../app",
+        ] {
+            assert!(!guard.url(url), "{url}");
+            assert!(!guard.url_read_only(url), "{url}");
+            assert!(!guard.target(url, false, Opener::None), "{url}");
         }
     }
 
