@@ -54,7 +54,7 @@ Seven's origins, the vault, browser pages, extensions and local files are always
 
 `eval` calls a function expression (arrow, `function` or async function) and prints its awaited result, like Playwright's evaluate. Other expressions and multi-statement scripts still print their values without being called. `--frame` uses the selected frame's isolated world.
 
-The cookie commands, `cookie-list`, `cookie-get`, `cookie-set`, `cookie-delete` and `cookie-clear`, work like Microsoft's and print ordinary values as they are. Seven's and the vault's cookies, including cookies scoped to a parent domain of a protected host, are never listed, read, set or deleted. Domain arguments are canonicalized before the guard checks them; protected scopes and malformed domains are refused. `cookie-clear` leaves protected cookies, and requests to protected origins are not recorded. Headers containing protected-scope cookies and console lines containing their values are hidden, even on ordinary pages.
+The cookie commands, `cookie-list`, `cookie-get`, `cookie-set`, `cookie-delete` and `cookie-clear`, work like Microsoft's and print ordinary values as they are. Seven's and the vault's cookies, including cookies scoped to a parent domain of a protected host, are never listed, read, set or deleted. Domain arguments are canonicalized before the guard checks them; protected scopes and malformed domains are refused. `cookie-clear` leaves protected cookies, and requests to protected origins are not recorded. Headers containing protected-scope cookies and console lines containing their values are hidden, even on ordinary pages. Response-side `Set-Cookie` for protected scopes through `Fetch.fulfillRequest`, `Fetch.continueResponse` and `Network.continueInterceptedRequest` is refused.
 
 Saved sessions never contain cookie values or value hashes. They retain only cookie names and scopes (domain and path), with Cookie and Set-Cookie header values redacted. `request-headers`, `response-headers` and `request` look up those scopes in the live guarded cookie jar and label any values they show as current jar values, not necessarily what was sent at that time. Removed and protected cookies stay `[redacted]`. A header with no retained scopes can show current cookies applicable to its URL only when that URL cannot share a protected parent-domain cookie. Cookie-bearing console messages may be shown live but are not saved.
 
@@ -315,6 +315,8 @@ What the clients need from a CDP backend, checked against the code by `crates/cd
 - `Browser.setPermission`
 - `Browser.grantPermissions`
 - `Network.setRequestInterception`
+- `Network.getResponseBodyForInterception`
+- `Network.takeResponseBodyForInterceptionAsStream`
 - `Inspector.enable` (private guard only)
 - `Fetch.*`
 

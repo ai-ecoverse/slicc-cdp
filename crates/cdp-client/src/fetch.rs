@@ -1113,9 +1113,16 @@ mod tests {
             "Fetch.getResponseBody",
             "Fetch.takeResponseBodyAsStream",
             "Network.continueInterceptedRequest",
-            "Network.getResponseBodyForInterception",
         ] {
             assert!(refused(cdp.call(method, json!({ "requestId": "R1", "interceptionId": "R1" }), Some("S"))), "{method}");
+        }
+        for method in [
+            "Network.getResponseBodyForInterception",
+            "Network.takeResponseBodyForInterceptionAsStream",
+        ] {
+            let err = cdp.call(method, json!({ "requestId": "R1", "interceptionId": "R1" }), Some("S")).unwrap_err();
+            assert!(err.starts_with("slicc: refused:"), "{method}: {err}");
+            assert!(err.contains("Fetch"), "{method}: {err}");
         }
         assert_eq!(methods(&log), ["Fetch.continueRequest"]);
         let old = cdp

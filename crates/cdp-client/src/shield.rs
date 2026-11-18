@@ -1,3 +1,4 @@
+use crate::net::base64_decode;
 use crate::protected::Protected;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -63,6 +64,12 @@ const COOKIE_SETTERS: &[&str] = &[
     "Page.deleteCookie",
 ];
 
+const RESPONSE_COOKIE_WRITERS: &[&str] = &[
+    "Fetch.fulfillRequest",
+    "Fetch.continueResponse",
+    "Network.continueInterceptedRequest",
+];
+
 const COOKIE_READERS: &[&str] = &[
     "Network.getCookies",
     "Network.getAllCookies",
@@ -104,6 +111,9 @@ pub fn browser_wide(
         }
         "Network.setRequestInterception" => {
             "Network.setRequestInterception would hand out seven's requests; use Fetch on a page session"
+        }
+        "Network.getResponseBodyForInterception" | "Network.takeResponseBodyForInterceptionAsStream" => {
+            "legacy Network interception bodies are refused; use Fetch on a page session"
         }
         _ if method.starts_with("Fetch.") && session_id.is_none() => {
             "Fetch on the browser itself would intercept seven's requests; use a page session"
@@ -162,6 +172,10 @@ pub fn answers_interception(method: &str) -> bool {
 
 pub fn cookie_method(method: &str) -> bool {
     COOKIE_SETTERS.contains(&method)
+}
+
+pub fn response_cookie_writer(method: &str) -> bool {
+    RESPONSE_COOKIE_WRITERS.contains(&method)
 }
 
 pub fn cookie_reader(method: &str) -> bool {
@@ -648,6 +662,204 @@ pub fn set_cookie_hidden(guard: &Protected, value: &str, base: &str) -> bool {
             domains.iter().any(|domain| guard.cookie_scope(domain))
         }
     })
+}
+
+fn cookie_line_parseable(line: &str) -> bool {
+    !line.is_empty()
+        && line.lines().all(|segment| {
+            segment
+                .split(';')
+                .next()
+                .and_then(|pair| pair.split_once('='))
+                .is_some_and(|(name, _)| {
+                    let name = name.trim();
+                    !name.is_empty() && !name.eq_ignore_ascii_case("domain")
+                })
+        })
+}
+
+fn header_field_ctl(text: &str) -> bool {
+    text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0'))
+}
+
+fn header_set_cookies(fields: Option<&Value>) -> Option<Vec<String>> {
+    let Some(fields) = fields else {
+        return Some(Vec::new());
+    };
+    let Value::Array(items) = fields else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            return None;
+        };
+        if header_field_ctl(name) {
+            return None;
+        }
+        if name.trim().eq_ignore_ascii_case("set-cookie") {
+            let Some(value) = item.get("value").and_then(Value::as_str) else {
+                return None;
+            };
+            out.push(value.to_string());
+        } else if let Some(value) = item.get("value").and_then(Value::as_str) {
+            if header_field_ctl(value) {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn http_header_block(text: &str) -> &str {
+    let mut cut = text.len();
+    for sep in ["\r\n\r\n", "\n\r\n", "\n\n"] {
+        if let Some(at) = text.find(sep) {
+            cut = cut.min(at);
+        }
+    }
+    &text[..cut]
+}
+
+fn header_block_has_bare_cr_or_nul(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            0 => return true,
+            b'\r' if bytes.get(at + 1) != Some(&b'\n') => return true,
+            b'\r' => at += 2,
+            _ => at += 1,
+        }
+    }
+    false
+}
+
+fn binary_line_ctl(line: &str) -> bool {
+    line.chars().any(|ch| ch == '\r' || ch.is_control() && ch != '\t')
+}
+
+fn http_status_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("HTTP/") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() < 7 {
+        return false;
+    }
+    if !bytes[0].is_ascii_digit() || bytes[1] != b'.' || !bytes[2].is_ascii_digit() || bytes[3] != b' ' {
+        return false;
+    }
+    if !bytes[4].is_ascii_digit() || !bytes[5].is_ascii_digit() || !bytes[6].is_ascii_digit() {
+        return false;
+    }
+    match bytes.get(7) {
+        None => true,
+        Some(b' ') => {
+            let phrase = &rest[8..];
+            !phrase.as_bytes().iter().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+                && !phrase.to_ascii_lowercase().contains("set-cookie")
+        }
+        Some(_) => false,
+    }
+}
+
+fn binary_set_cookies(binary: Option<&Value>) -> Option<Vec<String>> {
+    let Some(binary) = binary else {
+        return Some(Vec::new());
+    };
+    let Value::String(text) = binary else {
+        return None;
+    };
+    let bytes = base64_decode(text).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    for line in text.split(['\0', '\n']) {
+        if line.is_empty() {
+            continue;
+        }
+        if binary_line_ctl(line) || line.starts_with([' ', '\t']) || !line.contains(':') {
+            return None;
+        }
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("set-cookie") {
+            out.push(value.trim().to_string());
+        }
+    }
+    Some(out)
+}
+
+fn raw_response_set_cookies(raw: Option<&Value>) -> Option<Vec<String>> {
+    let Some(raw) = raw else {
+        return Some(Vec::new());
+    };
+    let Value::String(text) = raw else {
+        return None;
+    };
+    let bytes = base64_decode(text).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let head = http_header_block(&text);
+    if header_block_has_bare_cr_or_nul(head) {
+        return None;
+    }
+    let mut lines = head.lines();
+    let status = lines.next()?;
+    if !http_status_line(status) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with([' ', '\t']) || !line.contains(':') {
+            return None;
+        }
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("set-cookie") {
+            out.push(value.trim().to_string());
+        }
+    }
+    Some(out)
+}
+
+fn response_set_cookie_lines(method: &str, params: &Value) -> Option<Vec<String>> {
+    match method {
+        "Fetch.fulfillRequest" | "Fetch.continueResponse" => {
+            let mut lines = header_set_cookies(params.get("responseHeaders"))?;
+            lines.extend(binary_set_cookies(params.get("binaryResponseHeaders"))?);
+            Some(lines)
+        }
+        "Network.continueInterceptedRequest" => {
+            let mut lines = raw_response_set_cookies(params.get("rawResponse"))?;
+            if let Some(headers) = params.get("headers") {
+                match headers {
+                    Value::Object(map) => {
+                        for (name, value) in map {
+                            if name.trim().eq_ignore_ascii_case("set-cookie") {
+                                let Some(text) = value.as_str() else {
+                                    return None;
+                                };
+                                lines.push(text.to_string());
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(lines)
+        }
+        _ => Some(Vec::new()),
+    }
+}
+
+pub fn response_cookie_refused(guard: &Protected, method: &str, params: &Value, base: &str) -> bool {
+    match response_set_cookie_lines(method, params) {
+        None => true,
+        Some(lines) => lines
+            .iter()
+            .any(|line| !cookie_line_parseable(line) || set_cookie_hidden(guard, line, base)),
+    }
 }
 
 fn contains_cookie_value(value: &Value, protected_values: &[String]) -> bool {

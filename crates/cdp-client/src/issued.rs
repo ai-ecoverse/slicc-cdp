@@ -23,6 +23,13 @@ pub(super) struct Issued {
 }
 
 impl Issued {
+    pub(super) fn request_url(&self, session: Option<&str>, id: &str) -> String {
+        session
+            .and_then(|session| self.urls.get(&(session.to_string(), id.to_string())))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub(super) fn forget(&mut self, session: &str) {
         self.client.remove(session);
         self.armed.remove(session);

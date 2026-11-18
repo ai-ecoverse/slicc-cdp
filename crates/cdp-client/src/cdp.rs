@@ -1060,6 +1060,12 @@ impl Cdp {
         if shield::cookie_method(method) && shield::cookie_refused(&self.guard, params) {
             return Err(COOKIES.into());
         }
+        if shield::response_cookie_writer(method) {
+            let base = self.issued.request_url(session_id, &shield::request_key(params).unwrap_or_default());
+            if shield::response_cookie_refused(&self.guard, method, params, &base) {
+                return Err(COOKIES.into());
+            }
+        }
         if shield::names_protected_storage(&self.guard, params) {
             return Err(self.refusal());
         }
@@ -5850,6 +5856,7 @@ mod tests {
     include!("iframe_ancestor_test.rs");
     include!("target_scale_test.rs");
     include!("nested_oopif_test.rs");
+    include!("response_cookie_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
