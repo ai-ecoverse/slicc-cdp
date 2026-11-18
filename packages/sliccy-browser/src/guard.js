@@ -1,9 +1,47 @@
-import { protectedOrigins } from './protected.js';
+import { CREDENTIAL_ORIGINS as CREDENTIAL_ORIGIN_RULES } from './credential-origins.js';
+import { credentialOrigins as credentialOriginsOf, protectedOrigins } from './protected.js';
 import { PROTECTED_ORIGINS } from './protected-origins.js';
 
 export const REFUSAL = PROTECTED_ORIGINS.refusal;
 
 const guard = protectedOrigins(PROTECTED_ORIGINS);
+const credential = credentialOriginsOf(CREDENTIAL_ORIGIN_RULES);
+
+export const CREDENTIAL_ORIGINS = CREDENTIAL_ORIGIN_RULES.origins;
+export const CREDENTIAL_REFUSAL = CREDENTIAL_ORIGIN_RULES.refusal;
+
+const credentialHosts = credential.hosts();
+
+function coversCredential(domain) {
+  return domain.length > 0 && credentialHosts.some((host) => under(host, domain));
+}
+
+function credentialUrl(text) {
+  let host;
+  try {
+    host = hostOf(asHttp(text));
+  } catch {
+    return false;
+  }
+  if (host.startsWith('[') || /^[0-9.]+$/u.test(host)) return false;
+  const labels = host.split('.');
+  for (let at = 0; at < labels.length - 1; at += 1) {
+    if (coversCredential(labels.slice(at).join('.'))) return true;
+  }
+  return false;
+}
+
+export function credentialCookie(cookie) {
+  if (!cookie || typeof cookie !== 'object') return true;
+  if (typeof cookie.domain === 'string' && credential.cookieDomain(cookie.domain)) return true;
+  if (typeof cookie.url === 'string' && credentialUrl(cookie.url)) return true;
+  const key = cookie.partitionKey;
+  if (typeof key === 'string') return credential.topLevelSite(key);
+  if (key && typeof key === 'object' && typeof key.topLevelSite === 'string') {
+    return credential.topLevelSite(key.topLevelSite);
+  }
+  return false;
+}
 
 function under(host, domain) {
   return host === domain || host.endsWith(`.${domain}`);
@@ -66,6 +104,7 @@ function siteProtected(site) {
 
 export function cookieProtected(cookie) {
   if (!cookie || typeof cookie !== 'object') return true;
+  if (credentialCookie(cookie)) return true;
   if (typeof cookie.domain === 'string' && guard.cookieDomain(cookie.domain)) return true;
   if (typeof cookie.url === 'string') {
     if (isProtectedUrl(cookie.url)) return true;

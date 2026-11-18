@@ -317,6 +317,42 @@ fn response_side_set_cookie_ordinary_controls_stay_allowed() {
 }
 
 #[test]
+fn response_side_raw_crlf_then_bare_lf_terminator_is_admitted() {
+    let ordinary = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\nbody");
+    let mut ok = handed("https://example.test/", "I1");
+    assert!(ok
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({ "interceptionId": "I1", "rawResponse": ordinary }),
+            Some("S")
+        )
+        .is_ok());
+    let protected = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Domain=.sliccy.ai\r\n\n");
+    let mut refused = handed("https://example.test/", "I1");
+    assert_eq!(
+        refused
+            .call(
+                "Network.continueInterceptedRequest",
+                json!({ "interceptionId": "I1", "rawResponse": protected }),
+                Some("S")
+            )
+            .unwrap_err(),
+        super::COOKIES
+    );
+    let body_lookalike = crate::net::base64_encode(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\nSet-Cookie: sid=x; Domain=.sliccy.ai\n",
+    );
+    let mut body_ok = handed("https://example.test/", "I1");
+    assert!(body_ok
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({ "interceptionId": "I1", "rawResponse": body_lookalike }),
+            Some("S")
+        )
+        .is_ok());
+}
+
+#[test]
 fn response_side_obs_fold_continuations_in_raw_and_binary_fail_closed() {
     for raw in [
         b"HTTP/1.1 200 OK\r\nSet-Cookie: a=b;\r\n Domain=.sliccy.ai\r\n\r\n".as_slice(),

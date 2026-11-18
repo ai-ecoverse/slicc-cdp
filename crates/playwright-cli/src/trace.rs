@@ -124,7 +124,7 @@ pub fn absorb(cdp: &mut Cdp, session: &str) -> Result<(Vec<ConsoleEntry>, Vec<Ne
             .any(|value| !value.is_empty() && entry.text.contains(value));
     }
     for raw in &mut raws {
-        raw.item.cookie_scopes = crate::cookie_headers::scopes(&raw.item, &scope_jar);
+        raw.item.cookie_scopes = crate::cookie_headers::scopes(cdp.guard(), &raw.item, &scope_jar);
     }
     fetch_bodies(cdp, session, &mut raws)?;
     let requests = raws.into_iter().map(|raw| raw.item).collect();

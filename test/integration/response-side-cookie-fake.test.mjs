@@ -5,6 +5,7 @@ import { fakeCdp } from './fake-cdp.mjs';
 import { guarded } from './guard-client.mjs';
 
 const PLANTS = ['seven.sliccy.ai', 'vault.sliccy.ai', '.sliccy.ai'];
+const CREDENTIAL = ['.adobelogin.com', 'ims-na1.adobelogin.com'];
 
 before(() => {
   execFileSync(
@@ -128,6 +129,59 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
       );
     }
 
+    for (const domain of CREDENTIAL) {
+      const fulfillId = await enable('Request');
+      const fromFulfill = backend.calls.length;
+      await assert.rejects(
+        send('Fetch.fulfillRequest', {
+          requestId: fulfillId,
+          responseCode: 200,
+          responseHeaders: [{ name: 'Set-Cookie', value: plant(domain) }],
+        }),
+        /this origin holds sign-in credentials/
+      );
+      assert.equal(
+        backend.calls.slice(fromFulfill).some((call) => call.method === 'Fetch.fulfillRequest'),
+        false,
+        `credential fulfill ${domain} must not reach the backend`
+      );
+
+      const continueId = await enable('Response');
+      const fromContinue = backend.calls.length;
+      await assert.rejects(
+        send('Fetch.continueResponse', {
+          requestId: continueId,
+          responseCode: 200,
+          responseHeaders: [{ name: 'Set-Cookie', value: plant(domain) }],
+        }),
+        /this origin holds sign-in credentials/
+      );
+      assert.equal(
+        backend.calls.slice(fromContinue).some((call) => call.method === 'Fetch.continueResponse'),
+        false,
+        `credential continueResponse ${domain} must not reach the backend`
+      );
+
+      const rawId = await enable('Request');
+      const fromRaw = backend.calls.length;
+      await assert.rejects(
+        send('Network.continueInterceptedRequest', {
+          interceptionId: rawId,
+          rawResponse: Buffer.from(
+            `HTTP/1.1 200 OK\r\nSet-Cookie: ${plant(domain)}\r\n\r\n`
+          ).toString('base64'),
+        }),
+        /this origin holds sign-in credentials/
+      );
+      assert.equal(
+        backend.calls
+          .slice(fromRaw)
+          .some((call) => call.method === 'Network.continueInterceptedRequest'),
+        false,
+        `credential continueInterceptedRequest ${domain} must not reach the backend`
+      );
+    }
+
     const ordinaryId = await enable('Request');
     await send('Fetch.fulfillRequest', {
       requestId: ordinaryId,
@@ -167,6 +221,24 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
       responseHeaders: [{ name: 'Set-Cookie2', value: 'sid=ok; Domain=ordinary.example; Path=/' }],
     });
     assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', cookie2OrdinaryId));
+
+    const cookie2CredentialId = await enable('Request');
+    const fromCookie2Credential = backend.calls.length;
+    await assert.rejects(
+      send('Fetch.fulfillRequest', {
+        requestId: cookie2CredentialId,
+        responseCode: 200,
+        responseHeaders: [{ name: 'Set-Cookie2', value: plant('.adobelogin.com') }],
+      }),
+      /this origin holds sign-in credentials/
+    );
+    assert.equal(
+      backend.calls
+        .slice(fromCookie2Credential)
+        .some((call) => call.method === 'Fetch.fulfillRequest'),
+      false,
+      'credential Set-Cookie2 plant must not reach the backend'
+    );
 
     await assert.rejects(
       send('Network.setRequestInterception', { patterns: [] }),
