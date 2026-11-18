@@ -803,3 +803,271 @@ fn cookies_seen_only_in_extra_info_still_scrub_console_and_header_values_on_the_
         assert!(after.contains("https://shop.example.test/next") && after.contains("[redacted]"), "{domain}: {after}");
     }
 }
+
+struct Chrome158JarBackend {
+    inbox: VecDeque<String>,
+    jar: Value,
+    seen: std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>,
+}
+
+impl Transport for Chrome158JarBackend {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let message: Value = serde_json::from_str(text).unwrap();
+        let method = message["method"].as_str().unwrap().to_string();
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        self.seen.borrow_mut().push((method.clone(), params));
+        let result = match method.as_str() {
+            "Network.getAllCookies" | "Network.getCookies" | "Storage.getCookies" => json!({"cookies": self.jar}),
+            "Page.getCookies" => json!({"cookies": []}),
+            _ => json!({}),
+        };
+        self.inbox.push_back(json!({"id": message["id"], "result": result}).to_string());
+        Ok(())
+    }
+    fn recv_text(&mut self, _: Instant) -> Result<Option<String>, String> {
+        Ok(self.inbox.pop_front())
+    }
+}
+
+fn rewrite_jar() -> Value {
+    let mut cookies = credential_jar().as_array().unwrap().clone();
+    cookies.push(json!({"name":"seven","value":"SEVEN_PROTECTED_SECRET","domain":"seven.sliccy.ai","path":"/"}));
+    Value::Array(cookies)
+}
+
+fn chrome158_jar_backend(seen: std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>) -> Cdp {
+    let mut cdp = Cdp::from_transport(Box::new(Chrome158JarBackend {
+        inbox: VecDeque::new(),
+        jar: rewrite_jar(),
+        seen,
+    }));
+    cdp.fixture_session("S");
+    cdp
+}
+
+fn assert_filtered_jar(result: &Value, row: &str) {
+    let text = result.to_string();
+    for secret in [
+        "IDP_HOST_SECRET",
+        "IDP_DOTTED_SECRET",
+        "IDP_PARENT_SECRET",
+        "IDP_STAGE_SECRET",
+        "IDP_PARTITION_SECRET",
+        "SEVEN_PROTECTED_SECRET",
+    ] {
+        assert!(!text.contains(secret), "{row} leaked {secret}: {text}");
+    }
+    assert!(text.contains("ORDINARY_KEPT"), "{row} dropped ORDINARY_KEPT: {text}");
+}
+
+#[test]
+fn page_get_cookies_rewrite_answers_the_filtered_network_jar() {
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut cdp = chrome158_jar_backend(seen.clone());
+    let result = cdp.call("Page.getCookies", json!({}), Some("S")).unwrap();
+    assert_filtered_jar(&result, "page_get_cookies_rewrite empty urls");
+    let methods: Vec<String> = seen.borrow().iter().map(|(method, _)| method.clone()).collect();
+    assert!(
+        methods.iter().any(|method| method == "Network.getAllCookies"),
+        "Page.getCookies must rewrite to Network.getAllCookies: {methods:?}"
+    );
+    assert!(
+        !methods.iter().any(|method| method == "Page.getCookies"),
+        "Page.getCookies must not reach the wire: {methods:?}"
+    );
+    let network = cdp.call("Network.getAllCookies", json!({}), Some("S")).unwrap();
+    assert_eq!(result, network, "rewritten Page.getCookies must match Network.getAllCookies filter");
+}
+
+#[test]
+fn page_get_cookies_urls_rewrite_withholds_credential_cookies_like_network_get_cookies() {
+    let urls = json!(["https://adobelogin.com/", "https://auth.adobelogin.com/", "https://example.test/"]);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut cdp = chrome158_jar_backend(seen.clone());
+    let page = cdp.call("Page.getCookies", json!({"urls": urls.clone()}), Some("S")).unwrap();
+    assert_filtered_jar(&page, "page_get_cookies_urls_rewrite");
+    let wire = seen.borrow().clone();
+    assert!(
+        wire.iter().any(|(method, params)| {
+            method == "Network.getCookies" && params.get("urls") == Some(&urls)
+        }),
+        "Page.getCookies urls must rewrite to Network.getCookies with the same urls: {wire:?}"
+    );
+    assert!(
+        !wire.iter().any(|(method, _)| method == "Page.getCookies"),
+        "Page.getCookies must not reach the wire: {wire:?}"
+    );
+    let network = cdp.call("Network.getCookies", json!({"urls": urls}), Some("S")).unwrap();
+    assert_eq!(page, network, "rewritten Page.getCookies urls must match Network.getCookies filter");
+    assert!(!page.to_string().contains("IDP_PARENT_SECRET"), "parent-of-IdP urls must still withhold Domain=.adobelogin.com");
+}
+
+fn cookie_header_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("cookie") || name.trim().eq_ignore_ascii_case("set-cookie")
+}
+
+fn assert_cookie_map_keys_gone(headers: &Value, row: &str) {
+    let Some(map) = headers.as_object() else {
+        return;
+    };
+    for key in map.keys() {
+        assert!(!cookie_header_name(key), "{row}: cookie map key {key} still present");
+    }
+}
+
+fn assert_cookie_lines_gone(text: &str, row: &str) {
+    for line in text.lines() {
+        if let Some((name, _)) = line.split_once(':') {
+            assert!(!cookie_header_name(name), "{row}: cookie line still present: {line}");
+        }
+    }
+}
+
+fn event_params<'a>(cdp: &'a Cdp, method: &str) -> &'a Value {
+    &cdp.events()
+        .iter()
+        .find(|event| event["method"] == method)
+        .unwrap_or_else(|| panic!("missing {method}"))["params"]
+}
+
+#[test]
+fn credential_cookie_header_keys_and_lines_are_removed_not_redacted() {
+    let mut extra_only = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+    extra_only.absorb(json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":"S","params":{"requestId":"E",
+        "headers":{"Cookie":"sid=IDP_HELD_EXTRA_SECRET","X-Control":"kept"},
+        "headersText":"Cookie: sid=IDP_HELD_EXTRA_TEXT_SECRET\r\nX-Control: kept\r\n",
+        "associatedCookies":[{"blockedReasons":[],"cookie":{"name":"sid","value":"IDP_HELD_ASSOCIATED_SECRET","domain":".adobelogin.com","path":"/"}}]}}));
+    extra_only.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"E","type":"XHR","documentURL":"https://example.test/",
+        "request":{"url":"https://shop.example.test/api","method":"GET","headers":{"Accept":"*/*"}}}}));
+    let held_extra = event_params(&extra_only, "Network.requestWillBeSentExtraInfo");
+    assert_cookie_map_keys_gone(&held_extra["headers"], "ExtraInfo remove=true Cookie map key gone");
+    assert_eq!(held_extra["headers"]["X-Control"], "kept");
+    assert_cookie_lines_gone(
+        held_extra["headersText"].as_str().unwrap(),
+        "ExtraInfo remove=true headersText cookie lines gone",
+    );
+    assert!(
+        held_extra["associatedCookies"].as_array().is_some_and(|items| items.is_empty()),
+        "ExtraInfo remove=true associatedCookies sid gone: {}",
+        held_extra["associatedCookies"]
+    );
+    assert!(!serde_json::to_string(held_extra).unwrap().contains("[redacted]"), "ExtraInfo remove=true must not leave [redacted]");
+
+    let url = format!("{IDP}/ims/check");
+    let mut cdp = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+    cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"R","type":"XHR","documentURL":"https://example.test/",
+        "request":{"url":url,"method":"GET","headers":{"Cookie":"sid=IDP_REQUEST_SECRET","Accept":"*/*"}}}}));
+    cdp.absorb(json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":"S","params":{"requestId":"R",
+        "headers":{"Cookie":"sid=IDP_EXTRA_SECRET","X-Control":"kept"},
+        "headersText":"Cookie: sid=IDP_EXTRA_TEXT_SECRET\r\nX-Control: kept\r\n",
+        "associatedCookies":[{"blockedReasons":[],"cookie":{"name":"sid","value":"IDP_ASSOCIATED_SECRET","domain":".adobelogin.com","path":"/"}}]}}));
+    cdp.absorb(json!({"method":"Network.responseReceived","sessionId":"S","params":{"requestId":"R","type":"XHR","response":{"url":url,"status":200,
+        "headers":{"Set-Cookie":"sid=IDP_RESPONSE_SECRET; Domain=.adobelogin.com","Content-Type":"text/plain"},
+        "headersText":"HTTP/1.1 200 OK\r\nSet-Cookie: sid=IDP_TEXT_SECRET\r\nContent-Type: text/plain\r\n",
+        "requestHeaders":{"Cookie":"sid=IDP_REQUEST_HEADERS_SECRET"},
+        "requestHeadersText":"GET / HTTP/1.1\r\nCookie: sid=IDP_REQUEST_HEADERS_TEXT_SECRET\r\n"}}}));
+    cdp.absorb(json!({"method":"Network.responseReceivedExtraInfo","sessionId":"S","params":{"requestId":"R","statusCode":200,
+        "headers":{"set-cookie":"sid=IDP_EXTRA_RESPONSE_SECRET","X-Control":"kept"},
+        "headersText":"HTTP/1.1 200 OK\nset-cookie: sid=IDP_EXTRA_TEXT_SECRET\nX-Control: kept\n"}}));
+    cdp.absorb(json!({"method":"Fetch.requestPaused","sessionId":"S","params":{"requestId":"P","resourceType":"XHR",
+        "request":{"url":url,"method":"GET","headers":{"Cookie":"sid=IDP_PAUSED_SECRET","Accept":"*/*"}},
+        "responseStatusCode":200,
+        "responseHeaders":[{"name":"Set-Cookie","value":"sid=IDP_PAUSED_RESPONSE_SECRET"},{"name":"Content-Type","value":"text/plain"}]}}));
+
+    let request = event_params(&cdp, "Network.requestWillBeSent");
+    assert_cookie_map_keys_gone(&request["request"]["headers"], "requestWillBeSent Cookie map key gone");
+    assert_eq!(request["request"]["headers"]["Accept"], "*/*");
+
+    let extra = event_params(&cdp, "Network.requestWillBeSentExtraInfo");
+    assert_cookie_map_keys_gone(&extra["headers"], "requestWillBeSentExtraInfo Cookie map key gone");
+    assert_eq!(extra["headers"]["X-Control"], "kept");
+    assert_cookie_lines_gone(
+        extra["headersText"].as_str().unwrap(),
+        "requestWillBeSentExtraInfo headersText cookie lines gone",
+    );
+    let associated = extra["associatedCookies"].as_array().cloned().unwrap_or_default();
+    assert!(
+        associated.iter().all(|item| item.pointer("/cookie/name").and_then(Value::as_str) != Some("sid")),
+        "requestWillBeSentExtraInfo associatedCookies sid gone: {associated:?}"
+    );
+
+    let response = event_params(&cdp, "Network.responseReceived");
+    assert_cookie_map_keys_gone(&response["response"]["headers"], "responseReceived Set-Cookie map key gone");
+    assert_cookie_map_keys_gone(&response["response"]["requestHeaders"], "responseReceived requestHeaders Cookie map key gone");
+    assert_eq!(response["response"]["headers"]["Content-Type"], "text/plain");
+    assert_cookie_lines_gone(
+        response["response"]["headersText"].as_str().unwrap(),
+        "responseReceived headersText cookie lines gone",
+    );
+    assert_cookie_lines_gone(
+        response["response"]["requestHeadersText"].as_str().unwrap(),
+        "responseReceived requestHeadersText cookie lines gone",
+    );
+
+    let response_extra = event_params(&cdp, "Network.responseReceivedExtraInfo");
+    assert_cookie_map_keys_gone(&response_extra["headers"], "responseReceivedExtraInfo set-cookie map key gone");
+    assert_eq!(response_extra["headers"]["X-Control"], "kept");
+    assert_cookie_lines_gone(
+        response_extra["headersText"].as_str().unwrap(),
+        "responseReceivedExtraInfo headersText cookie lines gone",
+    );
+
+    let paused = cdp.next_paused(Some("S"), Duration::ZERO).unwrap().expect("Fetch.requestPaused stays drivable");
+    assert_eq!(paused.headers, vec![("Accept".to_string(), "*/*".to_string())], "Fetch.requestPaused Cookie map/array entry gone");
+    assert_eq!(
+        paused.response_headers,
+        Some(vec![("Content-Type".to_string(), "text/plain".to_string())]),
+        "Fetch.requestPaused Set-Cookie array entry gone"
+    );
+
+    let text = serde_json::to_string(cdp.events()).unwrap();
+    assert!(!text.contains("_SECRET"), "{text}");
+    assert!(!text.contains("[redacted]"), "credential remove=true must not leave [redacted]: {text}");
+
+    let mut ordinary = Cdp::from_transport(Box::new(OrdinaryReviewTransport { inbox: VecDeque::new() }));
+    ordinary.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"O","type":"XHR","documentURL":"https://example.test/",
+        "request":{"url":"https://shop.example.test/api","method":"GET","headers":{"Cookie":"sid=ORDINARY_REQUEST_KEPT"}}}}));
+    ordinary.absorb(json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":"S","params":{"requestId":"O",
+        "headers":{"Cookie":"sid=ORDINARY_EXTRA_KEPT"},
+        "associatedCookies":[{"blockedReasons":[],"cookie":{"name":"sid","value":"ORDINARY_EXTRA_KEPT","domain":"shop.example.test","path":"/"}}]}}));
+    ordinary.absorb(json!({"method":"Network.responseReceived","sessionId":"S","params":{"requestId":"O","type":"XHR","response":{"url":"https://shop.example.test/api","status":200,
+        "headers":{"Set-Cookie":"sid=ORDINARY_RESPONSE_KEPT"}}}}));
+    ordinary.absorb(json!({"method":"Fetch.requestPaused","sessionId":"S","params":{"requestId":"Q","resourceType":"XHR",
+        "request":{"url":"https://shop.example.test/api","method":"GET","headers":{"Cookie":"sid=ORDINARY_PAUSED_KEPT","Accept":"*/*"}},
+        "responseStatusCode":200,"responseHeaders":[{"name":"Set-Cookie","value":"sid=ORDINARY_PAUSED_RESPONSE_KEPT"},{"name":"Content-Type","value":"text/plain"}]}}));
+    let ordinary_text = serde_json::to_string(ordinary.events()).unwrap();
+    for kept in ["ORDINARY_REQUEST_KEPT", "ORDINARY_EXTRA_KEPT", "ORDINARY_RESPONSE_KEPT"] {
+        assert!(ordinary_text.contains(kept), "ordinary Cookie header kept {kept}: {ordinary_text}");
+    }
+    assert!(ordinary_text.contains("\"Cookie\""), "ordinary Cookie map key kept: {ordinary_text}");
+    assert!(!ordinary_text.contains("[redacted]"), "ordinary events stay byte-identical without [redacted]: {ordinary_text}");
+    let ordinary_paused = ordinary.next_paused(Some("S"), Duration::ZERO).unwrap().unwrap();
+    assert!(
+        ordinary_paused.headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("Cookie") && value == "sid=ORDINARY_PAUSED_KEPT"),
+        "ordinary Fetch Cookie header kept: {:?}",
+        ordinary_paused.headers
+    );
+    assert!(
+        ordinary_paused
+            .response_headers
+            .as_ref()
+            .is_some_and(|headers| headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("Set-Cookie") && value == "sid=ORDINARY_PAUSED_RESPONSE_KEPT")),
+        "ordinary Fetch Set-Cookie header kept: {:?}",
+        ordinary_paused.response_headers
+    );
+
+    let mut protected = Cdp::from_transport(Box::new(CookieJarBackend {
+        inbox: VecDeque::new(),
+        jar: json!([]),
+    }));
+    protected.fixture_session("S");
+    ordinary_request(&mut protected, "R", "https://shop.example.test/api");
+    protected.absorb(json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":"S","params":{"requestId":"R","headers":{},
+        "associatedCookies":[{"blockedReasons":[],"cookie":{"name":"sid","value":"SEVEN_REDACT_SECRET","domain":"seven.sliccy.ai","path":"/"}}]}}));
+    protected.absorb(json!({"method":"Network.requestWillBeSent","sessionId":"S","params":{"requestId":"R2","type":"XHR","documentURL":"https://shop.example.test/",
+        "request":{"url":"https://shop.example.test/next","method":"GET","headers":{"Cookie":"sid=SEVEN_REDACT_SECRET"}}}}));
+    protected.call("Network.getAllCookies", json!({}), Some("S")).unwrap();
+    let redacted = serde_json::to_string(protected.events()).unwrap();
+    assert!(!redacted.contains("SEVEN_REDACT_SECRET"), "{redacted}");
+    assert!(redacted.contains("[redacted]"), "protected non-credential [redacted] semantics stay: {redacted}");
+}
