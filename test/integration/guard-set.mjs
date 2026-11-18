@@ -671,32 +671,6 @@ export async function runPartition(t, id) {
               }
             };
           }
-          if (vector.id === 'C7.credential-export') {
-            const send = unguarded.send;
-            let adobeloginPlantTop = null;
-            unguarded.send = async (method, params = {}, sessionId) => {
-              const url = typeof params?.url === 'string' ? params.url : '';
-              if (
-                method === 'Target.createTarget' &&
-                adobeloginPlantTop &&
-                /:\/\/adobe\.com(?::|\/|$)/.test(url)
-              ) {
-                try {
-                  await send('Target.closeTarget', { targetId: adobeloginPlantTop });
-                } catch {}
-                adobeloginPlantTop = null;
-              }
-              const result = await send(method, params, sessionId);
-              if (method === 'Target.createTarget' && result?.targetId) {
-                if (url.includes('part=1') || /\/credential\?/.test(url))
-                  adobeloginPlantTop = result.targetId;
-              }
-              if (method === 'Target.closeTarget' && params?.targetId === adobeloginPlantTop) {
-                adobeloginPlantTop = null;
-              }
-              return result;
-            };
-          }
           startup.markRowStarted();
           return {
             client,
