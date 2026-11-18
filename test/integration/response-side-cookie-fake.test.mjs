@@ -144,6 +144,30 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
     });
     assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', deleteId));
 
+    const cookie2PlantId = await enable('Request');
+    const fromCookie2Plant = backend.calls.length;
+    await assert.rejects(
+      send('Fetch.fulfillRequest', {
+        requestId: cookie2PlantId,
+        responseCode: 200,
+        responseHeaders: [{ name: 'Set-Cookie2', value: plant('.sliccy.ai') }],
+      }),
+      /cookies on seven's origin/
+    );
+    assert.equal(
+      backend.calls.slice(fromCookie2Plant).some((call) => call.method === 'Fetch.fulfillRequest'),
+      false,
+      'Set-Cookie2 plant must not reach the backend'
+    );
+
+    const cookie2OrdinaryId = await enable('Request');
+    await send('Fetch.fulfillRequest', {
+      requestId: cookie2OrdinaryId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Set-Cookie2', value: 'sid=ok; Domain=ordinary.example; Path=/' }],
+    });
+    assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', cookie2OrdinaryId));
+
     await assert.rejects(
       send('Network.setRequestInterception', { patterns: [] }),
       /slicc: refused:/
