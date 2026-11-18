@@ -52,6 +52,7 @@ const QUIET = [
   '--no-pings',
   '--no-service-autorun',
 ];
+export const NO_KEYCHAIN = ['--password-store=basic', '--use-mock-keychain'];
 const QUIET_FEATURES = [
   'Translate',
   'MediaRouter',
@@ -117,6 +118,7 @@ export async function launchBrowser(extraArgs = [], options = {}) {
       '--no-first-run',
       '--no-default-browser-check',
       ...QUIET,
+      ...NO_KEYCHAIN,
       ...(headless ? ['--disable-gpu'] : ['--window-size=1280,800']),
       '--disable-dev-shm-usage',
       '--no-sandbox',

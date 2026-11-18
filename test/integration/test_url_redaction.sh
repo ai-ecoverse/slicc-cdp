@@ -43,6 +43,7 @@ PROFILE="$TMPDIR_TEST/chrome-profile"
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
   --headless --disable-gpu --no-sandbox \
   --remote-debugging-port=0 \
+  --password-store=basic --use-mock-keychain \
   --user-data-dir="$PROFILE" \
   "$SECRET_URL" >/dev/null 2>&1 &
 CHROME_PID=$!
