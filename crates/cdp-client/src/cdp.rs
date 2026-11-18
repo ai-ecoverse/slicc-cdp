@@ -644,7 +644,7 @@ impl Cdp {
         if method == "Page.getCookies" {
             let urls = params.get("urls").cloned().unwrap_or(Value::Null);
             let rewritten = if urls.is_null() {
-                ("Network.getAllCookies", json!({}))
+                ("Network.getCookies", json!({}))
             } else {
                 ("Network.getCookies", json!({ "urls": urls }))
             };

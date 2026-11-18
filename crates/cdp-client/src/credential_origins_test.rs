@@ -267,8 +267,8 @@ fn credential_clear_data_for_origin_is_refused_and_never_reaches_chrome() {
         inbox: VecDeque::new(),
         sent: Rc::clone(&sent),
     }));
-    cdp.fixture_session("S");
     let refusal = credential_refusal();
+    let clear = "Storage.clearDataForOrigin";
     for params in [
         json!({"origin": IDP, "storageTypes": "cookies,local_storage,indexeddb,cache_storage"}),
         json!({"origin": IDP, "storageTypes": "all"}),
@@ -276,16 +276,12 @@ fn credential_clear_data_for_origin_is_refused_and_never_reaches_chrome() {
     ] {
         sent.borrow_mut().clear();
         assert_eq!(
-            cdp.call("Storage.clearDataForOrigin", params.clone(), Some("S"))
-                .unwrap_err(),
+            cdp.call(clear, params.clone(), None).unwrap_err(),
             refusal,
             "{params}"
         );
         assert!(
-            !sent
-                .borrow()
-                .iter()
-                .any(|method| method == "Storage.clearDataForOrigin"),
+            !sent.borrow().iter().any(|method| method == clear),
             "clearDataForOrigin must not reach Chrome for {params}: {:?}",
             sent.borrow()
         );
@@ -866,17 +862,17 @@ fn page_get_cookies_rewrite_answers_the_filtered_network_jar() {
     let mut cdp = chrome158_jar_backend(seen.clone());
     let result = cdp.call("Page.getCookies", json!({}), Some("S")).unwrap();
     assert_filtered_jar(&result, "page_get_cookies_rewrite empty urls");
-    let methods: Vec<String> = seen.borrow().iter().map(|(method, _)| method.clone()).collect();
+    let wire = seen.borrow().clone();
     assert!(
-        methods.iter().any(|method| method == "Network.getAllCookies"),
-        "Page.getCookies must rewrite to Network.getAllCookies: {methods:?}"
+        wire.iter().any(|(method, params)| method == "Network.getCookies" && params.as_object().is_some_and(|map| map.is_empty())),
+        "Page.getCookies must rewrite to Network.getCookies {{}}: {wire:?}"
     );
     assert!(
-        !methods.iter().any(|method| method == "Page.getCookies"),
-        "Page.getCookies must not reach the wire: {methods:?}"
+        !wire.iter().any(|(method, _)| method == "Page.getCookies"),
+        "Page.getCookies must not reach the wire: {wire:?}"
     );
-    let network = cdp.call("Network.getAllCookies", json!({}), Some("S")).unwrap();
-    assert_eq!(result, network, "rewritten Page.getCookies must match Network.getAllCookies filter");
+    let network = cdp.call("Network.getCookies", json!({}), Some("S")).unwrap();
+    assert_eq!(result, network, "rewritten Page.getCookies must match Network.getCookies filter");
 }
 
 #[test]
