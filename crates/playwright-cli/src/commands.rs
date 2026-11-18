@@ -987,29 +987,31 @@ pub(crate) fn evaluate_source(
     report: &mut Report,
     expression: &str,
 ) -> Result<String, String> {
+    if invocation.flags.contains_key("attachment") && (!invocation.flags.contains_key("frame") || !invocation.flags.contains_key("loader")) {
+        return Err("eval: --attachment requires --frame and --loader from document-ready\n".into());
+    }
+    if invocation.flags.contains_key("loader") && !invocation.flags.contains_key("attachment") { return Err("eval: --loader requires --attachment\n".into()); }
     let pages = browser::list_pages(cdp)?;
     let target = resolve_target(cdp, invocation, state, &pages, false)?;
     report.tab(&target);
     report.begin(cdp);
     let session = browser::watch_attach(cdp, state, &target)?;
     let result: Result<String, String> = (|| {
-        let value = if let Some(frame_id) = invocation.flags.get("frame") {
+        let value = if invocation.flags.contains_key("attachment") {
+            crate::eval_frames::evaluate(cdp, invocation, &target, &session, expression).or_else(|err| {
+                retry_await(err, expression, |source| crate::eval_frames::evaluate(cdp, invocation, &target, &session, source))
+            })?
+        } else if let Some(frame_id) = invocation.flags.get("frame") {
             let child = browser::frame_session(cdp, &session, frame_id)?;
             let scope = child.as_deref().unwrap_or(&session);
             let value = browser::evaluate_called(cdp, scope, Some(frame_id), expression).or_else(|err| {
-                retry_await(err, expression, |source| {
-                    browser::evaluate_called(cdp, scope, Some(frame_id), source)
-                })
+                retry_await(err, expression, |source| browser::evaluate_called(cdp, scope, Some(frame_id), source))
             });
-            if let Some(child) = child.as_deref() {
-                cdp::detach(cdp, child);
-            }
+            if let Some(child) = child.as_deref() { cdp::detach(cdp, child); }
             value?
         } else {
             browser::evaluate_called(cdp, &session, None, expression).or_else(|err| {
-                retry_await(err, expression, |source| {
-                    browser::evaluate_called(cdp, &session, None, source)
-                })
+                retry_await(err, expression, |source| browser::evaluate_called(cdp, &session, None, source))
             })?
         };
         Ok(browser::format_eval(&value))

@@ -581,6 +581,16 @@ pub fn evaluate_called(
     frame_id: Option<&str>,
     expression: &str,
 ) -> Result<EvalValue, String> {
+    evaluate_called_context(cdp, session, frame_id, None, expression)
+}
+
+pub(crate) fn evaluate_called_context(
+    cdp: &mut Cdp,
+    session: &str,
+    frame_id: Option<&str>,
+    context: Option<&str>,
+    expression: &str,
+) -> Result<EvalValue, String> {
     let mut params = json!({
         "expression": expression,
         "returnByValue": false,
@@ -598,6 +608,7 @@ pub fn evaluate_called(
             .cloned()
             .ok_or("Page.createIsolatedWorld returned no executionContextId\n".to_string())?;
     }
+    if let Some(context) = context { params["uniqueContextId"] = json!(context); }
     let source = expression.trim();
     if source.starts_with("function") || source.starts_with("async function") {
         let wrapped = format!("({source}\n)");

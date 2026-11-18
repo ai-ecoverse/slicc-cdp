@@ -112,7 +112,7 @@ for (const world of ['main', 'isolated']) {
             event.reason === 'late' &&
             held.events().filter((item) => item.event === 'refused').length === 2
         );
-        assert.deepEqual(await inspect(), { marker: false });
+        assert.deepEqual(await inspect(), { marker: false }, JSON.stringify(held.events()));
         const before = held.events().filter((event) => event.event === 'refused').length;
         loaded = raw.event('Page.loadEventFired', sessionId);
         await raw.send('Page.navigate', { url: `${origin}/redirect` }, sessionId).catch((error) => {

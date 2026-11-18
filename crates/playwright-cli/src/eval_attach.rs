@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 pub(crate) fn precheck(invocation: &Invocation) -> Result<(), String> {
     if invocation.positionals.len() != 1 { return Err("eval-attach requires <file> containing a JavaScript body with send(payload)\n".into()) }
     Scope::parse(invocation)?;
+    crate::eval_frames::origins(invocation)?;
     if invocation.flags.get("world").is_some_and(|world| !matches!(world.as_str(), "main" | "isolated")) {
         return Err("eval-attach: --world must be main or isolated\n".into());
     }
@@ -33,10 +34,13 @@ pub(crate) fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) 
     let lease = match AttachmentLease::claim(invocation) { Ok(lease) => lease, Err(message) => return Output::err(message) };
     let world = invocation.flags.get("world").map(String::as_str).unwrap_or("main");
     let early = invocation.flags.contains_key("early");
-    let mut holder = Holder { scope, source, world, early, tabs: BTreeMap::new(), refused: BTreeMap::new(), key: format!("__slicc_{}", lease.id.replace('-', "_")), invocation, state, id: &lease.id };
+    let (same_origin, origins) = crate::eval_frames::origins(invocation).unwrap();
+    let cross_origin = (same_origin || !origins.is_empty()) && cdp.eval_attach_cross_origin_available();
+    let mut holder = Holder { lease: &lease, scope, source, world, early, same_origin, origins, cross_origin, active: BTreeMap::new(), observed: BTreeSet::new(), tabs: BTreeMap::new(), refused: BTreeMap::new(), key: format!("__slicc_{}", lease.id.replace('-', "_")), invocation, state, id: &lease.id };
     let result = holder.run(cdp, &lease);
     for tab in holder.tabs.values() {
         if early { cdp.eval_attach_early_stop(&tab.session); }
+        stop_children(cdp, tab);
         cdp::detach(cdp, &tab.session);
     }
     let reason = result.as_deref().unwrap_or("error");
@@ -45,6 +49,8 @@ pub(crate) fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) 
 }
 
 struct Tab {
+    target: String,
+    children: BTreeMap<String, Tab>,
     session: String,
     seen: usize,
     finish_early: bool,
@@ -59,13 +65,20 @@ struct Installed {
     default: String,
     frame: String,
     loader: String,
+    record: Value,
 }
 
 struct Holder<'a> {
+    lease: &'a AttachmentLease,
     scope: Scope,
     source: String,
     world: &'a str,
     early: bool,
+    same_origin: bool,
+    origins: Vec<String>,
+    cross_origin: bool,
+    active: BTreeMap<String, Value>,
+    observed: BTreeSet<String>,
     tabs: BTreeMap<String, Tab>,
     refused: BTreeMap<String, String>,
     key: String,
@@ -78,7 +91,7 @@ impl Holder<'_> {
     fn refuse(&mut self, target: &str, document: &str, reason: &str) -> Result<(), String> {
         if self.refused.get(target).is_some_and(|known| known == document || document == "blocked") { return Ok(()) }
         self.refused.insert(target.to_string(), document.to_string());
-        emit(json!({"event":"refused","attachmentId":self.id,"tab":target,"reason":reason}))
+        emit(json!({"event":"refused","attachmentId":self.id,"tab":target,"frameId":target,"reason":reason}))
     }
 
     fn run(&mut self, cdp: &mut Cdp, lease: &AttachmentLease) -> Result<String, String> {
@@ -92,6 +105,7 @@ impl Holder<'_> {
                 self.discover(cdp)?;
                 discovery = Instant::now();
             }
+            self.observed.clear();
             let targets: Vec<_> = self.tabs.keys().cloned().collect();
             for target in targets {
                 let mut tab = self.tabs.remove(&target).unwrap();
@@ -101,6 +115,8 @@ impl Holder<'_> {
                 self.tabs.insert(target, tab);
                 result?;
             }
+            self.active.retain(|key, _| self.observed.contains(key));
+            lease.publish(self.active.values().cloned().collect())?;
             cdp.pump(Instant::now() + Duration::from_millis(100))?;
             for notice in cdp.take_notices() { eprint!("{notice}"); }
         }
@@ -115,6 +131,7 @@ impl Holder<'_> {
             let tab = self.tabs.remove(&target).unwrap();
             if cdp.is_protected_target(&target) { self.refuse(&target, "blocked", "guard")?; }
             if self.early { cdp.eval_attach_early_stop(&tab.session); }
+            stop_children(cdp, &tab);
             cdp::detach(cdp, &tab.session);
         }
         let candidates: Vec<_> = if let Scope::Tab(target) = &self.scope { vec![target.clone()] }
@@ -140,7 +157,7 @@ impl Holder<'_> {
                 Ok(session)
             });
             match attached {
-                Ok(session) => { self.tabs.insert(target, Tab { session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None }); }
+                Ok(session) => { self.tabs.insert(target.clone(), Tab { target: target.clone(), children: BTreeMap::new(), session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None }); }
                 Err(_) => self.refuse(&target, "blocked", "guard")?,
             }
         }
@@ -168,18 +185,124 @@ impl Holder<'_> {
             tab.finish_early = true;
             return Ok(());
         }
+        let infos = if self.same_origin || !self.origins.is_empty() {
+            cdp.call("Target.getTargets", json!({}), None).ok().and_then(|value| value["targetInfos"].as_array().cloned()).unwrap_or_default()
+        } else { Vec::new() };
+        prune_children(cdp, tab, &infos);
+        self.visit(cdp, target, tab, &tree["frameTree"], &[], &infos)
+    }
+
+    fn visit(&mut self, cdp: &mut Cdp, target: &str, tab: &mut Tab, node: &Value, ancestors: &[crate::eval_frames::Document], infos: &[Value]) -> Result<(), String> {
+        if ancestors.len() >= 64 { return Ok(()) }
+        absorb(cdp, tab);
+        let frame = &node["frame"];
+        let mut chain = ancestors.to_vec();
+        chain.push(crate::eval_frames::Document { target: tab.target.clone(), session: tab.session.clone(), frame: frame.clone() });
+        let child = !ancestors.is_empty();
+        let origin = text(frame, "securityOrigin");
+        let requested = !child || self.same_origin && origin == chain[0].text("securityOrigin") || self.origins.iter().any(|wanted| wanted == origin);
+        let reason = if child && crate::eval_frames::verify(cdp, &chain).is_err() { Some("guard") }
+            else if !requested { Some("origin-not-requested") }
+            else if child && origin != chain[0].text("securityOrigin") && !self.cross_origin { Some(crate::eval_frames::UNAVAILABLE) }
+            else { None };
+        if let Some(reason) = reason {
+            self.refuse_document(target, frame, &chain, text(frame, "loaderId"), reason)?;
+            if reason == "guard" { return Ok(()) }
+        } else {
+            self.document(cdp, target, tab, frame, &chain)?;
+        }
+        if !child && self.early && tab.finish_early {
+            cdp.eval_attach_early_finish(&tab.session);
+            tab.finish_early = false;
+        }
+        if !self.same_origin && self.origins.is_empty() { return Ok(()) }
+        let locals = node["childFrames"].as_array().cloned().unwrap_or_default();
+        for node in &locals {
+            if !infos.iter().any(|info| info["type"] == "iframe" && info["targetId"] == node["frame"]["id"] && info["parentFrameId"] == frame["id"]) {
+                self.visit(cdp, target, tab, node, &chain, infos)?;
+            }
+        }
+        let remote: Vec<_> = infos.iter().filter(|info| info["type"] == "iframe" && info["parentFrameId"] == frame["id"]).collect();
+        for info in remote {
+            let id = text(info, "targetId");
+            if id.is_empty() || chain.iter().any(|document| document.text("id") == id) { continue }
+            let origin = url::Url::parse(text(info, "url")).ok().map(|url| url.origin().ascii_serialization()).unwrap_or_default();
+            let seed = json!({"id":id,"parentId":frame["id"],"securityOrigin":origin});
+            if cdp.is_protected_target(id) || !browser::ordinary_frame_url(cdp.guard(), text(info, "url")) {
+                self.refuse_document(target, &seed, &chain, "blocked", "guard")?;
+                continue;
+            }
+            let requested = self.same_origin && origin == chain[0].text("securityOrigin") || self.origins.contains(&origin);
+            if origin != chain[0].text("securityOrigin") && !self.cross_origin {
+                self.refuse_document(target, &seed, &chain, "blocked", if requested { crate::eval_frames::UNAVAILABLE } else { "origin-not-requested" })?;
+                continue;
+            }
+            if tab.children.len() >= 256 && !tab.children.contains_key(id) { self.refuse_document(target, &seed, &chain, "blocked", "guard")?; continue; }
+            let opened = if let Some(child) = tab.children.remove(id) { Ok(child) } else {
+                let seen = cdp.events().len();
+                cdp::attach(cdp, id).and_then(|session| {
+                    let enabled = ["Page.enable", "Runtime.enable", "Network.enable"].iter().try_for_each(|method| cdp.call(method, json!({}), Some(&session)).map(|_| ()));
+                    if let Err(message) = enabled { cdp::detach(cdp, &session); return Err(message) }
+                    Ok(Tab { target: id.to_string(), children: BTreeMap::new(), session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None })
+                })
+            };
+            match opened {
+                Ok(mut child) => {
+                    if let Ok(tree) = cdp.call("Page.getFrameTree", json!({}), Some(&child.session)) {
+                        if tree["frameTree"]["frame"]["id"] == id && tree["frameTree"]["frame"]["parentId"] == frame["id"] {
+                            self.visit(cdp, target, &mut child, &tree["frameTree"], &chain, infos)?;
+                        } else { self.refuse_document(target, &seed, &chain, "blocked", "guard")?; }
+                    } else { self.refuse_document(target, &seed, &chain, "blocked", "guard")?; }
+                    tab.children.insert(id.to_string(), child);
+                }
+                Err(_) => self.refuse_document(target, &seed, &chain, "blocked", "guard")?,
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_document(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, reason: &str) -> Result<(), String> {
+        let frame_id = text(frame, "id");
+        let key = if chain.len() == 1 && frame.get("parentId").is_none() { target.to_string() } else { format!("{target}:{frame_id}") };
+        if self.refused.get(&key).is_some_and(|known| known == document) { return Ok(()) }
+        self.refused.insert(key, document.to_string());
+        let mut event = json!({"event":"refused","attachmentId":self.id,"tab":target,"frameId":frame_id,"reason":reason});
+        if chain.len() > 1 || frame.get("parentId").is_some() {
+            event["parentFrameId"] = frame["parentId"].clone();
+            event["origin"] = if reason == "guard" { Value::Null } else { frame["securityOrigin"].clone() };
+        }
+        emit(event)
+    }
+
+    fn event_fields(&self, cdp: &mut Cdp, mut event: Value, chain: &[crate::eval_frames::Document]) -> Result<Value, String> {
+        if chain.len() > 1 {
+            let evidence: Vec<_> = chain.iter().enumerate().map(|(index, document)| document.evidence(cdp, index.checked_sub(1).map(|index| &chain[index]))).collect();
+            let child = evidence.last().unwrap();
+            for key in ["origin", "permissionsPolicy", "toolsAllowed", "allow", "srcOrigin"] { event[key] = child[key].clone(); }
+            event["parentFrameId"] = json!(chain[chain.len() - 2].text("id"));
+            event["ancestors"] = json!(&evidence[..evidence.len() - 1]);
+        }
+        if chain.len() > 1 { crate::eval_frames::verify(cdp, chain)?; }
+        Ok(event)
+    }
+
+    fn document(&mut self, cdp: &mut Cdp, target: &str, tab: &mut Tab, frame: &Value, chain: &[crate::eval_frames::Document]) -> Result<(), String> {
+        let frame_id = text(frame, "id");
+        let loader = text(frame, "loaderId");
+        let url = text(frame, "url");
+        let early = self.early && chain.len() == 1;
         let default = tab.contexts.values().find(|context| context["auxData"]["isDefault"] == true && context["auxData"]["frameId"] == frame_id).cloned();
         let Some(default) = default else { return Ok(()) };
         let unique = text(&default, "uniqueId");
-        if unique.is_empty() { return self.refuse(target, loader, "unverified-context") }
+        if unique.is_empty() { return self.refuse_document(target, frame, chain, loader, "unverified-context") }
         if tab.installed.as_ref().is_some_and(|installed| installed.default != unique || installed.loader != loader) { tab.installed = None; }
         if !tab.attempted.contains_key(unique) {
-            if self.early {
+            if early {
                 if cdp.eval_attach_early_waiting(&tab.session, unique) { return Ok(()) }
-                tab.finish_early = true;
+                tab.finish_early = cdp.eval_attach_early_paused(&tab.session, unique);
                 if !cdp.eval_attach_early_paused(&tab.session, unique) {
                     tab.attempted.insert(unique.to_string(), None);
-                    return self.refuse(target, unique, "late");
+                    return self.refuse_document(target, frame, chain, unique, "late");
                 }
             }
             tab.attempted.insert(unique.to_string(), None);
@@ -188,45 +311,64 @@ impl Holder<'_> {
                 absorb(cdp, tab);
                 created.ok().and_then(|created| tab.contexts.get(&created["executionContextId"].as_i64()?).cloned())
             } else { Some(default.clone()) };
-            let Some(context) = context else { return self.refuse(target, unique, "unverified-context") };
+            let Some(context) = context else { return self.refuse_document(target, frame, chain, unique, "unverified-context") };
             let context = text(&context, "uniqueId");
-            if context.is_empty() { return self.refuse(target, unique, "unverified-context") }
+            if context.is_empty() { return self.refuse_document(target, frame, chain, unique, "unverified-context") }
             if self.world == "isolated" {
                 let verified = cdp.call("Page.getFrameTree", json!({}), Some(&tab.session));
-                if !verified.is_ok_and(|tree| tree["frameTree"]["frame"]["id"] == frame_id && tree["frameTree"]["frame"]["loaderId"] == loader && tree["frameTree"]["frame"]["url"] == url) {
-                    return self.refuse(target, unique, "unverified-context");
+                if !verified.is_ok_and(|tree| find_frame(&tree["frameTree"], frame_id).is_some_and(|current| ["id", "loaderId", "url"].iter().all(|key| current[*key] == frame[*key]))) || chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() {
+                    return self.refuse_document(target, frame, chain, unique, "unverified-context");
                 }
             }
-            if self.early && !cdp.eval_attach_early_paused(&tab.session, unique) { return self.refuse(target, unique, "late") }
+            if early && !cdp.eval_attach_early_paused(&tab.session, unique) { return self.refuse_document(target, frame, chain, unique, "late") }
+            if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() { return self.refuse_document(target, frame, chain, unique, "guard") }
             let mut report = Report::for_command("eval").with_intent("eval", self.invocation.intent.as_deref());
             report.tab(target);
             report.begin(cdp);
-            let installed = if self.early {
+            let installed = if early {
                 cdp.eval_attach_early_evaluate(&tab.session, unique, json!({"expression":self.install_source(url),"uniqueContextId":context,"returnByValue":true})).and_then(evaluated)
             } else { evaluate(cdp, &tab.session, context, &self.install_source(url)) };
             let outcome = match &installed { Ok(Value::Bool(true)) => Output::ok(""), _ => Output::err("eval-attach: installation refused or script threw\n") };
             report.finish(cdp, &outcome);
             if !matches!(installed, Ok(Value::Bool(true))) {
                 let reason = if installed.as_ref().err().is_some_and(|message| message == "eval-attach: late\n") { "late" } else { "installation" };
-                return self.refuse(target, unique, reason);
+                return self.refuse_document(target, frame, chain, unique, reason);
             }
-            tab.installed = Some(Installed { context: context.to_string(), default: unique.to_string(), frame: frame_id.to_string(), loader: loader.to_string() });
+            if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() { return self.refuse_document(target, frame, chain, unique, "guard") }
+            let record = json!({"tab":target,"frameId":frame_id,"loaderId":loader,"context":context,"chain":chain.iter().map(|document| json!({"frame":document.frame,"target":document.target})).collect::<Vec<_>>()});
+            tab.installed = Some(Installed { record, context: context.to_string(), default: unique.to_string(), frame: frame_id.to_string(), loader: loader.to_string() });
             tab.attempted.insert(unique.to_string(), tab.installed.clone());
-            self.refused.remove(target);
-            emit(json!({"event":"document-ready","attachmentId":self.id,"tab":target,"frameId":frame_id,"loaderId":loader,"url":url,"world":self.world,"early":self.early}))?;
+            let refusal_key = if chain.len() == 1 { target.to_string() } else { format!("{target}:{frame_id}") };
+            self.refused.remove(&refusal_key);
+            self.observed.insert(format!("{target}:{frame_id}"));
+            self.active.insert(format!("{target}:{frame_id}"), tab.installed.as_ref().unwrap().record.clone());
+            self.lease.publish(self.active.values().cloned().collect())?;
+            let event = json!({"event":"document-ready","attachmentId":self.id,"tab":target,"frameId":frame_id,"loaderId":loader,"url":url,"world":self.world,"early":early});
+            match self.event_fields(cdp, event, chain) {
+                Ok(event) => emit(event)?,
+                Err(_) => return self.refuse_document(target, frame, chain, unique, "guard"),
+            }
         }
         tab.installed = tab.attempted.get(unique).cloned().flatten().filter(|installed| installed.loader == loader);
         let Some(installed) = &tab.installed else { return Ok(()) };
         let source = format!("globalThis[{}]({})", json!(self.key), json!(url.split('#').next().unwrap_or(url)));
+        if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() { return self.refuse_document(target, frame, chain, unique, "guard") }
         let drained = evaluate(cdp, &tab.session, &installed.context, &source);
         let values = match drained {
             Ok(value) => value,
-            Err(_) => { tab.installed = None; tab.attempted.insert(unique.to_string(), None); return self.refuse(target, unique, "relay") }
+            Err(_) => { return self.refuse_document(target, frame, chain, unique, "relay") }
         };
+        if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() { return self.refuse_document(target, frame, chain, unique, "guard") }
+        self.observed.insert(format!("{target}:{frame_id}"));
+        self.active.insert(format!("{target}:{frame_id}"), installed.record.clone());
         if let Some(messages) = values.as_array() {
             for message in messages.iter().take(256).filter_map(Value::as_str).filter(|message| message.len() <= 65536) {
                 if let Ok(payload) = serde_json::from_str::<Value>(message) {
-                    emit(json!({"event":"message","attachmentId":self.id,"tab":target,"frameId":installed.frame,"loaderId":installed.loader,"payload":payload}))?;
+                    let event = json!({"event":"message","attachmentId":self.id,"tab":target,"frameId":installed.frame,"loaderId":installed.loader,"payload":payload});
+                    match self.event_fields(cdp, event, chain) {
+                Ok(event) => emit(event)?,
+                Err(_) => return self.refuse_document(target, frame, chain, unique, "guard"),
+            }
                 }
             }
         }
@@ -267,5 +409,30 @@ fn absorb(cdp: &Cdp, tab: &mut Tab) {
             _ => {}
         }
     }
+    let live: BTreeSet<_> = tab.contexts.values().filter_map(|context| context["uniqueId"].as_str()).collect();
+    tab.attempted.retain(|unique, _| live.contains(unique.as_str()));
     tab.seen = cdp.events().len();
+}
+
+fn stop_children(cdp: &mut Cdp, tab: &Tab) {
+    for child in tab.children.values() {
+        stop_children(cdp, child);
+        cdp::detach(cdp, &child.session);
+    }
+}
+
+fn prune_children(cdp: &mut Cdp, tab: &mut Tab, infos: &[Value]) {
+    let removed: Vec<_> = tab.children.keys().filter(|id| !infos.iter().any(|info| info["targetId"] == id.as_str()) || cdp.is_protected_target(id)).cloned().collect();
+    for id in removed {
+        if let Some(child) = tab.children.remove(&id) {
+            stop_children(cdp, &child);
+            cdp::detach(cdp, &child.session);
+        }
+    }
+    for child in tab.children.values_mut() { prune_children(cdp, child, infos); }
+}
+
+fn find_frame<'a>(node: &'a Value, id: &str) -> Option<&'a Value> {
+    if node["frame"]["id"] == id { return node.get("frame"); }
+    node["childFrames"].as_array()?.iter().find_map(|node| find_frame(node, id))
 }
