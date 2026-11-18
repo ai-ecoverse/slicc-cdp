@@ -616,7 +616,6 @@ pub(crate) fn evaluate_called_context(
         if let Some(context) = params.get("contextId") {
             compile["executionContextId"] = context.clone();
         }
-        if context.is_some() { params["expression"] = json!(wrapped.clone()); }
         let parsed = cdp.call("Runtime.compileScript", compile, Some(session))?;
         if parsed.get("exceptionDetails").is_none() {
             params["expression"] = json!(wrapped);

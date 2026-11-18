@@ -383,7 +383,7 @@ fn implemented_page(name: &str) -> Option<String> {
         ),
         "eval" => page(
             "eval <func> [target]",
-            &["Evaluate JavaScript expression on page or element", "With --attachment, --frame and --loader, call a live attachment’s installed realm; changed documents are refused."],
+            &["Evaluate JavaScript expression on page or element"],
             &[
                 (
                     "<func>",
@@ -392,9 +392,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 ("[target]", "exact target element reference from the page snapshot, or a unique element selector"),
             ],
             &[
-                ("--tab <targetId>", "top tab to run in"),
-                ("--frame <frameId>", "isolated frame world unless --attachment selects its installed realm"),
-                ("--attachment <id>", "live attachment in this CLI session; requires --frame and --loader"),
+                ("--attachment <id>", "call the installed realm; see eval-file --help for document selectors"),
                 ("--loader <loaderId>", "document loader from document-ready"),
                 (
                     "--filename",

@@ -33,6 +33,7 @@ export const CHROME_FILES = new Set(
     'error-document-race',
     'eval-function',
     'eval-attach-chrome',
+    'eval-frames-chrome',
     'fetch',
     'guard-a',
     'guard-attach-race',

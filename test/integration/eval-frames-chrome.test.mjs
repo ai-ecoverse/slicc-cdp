@@ -112,6 +112,36 @@ for (const world of ['main', 'isolated']) {
         );
       }
       const first = await held.event('document-ready', (event) => event.url.endsWith('/cross'));
+      const frameFlags = [
+        '--tab',
+        tab,
+        '--frame',
+        first.frameId,
+        '--attachment',
+        ready.attachmentId,
+        '--loader',
+        first.loaderId,
+      ];
+      for (const [source, expected] of [
+        ['function helper() { return 7; }; helper()', '7'],
+        ['function () { return 8; }', '8'],
+        ['async function () { return 9; }', '9'],
+      ]) {
+        const result = await command(browser.wsUrl, ['eval', source, ...frameFlags], home);
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(result.stdout.trim(), expected, source);
+      }
+      await writeFile(
+        path.join(home, 'declaration.js'),
+        'function helper() { return 10; }; helper()'
+      );
+      const declaration = await command(
+        browser.wsUrl,
+        ['eval-file', 'declaration.js', ...frameFlags],
+        home
+      );
+      assert.equal(declaration.code, 0, declaration.stderr);
+      assert.equal(declaration.stdout.trim(), '10');
       assert.ok(
         (await raw.send('Target.getTargets')).targetInfos.some(
           (info) => info.type === 'iframe' && info.targetId === first.frameId
