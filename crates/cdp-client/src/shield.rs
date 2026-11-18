@@ -721,6 +721,49 @@ fn http_header_block(text: &str) -> &str {
     &text[..cut]
 }
 
+fn header_block_has_bare_cr_or_nul(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            0 => return true,
+            b'\r' if bytes.get(at + 1) != Some(&b'\n') => return true,
+            b'\r' => at += 2,
+            _ => at += 1,
+        }
+    }
+    false
+}
+
+fn binary_line_ctl(line: &str) -> bool {
+    line.chars().any(|ch| ch == '\r' || ch.is_control() && ch != '\t')
+}
+
+fn http_status_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("HTTP/") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() < 7 {
+        return false;
+    }
+    if !bytes[0].is_ascii_digit() || bytes[1] != b'.' || !bytes[2].is_ascii_digit() || bytes[3] != b' ' {
+        return false;
+    }
+    if !bytes[4].is_ascii_digit() || !bytes[5].is_ascii_digit() || !bytes[6].is_ascii_digit() {
+        return false;
+    }
+    match bytes.get(7) {
+        None => true,
+        Some(b' ') => {
+            let phrase = &rest[8..];
+            !phrase.as_bytes().iter().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+                && !phrase.to_ascii_lowercase().contains("set-cookie")
+        }
+        Some(_) => false,
+    }
+}
+
 fn binary_set_cookies(binary: Option<&Value>) -> Option<Vec<String>> {
     let Some(binary) = binary else {
         return Some(Vec::new());
@@ -735,7 +778,7 @@ fn binary_set_cookies(binary: Option<&Value>) -> Option<Vec<String>> {
         if line.is_empty() {
             continue;
         }
-        if line.starts_with([' ', '\t']) || !line.contains(':') {
+        if binary_line_ctl(line) || line.starts_with([' ', '\t']) || !line.contains(':') {
             return None;
         }
         let (name, value) = line.split_once(':')?;
@@ -756,8 +799,14 @@ fn raw_response_set_cookies(raw: Option<&Value>) -> Option<Vec<String>> {
     let bytes = base64_decode(text).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let head = http_header_block(&text);
+    if header_block_has_bare_cr_or_nul(head) {
+        return None;
+    }
     let mut lines = head.lines();
-    let _status = lines.next()?;
+    let status = lines.next()?;
+    if !http_status_line(status) {
+        return None;
+    }
     let mut out = Vec::new();
     for line in lines {
         if line.is_empty() {

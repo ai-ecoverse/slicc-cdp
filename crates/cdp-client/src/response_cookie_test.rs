@@ -397,6 +397,89 @@ fn response_side_raw_header_block_ends_at_lf_crlf() {
 }
 
 #[test]
+fn response_side_bare_cr_and_status_line_smuggling_fail_closed() {
+    for raw in [
+        b"HTTP/1.1 200 OK\rSet-Cookie: sid=x; Domain=.sliccy.ai\r\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\rSet-Cookie: sid=x; Domain=.sliccy.ai\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\0X-Trace: 1\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK Set-Cookie: sid=x; Domain=.sliccy.ai\r\nContent-Type: text/plain\r\n\r\n".as_slice(),
+    ] {
+        let mut cdp = response_paused("https://shop.example.test/api", "I1");
+        assert_eq!(
+            cdp.call(
+                "Network.continueInterceptedRequest",
+                json!({ "interceptionId": "I1", "rawResponse": crate::net::base64_encode(raw) }),
+                Some("S")
+            )
+            .unwrap_err(),
+            super::COOKIES,
+            "{raw:?}"
+        );
+    }
+    for binary in [
+        b"Content-Type: text/plain\rSet-Cookie: sid=x; Domain=.sliccy.ai".as_slice(),
+        b"Content-Type: text/plain\x01X-Trace: 1".as_slice(),
+        b"Set-Cookie: sid=x; Domain=.sliccy.ai\r\nContent-Type: text/plain".as_slice(),
+    ] {
+        let mut cdp = response_paused("https://shop.example.test/api", "R");
+        assert_eq!(
+            cdp.call(
+                "Fetch.fulfillRequest",
+                json!({ "requestId": "R", "responseCode": 200, "binaryResponseHeaders": crate::net::base64_encode(binary) }),
+                Some("S")
+            )
+            .unwrap_err(),
+            super::COOKIES,
+            "{binary:?}"
+        );
+    }
+    let mut crlf = response_paused("https://shop.example.test/api", "I1");
+    assert!(crlf
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({
+                "interceptionId": "I1",
+                "rawResponse": crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
+            }),
+            Some("S")
+        )
+        .is_ok());
+    let mut lf_only = response_paused("https://shop.example.test/api", "I1");
+    assert!(lf_only
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({
+                "interceptionId": "I1",
+                "rawResponse": crate::net::base64_encode(b"HTTP/1.1 200 OK\nContent-Type: text/plain\n\n")
+            }),
+            Some("S")
+        )
+        .is_ok());
+    let mut deletion = response_paused("https://shop.example.test/api", "I1");
+    assert!(deletion
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({
+                "interceptionId": "I1",
+                "rawResponse": crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=; Max-Age=0\r\n\r\n")
+            }),
+            Some("S")
+        )
+        .is_ok());
+    let mut body_cr = response_paused("https://shop.example.test/api", "I1");
+    assert!(body_cr
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({
+                "interceptionId": "I1",
+                "rawResponse": crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nline1\rline2")
+            }),
+            Some("S")
+        )
+        .is_ok());
+}
+
+#[test]
 fn response_side_empty_set_cookie_line_is_refused() {
     let mut array = response_paused("https://shop.example.test/api", "R");
     assert_eq!(
