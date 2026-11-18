@@ -88,6 +88,8 @@ fn credential_cookie_writes_are_refused_with_the_catalog_refusal() {
     }
     for (method, params) in [
         ("Network.setCookie", json!({"name":"x","value":"y","url":"https://example.test/"})),
+        ("Network.setCookie", json!({"name":"x","value":"y","url":"https://x.ims-na1.adobelogin.com/"})),
+        ("Network.setCookie", json!({"name":"x","value":"y","url":"https://auth.adobelogin.com/"})),
         ("Network.setCookie", json!({"name":"x","value":"y","domain":"x.ims-na1.adobelogin.com","path":"/"})),
         ("Network.setCookie", json!({"name":"x","value":"y","domain":"evil-adobelogin.com","path":"/"})),
         ("Network.setCookie", json!({"name":"x","value":"y","domain":"adobelogin.com.evil.test","path":"/"})),
@@ -200,6 +202,7 @@ fn credential_storage_commands_are_refused_and_ordinary_storage_stays_readable()
         ("CacheStorage.requestCacheNames", json!({"securityOrigin":IDP})),
         ("CacheStorage.requestEntries", json!({"cacheId":format!("{IDP}/|cache"),"skipCount":0,"pageSize":10})),
         ("Storage.getUsageAndQuota", json!({"origin":IDP})),
+        ("Storage.clearDataForOrigin", json!({"origin":IDP,"storageTypes":"cookies,local_storage,indexeddb,cache_storage"})),
         ("Storage.clearDataForOrigin", json!({"origin":IDP,"storageTypes":"all"})),
         ("Storage.clearDataForStorageKey", json!({"storageKey":key,"storageTypes":"all"})),
         ("Storage.getSharedStorageEntries", json!({"ownerOrigin":IDP})),
@@ -230,6 +233,62 @@ fn credential_storage_commands_are_refused_and_ordinary_storage_stays_readable()
         ("Storage.getUsageAndQuota", json!({"origin":"https://example.test"})),
     ] {
         assert!(url_backend("about:blank").call(method, params.clone(), Some("S")).is_ok(), "{method} {params}");
+    }
+}
+
+#[test]
+fn credential_clear_data_for_origin_is_refused_and_never_reaches_chrome() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Recording {
+        inbox: VecDeque<String>,
+        sent: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Transport for Recording {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            let message: Value = serde_json::from_str(text).unwrap();
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                self.sent.borrow_mut().push(method.to_string());
+            }
+            self.inbox
+                .push_back(json!({"id": message["id"], "result": {}}).to_string());
+            Ok(())
+        }
+
+        fn recv_text(&mut self, _: Instant) -> Result<Option<String>, String> {
+            Ok(self.inbox.pop_front())
+        }
+    }
+
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut cdp = Cdp::from_transport(Box::new(Recording {
+        inbox: VecDeque::new(),
+        sent: Rc::clone(&sent),
+    }));
+    cdp.fixture_session("S");
+    let refusal = credential_refusal();
+    for params in [
+        json!({"origin": IDP, "storageTypes": "cookies,local_storage,indexeddb,cache_storage"}),
+        json!({"origin": IDP, "storageTypes": "all"}),
+        json!({"origin": IDP_STAGE, "storageTypes": "all"}),
+    ] {
+        sent.borrow_mut().clear();
+        assert_eq!(
+            cdp.call("Storage.clearDataForOrigin", params.clone(), Some("S"))
+                .unwrap_err(),
+            refusal,
+            "{params}"
+        );
+        assert!(
+            !sent
+                .borrow()
+                .iter()
+                .any(|method| method == "Storage.clearDataForOrigin"),
+            "clearDataForOrigin must not reach Chrome for {params}: {:?}",
+            sent.borrow()
+        );
     }
 }
 

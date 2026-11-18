@@ -468,7 +468,7 @@ fn cookie_params(guard: &Protected, cookie: &Value, at: &str) -> Result<Value, S
     if let Some(site) = partition {
         params["partitionKey"] = json!({ "topLevelSite": site, "hasCrossSiteAncestor": ancestor.unwrap_or(true) });
     }
-    if shield::credential_cookie_refused(guard, &params) {
+    if shield::credential_cookie_refused(guard, "Network.setCookie", &params) {
         return Err(format!("{}\n", guard.credential_refusal()));
     }
     if shield::cookie_protected(guard, &params) {

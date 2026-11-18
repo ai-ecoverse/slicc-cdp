@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import catalog from '@ai-ecoverse/slicc-browsers/catalog.json' with { type: 'json' };
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { skipReason } from '@ai-ecoverse/slicc-browsers/guard-driver.mjs';
 import { run, summary } from '@ai-ecoverse/slicc-browsers/guard-runner';
@@ -16,6 +18,13 @@ import { browserArgs, browserStartup, origins } from './guard-fixture.mjs';
 import { inboundClients } from './inbound-clients.mjs';
 import { describeLoad, watchLoad } from './load.mjs';
 import { finalizeX1Privacy, recordX1Client, x1Privacy } from './x1-audit.mjs';
+
+const fixtureTls = {
+  cert: readFileSync(fileURLToPath(new URL('./fixtures/tls/cert.pem', import.meta.url))),
+  key: readFileSync(fileURLToPath(new URL('./fixtures/tls/key.pem', import.meta.url))),
+};
+
+const httpsTargets = new Set(['idp', 'idp-stg']);
 
 const { containsSecret } = await import(
   new URL('./redirect-secret.mjs', import.meta.resolve('@ai-ecoverse/slicc-browsers/package.json'))
@@ -123,7 +132,7 @@ export const published = JSON.parse(
 );
 
 export const partitions = {
-  a: ['seven', 'ordinary', 'chrome-newtab', 'chrome-passwords'],
+  a: ['seven', 'ordinary', 'chrome-newtab', 'chrome-passwords', 'idp', 'idp-stg'],
   b: ['vault', 'chrome-new-tab-page', 'chrome-settings'],
   c: ['vault-x', 'own', 'chrome-search'],
   d: ['apex', 'chrome-extension-page', 'file-root', 'network-error'],
@@ -355,14 +364,27 @@ const launched = [];
 
 async function guardBrowser(
   startup,
-  { privileged, extension, target, slot, siteIsolationOff, signal, deadlineAt }
+  {
+    privileged,
+    extension,
+    target,
+    slot,
+    siteIsolationOff,
+    ignoreCertificateErrors,
+    signal,
+    deadlineAt,
+  }
 ) {
   const controller = new AbortController();
   const started = await deadline(
     () =>
       startup.start(
         [
-          ...browserArgs({ privileged: privileged || extension, siteIsolationOff }),
+          ...browserArgs({
+            privileged: privileged || extension,
+            siteIsolationOff,
+            ignoreCertificateErrors,
+          }),
           ...(extension ? ['--enable-unsafe-extension-debugging'] : []),
         ],
         { target, slot, signal: AbortSignal.any([signal, controller.signal]), deadlineAt }
@@ -425,6 +447,7 @@ export async function runPartition(t, id) {
   requireChrome();
   const selectedTargets = partitions[id];
   assert.ok(selectedTargets, 'guard partition must be declared');
+  const only = process.env.SLICC_GUARD_VECTOR;
   const set = {
     ...published,
     vectors: published.vectors
@@ -432,7 +455,8 @@ export async function runPartition(t, id) {
         ...vector,
         targets: vector.targets.filter((target) => selectedTargets.includes(target)),
       }))
-      .filter((vector) => vector.targets.length),
+      .filter((vector) => vector.targets.length)
+      .filter((vector) => !only || vector.id === only),
   };
   const started = Date.now();
   launched.length = 0;
@@ -483,8 +507,9 @@ export async function runPartition(t, id) {
     };
     const failures = [];
     try {
+      const secure = httpsTargets.has(target);
       fixture = await acquire(
-        (signal) => fixtureServer({ signal }),
+        (signal) => fixtureServer({ signal, ...(secure ? { tls: fixtureTls } : {}) }),
         'fixture-startup',
         (resource) => resource.close(),
         remaining()
@@ -494,6 +519,8 @@ export async function runPartition(t, id) {
       const execution = await run(selected, {
         fixture,
         targets,
+        catalog,
+        credentialOrigins: catalog.credentialOrigins,
         capabilities: runCapabilities,
         variant: Object.keys(set.variants),
         parallel,
@@ -518,6 +545,7 @@ export async function runPartition(t, id) {
                 target,
                 slot,
                 siteIsolationOff,
+                ignoreCertificateErrors: secure,
                 signal: t.signal,
                 deadlineAt: setupDeadline,
               })
@@ -643,6 +671,32 @@ export async function runPartition(t, id) {
               }
             };
           }
+          if (vector.id === 'C7.credential-export') {
+            const send = unguarded.send;
+            let adobeloginPlantTop = null;
+            unguarded.send = async (method, params = {}, sessionId) => {
+              const url = typeof params?.url === 'string' ? params.url : '';
+              if (
+                method === 'Target.createTarget' &&
+                adobeloginPlantTop &&
+                /:\/\/adobe\.com(?::|\/|$)/.test(url)
+              ) {
+                try {
+                  await send('Target.closeTarget', { targetId: adobeloginPlantTop });
+                } catch {}
+                adobeloginPlantTop = null;
+              }
+              const result = await send(method, params, sessionId);
+              if (method === 'Target.createTarget' && result?.targetId) {
+                if (url.includes('part=1') || /\/credential\?/.test(url))
+                  adobeloginPlantTop = result.targetId;
+              }
+              if (method === 'Target.closeTarget' && params?.targetId === adobeloginPlantTop) {
+                adobeloginPlantTop = null;
+              }
+              return result;
+            };
+          }
           startup.markRowStarted();
           return {
             client,
@@ -740,12 +794,13 @@ export async function runPartition(t, id) {
       process.env.SLICC_GUARD_SHA ??
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
+  const expectedRows = only
+    ? rowsFor(selectedTargets).filter((row) => row.id === only)
+    : rowsFor(selectedTargets);
   const recorded = new Set(report.results.map(rowKey));
   const missing = new Set(report.missing.map(rowKey));
   report.missing.push(
-    ...rowsFor(selectedTargets).filter(
-      (row) => !recorded.has(rowKey(row)) && !missing.has(rowKey(row))
-    )
+    ...expectedRows.filter((row) => !recorded.has(rowKey(row)) && !missing.has(rowKey(row)))
   );
   report.partition = id;
   report.startupRetries = startup.retries;
@@ -808,10 +863,10 @@ export async function runPartition(t, id) {
   );
   assert.deepEqual(
     report.results.map(rowKey).sort(),
-    rowsFor(selectedTargets).map(rowKey).sort(),
+    expectedRows.map(rowKey).sort(),
     `partition ${id} must record every published row of its targets, once`
   );
-  assertGuardReport(report, id, report.sha);
+  if (!only) assertGuardReport(report, id, report.sha);
   assert.deepEqual(report.missing, [], 'all published rows must be present');
   assert.equal(report.observerSkipped, 0);
   assert.deepEqual(

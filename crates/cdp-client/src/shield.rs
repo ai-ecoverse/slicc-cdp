@@ -580,7 +580,7 @@ pub fn cookie_protected(guard: &Protected, cookie: &Value) -> bool {
         }
     }
     if let Some(url) = cookie.get("url").and_then(|v| v.as_str()) {
-        if url_protected(guard, url) || host_of(url).is_some_and(|host| guard.cookie_domain(&host)) || guard.credential_cookie_url(url)
+        if url_protected(guard, url) || host_of(url).is_some_and(|host| guard.cookie_domain(&host)) || guard.credential_url(url)
         {
             return true;
         }
@@ -641,9 +641,15 @@ pub fn cookie_refused(guard: &Protected, params: &Value) -> bool {
     }
 }
 
-fn credential_cookie(guard: &Protected, cookie: &Value) -> bool {
+fn credential_cookie(guard: &Protected, cookie: &Value, url_under: bool) -> bool {
     cookie.get("domain").and_then(Value::as_str).is_some_and(|domain| guard.credential_cookie_domain(domain))
-        || cookie.get("url").and_then(Value::as_str).is_some_and(|url| guard.credential_cookie_url(url))
+        || cookie.get("url").and_then(Value::as_str).is_some_and(|url| {
+            if url_under {
+                guard.credential_cookie_url(url)
+            } else {
+                guard.credential_url(url)
+            }
+        })
         || match cookie.get("partitionKey") {
             Some(Value::String(site)) => guard.credential_site(site),
             Some(key) => key.get("topLevelSite").and_then(Value::as_str).is_some_and(|site| guard.credential_site(site)),
@@ -651,10 +657,11 @@ fn credential_cookie(guard: &Protected, cookie: &Value) -> bool {
         }
 }
 
-pub fn credential_cookie_refused(guard: &Protected, params: &Value) -> bool {
+pub fn credential_cookie_refused(guard: &Protected, method: &str, params: &Value) -> bool {
+    let url_under = matches!(method, "Network.deleteCookies" | "Page.deleteCookie");
     match params.get("cookies").and_then(Value::as_array) {
-        Some(cookies) => cookies.iter().any(|cookie| credential_cookie(guard, cookie)),
-        None => credential_cookie(guard, params),
+        Some(cookies) => cookies.iter().any(|cookie| credential_cookie(guard, cookie, url_under)),
+        None => credential_cookie(guard, params, url_under),
     }
 }
 
@@ -732,12 +739,21 @@ fn redact_cookie_lines(text: &str) -> String {
 
 pub fn credential_associated(guard: &Protected, params: &Value) -> bool {
     params.get("associatedCookies").and_then(Value::as_array).into_iter().flatten()
-        .any(|item| item.get("cookie").is_some_and(|cookie| credential_cookie(guard, cookie)))
+        .any(|item| item.get("cookie").is_some_and(|cookie| credential_cookie(guard, cookie, true)))
         || params.pointer("/cookiePartitionKey/topLevelSite").and_then(Value::as_str).is_some_and(|site| guard.credential_site(site))
 }
 
 pub fn credential_cookie_event(guard: &Protected, params: &Value, urls: &[String]) -> bool {
     urls.is_empty() || urls.iter().any(|url| guard.credential_cookie_url(&web_socket_as_http(url))) || credential_associated(guard, params)
+}
+
+fn strip_cookie_lines(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| match line.split_once(':') {
+            Some((name, _)) if cookie_header(name.trim()) => false,
+            _ => true,
+        })
+        .collect()
 }
 
 pub fn strip_credential_cookies(guard: &Protected, value: &mut Value, remove: bool) {
@@ -761,7 +777,7 @@ pub fn strip_credential_cookies(guard: &Protected, value: &mut Value, remove: bo
                 if cookie_header(key) && item.is_string() {
                     *item = Value::String("[redacted]".to_string());
                 } else if let Some(text) = item.as_str().filter(|_| matches!(key.as_str(), "headersText" | "requestHeadersText")) {
-                    *item = Value::String(redact_cookie_lines(text));
+                    *item = Value::String(if remove { strip_cookie_lines(text) } else { redact_cookie_lines(text) });
                 } else if !FREE_FORM.contains(&key.as_str()) || key == "headers" {
                     strip_credential_cookies(guard, item, remove);
                 }

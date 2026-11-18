@@ -1,32 +1,19 @@
-import { protectedOrigins } from './protected.js';
+import { CREDENTIAL_ORIGINS as CREDENTIAL_ORIGIN_RULES } from './credential-origins.js';
+import { credentialOrigins as credentialOriginsOf, protectedOrigins } from './protected.js';
 import { PROTECTED_ORIGINS } from './protected-origins.js';
 
 export const REFUSAL = PROTECTED_ORIGINS.refusal;
 
 const guard = protectedOrigins(PROTECTED_ORIGINS);
+const credential = credentialOriginsOf(CREDENTIAL_ORIGIN_RULES);
 
-export const CREDENTIAL_ORIGINS = [
-  'https://ims-na1.adobelogin.com',
-  'https://ims-na1-stg1.adobelogin.com',
-];
+export const CREDENTIAL_ORIGINS = CREDENTIAL_ORIGIN_RULES.origins;
+export const CREDENTIAL_REFUSAL = CREDENTIAL_ORIGIN_RULES.refusal;
 
-const credentialHosts = CREDENTIAL_ORIGINS.map((origin) => new URL(origin).hostname);
+const credentialHosts = credential.hosts();
 
 function coversCredential(domain) {
   return domain.length > 0 && credentialHosts.some((host) => under(host, domain));
-}
-
-function credentialDomain(text) {
-  const domain = text.toLowerCase().replace(/^\./u, '').replace(/\.$/u, '');
-  return coversCredential(domain);
-}
-
-function credentialSite(text) {
-  try {
-    return coversCredential(hostOf(text));
-  } catch {
-    return false;
-  }
 }
 
 function credentialUrl(text) {
@@ -46,12 +33,12 @@ function credentialUrl(text) {
 
 export function credentialCookie(cookie) {
   if (!cookie || typeof cookie !== 'object') return true;
-  if (typeof cookie.domain === 'string' && credentialDomain(cookie.domain)) return true;
+  if (typeof cookie.domain === 'string' && credential.cookieDomain(cookie.domain)) return true;
   if (typeof cookie.url === 'string' && credentialUrl(cookie.url)) return true;
   const key = cookie.partitionKey;
-  if (typeof key === 'string') return credentialSite(key);
+  if (typeof key === 'string') return credential.topLevelSite(key);
   if (key && typeof key === 'object' && typeof key.topLevelSite === 'string') {
-    return credentialSite(key.topLevelSite);
+    return credential.topLevelSite(key.topLevelSite);
   }
   return false;
 }

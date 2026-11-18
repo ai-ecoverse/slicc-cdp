@@ -1,5 +1,7 @@
 export function origins(fixture) {
-  const origin = (host) => `http://${host}:${fixture.port}`;
+  const scheme =
+    typeof fixture?.origin === 'string' && fixture.origin.startsWith('https:') ? 'https' : 'http';
+  const origin = (host) => `${scheme}://${host}:${fixture.port}`;
   return {
     seven: origin('seven.sliccy.ai'),
     vault: origin('vault.sliccy.ai'),
@@ -9,6 +11,8 @@ export function origins(fixture) {
     client: origin('client.guard.test'),
     ordinary: origin('plain.guard.test'),
     cross: origin('cross.other.test'),
+    idp: origin('ims-na1.adobelogin.com'),
+    'idp-stg': origin('ims-na1-stg1.adobelogin.com'),
     'ordinary-same-site': null,
   };
 }
@@ -44,7 +48,11 @@ export function browserStartup(launch, report = () => {}) {
   };
 }
 
-export function browserArgs({ privileged = false, siteIsolationOff = false } = {}) {
+export function browserArgs({
+  privileged = false,
+  siteIsolationOff = false,
+  ignoreCertificateErrors = false,
+} = {}) {
   const hosts = [
     'seven.sliccy.ai',
     'vault.sliccy.ai',
@@ -54,6 +62,10 @@ export function browserArgs({ privileged = false, siteIsolationOff = false } = {
     'plain.guard.test',
     'same.guard.test',
     'cross.other.test',
+    'ims-na1.adobelogin.com',
+    'ims-na1-stg1.adobelogin.com',
+    'adobe.com',
+    'www.adobe.com',
     'exa%20mple.sliccy.ai',
     'xn--1ug.sliccy.ai',
     'xn--a.sliccy.ai',
@@ -61,6 +73,7 @@ export function browserArgs({ privileged = false, siteIsolationOff = false } = {
   return [
     `--host-resolver-rules=${hosts.map((host) => `MAP ${host} 127.0.0.1`).join(', ')}`,
     '--no-proxy-server',
+    ...(ignoreCertificateErrors ? ['--ignore-certificate-errors'] : []),
     ...(privileged
       ? []
       : ['--disable-extensions', '--disable-component-extensions-with-background-pages']),

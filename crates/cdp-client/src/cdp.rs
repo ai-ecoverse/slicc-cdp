@@ -641,6 +641,15 @@ impl Cdp {
             self.admit_for(method, &params, session_id, holder_debugger, left)?;
             return self.create_target(params, timeout);
         }
+        if method == "Page.getCookies" {
+            let urls = params.get("urls").cloned().unwrap_or(Value::Null);
+            let rewritten = if urls.is_null() {
+                ("Network.getAllCookies", json!({}))
+            } else {
+                ("Network.getCookies", json!({ "urls": urls }))
+            };
+            return self.call_guarded_for(rewritten.0, rewritten.1, session_id, timeout, holder_debugger, retry_opt_in);
+        }
         let mut checks = self.page_scope_admit_prepare(method, std::slice::from_ref(&params), &params, session_id, timeout, holder_debugger, retry_opt_in)?;
         #[cfg(test)]
         self.runtime_stage(method, "pin");
@@ -1057,7 +1066,7 @@ impl Cdp {
                 }
             }
         }
-        if shield::cookie_method(method) && shield::credential_cookie_refused(&self.guard, params)
+        if shield::cookie_method(method) && shield::credential_cookie_refused(&self.guard, method, params)
             || shield::storage_domain(method) && shield::names_credential_storage(&self.guard, params)
         {
             return Err(format!("{}\n", self.guard.credential_refusal()));
@@ -4683,7 +4692,7 @@ impl Cdp {
         if extra {
             if let Some(id) = id.clone() {
                 if credential_lists {
-                    shield::strip_credential_cookies(&self.guard, &mut value["params"], false);
+                    shield::strip_credential_cookies(&self.guard, &mut value["params"], true);
                 }
                 if self.requests.get(&id) != Some(&false) {
                     self.held.entry(id).or_default().push(value);
@@ -4692,8 +4701,7 @@ impl Cdp {
             }
         }
         if self.credential_cookie_event(&value) {
-            let fetch = value["method"].as_str().is_some_and(|method| method.starts_with("Fetch."));
-            shield::strip_credential_cookies(&self.guard, &mut value["params"], fetch);
+            shield::strip_credential_cookies(&self.guard, &mut value["params"], true);
         }
         if !terminal { self.visible_network(&value); }
         self.events.push(value);

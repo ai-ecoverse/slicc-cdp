@@ -159,6 +159,32 @@ test("sliccy-browser's protectedOrigins rules match the installed catalog", asyn
   );
 });
 
+test("sliccy-browser's credentialOrigins rules match the installed catalog", async () => {
+  const catalog = JSON.parse(
+    await readFile(
+      fileURLToPath(import.meta.resolve('@ai-ecoverse/slicc-browsers/catalog.json')),
+      'utf8'
+    )
+  );
+  const { CATALOG_CREDENTIAL_ORIGINS, CREDENTIAL_ORIGIN_FLOOR, CREDENTIAL_ORIGINS } = await import(
+    '../../packages/sliccy-browser/src/credential-origins.js'
+  );
+  assert.deepEqual(
+    CATALOG_CREDENTIAL_ORIGINS,
+    catalog.credentialOrigins,
+    'copy catalog.credentialOrigins into packages/sliccy-browser/src/credential-origins.js, and raise its version'
+  );
+  assert.deepEqual(
+    catalog.credentialOrigins.origins,
+    CREDENTIAL_ORIGIN_FLOOR,
+    '1.27.1 catalog list must equal the IMS floor today'
+  );
+  for (const origin of CREDENTIAL_ORIGIN_FLOOR) {
+    assert.ok(CREDENTIAL_ORIGINS.origins.includes(origin), `union lost floor host ${origin}`);
+  }
+  assert.equal(CREDENTIAL_ORIGINS.refusal, catalog.credentialOrigins.refusal);
+});
+
 test('what sliccy-browser ships is what npm has under its version, so a change to it names a new version for ci.yml to publish', async (t) => {
   const { version } = JSON.parse(await readFile(path.join(PACKAGE, 'package.json'), 'utf8'));
   const spec = `${NAME}@${version}`;

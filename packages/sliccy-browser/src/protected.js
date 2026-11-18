@@ -113,3 +113,52 @@ export function protectedOrigins(rules, extraOrigins = []) {
 
   return { url, target, cookieDomain, storageKey, unparseable, extensionFrame };
 }
+
+export function credentialOrigins(rules) {
+  const hosts = (rules?.origins ?? [])
+    .map((text) => {
+      const u = parse(text);
+      return u?.host ? hostOf(u) : null;
+    })
+    .filter(Boolean);
+
+  const hostMatch = (text) => {
+    const u = parse(text);
+    if (!u || !['http', 'https'].includes(scheme(u))) return false;
+    const h = hostOf(u);
+    return hosts.includes(h);
+  };
+
+  const cookieDomain = (domain) => {
+    let d = String(domain ?? '').toLowerCase();
+    if (d.startsWith('.')) d = d.slice(1);
+    if (d.endsWith('.')) d = d.slice(0, -1);
+    if (d === '') return false;
+    return hosts.some((h) => under(h, d));
+  };
+
+  const topLevelSite = (text) => {
+    const u = parse(text);
+    if (!u || !['http', 'https'].includes(scheme(u))) return false;
+    const site = hostOf(u);
+    return hosts.some((h) => under(h, site));
+  };
+
+  const storageKey = (key) => {
+    const [first, ...rest] = String(key ?? '').split('^');
+    if (hostMatch(first)) return true;
+    return rest
+      .filter((p) => p.startsWith('0'))
+      .map((p) => p.slice(1))
+      .some((text) => topLevelSite(text));
+  };
+
+  return {
+    url: hostMatch,
+    cookieDomain,
+    topLevelSite,
+    storageKey,
+    hosts: () => [...hosts],
+    refusal: () => rules?.refusal ?? '',
+  };
+}

@@ -1,4 +1,4 @@
-use slicc_browsers::ProtectedOrigins;
+use slicc_browsers::{CredentialOrigins, ProtectedOrigins};
 use std::sync::OnceLock;
 use url::Url;
 
@@ -19,12 +19,31 @@ pub struct Protected {
     credential_refusal: String,
 }
 
-const STAND_IN_CREDENTIAL_ORIGINS: &[&str] = &["https://ims-na1.adobelogin.com", "https://ims-na1-stg1.adobelogin.com"];
-const STAND_IN_CREDENTIAL_REFUSAL: &str = "slicc: refused: this origin holds sign-in credentials";
+const CREDENTIAL_ORIGIN_FLOOR: &[&str] = &[
+    "https://ims-na1.adobelogin.com",
+    "https://ims-na1-stg1.adobelogin.com",
+];
 
-fn credential_rules() -> &'static (Vec<String>, String) {
-    static RULES: OnceLock<(Vec<String>, String)> = OnceLock::new();
-    RULES.get_or_init(|| (STAND_IN_CREDENTIAL_ORIGINS.iter().map(|origin| origin.to_string()).collect(), STAND_IN_CREDENTIAL_REFUSAL.to_string()))
+fn effective_credential_origins(catalog: &CredentialOrigins) -> CredentialOrigins {
+    let mut origins = Vec::new();
+    for origin in CREDENTIAL_ORIGIN_FLOOR
+        .iter()
+        .copied()
+        .chain(catalog.origins.iter().map(String::as_str))
+    {
+        if !origins.iter().any(|existing| existing == origin) {
+            origins.push(origin.to_string());
+        }
+    }
+    CredentialOrigins {
+        origins,
+        refusal: catalog.refusal.clone(),
+    }
+}
+
+fn credential_rules() -> &'static CredentialOrigins {
+    static RULES: OnceLock<CredentialOrigins> = OnceLock::new();
+    RULES.get_or_init(|| effective_credential_origins(&slicc_browsers::catalog().credential_origins))
 }
 
 fn credential_hosts(origins: &[String]) -> Vec<String> {
@@ -62,13 +81,13 @@ impl Protected {
             .filter(|url| url.host_str().is_some_and(|host| !host.is_empty()))
             .map(host_of)
             .collect();
-        let (origins, refusal) = credential_rules();
+        let credential = credential_rules();
         Self {
             rules,
             extra,
             extra_hosts,
-            credential: credential_hosts(origins),
-            credential_refusal: refusal.clone(),
+            credential: credential_hosts(&credential.origins),
+            credential_refusal: credential.refusal.clone(),
         }
     }
 
@@ -699,6 +718,64 @@ mod tests {
             assert!(!guard.url_read_only(url), "{url}");
             assert!(!guard.target(url, false, Opener::None), "{url}");
         }
+    }
+
+    #[test]
+    fn catalog_credential_origins_are_the_two_ims_hosts() {
+        let catalog = &slicc_browsers::catalog().credential_origins;
+        let floor: Vec<String> = super::CREDENTIAL_ORIGIN_FLOOR
+            .iter()
+            .map(|origin| (*origin).to_string())
+            .collect();
+        assert_eq!(catalog.origins, floor, "1.27.1 catalog list must equal the IMS floor today");
+        assert_eq!(catalog.refusal, "slicc: refused: this origin holds sign-in credentials");
+        let rules = super::credential_rules();
+        assert_eq!(rules.refusal, catalog.refusal);
+        assert_eq!(rules.origins, floor);
+        for origin in super::CREDENTIAL_ORIGIN_FLOOR {
+            assert!(
+                rules.origins.iter().any(|entry| entry == origin),
+                "union lost floor host {origin}"
+            );
+        }
+        let guard = Protected::default();
+        assert_eq!(guard.credential_refusal(), catalog.refusal.as_str());
+        for origin in &rules.origins {
+            assert!(guard.credential_url(origin), "{origin}");
+        }
+        assert!(!guard.credential_url("https://third.example.test/"));
+    }
+
+    #[test]
+    fn credential_origin_union_keeps_the_floor_when_catalog_adds_or_drops_hosts() {
+        let with_extra = super::effective_credential_origins(&slicc_browsers::CredentialOrigins {
+            origins: vec![
+                "https://ims-na1.adobelogin.com".into(),
+                "https://extra.idp.test".into(),
+            ],
+            refusal: "slicc: refused: catalog text".into(),
+        });
+        assert_eq!(
+            with_extra.origins,
+            vec![
+                "https://ims-na1.adobelogin.com".to_string(),
+                "https://ims-na1-stg1.adobelogin.com".to_string(),
+                "https://extra.idp.test".to_string(),
+            ]
+        );
+        assert_eq!(with_extra.refusal, "slicc: refused: catalog text");
+        let empty = super::effective_credential_origins(&slicc_browsers::CredentialOrigins {
+            origins: vec![],
+            refusal: "slicc: refused: empty catalog".into(),
+        });
+        assert_eq!(
+            empty.origins,
+            super::CREDENTIAL_ORIGIN_FLOOR
+                .iter()
+                .map(|origin| (*origin).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(empty.refusal, "slicc: refused: empty catalog");
     }
 
     #[test]
