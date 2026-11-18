@@ -787,13 +787,23 @@ fn domain_attributes(line: &str) -> Vec<String> {
     }).collect()
 }
 
-fn cookie_line_usable(line: &str) -> bool {
+fn cookie_line_shaped(line: &str) -> bool {
     !line.is_empty() && line.lines().all(|line| {
-        line.split(';').next().and_then(|pair| pair.split_once('=')).is_some_and(|(name, value)| {
+        line.split(';').next().and_then(|pair| pair.split_once('=')).is_some_and(|(name, _)| {
             let name = name.trim();
-            !name.is_empty() && !value.trim().is_empty() && !name.eq_ignore_ascii_case("domain")
+            !name.is_empty() && !name.eq_ignore_ascii_case("domain")
         })
     })
+}
+
+fn cookie_line_usable(line: &str) -> bool {
+    cookie_line_shaped(line)
+        && line.lines().all(|line| {
+            line.split(';')
+                .next()
+                .and_then(|pair| pair.split_once('='))
+                .is_some_and(|(_, value)| !value.trim().is_empty())
+        })
 }
 
 fn line_scope_hidden(guard: &Protected, line: &str, base: &str) -> bool {
@@ -816,7 +826,7 @@ fn credential_line_scope(guard: &Protected, line: &str, base: &str) -> bool {
 }
 
 pub fn set_cookie_hidden(guard: &Protected, value: &str, base: &str) -> bool {
-    !cookie_line_usable(value) || guard.url(base) || value.lines().any(|line| line_scope_hidden(guard, line, base))
+    !cookie_line_shaped(value) || guard.url(base) || value.lines().any(|line| line_scope_hidden(guard, line, base))
 }
 
 pub fn cookie_line_hidden(guard: &Protected, line: &str, base: &str) -> bool {

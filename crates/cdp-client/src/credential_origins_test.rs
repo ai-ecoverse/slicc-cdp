@@ -458,8 +458,60 @@ fn set_cookie_domain_attributes_are_parsed_quoted_dotted_and_repeated() {
         assert!(crate::shield::set_cookie_hidden(&guard, line, base), "{line}");
         assert!(crate::shield::cookie_line_hidden(&guard, line, base), "{line}");
     }
-    for line in ["a=b; Domain=\"example.test\"", "a=b; Domain=.adobe.com", "a=b; Domain=example.test.; Domain=shop.example.test", "a=b; Path=/"] {
+    for line in ["a=b; Domain=\"example.test\"", "a=b; Domain=.adobe.com", "a=b; Domain=example.test.; Domain=shop.example.test", "a=b; Path=/", "sid=; Max-Age=0; Path=/"] {
         assert!(!crate::shield::set_cookie_hidden(&guard, line, base), "{line}");
+    }
+}
+
+#[test]
+fn ordinary_empty_value_set_cookie_deletion_headers_stay_visible() {
+    let guard = crate::protected::Protected::default();
+    let deletion = "sid=; Max-Age=0; Path=/";
+    let base = "https://shop.example.test/api";
+    assert!(!crate::shield::set_cookie_hidden(&guard, deletion, base));
+    assert!(crate::shield::cookie_line_hidden(&guard, deletion, base));
+    for domain in [".adobelogin.com", ".sliccy.ai"] {
+        let line = format!("sid=; Max-Age=0; Path=/; Domain={domain}");
+        assert!(crate::shield::set_cookie_hidden(&guard, &line, base), "{line}");
+        assert!(crate::shield::cookie_line_hidden(&guard, &line, base), "{line}");
+    }
+    let mut events = vec![
+        json!({"method": "Network.requestWillBeSent", "params": {"requestId": "R", "request": {"url": base, "headers": {}}}}),
+        json!({"method": "Network.responseReceived", "params": {"requestId": "R", "response": {"url": base, "status": 200, "headers": {"Set-Cookie": deletion}}}}),
+        json!({"method": "Network.responseReceivedExtraInfo", "params": {"requestId": "R", "statusCode": 200, "headers": {"set-cookie": deletion}}}),
+    ];
+    crate::shield::redact_cookie_events(&guard, &mut events, &json!({"cookies": []}));
+    let text = serde_json::to_string(&events).unwrap();
+    assert!(text.contains("sid=; Max-Age=0; Path=/"), "{text}");
+    assert!(!text.contains("[redacted]"), "{text}");
+    let mut hidden_events = vec![
+        json!({"method": "Network.responseReceived", "params": {"requestId": "H", "response": {"url": base, "status": 200, "headers": {"Set-Cookie": "sid=; Max-Age=0; Path=/; Domain=.adobelogin.com"}}}}),
+        json!({"method": "Network.responseReceived", "params": {"requestId": "P", "response": {"url": base, "status": 200, "headers": {"Set-Cookie": "sid=; Max-Age=0; Path=/; Domain=.sliccy.ai"}}}}),
+    ];
+    crate::shield::redact_cookie_events(&guard, &mut hidden_events, &json!({"cookies": []}));
+    let hidden = serde_json::to_string(&hidden_events).unwrap();
+    assert_eq!(hidden.matches("[redacted]").count(), 2, "{hidden}");
+    assert!(!hidden.contains("sid=;"), "{hidden}");
+    let empty = |domain: &str| json!([{"name": "Set-Cookie", "value": format!("sid=; Max-Age=0; Domain={domain}")}]);
+    for domain in [".adobelogin.com", ".sliccy.ai"] {
+        let mut fulfill = url_backend("https://example.test/");
+        fulfill.hand("S", "R");
+        fulfill.requests.insert("R".into(), false);
+        assert!(fulfill.call("Fetch.fulfillRequest", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(domain)}), Some("S")).is_err(), "{domain}");
+        let mut continued = url_backend("https://example.test/");
+        continued.absorb(json!({"method": "Fetch.requestPaused", "sessionId": "S", "params": {
+            "requestId": "R", "networkId": "N", "frameId": "F1", "resourceType": "XHR",
+            "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "Content-Type", "value": "text/plain"}]
+        }}));
+        assert!(continued.next_paused(Some("S"), Duration::ZERO).unwrap().is_some());
+        assert!(continued.call("Fetch.continueResponse", json!({"requestId": "R", "responseCode": 200, "responseHeaders": empty(domain)}), Some("S")).is_err(), "{domain}");
+        let raw = crate::net::base64_encode(format!("HTTP/1.1 200 OK\r\nSet-Cookie: sid=; Max-Age=0; Domain={domain}\r\n\r\n").as_bytes());
+        let mut intercepted = url_backend("https://example.test/");
+        intercepted.hand("S", "I1");
+        intercepted.requests.insert("I1".into(), false);
+        assert!(intercepted.call("Network.continueInterceptedRequest", json!({"interceptionId": "I1", "rawResponse": raw}), Some("S")).is_err(), "{domain}");
     }
 }
 
