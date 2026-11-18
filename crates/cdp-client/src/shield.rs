@@ -682,6 +682,11 @@ fn header_field_ctl(text: &str) -> bool {
     text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0'))
 }
 
+fn is_set_cookie_name(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
+}
+
 fn header_set_cookies(fields: Option<&Value>) -> Option<Vec<String>> {
     let Some(fields) = fields else {
         return Some(Vec::new());
@@ -697,7 +702,7 @@ fn header_set_cookies(fields: Option<&Value>) -> Option<Vec<String>> {
         if header_field_ctl(name) {
             return None;
         }
-        if name.trim().eq_ignore_ascii_case("set-cookie") {
+        if is_set_cookie_name(name) {
             let Some(value) = item.get("value").and_then(Value::as_str) else {
                 return None;
             };
@@ -782,7 +787,7 @@ fn binary_set_cookies(binary: Option<&Value>) -> Option<Vec<String>> {
             return None;
         }
         let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("set-cookie") {
+        if is_set_cookie_name(name) {
             out.push(value.trim().to_string());
         }
     }
@@ -816,7 +821,7 @@ fn raw_response_set_cookies(raw: Option<&Value>) -> Option<Vec<String>> {
             return None;
         }
         let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("set-cookie") {
+        if is_set_cookie_name(name) {
             out.push(value.trim().to_string());
         }
     }
@@ -836,7 +841,7 @@ fn response_set_cookie_lines(method: &str, params: &Value) -> Option<Vec<String>
                 match headers {
                     Value::Object(map) => {
                         for (name, value) in map {
-                            if name.trim().eq_ignore_ascii_case("set-cookie") {
+                            if is_set_cookie_name(name) {
                                 let Some(text) = value.as_str() else {
                                     return None;
                                 };
