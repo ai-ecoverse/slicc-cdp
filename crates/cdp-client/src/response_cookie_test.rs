@@ -322,6 +322,9 @@ fn response_side_obs_fold_continuations_in_raw_and_binary_fail_closed() {
         b"HTTP/1.1 200 OK\r\nSet-Cookie: a=b;\r\n Domain=.sliccy.ai\r\n\r\n".as_slice(),
         b"HTTP/1.1 200 OK\r\nSet-Cookie: a=b;\r\n\tDomain=.sliccy.ai\r\n\r\n".as_slice(),
         b"HTTP/1.1 200 OK\nSet-Cookie: a=b;\n Domain=.sliccy.ai\n\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nSet-Cookie: a=b;\r\n Domain=.sliccy.ai; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nSet-Cookie: a=b;\r\n\tDomain=.sliccy.ai; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\nSet-Cookie: a=b;\n Domain=.sliccy.ai; Expires=Wed, 21 Oct 2015 07:28:00 GMT\n\n".as_slice(),
     ] {
         let mut cdp = response_paused("https://shop.example.test/api", "I1");
         assert_eq!(
@@ -335,13 +338,100 @@ fn response_side_obs_fold_continuations_in_raw_and_binary_fail_closed() {
             "{raw:?}"
         );
     }
-    let binary = crate::net::base64_encode(b"Set-Cookie: a=b;\n Domain=.sliccy.ai\0Content-Type: text/plain");
+    for binary in [
+        b"Set-Cookie: a=b;\n Domain=.sliccy.ai\0Content-Type: text/plain".as_slice(),
+        b"Set-Cookie: a=b;\n Domain=.sliccy.ai; Expires=Wed, 21 Oct 2015 07:28:00 GMT\0Content-Type: text/plain".as_slice(),
+        b"Set-Cookie: a=b;\n\tDomain=.sliccy.ai; Expires=Wed, 21 Oct 2015 07:28:00 GMT\0Content-Type: text/plain".as_slice(),
+    ] {
+        let mut fulfill = response_paused("https://shop.example.test/api", "R");
+        assert_eq!(
+            fulfill
+                .call(
+                    "Fetch.fulfillRequest",
+                    json!({ "requestId": "R", "responseCode": 200, "binaryResponseHeaders": crate::net::base64_encode(binary) }),
+                    Some("S")
+                )
+                .unwrap_err(),
+            super::COOKIES,
+            "{binary:?}"
+        );
+    }
+}
+
+#[test]
+fn response_side_raw_header_block_ends_at_lf_crlf() {
+    let ordinary = crate::net::base64_encode(b"HTTP/1.1 200 OK\nContent-Type: text/plain\n\r\nhello");
+    let mut ok = response_paused("https://shop.example.test/api", "I1");
+    assert!(ok
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({ "interceptionId": "I1", "rawResponse": ordinary }),
+            Some("S")
+        )
+        .is_ok());
+    let planted = crate::net::base64_encode(
+        b"HTTP/1.1 200 OK\nSet-Cookie: sid=PLANTED; Domain=.sliccy.ai\n\r\nhello",
+    );
+    let mut refuse = response_paused("https://shop.example.test/api", "I1");
+    assert_eq!(
+        refuse
+            .call(
+                "Network.continueInterceptedRequest",
+                json!({ "interceptionId": "I1", "rawResponse": planted }),
+                Some("S")
+            )
+            .unwrap_err(),
+        super::COOKIES
+    );
+    let body_plant = crate::net::base64_encode(
+        b"HTTP/1.1 200 OK\nContent-Type: text/plain\n\r\nSet-Cookie: sid=PLANTED; Domain=.sliccy.ai",
+    );
+    let mut body_ok = response_paused("https://shop.example.test/api", "I1");
+    assert!(body_ok
+        .call(
+            "Network.continueInterceptedRequest",
+            json!({ "interceptionId": "I1", "rawResponse": body_plant }),
+            Some("S")
+        )
+        .is_ok());
+}
+
+#[test]
+fn response_side_empty_set_cookie_line_is_refused() {
+    let mut array = response_paused("https://shop.example.test/api", "R");
+    assert_eq!(
+        array
+            .call(
+                "Fetch.fulfillRequest",
+                json!({
+                    "requestId": "R",
+                    "responseCode": 200,
+                    "responseHeaders": [{ "name": "Set-Cookie", "value": "" }]
+                }),
+                Some("S")
+            )
+            .unwrap_err(),
+        super::COOKIES
+    );
+    let binary = crate::net::base64_encode(b"Set-Cookie:\0Content-Type: text/plain");
     let mut fulfill = response_paused("https://shop.example.test/api", "R");
     assert_eq!(
         fulfill
             .call(
                 "Fetch.fulfillRequest",
                 json!({ "requestId": "R", "responseCode": 200, "binaryResponseHeaders": binary }),
+                Some("S")
+            )
+            .unwrap_err(),
+        super::COOKIES
+    );
+    let raw = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie:\r\n\r\n");
+    let mut intercepted = response_paused("https://shop.example.test/api", "I1");
+    assert_eq!(
+        intercepted
+            .call(
+                "Network.continueInterceptedRequest",
+                json!({ "interceptionId": "I1", "rawResponse": raw }),
                 Some("S")
             )
             .unwrap_err(),

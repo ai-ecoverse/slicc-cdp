@@ -20,6 +20,10 @@ function plant(domain) {
   return `sid=PLANTED; Domain=${domain}; HttpOnly`;
 }
 
+function forwarded(backend, method, idKey, id) {
+  return backend.calls.some((call) => call.method === method && call.params?.[idKey] === id);
+}
+
 async function withPage(body) {
   let request = 0;
   let session;
@@ -45,7 +49,10 @@ async function withPage(body) {
   backend.targets.push({ targetId: 'T', url: 'https://ordinary.example/' });
   let client;
   try {
-    client = await guarded(backend.url, 'https://private.example.invalid');
+    client = await guarded(backend.url, 'https://private.example.invalid', {
+      variant: 'prompt',
+      detachDelay: 0,
+    });
     session = (await client.send('Target.attachToTarget', { targetId: 'T', flatten: true }))
       .sessionId;
     await body({
@@ -70,6 +77,7 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
   await withPage(async ({ send, enable, backend }) => {
     for (const domain of PLANTS) {
       const fulfillId = await enable('Request');
+      const fromFulfill = backend.calls.length;
       await assert.rejects(
         send('Fetch.fulfillRequest', {
           requestId: fulfillId,
@@ -78,18 +86,14 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
         }),
         /cookies on seven's origin/
       );
-      const binaryId = await enable('Request');
-      await assert.rejects(
-        send('Fetch.fulfillRequest', {
-          requestId: binaryId,
-          responseCode: 200,
-          binaryResponseHeaders: Buffer.from(
-            `Set-Cookie: ${plant(domain)}\0Content-Type: text/plain`
-          ).toString('base64'),
-        }),
-        /cookies on seven's origin/
+      assert.equal(
+        backend.calls.slice(fromFulfill).some((call) => call.method === 'Fetch.fulfillRequest'),
+        false,
+        `fulfill ${domain} must not reach the backend`
       );
+
       const continueId = await enable('Response');
+      const fromContinue = backend.calls.length;
       await assert.rejects(
         send('Fetch.continueResponse', {
           requestId: continueId,
@@ -98,7 +102,14 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
         }),
         /cookies on seven's origin/
       );
+      assert.equal(
+        backend.calls.slice(fromContinue).some((call) => call.method === 'Fetch.continueResponse'),
+        false,
+        `continueResponse ${domain} must not reach the backend`
+      );
+
       const rawId = await enable('Request');
+      const fromRaw = backend.calls.length;
       await assert.rejects(
         send('Network.continueInterceptedRequest', {
           interceptionId: rawId,
@@ -108,18 +119,31 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
         }),
         /cookies on seven's origin/
       );
+      assert.equal(
+        backend.calls
+          .slice(fromRaw)
+          .some((call) => call.method === 'Network.continueInterceptedRequest'),
+        false,
+        `continueInterceptedRequest ${domain} must not reach the backend`
+      );
     }
-    const okId = await enable('Request');
+
+    const ordinaryId = await enable('Request');
     await send('Fetch.fulfillRequest', {
-      requestId: okId,
+      requestId: ordinaryId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Set-Cookie', value: 'sid=ok; Domain=ordinary.example; Path=/' }],
+    });
+    assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', ordinaryId));
+
+    const deleteId = await enable('Request');
+    await send('Fetch.fulfillRequest', {
+      requestId: deleteId,
       responseCode: 200,
       responseHeaders: [{ name: 'Set-Cookie', value: 'sid=; Max-Age=0; Path=/' }],
     });
-    assert.ok(
-      backend.calls.some(
-        (call) => call.method === 'Fetch.fulfillRequest' && call.params?.requestId === okId
-      )
-    );
+    assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', deleteId));
+
     await assert.rejects(
       send('Network.setRequestInterception', { patterns: [] }),
       /slicc: refused:/

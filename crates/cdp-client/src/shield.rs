@@ -711,6 +711,16 @@ fn header_set_cookies(fields: Option<&Value>) -> Option<Vec<String>> {
     Some(out)
 }
 
+fn http_header_block(text: &str) -> &str {
+    let mut cut = text.len();
+    for sep in ["\r\n\r\n", "\n\r\n", "\n\n"] {
+        if let Some(at) = text.find(sep) {
+            cut = cut.min(at);
+        }
+    }
+    &text[..cut]
+}
+
 fn binary_set_cookies(binary: Option<&Value>) -> Option<Vec<String>> {
     let Some(binary) = binary else {
         return Some(Vec::new());
@@ -745,7 +755,7 @@ fn raw_response_set_cookies(raw: Option<&Value>) -> Option<Vec<String>> {
     };
     let bytes = base64_decode(text).ok()?;
     let text = String::from_utf8_lossy(&bytes);
-    let head = text.split("\r\n\r\n").next().unwrap_or("").split("\n\n").next().unwrap_or("");
+    let head = http_header_block(&text);
     let mut lines = head.lines();
     let _status = lines.next()?;
     let mut out = Vec::new();
