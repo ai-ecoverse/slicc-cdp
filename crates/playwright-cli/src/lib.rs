@@ -204,6 +204,15 @@ mod tests {
             assert!(output.stderr.contains("returned ws://203.0.113.9:9223/devtools/browser/x, a host other than this machine; refusing to dial it"), "{via}: {}", output.stderr);
         }
         assert_eq!(foreign_hits.load(std::sync::atomic::Ordering::SeqCst), count);
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://127.0.0.1:{}/json/version", listener.local_addr().unwrap().port())
+        };
+        launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = Some(Listed { saved: Some(dead.clone()), ..Listed::default() }));
+        let output = execute(&["tab-list".to_string()], None);
+        launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.ends_with(&format!("playwright-cli: {dead} is the endpoint playwright-cli saved for this directory, and it did not answer. Pass --cdp <port|url> to choose another browser.\n")), "{}", output.stderr);
         let (named, named_hits) = discovery_answering(|port| format!("ws://evil.localhost:{port}/devtools/browser/x"));
         launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = Some(Listed { probe: Some(named), ..Listed::default() }));
         let output = execute(&["tab-list".to_string()], None);

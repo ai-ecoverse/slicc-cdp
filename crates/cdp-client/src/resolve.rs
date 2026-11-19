@@ -6,7 +6,7 @@ pub const CONNECT_ORDER: &str = "Connect, in order: --cdp <url> wins; else SLICC
 
 pub const CDP_FORMS: &str = "--cdp and SLICC_CDP_URL take a port, host[:port], [ipv6][:port], ws://, wss://, http://, or https://. A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque. A webSocketDebuggerUrl from discovery is dialed only when it is ws:// or wss:// on this machine (for discovery on this machine) or on the host asked; anything else is refused before dialing. \"auto\" (or an empty value) skips that step, so --cdp auto ignores SLICC_CDP_URL.";
 
-pub const CDP_REPORT: &str = "--verbose prints \"* CDP <endpoint> (via <rule>)\" to stderr before connecting. When nothing is found, the error lists every step tried and why it was passed over.";
+pub const CDP_REPORT: &str = "--verbose prints \"* CDP <endpoint> (via <rule>)\" to stderr as soon as the endpoint is chosen, before connecting. When nothing is found, the error lists every step tried and why it was passed over. When a saved endpoint does not answer, the error names it.";
 
 pub fn help_block(indent: &str, width: usize) -> String {
     [CONNECT_ORDER, CDP_FORMS, CDP_REPORT]
@@ -202,6 +202,38 @@ pub fn describe(choice: &Choice, full_urls: bool) -> String {
     let url = endpoint(&choice.start);
     let shown = if full_urls { url.to_string() } else { crate::sanitize::redact_url(url) };
     format!("* CDP {shown} (via {})\n", choice.rule.label())
+}
+
+static EAGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn announce_eagerly() {
+    EAGER.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn announce(choice: &Choice, full_urls: bool) -> Option<String> {
+    let line = describe(choice, full_urls);
+    if EAGER.load(std::sync::atomic::Ordering::SeqCst) {
+        eprint!("{line}");
+        return None;
+    }
+    Some(line)
+}
+
+pub fn unreachable(message: &str) -> bool {
+    !message.starts_with("HTTP ")
+        && (message.contains("CDP connection to ")
+            || message.contains("CDP discovery failed for ")
+            || message.contains("could not resolve "))
+}
+
+pub fn saved_hint(tool: &str, choice: &Choice, message: &str) -> String {
+    if choice.rule != Rule::Saved || !unreachable(message) {
+        return String::new();
+    }
+    format!(
+        "{tool}: {} is the endpoint playwright-cli saved for this directory, and it did not answer. Pass --cdp <port|url> to choose another browser.\n",
+        crate::sanitize::redact_url(endpoint(&choice.start))
+    )
 }
 
 pub fn not_found(tool: &str, trail: &[Step]) -> String {
@@ -531,6 +563,27 @@ mod tests {
         let words = |text: &str| text.split_whitespace().map(str::to_string).collect::<Vec<_>>();
         let joined = [CONNECT_ORDER, CDP_FORMS, CDP_REPORT].join(" ");
         assert_eq!(words(&block), words(&joined));
+    }
+
+    #[test]
+    fn a_dead_saved_endpoint_is_named_and_others_are_not() {
+        let saved = Choice { start: Start::Discover(version(40103)), rule: Rule::Saved };
+        let dead = "CDP discovery failed for http://127.0.0.1:40103/json/version: Connection refused\n";
+        assert_eq!(
+            saved_hint("curlwright", &saved, dead),
+            "curlwright: http://127.0.0.1:40103/json/version is the endpoint playwright-cli saved for this directory, and it did not answer. Pass --cdp <port|url> to choose another browser.\n"
+        );
+        assert_eq!(saved_hint("curlwright", &saved, "HTTP 500\nCDP connection to x\n"), "");
+        assert_eq!(saved_hint("curlwright", &saved, "curlwright: no tab\n"), "");
+        let probed = Choice { start: Start::Discover(version(40104)), rule: Rule::Probe };
+        assert_eq!(saved_hint("curlwright", &probed, dead), "");
+        assert!(unreachable("could not resolve x\n") && unreachable("CDP connection to 127.0.0.1:1 failed\n"));
+    }
+
+    #[test]
+    fn announce_returns_the_line_unless_eager() {
+        let choice = Choice { start: Start::Discover(version(9222)), rule: Rule::Probe };
+        assert_eq!(announce(&choice, false).as_deref(), Some("* CDP http://127.0.0.1:9222/json/version (via port probe)\n"));
     }
 
     #[test]

@@ -16,14 +16,37 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
-    let mut picked = None;
+    let mut picked = Picked { verbose: invocation.verbose, full_urls: invocation.full_urls, choice: None, buffered: String::new() };
     let mut output = run_picked(invocation, env_url, &mut picked);
-    if invocation.verbose {
-        if let Some(choice) = &picked {
-            output.stderr.insert_str(0, &resolve::describe(choice, invocation.full_urls));
-        }
-    }
+    output.stderr.insert_str(0, &picked.buffered);
     output
+}
+
+struct Picked {
+    verbose: bool,
+    full_urls: bool,
+    choice: Option<resolve::Choice>,
+    buffered: String,
+}
+
+impl Picked {
+    fn set(&mut self, choice: resolve::Choice) {
+        if self.verbose {
+            if let Some(line) = resolve::announce(&choice, self.full_urls) {
+                self.buffered.push_str(&line);
+            }
+        }
+        self.choice = Some(choice);
+    }
+
+    fn failed(&self, message: String) -> Output {
+        let hint = self
+            .choice
+            .as_ref()
+            .map(|choice| resolve::saved_hint("playwright-cli", choice, &message))
+            .unwrap_or_default();
+        Output::err(format!("{message}{hint}"))
+    }
 }
 
 fn launched(start: &connect::Start, probed: bool) -> resolve::Choice {
@@ -31,7 +54,7 @@ fn launched(start: &connect::Start, probed: bool) -> resolve::Choice {
     resolve::Choice { start: start.clone(), rule }
 }
 
-fn run_picked(invocation: &Invocation, env_url: Option<&str>, picked: &mut Option<resolve::Choice>) -> Output {
+fn run_picked(invocation: &Invocation, env_url: Option<&str>, picked: &mut Picked) -> Output {
     let command = invocation.command.as_deref().unwrap_or("");
     if let Some(message) = trace::precheck(command, &invocation.positionals) {
         return Output::err(message);
@@ -106,14 +129,14 @@ fn run_picked(invocation: &Invocation, env_url: Option<&str>, picked: &mut Optio
     let mut started = None;
     let mut start = match resolved.choice {
         Some(choice) => {
-            *picked = Some(choice.clone());
+            picked.set(choice.clone());
             choice.start
         }
         None if launch::should_launch(command, explicit) => {
             match start_by_launching(command, &invocation.flags, &mut started) {
                 Ok((start, probed)) => {
                     from_probe = probed;
-                    *picked = Some(launched(&start, probed));
+                    picked.set(launched(&start, probed));
                     start
                 }
                 Err(message) => return Output::err(message),
@@ -128,7 +151,7 @@ fn run_picked(invocation: &Invocation, env_url: Option<&str>, picked: &mut Optio
             match start_by_launching(command, &invocation.flags, &mut started) {
                 Ok((next, probed)) => {
                     from_probe = probed;
-                    *picked = Some(launched(&next, probed));
+                    picked.set(launched(&next, probed));
                     start = next;
                     opened = cdp::open_dialed(start.clone(), runtime.as_deref());
                 }
@@ -138,7 +161,7 @@ fn run_picked(invocation: &Invocation, env_url: Option<&str>, picked: &mut Optio
     }
     let (_, connected) = match opened {
         Ok(pair) => pair,
-        Err(message) => return Output::err(message),
+        Err(message) => return picked.failed(message),
     };
     let endpoint = match &start {
         connect::Start::Direct(url) | connect::Start::Discover(url) => url.clone(),

@@ -149,9 +149,11 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         Ok(choice) => choice,
         Err(message) => return Output::plain(message, 1),
     };
+    let announced = if opts.verbose { cdp_client::resolve::announce(&choice, opts.full_urls) } else { None };
     let mut output = connected(&opts, choice.start.clone(), request, signer);
-    if opts.verbose {
-        output.stderr.insert_str(0, &cdp_client::resolve::describe(&choice, opts.full_urls));
+    output.stderr.push_str(&cdp_client::resolve::saved_hint("curlwright", &choice, &output.stderr));
+    if let Some(line) = announced {
+        output.stderr.insert_str(0, &line);
     }
     output
 }
@@ -636,6 +638,15 @@ mod tests {
             assert!(output.stderr.contains("returned ws://203.0.113.9:9223/devtools/browser/x, a host other than this machine; refusing to dial it"), "{via}: {}", output.stderr);
         }
         assert_eq!(foreign_hits.load(std::sync::atomic::Ordering::SeqCst), count);
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://127.0.0.1:{}/json/version", listener.local_addr().unwrap().port())
+        };
+        FINDER.with(|cell| *cell.borrow_mut() = Some(listed(None, Some(dead.clone()), None)));
+        let output = execute(&["https://app.example/x".to_string()], None);
+        FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.ends_with(&format!("curlwright: {dead} is the endpoint playwright-cli saved for this directory, and it did not answer. Pass --cdp <port|url> to choose another browser.\n")), "{}", output.stderr);
         let (named, named_hits) = discovery_answering(|port| format!("ws://evil.localhost:{port}/devtools/browser/x"));
         FINDER.with(|cell| *cell.borrow_mut() = Some(listed(None, None, Some(named))));
         let output = execute(&["https://app.example/x".to_string()], None);

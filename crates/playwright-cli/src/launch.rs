@@ -282,12 +282,7 @@ pub fn retry_open_without_endpoint(command: &str, message: &str) -> bool {
 }
 
 fn remembered_endpoint_unreachable(message: &str) -> bool {
-    if message.starts_with("HTTP ") {
-        return false;
-    }
-    message.contains("CDP connection to ")
-        || message.contains("CDP discovery failed for ")
-        || message.contains("could not resolve ")
+    cdp_client::resolve::unreachable(message)
 }
 
 #[allow(dead_code)]

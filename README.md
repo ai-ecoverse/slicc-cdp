@@ -80,7 +80,7 @@ Order (the first step that yields an endpoint wins):
 2. `SLICC_CDP_URL`.
 3. `slicc browsers --json`, when `slicc` is on `PATH`: prefer `sevenOpen`, then a slicc profile, then the best tier; loopback `ws://` only. The answer is cached for a few seconds under the user config dir.
 4. A live `DevToolsActivePort` under slicc `seven-profiles`, legacy `profiles`, and SLICC six profile dirs: loopback `/json/version` check, the live websocket pathname must match the file, the newest live file wins.
-5. The loopback endpoint `playwright-cli` saved for this working directory under the user config dir (`slicc/playwright-cli/sessions/`). `curlwright` reads it and never writes one. An endpoint that came from the port probe is reused only while it answers. A `.playwright-cli/session.json` in the working directory is ignored, and saved state never dials a non-loopback host.
+5. The loopback endpoint `playwright-cli` saved for this working directory under the user config dir (`slicc/playwright-cli/sessions/`). `curlwright` reads it and never writes one. A saved endpoint other than a probe-derived one is not re-checked first: if that browser is gone, the command fails (except `playwright-cli open`, which launches) and the error ends with `<endpoint> is the endpoint playwright-cli saved for this directory, and it did not answer. Pass --cdp <port|url> to choose another browser.` An endpoint that came from the port probe is reused only while it answers. A `.playwright-cli/session.json` in the working directory is ignored, and saved state never dials a non-loopback host.
 6. The first of `127.0.0.1:9222`-`9229` whose `/json/version` answers (`SLICC_CDP_PORTS` replaces the range in tests, which never dial 9222-9229).
 
 When nothing is found, `playwright-cli open` launches a browser; `curlwright` and every other `playwright-cli` command exit 1. The wasm builds stop after step 2 and use `127.0.0.1:9222`.
@@ -100,7 +100,7 @@ Anything else, `0` included, exits 1 with `unsupported CDP URL "<value>" (expect
 
 Every form other than a `ws://` or `wss://` URL with a path reads `/json/version` first, and the `webSocketDebuggerUrl` it returns is dialled only if it is `ws://` or `wss://` on this machine (when discovery asked this machine: `localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`, `::`) or on the same host as an explicit remote endpoint. Anything else is refused before any connection, with `CDP discovery at <url> returned <socket>, a host other than this machine; refusing to dial it`. The port probe skips a port whose reply points elsewhere.
 
-`--verbose` (`curlwright -v` too) prints the endpoint and the step that picked it to stderr before connecting. Query strings are redacted unless `--full-urls` is given:
+`--verbose` (`curlwright -v` too) prints the endpoint and the step that picked it to stderr as soon as it is chosen, before connecting, so a stalled connection still shows where it went. Query strings are redacted unless `--full-urls` is given:
 
 ```
 * CDP http://127.0.0.1:9222/json/version (via slicc browsers)
