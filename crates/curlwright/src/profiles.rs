@@ -1,17 +1,46 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
-pub(crate) fn attached_port() -> Result<Option<String>, String> {
-    #[cfg(any(test, target_arch = "wasm32"))]
-    {
-        Ok(None)
-    }
-    #[cfg(all(not(test), not(target_arch = "wasm32")))]
-    {
-        let ports = cdp_client::ports::catalog();
-        if let Some(url) = cdp_client::discover::attached(&mut |url| http_body(url))? {
-            return Ok(Some(url));
+use cdp_client::resolve::{Finder, Rule, Step};
+
+pub(crate) struct HostFinder;
+
+impl Finder for HostFinder {
+    fn attached(&mut self, trail: &mut Vec<Step>) -> Result<Option<(Rule, String)>, String> {
+        #[cfg(any(test, target_arch = "wasm32"))]
+        {
+            let _ = trail;
+            Ok(None)
         }
-        Ok(cdp_client::ports::first_live(&ports, &mut |url| http_body(url)))
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        {
+            cdp_client::discover::attached_traced(&mut |url| http_body(url), trail)
+        }
+    }
+
+    fn saved(&mut self, trail: &mut Vec<Step>) -> Option<String> {
+        #[cfg(any(test, target_arch = "wasm32"))]
+        {
+            let _ = trail;
+            None
+        }
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        {
+            let text = crate::tab::session_text();
+            cdp_client::resolve::saved_from_json(text.as_deref(), &mut |url| http_body(url), trail)
+        }
+    }
+
+    fn probe(&mut self, trail: &mut Vec<Step>) -> Option<String> {
+        #[cfg(any(test, target_arch = "wasm32"))]
+        {
+            let _ = trail;
+            None
+        }
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        {
+            let ports = cdp_client::ports::catalog();
+            cdp_client::resolve::probe_ports(&ports, &mut |url| http_body(url), trail)
+        }
     }
 }
 
@@ -142,8 +171,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tests_do_not_scan_the_disk() {
-        assert_eq!(attached_port().unwrap(), None);
+    fn tests_do_not_scan_the_disk_or_dial() {
+        let mut trail = Vec::new();
+        assert_eq!(HostFinder.attached(&mut trail).unwrap(), None);
+        assert_eq!(HostFinder.saved(&mut trail), None);
+        assert_eq!(HostFinder.probe(&mut trail), None);
     }
 
     #[test]

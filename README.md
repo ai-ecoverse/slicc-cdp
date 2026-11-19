@@ -40,9 +40,9 @@ playwright-cli click e3
 curlwright -i https://example.com/
 ```
 
-`open` attaches to a running Chrome or launches one. To pick a browser, pass `--cdp <port>` (for example `--cdp 9333`, which means `localhost:9333`) or `--cdp http://127.0.0.1:<port>`, or set `SLICC_CDP_URL`. Without those, host connect tries `slicc browsers --json` when `slicc` is on `PATH` (prefer `sevenOpen`, then a slicc profile, then best tier; loopback `ws://` only), then a live `DevToolsActivePort` under slicc `seven-profiles` / legacy `profiles` / SLICC six profile dirs (loopback `/json/version` check; the live websocket pathname must match the file; newest live wins), then a loopback endpoint saved under the user config dir, then probes `127.0.0.1:9222-9229`. `curlwright` uses the same order without the saved session and exits when nothing answers. The wasm builds still use port 9222 and skip the CLI and file steps. Run `playwright-cli --help` for all commands.
+`open` attaches to a running Chrome or launches one; `curlwright` and every other `playwright-cli` command only attach. Both pick the browser the same way, described in [Finding a browser](#finding-a-browser). Run `playwright-cli --help` for all commands.
 
-`--cdp` and `SLICC_CDP_URL` take a port, `host`, `host:port` (port 9222 when it is left out), an `http://` or `https://` URL, or a `ws://` or `wss://` URL. A `ws://` or `wss://` URL with a path is dialled as it is; every other form reads `/json/version` first. The client tries every address the host resolves to, and `localhost`, `127.0.0.1`, `::1` (`[::1]`) and `0.0.0.0` all mean this machine: both `::1` and `127.0.0.1` are tried. Every address but the last gets two seconds to connect.
+The client tries every address a `--cdp` host resolves to, and `localhost`, `127.0.0.1`, `::1` (`[::1]`) and `0.0.0.0` all mean this machine: both `::1` and `127.0.0.1` are tried. Every address but the last gets two seconds to connect.
 
 A `wss://` or `https://` endpoint on this machine with a self-signed certificate takes a pin: set `SLICC_CDP_CERT_SHA256` to the certificate's SHA-256 fingerprint, as 64 hex digits, with or without colons (`openssl x509 -noout -fingerprint -sha256`). The certificate must then match exactly, and it is checked before anything is sent, so a wrong certificate never sees the token in a URL. The pin replaces certificate verification only for names of this machine (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0` and `::`); any other host is verified as usual, and a value that isn't a fingerprint is an error. The wasm build has no TLS: in the kernel, a program reaches the browser through the `ws://` URL in `SLICC_CDP_URL`, and the page that hosts the kernel holds any `wss://` socket.
 
@@ -69,6 +69,53 @@ The web storage commands, `localstorage-list`, `-get`, `-set`, `-delete` and `-c
 WebMCP and Browser Annotation API polyfills are owned by [mcpcat](https://github.com/ai-ecoverse/mcpcat). Use `mcpcat serve --webmcp` for page tools. slicc-cdp provides the generic `eval-attach` / `eval-detach` primitive below; consumers supply their scripts and enforce their API semantics. `discover` still reports a page-provided WebMCP API at load time. It does not watch polyfill snapshots.
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
+
+## Finding a browser
+
+`playwright-cli` and `curlwright` share one resolver, `cdp_client::resolve`, so the order, the `--cdp` forms and the messages below are the same for both. `jerk` (ai-ecoverse/slicc-jerk) follows the same contract.
+
+Order (the first step that yields an endpoint wins):
+
+1. `--cdp <value>`.
+2. `SLICC_CDP_URL`.
+3. `slicc browsers --json`, when `slicc` is on `PATH`: prefer `sevenOpen`, then a slicc profile, then the best tier; loopback `ws://` only. The answer is cached for a few seconds under the user config dir.
+4. A live `DevToolsActivePort` under slicc `seven-profiles`, legacy `profiles`, and SLICC six profile dirs: loopback `/json/version` check, the live websocket pathname must match the file, the newest live file wins.
+5. The loopback endpoint `playwright-cli` saved for this working directory under the user config dir (`slicc/playwright-cli/sessions/`). An endpoint that came from the port probe is reused only while it answers. A `.playwright-cli/session.json` in the working directory is ignored, and saved state never dials a non-loopback host.
+6. The first of `127.0.0.1:9222`-`9229` whose `/json/version` answers (`SLICC_CDP_PORTS` replaces the range in tests, which never dial 9222-9229).
+
+When nothing is found, `playwright-cli open` launches a browser; `curlwright` and every other `playwright-cli` command exit 1. The wasm builds stop after step 2 and use `127.0.0.1:9222`.
+
+`--cdp` and `SLICC_CDP_URL` take:
+
+| Form | Example | Means |
+| --- | --- | --- |
+| port | `9333` | `http://localhost:9333/json/version` |
+| host, host:port | `localhost`, `127.0.0.1:9333`, `[::1]:9333` | that host's `/json/version`, port 9222 when left out |
+| `http://`, `https://` | `http://127.0.0.1:9333` | `/json/version` discovery |
+| path-less `ws://`, `wss://` | `ws://127.0.0.1:9333` | `/json/version` discovery |
+| `ws://`, `wss://` with a path | `ws://127.0.0.1:9333/devtools/browser/<id>` | dialled as it is; the path is opaque |
+| `auto` or empty | `--cdp auto` | skip this step; `--cdp auto` also skips `SLICC_CDP_URL` |
+
+Anything else, `0` included, exits 1 with `unsupported CDP URL "<value>" (expected a port, host:port, ws://, wss://, http://, or https://; use --cdp auto to search for a running browser)`. A misspelt option gets a hint, for example `unknown option --cpd` followed by `Did you mean --cdp?`.
+
+`--verbose` (`curlwright -v` too) prints the endpoint and the step that picked it to stderr before connecting. Query strings are redacted unless `--full-urls` is given:
+
+```
+* CDP http://127.0.0.1:9222/json/version (via slicc browsers)
+```
+
+The step names are `--cdp`, `SLICC_CDP_URL`, `slicc browsers`, `DevToolsActivePort`, `saved endpoint`, `port probe`, `launched browser` (`playwright-cli open` only) and `wasm default`. When nothing is found, the error lists every step and why it was passed over:
+
+```
+curlwright: no CDP browser found. Tried, in order:
+  --cdp               not given
+  SLICC_CDP_URL       not set
+  slicc browsers      slicc not on PATH, or it failed
+  DevToolsActivePort  no live file under slicc seven-profiles, profiles, or six profiles
+  saved endpoint      none for this directory
+  port probe          nothing answered on 127.0.0.1:9222-9229
+Pass --cdp <port|host:port|ws://...|http://...>, set SLICC_CDP_URL, or start a browser with --remote-debugging-port.
+```
 
 ## Eval attachment holder
 
@@ -321,6 +368,8 @@ The Chrome DevTools Protocol connection behind `playwright-cli` and `curlwright`
 cdp-client = { package = "slicc-cdp-client", version = "1" }
 ```
 
+`cdp_client::resolve` picks the browser for both CLIs: `resolve(cdp, env, &mut finder)` walks the order from [Finding a browser](https://github.com/ai-ecoverse/slicc-cdp#finding-a-browser) and returns the endpoint, the step that chose it, and a trail of the steps passed over; `describe` and `not_found` print them, and `CONNECT_ORDER`, `CDP_FORMS` and `CDP_REPORT` are the help text both CLIs show.
+
 #### Fetch interception
 
 ```rust
@@ -345,7 +394,7 @@ playwright-cli snapshot
 playwright-cli click e3
 ```
 
-`open` attaches to a running Chrome or launches one. Pass `--cdp http://127.0.0.1:<port>` or set `SLICC_CDP_URL` to pick a browser.
+`open` attaches to a running Chrome or launches one. Pass `--cdp <port|url>` or set `SLICC_CDP_URL` to pick a browser; otherwise it searches as described under Finding a browser in the [slicc-cdp README](https://github.com/ai-ecoverse/slicc-cdp#finding-a-browser). `--verbose` names the endpoint and the step that picked it.
 
 Prebuilt binaries: `curl -fsSL https://get.sliccy.ai/playwright-cli | sh`. See [slicc-cdp](https://github.com/ai-ecoverse/slicc-cdp).
 
@@ -359,7 +408,7 @@ curlwright -i https://example.com/
 curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ```
 
-Without `--tab` it uses the tab `playwright-cli` last selected, else the one open tab on the URL's origin. `--intent` and `SLICC_INTENT` work as for `playwright-cli` (see [Intent](#intent)) and go into the request's `Slicc.action`.
+It never launches a browser. It finds one exactly as `playwright-cli` does (`--cdp`, `SLICC_CDP_URL`, `slicc browsers`, `DevToolsActivePort`, the saved `playwright-cli` endpoint, then `127.0.0.1:9222-9229`; see Finding a browser in the [slicc-cdp README](https://github.com/ai-ecoverse/slicc-cdp#finding-a-browser)), and `-v` prints which endpoint it used and why. Without `--tab` it uses the tab `playwright-cli` last selected, else the one open tab on the URL's origin. `--intent` and `SLICC_INTENT` work as for `playwright-cli` (see [Intent](#intent)) and go into the request's `Slicc.action`.
 
 `curlwright upgrade`, or `curlwright update`, replaces a prebuilt `curlwright` with the latest release, under the same rules as `playwright-cli upgrade`. A copy installed with Cargo is left to `cargo install curlwright`. As the first argument the word is always that command, so write `./update` for a relative URL.
 

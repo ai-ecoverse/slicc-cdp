@@ -256,9 +256,20 @@ fn rejection(flag: &str, canonical: &str) -> Stop {
     ))
 }
 
+const LONG_OPTIONS: &[&str] = &[
+    "--request", "--header", "--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode",
+    "--json", "--form", "--form-string", "--output", "--dump-header", "--write-out", "--max-time", "--user",
+    "--referer", "--range", "--url", "--tab", "--frame", "--cdp", "--runtime", "--intent", "--sign-key",
+    "--signature-agent", "--silent", "--show-error", "--include", "--head", "--verbose", "--fail", "--location",
+    "--remote-name", "--get", "--no-credentials", "--full-urls", "--help", "--version", "--signature-agent-legacy",
+];
+
 pub fn unknown(flag: &str) -> Stop {
+    let hint = cdp_client::resolve::suggest(flag, LONG_OPTIONS)
+        .map(|known| format!("\nDid you mean {known}?"))
+        .unwrap_or_default();
     Stop::usage(format!(
-        "curlwright: unknown option {flag}\nRun 'curlwright --help' for the supported flags."
+        "curlwright: unknown option {flag}{hint}\nRun 'curlwright --help' for the supported flags."
     ))
 }
 
@@ -576,6 +587,9 @@ mod tests {
         assert!(err(&["-b", "a=1"]).message.contains("cookie-set"));
         assert!(err(&["-A", "curl/8"]).message.contains("forbidden header"));
         assert!(err(&["--unknown-thing"]).message.contains("unknown option --unknown-thing"));
+        let typo = err(&["--cpd", "0", "https://app.example/"]).message;
+        assert!(typo.contains("unknown option --cpd\nDid you mean --cdp?"), "{typo}");
+        assert!(!err(&["--unknown-thing"]).message.contains("Did you mean"));
         assert!(validate_headers(&[HeaderSpec { name: "Referer".into(), value: "x".into(), unset: false }]).unwrap_err().message.contains("-e/--referer"));
         assert!(validate_headers(&[HeaderSpec { name: "X-Fine".into(), value: "1".into(), unset: false }]).is_ok());
     }

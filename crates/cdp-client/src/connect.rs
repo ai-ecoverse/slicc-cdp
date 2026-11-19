@@ -24,9 +24,7 @@ pub const DEFAULT_PORT: u16 = 9222;
 
 fn classify(raw: &str) -> Result<Start, String> {
     let Some(url) = with_scheme(raw) else {
-        return Err(format!(
-            "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://)\n"
-        ));
+        return Err(unsupported(raw));
     };
     let lower = url.to_ascii_lowercase();
     if let Some(http) = pathless_socket(&url) {
@@ -36,10 +34,14 @@ fn classify(raw: &str) -> Result<Start, String> {
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
         Ok(Start::Discover(discovery_url(&url)))
     } else {
-        Err(format!(
-            "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://)\n"
-        ))
+        Err(unsupported(raw))
     }
+}
+
+fn unsupported(raw: &str) -> String {
+    format!(
+        "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://; use --cdp auto to search for a running browser)\n"
+    )
 }
 
 pub fn with_scheme(raw: &str) -> Option<String> {

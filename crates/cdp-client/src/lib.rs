@@ -16,6 +16,7 @@ pub mod protected;
 mod race;
 #[cfg(test)]
 mod raw;
+pub mod resolve;
 pub mod sanitize;
 pub mod shield;
 pub mod state;

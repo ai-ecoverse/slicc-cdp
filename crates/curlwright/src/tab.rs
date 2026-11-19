@@ -89,8 +89,11 @@ fn format_candidates(pages: &[&Page], full_urls: bool) -> String {
 }
 
 fn session_current() -> Option<String> {
-    let text = fs::read_to_string(session_file()?).ok()?;
-    current_target(&text)
+    current_target(&session_text()?)
+}
+
+pub(crate) fn session_text() -> Option<String> {
+    fs::read_to_string(session_file()?).ok()
 }
 
 fn session_file() -> Option<PathBuf> {

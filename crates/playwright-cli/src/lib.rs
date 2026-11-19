@@ -154,6 +154,32 @@ mod tests {
     }
 
     #[test]
+    fn connect_is_explained_and_typos_get_a_hint() {
+        let typo = execute(&["--cpd".into(), "0".into(), "snapshot".into()], None);
+        assert_eq!(typo.code, 1);
+        assert_eq!(typo.stderr, "Unknown option: --cpd\nDid you mean --cdp?\n\n");
+        let inner = execute(&["snapshot".into(), "--cpd=0".into()], None);
+        assert!(inner.stderr.starts_with("Unknown option: --cpd\nDid you mean --cdp?\n"), "{}", inner.stderr);
+        let zero = execute(&["--cdp".into(), "0".into(), "snapshot".into()], None);
+        assert!(zero.stderr.contains("use --cdp auto to search"), "{}", zero.stderr);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let missing = execute(&["--cdp".into(), "auto".into(), "snapshot".into()], Some("9444"));
+            assert_eq!(missing.code, 1);
+            assert!(missing.stderr.starts_with(
+                "playwright-cli: no CDP browser found. Tried, in order:\n  --cdp               auto\n  SLICC_CDP_URL       set, skipped by --cdp auto\n  saved endpoint      none usable for this directory\n"
+            ), "{}", missing.stderr);
+            let open = execute(&["--cdp=auto".into(), "--verbose".into(), "open".into()], None);
+            assert!(open.stderr.contains("browser launch is not available in tests"), "{}", open.stderr);
+        }
+        let verbose = execute(&["--verbose".into(), "--cdp".into(), "ws://127.0.0.1:1/devtools/browser/x".into(), "snapshot".into()], None);
+        assert_eq!(verbose.code, 1);
+        assert!(verbose.stderr.starts_with("* CDP ws://127.0.0.1:1/devtools/browser/x (via --cdp)\n"), "{}", verbose.stderr);
+        let quiet = execute(&["--cdp".into(), "ws://127.0.0.1:1/devtools/browser/x".into(), "snapshot".into()], None);
+        assert!(!quiet.stderr.contains("* CDP"));
+    }
+
+    #[test]
     fn unknown_command_matches_upstream_usage_error() {
         let output = execute(&["nope".to_string()], None);
         assert_eq!(output.code, 1);
@@ -217,11 +243,15 @@ mod tests {
             "playwright-cli - run playwright mcp commands from terminal\n\nUsage: playwright-cli <command> [args] [options]\n"
         ));
         assert!(stdout.contains("Usage: playwright-cli --cdp=<url> <command> [args] [options]\n"));
+        for shared in [
+            cdp_client::resolve::CONNECT_ORDER,
+            cdp_client::resolve::CDP_FORMS,
+            cdp_client::resolve::CDP_REPORT,
+        ] {
+            assert!(stdout.contains(&format!("{shared}\n")), "{shared}");
+        }
         assert!(stdout.contains(
-            "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else the slicc browsers JSON listing when slicc is on PATH (prefer sevenOpen, then a slicc profile, then best tier; loopback ws only); else a live DevToolsActivePort under slicc seven-profiles, legacy profiles, and SLICC six profile dirs (loopback /json/version check, websocket pathname must match the file, newest live wins); else a loopback endpoint this tool saved under the user config dir. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when that port is absent or unreachable, attaches to the first of those ports whose /json/version answers, with or without a seven tab. A probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy. The wasm build still uses port 9222 and skips slicc browsers and DevToolsActivePort file reads.\n"
-        ));
-        assert!(stdout.contains(
-            "A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque.\n"
+            "Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229. Host open, when nothing is found, launches a browser on the first free port from 9222 to 9229, or lets Chrome pick one when all are busy; a probe-derived session is reused while that browser answers, and every tab is shown except those on protected origins. Other commands exit 1 instead of launching.\n"
         ));
         assert!(stdout.contains(
             "--runtime <name> is appended to the query of the URL that is opened. It is not interpreted.\n"

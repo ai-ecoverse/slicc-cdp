@@ -174,25 +174,23 @@ pub fn run(invocation: &Invocation, cdp_env: Option<&str>) -> Output {
         Sink::Stdout
     };
 
-    let explicit = launch::endpoint_is_explicit(invocation.cdp.as_deref(), cdp_env);
-    let profile = if explicit {
-        None
-    } else {
-        match launch::attached_port() {
-            Ok(active) => active,
-            Err(message) => return Output::err(message),
-        }
-    };
-    let remembered = if explicit || profile.is_some() {
-        None
-    } else {
-        launch::remembered_endpoint_named(invocation.session.as_deref(), invocation.cwd.as_deref())
-    };
-    let active = profile.or(remembered);
-    let start = match launch::start_after_explicit(invocation.cdp.as_deref(), cdp_env, active) {
-        Ok(start) => start,
+    let resolved = match launch::pick(
+        invocation.cdp.as_deref(),
+        cdp_env,
+        invocation.session.as_deref(),
+        invocation.cwd.as_deref(),
+        true,
+    ) {
+        Ok(resolved) => resolved,
         Err(message) => return Output::err(message),
     };
+    let Some(choice) = resolved.choice else {
+        return Output::err(cdp_client::resolve::not_found("playwright-cli", &resolved.trail));
+    };
+    if invocation.verbose {
+        eprint!("{}", cdp_client::resolve::describe(&choice, invocation.full_urls));
+    }
+    let start = choice.start;
     let dialed = match cdp::resolve_websocket(start, invocation.runtime.as_deref()) {
         Ok(socket) => socket,
         Err(message) => return Output::err(message),
@@ -3012,6 +3010,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            verbose: false,
             intent: None,
             help: false,
             command_help: false,
@@ -3068,6 +3067,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            verbose: false,
             intent: None,
             help: false,
             command_help: false,
@@ -3950,6 +3950,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            verbose: false,
             intent: None,
             help: false,
             command_help: false,
@@ -3974,6 +3975,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            verbose: false,
             intent: None,
             help: false,
             command_help: false,
@@ -4769,6 +4771,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            verbose: false,
             intent: None,
             help: false,
             command_help: false,

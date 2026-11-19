@@ -13,6 +13,7 @@ pub struct Invocation {
     pub runtime: Option<String>,
     pub session: Option<String>,
     pub full_urls: bool,
+    pub verbose: bool,
     pub intent: Option<String>,
     pub help: bool,
     pub command_help: bool,
@@ -66,6 +67,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
     let mut help = false;
     let mut version = false;
     let mut full_urls = false;
+    let mut verbose = false;
     let mut intent = None;
     let mut index = 0;
     while index < args.len() {
@@ -89,6 +91,11 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         }
         if token == "--full-urls" {
             full_urls = true;
+            index += 1;
+            continue;
+        }
+        if token == "--verbose" {
+            verbose = true;
             index += 1;
             continue;
         }
@@ -172,7 +179,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             if token.starts_with('-') {
                 return Err(Output {
                     stdout: String::new(),
-                    stderr: format!("Unknown option: {token}\n\n"),
+                    stderr: format!("Unknown option: {token}\n{}\n", did_you_mean(token, None)),
                     code: 1,
                 });
             }
@@ -186,6 +193,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             runtime,
             session,
             full_urls,
+            verbose,
             intent,
             help: help || command.is_none(),
             command_help: false,
@@ -210,6 +218,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
             runtime,
             session,
             full_urls,
+            verbose,
             intent,
             help,
             command_help,
@@ -278,6 +287,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, Output> {
         runtime,
         session,
         full_urls,
+        verbose,
         intent,
         help,
         command_help,
@@ -299,9 +309,22 @@ fn unknown_option(token: &str, spec: Option<&Spec>) -> Output {
         .unwrap_or_else(help::global_help);
     Output {
         stdout: format!("\n{help_text}\n"),
-        stderr: format!("Unknown option: {token}\n"),
+        stderr: format!("Unknown option: {token}\n{}", did_you_mean(token, spec)),
         code: 1,
     }
+}
+
+const GLOBAL_OPTIONS: &[&str] = &["--cdp", "--runtime", "--session", "--intent", "--full-urls", "--verbose", "--help", "--version"];
+
+fn did_you_mean(token: &str, spec: Option<&Spec>) -> String {
+    let mut known: Vec<String> = GLOBAL_OPTIONS.iter().map(|name| (*name).to_string()).collect();
+    if let Some(spec) = spec {
+        known.extend(spec.flags.iter().map(|(name, _)| format!("--{name}")));
+    }
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    cdp_client::resolve::suggest(token, &known)
+        .map(|name| format!("Did you mean {name}?\n"))
+        .unwrap_or_default()
 }
 
 pub fn validate(invocation: &Invocation, spec: &Spec) -> Result<(), Output> {

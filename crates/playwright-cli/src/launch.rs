@@ -1,6 +1,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use serde_json::{Map, Value};
+use cdp_client::resolve::{Rule, Step};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -191,7 +192,63 @@ pub fn should_launch(command: &str, explicit: bool) -> bool {
 }
 
 pub fn endpoint_is_explicit(cdp: Option<&str>, env: Option<&str>) -> bool {
-    nonempty(cdp) || nonempty(env)
+    cdp_client::resolve::is_explicit(cdp, env)
+}
+
+pub struct HostFinder<'a> {
+    pub session: Option<&'a str>,
+    pub cwd: Option<&'a std::path::Path>,
+    pub probe: bool,
+}
+
+impl cdp_client::resolve::Finder for HostFinder<'_> {
+    fn attached(&mut self, trail: &mut Vec<Step>) -> Result<Option<(Rule, String)>, String> {
+        #[cfg(any(test, target_arch = "wasm32"))]
+        {
+            let _ = trail;
+            Ok(None)
+        }
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        {
+            cdp_client::discover::attached_traced(&mut |url| http_body(url), trail)
+        }
+    }
+
+    fn saved(&mut self, trail: &mut Vec<Step>) -> Option<String> {
+        let found = remembered_endpoint_named(self.session, self.cwd)
+            .filter(|url| crate::connect::choose_start(Some(url), None).is_ok());
+        if found.is_none() {
+            trail.push(Step::new(Rule::Saved, "none usable for this directory"));
+        }
+        found
+    }
+
+    fn probe(&mut self, trail: &mut Vec<Step>) -> Option<String> {
+        if !self.probe {
+            trail.push(Step::new(Rule::Probe, "left to open, which probes before it launches"));
+            return None;
+        }
+        #[cfg(any(test, target_arch = "wasm32"))]
+        {
+            let _ = trail;
+            None
+        }
+        #[cfg(all(not(test), not(target_arch = "wasm32")))]
+        {
+            let ports = cdp_client::ports::catalog();
+            cdp_client::resolve::probe_ports(&ports, &mut |url| http_body(url), trail)
+        }
+    }
+}
+
+pub fn pick(
+    cdp: Option<&str>,
+    env: Option<&str>,
+    session: Option<&str>,
+    cwd: Option<&std::path::Path>,
+    probe: bool,
+) -> Result<cdp_client::resolve::Resolved, String> {
+    cdp_client::resolve::resolve(cdp, env, &mut HostFinder { session, cwd, probe })
 }
 
 pub fn start_after_explicit(
@@ -199,8 +256,8 @@ pub fn start_after_explicit(
     env: Option<&str>,
     active: Option<String>,
 ) -> Result<crate::connect::Start, String> {
-    if endpoint_is_explicit(cdp, env) {
-        return crate::connect::choose_start(cdp, env);
+    if let Some(choice) = cdp_client::resolve::explicit_start(cdp, env) {
+        return choice.map(|choice| choice.start);
     }
     if let Some(url) = active {
         return crate::connect::choose_start(Some(&url), None);
@@ -250,21 +307,6 @@ pub fn remembered_endpoint_named(
         let _ = (session_name, cwd);
         None
     }
-}
-
-pub fn attached_port() -> Result<Option<String>, String> {
-    #[cfg(any(test, target_arch = "wasm32"))]
-    {
-        Ok(None)
-    }
-    #[cfg(all(not(test), not(target_arch = "wasm32")))]
-    {
-        cdp_client::discover::attached(&mut |url| http_body(url))
-    }
-}
-
-fn nonempty(value: Option<&str>) -> bool {
-    value.map(str::trim).is_some_and(|text| !text.is_empty())
 }
 
 pub fn host_only_line(command: &str, names: &[String]) -> String {
@@ -3138,7 +3180,10 @@ mod tests {
 
     #[test]
     fn explicit_endpoints_win_and_tests_do_not_scan() {
-        assert_eq!(attached_port().unwrap(), None);
+        let mut trail = Vec::new();
+        let mut finder = HostFinder { session: None, cwd: None, probe: true };
+        assert_eq!(cdp_client::resolve::Finder::attached(&mut finder, &mut trail).unwrap(), None);
+        assert_eq!(cdp_client::resolve::Finder::probe(&mut finder, &mut trail), None);
         assert!(remembered_endpoint().is_none());
         let active = "http://127.0.0.1:9444/json/version".to_string();
         assert_eq!(

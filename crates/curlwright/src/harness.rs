@@ -604,7 +604,9 @@ fn a_verbose_failure_reports_the_error_line_not_the_trace() {
         ],
     );
     assert_eq!(output.code, 22, "{}", output.stderr);
-    assert!(output.stderr.starts_with("> GET https://app.example/nope\n"));
+    let (picked, trace) = output.stderr.split_once('\n').unwrap();
+    assert!(picked.starts_with("* CDP http://127.0.0.1:") && picked.ends_with(" (via --cdp)"), "{picked}");
+    assert!(trace.starts_with("> GET https://app.example/nope\n"), "{trace}");
     assert!(output.stderr.contains("> Authorization: secret-token\n"));
     assert!(output.stderr.contains("curlwright: (22) The requested URL returned error: 500\n"));
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
