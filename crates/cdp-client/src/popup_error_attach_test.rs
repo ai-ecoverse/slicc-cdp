@@ -618,3 +618,457 @@ fn a_slicc_hide_target_event_is_never_delivered() {
     }}}));
     assert!(cdp.events()[mark..].iter().all(|event| event["params"]["targetInfo"]["targetId"] != "IF"), "{:?}", &cdp.events()[mark..]);
 }
+
+const STALE_MARKER: &str = "STALE_PROOF_MARKER";
+const STALE_PROTECTED: &str = "https://seven.sliccy.ai/path/STALE_PROOF_MARKER?q=STALE_PROOF_MARKER#STALE_PROOF_MARKER";
+const STALE_PROTECTED_B: &str = "https://vault.sliccy.ai/path/STALE_PROOF_MARKER?q=STALE_PROOF_MARKER#STALE_PROOF_MARKER";
+const STALE_ORDINARY: &str = "http://ordinary.invalid/doc?n=STALE_PROOF_MARKER";
+
+fn own_error_frame(loader: &str, unreachable: &str) -> Value {
+    let mut frame = json!({"id":"T","loaderId":loader,"url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html"});
+    if !unreachable.is_empty() {
+        frame["unreachableUrl"] = json!(unreachable);
+    }
+    frame
+}
+
+fn assert_client_surfaces_hide_failed(cdp: &mut Cdp, target: &str, label: &str) {
+    for event in cdp.events() {
+        let text = event.to_string();
+        assert!(!text.contains(STALE_MARKER), "{label}: {event}");
+        let info = &event["params"]["targetInfo"];
+        if info["targetId"] == target {
+            let title = info["title"].as_str().unwrap_or("");
+            let url = info["url"].as_str().unwrap_or("");
+            assert!(!title.contains("sliccy"), "{label}: {event}");
+            assert!(!url.contains("sliccy"), "{label}: {event}");
+            if title.contains("sliccy") || url.contains("sliccy") || text.contains(STALE_MARKER) {
+                assert_eq!(info["url"], "about:blank", "{label}: {event}");
+                assert_eq!(info["title"], "about:blank", "{label}: {event}");
+            }
+        }
+    }
+    if let Ok(listed) = cdp.call("Target.getTargets", json!({}), None) {
+        for info in listed["targetInfos"].as_array().unwrap().iter().filter(|info| info["targetId"] == target) {
+            assert!(!info.to_string().contains(STALE_MARKER), "{label}: {info}");
+            assert!(!info.to_string().contains("sliccy"), "{label}: {info}");
+            assert_eq!(info["url"], "about:blank", "{label}: {info}");
+            assert_eq!(info["title"], "about:blank", "{label}: {info}");
+        }
+    }
+    if let Ok(found) = cdp.call("Target.getTargetInfo", json!({"targetId":target}), None) {
+        assert!(!found.to_string().contains(STALE_MARKER), "{label}: {found}");
+        assert!(!found.to_string().contains("sliccy"), "{label}: {found}");
+    }
+}
+
+fn assert_surface_clean(value: &Value, label: &str) {
+    let text = value.to_string();
+    assert!(!text.contains(STALE_MARKER), "{label}: {text}");
+    assert!(!text.contains("sliccy"), "{label}: {text}");
+}
+
+#[test]
+fn a_second_protected_failed_load_is_scrubbed_after_an_ordinary_error_proof() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(popup_error_frame(STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(STALE_ORDINARY),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+    let mark = cdp.events().len();
+    let protected_title = format!("seven.sliccy.ai/path/{STALE_MARKER}");
+    let second = own_info(POPUP_ERROR, &protected_title);
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":second.clone()}}));
+    let before = cdp.events()[mark..].iter().find(|event| event["method"] == "Target.targetInfoChanged").expect("changed before proof");
+    assert_eq!(before["params"]["targetInfo"]["url"], "about:blank", "stale ordinary proof must not release the second title: {before}");
+    assert_eq!(before["params"]["targetInfo"]["title"], "about:blank", "{before}");
+    assert_surface_clean(before, "before-frame-refresh");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = second.clone();
+        state.frame = PopupFrame::Frame(popup_error_frame(STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":second}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":popup_error_frame(STALE_PROTECTED),"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "ordinary-then-protected");
+}
+
+#[test]
+fn an_own_tab_latch_that_stays_after_an_ordinary_failed_load_over_blocks() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    cdp.protect_target("T");
+    assert!(cdp.is_protected_target("T"));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame("L1", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_ORDINARY,"loaderId":"L1","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L1", STALE_ORDINARY),"type":"Navigation"}}));
+    assert!(!cdp.protected_targets.contains("T"), "availability: ordinary failed-load proof must clear an own-tab latch");
+    assert!(!cdp.is_protected_target("T"), "availability: cleared latch must not keep the live session blocked");
+    assert!(!cdp.blocked.contains(&live), "availability: live session must be released with the latch");
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+}
+
+#[test]
+fn a_popup_latch_that_clears_on_a_protected_failed_load_leaks() {
+    let mut cdp = popup_client(popup_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}")), PopupFrame::Frame(popup_error_frame(STALE_PROTECTED)));
+    popup_attach_refused(&mut cdp, "popup-latch-seed");
+    assert!(cdp.is_protected_target("P"));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":popup_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"))}}));
+    cdp.session_targets.insert("W".into(), "P".into());
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":"W","params":{"frame":popup_error_frame(STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.session_targets.remove("W");
+    assert!(cdp.is_protected_target("P"), "leak: a protected failed load must not clear a popup latch");
+    popup_attach_refused(&mut cdp, "popup-latch-must-hold");
+}
+
+#[test]
+fn a_protected_then_ordinary_failed_load_clears_own_latch_and_keeps_popup_latch() {
+    {
+        let start = own_info("https://example.test/start", "start");
+        let state = own_state(start.clone(), PopupFrame::Frame(json!({
+            "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+        })));
+        let mut cdp = own_client_from(state.clone(), &start);
+        let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+        let live = first["sessionId"].as_str().unwrap().to_string();
+        let guard = cdp.guards.get("T").cloned().expect("guard");
+        {
+            let mut state = state.borrow_mut();
+            state.popup = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+            state.frame = PopupFrame::Frame(popup_error_frame(STALE_PROTECTED));
+        }
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"))}}));
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(STALE_PROTECTED),"type":"Navigation"}}));
+        assert_client_surfaces_hide_failed(&mut cdp, "T", "own-protected");
+        {
+            let mut state = state.borrow_mut();
+            state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+            state.frame = PopupFrame::Frame(popup_error_frame(STALE_ORDINARY));
+        }
+        let mark = cdp.events().len();
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+        let pending = cdp.events()[mark..].iter().find(|event| event["method"] == "Target.targetInfoChanged").expect("ordinary pending");
+        assert_eq!(pending["params"]["targetInfo"]["url"], "about:blank", "ordinary title only after proof: {pending}");
+        cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(STALE_ORDINARY),"type":"Navigation"}}));
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+        assert!(!cdp.is_protected_target("T"), "own tab must clear latch after ordinary proof");
+        let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+        let tab = listed["targetInfos"].as_array().unwrap().iter().find(|info| info["targetId"] == "T").unwrap();
+        assert_eq!(tab["title"], "ordinary.invalid");
+        assert_eq!(tab["url"], POPUP_ERROR);
+        assert!(cdp.call("Page.navigate", json!({"url":"https://example.test/away"}), Some(&live)).is_ok());
+    }
+    {
+        let mut cdp = popup_client(popup_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}")), PopupFrame::Frame(popup_error_frame(STALE_PROTECTED)));
+        popup_attach_refused(&mut cdp, "popup-protected-first");
+        assert!(cdp.is_protected_target("P"));
+        {
+            let shared = POPUP_BROWSER.with(|state| state.borrow().as_ref().map(|state| state.clone()));
+            if let Some(state) = shared {
+                let mut state = state.borrow_mut();
+                state.popup = popup_info(POPUP_ERROR, "ordinary.invalid");
+                state.frame = PopupFrame::Frame(popup_error_frame(STALE_ORDINARY));
+            }
+        }
+        cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":popup_info(POPUP_ERROR, "ordinary.invalid")}}));
+        assert!(cdp.is_protected_target("P"), "popup latch must survive an ordinary chrome-error title");
+        popup_attach_refused(&mut cdp, "popup-still-latched");
+    }
+}
+
+#[test]
+fn a_second_failed_load_arriving_before_the_first_proof_stays_scrubbed() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Silent);
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let first_info = own_info(POPUP_ERROR, "ordinary.invalid");
+    let second_info = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = first_info.clone();
+        state.frame = PopupFrame::Silent;
+    }
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":first_info}}));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = second_info.clone();
+        state.frame = PopupFrame::Frame(popup_error_frame(STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":second_info.clone()}}));
+    for event in &cdp.events()[mark..] {
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+            assert_surface_clean(event, "back-to-back");
+        }
+    }
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":second_info}}));
+    cdp.absorb(json!({"method":"Page.lifecycleEvent","sessionId":live,"params":{"name":"load","frameId":"T","loaderId":"LP","timestamp":1.0}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "back-to-back-after");
+}
+
+#[test]
+fn a_stale_frame_tree_proof_must_not_apply_after_a_newer_navigation() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_ORDINARY,"loaderId":"LA","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"LB","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":{
+        "id":"T","loaderId":"LA","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html","unreachableUrl":STALE_ORDINARY
+    },"type":"Navigation"}}));
+    let stale = own_info(POPUP_ERROR, "ordinary.invalid");
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":stale}}));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+        state.frame = PopupFrame::Frame(popup_error_frame(STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":{
+        "id":"T","loaderId":"LB","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html","unreachableUrl":STALE_PROTECTED
+    },"type":"Navigation"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"))}}));
+    for event in &cdp.events()[mark..] {
+        assert_surface_clean(event, "stale-frame-tree");
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+        }
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":popup_error_frame(STALE_PROTECTED),"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "stale-frame-tree-surfaces");
+}
+
+#[test]
+fn a_new_document_and_reused_target_id_do_not_keep_stale_proof_or_provenance() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    assert!(cdp.client_targets.contains("T"));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(popup_error_frame(STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":{
+        "id":"T","loaderId":"L1","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html","unreachableUrl":STALE_ORDINARY
+    },"type":"Navigation"}}));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+        state.frame = PopupFrame::Frame(json!({
+            "id":"T","loaderId":"L2","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html","unreachableUrl":STALE_PROTECTED
+        }));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"L2","navigationType":"differentDocument"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"))}}));
+    for event in &cdp.events()[mark..] {
+        assert_surface_clean(event, "new-loader");
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+        }
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":{
+        "id":"T","loaderId":"L2","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html","unreachableUrl":STALE_PROTECTED
+    },"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "new-loader-after");
+    let _ = cdp.call("Target.detachFromTarget", json!({"sessionId":live}), None);
+    cdp.protect_target("T");
+    assert!(cdp.protected_targets.contains("T"));
+    cdp.absorb(json!({"method":"Target.targetDestroyed","params":{"targetId":"T"}}));
+    assert!(!cdp.client_targets.contains("T"), "destroy must clear provenance");
+    assert!(!cdp.protected_targets.contains("T"), "destroy must clear the protected latch");
+    assert!(!cdp.is_protected_target("T"), "destroy must clear the protected latch");
+    assert!(!cdp.documents.contains_key("T"));
+    let reused = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = reused.clone();
+        state.frame = PopupFrame::Frame(popup_error_frame(STALE_PROTECTED));
+        state.sessions.clear();
+    }
+    cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":reused.clone()}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":reused}}));
+    for event in &cdp.events()[mark..] {
+        assert_surface_clean(event, "id-reuse");
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+        }
+    }
+}
+
+#[test]
+fn two_different_protected_hosts_in_a_row_are_each_scrubbed_on_their_own_document() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let first_title = format!("seven.sliccy.ai/path/{STALE_MARKER}");
+    let second_title = format!("vault.sliccy.ai/path/{STALE_MARKER}");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &first_title);
+        state.frame = PopupFrame::Frame(own_error_frame("LA", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"LA","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &first_title)}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("LA", STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &first_title)}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":own_error_frame("LA", STALE_PROTECTED),"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "protected-host-a");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &second_title);
+        state.frame = PopupFrame::Frame(own_error_frame("LB", STALE_PROTECTED_B));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED_B,"loaderId":"LB","navigationType":"differentDocument"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &second_title)}}));
+    for event in &cdp.events()[mark..] {
+        assert_surface_clean(event, "protected-host-b-before");
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+        }
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("LB", STALE_PROTECTED_B),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &second_title)}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":own_error_frame("LB", STALE_PROTECTED_B),"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "protected-host-b");
+}
+
+#[test]
+fn the_same_protected_host_on_a_second_load_is_judged_on_its_own_document() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let title = format!("seven.sliccy.ai/path/{STALE_MARKER}");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &title);
+        state.frame = PopupFrame::Frame(own_error_frame("L1", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L1", STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &title)}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "protected-load-1");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &title);
+        state.frame = PopupFrame::Frame(own_error_frame("L2", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"L2","navigationType":"differentDocument"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &title)}}));
+    for event in &cdp.events()[mark..] {
+        assert_surface_clean(event, "protected-load-2-before");
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+        }
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L2", STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, &title)}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":own_error_frame("L2", STALE_PROTECTED),"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "protected-load-2");
+}
+
+#[test]
+fn the_same_ordinary_host_on_a_second_load_after_a_protected_one_needs_its_own_proof() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/path/{STALE_MARKER}"));
+        state.frame = PopupFrame::Frame(own_error_frame("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    assert_client_surfaces_hide_failed(&mut cdp, "T", "protected-before-ordinary");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame("L1", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_ORDINARY,"loaderId":"L1","navigationType":"differentDocument"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    let pending = cdp.events()[mark..].iter().find(|event| event["method"] == "Target.targetInfoChanged").expect("ordinary pending");
+    assert_eq!(pending["params"]["targetInfo"]["url"], "about:blank", "ordinary title only after its own proof: {pending}");
+    assert_surface_clean(pending, "ordinary-before-proof");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L1", STALE_ORDINARY),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+    let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+    let tab = listed["targetInfos"].as_array().unwrap().iter().find(|info| info["targetId"] == "T").unwrap();
+    assert_eq!(tab["title"], "ordinary.invalid");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame("L2", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_ORDINARY,"loaderId":"L2","navigationType":"differentDocument"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    let again = cdp.events()[mark..].iter().find(|event| event["method"] == "Target.targetInfoChanged").expect("ordinary second");
+    assert_eq!(again["params"]["targetInfo"]["url"], "about:blank", "stale ordinary proof must not release the second load: {again}");
+    assert_surface_clean(again, "ordinary-second-before");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L2", STALE_ORDINARY),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":own_error_frame("L2", STALE_ORDINARY),"type":"Navigation"}}));
+    let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
+    let tab = listed["targetInfos"].as_array().unwrap().iter().find(|info| info["targetId"] == "T").unwrap();
+    assert_eq!(tab["title"], "ordinary.invalid");
+    assert_eq!(tab["url"], POPUP_ERROR);
+}

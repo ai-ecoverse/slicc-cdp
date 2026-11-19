@@ -111,6 +111,9 @@ struct Navigation {
 #[derive(Clone)]
 struct MainDocument {
     frame_id: String,
+    loader_id: String,
+    proof_frame_id: String,
+    proof_loader_id: String,
     url: String,
     origin: String,
     unreachable_url: String,
@@ -675,6 +678,44 @@ impl Cdp {
             && !self.guard.url(unreachable) && !self.guard.unparseable(unreachable)
     }
 
+    fn proof_host_matches(&self, title: &str, unreachable: &str) -> bool {
+        if title.is_empty() || unreachable.is_empty() {
+            return false;
+        }
+        if self.reported_unreachable(unreachable, title) {
+            return true;
+        }
+        let Ok(parsed) = url::Url::parse(unreachable) else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        let title = title.trim_end_matches('.').to_ascii_lowercase();
+        title == host
+            || title.starts_with(&format!("{host}/"))
+            || title.starts_with(&format!("{host}?"))
+            || title.starts_with(&format!("{host}#"))
+            || url::Url::parse(&title).ok().is_some_and(|url| url.host_str().is_some_and(|have| have.eq_ignore_ascii_case(&host)))
+    }
+
+    fn proof_document_matches(&self, doc: &MainDocument) -> bool {
+        !doc.proof_frame_id.is_empty()
+            && !doc.proof_loader_id.is_empty()
+            && doc.proof_frame_id == doc.frame_id
+            && doc.proof_loader_id == doc.loader_id
+    }
+
+    fn error_proof_applies(&self, doc: &MainDocument, title: &str) -> bool {
+        if !self.proof_document_matches(doc) {
+            return false;
+        }
+        (self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() || Self::chrome_error(&doc.url))
+            && self.ordinary_unreachable(&doc.unreachable_url)
+            && self.proof_host_matches(title, &doc.unreachable_url)
+    }
+
     fn note_client_target(&mut self, target: &str) {
         if !target.is_empty() {
             self.client_targets.insert(target.to_string());
@@ -692,13 +733,8 @@ impl Cdp {
             return false;
         }
         let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
-        !self.documents.get(id).is_some_and(|doc| {
-            !doc.navigating && if self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() || Self::chrome_error(&doc.url) {
-                self.ordinary_unreachable(&doc.unreachable_url)
-            } else {
-                true
-            }
-        })
+        let title = info.get("title").and_then(Value::as_str).unwrap_or("");
+        !self.documents.get(id).is_some_and(|doc| self.error_proof_applies(doc, title))
     }
 
     fn error_popup_hold(&self, info: &Value) -> bool {
@@ -2404,8 +2440,14 @@ impl Cdp {
         let navigating = self.documents.get(target_id).map(|doc| doc.navigating).unwrap_or(false);
         let navigation_url = self.documents.get(target_id).map(|doc| doc.navigation_url.clone()).unwrap_or_default();
         let probed = self.documents.get(target_id).map(|doc| doc.probed).unwrap_or(false);
+        let loader_id = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
+        let proof_frame_id = self.documents.get(target_id).map(|doc| doc.proof_frame_id.clone()).unwrap_or_default();
+        let proof_loader_id = self.documents.get(target_id).map(|doc| doc.proof_loader_id.clone()).unwrap_or_default();
         let doc = MainDocument {
             frame_id: frame_id.clone(),
+            loader_id,
+            proof_frame_id,
+            proof_loader_id,
             url: frame_url,
             origin,
             unreachable_url,
@@ -2447,6 +2489,9 @@ impl Cdp {
         let known = self.documents.get(target_id);
         MainDocument {
             frame_id: String::new(),
+            loader_id: String::new(),
+            proof_frame_id: String::new(),
+            proof_loader_id: String::new(),
             url: String::new(),
             origin: known.map(|doc| doc.origin.clone()).unwrap_or_default(),
             unreachable_url: String::new(),
@@ -3022,8 +3067,9 @@ impl Cdp {
             return;
         }
         let Some(frame_id) = frame.get("id").and_then(Value::as_str) else { return };
-        if let Some(loader) = frame.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()) {
-            self.document_versions.insert((target.clone(), frame_id.to_string()), loader.to_string());
+        let loader_id = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
+        if !loader_id.is_empty() {
+            self.document_versions.insert((target.clone(), frame_id.to_string()), loader_id.clone());
         }
         let url = format!("{}{}", frame.get("url").and_then(Value::as_str).unwrap_or(""), frame.get("urlFragment").and_then(Value::as_str).unwrap_or(""));
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
@@ -3034,20 +3080,45 @@ impl Cdp {
             self.protected_targets.contains(&target) || unknown || self.guard.url(&unreachable_url)
         });
         let error = self.guard.error_page_url(&url) || !unreachable_url.is_empty();
-        let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if error {
+        let ordinary = error && self.ordinary_unreachable(&unreachable_url);
+        let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if ordinary {
+            false
+        } else if error {
             previous || unknown || !self.guard.error_document(&url, &origin)
         } else {
             self.guard.target(&url, self.protected_targets.contains(&target), Opener::None) || self.guard.url(&origin)
         };
+        let (proof_frame_id, proof_loader_id) = if ordinary {
+            (frame_id.to_string(), loader_id.clone())
+        } else {
+            (String::new(), String::new())
+        };
         self.documents.insert(target.clone(), MainDocument {
-            frame_id: frame_id.to_string(), url: url.clone(), origin: origin.clone(), unreachable_url, navigating: false, navigation_url: String::new(), previous: protected, probed: false,
+            frame_id: frame_id.to_string(), loader_id, proof_frame_id, proof_loader_id, url: url.clone(), origin: origin.clone(), unreachable_url, navigating: false, navigation_url: String::new(), previous: protected, probed: false,
         });
         self.note_iframe_own_frame(&target, &frame_id);
         if protected {
             self.protect_target(&target);
         } else if !self.abandoned.contains(&target) {
             self.protected_targets.remove(&target);
+            self.release_ordinary_sessions(&target);
             self.rejudge_descendants_after_ordinary(&target);
+        }
+    }
+
+    fn release_ordinary_sessions(&mut self, target: &str) {
+        let sessions: Vec<String> = self
+            .session_targets
+            .iter()
+            .filter(|(session, have)| have.as_str() == target && self.blocked.contains(*session))
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in sessions {
+            if self.guards.values().any(|guard| guard == &session) {
+                continue;
+            }
+            self.blocked.remove(&session);
+            self.unresolved_cuts.remove(&session);
         }
     }
 
@@ -3345,8 +3416,19 @@ impl Cdp {
         if self.documents.contains_key(&target) || !self.ordinary_history(&history, &unreachable_url) {
             return Ok(());
         }
+        let frame_id = text(&frame, "id");
+        let loader_id = text(&frame, "loaderId");
+        if !loader_id.is_empty() && !frame_id.is_empty() {
+            self.document_versions.insert((target.clone(), frame_id.clone()), loader_id.clone());
+        }
+        let ordinary = self.ordinary_unreachable(&unreachable_url);
+        let (proof_frame_id, proof_loader_id) = if ordinary {
+            (frame_id.clone(), loader_id.clone())
+        } else {
+            (String::new(), String::new())
+        };
         self.documents.insert(target, MainDocument {
-            frame_id: text(&frame, "id"), url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
+            frame_id, loader_id, proof_frame_id, proof_loader_id, url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
             navigating: false, navigation_url: String::new(), previous: false, probed: true,
         });
         Ok(())
@@ -4032,10 +4114,22 @@ impl Cdp {
                     if self.guards.get(&target).is_some_and(|guard| Some(guard) != session.as_ref()) && !self.unobserved.contains(&target) {
                         return;
                     }
-                    if let Some(doc) = self.documents.get_mut(&target) {
-                        if params.get("frameId").and_then(Value::as_str) == Some(&doc.frame_id) {
+                    let frame_id = params.get("frameId").and_then(Value::as_str).unwrap_or("");
+                    let loader = params.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()).map(str::to_string);
+                    let navigation_url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                    let matched = self.documents.get(&target).is_some_and(|doc| doc.frame_id == frame_id);
+                    if matched {
+                        if let Some(doc) = self.documents.get_mut(&target) {
                             doc.navigating = true;
-                            doc.navigation_url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                            doc.navigation_url = navigation_url;
+                            doc.unreachable_url.clear();
+                            doc.probed = false;
+                            if let Some(loader) = loader.clone() {
+                                doc.loader_id = loader;
+                            }
+                        }
+                        if let Some(loader) = loader {
+                            self.document_versions.insert((target, frame_id.to_string()), loader);
                         }
                     }
                 }
@@ -4238,6 +4332,7 @@ impl Cdp {
                     self.guards.remove(target);
                     self.targets.remove(target);
                     self.client_targets.remove(target);
+                    self.protected_targets.remove(target);
                     self.kept_url_latch.remove(target);
                     self.created_blanks.remove(target);
                     self.navigated_blanks.remove(target);

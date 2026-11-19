@@ -144,6 +144,9 @@ fn fixture(case: Case) -> Cdp {
         cdp.frames.insert("PARENT".into(), vec![case.parent_url.into(), origin.into()]);
         cdp.documents.insert("PARENT".into(), super::MainDocument {
             frame_id: "PARENT".into(),
+            loader_id: String::new(),
+            proof_frame_id: String::new(),
+            proof_loader_id: String::new(),
             url: case.parent_url.into(),
             origin: origin.into(),
             unreachable_url: String::new(),
@@ -243,6 +246,9 @@ fn protected_parent_iframe_children_are_hidden_from_discovery_events() {
             cdp.frame_parents.insert("MIDDLE".into(), "PARENT".into());
             cdp.documents.insert("PARENT".into(), super::MainDocument {
                 frame_id: "PARENT".into(),
+                loader_id: String::new(),
+                proof_frame_id: String::new(),
+                proof_loader_id: String::new(),
                 url: case.parent_url.into(),
                 origin: case.parent_url.trim_end_matches('/').into(),
                 unreachable_url: String::new(),
@@ -359,6 +365,9 @@ fn mid_stale_blank_frame_does_not_outrank_seven_iframe_target() {
     cdp.frames.insert("MID".into(), vec!["about:blank".into()]);
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "PAGE".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/sheet".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -390,6 +399,9 @@ fn nav_parent_to_seven_cuts_child_session_and_blocks_decider_fulfill() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PARENT".into(), super::MainDocument {
         frame_id: "PARENT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -436,6 +448,9 @@ fn worker_of_seven_iframe_is_hidden_and_refused() {
     cdp.targets.insert("WORKER".into(), worker.clone());
     cdp.documents.insert("PARENT".into(), super::MainDocument {
         frame_id: "PARENT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://seven.sliccy.ai/os/".into(),
         origin: "https://seven.sliccy.ai".into(),
         unreachable_url: String::new(),
@@ -472,6 +487,9 @@ fn distinct_frame_id_get_targets_first_is_reversible_after_placement() {
     let _ = cdp.call("Page.getFrameTree", json!({}), Some(&page_session));
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -498,6 +516,9 @@ fn distinct_frame_id_attach_first_keeps_excel_oopif_working() {
     let _ = cdp.call("Page.getFrameTree", json!({}), Some(&page_session));
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -526,6 +547,9 @@ fn mid_distinct_frame_id_cuts_child_when_middle_navigates_to_seven() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/sheet".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -581,6 +605,9 @@ fn worker_attached_after_creator_forgotten_is_bound_and_cut() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PARENT".into(), super::MainDocument {
         frame_id: "PARENT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -635,6 +662,9 @@ fn ordinary_recommit_clears_descendant_latch() {
     cdp.guards.insert("PARENT".into(), "PS".into());
     cdp.documents.insert("PARENT".into(), super::MainDocument {
         frame_id: "PARENT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -679,6 +709,9 @@ fn ordinary_recommit_info_only_keeps_page_guard_and_clears_descendants() {
     cdp.guard_sessions.insert("PS".into());
     cdp.documents.insert("PARENT".into(), super::MainDocument {
         frame_id: "PARENT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -753,6 +786,9 @@ fn frame_navigated_seven_equal_ids_refuses_child_while_target_blank() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "PAGE".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/sheet".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -785,6 +821,9 @@ fn frame_navigated_seven_distinct_ids_refuses_child_while_target_blank() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/sheet".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -821,6 +860,9 @@ fn two_orphan_frames_seven_mid_refuses_unbound_child() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/sheet".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -861,6 +903,9 @@ fn one_frame_two_targets_refuses_child_not_bound_to_seven() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/sheet".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -896,6 +941,9 @@ fn top_level_page_protect_detaches_like_main() {
     cdp.session_targets.insert("PS".into(), "PAGE".into());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "PAGE".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -922,6 +970,9 @@ fn top_level_page_protected_document_fails_like_main() {
     cdp.targets.insert("PAGE".into(), page);
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "PAGE".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -956,6 +1007,9 @@ fn page_commit_seven_detaches_and_continues_queued_non_document() {
     cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "PAGE".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1002,6 +1056,9 @@ fn protected_ancestor_detaches_descendant_and_refuses_client_fetch() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PARENT".into(), super::MainDocument {
         frame_id: "PARENT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1036,6 +1093,9 @@ fn destroyed_middle_iframe_leaves_nested_child_unresolved_and_cut() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1046,6 +1106,9 @@ fn destroyed_middle_iframe_leaves_nested_child_unresolved_and_cut() {
     });
     cdp.documents.insert("MID".into(), super::MainDocument {
         frame_id: "MIDFRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/mid".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1076,6 +1139,9 @@ fn opener_frame_only_worker_cuts_when_frame_turns_protected() {
     cdp.targets.insert("MID".into(), mid.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1088,6 +1154,9 @@ fn opener_frame_only_worker_cuts_when_frame_turns_protected() {
     cdp.iframe_own_frames.insert("MIDFRAME".into(), "MID".into());
     cdp.documents.insert("MID".into(), super::MainDocument {
         frame_id: "MIDFRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "about:blank".into(),
         origin: "://".into(),
         unreachable_url: String::new(),
@@ -1209,6 +1278,9 @@ fn h1_destroy_opener_frame_worker_cuts_and_refuses() {
     cdp.targets.insert("MID".into(), mid.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1219,6 +1291,9 @@ fn h1_destroy_opener_frame_worker_cuts_and_refuses() {
     });
     cdp.documents.insert("MID".into(), super::MainDocument {
         frame_id: "MIDFRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/mid".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1277,6 +1352,9 @@ fn h2_unbound_frame_worker_cuts_at_attach() {
     cdp.targets.insert("MID".into(), mid.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1382,6 +1460,9 @@ fn detach_error_then_retry_until_gone() {
     cdp.targets.insert("CHILD".into(), child.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "PAGE".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1424,6 +1505,9 @@ fn unresolved_cut_keeps_live_session_blocked_but_admits_fresh_attach() {
     cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1505,6 +1589,9 @@ fn refused_auto_attach_does_not_remap_blocked_session() {
     cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1547,6 +1634,9 @@ fn scenario_a_seven_own_url_stays_blocked_when_ancestor_clears() {
     cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1608,6 +1698,9 @@ fn scenario_b_unblocked_sessions_cannot_survive_protect_flip() {
     cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1683,6 +1776,9 @@ fn scenario_c_stale_page_scope_owner_cannot_unblock_inner() {
     cdp.targets.insert("SEVEN".into(), seven.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1744,6 +1840,9 @@ fn stale_page_scope_owner_cannot_admit_inner_under_unbound_seven() {
     cdp.targets.insert("SEVEN".into(), seven.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1798,6 +1897,9 @@ fn unbound_seven_without_stale_owner_refuses_inner_attach() {
     cdp.targets.insert("SEVEN".into(), seven.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1843,6 +1945,9 @@ fn bound_seven_frame_refuses_inner_even_with_stale_owner() {
     cdp.targets.insert("SEVEN".into(), seven.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
@@ -1890,6 +1995,9 @@ fn extension_iframe_does_not_shadow_ordinary_page_scope_owner() {
     cdp.targets.insert("EXT".into(), ext.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "https://ordinary.test/".into(),
         origin: "https://ordinary.test".into(),
         unreachable_url: String::new(),
