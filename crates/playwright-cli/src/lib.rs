@@ -36,10 +36,7 @@ mod spec;
 mod storage;
 mod trace;
 mod upgrade;
-mod webmcp;
-mod webmcp_frames;
-mod webmcp_polyfill;
-mod webmcp_watch;
+mod holder_input;
 
 pub use args::Output;
 
@@ -132,14 +129,6 @@ pub fn execute_in(
     }
     if recording::is_stop(&command) {
         return recording::stop(&invocation);
-    }
-    if command == "webmcp-call" {
-        if invocation.positionals.is_empty() {
-            return Output::err("webmcp-call requires <name> and <json-input>\n");
-        }
-        if invocation.positionals.len() < 2 {
-            return Output::err("webmcp-call requires <json-input>\n");
-        }
     }
     commands::run_command(&invocation, cdp_env)
 }

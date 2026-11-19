@@ -10,7 +10,6 @@ import { fileURLToPath } from 'node:url';
 import { fakeCdp } from './fake-cdp.mjs';
 import { HARNESS_PORTS } from './ports.mjs';
 import { killTree } from './watchdog.mjs';
-import { webmcpBackend } from './webmcp-backend.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const playwright = path.join(
@@ -95,47 +94,6 @@ async function freeHarnessPorts(count) {
   return ports;
 }
 
-function holder(args, cwd, endpoint, env) {
-  const child = spawn(playwright, ['--cdp', endpoint, ...args], {
-    cwd,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (bytes) => {
-    stdout += bytes;
-  });
-  child.stderr.on('data', (bytes) => {
-    stderr += bytes;
-  });
-  const ended = new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code) => resolve({ code, stdout, stderr }));
-  });
-  const ready = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(stderr || 'holder did not become ready'));
-    }, 15000);
-    child.stdout.on('data', () => {
-      if (!stdout.includes('\n')) return;
-      clearTimeout(timer);
-      try {
-        resolve(JSON.parse(stdout.split('\n')[0]));
-      } catch (error) {
-        reject(error);
-      }
-    });
-    ended.then((result) => {
-      clearTimeout(timer);
-      if (!stdout.includes('\n')) reject(new Error(result.stderr));
-    }, reject);
-  });
-  ready.catch(() => {});
-  return { child, ended, ready };
-}
-
 test('open recovers when a remembered http discovery endpoint is dead', async () => {
   const [deadPort, livePort] = await freeHarnessPorts(2);
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-dead-endpoint-'));
@@ -161,38 +119,6 @@ test('open recovers when a remembered http discovery endpoint is dead', async ()
   } finally {
     await dead.close().catch(() => {});
     await rm(home, { recursive: true, force: true });
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test('second-process webmcp-list finds holder tools across http and ws spellings', async () => {
-  const cwd = await mkdtemp(path.join(tmpdir(), 'slicc-cdp-webmcp-spellings-'));
-  const home = cwd;
-  const env = hostEnv(home);
-  const backend = await webmcpBackend({
-    definitions: [{ name: 'add', description: 'Add', execute: () => 3 }],
-  });
-  const http = `http://127.0.0.1:${backend.port}`;
-  const ws = backend.url;
-  const held = holder(['webmcp-polyfill', '--tab', 'TAB', '--reload'], cwd, http, env);
-  try {
-    assert.equal((await held.ready).mode, 'polyfill');
-    const viaWs = await run(['--cdp', ws, 'webmcp-list', '--tab', 'TAB', '--json'], cwd, env);
-    assert.equal(viaWs.code, 0, viaWs.stderr);
-    assert.deepEqual(
-      JSON.parse(viaWs.stdout).map((tool) => tool.name),
-      ['add']
-    );
-    const viaHttp = await run(['--cdp', http, 'webmcp-list', '--tab', 'TAB', '--json'], cwd, env);
-    assert.equal(viaHttp.code, 0, viaHttp.stderr);
-    assert.deepEqual(
-      JSON.parse(viaHttp.stdout).map((tool) => tool.name),
-      ['add']
-    );
-  } finally {
-    held.child.kill('SIGKILL');
-    await held.ended.catch(() => {});
-    await backend.close();
     await rm(cwd, { recursive: true, force: true });
   }
 });

@@ -33,10 +33,6 @@ impl Worlds {
         self.enabled.remove(session);
     }
 
-    pub fn fallback_safe(&self, session: &str) -> bool {
-        !self.protected_sessions.contains(session)
-    }
-
     pub fn sensitive(method: &str) -> bool {
         ["Debugger.", "Profiler.", "HeapProfiler."]
             .iter()

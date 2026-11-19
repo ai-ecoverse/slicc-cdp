@@ -127,10 +127,10 @@ fn result(value: &Value) -> String {
 }
 
 pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation) -> Output {
-    hold_with(cdp, state, invocation, crate::webmcp_polyfill::input)
+    hold_with(cdp, state, invocation, crate::holder_input::input)
 }
 
-fn hold_with(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, input: impl FnOnce() -> Result<crate::webmcp_polyfill::Input, String>) -> Output {
+fn hold_with(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, input: impl FnOnce() -> Result<crate::holder_input::Input, String>) -> Output {
     let files = match files(state.session_name.as_deref(), state.cwd.as_deref()) {
         Ok(files) => files,
         Err(message) => return Output::err(message),
@@ -153,7 +153,6 @@ fn hold_with(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, input:
     let _ = browser::watch_detach(cdp, &mut latest, &target, &session);
     latest.endpoint = state.endpoint.clone();
     latest.provenance = state.provenance.clone();
-    latest.webmcp_connection = state.webmcp_connection.clone();
     latest.current = Some(target);
     *state = latest;
     match held {
@@ -189,7 +188,7 @@ enum End {
 }
 
 impl Holder {
-    fn run(&mut self, cdp: &mut Cdp, input: impl FnOnce() -> Result<crate::webmcp_polyfill::Input, String>) -> Result<(), String> {
+    fn run(&mut self, cdp: &mut Cdp, input: impl FnOnce() -> Result<crate::holder_input::Input, String>) -> Result<(), String> {
         let (first, loader) = self.install(cdp)?;
         let _ = browser::activate(cdp, &self.target);
         let mut input = input()?;
@@ -227,7 +226,7 @@ impl Holder {
         }
     }
 
-    fn watch(&mut self, cdp: &mut Cdp, input: &mut crate::webmcp_polyfill::Input, context: &mut Option<i64>) -> Result<End, String> {
+    fn watch(&mut self, cdp: &mut Cdp, input: &mut crate::holder_input::Input, context: &mut Option<i64>) -> Result<End, String> {
         let mut paused = false;
         let mut beat = Instant::now();
         let mut retry = Instant::now();

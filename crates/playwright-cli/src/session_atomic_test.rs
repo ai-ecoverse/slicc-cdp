@@ -3,12 +3,12 @@ fn session_atomic_publication_fake_keeps_generation_metadata_during_an_open_writ
     let root = std::env::temp_dir().join(format!("slicc-state-publication-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let path = root.join("slicc/playwright-cli/sessions/current.json");
     let mut previous = Session::default();
-    previous.webmcp.insert("TAB".into(), json!({"owner":"bridge-owner","sessions":[{"target":"TAB","bridge":"bridge-owner","documents":{"TAB:L1":{"origin":"https://ordinary.test","policy":"tools=(*)"}}}]}));
+    previous.current = Some("OLD".into());
     write_at(&path, &previous).unwrap();
     let observed = path.clone();
-    let expected = previous.webmcp.clone();
+    let expected = previous.current.clone();
     PRIVATE_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(move |opened| {
-        assert_eq!(load_at(&observed).webmcp, expected);
+        assert_eq!(load_at(&observed).current, expected);
         assert_ne!(opened, observed);
         assert_eq!(fs::metadata(opened).unwrap().len(), 0);
         serde_json::from_str::<Value>(&fs::read_to_string(&observed).unwrap()).unwrap();

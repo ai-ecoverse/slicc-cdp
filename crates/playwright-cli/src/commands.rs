@@ -127,7 +127,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             }
         }
     }
-    let (dialed, connected) = match opened {
+    let (_, connected) = match opened {
         Ok(pair) => pair,
         Err(message) => return Output::err(message),
     };
@@ -136,7 +136,6 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     };
     let mut cdp = connected;
     let mut state = session::load_in(invocation.session.as_deref(), invocation.cwd.as_deref());
-    state.webmcp_connection = connect::webmcp_connection_key(&dialed);
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
@@ -177,13 +176,10 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
         }
         "har-start" | "record" => crate::har::hold(&mut cdp, &mut state, invocation, &endpoint),
         "eval-attach" => crate::eval_attach::hold(&mut cdp, &mut state, invocation),
-        "webmcp-polyfill" => crate::webmcp_polyfill::hold(&mut cdp, &mut state, invocation),
         _ if crate::recording::is_start(command) => crate::recording::hold(&mut cdp, &mut state, invocation),
-        "webmcp-list" => cmd_webmcp_list(&mut cdp, &mut state, invocation),
         _ if cookies::is_command(command) => cookies::run(&mut cdp, &mut state, invocation, command),
         _ if crate::input::is_command(command) => crate::input::run(&mut cdp, &mut state, invocation, command, &mut report),
         _ if crate::storage::is_command(command) => crate::storage::run(&mut cdp, &mut state, invocation, command),
-        "webmcp-call" => cmd_webmcp_call(&mut cdp, &mut state, invocation),
         "go-back" => cmd_go_back(&mut cdp, &mut state, invocation, &mut report),
         "go-forward" => cmd_go_forward(&mut cdp, &mut state, invocation, &mut report),
         "reload" => cmd_reload(&mut cdp, &mut state, invocation, &mut report),
@@ -1370,50 +1366,6 @@ fn default_screenshot_path() -> PathBuf {
         PathBuf::from(".playwright-cli").join(name)
     }
 }
-
-fn cmd_webmcp_list(
-    cdp: &mut Cdp,
-    state: &mut session::Session,
-    invocation: &Invocation,
-) -> Output {
-    let tab = invocation.flags.get("tab").map(String::as_str);
-    let json = flag_true(&invocation.flags, "json");
-    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
-        Ok(from) => from,
-        Err(message) => return Output::err(message),
-    };
-    crate::webmcp::list_from(cdp, state, tab, json, &from)
-}
-
-fn cmd_webmcp_call(
-    cdp: &mut Cdp,
-    state: &mut session::Session,
-    invocation: &Invocation,
-) -> Output {
-    let Some(name) = invocation.positionals.first() else {
-        return Output::err("webmcp-call requires <name> and <json-input>\n");
-    };
-    let Some(raw) = invocation.positionals.get(1) else {
-        return Output::err("webmcp-call requires <json-input>\n");
-    };
-    let input_json = if raw == "-" {
-        match crate::webmcp::read_stdin() {
-            Ok(text) => text,
-            Err(message) => return Output::err(message),
-        }
-    } else {
-        raw.clone()
-    };
-    let tab = invocation.flags.get("tab").map(String::as_str);
-    let allow_consequential = flag_true(&invocation.flags, "allow-consequential");
-    let from = match crate::webmcp_frames::origins(&invocation.repeated("from-origin")) {
-        Ok(from) => from,
-        Err(message) => return Output::err(message),
-    };
-    let frame = invocation.flags.get("frame").map(String::as_str);
-    crate::webmcp::call_from(cdp, state, name, &input_json, tab, allow_consequential, &from, frame)
-}
-
 
 fn default_pdf_path() -> PathBuf {
     let millis = SystemTime::now()

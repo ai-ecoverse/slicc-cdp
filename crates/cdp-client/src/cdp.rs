@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-#[path = "webmcp_guard.rs"]
-mod webmcp_guard;
+#[path = "document_verification.rs"]
+mod document_verification;
 #[path = "eval_early.rs"]
 mod eval_early;
 #[path = "har_guard.rs"]
@@ -214,7 +214,7 @@ pub struct Cdp {
     frame_versions: BTreeMap<String, u64>,
     documents: BTreeMap<String, MainDocument>,
     unobserved: BTreeSet<String>,
-    webmcp: webmcp_guard::Webmcp,
+    route_attested: bool,
     eval_early: eval_early::Early,
     har: har_guard::Har,
     waiting_calls: BTreeSet<i64>,
@@ -348,7 +348,7 @@ impl Cdp {
             frame_versions: BTreeMap::new(),
             documents: BTreeMap::new(),
             unobserved: BTreeSet::new(),
-            webmcp: webmcp_guard::Webmcp::default(),
+            route_attested: false,
             eval_early: eval_early::Early::default(),
             har: har_guard::Har::default(),
             waiting_calls: BTreeSet::new(),
@@ -1231,7 +1231,7 @@ impl Cdp {
 
     fn page_scope_prepare_retry_still_allowed(&self, session: Option<&str>) -> bool {
         let Some(session) = session else { return false };
-        if self.webmcp_is_paused(session) { return false }
+        if self.eval_attach_early_holding(session) { return false }
         let Some(target) = self.session_target(session) else { return false };
         if self.document_paused(&target) { return false }
         !(self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).is_some_and(|url| self.guard.error_page_url(url))
@@ -1990,9 +1990,6 @@ impl Cdp {
         if self.document_versions.keys().any(|(_, id)| id == frame) {
             return true;
         }
-        if self.webmcp_frame_owner(frame).is_some() {
-            return true;
-        }
         let placed = |item: &Value| matches!(item.get("type").and_then(Value::as_str), Some("page" | "tab" | "iframe"));
         all.with_id(frame).any(placed)
             || self.targets.with_id(frame).any(placed)
@@ -2015,9 +2012,6 @@ impl Cdp {
         }
         if let Some((owner, _)) = self.document_versions.keys().find(|(_, id)| id == frame) {
             return Some(owner.clone());
-        }
-        if let Some(owner) = self.webmcp_frame_owner(frame) {
-            return Some(owner);
         }
         all.first(frame)
             .or_else(|| self.targets.by_id(frame))
@@ -2053,10 +2047,6 @@ impl Cdp {
             return Some(false);
         }
         None
-    }
-
-    fn iframe_ancestor_unresolved(&self, info: &Value, all: &Listing) -> bool {
-        matches!(self.iframe_ancestor_state(info, all), AncestorState::Unresolved)
     }
 
     pub(super) fn iframe_ancestor_protected(&self, info: &Value, all: &Listing) -> bool {
@@ -2807,7 +2797,6 @@ impl Cdp {
 
     #[track_caller]
     fn abandon(&mut self, target_id: &str) {
-        self.webmcp_trace_decision("abandon", target_id, "", "abandon target");
         self.abandoned.insert(target_id.to_string());
         self.protect_target(target_id);
     }
@@ -2862,18 +2851,10 @@ impl Cdp {
     }
 
     fn block_session(&mut self, session_id: &str, latch: bool) {
-        let target = self.session_targets.get(session_id).cloned().unwrap_or_default();
-        self.webmcp_trace_decision("block", &target, session_id, "block session");
         let newly_blocked = self.blocked.insert(session_id.to_string());
-        if self.webmcp_is_paused(session_id) {
-            self.webmcp.deferred.insert(session_id.to_string());
-            self.webmcp_revoke(session_id);
+        if !newly_blocked {
             return;
         }
-        if !newly_blocked && !self.webmcp.deferred.remove(session_id) {
-            return;
-        }
-        self.webmcp_revoke(session_id);
         if latch {
             if let Some(target) = self.session_targets.get(session_id) {
                 self.protected_targets.insert(target.clone());
@@ -3509,7 +3490,6 @@ impl Cdp {
             if !seen.insert(current.clone()) {
                 continue;
             }
-            self.webmcp_trace_decision("protect_target", &current, "", "protect target");
             self.protected_targets.insert(current.clone());
             if let Some(doc) = self.documents.get_mut(&current) {
                 doc.previous = true;
@@ -4867,7 +4847,6 @@ impl Cdp {
 
     fn send(&mut self, method: &str, params: Value, session_id: Option<&str>) -> Result<i64, String> {
         if self.next_id >= (1 << 30) - 1 { return Err("CDP client message ID range exhausted\n".into()) }
-        self.webmcp_trace_fetch_command(method, &params, session_id);
         self.next_id += 1;
         let id = self.next_id;
         let mut message = json!({
@@ -4920,7 +4899,6 @@ impl Cdp {
 
     pub fn pump(&mut self, deadline: Instant) -> Result<bool, String> {
         self.eval_attach_early_sweep();
-        self.webmcp_sweep();
         let result = match self.recv(deadline)? {
             Some(text) => {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
@@ -4930,8 +4908,6 @@ impl Cdp {
             }
             None => Ok(false),
         };
-        self.webmcp_sweep();
-        self.webmcp_install_children();
         result
     }
 
@@ -5007,7 +4983,6 @@ impl Cdp {
     }
 
     fn forget_session(&mut self, session: &str) {
-        self.webmcp_cancel_queued(session);
         if !self.blocked.contains(session) && !self.guard_sessions.contains(session) {
             self.detached_ordinary.insert(session.to_string());
         }
@@ -5069,7 +5044,6 @@ impl Cdp {
         }
         self.worlds.event(&json!({"method":"Target.detachedFromTarget","params":{"sessionId":session}}), &self.guard);
         self.issued.forget(session);
-        self.webmcp.forget(session);
         self.eval_early.arms.remove(session);
         self.har_forget(session);
     }
@@ -5115,9 +5089,6 @@ impl Cdp {
             return;
         }
         if self.eval_attach_early_event(&value) { return; }
-        if self.webmcp_event(&value) {
-            return;
-        }
         if value.get("method").and_then(|item| item.as_str()) == Some("Fetch.authRequired")
             && self.challenge_protected(&value)
         {

@@ -1,6 +1,7 @@
 use crate::args::Invocation;
 use crate::cdp::Cdp;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 pub(crate) const UNAVAILABLE: &str = "cross-origin child tools are unavailable";
 
@@ -8,7 +9,7 @@ pub(crate) fn origins(invocation: &Invocation) -> Result<(bool, Vec<String>), St
     let values = invocation.repeated("frames");
     let same = values.contains(&"same-origin");
     let explicit: Vec<_> = values.into_iter().filter(|value| *value != "same-origin").collect();
-    let origins = crate::webmcp_frames::origins(&explicit).map_err(|message| message.replace("--from-origin", "--frames"))?;
+    let origins = explicit_origins(&explicit)?;
     if origins.iter().any(|origin| url::Url::parse(origin).is_ok_and(|url| url.host_str().is_some_and(|host| host.contains('*')))) {
         return Err("--frames requires an http(s) origin without wildcards\n".into());
     }
@@ -116,4 +117,16 @@ pub(crate) fn evaluate(cdp: &mut Cdp, invocation: &Invocation, target: &str, ses
     })();
     for session in opened.into_iter().rev() { crate::cdp::detach(cdp, &session); }
     result
+}
+
+fn explicit_origins(values: &[&str]) -> Result<Vec<String>, String> {
+    let mut result = BTreeSet::new();
+    for value in values {
+        let parsed = url::Url::parse(value).map_err(|_| "--frames requires an http(s) origin\n")?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err("--frames requires an http(s) origin without path, query, fragment or credentials\n".into());
+        }
+        result.insert(parsed.origin().ascii_serialization());
+    }
+    Ok(result.into_iter().collect())
 }

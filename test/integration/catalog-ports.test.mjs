@@ -242,13 +242,12 @@ test('a browser on a catalog debug port is attached and driven without a seven t
     });
 
     await t.test(
-      'webmcp, snapshot, goto, curlwright and discover refuse protected tabs and URLs',
+      'eval, snapshot, goto, curlwright and discover refuse protected tabs and URLs',
       async () => {
         const stand = (host) => `http://${host}:${fixture.port}`;
         const before = hits.length;
         const refused = [
-          await pw(['webmcp-list', '--tab', vault]),
-          await pw(['webmcp-call', 'greet', '{}', '--tab', vault]),
+          await pw(['eval', 'document.title', '--tab', vault]),
           await pw(['snapshot', '--tab', vault]),
         ];
         for (const host of ['vault.sliccy.ai', 'seven.sliccy.ai']) {
@@ -271,13 +270,8 @@ test('a browser on a catalog debug port is attached and driven without a seven t
 
     await t.test('the same commands work on an unprotected tab and URL', async () => {
       const before = hits.length;
-      const listed = await pw(['webmcp-list', '--tab', personal]);
-      assert.equal(listed.code, 2, listed.stderr);
-      assert.equal(listed.stdout, '');
-      assert.equal(
-        listed.stderr,
-        'webmcp-list: WebMCP is unavailable on this page (document.modelContext is absent)\n'
-      );
+      const evaluated = await pw(['eval', 'document.title', '--tab', personal]);
+      assert.equal(evaluated.code, 0, evaluated.stderr);
       const snapped = await pw(['snapshot', '--tab', personal]);
       assert.equal(snapped.code, 0, snapped.stderr);
       assert.match(snapped.stdout, /personal/);
