@@ -610,6 +610,91 @@ impl Cdp {
         holder_debugger: bool,
         retry_opt_in: bool,
     ) -> Result<Value, String> {
+        if method != "Target.attachToTarget" {
+            return self.guarded_call(method, params, session_id, timeout, holder_debugger, retry_opt_in);
+        }
+        let mark = self.events.len();
+        let target = params.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
+        let result = self.guarded_call(method, params, session_id, timeout, holder_debugger, retry_opt_in);
+        self.settle_attach_events(mark, &target, &result);
+        result
+    }
+
+    fn settle_attach_events(&mut self, mark: usize, target: &str, result: &Result<Value, String>) {
+        let admitted = result.as_ref().ok().and_then(|value| value.get("sessionId")).and_then(Value::as_str)
+            .filter(|session| !self.blocked.contains(*session)).map(str::to_string);
+        let mark = mark.min(self.events.len());
+        let dropped: BTreeSet<String> = self.events[mark..].iter()
+            .filter(|event| event["method"] == "Target.attachedToTarget" && event["params"]["targetInfo"]["targetId"] == target)
+            .filter_map(|event| event["params"]["sessionId"].as_str())
+            .filter(|session| admitted.as_deref() != Some(*session) && !self.guard_sessions.contains(*session))
+            .map(str::to_string)
+            .collect();
+        for session in &dropped {
+            if !self.blocked.contains(session) {
+                self.cut_unresolved_session(session);
+            }
+        }
+        let announced = self.targets.get(target).cloned().map(|info| {
+            let mut info = self.redact(&info, &Listing::NONE);
+            info = self.scrub_error(info);
+            shield::redact_strings(&self.guard, &mut info);
+            info
+        });
+        let mut held = self.events.split_off(mark);
+        held.retain_mut(|event| {
+            let session = event["params"]["sessionId"].as_str().unwrap_or("");
+            let method = event["method"].as_str().unwrap_or("");
+            if matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget") && dropped.contains(session) {
+                return false;
+            }
+            if method == "Target.attachedToTarget" && admitted.as_deref() == Some(session) {
+                if let Some(info) = &announced {
+                    event["params"]["targetInfo"] = info.clone();
+                }
+            }
+            true
+        });
+        self.events.extend(held);
+    }
+
+    fn chrome_error(url: &str) -> bool {
+        url.get(..13).is_some_and(|scheme| scheme.eq_ignore_ascii_case("chrome-error:"))
+    }
+
+    fn ordinary_unreachable(&self, unreachable: &str) -> bool {
+        !unreachable.is_empty() && url::Url::parse(unreachable).is_ok() && !Self::chrome_error(unreachable)
+            && !self.guard.url(unreachable) && !self.guard.unparseable(unreachable)
+    }
+
+    fn error_unproven(&self, info: &Value) -> bool {
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+        if !Self::chrome_error(url) && !self.guard.error_page_url(url) {
+            return false;
+        }
+        let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
+        !self.documents.get(id).is_some_and(|doc| {
+            !doc.navigating && if self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() || Self::chrome_error(&doc.url) {
+                self.ordinary_unreachable(&doc.unreachable_url)
+            } else {
+                true
+            }
+        })
+    }
+
+    fn scrub_error(&self, info: Value) -> Value {
+        if self.error_unproven(&info) { shield::redacted(&info) } else { info }
+    }
+
+    fn guarded_call(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        holder_debugger: bool,
+        retry_opt_in: bool,
+    ) -> Result<Value, String> {
         let session_id = session_id.filter(|id| !id.is_empty());
         if method == "Target.detachFromTarget" {
             if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
@@ -1666,6 +1751,10 @@ impl Cdp {
                         self.block(&session);
                         return Err(self.refusal());
                     }
+                    if self.targets.get(&target).is_some_and(|info| self.error_unproven(info)) {
+                        self.cut_unresolved_session(&session);
+                        return Err(self.refusal());
+                    }
                 }
             }
             "Target.createBrowserContext" => {
@@ -1697,7 +1786,7 @@ impl Cdp {
                     let verdicts = self.targets.verdicts(info, &self.guard);
                     if !(self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))
                         || verdicts.unparseable && verdicts.protected) {
-                        out.push(redacted);
+                        out.push(self.scrub_error(redacted));
                     }
                 }
                 result["targetInfos"] = Value::Array(out);
@@ -1719,9 +1808,7 @@ impl Cdp {
                             self.protect_target(&target);
                         }
                     }
-                    if protected || self.discovery_redacted(&info) {
-                        result["targetInfo"] = shield::redacted(&info);
-                    }
+                    result["targetInfo"] = if protected || self.discovery_redacted(&info) { shield::redacted(&info) } else { self.scrub_error(info) };
                 }
             }
             _ if shield::cookie_reader(method) => {
@@ -3998,6 +4085,9 @@ impl Cdp {
                 {
                     self.protected_targets.remove(&target);
                 }
+                if value.get("sliccHide").is_none() && value.pointer("/params/targetInfo").is_some_and(Value::is_object) {
+                    value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
+                }
             }
             "Target.attachedToTarget" => {
                 let child = params.get("sessionId").and_then(Value::as_str).unwrap_or("");
@@ -4082,11 +4172,12 @@ impl Cdp {
                         let _ = self.redact(info, &Listing::NONE);
                         value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));
                     } else {
-                        value["params"]["targetInfo"] = if info.get("targetId").and_then(Value::as_str).is_some_and(|target| self.probing.contains(target)) {
+                        let shown = if info.get("targetId").and_then(Value::as_str).is_some_and(|target| self.probing.contains(target)) {
                             shield::redacted(info)
                         } else {
                             self.redact(info, &Listing::NONE)
                         };
+                        value["params"]["targetInfo"] = self.scrub_error(shown);
                     }
                 }
             }
@@ -5897,6 +5988,7 @@ mod tests {
     include!("nested_oopif_test.rs");
     include!("response_cookie_test.rs");
     include!("credential_origins_test.rs");
+    include!("popup_error_attach_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
