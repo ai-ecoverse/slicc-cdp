@@ -578,8 +578,8 @@ fn guard_session_attach_events_in_the_settle_window_are_hidden_from_the_client()
 fn error_page_scrub_on_deliver_hides_the_failed_url() {
     let mut cdp = popup_client(popup_info(POPUP_ERROR, "seven.sliccy.ai"), PopupFrame::Frame(popup_error_frame(POPUP_SEVEN)));
     let mark = cdp.events().len();
-    cdp.absorb(json!({"method":"Inspector.targetRefreshed","params":{"targetInfo":popup_info(POPUP_ERROR, "seven.sliccy.ai")}}));
-    let shown = cdp.events()[mark..].iter().find(|event| event["method"] == "Inspector.targetRefreshed").expect("delivered");
+    cdp.absorb(json!({"method":"Inspector.targetCrashed","params":{"targetInfo":popup_info(POPUP_ERROR, "seven.sliccy.ai")}}));
+    let shown = cdp.events()[mark..].iter().find(|event| event["method"] == "Inspector.targetCrashed").expect("delivered");
     assert_eq!(shown["params"]["targetInfo"]["url"], "about:blank");
     assert!(!shown.to_string().contains("SECRET"));
 }
