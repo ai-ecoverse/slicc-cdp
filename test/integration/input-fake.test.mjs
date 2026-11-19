@@ -964,9 +964,13 @@ test('argument errors match Microsoft before any browser is touched', async () =
       [['resize', '800'], "error: 'h' argument: expected number, received 'undefined'\n"],
       [
         ['resize', '800.5', '600'],
-        'Error: resize needs whole widths and heights from 1 to 10000000\n',
+        'Error: resize needs whole widths and heights from 1 to 16384\n',
       ],
-      [['resize', '0', '600'], 'Error: resize needs whole widths and heights from 1 to 10000000\n'],
+      [['resize', '0', '600'], 'Error: resize needs whole widths and heights from 1 to 16384\n'],
+      [
+        ['resize', '16385', '600'],
+        'Error: resize needs whole widths and heights from 1 to 16384\n',
+      ],
       [['keydown'], "error: 'key' argument: expected string, received undefined\n"],
       [['keyup', 'Shift+a'], 'Error: Unknown key: "Shift+a"\n'],
       [
@@ -1010,20 +1014,25 @@ test('resize sizes the window around the measured viewport', async () => {
   });
 });
 
-test('resize is refused while a protected or unverified tab shares the browser profile', async () => {
+test('resize is not refused because a protected or unverified tab shares the window', async () => {
   for (const url of [
+    'https://www.sliccy.ai/os/',
     'https://seven.sliccy.ai/?secret=hidden',
     'http://vault.sliccy.ai/',
     '',
     'chrome://settings/',
   ]) {
-    await withFake({}, async (fake, pw) => {
+    await withFake({ inner: [880, 620] }, async (fake, pw) => {
       fake.targets.push({ targetId: 'OTHER', url });
-      const result = await pw(['resize', '1024', '768', '--tab', 'TAB']);
-      assert.equal(result.code, 1, url);
-      assert.match(result.stderr, /refused/);
-      assert.ok(!result.stderr.includes('hidden'));
-      assert.equal(sent(fake, 'Browser.setWindowBounds').length, 0, url);
+      const result = await pw(['resize', '2048', '1536', '--tab', 'TAB']);
+      assert.equal(result.code, 0, `${url}: ${result.stderr}`);
+      assert.equal(
+        result.stdout,
+        code('await page.setViewportSize({ width: 2048, height: 1536 });')
+      );
+      assert.deepEqual(params(fake, 'Browser.setWindowBounds'), [
+        { windowId: 3, bounds: { width: 2068, height: 1616 } },
+      ]);
       assert.deepEqual(
         fake.calls
           .filter(
@@ -1035,54 +1044,38 @@ test('resize is refused while a protected or unverified tab shares the browser p
       );
     });
   }
-  const elsewhere = {
-    intercept: (message, reply) => {
-      if (message.method !== 'Target.getTargets') return false;
-      reply({
-        targetInfos: [
-          {
-            targetId: 'TAB',
-            type: 'page',
-            url: 'https://example.test/',
-            title: '',
-            attached: true,
-            browserContextId: 'CTX',
-          },
-          {
-            targetId: 'SEVEN',
-            type: 'page',
-            url: 'https://seven.sliccy.ai/',
-            title: '',
-            attached: false,
-            browserContextId: 'OTHER',
-          },
-          {
-            targetId: 'OMNIBOX',
-            type: 'browser_ui',
-            url: 'chrome://omnibox-popup.top-chrome/',
-            title: '',
-            attached: false,
-            browserContextId: 'CTX',
-          },
-          {
-            targetId: 'SW',
-            type: 'service_worker',
-            url: 'https://seven.sliccy.ai/sw.js',
-            title: '',
-            attached: false,
-            browserContextId: 'CTX',
-          },
-        ],
-      });
-      return true;
-    },
-  };
-  await withFake(elsewhere, async (fake, pw) => {
-    const result = await pw(['resize', '640', '480']);
-    assert.equal(result.code, 0, result.stderr);
+});
+
+test('resize stops at a window of 16384 by 16384', async () => {
+  await withFake({ inner: [880, 620] }, async (fake, pw) => {
+    const edge = await pw(['resize', '16364', '16304']);
+    assert.equal(edge.code, 0, edge.stderr);
     assert.deepEqual(params(fake, 'Browser.setWindowBounds'), [
-      { windowId: 3, bounds: { width: 740, height: 580 } },
+      { windowId: 3, bounds: { width: 16384, height: 16384 } },
     ]);
+    const over = await pw(['resize', '16384', '16304']);
+    assert.equal(over.code, 1);
+    assert.equal(
+      over.stderr,
+      "Error: resize needs a window of at most 16384 by 16384, and this one would be 16404 by 16384 with the browser's frame\n"
+    );
+    assert.equal(sent(fake, 'Browser.setWindowBounds').length, 1);
+  });
+});
+
+test('resize reaches an about:blank tab that open made beside seven', async () => {
+  await withFake({ inner: [880, 620] }, async (fake, pw) => {
+    fake.targets.push({ targetId: 'OS', url: 'https://www.sliccy.ai/os/' });
+    const opened = await pw(['open', 'about:blank']);
+    assert.equal(opened.code, 0, opened.stderr);
+    const tab = opened.stdout.match(/targetId: (\S+)\]/)[1];
+    const result = await pw(['resize', '2048', '1536']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, code('await page.setViewportSize({ width: 2048, height: 1536 });'));
+    const sized = sent(fake, 'Browser.setWindowBounds');
+    assert.equal(sized.length, 1);
+    assert.equal(sized[0].target, tab);
+    assert.deepEqual(sized[0].params, { windowId: 3, bounds: { width: 2068, height: 1616 } });
   });
 });
 
@@ -1242,10 +1235,9 @@ test('kernel input commands send the same CDP and print the same text', async ()
       'kernel drop'
     );
     fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
-    const refused = await runner.playwright(['resize', '800', '600', '--tab', 'TAB'], cwd);
-    assert.equal(refused.code, 1);
-    assert.match(refused.stderr, /refused/);
-    assert.equal(sent(fake, 'Browser.setWindowBounds').length, 1);
+    const beside = await runner.playwright(['resize', '800', '600', '--tab', 'TAB'], cwd);
+    assert.equal(beside.code, 0, beside.stderr);
+    assert.equal(sent(fake, 'Browser.setWindowBounds').length, 2);
   } finally {
     await Promise.resolve(runner?.close()).catch(() => {});
     await fake.close();

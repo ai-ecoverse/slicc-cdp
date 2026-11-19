@@ -26,6 +26,7 @@ struct Backend {
     attach_event: Option<Value>,
     event_loader: String,
     event_session: Option<String>,
+    tree_swap: Option<(usize, Value)>,
     sessions: BTreeMap<String, String>,
     calls: Vec<Value>,
     inbox: VecDeque<String>,
@@ -57,6 +58,11 @@ impl Transport for Fake {
                     backend.inbox.push_back(json!({"method":"Runtime.executionContextsCleared","sessionId":session,"params":{}}).to_string());
                 }
                 if backend.block_tree { return Ok(()) }
+                match backend.tree_swap.take() {
+                    Some((0, next)) => backend.tree = next,
+                    Some((left, next)) => backend.tree_swap = Some((left - 1, next)),
+                    None => {}
+                }
                 if backend.sessions.get(call["sessionId"].as_str().unwrap_or("")).is_some_and(|target| target == "OWNER") { backend.owner_tree.clone().unwrap_or_else(|| backend.tree.clone()) } else { backend.tree.clone() }
             },
             "Page.navigate" => {
@@ -129,7 +135,7 @@ impl Transport for Fake {
 fn fixture() -> (Cdp, Rc<RefCell<Backend>>) {
     let backend = Rc::new(RefCell::new(Backend {
         worker:None, tree:tree("L1"), next_tree:None, navigation_tree:None, navigation_reply:None, owner_tree:None, history:Some(json!({"entries":[{"id":1,"url":"https://ordinary.example/"}]})), deadlines:Vec::new(), block_tree:false, contexts:true, clear_after_enable:false, pending_context_clear:None, context_origin:None, next_worker_url:None, navigation_event:false, block_during_execution:false, execution_error:None, attach_event:None,
-        event_loader:"L2".into(), event_session:None,
+        event_loader:"L2".into(), event_session:None, tree_swap:None,
         sessions:BTreeMap::new(), calls:Vec::new(), inbox:VecDeque::new(),
     }));
     (Cdp::from_transport(Box::new(Fake(backend.clone()))), backend)
@@ -324,6 +330,54 @@ fn guard_created_blank_documents_have_creation_and_history_evidence() {
         let result = cdp.call("Runtime.evaluate", json!({"expression":"document.title"}), Some(&session));
         if shape == "ordinary" { result.unwrap(); } else { refused(result); }
     }
+}
+
+#[test]
+fn frame_scoped_calls_reach_a_guard_created_blank_but_not_an_unproven_one() {
+    for shape in ["created", "uncreated", "multiple-history", "loader-changed", "frame-changed", "child"] {
+        let (mut cdp, backend) = fixture();
+        backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
+        backend.borrow_mut().history = Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]}));
+        if shape == "multiple-history" { backend.borrow_mut().history = Some(json!({"currentIndex":1,"entries":[{"id":1,"url":"https://vault.sliccy.ai/"},{"id":2,"url":"about:blank"}]})); }
+        if shape != "uncreated" { cdp.call("Target.createTarget", json!({"url":"about:blank"}), None).unwrap(); }
+        let session = attach(&mut cdp, "T");
+        if shape == "loader-changed" { backend.borrow_mut().tree["frameTree"]["frame"]["loaderId"] = json!("OTHER"); }
+        if shape == "frame-changed" { backend.borrow_mut().tree["frameTree"]["frame"]["id"] = json!("OTHER"); }
+        if shape == "child" { backend.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"CHILD","parentId":"F","loaderId":"LC","url":"https://vault.sliccy.ai/","securityOrigin":"https://vault.sliccy.ai"}}]); }
+        let from = backend.borrow().calls.len();
+        let result = cdp.call("Page.createIsolatedWorld", json!({"frameId":"F","grantUniveralAccess":true}), Some(&session));
+        let sent = backend.borrow().calls[from..].iter().any(|call| call["method"] == "Page.createIsolatedWorld");
+        if shape == "created" { result.unwrap(); assert!(sent); } else {
+            refused(result);
+            assert!(!sent, "{shape}");
+        }
+    }
+}
+
+#[test]
+fn a_blank_loader_that_changes_before_the_frame_recheck_is_refused() {
+    let world = |swap: Option<usize>| {
+        let (mut cdp, backend) = fixture();
+        backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
+        backend.borrow_mut().history = Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]}));
+        cdp.call("Target.createTarget", json!({"url":"about:blank"}), None).unwrap();
+        let session = attach(&mut cdp, "T");
+        let from = backend.borrow().calls.len();
+        if let Some(left) = swap {
+            backend.borrow_mut().tree_swap = Some((left, json!({"frameTree":{"frame":{"id":"F","loaderId":"LOTHER","url":"about:blank","securityOrigin":"://"}}})));
+        }
+        let result = cdp.call("Page.createIsolatedWorld", json!({"frameId":"F","grantUniveralAccess":true}), Some(&session));
+        let calls = backend.borrow().calls[from..].to_vec();
+        (result, calls)
+    };
+    let (admitted, calls) = world(None);
+    admitted.unwrap();
+    let sent = calls.iter().position(|call| call["method"] == "Page.createIsolatedWorld").unwrap();
+    let trees = calls[..sent].iter().filter(|call| call["method"] == "Page.getFrameTree").count();
+    assert!(trees >= 2);
+    let (refused_result, calls) = world(Some(trees - 1));
+    refused(refused_result);
+    assert!(!calls.iter().any(|call| call["method"] == "Page.createIsolatedWorld"));
 }
 
 #[test]

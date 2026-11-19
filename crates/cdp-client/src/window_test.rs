@@ -62,54 +62,60 @@ fn window_bounds(width: u64, height: u64) -> Value {
 }
 
 #[test]
-fn window_bounds_are_admitted_for_an_ordinary_page_alone_in_its_profile() {
+fn window_bounds_are_admitted_whatever_else_shares_the_window() {
     for extra in [
         vec![],
         vec![window_page("OTHER", "https://other.test/", "CTX")],
         vec![window_page("SEVEN", "https://seven.sliccy.ai/", "ELSEWHERE")],
+        vec![window_page("OS", "https://www.sliccy.ai/os/", "CTX")],
+        vec![window_page("SEVEN", "https://seven.sliccy.ai/?secret=1", "CTX")],
+        vec![window_page("VAULT", "http://vault.sliccy.ai/", "CTX")],
+        vec![window_page("BLANK", "", "CTX")],
+        vec![window_page("SETTINGS", "chrome://settings/", "CTX")],
+        vec![window_page("NOCTX", "https://seven.sliccy.ai/", "")],
+        vec![json!({ "targetId": "FRAME", "type": "iframe", "url": "https://vault.sliccy.ai/frame", "browserContextId": "CTX", "parentFrameId": "T" })],
+        vec![json!({ "targetId": "PANEL", "type": "other", "url": "chrome-extension://abc/panel.html", "browserContextId": "CTX" })],
+        vec![json!({ "targetId": "", "type": "page", "url": "https://other.test/", "browserContextId": "CTX" })],
         vec![json!({ "targetId": "SW", "type": "service_worker", "url": "https://seven.sliccy.ai/sw.js", "browserContextId": "CTX" })],
-        vec![
-            json!({ "targetId": "OMNIBOX", "type": "browser_ui", "url": "chrome://omnibox-popup.top-chrome/", "browserContextId": "CTX" }),
-            json!({ "targetId": "OMNIBOX2", "type": "browser_ui", "url": "chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html", "browserContextId": "CTX" }),
-        ],
+        vec![json!({ "targetId": "UISEVEN", "type": "browser_ui", "url": "https://seven.sliccy.ai/", "browserContextId": "CTX" })],
     ] {
         let (mut cdp, session, browser) = window_client(extra.clone(), vec![]);
         cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_or_else(|error| panic!("{extra:?}: {error}"));
         assert_eq!(window_resized(&browser), 1, "{extra:?}");
+        let others = browser.borrow().sent.iter().filter(|call| call["method"].as_str().is_some_and(|method| method.starts_with("Browser.")) && call["params"].get("targetId").is_some()).count();
+        assert_eq!(others, 0, "{extra:?}");
     }
 }
 
 #[test]
-fn window_bounds_are_refused_when_a_protected_or_unknown_target_could_share_the_window() {
-    for extra in [
-        window_page("SEVEN", "https://seven.sliccy.ai/?secret=1", "CTX"),
-        window_page("VAULT", "http://vault.sliccy.ai/", "CTX"),
-        window_page("BLANK", "", "CTX"),
-        window_page("SETTINGS", "chrome://settings/", "CTX"),
-        window_page("NOCTX", "https://seven.sliccy.ai/", ""),
-        json!({ "targetId": "FRAME", "type": "iframe", "url": "https://vault.sliccy.ai/frame", "browserContextId": "CTX", "parentFrameId": "T" }),
-        json!({ "targetId": "PANEL", "type": "other", "url": "chrome-extension://abc/panel.html", "browserContextId": "CTX" }),
-        json!({ "targetId": "", "type": "page", "url": "https://other.test/", "browserContextId": "CTX" }),
-        window_page("FAKEUI", "chrome://omnibox-popup.top-chrome/", "CTX"),
-        json!({ "targetId": "UI", "type": "browser_ui", "url": "chrome://settings/", "browserContextId": "CTX" }),
-        json!({ "targetId": "UIEXT", "type": "browser_ui", "url": "chrome-extension://abc.top-chrome/panel.html", "browserContextId": "CTX" }),
-        json!({ "targetId": "UIUSER", "type": "browser_ui", "url": "chrome://seven@omnibox-popup.top-chrome/", "browserContextId": "CTX" }),
-        json!({ "targetId": "UISEVEN", "type": "browser_ui", "url": "https://seven.sliccy.ai/", "browserContextId": "CTX" }),
-    ] {
-        let (mut cdp, session, browser) = window_client(vec![extra.clone()], vec![]);
-        let refused = cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).err().unwrap_or_else(|| panic!("{extra} was admitted"));
-        assert!(refused.starts_with("slicc: refused:"), "{extra}: {refused}");
-        assert!(!refused.contains("secret"));
-        assert_eq!(window_resized(&browser), 0, "{extra}");
-    }
+fn an_about_blank_tab_beside_seven_os_in_one_window_is_resized() {
+    let (mut cdp, session, browser) = window_client(vec![window_page("OS", "https://www.sliccy.ai/os/", "CTX")], vec![]);
+    browser.borrow_mut().targets[0]["url"] = json!("about:blank");
+    cdp.call("Browser.setWindowBounds", window_bounds(2048, 1536), Some(&session)).unwrap();
+    let sent = browser.borrow().sent.iter().filter(|call| call["method"] == "Browser.setWindowBounds").cloned().collect::<Vec<_>>();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["sessionId"], json!(session));
+    assert_eq!(sent[0]["params"], window_bounds(2048, 1536));
 }
 
 #[test]
 fn window_bounds_are_refused_for_a_protected_child_frame_of_the_page() {
     let child = json!({ "frame": { "id": "C", "loaderId": "LC", "parentId": "T", "url": "https://seven.sliccy.ai/", "securityOrigin": "https://seven.sliccy.ai" } });
-    let (mut cdp, session, browser) = window_client(vec![], vec![child]);
-    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err().starts_with("slicc: refused:"));
+    let (mut cdp, session, browser) = window_client(vec![window_page("OS", "https://www.sliccy.ai/os/", "CTX")], vec![child]);
+    assert_eq!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err(), format!("{}\n", crate::protected::refusal()));
     assert_eq!(window_resized(&browser), 0);
+}
+
+#[test]
+fn window_bounds_stop_at_sixteen_thousand_pixels_each_way() {
+    assert_eq!(crate::cdp::MAX_WINDOW, 16_384);
+    let (mut cdp, session, browser) = window_client(vec![], vec![]);
+    cdp.call("Browser.setWindowBounds", window_bounds(16_384, 16_384), Some(&session)).unwrap();
+    assert_eq!(window_resized(&browser), 1);
+    for (width, height) in [(16_385, 768), (1024, 16_385)] {
+        assert_eq!(cdp.call("Browser.setWindowBounds", window_bounds(width, height), Some(&session)).unwrap_err(), crate::cdp::WINDOW_SHAPE);
+    }
+    assert_eq!(window_resized(&browser), 1);
 }
 
 #[test]
@@ -127,7 +133,7 @@ fn window_bounds_params_and_sessions_are_allowlisted() {
         (json!({ "windowId": 7 }), Some("U")),
         (json!([]), Some("U")),
         (window_bounds(0, 768), Some("U")),
-        (window_bounds(1024, 10_000_001), Some("U")),
+        (window_bounds(1024, 16_385), Some("U")),
         (json!({ "windowId": 7, "bounds": { "width": 10.5, "height": 768 } }), Some("U")),
         (json!({ "windowId": 7, "bounds": { "width": -1, "height": 768 } }), Some("U")),
     ] {
@@ -140,13 +146,28 @@ fn window_bounds_params_and_sessions_are_allowlisted() {
 }
 
 #[test]
+fn window_bounds_shape_and_window_refusals_do_not_blame_seven() {
+    for (params, expected) in [
+        (json!({ "windowId": 7, "bounds": { "windowState": "minimized" } }), crate::cdp::WINDOW_SHAPE),
+        (json!({ "windowId": 8, "bounds": { "width": 1024, "height": 768 } }), crate::cdp::WINDOW_OWN),
+    ] {
+        let (mut cdp, session, _) = window_client(vec![window_page("OS", "https://www.sliccy.ai/os/", "CTX")], vec![]);
+        assert_eq!(cdp.call("Browser.setWindowBounds", params, Some(&session)).unwrap_err(), expected);
+    }
+    let (mut cdp, _, _) = window_client(vec![], vec![]);
+    let sessionless: Option<&str> = None;
+    assert_eq!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), sessionless).unwrap_err(), crate::cdp::WINDOW_OWN);
+}
+
+#[test]
 fn window_bounds_are_refused_for_a_blocked_or_protected_session() {
     let (mut cdp, session, browser) = window_client(vec![], vec![]);
     cdp.blocked.insert(session.clone());
-    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).is_err());
-    let (mut cdp, session, _) = window_client(vec![], vec![]);
+    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err().starts_with("slicc: refused:"));
+    assert_eq!(window_resized(&browser), 0);
+    let (mut cdp, session, browser) = window_client(vec![], vec![]);
     cdp.protected_targets.insert("T".into());
-    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).is_err());
+    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err().starts_with("slicc: refused:"));
     assert_eq!(window_resized(&browser), 0);
 }
 
@@ -154,9 +175,17 @@ fn window_bounds_are_refused_for_a_blocked_or_protected_session() {
 fn window_bounds_are_refused_when_the_page_is_not_listed_as_an_ordinary_page() {
     let (mut cdp, session, browser) = window_client(vec![], vec![]);
     browser.borrow_mut().targets[0]["type"] = json!("other");
-    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).is_err());
+    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err().starts_with("slicc: refused:"));
     browser.borrow_mut().targets.clear();
-    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).is_err());
+    assert!(cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err().starts_with("slicc: refused:"));
     assert_eq!(window_resized(&browser), 0);
 }
 
+#[test]
+fn window_bounds_are_refused_when_the_listing_puts_the_page_on_seven() {
+    let (mut cdp, session, browser) = window_client(vec![], vec![]);
+    browser.borrow_mut().targets[0]["url"] = json!("https://seven.sliccy.ai/?secret=1");
+    let refused = cdp.call("Browser.setWindowBounds", window_bounds(1024, 768), Some(&session)).unwrap_err();
+    assert!(refused.starts_with("slicc: refused:") && !refused.contains("secret"), "{refused}");
+    assert_eq!(window_resized(&browser), 0);
+}
