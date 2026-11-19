@@ -1,6 +1,7 @@
 fn main() {
     #[cfg(windows)]
     curlwright::remove_parked_binary();
+    cdp_client::resolve::announce_eagerly();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cdp_env = std::env::var("SLICC_CDP_URL").ok();
     let output = curlwright::execute(&args, cdp_env.as_deref());

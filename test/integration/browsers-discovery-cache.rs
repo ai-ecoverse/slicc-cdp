@@ -1,8 +1,10 @@
 #![cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
 
 use cdp_client::discover::{
-    attached_with, read_browsers_cache, version_url, BrowsersCache, CLI_MAX_STDOUT,
+    attached_with, attached_with_traced, read_browsers_cache, version_url, BrowsersCache,
+    CLI_MAX_STDOUT,
 };
+use cdp_client::resolve::{Rule, Step};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -105,7 +107,7 @@ impl Drop for EnvGuard {
 
 #[test]
 fn two_commands_within_ttl_spawn_slicc_once() {
-    let _lock = env_lock().lock().unwrap();
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = scratch();
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -165,7 +167,7 @@ fn two_commands_within_ttl_spawn_slicc_once() {
 
 #[test]
 fn hanging_slicc_costs_timeout_once_across_commands() {
-    let _lock = env_lock().lock().unwrap();
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = scratch();
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -207,5 +209,78 @@ fn hanging_slicc_costs_timeout_once_across_commands() {
         started.elapsed()
     );
     assert_eq!(std::fs::read_to_string(&count).unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn listing_entry(port: u16, host: &str, tier: i64, seven_open: bool, profile: Option<&str>) -> serde_json::Value {
+    let mut endpoint = json!({
+        "cdp": format!("http://127.0.0.1:{port}"),
+        "webSocketDebuggerUrl": format!("ws://{host}:{port}/devtools/browser/b{port}"),
+        "sevenOpen": seven_open,
+    });
+    if let Some(profile) = profile {
+        endpoint["profile"] = json!(profile);
+    }
+    json!({ "id": format!("cdp:127.0.0.1:{port}"), "kind": "endpoint", "tier": tier, "endpoint": endpoint })
+}
+
+fn listing_slicc(root: &Path, entries: Vec<serde_json::Value>) -> PathBuf {
+    let doc = json!({ "schema": 1, "entries": entries }).to_string().replace('\'', "");
+    fake_slicc(root, &format!("#!/bin/sh\nprintf '%s' '{doc}'\n"))
+}
+
+#[test]
+fn with_several_browsers_listed_the_seven_open_one_wins_and_says_so() {
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = scratch();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let _env = EnvGuard::isolate(&home);
+    let slicc = listing_slicc(
+        &root,
+        vec![
+            listing_entry(40110, "127.0.0.1", 0, false, None),
+            listing_entry(40111, "127.0.0.1", 1, false, Some("work")),
+            listing_entry(40112, "127.0.0.1", 3, true, Some("six")),
+            listing_entry(40113, "203.0.113.9", 0, true, Some("remote")),
+            listing_entry(40114, "localhost", 2, false, None),
+            listing_entry(40115, "127.0.0.1", 2, false, None),
+        ],
+    );
+    let mut trail = Vec::new();
+    let picked = attached_with_traced(Some(&slicc), None, FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT, &mut |url| {
+        panic!("a fresh listing is not dialled: {url}")
+    }, &mut trail)
+    .unwrap();
+    assert_eq!(picked, Some((Rule::SliccBrowsers, version_url(40112))));
+    assert!(trail.is_empty(), "{trail:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_listing_with_nothing_usable_falls_through_and_records_why() {
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = scratch();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let _env = EnvGuard::isolate(&home);
+    let slicc = listing_slicc(&root, vec![listing_entry(40113, "203.0.113.9", 0, true, None)]);
+    let mut trail = Vec::new();
+    let picked = attached_with_traced(Some(&slicc), None, FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT, &mut |_| {
+        Err("unused\n".to_string())
+    }, &mut trail)
+    .unwrap();
+    assert_eq!(picked, None);
+    assert_eq!(
+        trail,
+        [
+            Step::new(Rule::SliccBrowsers, "no loopback CDP endpoint listed"),
+            Step::new(Rule::ActivePort, "no live file under slicc seven-profiles, profiles, or six profiles"),
+        ]
+    );
+    let missing = root.join("no-such-slicc");
+    let mut trail = Vec::new();
+    attached_with_traced(Some(&missing), None, FAKE_SLICC_TIMEOUT, CLI_MAX_STDOUT, &mut |_| Err("unused\n".to_string()), &mut trail).unwrap();
+    assert_eq!(trail[0], Step::new(Rule::SliccBrowsers, "slicc not on PATH, or it failed"));
     let _ = std::fs::remove_dir_all(&root);
 }

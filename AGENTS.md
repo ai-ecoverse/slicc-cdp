@@ -4,6 +4,6 @@
 
 CLIs: `crates/playwright-cli`, `crates/curlwright`. Shared CDP: `crates/cdp-client`. Attach with `flatten: true` and a top-level `sessionId`. No `/devtools/page/<id>` socket. `--version` prints `package.json`.
 
-Connect: `--cdp`, else `SLICC_CDP_URL`, else `slicc browsers --json`, else live DevToolsActivePort (seven/legacy/six; loopback + path id), else loopback saved session (playwright-cli), else 9222-9229. Ignore cwd sessions; saved state stays loopback. Wasm: 9222 only. `ws`/`wss` dial; `http` discovers. Non-2xx exits non-zero. WASI has no TLS.
+Connect (`cdp_client::resolve`): `--cdp`, else `SLICC_CDP_URL`, else `slicc browsers --json`, else live DevToolsActivePort (seven/legacy/six; loopback + path id), else saved loopback session, else 9222-9229. Ignore cwd sessions; saved state stays loopback. Wasm: 9222 only. `ws`/`wss` dial; `http` discovers. Non-2xx exits non-zero. WASI has no TLS.
 
 Kernel wasm: `bin/playwright-cli.wasm`, `bin/curlwright.wasm` (`slicc.abi` `wasi`). `npm run build:wasm` writes both. Do not commit them.

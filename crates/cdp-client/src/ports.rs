@@ -33,12 +33,18 @@ pub fn parse(text: &str) -> Option<Vec<u16>> {
 }
 
 pub fn real_debug_port(host: &str, port: u16) -> bool {
-    if !(9222..=9229).contains(&port) {
-        return false;
-    }
+    (9222..=9229).contains(&port) && (local_host(host) || localhost_name(host))
+}
+
+fn localhost_name(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
     let host = host.strip_suffix('.').unwrap_or(&host);
-    if host == "localhost" || host.ends_with(".localhost") {
+    host == "localhost" || host.ends_with(".localhost")
+}
+
+pub fn local_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if host == "localhost" {
         return true;
     }
     match host.parse::<std::net::IpAddr>() {
@@ -63,7 +69,10 @@ pub fn first_live(
         let Ok(body) = probe(&version) else {
             continue;
         };
-        if crate::connect::websocket_url_from_version(&body).is_ok() {
+        let Ok(socket) = crate::connect::websocket_url_from_version(&body) else {
+            continue;
+        };
+        if crate::connect::checked_socket(&version, &socket).is_ok() {
             return Some(version);
         }
     }
@@ -130,13 +139,27 @@ mod tests {
     }
 
     #[test]
+    fn only_literal_localhost_and_local_addresses_are_this_machine() {
+        for host in ["localhost", "LOCALHOST", "127.0.0.1", "127.8.9.10", "::1", "[::1]", "0.0.0.0", "::", "::ffff:127.0.0.1"] {
+            assert!(local_host(host), "{host}");
+        }
+        for host in ["evil.localhost", "foo.localhost", "app.localhost", "localhost.", "127.0.0.1.", "localhost.evil.example", "0x7f.0.0.1", "127.000.0.1", "203.0.113.9", "::ffff:203.0.113.9", "example.com", ""] {
+            assert!(!local_host(host), "{host}");
+        }
+        assert!(real_debug_port("evil.localhost", 9222), "the test guard stays broad");
+    }
+
+    #[test]
     fn the_first_port_with_a_debugger_wins() {
         let mut seen = Vec::new();
-        let found = first_live(&[40100, 40101, 40102, 40103], &mut |url| {
+        let found = first_live(&[40100, 40101, 40104, 40102, 40103], &mut |url| {
             seen.push(url.to_string());
             match url {
                 "http://127.0.0.1:40100/json/version" => Err("refused\n".to_string()),
                 "http://127.0.0.1:40101/json/version" => Ok("{}".to_string()),
+                "http://127.0.0.1:40104/json/version" => Ok(
+                    r#"{"webSocketDebuggerUrl":"ws://203.0.113.9:40104/devtools/browser/b"}"#.to_string(),
+                ),
                 "http://127.0.0.1:40102/json/version" => Ok(
                     r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:40102/devtools/browser/b"}"#
                         .to_string(),
@@ -145,7 +168,7 @@ mod tests {
             }
         });
         assert_eq!(found.as_deref(), Some("http://127.0.0.1:40102/json/version"));
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 4);
         assert_eq!(first_live(&[40100], &mut |_| Err("HTTP 404\n".to_string())), None);
     }
 }

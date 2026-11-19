@@ -8,6 +8,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub use cdp_client::resolve::{known_provenance, loopback_url, usable_endpoint};
+#[cfg(not(target_arch = "wasm32"))]
+pub use cdp_client::resolve::reuse_saved;
+
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     pub current: Option<String>,
@@ -901,46 +905,11 @@ fn host_write(path: &Path, body: &str, private_dirs: bool) -> Result<(), String>
     }
 }
 
-pub fn known_provenance(text: &str) -> bool {
-    matches!(text, "explicit" | "seven-profile" | "probe")
-}
-
 pub fn note_owned(session: &mut Session, id: &str) {
     if id.is_empty() || session.owned.iter().any(|have| have == id) {
         return;
     }
     session.owned.push(id.to_string());
-}
-
-pub fn usable_endpoint(endpoint: Option<&str>, provenance: Option<&str>) -> Option<String> {
-    let url = endpoint.filter(|text| !text.is_empty())?;
-    if !known_provenance(provenance?) {
-        return None;
-    }
-    if !loopback_url(url) {
-        return None;
-    }
-    Some(url.to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn reuse_saved(
-    endpoint: Option<&str>,
-    provenance: Option<&str>,
-    version_body: Option<&str>,
-) -> Option<String> {
-    let url = usable_endpoint(endpoint, provenance)?;
-    if provenance == Some("probe") {
-        discovery_url(&url)?;
-        crate::connect::websocket_url_from_version(version_body?).ok()?;
-    }
-    Some(url)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn discovery_url(endpoint: &str) -> Option<&str> {
-    let lower = endpoint.to_ascii_lowercase();
-    (lower.starts_with("http://") || lower.starts_with("https://")).then_some(endpoint)
 }
 
 #[cfg(test)]
@@ -965,34 +934,6 @@ fn private_file(path: &Path) -> Result<(), String> {
         let _ = path;
     }
     Ok(())
-}
-
-pub fn loopback_url(url: &str) -> bool {
-    let Ok(endpoint) = cdp_client::net::parse_endpoint(url) else {
-        return false;
-    };
-    if !matches!(endpoint.scheme.as_str(), "http" | "https" | "ws" | "wss") {
-        return false;
-    }
-    let host = endpoint.host.to_ascii_lowercase();
-    host == "localhost" || host == "::1" || ipv4_loopback(&host)
-}
-
-fn ipv4_loopback(host: &str) -> bool {
-    let mut parts = host.split('.');
-    let Some(first) = parts.next().and_then(|text| text.parse::<u8>().ok()) else {
-        return false;
-    };
-    let Some(_) = parts.next().and_then(|text| text.parse::<u8>().ok()) else {
-        return false;
-    };
-    let Some(_) = parts.next().and_then(|text| text.parse::<u8>().ok()) else {
-        return false;
-    };
-    let Some(_) = parts.next().and_then(|text| text.parse::<u8>().ok()) else {
-        return false;
-    };
-    parts.next().is_none() && first == 127
 }
 
 #[cfg(test)]

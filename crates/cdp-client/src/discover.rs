@@ -1,3 +1,4 @@
+use crate::resolve::{Rule, Step};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -178,6 +179,14 @@ pub fn attached(
     Ok(None)
 }
 
+#[cfg(any(target_arch = "wasm32", target_os = "wasi"))]
+pub fn attached_traced(
+    _probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    _trail: &mut Vec<Step>,
+) -> Result<Option<(Rule, String)>, String> {
+    Ok(None)
+}
+
 pub fn accept_cached_version_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
@@ -214,9 +223,17 @@ pub fn browsers_discovery_cache_path(env: &HostEnv) -> String {
 pub fn attached(
     probe: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
+    Ok(attached_traced(probe, &mut Vec::new())?.map(|(_, url)| url))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+pub fn attached_traced(
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    trail: &mut Vec<Step>,
+) -> Result<Option<(Rule, String)>, String> {
     let env = current_env();
     let cache = browsers_discovery_cache_path(&env);
-    attached_with(None, Some(std::path::Path::new(&cache)), CLI_TIMEOUT, CLI_MAX_STDOUT, probe)
+    attached_with_traced(None, Some(std::path::Path::new(&cache)), CLI_TIMEOUT, CLI_MAX_STDOUT, probe, trail)
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
@@ -227,18 +244,29 @@ pub fn attached_with(
     max_stdout: usize,
     probe: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
+    Ok(attached_with_traced(program, cache_path, timeout, max_stdout, probe, &mut Vec::new())?.map(|(_, url)| url))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+pub fn attached_with_traced(
+    program: Option<&std::path::Path>,
+    cache_path: Option<&std::path::Path>,
+    timeout: Duration,
+    max_stdout: usize,
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    trail: &mut Vec<Step>,
+) -> Result<Option<(Rule, String)>, String> {
     if let Some(path) = cache_path {
         match read_browsers_cache(path, std::time::SystemTime::now()) {
             BrowsersCache::Positive(url) if accept_cached_version_url(&url) => {
                 if cached_endpoint_live(&url, probe) {
-                    return Ok(Some(url));
+                    return Ok(Some((Rule::SliccBrowsers, url)));
                 }
                 let _ = std::fs::remove_file(path);
             }
             BrowsersCache::Negative | BrowsersCache::Empty => {
-                let env = current_env();
-                let roots = slicc_profile_roots(&env);
-                return from_devtools_active_port(&env, &DiskFs, &roots, probe);
+                trail.push(Step::new(Rule::SliccBrowsers, "no loopback CDP endpoint listed (cached)"));
+                return active_port_traced(probe, trail);
             }
             BrowsersCache::Positive(_) | BrowsersCache::Miss => {}
         }
@@ -250,22 +278,38 @@ pub fn attached_with(
                     let _ = write_browsers_cache(path, CacheRecord::Positive(url.clone()));
                 }
             }
-            return Ok(Some(url));
+            return Ok(Some((Rule::SliccBrowsers, url)));
         }
         SliccBrowsersOutcome::Empty => {
             if let Some(path) = cache_path {
                 let _ = write_browsers_cache(path, CacheRecord::Empty);
             }
+            trail.push(Step::new(Rule::SliccBrowsers, "no loopback CDP endpoint listed"));
         }
         SliccBrowsersOutcome::Failed => {
             if let Some(path) = cache_path {
                 let _ = write_browsers_cache(path, CacheRecord::Failed);
             }
+            trail.push(Step::new(Rule::SliccBrowsers, "slicc not on PATH, or it failed"));
         }
     }
+    active_port_traced(probe, trail)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "wasi")))]
+fn active_port_traced(
+    probe: &mut dyn FnMut(&str) -> Result<String, String>,
+    trail: &mut Vec<Step>,
+) -> Result<Option<(Rule, String)>, String> {
     let env = current_env();
     let roots = slicc_profile_roots(&env);
-    from_devtools_active_port(&env, &DiskFs, &roots, probe)
+    match from_devtools_active_port(&env, &DiskFs, &roots, probe)? {
+        Some(url) => Ok(Some((Rule::ActivePort, url))),
+        None => {
+            trail.push(Step::new(Rule::ActivePort, "no live file under slicc seven-profiles, profiles, or six profiles"));
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

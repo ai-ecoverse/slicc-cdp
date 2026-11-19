@@ -2888,7 +2888,7 @@ mod tests {
             "Host list GETs /json/version and /json/list on 127.0.0.1:9222-9229."
         ));
         assert!(global.stdout.contains(
-            "Otherwise launch binds the first free port from 9222 to 9229, or lets Chrome pick one when all are busy."
+            "Host open, when nothing is found, launches a browser on the first free port from 9222 to 9229, or lets Chrome pick one when all are busy;"
         ));
         let pending = global.stdout.split("Not implemented yet:").nth(1).unwrap();
         let pending_names: Vec<&str> = pending
@@ -3603,6 +3603,7 @@ mod tests {
             runtime: None,
             session: None,
             full_urls: false,
+            verbose: false,
             intent: None,
             help: false,
             command_help: false,

@@ -24,11 +24,16 @@ Request:
   -r, --range <range>        Add a Range header ("0-499" becomes "bytes=0-499")
       --no-credentials       Do not send cookies (they are sent by default)
 
+Browser (curlwright never launches one):
+      --cdp <url|auto>       Browser to use; see the connect order below
+      --runtime <name>       Appended as ?runtime= to the URL that is opened
+
+{connect}
 Tab selection:
-      --tab <targetId>       Tab to run in. Without it: the current tab in
-                             .playwright-cli/session.json when that tab is
-                             still open, else the one open tab on the URL's
-                             origin. Any other case exits 2 and lists --tab
+      --tab <targetId>       Tab to run in. Without it: the current tab
+                             playwright-cli saved for this directory when that
+                             tab is still open, else the one open tab on the
+                             URL's origin. Any other case exits 2 and lists --tab
       --frame <frameId>      Run in a child frame of that tab
       --full-urls            Print URLs without redacting query strings (may expose login tokens)
       --intent <text>        What the request is for, shown in SLICC's recent
@@ -54,7 +59,7 @@ Output:
   -w, --write-out <format>   Print a format string after the transfer
   -s, --silent               Suppress error messages
   -S, --show-error           Show errors even with -s
-  -v, --verbose              Trace the request and response to stderr
+  -v, --verbose              Trace the CDP endpoint, request and response to stderr
   -f, --fail                 No body on HTTP >= 400; exit 22
   -m, --max-time <seconds>   Abort the request after this long; exit 28
   -V, --version              Print the package version

@@ -24,9 +24,7 @@ pub const DEFAULT_PORT: u16 = 9222;
 
 fn classify(raw: &str) -> Result<Start, String> {
     let Some(url) = with_scheme(raw) else {
-        return Err(format!(
-            "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://)\n"
-        ));
+        return Err(unsupported(raw));
     };
     let lower = url.to_ascii_lowercase();
     if let Some(http) = pathless_socket(&url) {
@@ -36,10 +34,14 @@ fn classify(raw: &str) -> Result<Start, String> {
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
         Ok(Start::Discover(discovery_url(&url)))
     } else {
-        Err(format!(
-            "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://)\n"
-        ))
+        Err(unsupported(raw))
     }
+}
+
+fn unsupported(raw: &str) -> String {
+    format!(
+        "unsupported CDP URL \"{raw}\" (expected a port, host:port, ws://, wss://, http://, or https://; use --cdp auto to search for a running browser)\n"
+    )
 }
 
 pub fn with_scheme(raw: &str) -> Option<String> {
@@ -136,6 +138,35 @@ pub fn websocket_url_from_version(body: &str) -> Result<String, String> {
         Some(url) if !url.is_empty() => Ok(url.to_string()),
         _ => Err("json/version returned no webSocketDebuggerUrl\n".to_string()),
     }
+}
+
+pub fn checked_socket(discovery: &str, socket: &str) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "CDP discovery at {} returned {}, {why}; refusing to dial it\n",
+            crate::sanitize::redact_url(discovery),
+            crate::sanitize::redact_url(socket)
+        ))
+    };
+    let Ok(found) = crate::net::parse_endpoint(socket) else {
+        return refuse("which is not a ws:// or wss:// URL");
+    };
+    if !matches!(found.scheme.as_str(), "ws" | "wss") {
+        return refuse("which is not a ws:// or wss:// URL");
+    }
+    let Ok(asked) = crate::net::parse_endpoint(discovery) else {
+        return refuse("and the discovery URL does not parse");
+    };
+    if crate::ports::local_host(&asked.host) {
+        if crate::ports::local_host(&found.host) {
+            return Ok(());
+        }
+        return refuse("a host other than this machine");
+    }
+    if found.host.eq_ignore_ascii_case(&asked.host) {
+        return Ok(());
+    }
+    refuse("a host other than the one asked")
 }
 
 pub fn dialed_from_version(body: &str, runtime: Option<&str>) -> Result<String, String> {
@@ -255,6 +286,39 @@ mod tests {
         assert_eq!(pathless_socket("http://x"), None);
         assert_eq!(pathless_socket("ws://"), None);
         assert_eq!(pathless_socket("nothing"), None);
+    }
+
+    #[test]
+    fn a_discovered_socket_stays_on_this_machine_or_the_host_asked() {
+        for (discovery, socket) in [
+            ("http://127.0.0.1:9300/json/version", "ws://127.0.0.1:9300/devtools/browser/a"),
+            ("http://127.0.0.1:9300/json/version", "ws://localhost:9301/devtools/browser/a"),
+            ("http://localhost:9300/json/version", "ws://[::1]:9300/devtools/browser/a"),
+            ("http://[::1]:9300/json/version", "wss://127.0.0.1:9300/devtools/browser/a"),
+            ("http://0.0.0.0:9300/json/version", "ws://127.0.0.1:9300/devtools/browser/a"),
+            ("http://LOCALHOST:9300/json/version", "ws://LocalHost:9300/devtools/browser/a"),
+            ("http://evil.localhost:9300/json/version", "ws://EVIL.localhost:9300/devtools/browser/a"),
+            ("https://cdp.example:9444/json/version", "wss://CDP.example:9445/devtools/browser/a"),
+        ] {
+            assert_eq!(checked_socket(discovery, socket), Ok(()), "{discovery} {socket}");
+        }
+        for (discovery, socket, why) in [
+            ("http://127.0.0.1:9300/json/version", "ws://203.0.113.9:9223/devtools/browser/a", "a host other than this machine"),
+            ("http://127.0.0.1:9300/json/version", "ws://127.0.0.1@evil.example:9300/x", "a host other than this machine"),
+            ("http://localhost:9300/json/version", "ws://attacker.example/devtools/browser/a", "a host other than this machine"),
+            ("http://127.0.0.1:9300/json/version", "ws://evil.localhost:9300/devtools/browser/a", "a host other than this machine"),
+            ("http://localhost:9300/json/version", "ws://foo.localhost:9300/devtools/browser/a", "a host other than this machine"),
+            ("http://evil.localhost:9300/json/version", "ws://127.0.0.1:9300/devtools/browser/a", "a host other than the one asked"),
+            ("http://foo.localhost:9300/json/version", "ws://bar.localhost:9300/devtools/browser/a", "a host other than the one asked"),
+            ("https://cdp.example:9444/json/version", "wss://other.example:9444/devtools/browser/a", "a host other than the one asked"),
+            ("https://cdp.example:9444/json/version", "ws://127.0.0.1:9222/devtools/browser/a", "a host other than the one asked"),
+            ("http://127.0.0.1:9300/json/version", "http://127.0.0.1:9300/devtools/browser/a", "not a ws:// or wss:// URL"),
+        ] {
+            let err = checked_socket(discovery, socket).unwrap_err();
+            assert!(err.contains(why) && err.ends_with("refusing to dial it\n"), "{err}");
+        }
+        let secret = checked_socket("http://127.0.0.1:9300/json/version", "ws://evil.example/x?token=hunter2").unwrap_err();
+        assert!(!secret.contains("hunter2"), "{secret}");
     }
 
     #[test]

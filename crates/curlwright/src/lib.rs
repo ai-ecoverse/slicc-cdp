@@ -21,40 +21,37 @@ use write_out::{format_write_out, WriteOut};
 
 const HELP: &str = include_str!("help.txt");
 
+fn help() -> String {
+    HELP.replace("{connect}", &cdp_client::resolve::help_block("  ", 80))
+}
+
 #[cfg(windows)]
 pub fn remove_parked_binary() {
     cdp_client::upgrade::remove_parked();
 }
 
+#[cfg(test)]
+thread_local! {
+    static FINDER: std::cell::RefCell<Option<cdp_client::resolve::Listed>> = const { std::cell::RefCell::new(None) };
+}
+
+fn host_choice(cdp: Option<&str>, env: Option<&str>) -> Result<cdp_client::resolve::Choice, String> {
+    #[cfg(test)]
+    if let Some(mut listed) = FINDER.with(|cell| cell.borrow().clone()) {
+        return connect_start(cdp, env, &mut listed);
+    }
+    connect_start(cdp, env, &mut profiles::HostFinder)
+}
+
 fn connect_start(
     cdp: Option<&str>,
     env: Option<&str>,
-) -> Result<cdp_client::connect::Start, String> {
-    if host_endpoint_missing(cdp, env) {
-        return profile_start(profiles::attached_port());
-    }
-    cdp_client::connect::choose_start(cdp, env)
-}
-
-fn profile_start(
-    found: Result<Option<String>, String>,
-) -> Result<cdp_client::connect::Start, String> {
-    match found {
-        Ok(Some(url)) => Ok(cdp_client::connect::Start::Discover(url)),
-        Ok(None) => Err("curlwright: no debugger is connected\n".to_string()),
-        Err(message) => Err(message),
-    }
-}
-
-fn host_endpoint_missing(cdp: Option<&str>, env: Option<&str>) -> bool {
-    if cfg!(target_arch = "wasm32") {
-        return false;
-    }
-    trimmed_nonempty(cdp).is_none() && trimmed_nonempty(env).is_none()
-}
-
-fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|text| !text.is_empty())
+    finder: &mut dyn cdp_client::resolve::Finder,
+) -> Result<cdp_client::resolve::Choice, String> {
+    let resolved = cdp_client::resolve::resolve(cdp, env, finder)?;
+    resolved
+        .choice
+        .ok_or_else(|| cdp_client::resolve::not_found("curlwright", &resolved.trail))
 }
 
 pub struct Output {
@@ -119,7 +116,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
         return Output::text(format!("curlwright {}\n", env!("CURLWRIGHT_VERSION")));
     }
     if opts.help {
-        return Output::text(HELP.to_string());
+        return Output::text(help());
     }
     if opts.url.is_none() {
         return Output::from_stop(Stop::usage("curlwright: no URL specified"));
@@ -148,10 +145,25 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     if let Some(Err(message)) = signer.as_ref().map(|signer| signer.apply(&mut request)) {
         return Output::from_stop(Stop::usage(message.trim_end()));
     }
-    let start = match connect_start(opts.cdp.as_deref(), cdp_env) {
-        Ok(start) => start,
+    let choice = match host_choice(opts.cdp.as_deref(), cdp_env) {
+        Ok(choice) => choice,
         Err(message) => return Output::plain(message, 1),
     };
+    let announced = if opts.verbose { cdp_client::resolve::announce(&choice, opts.full_urls) } else { None };
+    let mut output = connected(&opts, choice.start.clone(), request, signer);
+    output.stderr.push_str(&cdp_client::resolve::saved_hint("curlwright", &choice, &output.stderr));
+    if let Some(line) = announced {
+        output.stderr.insert_str(0, &line);
+    }
+    output
+}
+
+fn connected(
+    opts: &Options,
+    start: cdp_client::connect::Start,
+    mut request: PreparedRequest,
+    signer: Option<sign::Signer>,
+) -> Output {
     let mut cdp = match cdp_client::cdp::open(start, opts.runtime.as_deref()) {
         Ok(cdp) => cdp,
         Err(message) => return Output::plain(message, 1),
@@ -234,7 +246,7 @@ fn annotation_stderr(stderr: &str) -> &str {
         let Some(line) = rest.lines().next() else {
             return "";
         };
-        if !(line.starts_with("> ") || line.starts_with("< ")) {
+        if !(line.starts_with("> ") || line.starts_with("< ") || line.starts_with("* CDP ")) {
             return rest;
         }
         rest = &rest[line.len()..];
@@ -502,8 +514,15 @@ mod tests {
         let output = run(&["--help"]);
         assert_eq!(output.code, 0);
         assert_eq!(output.stderr, "");
-        assert_eq!(output.as_text(), HELP);
+        assert_eq!(output.as_text(), help());
+        assert!(!output.as_text().contains("{connect}"));
+        let words = |text: &str| text.split_whitespace().map(str::to_string).collect::<Vec<_>>().join(" ");
+        let text = words(&output.as_text());
+        for shared in [cdp_client::resolve::CONNECT_ORDER, cdp_client::resolve::CDP_FORMS, cdp_client::resolve::CDP_REPORT] {
+            assert!(text.contains(&words(shared)), "{shared}");
+        }
         for flag in [
+            "--cdp <url|auto>", "--runtime <name>",
             "-X, --request", "-H, --header", "-d, --data", "--data-raw", "--data-binary",
             "--data-urlencode", "--json", "-F, --form", "--form-string", "-G, --get",
             "-u, --user", "-e, --referer", "-r, --range", "--no-credentials", "--tab",
@@ -543,7 +562,7 @@ mod tests {
         }
         for args in [&["./update"][..], &["--", "update"][..], &["-s", "update"][..]] {
             let output = run(args);
-            assert_eq!(output.stderr, "curlwright: no debugger is connected\n");
+            assert!(output.stderr.starts_with("curlwright: no CDP browser found."), "{}", output.stderr);
         }
     }
 
@@ -565,50 +584,135 @@ mod tests {
         assert_eq!(code, 28);
     }
 
-    #[test]
-    fn host_refuses_an_unnamed_debugger() {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let missing = connect_start(None, None).unwrap_err();
-            assert_eq!(missing, "curlwright: no debugger is connected\n");
-            let blank = connect_start(Some(" "), Some("")).unwrap_err();
-            assert_eq!(blank, "curlwright: no debugger is connected\n");
-            assert_eq!(
-                connect_start(Some("http://127.0.0.1:9225"), None).unwrap(),
-                cdp_client::connect::Start::Discover(
-                    "http://127.0.0.1:9225/json/version".to_string()
-                )
-            );
-            let output = run(&["https://app.example/x"]);
-            assert_eq!(output.code, 1);
-            assert_eq!(output.stderr, "curlwright: no debugger is connected\n");
-            assert!(!output.stderr.contains("9222"));
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            assert_eq!(
-                connect_start(None, None).unwrap(),
-                cdp_client::connect::Start::Discover(
-                    "http://127.0.0.1:9222/json/version".to_string()
-                )
-            );
-        }
+    fn listed(attached: Option<(cdp_client::resolve::Rule, String)>, saved: Option<String>, probe: Option<String>) -> cdp_client::resolve::Listed {
+        cdp_client::resolve::Listed { attached, saved, probe }
+    }
+
+    fn discovery_answering(socket: impl Fn(u16) -> String + Send + 'static) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if !String::from_utf8_lossy(&buf[..n]).starts_with("GET /json/version") {
+                    seen.fetch_add(1000, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = format!(r#"{{"webSocketDebuggerUrl":"{}"}}"#, socket(port));
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}/json/version"), hits)
     }
 
     #[test]
-    fn a_live_seven_profile_is_discovery() {
-        let url = "http://127.0.0.1:9333/json/version".to_string();
-        assert_eq!(
-            profile_start(Ok(Some(url.clone()))).unwrap(),
-            cdp_client::connect::Start::Discover(url)
-        );
-        let missing = profile_start(Ok(None)).unwrap_err();
-        assert_eq!(missing, "curlwright: no debugger is connected\n");
-        assert!(!missing.contains("9222"));
-        assert_eq!(
-            profile_start(Err("HTTP 500\nno\n".to_string())).unwrap_err(),
-            "HTTP 500\nno\n"
-        );
+    fn every_rule_ends_in_the_checked_dial_and_a_foreign_socket_is_refused() {
+        use cdp_client::resolve::Rule;
+        let (foreign, foreign_hits) = discovery_answering(|_| "ws://203.0.113.9:9223/devtools/browser/x".to_string());
+        let routes: Vec<(Option<&str>, Option<&str>, cdp_client::resolve::Listed, &str)> = vec![
+            (Some(foreign.as_str()), None, listed(None, None, None), "via --cdp"),
+            (None, Some(foreign.as_str()), listed(None, None, None), "via SLICC_CDP_URL"),
+            (None, None, listed(Some((Rule::SliccBrowsers, foreign.clone())), None, None), "via slicc browsers"),
+            (None, None, listed(Some((Rule::ActivePort, foreign.clone())), None, None), "via DevToolsActivePort"),
+            (None, None, listed(None, Some(foreign.clone()), None), "via saved endpoint"),
+            (None, None, listed(None, None, Some(foreign.clone())), "via port probe"),
+        ];
+        let count = routes.len();
+        for (cdp, env, finder, via) in routes {
+            FINDER.with(|cell| *cell.borrow_mut() = Some(finder));
+            let mut argv = vec!["-v".to_string()];
+            if let Some(cdp) = cdp {
+                argv.extend(["--cdp".to_string(), cdp.to_string()]);
+            }
+            argv.push("https://app.example/x".to_string());
+            let output = execute(&argv, env);
+            FINDER.with(|cell| *cell.borrow_mut() = None);
+            assert_eq!(output.code, 1, "{via}: {}", output.stderr);
+            assert!(output.stderr.contains(via), "{via}: {}", output.stderr);
+            assert!(output.stderr.contains("returned ws://203.0.113.9:9223/devtools/browser/x, a host other than this machine; refusing to dial it"), "{via}: {}", output.stderr);
+        }
+        assert_eq!(foreign_hits.load(std::sync::atomic::Ordering::SeqCst), count);
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://127.0.0.1:{}/json/version", listener.local_addr().unwrap().port())
+        };
+        FINDER.with(|cell| *cell.borrow_mut() = Some(listed(None, Some(dead.clone()), None)));
+        let output = execute(&["https://app.example/x".to_string()], None);
+        FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.ends_with(&format!("curlwright: {dead} is the endpoint playwright-cli saved for this directory, and it did not answer. Pass --cdp <port|url> to choose another browser.\n")), "{}", output.stderr);
+        let (named, named_hits) = discovery_answering(|port| format!("ws://evil.localhost:{port}/devtools/browser/x"));
+        FINDER.with(|cell| *cell.borrow_mut() = Some(listed(None, None, Some(named))));
+        let output = execute(&["https://app.example/x".to_string()], None);
+        FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("a host other than this machine; refusing to dial it"), "{}", output.stderr);
+        assert_eq!(named_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (local, local_hits) = discovery_answering(|port| format!("ws://localhost:{port}/devtools/browser/x"));
+        FINDER.with(|cell| *cell.borrow_mut() = Some(listed(None, None, Some(local))));
+        let output = execute(&["https://app.example/x".to_string()], None);
+        FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(!output.stderr.contains("refusing to dial"), "{}", output.stderr);
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 1001);
+    }
+
+    #[test]
+    fn host_lists_what_it_tried_when_no_debugger_answers() {
+        use cdp_client::connect::Start;
+        use cdp_client::resolve::Rule;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let missing = connect_start(None, None, &mut listed(None, None, None)).unwrap_err();
+            assert!(missing.starts_with("curlwright: no CDP browser found. Tried, in order:\n  --cdp               not given\n  SLICC_CDP_URL       not set\n  slicc browsers"), "{missing}");
+            assert!(missing.contains("port probe          nothing answered\n"), "{missing}");
+            let blank = connect_start(Some(" "), Some(""), &mut listed(None, None, None)).unwrap_err();
+            assert!(blank.starts_with("curlwright: no CDP browser found."));
+            let output = run(&["https://app.example/x"]);
+            assert_eq!(output.code, 1);
+            assert!(output.stderr.starts_with("curlwright: no CDP browser found. Tried, in order:\n"), "{}", output.stderr);
+            let several = listed(
+                Some((Rule::SliccBrowsers, "http://127.0.0.1:40101/json/version".into())),
+                Some("http://127.0.0.1:40102/json/version".into()),
+                Some("http://127.0.0.1:40103/json/version".into()),
+            );
+            let mut several = several;
+            let choice = connect_start(None, None, &mut several).unwrap();
+            assert_eq!(choice.rule, Rule::SliccBrowsers);
+            assert_eq!(choice.start, Start::Discover("http://127.0.0.1:40101/json/version".into()));
+            several.attached = None;
+            assert_eq!(connect_start(None, None, &mut several).unwrap().rule, Rule::Saved);
+            several.saved = None;
+            assert_eq!(connect_start(None, None, &mut several).unwrap().rule, Rule::Probe);
+            assert_eq!(connect_start(Some("auto"), Some("40199"), &mut several).unwrap().rule, Rule::Probe);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let choice = connect_start(None, None, &mut listed(None, None, None)).unwrap();
+            assert_eq!(choice.start, Start::Discover("http://127.0.0.1:9222/json/version".to_string()));
+        }
+        let flag = connect_start(Some("http://127.0.0.1:9225"), Some("9444"), &mut listed(None, None, None)).unwrap();
+        assert_eq!(flag.start, Start::Discover("http://127.0.0.1:9225/json/version".to_string()));
+        assert_eq!(flag.rule, Rule::Flag);
+    }
+
+    #[test]
+    fn verbose_names_the_endpoint_and_why_even_when_connect_fails() {
+        let output = run(&["-v", "--cdp", "ws://127.0.0.1:1/devtools/browser/x", "https://app.example/x"]);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.starts_with("* CDP ws://127.0.0.1:1/devtools/browser/x (via --cdp)\n"), "{}", output.stderr);
+        let quiet = run(&["--cdp", "ws://127.0.0.1:1/devtools/browser/x", "https://app.example/x"]);
+        assert!(!quiet.stderr.contains("* CDP"));
+        let zero = run(&["--cdp", "0", "https://app.example/x"]);
+        assert_eq!(zero.code, 1);
+        assert!(zero.stderr.contains("use --cdp auto"), "{}", zero.stderr);
+        assert_eq!(annotation_stderr("* CDP x (via --cdp)\n> GET / HTTP/1.1\nboom\n"), "boom\n");
     }
 
     #[test]

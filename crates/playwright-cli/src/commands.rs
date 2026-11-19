@@ -4,6 +4,7 @@ use crate::browser::{self, PageInfo};
 use crate::cdp::{self, Cdp};
 use crate::connect;
 use crate::cookies;
+use cdp_client::resolve::{self, Rule};
 use crate::launch::{self, Started};
 use crate::sanitize;
 use crate::session::{self, Session};
@@ -15,6 +16,45 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
+    let mut picked = Picked { verbose: invocation.verbose, full_urls: invocation.full_urls, choice: None, buffered: String::new() };
+    let mut output = run_picked(invocation, env_url, &mut picked);
+    output.stderr.insert_str(0, &picked.buffered);
+    output
+}
+
+struct Picked {
+    verbose: bool,
+    full_urls: bool,
+    choice: Option<resolve::Choice>,
+    buffered: String,
+}
+
+impl Picked {
+    fn set(&mut self, choice: resolve::Choice) {
+        if self.verbose {
+            if let Some(line) = resolve::announce(&choice, self.full_urls) {
+                self.buffered.push_str(&line);
+            }
+        }
+        self.choice = Some(choice);
+    }
+
+    fn failed(&self, message: String) -> Output {
+        let hint = self
+            .choice
+            .as_ref()
+            .map(|choice| resolve::saved_hint("playwright-cli", choice, &message))
+            .unwrap_or_default();
+        Output::err(format!("{message}{hint}"))
+    }
+}
+
+fn launched(start: &connect::Start, probed: bool) -> resolve::Choice {
+    let rule = if probed { Rule::Probe } else { Rule::Launch };
+    resolve::Choice { start: start.clone(), rule }
+}
+
+fn run_picked(invocation: &Invocation, env_url: Option<&str>, picked: &mut Picked) -> Output {
     let command = invocation.command.as_deref().unwrap_or("");
     if let Some(message) = trace::precheck(command, &invocation.positionals) {
         return Output::err(message);
@@ -72,46 +112,37 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             .cloned()
     });
     let explicit = launch::endpoint_is_explicit(invocation.cdp.as_deref(), env_url);
-    let profile = if explicit {
-        None
-    } else {
-        match launch::attached_port() {
-            Ok(active) => active,
-            Err(message) => return Output::err(message),
-        }
+    let resolved = match launch::pick(
+        invocation.cdp.as_deref(),
+        env_url,
+        invocation.session.as_deref(),
+        invocation.cwd.as_deref(),
+        !launch::should_launch(command, false),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => return Output::err(message),
     };
-    let remembered = if explicit || profile.is_some() {
-        None
-    } else {
-        launch::remembered_endpoint_named(invocation.session.as_deref(), invocation.cwd.as_deref())
-    };
-    let mut from_memory = remembered.is_some();
-    let active = profile.clone().or(remembered);
+    let rule = resolved.choice.as_ref().map(|choice| choice.rule);
+    let profile = matches!(rule, Some(Rule::SliccBrowsers | Rule::ActivePort));
+    let mut from_memory = rule == Some(Rule::Saved);
+    let mut from_probe = rule == Some(Rule::Probe);
     let mut started = None;
-    let mut from_probe = false;
-    let mut start = if active.is_none() && launch::should_launch(command, explicit) {
-        match start_by_launching(command, &invocation.flags, &mut started) {
-            Ok((start, probed)) => {
-                from_probe = probed;
-                start
-            }
-            Err(message) => return Output::err(message),
+    let mut start = match resolved.choice {
+        Some(choice) => {
+            picked.set(choice.clone());
+            choice.start
         }
-    } else {
-        match launch::start_after_explicit(invocation.cdp.as_deref(), env_url, active) {
-            Ok(start) => start,
-            Err(_) if from_memory && launch::should_launch(command, false) => {
-                from_memory = false;
-                match start_by_launching(command, &invocation.flags, &mut started) {
-                    Ok((start, probed)) => {
-                        from_probe = probed;
-                        start
-                    }
-                    Err(message) => return Output::err(message),
+        None if launch::should_launch(command, explicit) => {
+            match start_by_launching(command, &invocation.flags, &mut started) {
+                Ok((start, probed)) => {
+                    from_probe = probed;
+                    picked.set(launched(&start, probed));
+                    start
                 }
+                Err(message) => return Output::err(message),
             }
-            Err(message) => return Output::err(message),
         }
+        None => return Output::err(resolve::not_found("playwright-cli", &resolved.trail)),
     };
     let mut opened = cdp::open_dialed(start.clone(), runtime.as_deref());
     if let Err(message) = &opened {
@@ -120,6 +151,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
             match start_by_launching(command, &invocation.flags, &mut started) {
                 Ok((next, probed)) => {
                     from_probe = probed;
+                    picked.set(launched(&next, probed));
                     start = next;
                     opened = cdp::open_dialed(start.clone(), runtime.as_deref());
                 }
@@ -129,7 +161,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     }
     let (_, connected) = match opened {
         Ok(pair) => pair,
-        Err(message) => return Output::err(message),
+        Err(message) => return picked.failed(message),
     };
     let endpoint = match &start {
         connect::Start::Direct(url) | connect::Start::Discover(url) => url.clone(),
@@ -139,7 +171,7 @@ pub fn run_command(invocation: &Invocation, env_url: Option<&str>) -> Output {
     let loaded_kind = state.provenance.clone();
     match saved_provenance(
         explicit,
-        profile.is_some(),
+        profile,
         from_memory,
         from_probe,
         &endpoint,
