@@ -17,6 +17,14 @@ const surfaces = [
   ['Input.dispatchMouseEvent', { type: 'mousePressed', x: 1, y: 1, button: 'left', clickCount: 1 }],
 ];
 
+async function until(check, ms, what) {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 function node(id, parentId, protectedFrame = false) {
   const origin = protectedFrame ? 'http://localhost:9401' : 'http://localhost:9400';
   return {
@@ -138,14 +146,17 @@ test('page scope stops and discards unadmitted cast events', async () => {
     async (client, session, fake) => {
       const from = client.events.length;
       await client.send('Runtime.evaluate', { expression: '0' }, session);
+      await until(
+        () =>
+          fake.calls.some(
+            (call) => call.method === 'Page.stopScreencast' && call.sessionId === session
+          ),
+        10000,
+        'Page.stopScreencast'
+      );
       assert.equal(
         client.events.slice(from).filter((event) => event.method === 'Page.screencastFrame').length,
         0
-      );
-      assert.ok(
-        fake.calls.some(
-          (call) => call.method === 'Page.stopScreencast' && call.sessionId === session
-        )
       );
     },
     (message, event) => {
