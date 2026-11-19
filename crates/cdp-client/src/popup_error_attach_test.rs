@@ -97,7 +97,7 @@ impl Transport for PopupBrowser {
                 }
                 json!({})
             }
-            "Page.getFrameTree" if target == "P" => match state.frame.clone() {
+            "Page.getFrameTree" if target != "O" => match state.frame.clone() {
                 PopupFrame::Frame(frame) => json!({"frameTree":{"frame":frame}}),
                 PopupFrame::Tree(tree) => tree,
                 PopupFrame::Error => {
@@ -107,7 +107,11 @@ impl Transport for PopupBrowser {
                 PopupFrame::Silent => return Ok(()),
             },
             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"O","loaderId":"LO","url":"https://example.test/opener","securityOrigin":"https://example.test","mimeType":"text/html"}}}),
-            "Page.getNavigationHistory" => json!({"currentIndex":0,"entries":[{"id":1,"url":POPUP_SEVEN,"userTypedURL":POPUP_SEVEN,"title":"seven.sliccy.ai","transitionType":"link"}]}),
+            "Page.getNavigationHistory" => {
+                let url = state.popup["url"].as_str().unwrap_or("about:blank");
+                let title = state.popup["title"].as_str().unwrap_or(url);
+                json!({"currentIndex":0,"entries":[{"id":1,"url":url,"userTypedURL":url,"title":title,"transitionType":"link"}]})
+            }
             "Runtime.evaluate" => json!({"result":{"type":"string","value":"document-read"}}),
             _ => json!({}),
         };
@@ -222,6 +226,7 @@ fn an_error_page_popup_latched_on_its_protected_url_stays_refused() {
                 cdp.session_targets.remove("W");
             }
             cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":popup_info(POPUP_ERROR, title)}}));
+            assert!(cdp.is_protected_target("P"), "latched title={title} documented={documented}");
             popup_attach_refused(&mut cdp, &format!("latched title={title} documented={documented}"));
         }
     }
@@ -313,4 +318,145 @@ fn a_created_target_aimed_at_a_protected_url_is_refused_before_any_attach() {
     let mut cdp = popup_client(popup_info(POPUP_ERROR, POPUP_ERROR), PopupFrame::Frame(popup_error_frame(POPUP_SEVEN)));
     assert!(cdp.call("Target.createTarget", json!({"url":POPUP_SEVEN}), None).is_err());
     assert!(cdp.events().iter().all(|event| event["method"] != "Target.attachedToTarget"));
+}
+
+fn own_info(url: &str, title: &str) -> Value {
+    json!({"targetId":"T","type":"page","url":url,"title":title,"attached":false,"canAccessOpener":false})
+}
+
+fn own_state(info: Value, frame: PopupFrame) -> std::rc::Rc<std::cell::RefCell<PopupState>> {
+    let state = std::rc::Rc::new(std::cell::RefCell::new(PopupState {
+        popup: info, frame, order: PopupOrder::EventFirst, sessions: std::collections::BTreeMap::new(), attached: 0,
+    }));
+    POPUP_BROWSER.with(|shared| *shared.borrow_mut() = Some(state.clone()));
+    state
+}
+
+fn own_client_from(state: std::rc::Rc<std::cell::RefCell<PopupState>>, info: &Value) -> Cdp {
+    let mut cdp = Cdp::from_transport(Box::new(PopupBrowser { inbox: VecDeque::new(), state }));
+    cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":info}}));
+    cdp
+}
+
+fn assert_recovered(cdp: &mut Cdp, session: &str, label: &str) {
+    let announced = cdp.events().iter().rev().find(|event| event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == session).unwrap();
+    assert_eq!(announced["params"]["targetInfo"]["url"], "about:blank", "{label}: {announced}");
+    assert_eq!(announced["params"]["targetInfo"]["title"], "about:blank", "{label}: {announced}");
+    assert!(!announced.to_string().contains("sliccy"), "{label}: {announced}");
+    assert!(cdp.call("Runtime.evaluate", json!({"expression":"document.body.innerHTML"}), Some(session)).is_err(), "{label}");
+    assert!(cdp.call("Page.navigate", json!({"url":"https://example.test/recovered"}), Some(session)).is_ok(), "{label}");
+}
+
+#[test]
+fn an_own_tab_error_page_with_a_protected_failed_url_stays_attachable() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    assert!(cdp.call("Page.navigate", json!({"url":"https://example.test/next"}), Some(&live)).is_ok());
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "seven.sliccy.ai");
+        state.frame = PopupFrame::Frame(popup_error_frame(POPUP_SEVEN));
+    }
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "seven.sliccy.ai")}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(POPUP_SEVEN),"type":"Navigation"}}));
+    assert!(!cdp.is_protected_target("T"));
+    assert!(cdp.call("Runtime.evaluate", json!({"expression":"1"}), Some(&live)).is_err());
+    let _ = cdp.call("Target.detachFromTarget", json!({"sessionId":live}), None);
+    let reply = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    assert_recovered(&mut cdp, reply["sessionId"].as_str().unwrap(), "protected-unreachable");
+}
+
+#[test]
+fn an_own_tab_error_page_with_an_empty_failed_url_stays_attachable_across_processes() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut first = own_client_from(state.clone(), &start);
+    assert!(first.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_ok());
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "seven.sliccy.ai");
+        state.frame = PopupFrame::Frame(popup_error_frame(""));
+        state.sessions.clear();
+    }
+    let error = own_info(POPUP_ERROR, "seven.sliccy.ai");
+    let mut fresh = own_client_from(state, &error);
+    let reply = fresh.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    assert_recovered(&mut fresh, reply["sessionId"].as_str().unwrap(), "empty-unreachable");
+}
+
+#[test]
+fn a_fresh_attach_after_a_post_attach_chrome_error_target_info_recovers_an_own_tab() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut live = own_client_from(state.clone(), &start);
+    let first = live.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let session = first["sessionId"].as_str().unwrap().to_string();
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "seven.sliccy.ai");
+        state.frame = PopupFrame::Frame(popup_error_frame(""));
+    }
+    let guard = live.guards.get("T").cloned().expect("guard");
+    live.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "seven.sliccy.ai")}}));
+    live.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":popup_error_frame(""),"type":"Navigation"}}));
+    assert!(live.call("Runtime.evaluate", json!({"expression":"1"}), Some(&session)).is_err());
+    {
+        let mut state = state.borrow_mut();
+        state.sessions.clear();
+    }
+    let error = own_info(POPUP_ERROR, "seven.sliccy.ai");
+    let mut fresh = own_client_from(state, &error);
+    let reply = fresh.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    assert_recovered(&mut fresh, reply["sessionId"].as_str().unwrap(), "post-attach-chrome-error");
+}
+
+#[test]
+fn an_error_page_iframe_is_not_held_by_the_popup_error_attach_gate() {
+    let iframe = json!({"targetId":"IF","type":"iframe","url":"chrome-error://private/","title":"private","attached":false});
+    let popup = popup_info("chrome-error://private/", "private");
+    let cdp = Cdp::from_transport(Box::new(PopupBrowser {
+        inbox: VecDeque::new(),
+        state: own_state(iframe.clone(), PopupFrame::Frame(json!({"id":"IF","loaderId":"LIF","url":"chrome-error://private/","securityOrigin":"://","mimeType":"text/html"}))),
+    }));
+    assert!(!cdp.error_popup_hold(&iframe));
+    assert!(cdp.error_unproven(&iframe));
+    assert!(cdp.error_popup_hold(&popup));
+}
+
+#[test]
+fn guard_session_attach_events_in_the_settle_window_are_hidden_from_the_client() {
+    let mut cdp = popup_client_in(popup_info(POPUP_ERROR, "ordinary.invalid"), PopupFrame::Frame(popup_error_frame(POPUP_ORDINARY)), PopupOrder::EventFirst);
+    let reply = cdp.call("Target.attachToTarget", json!({"targetId":"P","flatten":true}), None).unwrap();
+    assert_eq!(reply["sessionId"], "A1");
+    for event in cdp.events() {
+        let session = event["params"]["sessionId"].as_str().unwrap_or("");
+        if matches!(event["method"].as_str(), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget")) {
+            assert!(!cdp.guard_sessions.contains(session), "{event}");
+            assert_ne!(session, "", "{event}");
+        }
+    }
+    assert!(cdp.events().iter().any(|event| event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == "A1"));
+}
+
+#[test]
+fn a_slicc_hide_target_event_is_never_delivered() {
+    let mut cdp = popup_client(popup_opener(), PopupFrame::Frame(json!({
+        "id":"O","loaderId":"LO","url":"https://example.test/opener","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    cdp.protect_target("O");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":{
+        "targetId":"IF","type":"iframe","url":"chrome-error://private/","title":"private","openerId":"O","parentFrameId":"O","attached":false
+    }}}));
+    assert!(cdp.events()[mark..].iter().all(|event| event["params"]["targetInfo"]["targetId"] != "IF"), "{:?}", &cdp.events()[mark..]);
 }

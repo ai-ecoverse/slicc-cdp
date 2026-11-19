@@ -156,6 +156,7 @@ pub struct Cdp {
     crashed_targets: BTreeSet<String>,
     session_targets: BTreeMap<String, String>,
     protected_targets: BTreeSet<String>,
+    client_targets: BTreeSet<String>,
     kept_url_latch: BTreeSet<String>,
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
@@ -290,6 +291,7 @@ impl Cdp {
             crashed_targets: BTreeSet::new(),
             session_targets: BTreeMap::new(),
             protected_targets: BTreeSet::new(),
+            client_targets: BTreeSet::new(),
             kept_url_latch: BTreeSet::new(),
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
@@ -645,7 +647,9 @@ impl Cdp {
         held.retain_mut(|event| {
             let session = event["params"]["sessionId"].as_str().unwrap_or("");
             let method = event["method"].as_str().unwrap_or("");
-            if matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget") && dropped.contains(session) {
+            if matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget")
+                && (dropped.contains(session) || self.guard_sessions.contains(session))
+            {
                 return false;
             }
             if method == "Target.attachedToTarget" && admitted.as_deref() == Some(session) {
@@ -667,6 +671,17 @@ impl Cdp {
             && !self.guard.url(unreachable) && !self.guard.unparseable(unreachable)
     }
 
+    fn note_client_target(&mut self, target: &str) {
+        if !target.is_empty() {
+            self.client_targets.insert(target.to_string());
+        }
+    }
+
+    fn popup_shaped(info: &Value) -> bool {
+        info.get("type").and_then(Value::as_str) == Some("page")
+            && info.get("openerId").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
+    }
+
     fn error_unproven(&self, info: &Value) -> bool {
         let url = info.get("url").and_then(Value::as_str).unwrap_or("");
         if !Self::chrome_error(url) && !self.guard.error_page_url(url) {
@@ -680,6 +695,12 @@ impl Cdp {
                 true
             }
         })
+    }
+
+    fn error_popup_hold(&self, info: &Value) -> bool {
+        Self::popup_shaped(info)
+            && !info.get("targetId").and_then(Value::as_str).is_some_and(|id| self.client_targets.contains(id))
+            && self.error_unproven(info)
     }
 
     fn scrub_error(&self, info: Value) -> Value {
@@ -1751,10 +1772,11 @@ impl Cdp {
                         self.block(&session);
                         return Err(self.refusal());
                     }
-                    if self.targets.get(&target).is_some_and(|info| self.error_unproven(info)) {
+                    if self.targets.get(&target).is_some_and(|info| self.error_popup_hold(info)) {
                         self.cut_unresolved_session(&session);
                         return Err(self.refusal());
                     }
+                    self.note_client_target(&target);
                 }
             }
             "Target.createBrowserContext" => {
@@ -2645,6 +2667,7 @@ impl Cdp {
             });
         }
         self.record_initial_blank(&target);
+        self.note_client_target(&target);
         if !url.eq_ignore_ascii_case("about:blank") {
             let guard = self.guards.get(&target).cloned();
             self.send("Page.navigate", json!({ "url": url }), guard.as_deref())?;
@@ -4082,10 +4105,11 @@ impl Cdp {
                     value["params"]["targetInfo"] = shield::redacted(&info);
                 } else if !self.documents.contains_key(&target) && !verdicts.target(false, Opener::Unknown)
                     && !self.abandoned.contains(&target)
+                    && !self.error_unproven(&info)
                 {
                     self.protected_targets.remove(&target);
                 }
-                if value.get("sliccHide").is_none() && value.pointer("/params/targetInfo").is_some_and(Value::is_object) {
+                if value.pointer("/params/targetInfo").is_some_and(Value::is_object) {
                     value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
                 }
             }
@@ -4207,6 +4231,7 @@ impl Cdp {
                     owned_frames.insert(target.to_string());
                     self.guards.remove(target);
                     self.targets.remove(target);
+                    self.client_targets.remove(target);
                     self.kept_url_latch.remove(target);
                     self.created_blanks.remove(target);
                     self.navigated_blanks.remove(target);
@@ -4348,8 +4373,13 @@ impl Cdp {
     }
 
     fn remember_navigation(&mut self, params: &Value, session: Option<&str>) {
-        if let Some((session, url)) = session.zip(params["url"].as_str()).filter(|(_, url)| self.ordinary_redirect_url(url)) {
-            self.client_navigation_urls.insert(session.to_string(), url.to_string());
+        if let Some(session) = session {
+            if let Some(target) = self.session_target(session) {
+                self.note_client_target(&target);
+            }
+            if let Some(url) = params["url"].as_str().filter(|url| self.ordinary_redirect_url(url)) {
+                self.client_navigation_urls.insert(session.to_string(), url.to_string());
+            }
         }
     }
 
@@ -4684,6 +4714,9 @@ impl Cdp {
 
     fn deliver_event(&mut self, mut value: Value) {
         self.watch(&mut value);
+        if value.pointer("/params/targetInfo").is_some_and(Value::is_object) {
+            value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
+        }
         if value.get("sliccHide").and_then(Value::as_bool) == Some(true) {
             return;
         }
