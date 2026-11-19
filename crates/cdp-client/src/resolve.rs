@@ -289,18 +289,7 @@ pub fn loopback_url(url: &str) -> bool {
     let Ok(endpoint) = crate::net::parse_endpoint(url) else {
         return false;
     };
-    if !matches!(endpoint.scheme.as_str(), "http" | "https" | "ws" | "wss") {
-        return false;
-    }
-    let host = endpoint.host.to_ascii_lowercase();
-    host == "localhost" || host == "::1" || ipv4_loopback(&host)
-}
-
-fn ipv4_loopback(host: &str) -> bool {
-    let parts: Vec<&str> = host.split('.').collect();
-    parts.len() == 4
-        && parts.iter().all(|part| part.parse::<u8>().is_ok())
-        && parts[0].parse::<u8>() == Ok(127)
+    matches!(endpoint.scheme.as_str(), "http" | "https" | "ws" | "wss") && crate::ports::local_host(&endpoint.host)
 }
 
 pub fn suggest<'a>(token: &str, known: &[&'a str]) -> Option<&'a str> {
@@ -505,12 +494,22 @@ mod tests {
             "http://127.0.0.1.evil.example:9300/",
             "http://0x7f.0.0.1:9300/",
             "http://evil.example/127.0.0.1",
+            "http://evil.localhost:9300/json/version",
+            "ws://foo.localhost:9300/devtools/browser/x",
+            "http://127.000.0.1:9300/",
         ] {
             assert!(!loopback_url(odd), "{odd}");
             let saved = format!(r#"{{"endpoint":"{odd}","provenance":"explicit"}}"#);
             assert_eq!(saved_from_json(Some(&saved), &mut live, &mut trail), None, "{odd}");
         }
         assert!(loopback_url("http://user@127.0.0.1:9300/json/version"));
+        for host in ["localhost", "LOCALHOST", "127.0.0.1", "127.8.9.10", "[::1]", "0.0.0.0", "[::]", "[::ffff:127.0.0.1]", "evil.localhost", "foo.localhost", "localhost.", "127.0.0.1.", "0x7f.0.0.1", "203.0.113.9"] {
+            assert_eq!(
+                loopback_url(&format!("http://{host}:9300/json/version")),
+                crate::ports::local_host(host),
+                "{host}"
+            );
+        }
     }
 
     #[test]

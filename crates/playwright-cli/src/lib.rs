@@ -204,6 +204,13 @@ mod tests {
             assert!(output.stderr.contains("returned ws://203.0.113.9:9223/devtools/browser/x, a host other than this machine; refusing to dial it"), "{via}: {}", output.stderr);
         }
         assert_eq!(foreign_hits.load(std::sync::atomic::Ordering::SeqCst), count);
+        let (named, named_hits) = discovery_answering(|port| format!("ws://evil.localhost:{port}/devtools/browser/x"));
+        launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = Some(Listed { probe: Some(named), ..Listed::default() }));
+        let output = execute(&["tab-list".to_string()], None);
+        launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("a host other than this machine; refusing to dial it"), "{}", output.stderr);
+        assert_eq!(named_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         let (local, local_hits) = discovery_answering(|port| format!("ws://[::1]:{port}/devtools/browser/x"));
         launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = Some(Listed { probe: Some(local), ..Listed::default() }));
         let output = execute(&["tab-list".to_string()], None);

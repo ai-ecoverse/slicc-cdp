@@ -296,6 +296,8 @@ mod tests {
             ("http://localhost:9300/json/version", "ws://[::1]:9300/devtools/browser/a"),
             ("http://[::1]:9300/json/version", "wss://127.0.0.1:9300/devtools/browser/a"),
             ("http://0.0.0.0:9300/json/version", "ws://127.0.0.1:9300/devtools/browser/a"),
+            ("http://LOCALHOST:9300/json/version", "ws://LocalHost:9300/devtools/browser/a"),
+            ("http://evil.localhost:9300/json/version", "ws://EVIL.localhost:9300/devtools/browser/a"),
             ("https://cdp.example:9444/json/version", "wss://CDP.example:9445/devtools/browser/a"),
         ] {
             assert_eq!(checked_socket(discovery, socket), Ok(()), "{discovery} {socket}");
@@ -304,6 +306,10 @@ mod tests {
             ("http://127.0.0.1:9300/json/version", "ws://203.0.113.9:9223/devtools/browser/a", "a host other than this machine"),
             ("http://127.0.0.1:9300/json/version", "ws://127.0.0.1@evil.example:9300/x", "a host other than this machine"),
             ("http://localhost:9300/json/version", "ws://attacker.example/devtools/browser/a", "a host other than this machine"),
+            ("http://127.0.0.1:9300/json/version", "ws://evil.localhost:9300/devtools/browser/a", "a host other than this machine"),
+            ("http://localhost:9300/json/version", "ws://foo.localhost:9300/devtools/browser/a", "a host other than this machine"),
+            ("http://evil.localhost:9300/json/version", "ws://127.0.0.1:9300/devtools/browser/a", "a host other than the one asked"),
+            ("http://foo.localhost:9300/json/version", "ws://bar.localhost:9300/devtools/browser/a", "a host other than the one asked"),
             ("https://cdp.example:9444/json/version", "wss://other.example:9444/devtools/browser/a", "a host other than the one asked"),
             ("https://cdp.example:9444/json/version", "ws://127.0.0.1:9222/devtools/browser/a", "a host other than the one asked"),
             ("http://127.0.0.1:9300/json/version", "http://127.0.0.1:9300/devtools/browser/a", "not a ws:// or wss:// URL"),
