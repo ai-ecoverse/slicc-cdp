@@ -2386,7 +2386,9 @@ mod tests {
                     &seven,
                     |current| current.is_none(),
                 );
-            let session = pending.then(|| client::attach(&mut cdp, &tab).unwrap());
+            let attached = pending.then(|| client::attach(&mut cdp, &tab));
+            let unanswered = matches!(&attached, Some(Err(error)) if error.starts_with(client::UNANSWERED) && error.ends_with(" timed out\n"));
+            let session = if unanswered { None } else { attached.map(Result::unwrap) };
             let proxy_evidence: Value = serde_json::from_slice(
                 &crate::net::http_probe(&evidence_url, "application/json")
                     .unwrap_or_else(|error| panic!("guard evidence unavailable: {error}"))
@@ -2395,6 +2397,7 @@ mod tests {
             .unwrap();
             let replies = proxy_evidence["window_replies"].as_array().unwrap();
             let produced = pending
+                && session.is_some()
                 && replies.len() == window_reply_count + 1
                 && replies.last().is_some_and(|reply| {
                     reply["error"]["message"]
@@ -2419,7 +2422,7 @@ mod tests {
                 || !seven_commits.is_empty()
                 || !proxy_evidence["seven_commits"].as_array().unwrap().is_empty();
             let evidence = format!(
-                "pending_window_produced={produced}; pending_before_attach={pending}; js_redirect_committed={committed}; tab={tab}; trigger={trigger:?}; fixture_hits(/code,/dump)={hits:?}; seven_commits={seven_commits:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+                "pending_window_produced={produced}; pending_before_attach={pending}; js_redirect_committed={committed}; attach_unanswered={unanswered}; tab={tab}; trigger={trigger:?}; fixture_hits(/code,/dump)={hits:?}; seven_commits={seven_commits:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
                 cdp.events(), cdp.paused_trail
             );
             if bypass || !produced {

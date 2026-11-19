@@ -174,6 +174,16 @@ async function waitForShim(raw, session, timeout = 15000) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function until(read, ms, what) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const value = await read();
+    if (value) return value;
+    assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+    await sleep(50);
+  }
+}
 const changed = (frameId) => (line) => line.event === 'tools-changed' && line.frameId === frameId;
 const names = (event) => event.tools.map((tool) => tool.name);
 
@@ -586,8 +596,12 @@ const late = ${tool('cross_late')};
 const awaitShim = ${awaitShim ? 'true' : 'false'};
 if (awaitShim) {
   void (async () => {
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const deadline = Date.now() + 30000;
+    while (!document.modelContext && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     document.modelContext?.registerTool(early);
+    window.earlyRegistered = Boolean(document.modelContext);
   })();
 } else if (document.modelContext) {
   document.modelContext.registerTool(early);
@@ -675,6 +689,25 @@ if (document.modelContext) document.modelContext.registerTool(${tool('initial')}
     await raw.send('Target.detachFromTarget', { sessionId: childSession });
     const ready = held.next((line) => line.event === 'document-ready', held.lines.length);
     await Promise.all([navigate(raw, sessionId, `${ordinary}/lazy?reload=1`), ready]);
+    const reloadedChild = await until(
+      async () =>
+        (await raw.send('Target.getTargets', {})).targetInfos.find(
+          (target) =>
+            target.type === 'iframe' &&
+            target.url === `https://foreign.test:${port}/cross-lazy?await=1`
+        ),
+      15000,
+      'reloaded lazy OOPIF'
+    );
+    const reloadedSession = (
+      await raw.send('Target.attachToTarget', { targetId: reloadedChild.targetId, flatten: true })
+    ).sessionId;
+    await until(
+      () => evaluate(raw, reloadedSession, 'window.earlyRegistered === true'),
+      30000,
+      'cross_early registration after the reloaded child shim installed'
+    );
+    await raw.send('Target.detachFromTarget', { sessionId: reloadedSession });
     const reloaded = await listUntil(
       wire.url,
       cwd,
