@@ -641,15 +641,6 @@ impl Cdp {
             self.admit_for(method, &params, session_id, holder_debugger, left)?;
             return self.create_target(params, timeout);
         }
-        if method == "Page.getCookies" {
-            let urls = params.get("urls").cloned().unwrap_or(Value::Null);
-            let rewritten = if urls.is_null() {
-                ("Network.getCookies", json!({}))
-            } else {
-                ("Network.getCookies", json!({ "urls": urls }))
-            };
-            return self.call_guarded_for(rewritten.0, rewritten.1, session_id, timeout, holder_debugger, retry_opt_in);
-        }
         let mut checks = self.page_scope_admit_prepare(method, std::slice::from_ref(&params), &params, session_id, timeout, holder_debugger, retry_opt_in)?;
         #[cfg(test)]
         self.runtime_stage(method, "pin");

@@ -67,6 +67,83 @@ fn credential_cookie_readers_drop_idp_cookies_on_every_route_and_keep_ordinary_o
 }
 
 #[test]
+fn page_get_cookies_forwards_unchanged_and_preserves_unsupported_method_errors() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Recording {
+        inbox: VecDeque<String>,
+        sent: Rc<RefCell<Vec<Value>>>,
+        reply: Value,
+    }
+
+    impl Transport for Recording {
+        fn send_text(&mut self, text: &str) -> Result<(), String> {
+            let message: Value = serde_json::from_str(text).unwrap();
+            self.sent.borrow_mut().push(message.clone());
+            let mut reply = self.reply.clone();
+            reply["id"] = message["id"].clone();
+            if let Some(session) = message.get("sessionId") {
+                reply["sessionId"] = session.clone();
+            }
+            self.inbox.push_back(reply.to_string());
+            Ok(())
+        }
+
+        fn recv_text(&mut self, _: Instant) -> Result<Option<String>, String> {
+            Ok(self.inbox.pop_front())
+        }
+    }
+
+    let urls = json!([format!("{IDP}/ims/authorize"), "https://example.test/"]);
+    let params = json!({"urls": urls.clone()});
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut unsupported = Cdp::from_transport(Box::new(Recording {
+        inbox: VecDeque::new(),
+        sent: Rc::clone(&sent),
+        reply: json!({"error":{"code":-32601,"message":"'Page.getCookies' wasn't found"}}),
+    }));
+    unsupported.fixture_session("S");
+    let err = unsupported
+        .call("Page.getCookies", params.clone(), Some("S"))
+        .unwrap_err();
+    assert!(
+        err.starts_with("Page.getCookies: 'Page.getCookies' wasn't found"),
+        "unsupported-method error must keep the original method name: {err}"
+    );
+    assert!(err.contains("-32601") || err.contains("wasn't found"), "{err}");
+    let wire = sent.borrow().clone();
+    assert_eq!(wire.len(), 1, "{wire:?}");
+    assert_eq!(wire[0]["method"], "Page.getCookies", "{wire:?}");
+    assert_eq!(wire[0]["params"]["urls"], urls, "{wire:?}");
+    assert_eq!(wire[0]["sessionId"], "S", "{wire:?}");
+    assert_ne!(wire[0]["method"], "Network.getCookies", "{wire:?}");
+
+    sent.borrow_mut().clear();
+    let mut supported = Cdp::from_transport(Box::new(Recording {
+        inbox: VecDeque::new(),
+        sent: Rc::clone(&sent),
+        reply: json!({"result":{"cookies":credential_jar()}}),
+    }));
+    supported.fixture_session("S");
+    let result = supported
+        .call("Page.getCookies", params.clone(), Some("S"))
+        .unwrap();
+    let text = result.to_string();
+    for secret in ["IDP_HOST_SECRET", "IDP_DOTTED_SECRET", "IDP_PARENT_SECRET", "IDP_STAGE_SECRET", "IDP_PARTITION_SECRET"] {
+        assert!(!text.contains(secret), "supported Page.getCookies leaked {secret}: {text}");
+    }
+    for kept in ["ORDINARY_KEPT", "ADOBE_PARENT_KEPT"] {
+        assert!(text.contains(kept), "supported Page.getCookies dropped {kept}: {text}");
+    }
+    let wire = sent.borrow().clone();
+    assert_eq!(wire.len(), 1, "{wire:?}");
+    assert_eq!(wire[0]["method"], "Page.getCookies", "{wire:?}");
+    assert_eq!(wire[0]["params"], params, "{wire:?}");
+    assert_eq!(wire[0]["sessionId"], "S", "{wire:?}");
+}
+
+#[test]
 fn credential_cookie_writes_are_refused_with_the_catalog_refusal() {
     let refusal = credential_refusal();
     for (method, params) in [
@@ -798,104 +875,6 @@ fn cookies_seen_only_in_extra_info_still_scrub_console_and_header_values_on_the_
         assert!(!after.contains(secret), "{domain}: {after}");
         assert!(after.contains("https://shop.example.test/next") && after.contains("[redacted]"), "{domain}: {after}");
     }
-}
-
-struct Chrome158JarBackend {
-    inbox: VecDeque<String>,
-    jar: Value,
-    seen: std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>,
-}
-
-impl Transport for Chrome158JarBackend {
-    fn send_text(&mut self, text: &str) -> Result<(), String> {
-        let message: Value = serde_json::from_str(text).unwrap();
-        let method = message["method"].as_str().unwrap().to_string();
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-        self.seen.borrow_mut().push((method.clone(), params));
-        let result = match method.as_str() {
-            "Network.getAllCookies" | "Network.getCookies" | "Storage.getCookies" => json!({"cookies": self.jar}),
-            "Page.getCookies" => json!({"cookies": []}),
-            _ => json!({}),
-        };
-        self.inbox.push_back(json!({"id": message["id"], "result": result}).to_string());
-        Ok(())
-    }
-    fn recv_text(&mut self, _: Instant) -> Result<Option<String>, String> {
-        Ok(self.inbox.pop_front())
-    }
-}
-
-fn rewrite_jar() -> Value {
-    let mut cookies = credential_jar().as_array().unwrap().clone();
-    cookies.push(json!({"name":"seven","value":"SEVEN_PROTECTED_SECRET","domain":"seven.sliccy.ai","path":"/"}));
-    Value::Array(cookies)
-}
-
-fn chrome158_jar_backend(seen: std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>) -> Cdp {
-    let mut cdp = Cdp::from_transport(Box::new(Chrome158JarBackend {
-        inbox: VecDeque::new(),
-        jar: rewrite_jar(),
-        seen,
-    }));
-    cdp.fixture_session("S");
-    cdp
-}
-
-fn assert_filtered_jar(result: &Value, row: &str) {
-    let text = result.to_string();
-    for secret in [
-        "IDP_HOST_SECRET",
-        "IDP_DOTTED_SECRET",
-        "IDP_PARENT_SECRET",
-        "IDP_STAGE_SECRET",
-        "IDP_PARTITION_SECRET",
-        "SEVEN_PROTECTED_SECRET",
-    ] {
-        assert!(!text.contains(secret), "{row} leaked {secret}: {text}");
-    }
-    assert!(text.contains("ORDINARY_KEPT"), "{row} dropped ORDINARY_KEPT: {text}");
-}
-
-#[test]
-fn page_get_cookies_rewrite_answers_the_filtered_network_jar() {
-    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let mut cdp = chrome158_jar_backend(seen.clone());
-    let result = cdp.call("Page.getCookies", json!({}), Some("S")).unwrap();
-    assert_filtered_jar(&result, "page_get_cookies_rewrite empty urls");
-    let wire = seen.borrow().clone();
-    assert!(
-        wire.iter().any(|(method, params)| method == "Network.getCookies" && params.as_object().is_some_and(|map| map.is_empty())),
-        "Page.getCookies must rewrite to Network.getCookies {{}}: {wire:?}"
-    );
-    assert!(
-        !wire.iter().any(|(method, _)| method == "Page.getCookies"),
-        "Page.getCookies must not reach the wire: {wire:?}"
-    );
-    let network = cdp.call("Network.getCookies", json!({}), Some("S")).unwrap();
-    assert_eq!(result, network, "rewritten Page.getCookies must match Network.getCookies filter");
-}
-
-#[test]
-fn page_get_cookies_urls_rewrite_withholds_credential_cookies_like_network_get_cookies() {
-    let urls = json!(["https://adobelogin.com/", "https://auth.adobelogin.com/", "https://example.test/"]);
-    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let mut cdp = chrome158_jar_backend(seen.clone());
-    let page = cdp.call("Page.getCookies", json!({"urls": urls.clone()}), Some("S")).unwrap();
-    assert_filtered_jar(&page, "page_get_cookies_urls_rewrite");
-    let wire = seen.borrow().clone();
-    assert!(
-        wire.iter().any(|(method, params)| {
-            method == "Network.getCookies" && params.get("urls") == Some(&urls)
-        }),
-        "Page.getCookies urls must rewrite to Network.getCookies with the same urls: {wire:?}"
-    );
-    assert!(
-        !wire.iter().any(|(method, _)| method == "Page.getCookies"),
-        "Page.getCookies must not reach the wire: {wire:?}"
-    );
-    let network = cdp.call("Network.getCookies", json!({"urls": urls}), Some("S")).unwrap();
-    assert_eq!(page, network, "rewritten Page.getCookies urls must match Network.getCookies filter");
-    assert!(!page.to_string().contains("IDP_PARENT_SECRET"), "parent-of-IdP urls must still withhold Domain=.adobelogin.com");
 }
 
 fn cookie_header_name(name: &str) -> bool {
