@@ -62,3 +62,21 @@ test('the Rust catalog protectedOrigins equals the installed npm catalog', async
     'the guard and its vectors must use identical protection rules'
   );
 });
+
+test('the CLI catalog excludes the retired WebMCP verbs', () => {
+  const binary = path.join(
+    root,
+    'target/debug',
+    process.platform === 'win32' ? 'playwright-cli.exe' : 'playwright-cli'
+  );
+  const help = execFileSync(binary, ['--help'], { encoding: 'utf8', timeout: 10000 });
+  assert.match(help, /eval-attach/);
+  assert.match(help, /eval-detach/);
+  assert.doesNotMatch(help, /webmcp-(?:polyfill|list|call)/);
+  for (const verb of ['webmcp-polyfill', 'webmcp-list', 'webmcp-call']) {
+    assert.throws(
+      () => execFileSync(binary, [verb], { encoding: 'utf8', timeout: 10000, stdio: 'pipe' }),
+      /Unknown command/
+    );
+  }
+});

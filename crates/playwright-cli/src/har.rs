@@ -200,7 +200,6 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     let mut latest = session::load_in(state.session_name.as_deref(), state.cwd.as_deref());
     latest.endpoint = state.endpoint.clone();
     latest.provenance = state.provenance.clone();
-    latest.webmcp_connection = state.webmcp_connection.clone();
     latest.current = Some(target.clone());
     if alias {
         session::note_owned(&mut latest, &target);
@@ -299,7 +298,7 @@ impl Holder {
     fn run(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str, url: Option<&str>) -> Result<(), String> {
         self.beat()?;
         if let Err(message) = self.checkpoint(cdp) { clear(&self.files, &self.id); return Err(message) }
-        let mut input = crate::webmcp_polyfill::input()?;
+        let mut input = crate::holder_input::input()?;
         emit(self.status("ready"))?;
         if self.paused { emit(self.status("paused"))?; }
         let watched = (|| {
@@ -330,7 +329,7 @@ impl Holder {
         known.then(|| text(frame, "loaderId").to_string())
     }
 
-    fn watch(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str, input: &mut crate::webmcp_polyfill::Input) -> Result<String, String> {
+    fn watch(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str, input: &mut crate::holder_input::Input) -> Result<String, String> {
         let mut beat = Instant::now();
         let mut retry = Instant::now();
         loop {

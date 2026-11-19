@@ -24,10 +24,6 @@ name = "document-validation"
 path = "../../test/integration/document-validation.rs"
 
 [[test]]
-name = "webmcp-stage1"
-path = "../../test/integration/webmcp-stage1.rs"
-
-[[test]]
 name = "guard-domain-premise"
 path = "../../test/integration/guard-domain-premise.rs"
 
@@ -36,7 +32,6 @@ name = "browsers-discovery-cache"
 path = "../../test/integration/browsers-discovery-cache.rs"
 
 [dependencies]
-getrandom = "0.4"
 serde_json = "1"
 slicc-browsers = { version = "=1.28.0", features = ["serde"] }
 url = "2.5"

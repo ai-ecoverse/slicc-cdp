@@ -560,9 +560,9 @@ fn page_scope_prepare_retry_stays_off_for_holder_and_paused_paths() {
     let (cdp, session, _) = client(0, None, false);
     assert!(cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session)));
     let mut cdp = cdp;
-    cdp.webmcp.paused.insert(session.clone());
+    cdp.eval_early.arms.entry(session.clone()).or_default().paused = Some(("CONTEXT".into(), Instant::now() + Duration::from_secs(1)));
     assert!(!cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session)));
-    cdp.webmcp.paused.clear();
+    cdp.eval_early.arms.clear();
     cdp.paused_documents.insert((session.clone(), "REQ".into()));
     assert!(!cdp.page_scope_prepare_retry_allowed("DOM.describeNode", Some(&session)));
 }
@@ -625,7 +625,7 @@ fn call_for_does_not_retry_a_changing_page() {
 #[test]
 fn a_holder_pause_evaluate_runs_one_page_check_attempt() {
     let (mut cdp, session, browser) = client(u32::MAX, None, false);
-    cdp.webmcp.paused.insert(session.clone());
+    cdp.eval_early.arms.entry(session.clone()).or_default().paused = Some(("CONTEXT".into(), Instant::now() + Duration::from_secs(1)));
     let start = Instant::now();
     let message = cdp.call_for(
         "DOM.describeNode",
@@ -806,7 +806,7 @@ fn a_batch_navigation_after_the_first_request_refuses_without_retry() {
 #[test]
 fn a_batch_under_a_held_holder_pause_does_not_retry() {
     let (mut cdp, session, browser) = batch_client(u32::MAX, None);
-    cdp.webmcp.paused.insert(session.clone());
+    cdp.eval_early.arms.entry(session.clone()).or_default().paused = Some(("CONTEXT".into(), Instant::now() + Duration::from_secs(1)));
     let message = cdp.call_batch("DOM.describeNode", describe_batch(), Some(&session)).unwrap_err();
     assert_eq!(message, PAGE_CHANGED);
     assert_eq!(browser.borrow().inventories, 1);

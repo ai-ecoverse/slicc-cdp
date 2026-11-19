@@ -95,7 +95,7 @@ impl Holder<'_> {
     }
 
     fn run(&mut self, cdp: &mut Cdp, lease: &AttachmentLease) -> Result<String, String> {
-        let mut input = crate::webmcp_polyfill::input()?;
+        let mut input = crate::holder_input::input()?;
         emit(json!({"event":"ready","attachmentId":self.id,"world":self.world,"early":self.early}))?;
         let mut discovery = Instant::now() - Duration::from_millis(250);
         loop {

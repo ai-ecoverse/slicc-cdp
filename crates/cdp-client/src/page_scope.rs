@@ -52,10 +52,6 @@ impl Cdp {
         self.page_scope_state(session, false, None)
     }
 
-    pub(super) fn verify_runtime_page_scope_state(&mut self, session: Option<&str>) -> Result<((String, u64, u64), DocumentState), String> {
-        self.page_scope_state(session, true, None)
-    }
-
     pub(super) fn verify_page_scope_state_until(&mut self, session: Option<&str>, until: Instant) -> Result<((String, u64, u64), DocumentState), String> {
         self.page_scope_state(session, false, Some(until))
     }

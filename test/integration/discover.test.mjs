@@ -347,6 +347,7 @@ test('playwright-cli discover --once', { timeout: 60_000 }, async (t) => {
       const webmcp = events.find((e) => e.standard === 'webmcp');
       assert.ok(webmcp, `webmcp: ${result.stdout}`);
       assert.equal(webmcp.via, 'page-api');
+      assert.doesNotMatch(JSON.stringify(webmcp), /webmcp-(?:polyfill|list|call)/);
       assert.ok(webmcp.summary.tools.length > 0);
     });
 
@@ -451,6 +452,7 @@ if (document.modelContext && document.modelContext.registerTool) {
         const webmcp = events.find((e) => e.standard === 'webmcp');
         assert.ok(webmcp, `webmcp event expected: ${result.stdout}`);
         assert.equal(webmcp.via, 'page-api');
+        assert.doesNotMatch(JSON.stringify(webmcp), /webmcp-(?:polyfill|list|call)/);
         assert.ok(webmcp.summary.tools.length > 0);
         const wellKnown = events.filter((e) => e.via === 'well-known');
         assert.equal(wellKnown.length, 0, `no well-known request expected: ${result.stdout}`);
@@ -922,7 +924,10 @@ Object.defineProperty(document, 'modelContext', {
         const cwd = await runner.fresh();
         await runner.clearSession(cwd);
         await runner.playwright(['open', `${escOrigin}/`], cwd);
-        const result = await runner.playwright(['webmcp-call', 'evil-eval', '{}'], cwd);
+        const result = await runner.playwright(
+          ['eval', "document.modelContext.executeTool('evil-eval', {})"],
+          cwd
+        );
         assert.equal(result.code, 1);
         const raw = Buffer.from(result.stderr, 'utf8');
         for (let i = 0; i < raw.length; i++) {

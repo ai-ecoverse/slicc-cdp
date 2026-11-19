@@ -142,10 +142,6 @@ pub fn dialed_from_version(body: &str, runtime: Option<&str>) -> Result<String, 
     Ok(append_runtime(&websocket_url_from_version(body)?, runtime))
 }
 
-pub fn webmcp_connection_key(dialed_socket: &str) -> String {
-    crate::hash::sha256_hex(dialed_socket.as_bytes())
-}
-
 fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
@@ -285,17 +281,5 @@ mod tests {
         let from_discover = dialed_from_version(&body, None).unwrap();
         let from_direct = append_runtime(dialed, None);
         assert_eq!(from_discover, from_direct);
-        assert_eq!(
-            webmcp_connection_key(&from_discover),
-            webmcp_connection_key(&from_direct)
-        );
-        assert_ne!(
-            webmcp_connection_key("http://127.0.0.1:9222/json/version"),
-            webmcp_connection_key(&from_direct)
-        );
-        assert_ne!(
-            webmcp_connection_key("ws://127.0.0.1:9222/devtools/browser/other"),
-            webmcp_connection_key(&from_direct)
-        );
     }
 }

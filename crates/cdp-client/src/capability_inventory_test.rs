@@ -20,7 +20,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         "Target.activateTarget", "Target.attachToTarget", "Target.closeTarget", "Target.createTarget",
         "Target.detachFromTarget", "Target.getTargetInfo", "Target.getTargets",
     ]);
-    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Network.loadNetworkResource", "Inspector.enable", "Target.setAutoAttach", "Runtime.runIfWaitingForDebugger"]);
+    let internal = set(&["Browser.getVersion", "Slicc.action", "Fetch.enable", "Fetch.disable", "Network.setBypassServiceWorker", "Inspector.enable", "Target.setAutoAttach", "Runtime.runIfWaitingForDebugger"]);
     let debugger_control = set(&["Debugger.pause"]);
     let debugger_persistent = set(&["Debugger.enable", "Debugger.setInstrumentationBreakpoint"]);
     let window = set(&["Browser.getWindowForTarget", "Browser.setWindowBounds"]);
@@ -28,7 +28,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     let inventory = [&document, &observation, &request, &origin, &target, &internal, &debugger_control, &debugger_persistent, &window, &network_state];
     for (method, _, place) in sent().into_iter().filter(|(_, _, place)| !place.contains("_test.rs") && !place.contains("/raw.rs") && !place.contains("/race.rs")) {
         if debugger_persistent.contains(&method) || debugger_control.contains(&method) {
-            assert!(place.starts_with("crates/cdp-client/src/webmcp_guard.rs:") || place.starts_with("crates/cdp-client/src/eval_early.rs:"), "persistent debugger capability widened at {place}");
+            assert!(place.starts_with("crates/cdp-client/src/eval_early.rs:"), "persistent debugger capability widened at {place}");
         }
     }
     let mut methods: BTreeSet<String> = sent().into_iter()
@@ -41,9 +41,10 @@ fn production_cdp_methods_have_a_lifetime_classification() {
     for method in &methods {
         assert_eq!(inventory.iter().filter(|class| class.contains(method)).count(), 1, "unclassified or ambiguous method: {method}");
         if debugger_control.contains(method) {
-            let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();
-            assert!(source.contains("fn webmcp_handle_instrumentation"));
-            assert!(source.contains("arm.identifier.is_some() && arm.conversion.is_none()"));
+            let source = fs::read_to_string(root().join("crates/cdp-client/src/eval_early.rs")).unwrap();
+            assert!(source.contains("arm.conversion = Some((unique, until))"));
+            assert!(source.contains("arm.first_scripts.get(unique).map(String::as_str) == script"));
+            assert!(source.contains("location.as_ref() == value.pointer(\"/params/callFrames/0/location\")"));
             assert!(!source.contains("call_for(\"Debugger.pause\""));
         }
         if method == "Runtime.compileScript" {
@@ -54,11 +55,6 @@ fn production_cdp_methods_have_a_lifetime_classification() {
         }
         if crate::shield::persistent_capability(method) {
             if debugger_persistent.contains(method) {
-                let source = fs::read_to_string(root().join("crates/cdp-client/src/webmcp_guard.rs")).unwrap();
-                assert!(source.contains("vetted_source(SHIM)?"));
-                assert!(source.contains("sha256_hex(source.as_bytes()) != SHIM_HASH"));
-                assert!(source.contains("webmcp_verify_pause") && source.contains("uniqueContextId"));
-                assert!(!source.contains("Page.addScriptToEvaluateOnNewDocument") && !source.contains("Debugger.evaluateOnCallFrame") && !source.contains("Debugger.getScriptSource"));
                 let guard = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
                 assert!(guard.contains("self.verify_page_scope(session_id)?;"));
                 assert!(guard.contains("debugger_lifetime(method) != Some(DebuggerLifetime::Persistent)"));

@@ -75,10 +75,6 @@ export const CHROME_FILES = new Set(
     'snapshot-golden',
     'snapshot-oopif-chrome',
     'storage-chrome',
-    'webmcp-polyfill-chrome',
-    'webmcp-toolchange-chrome',
-    'webmcp-unavailable',
-    'webmcp',
   ].map((name) => path.join(directory, `${name}.test.mjs`))
 );
 

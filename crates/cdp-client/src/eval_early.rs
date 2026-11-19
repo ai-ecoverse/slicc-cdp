@@ -19,7 +19,7 @@ pub(super) struct Arm {
     pending: BTreeMap<String, Instant>,
     conversion: Option<(String, Instant)>,
     conversion_location: Option<Value>,
-    paused: Option<(String, Instant)>,
+    pub(super) paused: Option<(String, Instant)>,
     evaluating: Option<String>,
 }
 
@@ -61,6 +61,10 @@ impl Cdp {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn eval_attach_early_holding(&self, session: &str) -> bool {
+        self.eval_early.arms.get(session).is_some_and(|arm| arm.paused.is_some() || arm.conversion.is_some())
     }
 
     pub fn eval_attach_early_paused(&self, session: &str, unique: &str) -> bool {

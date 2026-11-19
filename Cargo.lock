@@ -652,7 +652,6 @@ dependencies = [
 name = "slicc-cdp-client"
 version = "0.0.0"
 dependencies = [
- "getrandom",
  "libc",
  "native-tls",
  "openssl",

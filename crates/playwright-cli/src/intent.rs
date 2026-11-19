@@ -13,7 +13,6 @@ const PAGE_COMMANDS: &[&str] = &[
     "open", "tab-new", "goto", "navigate", "go-back", "go-forward", "reload", "click", "dblclick", "fill", "type", "press",
     "keydown", "keyup", "hover", "select", "check", "uncheck", "upload", "drag", "drop", "mousemove", "mousedown", "mouseup",
     "mousewheel", "eval", "eval-file", "snapshot", "screenshot", "pdf", "resize", "highlight", "generate-locator", "fetch",
-    "webmcp-call",
 ];
 
 pub fn acts_on_page(command: &str) -> bool {

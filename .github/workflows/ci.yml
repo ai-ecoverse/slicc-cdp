@@ -91,11 +91,6 @@ jobs:
         **/snapshot-review.test.*
         **/storage*.test.*
         **/upgrade.test.*
-        **/webmcp-polyfill-*.test.*
-        **/webmcp-shim.test.*
-        **/webmcp-toolchange-*.test.*
-        **/webmcp-unavailable-fake.test.*
-        **/webmcp.test.*
         **/x1-audit.test.*
       shards: 8
       timeout-minutes: 30
@@ -108,7 +103,7 @@ jobs:
         There is no certification after you: once this pull request passes the merge queue, semantic-release publishes it to npm from `main`, then the crates and the signed binaries follow. Seven ships `playwright-cli` and `curlwright` in its base set, and every repository's CI on slicc-shared-web's pipeline installs Chrome with the latest `slicc-cdp install-browser`. Review it as the last check before it ships.
 
         Look for real defects, in this order:
-        1. The guard: seven's origins, the vault, browser pages, extensions and local files stay out of reach in every path (tabs, frames, redirects, popups, `Fetch`, cookies, headers, console, saved sessions, WebMCP), protected cookies and their values never leak, and a refusal fails closed. Check the Rust guard in `crates/cdp-client` and the Node client in `src/` both.
+        1. The guard: seven's origins, the vault, browser pages, extensions and local files stay out of reach in every path (tabs, frames, redirects, popups, `Fetch`, cookies, headers, console, saved sessions, eval attachments), protected cookies and their values never leak, and a refusal fails closed. Check the Rust guard in `crates/cdp-client` and the Node client in `src/` both.
         2. Connecting: `--cdp`, then `SLICC_CDP_URL`, then a seven-profiles port, then a loopback session in the user config dir; a cwd session file is ignored, saved state never dials a remote host, probes and launch stay on 9222 to 9229, `ws`/`wss` dial and `http` discovers, a non-2xx exits non-zero, and the wasm builds use 9222 and have no TLS.
         3. Compatibility for consumers: Microsoft playwright-cli's commands, flags and output for what we claim to match, curl's for curlwright, the public Node entry and its types, the crates' public API, `install.sh` and the release asset names, and `slicc.commands` in `package.json`.
         4. Correctness of CDP use: flat sessions with a top-level `sessionId`, no `/devtools/page/<id>` socket, races between targets, sessions and events, and promises or reads that never end.
