@@ -217,6 +217,7 @@ export const runCapabilities = {
   inboundDelay: true,
   forwardAudit: true,
   closeProtected: true,
+  errorFrameClass: true,
 };
 
 export function declaredCapabilityNames(capabilities = runCapabilities) {
