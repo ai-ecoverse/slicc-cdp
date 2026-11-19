@@ -80,7 +80,7 @@ fn production_cdp_methods_have_a_lifetime_classification() {
                 let guard = fs::read_to_string(root().join("crates/cdp-client/src/cdp.rs")).unwrap();
                 let source = fs::read_to_string(root().join("crates/cdp-client/src/window.rs")).unwrap();
                 assert!(guard.contains("if method == \"Browser.setWindowBounds\" {\n            self.admit_window(params, session_id)?;"));
-                assert!(source.contains("fn admit_window") && source.contains("self.info_protected(info, &infos)"));
+                assert!(source.contains("fn admit_window") && source.contains("self.blocked.contains(session) || self.protected_targets.contains(&target)") && source.contains("!= Some(window)"));
                 continue;
             }
             if network_state.contains(method) {

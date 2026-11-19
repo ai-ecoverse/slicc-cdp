@@ -292,11 +292,14 @@ async function flow(runner, raw, port) {
   );
   const seven = await raw.open('http://seven.sliccy.ai/frame?k=TAB_SECRET');
   try {
-    const refused = await pw(['resize', '800', '600']);
-    assert.equal(refused.code, 1);
-    assert.match(refused.stderr, /refused/);
-    assert.doesNotMatch(refused.stderr, /TAB_SECRET/);
-    assert.deepEqual(await value('[innerWidth, innerHeight]'), [1000, 700]);
+    const beside = await pw(['resize', '800', '600']);
+    assert.equal(beside.code, 0, beside.stderr);
+    assert.doesNotMatch(beside.stdout + beside.stderr, /TAB_SECRET/);
+    await until(
+      () => value('[innerWidth, innerHeight]'),
+      (size) => size[0] === 800 && size[1] === 600,
+      'viewport resized beside seven'
+    );
   } finally {
     await raw.send('Target.closeTarget', { targetId: seven });
   }

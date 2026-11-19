@@ -601,7 +601,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "Resize the browser window",
                 "",
                 "Sets the window bounds so the viewport becomes <w> by <h> CSS pixels and stays that size after the command exits.",
-                "Refused while a protected or unverified tab or frame is open in the same browser profile.",
+                "Other tabs in the window, seven's included, do not stop it. Refused when the tab itself holds a protected or unverified frame.",
             ],
             &[("<w>", "width of the browser window"), ("<h>", "height of the browser window")],
             &[],
