@@ -43,6 +43,7 @@ export const CHROME_FILES = new Set(
     'guard-d',
     'guard-extension-frame-focus',
     'guard-fail-fast',
+    'guard-isolated-world-chrome',
     'guard-native',
     'guard-persistent',
     'guard-setup-budget',
