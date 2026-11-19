@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
 import { guarded, observer } from './guard-client.mjs';
+import { browserArgs, origins } from './guard-fixture.mjs';
 import './watchdog.mjs';
 
 const MARKER = 'PROTECTED-BODY-MARKER-IW-UA';
@@ -11,29 +13,30 @@ const HEADER_VALUE = 'PROTECTED-HEADER-MARKER-IW-UA';
 const COOKIE_NAME = 'iw_ua_session';
 const COOKIE_VALUE = 'IW-UA-COOKIE-SECRET';
 
-function site() {
+async function navigate(raw, session, url) {
+  const loaded = raw.waitEvent(
+    (event) => event.method === 'Page.loadEventFired' && event.sessionId === session,
+    15000
+  );
+  await raw.send('Page.navigate', { url }, session);
+  await loaded;
+}
+
+function protectedSite() {
   const hits = [];
   const server = createServer((req, res) => {
-    const host = String(req.headers.host || '').split(':')[0];
     const url = new URL(req.url || '/', 'http://127.0.0.1');
-    if (host === 'seven.sliccy.ai' && url.pathname === '/secret') {
-      hits.push({
-        host,
-        path: url.pathname,
-        cookie: String(req.headers.cookie || ''),
-        origin: String(req.headers.origin || ''),
-      });
+    hits.push({
+      path: url.pathname,
+      cookie: String(req.headers.cookie || ''),
+      origin: String(req.headers.origin || ''),
+    });
+    if (url.pathname === '/secret') {
       res.writeHead(200, {
         'content-type': 'text/plain; charset=utf-8',
         [HEADER]: HEADER_VALUE,
-        'set-cookie': `${COOKIE_NAME}=${COOKIE_VALUE}; Path=/`,
       });
       res.end(`${MARKER}\n`);
-      return;
-    }
-    if (host === 'ordinary.test' && url.pathname === '/') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><title>ordinary</title><p>ordinary</p>');
       return;
     }
     res.writeHead(404, { 'content-type': 'text/plain' });
@@ -45,8 +48,7 @@ function site() {
       resolve({
         port,
         hits,
-        ordinary: `http://ordinary.test:${port}/`,
-        protected: `http://seven.sliccy.ai:${port}/secret`,
+        url: `http://seven.sliccy.ai:${port}/secret`,
         close: () =>
           new Promise((done) => {
             server.closeAllConnections();
@@ -176,15 +178,14 @@ function readable(probe) {
 test('Chrome: isolated world without universal access cannot read a protected cross-origin body', {
   timeout: 180000,
 }, async () => {
-  const fixture = await site();
+  const fixture = await fixtureServer();
+  const sites = origins(fixture);
+  const protectedFixture = await protectedSite();
   let browser;
   let raw;
   let client;
   try {
-    browser = await launchBrowser([
-      `--host-resolver-rules=MAP ordinary.test 127.0.0.1:${fixture.port}, MAP seven.sliccy.ai 127.0.0.1:${fixture.port}`,
-      '--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable',
-    ]);
+    browser = await launchBrowser(browserArgs());
     raw = await observer(browser.wsUrl);
     const version = await raw.send('Browser.getVersion', {});
     await raw.send('Storage.setCookies', {
@@ -200,11 +201,37 @@ test('Chrome: isolated world without universal access cannot read a protected cr
       ],
     });
 
-    client = await guarded(browser.wsUrl, 'https://fixture-protected.invalid', {
+    client = await guarded(browser.wsUrl, sites.client, {
       variant: 'prompt',
-      detachDelay: 0,
+      detachDelay: 2000,
     });
-    const { targetId } = await client.send('Target.createTarget', { url: fixture.ordinary });
+
+    const { targetId } = await raw.send('Target.createTarget', {
+      url: 'about:blank',
+      background: true,
+    });
+    const { sessionId: rawSession } = await raw.send('Target.attachToTarget', {
+      targetId,
+      flatten: true,
+    });
+    await raw.send('Page.enable', {}, rawSession);
+    const ordinaryUrl = `${sites.ordinary}/doc?n=iw-ua`;
+    await navigate(raw, rawSession, ordinaryUrl);
+    const pageState = await raw.send(
+      'Runtime.evaluate',
+      {
+        expression: '({ href: location.href, title: document.title, ready: document.readyState })',
+        returnByValue: true,
+      },
+      rawSession
+    );
+    assert.equal(
+      pageState.result?.value?.href,
+      ordinaryUrl,
+      `unguarded page URL before world create; state=${JSON.stringify(pageState.result?.value)}`
+    );
+    assert.equal(pageState.result?.value?.title, 'doc');
+
     const { sessionId } = await client.send('Target.attachToTarget', {
       targetId,
       flatten: true,
@@ -212,37 +239,31 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     for (const method of ['Page.enable', 'Runtime.enable', 'Network.enable']) {
       await client.send(method, {}, sessionId);
     }
-    await client.send('Page.navigate', { url: fixture.ordinary }, sessionId);
-    await client.waitEvent(
-      (event) =>
-        event.sessionId === sessionId &&
-        event.method === 'Page.frameNavigated' &&
-        String(event.params?.frame?.url || '').startsWith(fixture.ordinary.replace(/\/$/, '')),
-      20000
-    );
     const tree = await client.send('Page.getFrameTree', {}, sessionId);
     const frameId = tree.frameTree.frame.id;
 
     const withUaId = await createWorld(client, sessionId, frameId, 'slicc-ua-probe', true);
     const withoutUaId = await createWorld(client, sessionId, frameId, 'slicc-plain-probe', false);
 
-    const withUa = await worldProbe(client, sessionId, withUaId, fixture.protected);
-    const withoutUa = await worldProbe(client, sessionId, withoutUaId, fixture.protected);
+    const withUa = await worldProbe(client, sessionId, withUaId, protectedFixture.url);
+    const withoutUa = await worldProbe(client, sessionId, withoutUaId, protectedFixture.url);
     const mainFetch = await evaluate(
       client,
       sessionId,
-      probeExpression(fixture.protected, 'fetch')
+      probeExpression(protectedFixture.url, 'fetch')
     );
-    const mainXhr = await evaluate(client, sessionId, probeExpression(fixture.protected, 'xhr'));
+    const mainXhr = await evaluate(client, sessionId, probeExpression(protectedFixture.url, 'xhr'));
 
-    assert.equal(withUa.sameOrigin, `http://ordinary.test:${fixture.port}|ordinary`);
-    assert.equal(withoutUa.sameOrigin, `http://ordinary.test:${fixture.port}|ordinary`);
+    const expectedOrigin = `${sites.ordinary}|doc`;
+    assert.equal(withUa.sameOrigin, expectedOrigin);
+    assert.equal(withoutUa.sameOrigin, expectedOrigin);
 
     const report = {
       chromeVersion: version.product || version.userAgent || version,
-      protectedUrl: fixture.protected,
+      ordinaryUrl,
+      protectedUrl: protectedFixture.url,
       cookie: `${COOKIE_NAME}=${COOKIE_VALUE}`,
-      hits: fixture.hits,
+      hits: protectedFixture.hits,
       withGrantUniveralAccess: withUa,
       withoutGrantUniveralAccess: withoutUa,
       mainWorld: { fetch: mainFetch, xhr: mainXhr },
@@ -277,6 +298,7 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     await client?.close();
     await raw?.close();
     await browser?.close();
+    await protectedFixture.close();
     await fixture.close();
   }
 });
