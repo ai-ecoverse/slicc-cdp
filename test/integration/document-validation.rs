@@ -327,6 +327,28 @@ fn guard_created_blank_documents_have_creation_and_history_evidence() {
 }
 
 #[test]
+fn frame_scoped_calls_reach_a_guard_created_blank_but_not_an_unproven_one() {
+    for shape in ["created", "uncreated", "multiple-history", "loader-changed", "frame-changed", "child"] {
+        let (mut cdp, backend) = fixture();
+        backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
+        backend.borrow_mut().history = Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]}));
+        if shape == "multiple-history" { backend.borrow_mut().history = Some(json!({"currentIndex":1,"entries":[{"id":1,"url":"https://vault.sliccy.ai/"},{"id":2,"url":"about:blank"}]})); }
+        if shape != "uncreated" { cdp.call("Target.createTarget", json!({"url":"about:blank"}), None).unwrap(); }
+        let session = attach(&mut cdp, "T");
+        if shape == "loader-changed" { backend.borrow_mut().tree["frameTree"]["frame"]["loaderId"] = json!("OTHER"); }
+        if shape == "frame-changed" { backend.borrow_mut().tree["frameTree"]["frame"]["id"] = json!("OTHER"); }
+        if shape == "child" { backend.borrow_mut().tree["frameTree"]["childFrames"] = json!([{"frame":{"id":"CHILD","parentId":"F","loaderId":"LC","url":"https://vault.sliccy.ai/","securityOrigin":"https://vault.sliccy.ai"}}]); }
+        let from = backend.borrow().calls.len();
+        let result = cdp.call("Page.createIsolatedWorld", json!({"frameId":"F","grantUniveralAccess":true}), Some(&session));
+        let sent = backend.borrow().calls[from..].iter().any(|call| call["method"] == "Page.createIsolatedWorld");
+        if shape == "created" { result.unwrap(); assert!(sent); } else {
+            refused(result);
+            assert!(!sent, "{shape}");
+        }
+    }
+}
+
+#[test]
 fn creation_receipts_require_fresh_matching_browser_evidence_after_reconnect() {
     let (mut cdp, backend) = fixture();
     backend.borrow_mut().tree = json!({"frameTree":{"frame":{"id":"F","loaderId":"LBLANK","url":"about:blank","securityOrigin":"://"}}});
