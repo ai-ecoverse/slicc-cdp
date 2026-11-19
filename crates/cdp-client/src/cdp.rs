@@ -161,6 +161,7 @@ pub struct Cdp {
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
     checking_page_events: bool,
+    settling_attach: bool,
     pending_page_events: VecDeque<Value>,
     runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
@@ -296,6 +297,7 @@ impl Cdp {
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
             checking_page_events: false,
+            settling_attach: false,
             pending_page_events: VecDeque::new(),
             runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
@@ -617,8 +619,10 @@ impl Cdp {
         }
         let mark = self.events.len();
         let target = params.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
+        self.settling_attach = true;
         let result = self.guarded_call(method, params, session_id, timeout, holder_debugger, retry_opt_in);
         self.settle_attach_events(mark, &target, &result);
+        self.settling_attach = false;
         result
     }
 
@@ -1776,7 +1780,9 @@ impl Cdp {
                         self.cut_unresolved_session(&session);
                         return Err(self.refusal());
                     }
-                    self.note_client_target(&target);
+                    if !self.targets.get(&target).is_some_and(Self::popup_shaped) {
+                        self.note_client_target(&target);
+                    }
                 }
             }
             "Target.createBrowserContext" => {
@@ -4375,7 +4381,11 @@ impl Cdp {
     fn remember_navigation(&mut self, params: &Value, session: Option<&str>) {
         if let Some(session) = session {
             if let Some(target) = self.session_target(session) {
-                self.note_client_target(&target);
+                let owned = self.client_targets.contains(&target);
+                let popup = self.targets.get(&target).is_some_and(Self::popup_shaped);
+                if owned || !popup {
+                    self.note_client_target(&target);
+                }
             }
             if let Some(url) = params["url"].as_str().filter(|url| self.ordinary_redirect_url(url)) {
                 self.client_navigation_urls.insert(session.to_string(), url.to_string());
@@ -4714,7 +4724,10 @@ impl Cdp {
 
     fn deliver_event(&mut self, mut value: Value) {
         self.watch(&mut value);
-        if value.pointer("/params/targetInfo").is_some_and(Value::is_object) {
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        if value.pointer("/params/targetInfo").is_some_and(Value::is_object)
+            && !matches!(method, "Target.targetCreated" | "Target.targetInfoChanged" | "Target.attachedToTarget")
+        {
             value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
         }
         if value.get("sliccHide").and_then(Value::as_bool) == Some(true) {
@@ -4780,7 +4793,10 @@ impl Cdp {
             && !self.protected_body_requests.contains(&key.1) && self.client_navigation_urls.get(&key.0).is_some_and(|url| value.pointer("/params/request/url").and_then(Value::as_str) == Some(url.as_str()))).then(|| value["params"]["request"]["url"].clone());
         shield::redact_strings(&self.guard, &mut value);
         if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
-        if self.hidden(&value) {
+        let settle_guard = self.settling_attach
+            && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
+            && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
+        if self.hidden(&value) && !settle_guard {
             self.fail_seen_network(&value);
             return;
         }
