@@ -5828,7 +5828,9 @@ pub fn resolve_websocket(start: crate::connect::Start, runtime: Option<&str>) ->
                 }
             };
             let body = String::from_utf8_lossy(&response.body).to_string();
-            crate::connect::websocket_url_from_version(&body)?
+            let socket = crate::connect::websocket_url_from_version(&body)?;
+            crate::connect::checked_socket(&url, &socket)?;
+            socket
         }
     };
     Ok(crate::connect::append_runtime(&socket, runtime))

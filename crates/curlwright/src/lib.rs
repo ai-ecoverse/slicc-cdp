@@ -30,6 +30,19 @@ pub fn remove_parked_binary() {
     cdp_client::upgrade::remove_parked();
 }
 
+#[cfg(test)]
+thread_local! {
+    static FINDER: std::cell::RefCell<Option<cdp_client::resolve::Listed>> = const { std::cell::RefCell::new(None) };
+}
+
+fn host_choice(cdp: Option<&str>, env: Option<&str>) -> Result<cdp_client::resolve::Choice, String> {
+    #[cfg(test)]
+    if let Some(mut listed) = FINDER.with(|cell| cell.borrow().clone()) {
+        return connect_start(cdp, env, &mut listed);
+    }
+    connect_start(cdp, env, &mut profiles::HostFinder)
+}
+
 fn connect_start(
     cdp: Option<&str>,
     env: Option<&str>,
@@ -132,7 +145,7 @@ pub fn execute(argv: &[String], cdp_env: Option<&str>) -> Output {
     if let Some(Err(message)) = signer.as_ref().map(|signer| signer.apply(&mut request)) {
         return Output::from_stop(Stop::usage(message.trim_end()));
     }
-    let choice = match connect_start(opts.cdp.as_deref(), cdp_env, &mut profiles::HostFinder) {
+    let choice = match host_choice(opts.cdp.as_deref(), cdp_env) {
         Ok(choice) => choice,
         Err(message) => return Output::plain(message, 1),
     };
@@ -569,26 +582,67 @@ mod tests {
         assert_eq!(code, 28);
     }
 
-    struct Listed(Option<(cdp_client::resolve::Rule, String)>, Option<String>, Option<String>);
+    fn listed(attached: Option<(cdp_client::resolve::Rule, String)>, saved: Option<String>, probe: Option<String>) -> cdp_client::resolve::Listed {
+        cdp_client::resolve::Listed { attached, saved, probe }
+    }
 
-    impl cdp_client::resolve::Finder for Listed {
-        fn attached(&mut self, trail: &mut Vec<cdp_client::resolve::Step>) -> Result<Option<(cdp_client::resolve::Rule, String)>, String> {
-            if self.0.is_none() {
-                trail.push(cdp_client::resolve::Step::new(cdp_client::resolve::Rule::SliccBrowsers, "slicc not on PATH, or it failed"));
+    fn discovery_answering(socket: impl Fn(u16) -> String + Send + 'static) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if !String::from_utf8_lossy(&buf[..n]).starts_with("GET /json/version") {
+                    seen.fetch_add(1000, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = format!(r#"{{"webSocketDebuggerUrl":"{}"}}"#, socket(port));
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
             }
-            Ok(self.0.clone())
-        }
+        });
+        (format!("http://127.0.0.1:{port}/json/version"), hits)
+    }
 
-        fn saved(&mut self, _: &mut Vec<cdp_client::resolve::Step>) -> Option<String> {
-            self.1.clone()
-        }
-
-        fn probe(&mut self, trail: &mut Vec<cdp_client::resolve::Step>) -> Option<String> {
-            if self.2.is_none() {
-                trail.push(cdp_client::resolve::Step::new(cdp_client::resolve::Rule::Probe, "nothing answered on 127.0.0.1:9300-9309"));
+    #[test]
+    fn every_rule_ends_in_the_checked_dial_and_a_foreign_socket_is_refused() {
+        use cdp_client::resolve::Rule;
+        let (foreign, foreign_hits) = discovery_answering(|_| "ws://203.0.113.9:9223/devtools/browser/x".to_string());
+        let routes: Vec<(Option<&str>, Option<&str>, cdp_client::resolve::Listed, &str)> = vec![
+            (Some(foreign.as_str()), None, listed(None, None, None), "via --cdp"),
+            (None, Some(foreign.as_str()), listed(None, None, None), "via SLICC_CDP_URL"),
+            (None, None, listed(Some((Rule::SliccBrowsers, foreign.clone())), None, None), "via slicc browsers"),
+            (None, None, listed(Some((Rule::ActivePort, foreign.clone())), None, None), "via DevToolsActivePort"),
+            (None, None, listed(None, Some(foreign.clone()), None), "via saved endpoint"),
+            (None, None, listed(None, None, Some(foreign.clone())), "via port probe"),
+        ];
+        let count = routes.len();
+        for (cdp, env, finder, via) in routes {
+            FINDER.with(|cell| *cell.borrow_mut() = Some(finder));
+            let mut argv = vec!["-v".to_string()];
+            if let Some(cdp) = cdp {
+                argv.extend(["--cdp".to_string(), cdp.to_string()]);
             }
-            self.2.clone()
+            argv.push("https://app.example/x".to_string());
+            let output = execute(&argv, env);
+            FINDER.with(|cell| *cell.borrow_mut() = None);
+            assert_eq!(output.code, 1, "{via}: {}", output.stderr);
+            assert!(output.stderr.contains(via), "{via}: {}", output.stderr);
+            assert!(output.stderr.contains("returned ws://203.0.113.9:9223/devtools/browser/x, a host other than this machine; refusing to dial it"), "{via}: {}", output.stderr);
         }
+        assert_eq!(foreign_hits.load(std::sync::atomic::Ordering::SeqCst), count);
+        let (local, local_hits) = discovery_answering(|port| format!("ws://localhost:{port}/devtools/browser/x"));
+        FINDER.with(|cell| *cell.borrow_mut() = Some(listed(None, None, Some(local))));
+        let output = execute(&["https://app.example/x".to_string()], None);
+        FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(!output.stderr.contains("refusing to dial"), "{}", output.stderr);
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 1001);
     }
 
     #[test]
@@ -597,15 +651,15 @@ mod tests {
         use cdp_client::resolve::Rule;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let missing = connect_start(None, None, &mut Listed(None, None, None)).unwrap_err();
+            let missing = connect_start(None, None, &mut listed(None, None, None)).unwrap_err();
             assert!(missing.starts_with("curlwright: no CDP browser found. Tried, in order:\n  --cdp               not given\n  SLICC_CDP_URL       not set\n  slicc browsers"), "{missing}");
-            assert!(missing.contains("port probe          nothing answered on 127.0.0.1:9300-9309\n"), "{missing}");
-            let blank = connect_start(Some(" "), Some(""), &mut Listed(None, None, None)).unwrap_err();
+            assert!(missing.contains("port probe          nothing answered\n"), "{missing}");
+            let blank = connect_start(Some(" "), Some(""), &mut listed(None, None, None)).unwrap_err();
             assert!(blank.starts_with("curlwright: no CDP browser found."));
             let output = run(&["https://app.example/x"]);
             assert_eq!(output.code, 1);
             assert!(output.stderr.starts_with("curlwright: no CDP browser found. Tried, in order:\n"), "{}", output.stderr);
-            let several = Listed(
+            let several = listed(
                 Some((Rule::SliccBrowsers, "http://127.0.0.1:40101/json/version".into())),
                 Some("http://127.0.0.1:40102/json/version".into()),
                 Some("http://127.0.0.1:40103/json/version".into()),
@@ -614,18 +668,18 @@ mod tests {
             let choice = connect_start(None, None, &mut several).unwrap();
             assert_eq!(choice.rule, Rule::SliccBrowsers);
             assert_eq!(choice.start, Start::Discover("http://127.0.0.1:40101/json/version".into()));
-            several.0 = None;
+            several.attached = None;
             assert_eq!(connect_start(None, None, &mut several).unwrap().rule, Rule::Saved);
-            several.1 = None;
+            several.saved = None;
             assert_eq!(connect_start(None, None, &mut several).unwrap().rule, Rule::Probe);
             assert_eq!(connect_start(Some("auto"), Some("40199"), &mut several).unwrap().rule, Rule::Probe);
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let choice = connect_start(None, None, &mut Listed(None, None, None)).unwrap();
+            let choice = connect_start(None, None, &mut listed(None, None, None)).unwrap();
             assert_eq!(choice.start, Start::Discover("http://127.0.0.1:9222/json/version".to_string()));
         }
-        let flag = connect_start(Some("http://127.0.0.1:9225"), Some("9444"), &mut Listed(None, None, None)).unwrap();
+        let flag = connect_start(Some("http://127.0.0.1:9225"), Some("9444"), &mut listed(None, None, None)).unwrap();
         assert_eq!(flag.start, Start::Discover("http://127.0.0.1:9225/json/version".to_string()));
         assert_eq!(flag.rule, Rule::Flag);
     }

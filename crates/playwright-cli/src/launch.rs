@@ -248,7 +248,16 @@ pub fn pick(
     cwd: Option<&std::path::Path>,
     probe: bool,
 ) -> Result<cdp_client::resolve::Resolved, String> {
+    #[cfg(test)]
+    if let Some(mut listed) = TEST_FINDER.with(|cell| cell.borrow().clone()) {
+        return cdp_client::resolve::resolve(cdp, env, &mut listed);
+    }
     cdp_client::resolve::resolve(cdp, env, &mut HostFinder { session, cwd, probe })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static TEST_FINDER: std::cell::RefCell<Option<cdp_client::resolve::Listed>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn start_after_explicit(

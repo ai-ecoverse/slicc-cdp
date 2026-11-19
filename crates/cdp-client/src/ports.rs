@@ -33,9 +33,10 @@ pub fn parse(text: &str) -> Option<Vec<u16>> {
 }
 
 pub fn real_debug_port(host: &str, port: u16) -> bool {
-    if !(9222..=9229).contains(&port) {
-        return false;
-    }
+    (9222..=9229).contains(&port) && local_host(host)
+}
+
+pub fn local_host(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
     let host = host.strip_suffix('.').unwrap_or(&host);
     if host == "localhost" || host.ends_with(".localhost") {
@@ -63,7 +64,10 @@ pub fn first_live(
         let Ok(body) = probe(&version) else {
             continue;
         };
-        if crate::connect::websocket_url_from_version(&body).is_ok() {
+        let Ok(socket) = crate::connect::websocket_url_from_version(&body) else {
+            continue;
+        };
+        if crate::connect::checked_socket(&version, &socket).is_ok() {
             return Some(version);
         }
     }
@@ -132,11 +136,14 @@ mod tests {
     #[test]
     fn the_first_port_with_a_debugger_wins() {
         let mut seen = Vec::new();
-        let found = first_live(&[40100, 40101, 40102, 40103], &mut |url| {
+        let found = first_live(&[40100, 40101, 40104, 40102, 40103], &mut |url| {
             seen.push(url.to_string());
             match url {
                 "http://127.0.0.1:40100/json/version" => Err("refused\n".to_string()),
                 "http://127.0.0.1:40101/json/version" => Ok("{}".to_string()),
+                "http://127.0.0.1:40104/json/version" => Ok(
+                    r#"{"webSocketDebuggerUrl":"ws://203.0.113.9:40104/devtools/browser/b"}"#.to_string(),
+                ),
                 "http://127.0.0.1:40102/json/version" => Ok(
                     r#"{"webSocketDebuggerUrl":"ws://127.0.0.1:40102/devtools/browser/b"}"#
                         .to_string(),
@@ -145,7 +152,7 @@ mod tests {
             }
         });
         assert_eq!(found.as_deref(), Some("http://127.0.0.1:40102/json/version"));
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 4);
         assert_eq!(first_live(&[40100], &mut |_| Err("HTTP 404\n".to_string())), None);
     }
 }

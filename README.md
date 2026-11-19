@@ -80,7 +80,7 @@ Order (the first step that yields an endpoint wins):
 2. `SLICC_CDP_URL`.
 3. `slicc browsers --json`, when `slicc` is on `PATH`: prefer `sevenOpen`, then a slicc profile, then the best tier; loopback `ws://` only. The answer is cached for a few seconds under the user config dir.
 4. A live `DevToolsActivePort` under slicc `seven-profiles`, legacy `profiles`, and SLICC six profile dirs: loopback `/json/version` check, the live websocket pathname must match the file, the newest live file wins.
-5. The loopback endpoint `playwright-cli` saved for this working directory under the user config dir (`slicc/playwright-cli/sessions/`). An endpoint that came from the port probe is reused only while it answers. A `.playwright-cli/session.json` in the working directory is ignored, and saved state never dials a non-loopback host.
+5. The loopback endpoint `playwright-cli` saved for this working directory under the user config dir (`slicc/playwright-cli/sessions/`). `curlwright` reads it and never writes one. An endpoint that came from the port probe is reused only while it answers. A `.playwright-cli/session.json` in the working directory is ignored, and saved state never dials a non-loopback host.
 6. The first of `127.0.0.1:9222`-`9229` whose `/json/version` answers (`SLICC_CDP_PORTS` replaces the range in tests, which never dial 9222-9229).
 
 When nothing is found, `playwright-cli open` launches a browser; `curlwright` and every other `playwright-cli` command exit 1. The wasm builds stop after step 2 and use `127.0.0.1:9222`.
@@ -97,6 +97,8 @@ When nothing is found, `playwright-cli open` launches a browser; `curlwright` an
 | `auto` or empty | `--cdp auto` | skip this step; `--cdp auto` also skips `SLICC_CDP_URL` |
 
 Anything else, `0` included, exits 1 with `unsupported CDP URL "<value>" (expected a port, host:port, ws://, wss://, http://, or https://; use --cdp auto to search for a running browser)`. A misspelt option gets a hint, for example `unknown option --cpd` followed by `Did you mean --cdp?`.
+
+Every form other than a `ws://` or `wss://` URL with a path reads `/json/version` first, and the `webSocketDebuggerUrl` it returns is dialled only if it is `ws://` or `wss://` on this machine (when discovery asked this machine: `localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`, `::`) or on the same host as an explicit remote endpoint. Anything else is refused before any connection, with `CDP discovery at <url> returned <socket>, a host other than this machine; refusing to dial it`. The port probe skips a port whose reply points elsewhere.
 
 `--verbose` (`curlwright -v` too) prints the endpoint and the step that picked it to stderr before connecting. Query strings are redacted unless `--full-urls` is given:
 
@@ -408,7 +410,7 @@ curlwright -i https://example.com/
 curlwright --cdp http://127.0.0.1:9333 -I https://example.com/
 ```
 
-It never launches a browser. It finds one exactly as `playwright-cli` does (`--cdp`, `SLICC_CDP_URL`, `slicc browsers`, `DevToolsActivePort`, the saved `playwright-cli` endpoint, then `127.0.0.1:9222-9229`; see Finding a browser in the [slicc-cdp README](https://github.com/ai-ecoverse/slicc-cdp#finding-a-browser)), and `-v` prints which endpoint it used and why. Without `--tab` it uses the tab `playwright-cli` last selected, else the one open tab on the URL's origin. `--intent` and `SLICC_INTENT` work as for `playwright-cli` (see [Intent](#intent)) and go into the request's `Slicc.action`.
+It never launches a browser. It finds one exactly as `playwright-cli` does (`--cdp`, `SLICC_CDP_URL`, `slicc browsers`, `DevToolsActivePort`, the endpoint `playwright-cli` saved for this directory, which `curlwright` reads but never writes, then `127.0.0.1:9222-9229`; see Finding a browser in the [slicc-cdp README](https://github.com/ai-ecoverse/slicc-cdp#finding-a-browser)), and `-v` prints which endpoint it used and why. Without `--tab` it uses the tab `playwright-cli` last selected, else the one open tab on the URL's origin. `--intent` and `SLICC_INTENT` work as for `playwright-cli` (see [Intent](#intent)) and go into the request's `Slicc.action`.
 
 `curlwright upgrade`, or `curlwright update`, replaces a prebuilt `curlwright` with the latest release, under the same rules as `playwright-cli upgrade`. A copy installed with Cargo is left to `cargo install curlwright`. As the first argument the word is always that command, so write `./update` for a relative URL.
 

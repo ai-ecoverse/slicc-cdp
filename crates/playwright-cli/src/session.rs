@@ -8,7 +8,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub use cdp_client::resolve::{known_provenance, loopback_url, reuse_saved, usable_endpoint};
+pub use cdp_client::resolve::{known_provenance, loopback_url, usable_endpoint};
+#[cfg(not(target_arch = "wasm32"))]
+pub use cdp_client::resolve::reuse_saved;
 
 #[derive(Debug, Clone, Default)]
 pub struct Session {

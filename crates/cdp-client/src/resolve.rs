@@ -2,9 +2,9 @@ use crate::connect::{choose_start, Start};
 
 pub const AUTO: &str = "auto";
 
-pub const CONNECT_ORDER: &str = "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else the slicc browsers JSON listing when slicc is on PATH (prefer sevenOpen, then a slicc profile, then best tier; loopback ws only); else a live DevToolsActivePort under slicc seven-profiles, legacy profiles, and SLICC six profile dirs (loopback /json/version check, websocket pathname must match the file, newest live wins); else a loopback endpoint playwright-cli saved for this directory under the user config dir; else the first of 127.0.0.1:9222-9229 whose /json/version answers. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. The wasm build uses port 9222 and skips every step after SLICC_CDP_URL.";
+pub const CONNECT_ORDER: &str = "Connect, in order: --cdp <url> wins; else SLICC_CDP_URL; else the slicc browsers JSON listing when slicc is on PATH (prefer sevenOpen, then a slicc profile, then best tier; loopback ws only); else a live DevToolsActivePort under slicc seven-profiles, legacy profiles, and SLICC six profile dirs (loopback /json/version check, websocket pathname must match the file, newest live wins); else a loopback endpoint playwright-cli saved for this directory under the user config dir (curlwright reads it and never writes one); else the first of 127.0.0.1:9222-9229 whose /json/version answers. A .playwright-cli/session.json in the working directory is ignored. Saved state never dials a non-loopback host. The wasm build uses port 9222 and skips every step after SLICC_CDP_URL.";
 
-pub const CDP_FORMS: &str = "--cdp and SLICC_CDP_URL take a port, host[:port], [ipv6][:port], ws://, wss://, http://, or https://. A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque. \"auto\" (or an empty value) skips that step, so --cdp auto ignores SLICC_CDP_URL.";
+pub const CDP_FORMS: &str = "--cdp and SLICC_CDP_URL take a port, host[:port], [ipv6][:port], ws://, wss://, http://, or https://. A ws:// or wss:// URL with a path is dialed directly. An http:// URL, a path-less ws:// URL, a port, or host[:port] is /json/version discovery. The debugger path is opaque. A webSocketDebuggerUrl from discovery is dialed only when it is ws:// or wss:// on this machine (for discovery on this machine) or on the host asked; anything else is refused before dialing. \"auto\" (or an empty value) skips that step, so --cdp auto ignores SLICC_CDP_URL.";
 
 pub const CDP_REPORT: &str = "--verbose prints \"* CDP <endpoint> (via <rule>)\" to stderr before connecting. When nothing is found, the error lists every step tried and why it was passed over.";
 
@@ -90,6 +90,37 @@ pub trait Finder {
     fn attached(&mut self, trail: &mut Vec<Step>) -> Result<Option<(Rule, String)>, String>;
     fn saved(&mut self, trail: &mut Vec<Step>) -> Option<String>;
     fn probe(&mut self, trail: &mut Vec<Step>) -> Option<String>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listed {
+    pub attached: Option<(Rule, String)>,
+    pub saved: Option<String>,
+    pub probe: Option<String>,
+}
+
+impl Finder for Listed {
+    fn attached(&mut self, trail: &mut Vec<Step>) -> Result<Option<(Rule, String)>, String> {
+        if self.attached.is_none() {
+            trail.push(Step::new(Rule::SliccBrowsers, "slicc not on PATH, or it failed"));
+            trail.push(Step::new(Rule::ActivePort, "no live file under slicc seven-profiles, profiles, or six profiles"));
+        }
+        Ok(self.attached.clone())
+    }
+
+    fn saved(&mut self, trail: &mut Vec<Step>) -> Option<String> {
+        if self.saved.is_none() {
+            trail.push(Step::new(Rule::Saved, "none for this directory"));
+        }
+        self.saved.clone()
+    }
+
+    fn probe(&mut self, trail: &mut Vec<Step>) -> Option<String> {
+        if self.probe.is_none() {
+            trail.push(Step::new(Rule::Probe, "nothing answered"));
+        }
+        self.probe.clone()
+    }
 }
 
 pub fn explicit(value: Option<&str>) -> Option<&str> {
@@ -464,6 +495,22 @@ mod tests {
         assert!(saved_from_json(Some(explicit), &mut dead, &mut trail).is_some());
         assert!(loopback_url("http://127.0.0.1:1/") && loopback_url("ws://localhost:2/x") && loopback_url("http://[::1]:3/"));
         assert!(!loopback_url("http://127.0.0.1.evil:1/") && !loopback_url("ftp://127.0.0.1/"));
+        for odd in [
+            "http://127.0.0.1@evil.example:1/",
+            "http://127.0.0.1:80@evil.example/",
+            "http://[::1]@evil.example/",
+            "ws://localhost@evil.example:9300/devtools/browser/x",
+            "http://127.0.0.1.:9300/json/version",
+            "http://localhost.:9300/json/version",
+            "http://127.0.0.1.evil.example:9300/",
+            "http://0x7f.0.0.1:9300/",
+            "http://evil.example/127.0.0.1",
+        ] {
+            assert!(!loopback_url(odd), "{odd}");
+            let saved = format!(r#"{{"endpoint":"{odd}","provenance":"explicit"}}"#);
+            assert_eq!(saved_from_json(Some(&saved), &mut live, &mut trail), None, "{odd}");
+        }
+        assert!(loopback_url("http://user@127.0.0.1:9300/json/version"));
     }
 
     #[test]

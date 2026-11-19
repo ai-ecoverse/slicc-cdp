@@ -153,6 +153,66 @@ mod tests {
         }
     }
 
+    fn discovery_answering(socket: impl Fn(u16) -> String + Send + 'static) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if !String::from_utf8_lossy(&buf[..n]).starts_with("GET /json/version") {
+                    seen.fetch_add(1000, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = format!(r#"{{"webSocketDebuggerUrl":"{}"}}"#, socket(port));
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}/json/version"), hits)
+    }
+
+    #[test]
+    fn every_rule_ends_in_the_checked_dial_and_a_foreign_socket_is_refused() {
+        use cdp_client::resolve::{Listed, Rule};
+        let (foreign, foreign_hits) = discovery_answering(|_| "ws://203.0.113.9:9223/devtools/browser/x".to_string());
+        let empty = Listed::default();
+        let routes: Vec<(Option<&str>, Option<&str>, Listed, &str)> = vec![
+            (Some(foreign.as_str()), None, empty.clone(), "via --cdp"),
+            (None, Some(foreign.as_str()), empty.clone(), "via SLICC_CDP_URL"),
+            (None, None, Listed { attached: Some((Rule::SliccBrowsers, foreign.clone())), ..Listed::default() }, "via slicc browsers"),
+            (None, None, Listed { attached: Some((Rule::ActivePort, foreign.clone())), ..Listed::default() }, "via DevToolsActivePort"),
+            (None, None, Listed { saved: Some(foreign.clone()), ..Listed::default() }, "via saved endpoint"),
+            (None, None, Listed { probe: Some(foreign.clone()), ..Listed::default() }, "via port probe"),
+        ];
+        let count = routes.len();
+        for (cdp, env, finder, via) in routes {
+            launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = Some(finder));
+            let mut argv = vec!["--verbose".to_string()];
+            if let Some(cdp) = cdp {
+                argv.extend(["--cdp".to_string(), cdp.to_string()]);
+            }
+            argv.push("tab-list".to_string());
+            let output = execute(&argv, env);
+            launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = None);
+            assert_eq!(output.code, 1, "{via}: {}", output.stderr);
+            assert!(output.stderr.contains(via), "{via}: {}", output.stderr);
+            assert!(output.stderr.contains("returned ws://203.0.113.9:9223/devtools/browser/x, a host other than this machine; refusing to dial it"), "{via}: {}", output.stderr);
+        }
+        assert_eq!(foreign_hits.load(std::sync::atomic::Ordering::SeqCst), count);
+        let (local, local_hits) = discovery_answering(|port| format!("ws://[::1]:{port}/devtools/browser/x"));
+        launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = Some(Listed { probe: Some(local), ..Listed::default() }));
+        let output = execute(&["tab-list".to_string()], None);
+        launch::TEST_FINDER.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(output.code, 1);
+        assert!(!output.stderr.contains("refusing to dial"), "{}", output.stderr);
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 1001);
+    }
+
     #[test]
     fn connect_is_explained_and_typos_get_a_hint() {
         let typo = execute(&["--cpd".into(), "0".into(), "snapshot".into()], None);
