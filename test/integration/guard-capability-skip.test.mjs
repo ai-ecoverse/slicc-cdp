@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  declaredCapabilityNames,
   mandatory,
+  protectedBfcacheRows,
   published,
   requiredCapabilities,
   runCapabilities,
@@ -112,4 +114,63 @@ test('the signInHold skip is accepted only for the sign-in hold vectors', () => 
   const skipped = row(plain, plain.targets[0], 'skip', 'not-supported:signInHold');
   assert.equal(validCapabilitySkip(plain, skipped), false);
   assert.notDeepEqual(verdictProblems([skipped]), []);
+});
+
+test('the run does not declare autoAttach because the route refuses auto-attach', () => {
+  assert.equal(declaredCapabilityNames(runCapabilities).has('autoAttach'), false);
+  assert.notEqual(runCapabilities.autoAttach, true);
+});
+
+test('a not-supported:autoAttach skip is accepted only for vectors that require autoAttach', () => {
+  const gated = [
+    'C3.popup',
+    'C3.popup-self-nav',
+    'C3.popup-on-redirect-302',
+    'C3.popup-on-redirect-chain',
+    'C3.direct-popup-stays-out',
+    'C3.redirect-popup-stays-out',
+    'C4.static-cross-site',
+    'C4.script-cross-site',
+  ];
+  for (const id of gated) {
+    const vector = published.vectors.find((entry) => entry.id === id);
+    assert.ok(vector, id);
+    assert.ok(vector.requires.includes('autoAttach'), id);
+    assert.equal(mandatory(id), false, id);
+    for (const target of vector.targets) {
+      const skipped = row(vector, target, 'skip', 'not-supported:autoAttach');
+      assert.equal(validCapabilitySkip(vector, skipped), true, `${id} ${target}`);
+      assert.deepEqual(verdictProblems([skipped]), [], `${id} ${target}`);
+    }
+  }
+  const frame = published.vectors.find((entry) => entry.id === 'C9.frame-hidden');
+  assert.ok(frame);
+  assert.equal(requiredCapabilities(frame).has('autoAttach'), true);
+  const other = published.vectors.find(
+    (vector) =>
+      vector.kind !== 'text' &&
+      !mandatory(vector.id) &&
+      !requiredCapabilities(vector).has('autoAttach')
+  );
+  assert.ok(other);
+  const skipped = row(other, other.targets[0], 'skip', 'not-supported:autoAttach');
+  assert.equal(validCapabilitySkip(other, skipped), false);
+  assert.equal(verdictProblems([skipped]).length, 1);
+});
+
+test('no mandatory row requires autoAttach or can take its skip', () => {
+  const rows = published.vectors.filter((vector) => mandatory(vector.id));
+  const ids = rows.map((vector) => vector.id);
+  for (const id of protectedBfcacheRows) assert.ok(ids.includes(id), id);
+  assert.ok(ids.includes('X1.after-exit'));
+  assert.ok(ids.some((id) => id.startsWith('C2.redirect-')));
+  assert.ok(ids.some((id) => /^C4\.iframe-preattach\..*\.shared$/.test(id)));
+  for (const vector of rows) {
+    assert.equal(requiredCapabilities(vector).has('autoAttach'), false, vector.id);
+    for (const target of vector.targets) {
+      const skipped = row(vector, target, 'skip', 'not-supported:autoAttach');
+      assert.equal(validCapabilitySkip(vector, skipped), false, `${vector.id} ${target}`);
+      assert.equal(verdictProblems([skipped]).length, 1, `${vector.id} ${target}`);
+    }
+  }
 });

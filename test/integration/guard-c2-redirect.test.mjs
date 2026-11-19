@@ -57,7 +57,6 @@ for (const transport of ['native', 'wasi']) {
             targets,
             capabilities: {
               scope: 'slicc-cdp',
-              autoAttach: true,
               iframeAutoAttach: true,
               browserSession: true,
               browserContexts: true,
