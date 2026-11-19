@@ -3342,8 +3342,8 @@ impl Cdp {
             return Ok(!target_allowed);
         };
         match self.raw_call("Page.getFrameTree", json!({}), Some(session), Duration::from_secs(10)) {
-            Ok(_) => Ok(!self.frame_sessions.get(session).is_some_and(|frames| frames.contains(frame_id))
-                || !(owned && self.blank_opaque(frame_id) || self.frame_verified(frame_id))),
+            Ok(tree) => Ok(!self.frame_sessions.get(session).is_some_and(|frames| frames.contains(frame_id))
+                || !(owned && self.blank_opaque(frame_id) && self.owned_blank_tree(frame_id, session, &tree) || self.frame_verified(frame_id))),
             Err(message) if transport_error(&message) => Err(message),
             Err(message) if message.contains("slicc: refused:") => Ok(true),
             Err(_) => Ok(known || !target_allowed),
@@ -3356,6 +3356,14 @@ impl Cdp {
         evidence.len() == 5 && evidence[4].is_empty() && evidence[1] == "about:blank" && evidence[2] == "://"
             && !self.protected_targets.contains(&target) && !self.frame_parents.contains_key(frame_id)
             && self.blank_opaque(frame_id) && self.owns_blank(&target, frame_id, &evidence[0])
+    }
+
+    fn owned_blank_tree(&self, frame_id: &str, session: &str, tree: &Value) -> bool {
+        let Some(target) = self.session_target(session) else { return false };
+        let Some(frame) = tree.pointer("/frameTree/frame") else { return false };
+        let text = |key: &str| frame.get(key).and_then(Value::as_str);
+        text("id") == Some(frame_id) && text("url") == Some("about:blank") && text("securityOrigin") == Some("://") && frame.get("parentId").is_none()
+            && !self.protected_targets.contains(&target) && text("loaderId").is_some_and(|loader| self.owns_blank(&target, frame_id, loader))
     }
 
     fn blank_opaque(&self, frame_id: &str) -> bool {

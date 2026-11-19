@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 const COMMANDS: &[&str] = &["resize", "keydown", "keyup", "mousemove", "mousedown", "mouseup", "mousewheel", "drop"];
 const BUTTONS: &[&str] = &["left", "right", "middle"];
 const MAX_DROP_BYTES: u64 = 25 * 1024 * 1024;
-const MAX_SIZE: f64 = 10_000_000.0;
+const MAX_SIZE: f64 = 16_384.0;
 const MAX_KEYS: usize = 64;
 const GROUP: &str = "slicc-input";
 const INNER: &str = "[innerWidth, innerHeight]";
@@ -136,7 +136,7 @@ fn sizes(invocation: &Invocation) -> Result<(u64, u64), String> {
     let (width, height) = numbers(invocation, ["w", "h"])?;
     let whole = |value: f64| value.fract() == 0.0 && (1.0..=MAX_SIZE).contains(&value);
     if !whole(width) || !whole(height) {
-        return Err("Error: resize needs whole widths and heights from 1 to 10000000\n".to_string());
+        return Err("Error: resize needs whole widths and heights from 1 to 16384\n".to_string());
     }
     Ok((width as u64, height as u64))
 }
@@ -476,7 +476,11 @@ fn resize(cdp: &mut Cdp, session: &str, width: u64, height: u64) -> Result<(), S
         (Some(outer), Some(inner)) if outer.is_finite() && inner.is_finite() && outer > inner => (outer - inner).round() as u64,
         _ => 0,
     };
-    let bounds = json!({ "width": width + inset(outer("width"), viewport(0)), "height": height + inset(outer("height"), viewport(1)) });
+    let (outer_width, outer_height) = (width + inset(outer("width"), viewport(0)), height + inset(outer("height"), viewport(1)));
+    if outer_width > MAX_SIZE as u64 || outer_height > MAX_SIZE as u64 {
+        return Err(format!("Error: resize needs a window of at most 16384 by 16384, and this one would be {outer_width} by {outer_height} with the browser's frame\n"));
+    }
+    let bounds = json!({ "width": outer_width, "height": outer_height });
     cdp.call("Browser.setWindowBounds", json!({ "windowId": id, "bounds": bounds }), Some(session)).map_err(|message| {
         if message.ends_with("wasn't found\n") { UNSIZED.to_string() } else { message }
     })?;

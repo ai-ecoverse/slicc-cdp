@@ -84,7 +84,7 @@ fn resize(children: Vec<Value>) -> Result<Value, String> {
 fn a_sandboxed_blank_frame_is_refused_as_unplaceable_not_as_sevens() {
     assert_eq!(scoped(vec![ordinary(), sandboxed()]).unwrap_err(), UNPLACEABLE);
     assert_eq!(forward(vec![ordinary(), sandboxed()]).unwrap_err(), UNPLACEABLE);
-    assert!(resize(vec![ordinary(), sandboxed()]).is_ok());
+    assert_eq!(resize(vec![ordinary(), sandboxed()]).unwrap_err(), UNPLACEABLE);
     let srcdoc = child("SRCDOC", "about:srcdoc", "null");
     assert_eq!(scoped(vec![srcdoc.clone(), sandboxed()]).unwrap_err(), UNPLACEABLE);
     assert_eq!(forward(vec![srcdoc]).unwrap_err(), UNPLACEABLE);
@@ -105,7 +105,7 @@ fn a_seven_frame_keeps_the_seven_text_wherever_it_sits_beside_an_unplaceable_one
     for children in [vec![seven()], vec![sandboxed(), seven()], vec![seven(), sandboxed()]] {
         assert_eq!(scoped(children.clone()).unwrap_err(), SEVEN);
         assert_eq!(forward(children.clone()).unwrap_err(), SEVEN);
-        assert!(resize(children).is_ok());
+        assert_eq!(resize(children).unwrap_err(), SEVEN);
     }
     let mut nested = sandboxed();
     let mut inner = seven();

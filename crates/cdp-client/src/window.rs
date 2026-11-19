@@ -1,5 +1,5 @@
 const WINDOWLESS: &[&str] = &["service_worker", "shared_worker", "worker", "worklet", "auction_worklet", "shared_storage_worklet", "browser"];
-const MAX_WINDOW: u64 = 10_000_000;
+pub const MAX_WINDOW: u64 = 16_384;
 pub const WINDOW_SHAPE: &str = "slicc: refused: Browser.setWindowBounds takes only a windowId and a whole-number width and height\n";
 pub const WINDOW_OWN: &str = "slicc: refused: Browser.setWindowBounds resizes only the window of the session's own tab\n";
 
@@ -14,9 +14,20 @@ impl Cdp {
         let window = params.get("windowId").and_then(Value::as_i64).ok_or(WINDOW_SHAPE)?;
         let session = session.ok_or(WINDOW_OWN)?;
         let target = self.window_session(session)?;
+        self.document_state_for(&target, true, None).ok_or_else(|| self.document_refusal())?;
+        self.window_page(&target)?;
         let owned = self.raw_call("Browser.getWindowForTarget", json!({}), Some(session), DOCUMENT_CHECK).map_err(|_| WINDOW_OWN.to_string())?;
         if owned.get("windowId").and_then(Value::as_i64) != Some(window) { return Err(WINDOW_OWN.into()) }
         if self.window_session(session)? != target { return Err(self.refusal()) }
+        Ok(())
+    }
+
+    fn window_page(&mut self, target: &str) -> Result<(), String> {
+        let listed = self.raw_call("Target.getTargets", json!({}), None, DOCUMENT_CHECK)?;
+        let all = listed.get("targetInfos").and_then(Value::as_array).cloned().ok_or_else(|| self.refusal())?;
+        let infos = Listing::new(&all);
+        let own = all.iter().find(|info| info.get("targetId").and_then(Value::as_str) == Some(target)).ok_or_else(|| self.refusal())?;
+        if own.get("type").and_then(Value::as_str) != Some("page") || self.info_protected(own, &infos) { return Err(self.refusal()) }
         Ok(())
     }
 
