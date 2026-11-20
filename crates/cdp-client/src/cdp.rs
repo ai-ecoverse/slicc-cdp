@@ -4975,16 +4975,14 @@ impl Cdp {
             return;
         }
         if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Debugger.")) { return; }
-        let scrub_through = value.get("method").and_then(Value::as_str).is_some_and(|method| {
-            method.starts_with("Target.") || method == "Page.windowOpen"
-        });
-        if guarded && !scrub_through {
+        if guarded && !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") {
             self.fail_seen_network(&value);
             return;
         }
         self.adopt_guard_attach(&value);
         if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or(""))
-            || !scrub_through && shield::loaded_urls_protected(&self.guard, &value["params"])
+            || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.")
+                && shield::loaded_urls_protected(&self.guard, &value["params"])
         {
             self.fail_seen_network(&value);
             return;
@@ -4998,9 +4996,7 @@ impl Cdp {
         let settle_guard = self.settling_attach
             && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
             && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
-        if self.hidden(&value) && !settle_guard
-            && value.get("method").and_then(Value::as_str) != Some("Page.windowOpen")
-        {
+        if self.hidden(&value) && !settle_guard {
             self.fail_seen_network(&value);
             return;
         }

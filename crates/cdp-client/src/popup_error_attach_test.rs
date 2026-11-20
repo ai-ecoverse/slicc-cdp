@@ -1470,8 +1470,52 @@ fn window_name_and_dom_frame_name_on_an_ordinary_page_are_not_blanked() {
     assert!(attrs.windows(2).any(|pair| pair[0] == "name" && pair[1] == host_name), "{described}");
 }
 
+
 #[test]
-fn page_window_open_blanks_window_name_on_a_protected_failed_load() {
+fn a_guard_session_page_window_open_is_never_delivered() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    assert_ne!(guard, live);
+    assert!(cdp.guard_sessions.contains(&guard));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":name("Page", "windowOpen"),"sessionId":guard,
+        "params":{"url":"https://idp.example/authorize?code=SECRETCODE","windowName":"vault-oauth","windowFeatures":"","userGesture":true}
+    }));
+    let leaked = cdp.events()[mark..].iter().any(|event| {
+        event["method"].as_str() == Some(name("Page", "windowOpen").as_str())
+            || event.to_string().contains("SECRETCODE")
+            || event.to_string().contains("vault-oauth")
+    });
+    assert!(!leaked, "guard-session windowOpen must not reach the client: {:?}", &cdp.events()[mark..]);
+}
+
+#[test]
+fn a_blocked_session_page_window_open_is_never_delivered() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    cdp.blocked.insert(live.clone());
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":name("Page", "windowOpen"),"sessionId":live,
+        "params":{"url":"https://example.test/opened","windowName":"blocked-window","windowFeatures":"","userGesture":true}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str()) || event.to_string().contains("blocked-window")), "{:?}", &cdp.events()[mark..]);
+}
+
+#[test]
+fn a_protected_url_page_window_open_on_an_own_session_is_never_delivered() {
     let host = "seven.sliccy.ai";
     let start = own_info("https://example.test/start", "start");
     let state = own_state(start.clone(), PopupFrame::Frame(json!({
@@ -1485,11 +1529,11 @@ fn page_window_open_blanks_window_name_on_a_protected_failed_load() {
         "method":name("Page", "windowOpen"),"sessionId":live,
         "params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"noopener","userGesture":true}
     }));
-    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
-    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
-    assert_no_failed_host("windowOpen-protected", opened, host, STALE_MARKER);
-    let url = opened.pointer("/params/url").and_then(Value::as_str).unwrap_or("");
-    assert!(url.is_empty() || url == "https://seven.sliccy.ai" || url == "about:blank", "url={url}");
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"].as_str() == Some(name("Page", "windowOpen").as_str())
+            || event.to_string().contains(host)
+            || event.to_string().contains(STALE_MARKER)
+    }), "protected-url windowOpen must drop as on main: {:?}", &cdp.events()[mark..]);
 }
 
 #[test]
@@ -1514,7 +1558,7 @@ fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
     }));
     let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
-    assert!(!opened.to_string().eq_ignore_ascii_case(&host) && !opened.pointer("/params/windowName").and_then(Value::as_str).unwrap_or("").eq_ignore_ascii_case(host), "{opened}");
+    assert!(!opened.pointer("/params/windowName").and_then(Value::as_str).unwrap_or("").eq_ignore_ascii_case(host), "{opened}");
 }
 
 #[test]
@@ -1534,6 +1578,184 @@ fn page_window_open_keeps_an_ordinary_window_name() {
     let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some("my-window"));
     assert_eq!(opened.pointer("/params/url").and_then(Value::as_str), Some("https://example.test/opened"));
+}
+
+#[test]
+fn settle_guard_never_delivers_guard_blocked_or_own_protected_attach() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let before = cdp.events().len();
+    let reply = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = reply["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    for event in &cdp.events()[before..] {
+        let session = event["params"]["sessionId"].as_str().unwrap_or("");
+        if matches!(event["method"].as_str(), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget")) {
+            assert!(!cdp.guard_sessions.contains(session), "guard settle attach must not remain: {event}");
+        }
+    }
+    assert!(cdp.events().iter().any(|event| event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == live));
+    cdp.settling_attach = true;
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":name("Page", "windowOpen"),"sessionId":guard,
+        "params":{"url":"https://idp.example/authorize?code=SETTLESECRET","windowName":"settle-leak","windowFeatures":"","userGesture":true}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"].as_str() == Some(name("Page", "windowOpen").as_str())
+            || event.to_string().contains("SETTLESECRET")
+            || event.to_string().contains("settle-leak")
+    }), "settle_guard must not widen past attach/detach: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.insert(live.clone());
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget","params":{"sessionId":live,"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai"),"waitingForDebugger":false}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == live
+            || event.to_string().contains(STALE_MARKER)
+    }), "blocked attach during settle must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.remove(&live);
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget","params":{"sessionId":live,"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai"),"waitingForDebugger":false}
+    }));
+    for event in &cdp.events()[mark..] {
+        assert!(!event.to_string().contains(STALE_MARKER), "own protected attach during settle must not leak marker: {event}");
+        if event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == live {
+            let url = event.pointer("/params/targetInfo/url").and_then(Value::as_str).unwrap_or("");
+            assert!(!url.contains(STALE_MARKER) && !url.contains("/path/"), "own protected attach must scrub path secrets: {event}");
+        }
+    }
+    cdp.settling_attach = false;
+}
+
+#[test]
+fn target_created_scrub_skip_drops_guard_blocked_and_scrubs_own_protected() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.targetCreated","sessionId":guard,
+        "params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.targetCreated" || event.to_string().contains(STALE_MARKER)
+    }), "guard-session targetCreated must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.insert(live.clone());
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.targetCreated","sessionId":live,
+        "params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.targetCreated" || event.to_string().contains(STALE_MARKER)
+    }), "blocked-session targetCreated must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.remove(&live);
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.targetCreated",
+        "params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}
+    }));
+    for event in &cdp.events()[mark..] {
+        if event["method"] == "Target.targetCreated" {
+            assert!(!event.to_string().contains(STALE_MARKER), "own protected targetCreated must scrub: {event}");
+            let url = event.pointer("/params/targetInfo/url").and_then(Value::as_str).unwrap_or("");
+            assert!(url == "about:blank" || !url.contains(STALE_MARKER), "{event}");
+        }
+    }
+}
+
+#[test]
+fn target_info_changed_scrub_skip_drops_guard_blocked_and_scrubs_own_protected() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged","sessionId":guard,
+        "params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.targetInfoChanged" && event.get("sessionId").and_then(Value::as_str) == Some(guard.as_str())
+            || event.to_string().contains(STALE_MARKER) && event.get("sessionId").and_then(Value::as_str) == Some(guard.as_str())
+    }), "guard-session targetInfoChanged must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.insert(live.clone());
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged","sessionId":live,
+        "params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event.get("sessionId").and_then(Value::as_str) == Some(live.as_str())
+            && (event["method"] == "Target.targetInfoChanged" || event.to_string().contains(STALE_MARKER))
+    }), "blocked-session targetInfoChanged must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.remove(&live);
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.targetInfoChanged",
+        "params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}
+    }));
+    for event in &cdp.events()[mark..] {
+        if event["method"] == "Target.targetInfoChanged" {
+            assert!(!event.to_string().contains(STALE_MARKER), "own protected targetInfoChanged must scrub: {event}");
+        }
+    }
+}
+
+#[test]
+fn target_attached_scrub_skip_drops_guard_blocked_and_scrubs_own_protected() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget","params":{"sessionId":guard,"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai"),"waitingForDebugger":false}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == guard
+            || event.to_string().contains(STALE_MARKER)
+    }), "guard attachedToTarget must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.insert(live.clone());
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget","params":{"sessionId":live,"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai"),"waitingForDebugger":false}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == live
+            || event.to_string().contains(STALE_MARKER)
+    }), "blocked attachedToTarget must drop: {:?}", &cdp.events()[mark..]);
+    cdp.blocked.remove(&live);
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget","params":{"sessionId":"OWN-SCRUB","targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai"),"waitingForDebugger":false}
+    }));
+    for event in &cdp.events()[mark..] {
+        if event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == "OWN-SCRUB" {
+            assert!(!event.to_string().contains(STALE_MARKER), "own protected attachedToTarget must scrub: {event}");
+        } else {
+            assert!(!event.to_string().contains(STALE_MARKER) || event["method"] != "Target.attachedToTarget", "{event}");
+        }
+    }
 }
 
 #[test]
@@ -1743,7 +1965,7 @@ fn name_label_carrier_sweep_on_a_protected_failed_load() {
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
     let mark = cdp.events().len();
     let carriers = [
-        json!({"method":name("Page", "windowOpen"),"sessionId":live,"params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"","userGesture":true}}),
+        json!({"method":name("Page", "windowOpen"),"sessionId":live,"params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}}),
         json!({"method":"Page.frameRequestedNavigation","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED,"reason":"scriptInitiated","disposition":"currentTab"}}),
         json!({"method":"Page.navigatedWithinDocument","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED}}),
         json!({"method":name("Page", "fileChooserOpened"),"sessionId":live,"params":{"mode":"selectSingle","frameId":"T","backendNodeId":1}}),
