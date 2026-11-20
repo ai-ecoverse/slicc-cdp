@@ -843,3 +843,198 @@ fn legacy_network_interception_body_readers_are_refused() {
         .unwrap_err();
     assert!(enable.starts_with("slicc: refused:"));
 }
+
+fn array_headers(name: &str, value: &str) -> Value {
+    json!([{ "name": name, "value": value }])
+}
+
+fn issued_on(url: &str, id: &str) -> Cdp {
+    let mut cdp = url_backend("https://example.test/");
+    cdp.absorb(json!({
+        "method": "Fetch.requestPaused",
+        "sessionId": "S",
+        "params": {
+            "requestId": id,
+            "networkId": "N",
+            "frameId": "F1",
+            "resourceType": "XHR",
+            "request": { "url": url, "method": "GET", "headers": {} },
+            "responseStatusCode": 200,
+            "responseHeaders": [{ "name": "Content-Type", "value": "text/plain" }]
+        }
+    }));
+    let _ = cdp.next_paused(Some("S"), Duration::ZERO);
+    cdp.hand("S", id);
+    cdp.requests.insert(id.into(), false);
+    cdp
+}
+
+fn assert_array_refused(method: &str, url: &str, name: &str, value: &str) {
+    assert_array_refused_as(method, url, name, value, false);
+}
+
+fn assert_array_refused_as(method: &str, url: &str, name: &str, value: &str, credential: bool) {
+    let mut cdp = if url.starts_with("https://shop.example.test") || url.starts_with("https://ims-") {
+        response_paused(url, "R")
+    } else {
+        issued_on(url, "R")
+    };
+    let err = cdp
+        .call(
+            method,
+            json!({ "requestId": "R", "responseCode": 200, "responseHeaders": array_headers(name, value) }),
+            Some("S"),
+        )
+        .unwrap_err();
+    if credential {
+        assert!(
+            err.contains("sign-in credentials"),
+            "{method} {url} {name:?} {value:?}: want credential refusal, got {err}"
+        );
+    } else {
+        assert!(
+            err == super::COOKIES || err.contains("cookies on seven"),
+            "{method} {url} {name:?} {value:?}: {err}"
+        );
+    }
+}
+
+fn assert_array_forwarded(method: &str, url: &str, name: &str, value: &str) {
+    let mut cdp = response_paused(url, "R");
+    assert!(
+        cdp.call(
+            method,
+            json!({ "requestId": "R", "responseCode": 200, "responseHeaders": array_headers(name, value) }),
+            Some("S"),
+        )
+        .is_ok(),
+        "{method} {url} {name:?} {value:?}"
+    );
+}
+
+#[test]
+fn response_side_array_set_cookie_value_ctl_on_protected_scope_is_refused() {
+    let fulfill = "Fetch.fulfillRequest";
+    let cont = "Fetch.continueResponse";
+    for method in [fulfill, cont] {
+        for value in [
+            "sid=PLANTED\nother=1",
+            "sid=PLANTED; Domain=.seven.sliccy.ai\nother=1",
+            "sid=PLANTED\nother=1; Domain=.seven.sliccy.ai",
+            "sid=PLANTED\rother=1; Domain=.seven.sliccy.ai",
+            "sid=PLANTED\0other=1; Domain=.seven.sliccy.ai",
+            "sid=PLANTED\rother=1",
+            "sid=PLANTED\0other=1",
+        ] {
+            assert_array_refused(method, "https://seven.sliccy.ai/path", "Set-Cookie", value);
+        }
+        for value in [
+            "sid=PLANTED; Domain=.seven.sliccy.ai\nother=1",
+            "sid=PLANTED\nother=1; Domain=.seven.sliccy.ai",
+            "sid=PLANTED\rother=1; Domain=.seven.sliccy.ai",
+            "sid=PLANTED\0other=1; Domain=.seven.sliccy.ai",
+        ] {
+            assert_array_refused(method, "https://shop.example.test/api", "Set-Cookie", value);
+        }
+    }
+}
+
+#[test]
+fn response_side_array_set_cookie_padded_name_on_protected_scope_is_refused() {
+    let fulfill = "Fetch.fulfillRequest";
+    let cont = "Fetch.continueResponse";
+    for method in [fulfill, cont] {
+        for name in ["Set-Cookie\t", " Set-Cookie", "\tSet-Cookie", "Set-Cookie "] {
+            assert_array_refused(method, "https://seven.sliccy.ai/path", name, "sid=ok; Path=/");
+            assert_array_refused(
+                method,
+                "https://shop.example.test/api",
+                name,
+                "sid=ok; Domain=.seven.sliccy.ai",
+            );
+        }
+    }
+}
+
+#[test]
+fn response_side_array_set_cookie_ctl_and_padded_on_credential_scope_is_refused() {
+    let fulfill = "Fetch.fulfillRequest";
+    let cont = "Fetch.continueResponse";
+    let ims = "https://ims-na1.adobelogin.com/ims";
+    for method in [fulfill, cont] {
+        for value in [
+            "sid=PLANTED\nother=1",
+            "sid=PLANTED\rother=1",
+            "sid=PLANTED\0other=1",
+            "sid=PLANTED\nother=1; Domain=.adobelogin.com",
+        ] {
+            assert_array_refused_as(method, ims, "Set-Cookie", value, true);
+        }
+        for name in ["Set-Cookie\t", " Set-Cookie"] {
+            assert_array_refused_as(method, ims, name, "sid=ok; Path=/", true);
+            assert_array_refused_as(
+                method,
+                "https://shop.example.test/api",
+                name,
+                "sid=ok; Domain=.adobelogin.com",
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn response_side_array_set_cookie_ctl_and_padded_ordinary_controls_stay_forwarded() {
+    let fulfill = "Fetch.fulfillRequest";
+    let cont = "Fetch.continueResponse";
+    let ordinary = "https://shop.example.test/api";
+    for method in [fulfill, cont] {
+        assert_array_forwarded(method, ordinary, "Set-Cookie", "sid=PLANTED\nother=1");
+        assert_array_forwarded(method, ordinary, "Set-Cookie", "sid=PLANTED\rother=1");
+        assert_array_forwarded(method, ordinary, "Set-Cookie", "sid=PLANTED\0other=1");
+        assert_array_forwarded(method, ordinary, "Set-Cookie\t", "sid=ok; Path=/");
+        assert_array_forwarded(method, ordinary, " Set-Cookie", "sid=ok; Path=/");
+        assert_array_forwarded(method, ordinary, "Set-Cookie", "sid=a\tsid=b");
+        assert_array_forwarded(method, ordinary, "Set-Cookie", "sid=; Max-Age=0");
+        assert_array_forwarded(
+            method,
+            ordinary,
+            "Set-Cookie",
+            "sid=ok; Domain=example.test; Path=/",
+        );
+    }
+}
+
+#[test]
+fn response_side_array_set_cookie_raw_and_binary_protected_forms_stay_refused() {
+    let raw = crate::net::base64_encode(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Domain=.seven.sliccy.ai\r\n\r\n");
+    let mut intercepted = handed("https://example.test/", "I1");
+    assert_eq!(
+        intercepted
+            .call(
+                "Network.continueInterceptedRequest",
+                json!({ "interceptionId": "I1", "rawResponse": raw }),
+                Some("S")
+            )
+            .unwrap_err(),
+        super::COOKIES
+    );
+    let binary = crate::net::base64_encode(b"Set-Cookie: sid=PLANTED\nother=1\0Content-Type: text/plain");
+    let mut fulfill_binary = handed("https://example.test/", "R");
+    assert_eq!(
+        fulfill_binary
+            .call(
+                "Fetch.fulfillRequest",
+                json!({ "requestId": "R", "responseCode": 200, "binaryResponseHeaders": binary }),
+                Some("S")
+            )
+            .unwrap_err(),
+        super::COOKIES
+    );
+    assert_array_refused(
+        "Fetch.fulfillRequest",
+        "https://shop.example.test/api",
+        "Set-Cookie",
+        "sid=x\n Domain=.seven.sliccy.ai",
+    );
+}

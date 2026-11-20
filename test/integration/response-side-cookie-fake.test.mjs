@@ -248,5 +248,79 @@ test('fake: response-side Set-Cookie for protected scopes through interception i
       send('Network.getResponseBodyForInterception', { interceptionId: 'I1' }),
       /slicc: refused:/
     );
+
+    for (const value of [
+      'sid=PLANTED\nother=1; Domain=.seven.sliccy.ai',
+      'sid=PLANTED\rother=1; Domain=.seven.sliccy.ai',
+      'sid=PLANTED\0other=1; Domain=.seven.sliccy.ai',
+    ]) {
+      const ctlId = await enable('Request');
+      const fromCtl = backend.calls.length;
+      await assert.rejects(
+        send('Fetch.fulfillRequest', {
+          requestId: ctlId,
+          responseCode: 200,
+          responseHeaders: [{ name: 'Set-Cookie', value }],
+        }),
+        /cookies on seven's origin/
+      );
+      assert.equal(
+        backend.calls.slice(fromCtl).some((call) => call.method === 'Fetch.fulfillRequest'),
+        false,
+        `ctl value must not reach the backend: ${JSON.stringify(value)}`
+      );
+    }
+
+    for (const name of ['Set-Cookie\t', ' Set-Cookie']) {
+      const paddedId = await enable('Request');
+      const fromPadded = backend.calls.length;
+      await assert.rejects(
+        send('Fetch.fulfillRequest', {
+          requestId: paddedId,
+          responseCode: 200,
+          responseHeaders: [{ name, value: plant('.sliccy.ai') }],
+        }),
+        /cookies on seven's origin/
+      );
+      assert.equal(
+        backend.calls.slice(fromPadded).some((call) => call.method === 'Fetch.fulfillRequest'),
+        false,
+        `padded name must not reach the backend: ${JSON.stringify(name)}`
+      );
+    }
+
+    const continueCtlId = await enable('Response');
+    const fromContinueCtl = backend.calls.length;
+    await assert.rejects(
+      send('Fetch.continueResponse', {
+        requestId: continueCtlId,
+        responseCode: 200,
+        responseHeaders: [
+          { name: 'Set-Cookie', value: 'sid=PLANTED\nother=1; Domain=.seven.sliccy.ai' },
+        ],
+      }),
+      /cookies on seven's origin/
+    );
+    assert.equal(
+      backend.calls.slice(fromContinueCtl).some((call) => call.method === 'Fetch.continueResponse'),
+      false,
+      'continueResponse ctl value must not reach the backend'
+    );
+
+    const ordinaryLfId = await enable('Request');
+    await send('Fetch.fulfillRequest', {
+      requestId: ordinaryLfId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Set-Cookie', value: 'sid=PLANTED\nother=1' }],
+    });
+    assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', ordinaryLfId));
+
+    const ordinaryPaddedId = await enable('Request');
+    await send('Fetch.fulfillRequest', {
+      requestId: ordinaryPaddedId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Set-Cookie\t', value: 'sid=ok; Path=/' }],
+    });
+    assert.ok(forwarded(backend, 'Fetch.fulfillRequest', 'requestId', ordinaryPaddedId));
   });
 });
