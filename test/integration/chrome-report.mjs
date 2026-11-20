@@ -45,6 +45,7 @@ export const CHROME_FILES = new Set(
     'guard-fail-fast',
     'guard-native',
     'guard-persistent',
+    'guard-service-worker-chrome',
     'guard-setup-budget',
     'har-chrome',
     'har-worker-chrome',

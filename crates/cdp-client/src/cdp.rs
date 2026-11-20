@@ -6248,6 +6248,7 @@ mod tests {
     include!("response_cookie_test.rs");
     include!("credential_origins_test.rs");
     include!("popup_error_attach_test.rs");
+    include!("interim_lock_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
