@@ -143,26 +143,43 @@ async function createWorld(client, sessionId, frameId, options = {}) {
   return { world, contextId, params };
 }
 
-async function waitFrames(raw, sessionId) {
-  const deadline = Date.now() + 15000;
+function childUrls(tree, urls = []) {
+  const frame = tree?.frame;
+  if (frame?.url) urls.push(String(frame.url));
+  for (const child of tree?.childFrames || []) childUrls(child, urls);
+  return urls;
+}
+
+async function waitFrames(raw, sessionId, openUrl, protUrl) {
+  const deadline = Date.now() + 20000;
+  let last = null;
   do {
-    const state = valueOf(
+    const tree = await raw.send('Page.getFrameTree', {}, sessionId);
+    const urls = childUrls(tree.frameTree);
+    const openLoaded = urls.some((url) => url.startsWith(openUrl) || url.includes('/open-frame'));
+    const protLoaded = urls.some((url) => url.startsWith(protUrl) || url.includes('/prot-frame'));
+    const mainProbe = valueOf(
       await evaluateRaw(
         raw,
         sessionId,
         `({
-          openReady: (() => { try { const f=document.getElementById('open'); return Boolean(f && f.contentDocument && f.contentDocument.readyState === 'complete' && (f.contentDocument.body||{}).innerText); } catch (_) { return false } })(),
+          openCrossOriginBlocked: (() => { try { return document.getElementById('open').contentDocument == null; } catch (e) { return String(e && e.name ? e.name : 'Error'); } })(),
+          protCrossOriginBlocked: (() => { try { return document.getElementById('prot').contentDocument == null; } catch (e) { return String(e && e.name ? e.name : 'Error'); } })(),
           protHrefKind: (() => { try { const href=String(document.getElementById('prot').contentWindow.location.href||''); if(href==='about:blank') return 'blank'; if(href.includes('seven.sliccy.ai')) return 'prot'; if(href) return 'other'; return 'none'; } catch (e) { return 'error:' + (e && e.name ? e.name : 'Error'); } })(),
-          protHasDoc: (() => { try { return document.getElementById('prot').contentDocument != null; } catch (_) { return false } })(),
-          protTextLen: (() => { try { const d=document.getElementById('prot').contentDocument; return d && d.body ? String(d.body.innerText||'').length : 0; } catch (_) { return -1 } })(),
-          protHasMarker: (() => { try { const d=document.getElementById('prot').contentDocument; return Boolean(d && d.body && String(d.body.innerText||'').includes(${JSON.stringify(PROT_MARKER)})); } catch (_) { return false } })()
+          openHrefKind: (() => { try { const href=String(document.getElementById('open').contentWindow.location.href||''); if(href==='about:blank') return 'blank'; if(href.includes('open.other.test')) return 'open'; if(href) return 'other'; return 'none'; } catch (e) { return 'error:' + (e && e.name ? e.name : 'Error'); } })()
         })`
       )
     );
-    if (state?.openReady) return state;
+    last = {
+      urls,
+      openLoaded,
+      protLoaded,
+      ...mainProbe,
+    };
+    if (openLoaded && protLoaded) return last;
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
-  throw new Error('iframe settle timeout');
+  throw new Error(`iframe settle timeout; last=${JSON.stringify(last)}`);
 }
 
 function publishReport(report) {
@@ -227,7 +244,12 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     assert.equal(pageState?.hasOpen, true);
     assert.equal(pageState?.hasProt, true);
 
-    const unguardedIframes = await waitFrames(raw, rawSession);
+    const unguardedIframes = await waitFrames(
+      raw,
+      rawSession,
+      pages.openFrameUrl,
+      pages.protFrameUrl
+    );
     const rawTree = await raw.send('Page.getFrameTree', {}, rawSession);
     const frameId = rawTree.frameTree.frame.id;
 
@@ -275,9 +297,8 @@ test('Chrome: isolated world without universal access cannot read a protected cr
       openFrameUrl: pages.openFrameUrl,
       protFrameUrl: pages.protFrameUrl,
       unguardedIframes,
-      protectedIframeLoadedInUnguardedBrowser: Boolean(
-        unguardedIframes?.protHrefKind === 'prot' || unguardedIframes?.protHasMarker
-      ),
+      protectedIframeLoadedInUnguardedBrowser: Boolean(unguardedIframes?.protLoaded),
+      openIframeLoadedInUnguardedBrowser: Boolean(unguardedIframes?.openLoaded),
       worldParams: {
         attackNamed: attackNamed.params,
         attackAnon: attackAnon.params,
