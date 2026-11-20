@@ -1173,6 +1173,9 @@ pub fn redacted(info: &Value) -> Value {
         .unwrap_or_else(|| "about:blank".to_string());
     out["url"] = Value::String(origin.clone());
     out["title"] = Value::String(origin);
+    if out.get("name").is_some() {
+        out["name"] = Value::String(String::new());
+    }
     out
 }
 
@@ -1373,14 +1376,16 @@ mod tests {
 
     #[test]
     fn listing_keeps_only_the_origin() {
-        let info = json!({ "targetId": "T", "type": "page", "url": "https://seven.sliccy.ai/os/?k=secret", "title": "SECRET" });
+        let info = json!({ "targetId": "T", "type": "page", "url": "https://seven.sliccy.ai/os/?k=secret", "title": "SECRET", "name": "name-SECRET" });
         let out = redacted(&info);
         assert_eq!(out["url"], "https://seven.sliccy.ai");
         assert_eq!(out["title"], "https://seven.sliccy.ai");
+        assert_eq!(out["name"], "");
         assert_eq!(
             redacted(&json!({ "url": "about:blank", "title": "x" }))["url"],
             "about:blank"
         );
+        assert!(redacted(&json!({ "url": "https://seven.sliccy.ai/", "title": "t" })).get("name").is_none());
         assert_eq!(
             web_socket_as_http("WSS://seven.sliccy.ai/ws"),
             "https://seven.sliccy.ai/ws"
