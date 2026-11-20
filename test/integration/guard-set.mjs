@@ -391,6 +391,12 @@ function table(results) {
   ].join('\n');
 }
 
+function matchesGuardVectorFilter(only, id) {
+  if (!only) return true;
+  if (only.endsWith('*')) return id.startsWith(only.slice(0, -1));
+  return id === only;
+}
+
 export async function runPartition(t, id) {
   requireChrome();
   const selectedTargets = partitions[id];
@@ -404,7 +410,7 @@ export async function runPartition(t, id) {
         targets: vector.targets.filter((target) => selectedTargets.includes(target)),
       }))
       .filter((vector) => vector.targets.length)
-      .filter((vector) => !only || vector.id === only),
+      .filter((vector) => matchesGuardVectorFilter(only, vector.id)),
   };
   const started = Date.now();
   launched.length = 0;
@@ -717,7 +723,7 @@ export async function runPartition(t, id) {
       execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   });
   const expectedRows = only
-    ? rowsFor(selectedTargets).filter((row) => row.id === only)
+    ? rowsFor(selectedTargets).filter((row) => matchesGuardVectorFilter(only, row.id))
     : rowsFor(selectedTargets);
   const recorded = new Set(report.results.map(rowKey));
   const missing = new Set(report.missing.map(rowKey));
