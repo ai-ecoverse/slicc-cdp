@@ -29,7 +29,14 @@ fn lag_protected_lives() -> Vec<String> {
 }
 
 fn lag_origin(url: &str) -> String {
-    if url.starts_with("view-source:") || url.starts_with("blob:") || url.starts_with("filesystem:") {
+    if url == LAG_BLANK
+        || url.starts_with("view-source:")
+        || url.starts_with("blob:")
+        || url.starts_with("filesystem:")
+        || url.starts_with("chrome:")
+        || url.starts_with("chrome-untrusted:")
+        || url.starts_with("chrome-extension:")
+    {
         return "://".into();
     }
     url::Url::parse(url)
@@ -51,6 +58,7 @@ enum LagTreeMode {
     AlwaysLive,
     AlwaysBlank,
     SecondRead,
+    BlankThenTimeout,
 }
 
 struct LagState {
@@ -189,9 +197,20 @@ impl Transport for LagBrowser {
             json!({})
         } else if called == frame_tree {
             state.tree_reads += 1;
+            if state.tree_mode == LagTreeMode::BlankThenTimeout && state.tree_reads >= 2 {
+                self.inbox.push_back(
+                    json!({
+                        "id": call["id"],
+                        "sessionId": call["sessionId"],
+                        "error": { "message": "Page.getFrameTree timed out" },
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
             let frame = match state.tree_mode {
                 LagTreeMode::AlwaysLive => state.live.clone(),
-                LagTreeMode::AlwaysBlank => state.blank.clone(),
+                LagTreeMode::AlwaysBlank | LagTreeMode::BlankThenTimeout => state.blank.clone(),
                 LagTreeMode::SecondRead if state.tree_reads >= 2 => state.live.clone(),
                 LagTreeMode::SecondRead => state.blank.clone(),
             };
@@ -241,9 +260,50 @@ impl Transport for LagBrowser {
             })
         } else if called == net_body {
             json!({ "body": format!("net {LAG_MARK}"), "base64Encoded": false })
+        } else if called == enable_runtime {
+            let session = call["sessionId"].as_str().unwrap_or("");
+            let tree_url = match state.tree_mode {
+                LagTreeMode::AlwaysLive => state.live.get("url").and_then(Value::as_str).unwrap_or(LAG_BLANK),
+                LagTreeMode::AlwaysBlank | LagTreeMode::BlankThenTimeout => {
+                    state.blank.get("url").and_then(Value::as_str).unwrap_or(LAG_BLANK)
+                }
+                LagTreeMode::SecondRead if state.tree_reads >= 2 => {
+                    state.live.get("url").and_then(Value::as_str).unwrap_or(LAG_BLANK)
+                }
+                LagTreeMode::SecondRead => state.blank.get("url").and_then(Value::as_str).unwrap_or(LAG_BLANK),
+            };
+            let frame_id = state.blank.get("id").and_then(Value::as_str).unwrap_or("T");
+            let origin = if tree_url.starts_with("chrome:")
+                || tree_url.starts_with("chrome-untrusted:")
+                || tree_url.starts_with("chrome-extension:")
+            {
+                tree_url.to_string()
+            } else {
+                url::Url::parse(tree_url)
+                    .ok()
+                    .map(|parsed| parsed.origin().ascii_serialization())
+                    .filter(|text| text != "null")
+                    .unwrap_or_else(|| "https://ordinary.example".into())
+            };
+            self.inbox.push_back(
+                json!({
+                    "method": method("Runtime", "executionContextCreated"),
+                    "sessionId": session,
+                    "params": {
+                        "context": {
+                            "id": 1,
+                            "uniqueId": format!("ctx-{session}"),
+                            "origin": origin,
+                            "name": "",
+                            "auxData": { "frameId": frame_id, "isDefault": true },
+                        }
+                    },
+                })
+                .to_string(),
+            );
+            json!({})
         } else if called == nav
             || called == enable_page
-            || called == enable_runtime
             || called == enable_net
             || called == bypass
             || called == enable_fetch
@@ -440,20 +500,24 @@ fn mutation_rows_each_attach_gate_is_necessary() {
         "SecondRead+Never must not depend on reported-url latch alone"
     );
 
-    let (mut prompt_blank, _) = lag_client(&live, LagTreeMode::AlwaysBlank, LagInfoTiming::BeforeAttach);
-    let prompt_reply = prompt_blank.call(
+    let (mut exclusive, _) = lag_client(&live, LagTreeMode::AlwaysBlank, LagInfoTiming::BeforeAttach);
+    let exclusive_reply = exclusive.call(
         &method("Target", "attachToTarget"),
         json!({ "targetId": "T", "flatten": true }),
         None,
     );
     assert!(
-        prompt_reply.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
-        "drop cached-url latch would admit AlwaysBlank+BeforeAttach: {prompt_reply:?}"
+        exclusive_reply.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "drop reported-url latch would admit placeable-blank+protected-info: {exclusive_reply:?}"
     );
-    assert!(prompt_blank.is_protected_target("T"));
+    assert!(exclusive.is_protected_target("T"));
     assert!(
-        prompt_blank.reported_url_protected("T"),
-        "AlwaysBlank+BeforeAttach is carried by the reported-url latch"
+        exclusive.reported_url_protected("T"),
+        "exclusive reported-url cell must still see the protected reported url"
+    );
+    assert!(
+        exclusive.documents.get("T").is_none_or(|doc| !doc.previous || exclusive.is_protected_target("T")),
+        "reported-url latch must be what keeps the placeable blank from proving"
     );
 
     let (mut ordinary, state) = lag_client(
@@ -502,6 +566,155 @@ fn ordinary_blank_and_https_foreign_tabs_still_attach() {
         assert!(!cdp.is_protected_target("T"), "{live}");
         assert!(!cdp.session_blocked(session), "{live}");
     }
+}
+
+#[test]
+fn chrome_scheme_exceptions_and_opaque_pages_still_attach() {
+    for live in [
+        "chrome://new-tab-page/",
+        "chrome://new-tab-page",
+        "chrome-untrusted://new-tab-page/",
+    ] {
+        assert!(!super::Protected::default().url(live), "matcher must admit {live}");
+        assert!(super::Protected::default().opaque_document(live, true), "{live}");
+        let (mut cdp, state) = lag_client(live, LagTreeMode::AlwaysLive, LagInfoTiming::Never);
+        {
+            let mut state = state.borrow_mut();
+            state.info = lag_info(live);
+            state.live = lag_frame(live, "L1");
+            state.blank = lag_frame(live, "L1");
+        }
+        let reply = cdp
+            .call(
+                &method("Target", "attachToTarget"),
+                json!({ "targetId": "T", "flatten": true }),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("chromeUrlsAttach control refused for {live}: {err}"));
+        let session = reply["sessionId"].as_str().unwrap();
+        assert!(!cdp.is_protected_target("T"), "{live}");
+        assert!(!cdp.session_blocked(session), "{live}");
+        let evaluate = cdp.call(
+            &method("Runtime", "evaluate"),
+            json!({ "expression": "location.href", "returnByValue": true }),
+            Some(session),
+        );
+        assert!(evaluate.is_ok(), "{live}: {evaluate:?}");
+    }
+}
+
+#[test]
+fn protected_chrome_settings_extension_and_file_roots_refuse_and_latch() {
+    for live in [
+        "chrome://settings/",
+        "chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html",
+        "file:///",
+    ] {
+        assert!(super::Protected::default().url(live), "matcher must protect {live}");
+        let (mut cdp, state) = lag_client(live, LagTreeMode::AlwaysLive, LagInfoTiming::Never);
+        {
+            let mut state = state.borrow_mut();
+            state.info = lag_info(live);
+            state.live = lag_frame(live, "L1");
+            state.blank = lag_frame(live, "L1");
+        }
+        let reply = cdp.call(
+            &method("Target", "attachToTarget"),
+            json!({ "targetId": "T", "flatten": true }),
+            None,
+        );
+        assert!(
+            reply.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+            "{live}: {reply:?}"
+        );
+        assert!(cdp.is_protected_target("T"), "{live}");
+    }
+}
+
+#[test]
+fn blank_then_timeout_content_read_refuses_without_latching_and_retry_can_prove() {
+    let live = lag_wrap("view-source", &lag_vault_https());
+    let (mut cdp, state) = lag_client(&live, LagTreeMode::BlankThenTimeout, LagInfoTiming::Never);
+    let first = cdp.call(
+        &method("Target", "attachToTarget"),
+        json!({ "targetId": "T", "flatten": true }),
+        None,
+    );
+    assert!(
+        first.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "S1 blank-then-timeout must refuse: {first:?}"
+    );
+    assert!(
+        !cdp.is_protected_target("T"),
+        "O2: no-proof timeout must not latch protected"
+    );
+    {
+        let mut state = state.borrow_mut();
+        state.tree_mode = LagTreeMode::AlwaysLive;
+        state.tree_reads = 0;
+        state.info = lag_info("https://ordinary.example/doc");
+        state.live = lag_frame("https://ordinary.example/doc", "L9");
+        state.blank = lag_frame("https://ordinary.example/doc", "L9");
+        state.sessions.clear();
+    }
+    cdp.absorb(json!({
+        "method": method("Target", "targetInfoChanged"),
+        "params": { "targetInfo": lag_info("https://ordinary.example/doc") },
+    }));
+    let second = cdp
+        .call(
+            &method("Target", "attachToTarget"),
+            json!({ "targetId": "T", "flatten": true }),
+            None,
+        )
+        .expect("retry after no-proof refuse must admit a healthy ordinary tree");
+    assert!(!cdp.is_protected_target("T"));
+    assert!(!cdp.session_blocked(second["sessionId"].as_str().unwrap()));
+}
+
+#[test]
+fn always_blank_with_never_timing_admits_only_when_blank_is_the_proven_document() {
+    let (mut cdp, state) = lag_client(LAG_BLANK, LagTreeMode::AlwaysBlank, LagInfoTiming::Never);
+    {
+        let mut state = state.borrow_mut();
+        state.info = lag_info(LAG_BLANK);
+        state.live = lag_frame(LAG_BLANK, "L1");
+        state.blank = lag_frame(LAG_BLANK, "L0");
+    }
+    let reply = cdp
+        .call(
+            &method("Target", "attachToTarget"),
+            json!({ "targetId": "T", "flatten": true }),
+            None,
+        )
+        .expect("AlwaysBlank+Never with blank reported must prove ordinary blank");
+    assert!(!cdp.is_protected_target("T"));
+    assert!(!cdp.session_blocked(reply["sessionId"].as_str().unwrap()));
+}
+
+#[test]
+fn positive_proof_requirement_refuses_absence_of_protected_shapes() {
+    let live = lag_wrap("view-source", &lag_vault_https());
+    let (mut timeout, _) = lag_client(&live, LagTreeMode::BlankThenTimeout, LagInfoTiming::Never);
+    let timeout_reply = timeout.call(
+        &method("Target", "attachToTarget"),
+        json!({ "targetId": "T", "flatten": true }),
+        None,
+    );
+    assert!(timeout_reply.is_err(), "{timeout_reply:?}");
+    assert!(!timeout.is_protected_target("T"));
+    assert!(!timeout.attach_document_proven("T"));
+    assert!(!timeout.attach_content_ok.contains("T"));
+
+    let (mut empty, state) = lag_client(&live, LagTreeMode::AlwaysLive, LagInfoTiming::Never);
+    {
+        let mut state = state.borrow_mut();
+        state.tree_mode = LagTreeMode::BlankThenTimeout;
+        state.tree_reads = 1;
+    }
+    empty.attach_content_ok.clear();
+    empty.documents.remove("T");
+    assert!(!empty.attach_document_proven("T"), "empty documents is not positive proof");
 }
 
 #[test]

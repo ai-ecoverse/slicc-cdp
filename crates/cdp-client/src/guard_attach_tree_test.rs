@@ -47,7 +47,7 @@ const ATTACH_SEVEN: &str = "http://seven.sliccy.ai/dump?n=main";
 fn attach_during(during_read: Option<Value>) -> (Cdp, String, std::rc::Rc<std::cell::RefCell<AttachBrowser>>) {
     let browser = std::rc::Rc::new(std::cell::RefCell::new(AttachBrowser {
         url: ATTACH_LANDING.into(),
-        main: json!({ "id": "T", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
+        main: json!({ "id": "T", "loaderId": "L", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
         during_read,
         attaching: true,
     }));
@@ -93,7 +93,7 @@ fn a_main_frame_update_during_the_guard_tree_read_still_fails_closed() {
     let update = json!({ "method": "Page.navigatedWithinDocument", "sessionId": "G", "params": { "frameId": "T", "url": format!("{ATTACH_LANDING}#moved") } });
     let browser = std::rc::Rc::new(std::cell::RefCell::new(AttachBrowser {
         url: ATTACH_LANDING.into(),
-        main: json!({ "id": "T", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
+        main: json!({ "id": "T", "loaderId": "L", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
         during_read: Some(update),
         attaching: true,
     }));

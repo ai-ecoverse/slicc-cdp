@@ -479,28 +479,18 @@ fn distinct_frame_id_get_targets_first_is_reversible_after_placement() {
     let first = cdp.call("Target.getTargets", json!({}), None).unwrap();
     assert!(!first["targetInfos"].as_array().unwrap().iter().any(|info| info["targetId"] == "OOPIF"), "unplaced OOPIF must hide: {first}");
     assert!(!cdp.is_protected_target("OOPIF"), "unresolved ancestor must not latch protected_targets");
-    let page_attach = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
-    let page_session = page_attach["sessionId"].as_str().unwrap().to_string();
     browser.borrow_mut().trees.insert("PAGE".into(), json!({
         "frameTree":{"frame":{"id":"FRAME","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"L"}}
     }));
+    let page_attach = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
+    let page_session = page_attach["sessionId"].as_str().unwrap().to_string();
     let _ = cdp.call("Page.getFrameTree", json!({}), Some(&page_session));
-    cdp.documents.insert("PAGE".into(), super::MainDocument {
-        frame_id: "FRAME".into(),
-        loader_id: String::new(),
-        proof_frame_id: String::new(),
-        proof_loader_id: String::new(),
-        url: "https://ordinary.test/".into(),
-        origin: "https://ordinary.test".into(),
-        unreachable_url: String::new(),
-        navigating: false,
-        navigation_url: String::new(),
-        previous: false,
-        probed: false,
-    });
     cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
     let second = cdp.call("Target.getTargets", json!({}), None).unwrap();
     assert!(second["targetInfos"].as_array().unwrap().iter().any(|info| info["targetId"] == "OOPIF"), "placed OOPIF must list: {second}");
+    browser.borrow_mut().trees.insert("OOPIF".into(), json!({
+        "frameTree":{"frame":{"id":"OOPIF","parentId":"FRAME","url":"https://foreign.test/excel","securityOrigin":"https://foreign.test","loaderId":"F"}}
+    }));
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
     assert!(attach.is_ok(), "placed OOPIF must attach: {attach:?}");
 }
@@ -508,28 +498,18 @@ fn distinct_frame_id_get_targets_first_is_reversible_after_placement() {
 #[test]
 fn distinct_frame_id_attach_first_keeps_excel_oopif_working() {
     let (mut cdp, browser, _) = logging_browser(distinct_infos());
-    let page_attach = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
-    let page_session = page_attach["sessionId"].as_str().unwrap().to_string();
     browser.borrow_mut().trees.insert("PAGE".into(), json!({
         "frameTree":{"frame":{"id":"FRAME","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"L"}}
     }));
+    let page_attach = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
+    let page_session = page_attach["sessionId"].as_str().unwrap().to_string();
     let _ = cdp.call("Page.getFrameTree", json!({}), Some(&page_session));
-    cdp.documents.insert("PAGE".into(), super::MainDocument {
-        frame_id: "FRAME".into(),
-        loader_id: String::new(),
-        proof_frame_id: String::new(),
-        proof_loader_id: String::new(),
-        url: "https://ordinary.test/".into(),
-        origin: "https://ordinary.test".into(),
-        unreachable_url: String::new(),
-        navigating: false,
-        navigation_url: String::new(),
-        previous: false,
-        probed: false,
-    });
     cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
     let listed = cdp.call("Target.getTargets", json!({}), None).unwrap();
     assert!(listed["targetInfos"].as_array().unwrap().iter().any(|info| info["targetId"] == "OOPIF"), "{listed}");
+    browser.borrow_mut().trees.insert("OOPIF".into(), json!({
+        "frameTree":{"frame":{"id":"OOPIF","parentId":"FRAME","url":"https://foreign.test/excel","securityOrigin":"https://foreign.test","loaderId":"F"}}
+    }));
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None).unwrap();
     let session = attach["sessionId"].as_str().unwrap().to_string();
     assert!(cdp.call("Network.enable", json!({}), Some(&session)).is_ok());
@@ -966,21 +946,11 @@ fn top_level_page_protect_detaches_like_main() {
 #[test]
 fn top_level_page_protected_document_fails_like_main() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
-    let (mut cdp, _browser, sent) = logging_browser(vec![page.clone()]);
+    let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
     cdp.targets.insert("PAGE".into(), page);
-    cdp.documents.insert("PAGE".into(), super::MainDocument {
-        frame_id: "PAGE".into(),
-        loader_id: String::new(),
-        proof_frame_id: String::new(),
-        proof_loader_id: String::new(),
-        url: "https://ordinary.test/".into(),
-        origin: "https://ordinary.test".into(),
-        unreachable_url: String::new(),
-        navigating: false,
-        navigation_url: String::new(),
-        previous: false,
-        probed: false,
-    });
+    browser.borrow_mut().trees.insert("PAGE".into(), json!({
+        "frameTree":{"frame":{"id":"PAGE","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"L"}}
+    }));
     let attached = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
     let session = attached["sessionId"].as_str().unwrap().to_string();
     cdp.call("Fetch.enable", json!({"patterns":[{"urlPattern":"*"}]}), Some(&session)).unwrap();
@@ -1005,19 +975,9 @@ fn page_commit_seven_detaches_and_continues_queued_non_document() {
     let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
     let (mut cdp, browser, sent) = logging_browser(vec![page.clone()]);
     cdp.targets.insert("PAGE".into(), page.clone());
-    cdp.documents.insert("PAGE".into(), super::MainDocument {
-        frame_id: "PAGE".into(),
-        loader_id: String::new(),
-        proof_frame_id: String::new(),
-        proof_loader_id: String::new(),
-        url: "https://ordinary.test/".into(),
-        origin: "https://ordinary.test".into(),
-        unreachable_url: String::new(),
-        navigating: false,
-        navigation_url: String::new(),
-        previous: false,
-        probed: false,
-    });
+    browser.borrow_mut().trees.insert("PAGE".into(), json!({
+        "frameTree":{"frame":{"id":"PAGE","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"L"}}
+    }));
     let attached = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
     let session = attached["sessionId"].as_str().unwrap().to_string();
     cdp.call("Fetch.enable", json!({"patterns":[{"urlPattern":"*"}]}), Some(&session)).unwrap();
