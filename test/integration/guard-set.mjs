@@ -393,8 +393,12 @@ function table(results) {
 
 function matchesGuardVectorFilter(only, id) {
   if (!only) return true;
-  if (only.endsWith('*')) return id.startsWith(only.slice(0, -1));
-  return id === only;
+  return only.split(',').some((token) => {
+    const part = token.trim();
+    if (!part) return false;
+    if (part.endsWith('*')) return id.startsWith(part.slice(0, -1));
+    return id === part;
+  });
 }
 
 export async function runPartition(t, id) {
