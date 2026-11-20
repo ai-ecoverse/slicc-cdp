@@ -116,15 +116,30 @@ impl Transport for PopupBrowser {
                 }
                 json!({})
             }
-            "Page.getFrameTree" if target != "O" => match state.frame.clone() {
-                PopupFrame::Frame(frame) => json!({"frameTree":{"frame":frame}}),
-                PopupFrame::Tree(tree) => tree,
-                PopupFrame::Error => {
-                    self.inbox.push_back(json!({"id":call["id"],"sessionId":call["sessionId"],"error":{"code":-32000,"message":"Inspected target navigated or closed"}}).to_string());
-                    return Ok(());
+            "Page.getFrameTree" if target != "O" => {
+                let session = call["sessionId"].as_str().unwrap_or("");
+                let (tree, frame_id, origin) = match state.frame.clone() {
+                    PopupFrame::Frame(frame) => {
+                        let id = frame.get("id").and_then(Value::as_str).unwrap_or("T").to_string();
+                        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("https://example.test").to_string();
+                        (json!({"frameTree":{"frame":frame}}), id, origin)
+                    }
+                    PopupFrame::Tree(tree) => {
+                        let id = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).unwrap_or("T").to_string();
+                        let origin = tree.pointer("/frameTree/frame/securityOrigin").and_then(Value::as_str).unwrap_or("https://example.test").to_string();
+                        (tree, id, origin)
+                    }
+                    PopupFrame::Error => {
+                        self.inbox.push_back(json!({"id":call["id"],"sessionId":call["sessionId"],"error":{"code":-32000,"message":"Inspected target navigated or closed"}}).to_string());
+                        return Ok(());
+                    }
+                    PopupFrame::Silent => return Ok(()),
+                };
+                if !session.is_empty() {
+                    self.inbox.push_back(json!({"method":"Runtime.executionContextCreated","sessionId":session,"params":{"context":{"id":1,"uniqueId":format!("ctx-{session}"),"origin":origin,"name":"","auxData":{"frameId":frame_id,"isDefault":true}}}}).to_string());
                 }
-                PopupFrame::Silent => return Ok(()),
-            },
+                tree
+            }
             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"O","loaderId":"LO","url":"https://example.test/opener","securityOrigin":"https://example.test","mimeType":"text/html"}}}),
             "Page.getNavigationHistory" => {
                 let unreachable = match &state.frame {
@@ -154,8 +169,28 @@ impl Transport for PopupBrowser {
             "Page.printToPDF" => json!({"data":"JVBERi0="}),
             "Network.getResponseBody" => json!({"body":format!("net {}", state.popup),"base64Encoded":false}),
             "DOM.getDocument" => json!({"root":{"nodeId":1,"nodeName":"HTML","documentURL":state.popup["url"].clone()}}),
+            "DOM.describeNode" => {
+                let name = match &state.frame {
+                    PopupFrame::Frame(frame) => frame.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    PopupFrame::Tree(tree) => tree.pointer("/frameTree/childFrames/0/frame/name").or_else(|| tree.pointer("/frameTree/frame/name")).and_then(Value::as_str).unwrap_or("").to_string(),
+                    _ => String::new(),
+                };
+                json!({"node":{"nodeId":2,"backendNodeId":2,"nodeName":"IFRAME","localName":"iframe","attributes":["name", name]}})
+            }
             "Runtime.callFunctionOn" => json!({"result":{"type":"string","value":"document-read"}}),
-            "Runtime.evaluate" => json!({"result":{"type":"string","value":"document-read"}}),
+            "Runtime.evaluate" => {
+                let expr = call["params"]["expression"].as_str().unwrap_or("");
+                let name = match &state.frame {
+                    PopupFrame::Frame(frame) => frame.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    PopupFrame::Tree(tree) => tree.pointer("/frameTree/childFrames/0/frame/name").or_else(|| tree.pointer("/frameTree/frame/name")).and_then(Value::as_str).unwrap_or("").to_string(),
+                    _ => String::new(),
+                };
+                if expr.contains("window.name") {
+                    json!({"result":{"type":"string","value":name}})
+                } else {
+                    json!({"result":{"type":"string","value":"document-read"}})
+                }
+            }
             _ => json!({}),
         };
         self.inbox.push_back(reply(result));
@@ -1336,4 +1371,76 @@ fn an_attached_session_hides_other_failed_host_carriers_for_a_protected_failed_l
             assert!(!name.eq_ignore_ascii_case(host), "executionContext name={name}");
         }
     }
+}
+
+#[test]
+fn an_ordinary_iframe_named_like_a_protected_host_keeps_its_frame_name() {
+    let host_name = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let tree = json!({
+        "frameTree": {
+            "frame": {"id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html","name":""},
+            "childFrames": [{
+                "frame": {"id":"IF","loaderId":"LIF","url":"https://example.test/inner","securityOrigin":"https://example.test","mimeType":"text/html","name":host_name}
+            }]
+        }
+    });
+    let state = own_state(start.clone(), PopupFrame::Tree(tree.clone()));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let listed = cdp.call("Page.getFrameTree", json!({}), Some(&live)).unwrap();
+    assert_eq!(listed.pointer("/frameTree/childFrames/0/frame/name").and_then(Value::as_str), Some(host_name));
+    assert_eq!(listed.pointer("/frameTree/childFrames/0/frame/url").and_then(Value::as_str), Some("https://example.test/inner"));
+    let resources = cdp.call("Page.getResourceTree", json!({}), Some(&live)).unwrap();
+    assert_eq!(resources.pointer("/frameTree/childFrames/0/frame/name").and_then(Value::as_str), Some(host_name));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":{"id":"IF","loaderId":"LIF","url":"https://example.test/inner","securityOrigin":"https://example.test","mimeType":"text/html","name":host_name},"type":"Navigation"}}));
+    let navigated = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.frameNavigated").expect("frameNavigated");
+    assert_eq!(navigated.pointer("/params/frame/name").and_then(Value::as_str), Some(host_name));
+}
+
+#[test]
+fn an_ordinary_iframe_name_survives_next_to_a_protected_sibling_iframe() {
+    let start = own_info("https://example.test/start", "start");
+    let tree = json!({
+        "frameTree": {
+            "frame": {"id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html","name":""},
+            "childFrames": [
+                {"frame": {"id":"PLAIN","loaderId":"LP","url":"https://example.test/plain","securityOrigin":"https://example.test","mimeType":"text/html","name":"plain-frame"}},
+                {"frame": {"id":"PROT","loaderId":"LR","url":"https://seven.sliccy.ai/path/STALE_PROOF_MARKER","securityOrigin":"https://seven.sliccy.ai","mimeType":"text/html","name":"seven.sliccy.ai"}}
+            ]
+        }
+    });
+    let state = own_state(start.clone(), PopupFrame::Tree(tree));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let listed = cdp.call("Page.getFrameTree", json!({}), Some(&live)).unwrap();
+    let children = listed.pointer("/frameTree/childFrames").and_then(Value::as_array).expect("children");
+    let plain = children.iter().find(|node| node.pointer("/frame/id") == Some(&json!("PLAIN"))).expect("plain");
+    let protected = children.iter().find(|node| node.pointer("/frame/id") == Some(&json!("PROT"))).expect("protected");
+    assert_eq!(plain.pointer("/frame/name").and_then(Value::as_str), Some("plain-frame"));
+    assert_eq!(protected.pointer("/frame/name").and_then(Value::as_str), Some(""));
+    assert!(!listed.to_string().contains("STALE_PROOF_MARKER"), "{listed}");
+}
+
+#[test]
+fn window_name_and_dom_frame_name_on_an_ordinary_page_are_not_blanked() {
+    let host_name = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let frame = json!({"id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html","name":host_name});
+    let state = own_state(start.clone(), PopupFrame::Frame(frame.clone()));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":frame.clone(),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":frame,"type":"Navigation"}}));
+    let _ = cdp.call("Runtime.enable", json!({}), Some(&live));
+    let evaluated = cdp.call("Runtime.evaluate", json!({"expression":"window.name"}), Some(&live)).unwrap();
+    assert_eq!(evaluated.pointer("/result/value").and_then(Value::as_str), Some(host_name));
+    let described = cdp.call("DOM.describeNode", json!({"nodeId":2}), Some(&live)).unwrap();
+    let attrs = described.pointer("/node/attributes").and_then(Value::as_array).expect("attrs");
+    assert!(attrs.windows(2).any(|pair| pair[0] == "name" && pair[1] == host_name), "{described}");
 }
