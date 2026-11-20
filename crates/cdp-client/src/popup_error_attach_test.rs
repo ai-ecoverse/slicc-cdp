@@ -1072,3 +1072,84 @@ fn the_same_ordinary_host_on_a_second_load_after_a_protected_one_needs_its_own_p
     assert_eq!(tab["title"], "ordinary.invalid");
     assert_eq!(tab["url"], POPUP_ERROR);
 }
+
+#[test]
+fn a_stale_proof_loader_id_after_loader_advance_stays_unproven_on_the_read_gate() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let _ = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame("L1", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L1", STALE_ORDINARY),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+    let doc = cdp.documents.get_mut("T").expect("doc");
+    assert_eq!(doc.proof_loader_id, "L1");
+    doc.loader_id = "L2".into();
+    assert!(cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")), "read-side document match must refuse a stale proof loader when unreachable still matches the title");
+}
+
+#[test]
+fn a_reused_target_id_after_abandon_and_destroy_is_probeable_again() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    cdp.abandon("T");
+    assert!(cdp.abandoned.contains("T"));
+    cdp.probing.insert("T".into());
+    cdp.session_targets.insert("STALE".into(), "T".into());
+    let _ = cdp.call("Target.detachFromTarget", json!({"sessionId":live}), None);
+    cdp.absorb(json!({"method":"Target.targetDestroyed","params":{"targetId":"T"}}));
+    assert!(!cdp.abandoned.contains("T"), "destroy must clear abandoned so a reused id stays probeable");
+    assert!(!cdp.probing.contains("T"), "destroy must clear probing");
+    assert!(!cdp.session_targets.values().any(|owner| owner == "T"), "destroy must drop session maps to the destroyed id");
+    assert!(!cdp.client_targets.contains("T"));
+    assert!(!cdp.protected_targets.contains("T"));
+    let reused = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = reused.clone();
+        state.frame = PopupFrame::Frame(own_error_frame("LR", STALE_PROTECTED));
+        state.sessions.clear();
+    }
+    cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":reused.clone()}}));
+    assert!(cdp.probe_candidate(&reused), "reused id must not stay sticky-abandoned");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":reused}}));
+    for event in &cdp.events()[mark..] {
+        assert_surface_clean(event, "abandon-reuse");
+        if event["params"]["targetInfo"]["targetId"] == "T" {
+            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
+        }
+    }
+}
+
+#[test]
+fn a_unicode_idn_title_versus_punycode_unreachable_stays_unproven_by_design() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let _ = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let punycode = "http://xn--bcher-kva.test/doc";
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "xn--bcher-kva.test");
+        state.frame = PopupFrame::Frame(own_error_frame("L1", punycode));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L1", punycode),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "xn--bcher-kva.test")));
+    assert!(cdp.error_unproven(&own_info(POPUP_ERROR, "bücher.test")), "unicode IDN title vs punycode unreachable is fail-closed over-scrub by design");
+}
