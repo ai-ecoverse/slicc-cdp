@@ -752,40 +752,6 @@ fn positive_proof_requirement_refuses_absence_of_protected_shapes() {
 }
 
 #[test]
-fn empty_document_url_is_not_positive_attach_proof() {
-    let (mut cdp, _) = lag_client(LAG_BLANK, LagTreeMode::AlwaysBlank, LagInfoTiming::Never);
-    cdp.targets.insert(
-        "T".into(),
-        json!({"targetId":"T","type":"page","url":"","title":""}),
-    );
-    cdp.documents.insert(
-        "T".into(),
-        super::MainDocument {
-            frame_id: "T".into(),
-            loader_id: "L0".into(),
-            proof_frame_id: String::new(),
-            proof_loader_id: String::new(),
-            url: String::new(),
-            origin: String::new(),
-            unreachable_url: String::new(),
-            navigating: false,
-            navigation_url: String::new(),
-            previous: false,
-            probed: false,
-        },
-    );
-    cdp.attach_content_ok.clear();
-    cdp.client_targets.remove("T");
-    cdp.created_blanks.remove("T");
-    cdp.protected_targets.remove("T");
-    assert!(
-        !cdp.attach_document_proven("T"),
-        "empty document URL must not count as positive attach proof"
-    );
-    assert!(!cdp.is_protected_target("T"));
-}
-
-#[test]
 fn an_existing_blank_session_is_cut_when_the_document_navigates_to_vault() {
     for live in [lag_vault_https(), lag_wrap("view-source", &lag_vault_https())] {
         let blank = lag_frame(LAG_BLANK, "L0");

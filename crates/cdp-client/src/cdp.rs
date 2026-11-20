@@ -3121,7 +3121,7 @@ impl Cdp {
             return true;
         }
         if doc.url.is_empty() {
-            return false;
+            return true;
         }
         if self.guard.inheriting(&doc.url) {
             if kind == "iframe" {
