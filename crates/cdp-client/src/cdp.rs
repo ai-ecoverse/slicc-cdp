@@ -4331,6 +4331,7 @@ impl Cdp {
                     owned_frames.insert(target.to_string());
                     self.guards.remove(target);
                     self.targets.remove(target);
+                    self.kept_url_latch.remove(target);
                     self.client_targets.remove(target);
                     self.probing.remove(target);
                     self.created_blanks.remove(target);
