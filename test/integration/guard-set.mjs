@@ -412,6 +412,10 @@ export async function runPartition(t, id) {
       .filter((vector) => vector.targets.length)
       .filter((vector) => matchesGuardVectorFilter(only, vector.id)),
   };
+  if (only && set.vectors.length === 0) {
+    t.diagnostic(`quiet filter ${only}: partition ${id} has no matching vectors`);
+    return;
+  }
   const started = Date.now();
   launched.length = 0;
   const stopLoad = watchLoad();
