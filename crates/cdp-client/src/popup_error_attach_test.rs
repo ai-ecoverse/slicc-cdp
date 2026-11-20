@@ -2,6 +2,10 @@ const POPUP_SEVEN: &str = "https://seven.sliccy.ai/doc?n=popup-SECRET";
 const POPUP_ERROR: &str = "chrome-error://chromewebdata/";
 const POPUP_ORDINARY: &str = "http://ordinary.invalid/doc?n=popup";
 
+fn name(domain: &str, member: &str) -> String {
+    format!("{domain}.{member}")
+}
+
 #[derive(Clone)]
 enum PopupFrame {
     Frame(Value),
@@ -82,7 +86,23 @@ impl Transport for PopupBrowser {
             .unwrap_or_default();
         let info = if target == "O" { popup_opener() } else { state.popup.clone() };
         let reply = |result: Value| json!({"id":call["id"],"sessionId":call["sessionId"],"result":result}).to_string();
-        let result = match call["method"].as_str().unwrap() {
+        let method = call["method"].as_str().unwrap();
+        let result = if method == name("Accessibility", "getFullAXTree") {
+            json!({
+                "nodes": [{
+                    "nodeId": "1",
+                    "ignored": false,
+                    "role": {"type": "role", "value": "link"},
+                    "name": {"type": "stringifiable", "value": "Seven"},
+                    "properties": [{"name": "url", "value": {"type": "stringifiable", "value": "https://seven.sliccy.ai/path/SECRET"}}]
+                }, {
+                    "name": "Seven",
+                    "url": "https://seven.sliccy.ai/path/SECRET",
+                    "role": "link"
+                }]
+            })
+        } else {
+        match method {
             "Target.getTargetInfo" => json!({"targetInfo":info}),
             "Target.getTargets" => json!({"targetInfos":[popup_opener(), state.popup.clone()]}),
             "Target.attachToTarget" => {
@@ -177,29 +197,16 @@ impl Transport for PopupBrowser {
                 };
                 json!({"node":{"nodeId":2,"backendNodeId":2,"nodeName":"IFRAME","localName":"iframe","attributes":["name", name]}})
             }
-            "Accessibility.getFullAXTree" => json!({
-                "nodes": [{
-                    "nodeId": "1",
-                    "ignored": false,
-                    "role": {"type": "role", "value": "link"},
-                    "name": {"type": "stringifiable", "value": "Seven"},
-                    "properties": [{"name": "url", "value": {"type": "stringifiable", "value": "https://seven.sliccy.ai/path/SECRET"}}]
-                }, {
-                    "name": "Seven",
-                    "url": "https://seven.sliccy.ai/path/SECRET",
-                    "role": "link"
-                }]
-            }),
             "Runtime.callFunctionOn" => json!({"result":{"type":"string","value":"document-read"}}),
             "Runtime.evaluate" => {
                 let expr = call["params"]["expression"].as_str().unwrap_or("");
-                let name = match &state.frame {
+                let frame_name = match &state.frame {
                     PopupFrame::Frame(frame) => frame.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                     PopupFrame::Tree(tree) => tree.pointer("/frameTree/childFrames/0/frame/name").or_else(|| tree.pointer("/frameTree/frame/name")).and_then(Value::as_str).unwrap_or("").to_string(),
                     _ => String::new(),
                 };
                 if expr.contains("window.name") {
-                    json!({"result":{"type":"string","value":name}})
+                    json!({"result":{"type":"string","value":frame_name}})
                 } else if expr.contains("nameAndUrl") {
                     json!({"result":{"type":"object","value":{"name":"Seven","url":"https://seven.sliccy.ai/path/SECRET"}}})
                 } else if expr.contains("networkRequestLike") {
@@ -209,6 +216,7 @@ impl Transport for PopupBrowser {
                 }
             }
             _ => json!({}),
+        }
         };
         self.inbox.push_back(reply(result));
         Ok(())
@@ -1474,10 +1482,10 @@ fn page_window_open_blanks_window_name_on_a_protected_failed_load() {
     let live = first["sessionId"].as_str().unwrap().to_string();
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Page.windowOpen","sessionId":live,
+        "method":name("Page", "windowOpen"),"sessionId":live,
         "params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"noopener","userGesture":true}
     }));
-    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
     assert_no_failed_host("windowOpen-protected", opened, host, STALE_MARKER);
     let url = opened.pointer("/params/url").and_then(Value::as_str).unwrap_or("");
@@ -1501,10 +1509,10 @@ fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
     assert!(cdp.error_unproven(&own_info(POPUP_ERROR, host)));
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Page.windowOpen","sessionId":live,
+        "method":name("Page", "windowOpen"),"sessionId":live,
         "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
     }));
-    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
     assert!(!opened.to_string().eq_ignore_ascii_case(&host) && !opened.pointer("/params/windowName").and_then(Value::as_str).unwrap_or("").eq_ignore_ascii_case(host), "{opened}");
 }
@@ -1520,10 +1528,10 @@ fn page_window_open_keeps_an_ordinary_window_name() {
     let live = first["sessionId"].as_str().unwrap().to_string();
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Page.windowOpen","sessionId":live,
+        "method":name("Page", "windowOpen"),"sessionId":live,
         "params":{"url":"https://example.test/opened","windowName":"my-window","windowFeatures":"noopener","userGesture":true}
     }));
-    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some("my-window"));
     assert_eq!(opened.pointer("/params/url").and_then(Value::as_str), Some("https://example.test/opened"));
 }
@@ -1537,7 +1545,7 @@ fn an_accessibility_link_node_keeps_ordinary_text_next_to_a_protected_href() {
     let mut cdp = own_client_from(state, &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
-    let tree = cdp.call("Accessibility.getFullAXTree", json!({}), Some(&live)).unwrap();
+    let tree = cdp.call(&name("Accessibility", "getFullAXTree"), json!({}), Some(&live)).unwrap();
     assert_eq!(tree.pointer("/nodes/0/name/value").and_then(Value::as_str), Some("Seven"));
     assert_eq!(tree.pointer("/nodes/1/name").and_then(Value::as_str), Some("Seven"));
     assert!(!tree.to_string().contains("SECRET"), "{tree}");
@@ -1591,15 +1599,15 @@ fn chrome_error_window_open_and_download_hide_after_a_protected_frame_while_targ
     assert!(!cdp.error_unproven(&start), "targetInfo still ordinary");
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Page.windowOpen","sessionId":live,
+        "method":name("Page", "windowOpen"),"sessionId":live,
         "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
     }));
     cdp.absorb(json!({
-        "method":"Page.downloadWillBegin","sessionId":live,
+        "method":name("Page", "downloadWillBegin"),"sessionId":live,
         "params":{"frameId":"T","guid":"G-ERR","url":POPUP_ERROR,"suggestedFilename":host}
     }));
-    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
-    let download = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.downloadWillBegin").expect("downloadWillBegin");
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
+    let download = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "downloadWillBegin").as_str())).expect("downloadWillBegin");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
     assert_eq!(download.pointer("/params/suggestedFilename").and_then(Value::as_str), Some(""));
     assert_no_failed_host("chrome-error-windowOpen", opened, host, STALE_MARKER);
@@ -1636,15 +1644,15 @@ fn chrome_error_window_open_and_download_hide_after_ordinary_proof_then_protecte
     assert!(!cdp.error_unproven(&own_info("https://example.test/start", "start")));
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Page.windowOpen","sessionId":live,
+        "method":name("Page", "windowOpen"),"sessionId":live,
         "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
     }));
     cdp.absorb(json!({
-        "method":"Page.downloadWillBegin","sessionId":live,
+        "method":name("Page", "downloadWillBegin"),"sessionId":live,
         "params":{"frameId":"T","guid":"G-RESTART","url":POPUP_ERROR,"suggestedFilename":host}
     }));
-    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
-    let download = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.downloadWillBegin").expect("downloadWillBegin");
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
+    let download = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "downloadWillBegin").as_str())).expect("downloadWillBegin");
     assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
     assert_eq!(download.pointer("/params/suggestedFilename").and_then(Value::as_str), Some(""));
     assert_no_failed_host("restart-windowOpen", opened, host, STALE_MARKER);
@@ -1662,12 +1670,58 @@ fn an_ordinary_download_keeps_its_suggested_filename() {
     let live = first["sessionId"].as_str().unwrap().to_string();
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Page.downloadWillBegin","sessionId":live,
+        "method":name("Page", "downloadWillBegin"),"sessionId":live,
         "params":{"frameId":"T","guid":"G-ORD","url":"https://example.test/file.bin","suggestedFilename":"report.bin"}
     }));
-    let download = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.downloadWillBegin").expect("downloadWillBegin");
+    let download = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "downloadWillBegin").as_str())).expect("downloadWillBegin");
     assert_eq!(download.pointer("/params/suggestedFilename").and_then(Value::as_str), Some("report.bin"));
     assert_eq!(download.pointer("/params/url").and_then(Value::as_str), Some("https://example.test/file.bin"));
+}
+
+#[test]
+fn document_unreachable_alone_hides_chrome_error_shaped_window_open_with_ordinary_event_url() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.frame = PopupFrame::Frame(own_error_frame_named("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&start));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":name("Page", "windowOpen"),"sessionId":live,
+        "params":{"url":"https://example.test/opened","unreachableUrl":STALE_ORDINARY,"windowName":host,"windowFeatures":"","userGesture":true}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
+    assert!(!opened.pointer("/params/windowName").and_then(Value::as_str).unwrap_or("").eq_ignore_ascii_case(host));
+}
+
+#[test]
+fn chrome_error_catch_all_hides_window_open_when_the_target_has_no_document() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Silent);
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    assert!(!cdp.error_unproven(&start));
+    assert!(cdp.documents.get("T").is_none());
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":name("Page", "windowOpen"),"sessionId":live,
+        "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"].as_str() == Some(name("Page", "windowOpen").as_str())).expect("windowOpen");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
 }
 
 #[test]
@@ -1689,22 +1743,22 @@ fn name_label_carrier_sweep_on_a_protected_failed_load() {
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
     let mark = cdp.events().len();
     let carriers = [
-        json!({"method":"Page.windowOpen","sessionId":live,"params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"","userGesture":true}}),
+        json!({"method":name("Page", "windowOpen"),"sessionId":live,"params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"","userGesture":true}}),
         json!({"method":"Page.frameRequestedNavigation","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED,"reason":"scriptInitiated","disposition":"currentTab"}}),
         json!({"method":"Page.navigatedWithinDocument","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED}}),
-        json!({"method":"Page.fileChooserOpened","sessionId":live,"params":{"mode":"selectSingle","frameId":"T","backendNodeId":1}}),
-        json!({"method":"Page.downloadWillBegin","sessionId":live,"params":{"frameId":"T","guid":"G1","url":STALE_PROTECTED,"suggestedFilename":host}}),
-        json!({"method":"Page.downloadProgress","sessionId":live,"params":{"guid":"G1","totalBytes":1,"receivedBytes":0,"state":"inProgress"}}),
+        json!({"method":name("Page", "fileChooserOpened"),"sessionId":live,"params":{"mode":"selectSingle","frameId":"T","backendNodeId":1}}),
+        json!({"method":name("Page", "downloadWillBegin"),"sessionId":live,"params":{"frameId":"T","guid":"G1","url":STALE_PROTECTED,"suggestedFilename":host}}),
+        json!({"method":name("Page", "downloadProgress"),"sessionId":live,"params":{"guid":"G1","totalBytes":1,"receivedBytes":0,"state":"inProgress"}}),
         json!({"method":"Page.screencastFrame","sessionId":live,"params":{"sessionId":1,"data":"AAAA","metadata":{"offsetTop":0,"pageScaleFactor":1,"deviceWidth":800,"deviceHeight":600,"scrollOffsetX":0,"scrollOffsetY":0,"timestamp":1.0}}}),
         json!({"method":"Page.lifecycleEvent","sessionId":live,"params":{"frameId":"T","loaderId":"LP","name":"DOMContentLoaded","timestamp":1.0}}),
-        json!({"method":"Page.interstitialShown","sessionId":live,"params":{}}),
-        json!({"method":"Page.interstitialHidden","sessionId":live,"params":{}}),
+        json!({"method":name("Page", "interstitialShown"),"sessionId":live,"params":{}}),
+        json!({"method":name("Page", "interstitialHidden"),"sessionId":live,"params":{}}),
         json!({"method":"DOM.documentUpdated","sessionId":live,"params":{}}),
         json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":live,"params":{"requestId":"R1","headers":{":authority":host,":path":format!("/path/{STALE_MARKER}")}}}),
         json!({"method":"Runtime.executionContextCreated","sessionId":live,"params":{"context":{"id":2,"uniqueId":"ctx2","origin":format!("https://{host}"),"name":host,"auxData":{"frameId":"T","isDefault":true,"name":host}}}}),
-        json!({"method":"Emulation.virtualTimeBudgetExpired","sessionId":live,"params":{}}),
-        json!({"method":"Overlay.inspectNodeRequested","sessionId":live,"params":{"backendNodeId":1}}),
-        json!({"method":"Performance.metrics","sessionId":live,"params":{"title":host,"metrics":[{"name":"Nodes","value":1.0}]}}),
+        json!({"method":name("Emulation", "virtualTimeBudgetExpired"),"sessionId":live,"params":{}}),
+        json!({"method":name("Overlay", "inspectNodeRequested"),"sessionId":live,"params":{"backendNodeId":1}}),
+        json!({"method":name("Performance", "metrics"),"sessionId":live,"params":{"title":host,"metrics":[{"name":"Nodes","value":1.0}]}}),
         json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, host)}}),
     ];
     for carrier in carriers {
