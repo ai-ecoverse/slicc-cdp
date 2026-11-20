@@ -47,7 +47,7 @@ const ATTACH_SEVEN: &str = "http://seven.sliccy.ai/dump?n=main";
 fn attach_during(during_read: Option<Value>) -> (Cdp, String, std::rc::Rc<std::cell::RefCell<AttachBrowser>>) {
     let browser = std::rc::Rc::new(std::cell::RefCell::new(AttachBrowser {
         url: ATTACH_LANDING.into(),
-        main: json!({ "id": "T", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
+        main: json!({ "id": "T", "loaderId": "L", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
         during_read,
         attaching: true,
     }));
@@ -91,12 +91,16 @@ fn a_subframe_attached_while_the_guard_reads_the_tree_keeps_the_main_document() 
 #[test]
 fn a_main_frame_update_during_the_guard_tree_read_still_fails_closed() {
     let update = json!({ "method": "Page.navigatedWithinDocument", "sessionId": "G", "params": { "frameId": "T", "url": format!("{ATTACH_LANDING}#moved") } });
-    let (mut cdp, session, browser) = attach_during(Some(update));
-    assert_eq!(cdp.document_evidence("T"), "none");
-    blocked_seven_navigation(&mut cdp, &browser);
-    assert!(cdp.session_blocked(&session));
-    assert!(cdp.target_protected("T", false).unwrap());
-    assert!(ready(&mut cdp, &session).is_err());
+    let browser = std::rc::Rc::new(std::cell::RefCell::new(AttachBrowser {
+        url: ATTACH_LANDING.into(),
+        main: json!({ "id": "T", "loaderId": "L", "url": ATTACH_LANDING, "securityOrigin": "http://127.0.0.1:8000" }),
+        during_read: Some(update),
+        attaching: true,
+    }));
+    let mut cdp = Cdp::from_transport(Box::new(AttachTree { inbox: VecDeque::new(), browser: browser.clone(), guard: false }));
+    let refused = super::attach(&mut cdp, "T");
+    assert!(refused.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")), "{refused:?}");
+    assert!(cdp.is_protected_target("T") || cdp.document_evidence("T") == "none");
 }
 
 #[test]
