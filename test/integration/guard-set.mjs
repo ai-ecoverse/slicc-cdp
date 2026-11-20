@@ -204,7 +204,6 @@ export function validApplicabilitySkip(vector, row) {
 
 export const runCapabilities = {
   scope: 'slicc-cdp',
-  autoAttach: true,
   iframeAutoAttach: true,
   browserSession: true,
   chromeUrlsAttach: true,
