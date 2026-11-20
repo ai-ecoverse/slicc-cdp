@@ -50,8 +50,27 @@ fn popup_error_frame(unreachable: &str) -> Value {
     let mut frame = json!({"id":"P","loaderId":"LP","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html"});
     if !unreachable.is_empty() {
         frame["unreachableUrl"] = json!(unreachable);
+        if let Ok(parsed) = url::Url::parse(unreachable) {
+            if let Some(host) = parsed.host_str() {
+                frame["name"] = json!(host);
+            }
+        }
     }
     frame
+}
+
+fn own_error_frame_named(loader: &str, unreachable: &str) -> Value {
+    let mut frame = own_error_frame(loader, unreachable);
+    if let Ok(parsed) = url::Url::parse(unreachable) {
+        if let Some(host) = parsed.host_str() {
+            frame["name"] = json!(host);
+        }
+    }
+    frame
+}
+
+fn failed_host(unreachable: &str) -> String {
+    url::Url::parse(unreachable).ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_default()
 }
 
 impl Transport for PopupBrowser {
@@ -113,12 +132,22 @@ impl Transport for PopupBrowser {
                     _ => String::new(),
                 };
                 let url = if !unreachable.is_empty() {
-                    unreachable
+                    unreachable.clone()
                 } else {
                     state.popup["url"].as_str().unwrap_or("about:blank").to_string()
                 };
-                let title = state.popup["title"].as_str().unwrap_or(url.as_str()).to_string();
+                let host = failed_host(&url);
+                let title = if !host.is_empty() {
+                    host
+                } else {
+                    state.popup["title"].as_str().unwrap_or(url.as_str()).to_string()
+                };
                 json!({"currentIndex":0,"entries":[{"id":1,"url":url,"userTypedURL":url,"title":title,"transitionType":"link"}]})
+            }
+            "Page.getResourceTree" => match state.frame.clone() {
+                PopupFrame::Frame(frame) => json!({"frameTree":{"frame":frame,"resources":[]}}),
+                PopupFrame::Tree(tree) => tree,
+                _ => json!({"frameTree":{"frame":{"id":"T","url":"about:blank"},"resources":[]}}),
             }
             "Page.getResourceContent" => json!({"content":format!("body {}", state.popup),"base64Encoded":false}),
             "Page.captureScreenshot" => json!({"data":"iVBORw0KGgo="}),
@@ -1159,4 +1188,152 @@ fn a_unicode_idn_title_versus_punycode_unreachable_stays_unproven_by_design() {
     cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L1", punycode),"type":"Navigation"}}));
     assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "xn--bcher-kva.test")));
     assert!(cdp.error_unproven(&own_info(POPUP_ERROR, "bücher.test")), "unicode IDN title vs punycode unreachable is fail-closed over-scrub by design");
+}
+
+fn assert_no_failed_host(label: &str, value: &Value, host: &str, marker: &str) {
+    let text = value.to_string();
+    assert!(!text.contains(marker), "{label}: {text}");
+    if let Some(name) = value.pointer("/frameTree/frame/name").or_else(|| value.pointer("/frame/name")).or_else(|| value.get("name")).and_then(Value::as_str) {
+        assert!(name.is_empty() || name == "about:blank" || !name.eq_ignore_ascii_case(host) && !name.contains(host), "{label} frame.name={name}");
+    }
+    if let Some(title) = value.get("title").and_then(Value::as_str) {
+        assert!(!title.eq_ignore_ascii_case(host), "{label} title bare host={title}");
+        assert!(!title.contains(marker), "{label} title={title}");
+    }
+}
+
+#[test]
+fn an_attached_session_hides_frame_name_and_history_title_for_a_protected_failed_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html","name":""
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame_named("LO", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LO", STALE_ORDINARY),"type":"Navigation"}}));
+    let ordinary = cdp.call("Page.getFrameTree", json!({}), Some(&live)).unwrap();
+    assert_eq!(ordinary.pointer("/frameTree/frame/name").and_then(Value::as_str), Some("ordinary.invalid"));
+    let ordinary_history = cdp.call("Page.getNavigationHistory", json!({}), Some(&live)).unwrap();
+    assert_eq!(ordinary_history["entries"][0]["title"], "ordinary.invalid");
+    let title = format!("{host}/path/{STALE_MARKER}");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &title);
+        state.frame = PopupFrame::Frame(own_error_frame_named("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"LP","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    let tree = cdp.call("Page.getFrameTree", json!({}), Some(&live)).unwrap();
+    assert_no_failed_host("getFrameTree", &tree, host, STALE_MARKER);
+    assert_ne!(tree.pointer("/frameTree/frame/name").and_then(Value::as_str).unwrap_or(host), host, "getFrameTree frame.name must not be the failed host");
+    match cdp.call("Page.getResourceTree", json!({}), Some(&live)) {
+        Ok(resources) => assert_no_failed_host("getResourceTree", &resources, host, STALE_MARKER),
+        Err(error) => assert!(error.contains("seven") || error.contains("refused"), "getResourceTree must refuse or scrub: {error}"),
+    }
+    let history = cdp.call("Page.getNavigationHistory", json!({}), Some(&live)).unwrap();
+    for entry in history["entries"].as_array().unwrap() {
+        assert_no_failed_host("history-entry", entry, host, STALE_MARKER);
+        assert!(!entry["title"].as_str().unwrap_or("").eq_ignore_ascii_case(host), "history title bare host");
+    }
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"LP","name":host,"navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Page.frameAttached","sessionId":live,"params":{"frameId":"C","parentFrameId":"T","stack":{"callFrames":[{"url":STALE_PROTECTED,"functionName":host}]}}}));
+    for event in &cdp.events()[mark..] {
+        assert_no_failed_host(&format!("event:{}", event["method"]), event, host, STALE_MARKER);
+        if let Some(name) = event.pointer("/params/frame/name").and_then(Value::as_str) {
+            assert!(name.is_empty() || name == "about:blank", "frameNavigated name={name}");
+        }
+    }
+}
+
+#[test]
+fn a_stale_ordinary_proof_must_not_release_frame_name_or_history_title_on_a_later_protected_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame_named("L1", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("L1", STALE_ORDINARY),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &format!("{host}/path/{STALE_MARKER}"));
+        state.frame = PopupFrame::Frame(own_error_frame_named("L2", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"L2","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("L2", STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":live,"params":{"frame":own_error_frame_named("L2", STALE_PROTECTED),"type":"Navigation"}}));
+    let tree = cdp.call("Page.getFrameTree", json!({}), Some(&live)).unwrap();
+    assert_no_failed_host("stale-proof-tree", &tree, host, STALE_MARKER);
+    assert_ne!(tree.pointer("/frameTree/frame/name").and_then(Value::as_str).unwrap_or(host), host);
+    let history = cdp.call("Page.getNavigationHistory", json!({}), Some(&live)).unwrap();
+    for entry in history["entries"].as_array().unwrap() {
+        assert_no_failed_host("stale-proof-history", entry, host, STALE_MARKER);
+    }
+    assert!(cdp.call("Page.navigate", json!({"url":"https://example.test/away"}), Some(&live)).is_ok());
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info("https://example.test/away", "away");
+        state.frame = PopupFrame::Frame(json!({"id":"T","loaderId":"L3","url":"https://example.test/away","securityOrigin":"https://example.test","mimeType":"text/html","name":""}));
+        state.sessions.insert(live.clone(), "T".into());
+    }
+    let after = cdp.call("Page.getNavigationHistory", json!({}), Some(&live)).unwrap();
+    assert!(!after.to_string().contains(STALE_MARKER), "{after}");
+    assert!(!after["entries"].to_string().contains(host) || after["entries"].as_array().unwrap().iter().all(|entry| {
+        !entry["title"].as_str().unwrap_or("").eq_ignore_ascii_case(host)
+    }), "navigate-away must not leave a bare failed host title: {after}");
+}
+
+#[test]
+fn an_attached_session_hides_other_failed_host_carriers_for_a_protected_failed_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &format!("{host}/path/{STALE_MARKER}"));
+        state.frame = PopupFrame::Frame(own_error_frame_named("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Runtime.executionContextCreated","sessionId":live,"params":{"context":{"id":1,"uniqueId":"ctx","origin":format!("https://{host}"),"name":host,"auxData":{"frameId":"T","isDefault":true}}}}));
+    cdp.absorb(json!({"method":"Network.requestWillBeSent","sessionId":live,"params":{"requestId":"R1","type":"Document","documentURL":STALE_PROTECTED,"request":{"url":STALE_PROTECTED},"frameId":"T"}}));
+    cdp.absorb(json!({"method":"Network.responseReceived","sessionId":live,"params":{"requestId":"R1","type":"Document","response":{"url":STALE_PROTECTED,"status":0},"frameId":"T"}}));
+    cdp.absorb(json!({"method":"Network.loadingFailed","sessionId":live,"params":{"requestId":"R1","errorText":format!("net::ERR_NAME_NOT_RESOLVED for https://{host}/path/{STALE_MARKER}"),"type":"Document","canceled":false}}));
+    cdp.absorb(json!({"method":"Log.entryAdded","sessionId":live,"params":{"entry":{"source":"network","level":"error","text":format!("Failed to load https://{host}/path/{STALE_MARKER}"),"url":STALE_PROTECTED}}}));
+    cdp.absorb(json!({"method":"Runtime.consoleAPICalled","sessionId":live,"params":{"type":"error","args":[{"type":"string","value":format!("net::ERR {host}/{STALE_MARKER}")}]}}));
+    cdp.absorb(json!({"method":"Runtime.exceptionThrown","sessionId":live,"params":{"exceptionDetails":{"text":format!("Uncaught {host}/{STALE_MARKER}"),"exception":{"description":format!("Error: {STALE_PROTECTED}")}}}}));
+    cdp.absorb(json!({"method":"Page.javascriptDialogOpening","sessionId":live,"params":{"url":STALE_PROTECTED,"message":format!("leave {host}?"),"type":"beforeunload","hasBrowserHandler":false}}));
+    cdp.absorb(json!({"method":"Inspector.targetCrashed","sessionId":live,"params":{}}));
+    for event in &cdp.events()[mark..] {
+        let text = event.to_string();
+        assert!(!text.contains(STALE_MARKER), "carrier {}: {event}", event["method"]);
+        if let Some(name) = event.pointer("/params/context/name").and_then(Value::as_str) {
+            assert!(!name.eq_ignore_ascii_case(host), "executionContext name={name}");
+        }
+    }
 }

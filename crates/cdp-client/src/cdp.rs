@@ -747,6 +747,58 @@ impl Cdp {
         if self.error_unproven(&info) { shield::redacted(&info) } else { info }
     }
 
+    fn failed_load_host_hidden(&self, target: Option<&str>, url: &str, unreachable: &str) -> bool {
+        let failed = if !unreachable.is_empty() { unreachable } else { url };
+        if self.guard.url(failed) || self.guard.url(unreachable) {
+            return true;
+        }
+        let error = Self::chrome_error(url) || self.guard.error_page_url(url) || !unreachable.is_empty();
+        if !error {
+            return false;
+        }
+        target.is_some_and(|id| self.targets.get(id).is_some_and(|info| self.error_unproven(info)))
+            || (!unreachable.is_empty() && !self.ordinary_unreachable(unreachable))
+    }
+
+    fn scrub_failed_load_carriers(&self, value: &mut Value, target: Option<&str>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.scrub_failed_load_carriers(item, target);
+                }
+            }
+            Value::Object(map) => {
+                let url = map.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let unreachable = map.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
+                let history = map.contains_key("userTypedURL") || map.contains_key("transitionType");
+                let error = Self::chrome_error(&url) || self.guard.error_page_url(&url) || !unreachable.is_empty() || history && target.is_some_and(|id| {
+                    self.documents.get(id).is_some_and(|doc| Self::chrome_error(&doc.url) || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty())
+                });
+                if error && self.failed_load_host_hidden(target, &url, &unreachable) {
+                    if map.contains_key("name") {
+                        map.insert("name".into(), Value::String(String::new()));
+                    }
+                    if map.contains_key("title") {
+                        let failed = if !unreachable.is_empty() { unreachable.as_str() } else { url.as_str() };
+                        let title = if self.guard.url(failed) || self.guard.url(&unreachable) {
+                            url::Url::parse(failed).ok()
+                                .map(|parsed| parsed.origin().ascii_serialization())
+                                .filter(|origin| origin != "null")
+                                .unwrap_or_else(|| "about:blank".into())
+                        } else {
+                            "about:blank".into()
+                        };
+                        map.insert("title".into(), Value::String(title));
+                    }
+                }
+                for item in map.values_mut() {
+                    self.scrub_failed_load_carriers(item, target);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn guarded_call(
         &mut self,
         method: &str,
@@ -1884,6 +1936,8 @@ impl Cdp {
             _ => {}
         }
         shield::redact_strings(&self.guard, &mut result);
+        let target = session_id.and_then(|session| self.session_target(session));
+        self.scrub_failed_load_carriers(&mut result, target.as_deref());
         Ok(result)
     }
 
@@ -4889,6 +4943,8 @@ impl Cdp {
             && !self.protected_body_requests.contains(&key.1) && self.client_navigation_urls.get(&key.0).is_some_and(|url| value.pointer("/params/request/url").and_then(Value::as_str) == Some(url.as_str()))).then(|| value["params"]["request"]["url"].clone());
         shield::redact_strings(&self.guard, &mut value);
         if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
+        let event_target = value.get("sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session));
+        self.scrub_failed_load_carriers(&mut value, event_target.as_deref());
         let settle_guard = self.settling_attach
             && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
             && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));

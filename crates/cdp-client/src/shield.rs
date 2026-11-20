@@ -517,6 +517,9 @@ pub fn redact_strings(guard: &Protected, value: &mut Value) -> bool {
                         .map(|url| url.origin().ascii_serialization()).filter(|origin| origin != "null").unwrap_or_default();
                     map.insert("title".to_string(), Value::String(origin));
                 }
+                if map.contains_key("name") {
+                    map.insert("name".to_string(), Value::String(String::new()));
+                }
             }
             let link_value = map.get("name").and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case("link"));
             let mut found = named_protected;
