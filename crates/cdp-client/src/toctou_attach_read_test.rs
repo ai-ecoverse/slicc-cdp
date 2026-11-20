@@ -205,14 +205,20 @@ impl ToctouState {
             .to_string(),
         );
         if deliver_frame {
-            nav.push_back(
-                json!({
-                    "method": toctou_method("Page", "frameNavigated"),
-                    "sessionId": session,
-                    "params": { "frame": self.live.clone(), "type": "Navigation" },
-                })
-                .to_string(),
-            );
+            let mut sessions: Vec<String> = self.sessions.keys().cloned().collect();
+            if !sessions.iter().any(|have| have == session) {
+                sessions.push(session.to_string());
+            }
+            for session_id in sessions {
+                nav.push_back(
+                    json!({
+                        "method": toctou_method("Page", "frameNavigated"),
+                        "sessionId": session_id,
+                        "params": { "frame": self.live.clone(), "type": "Navigation" },
+                    })
+                    .to_string(),
+                );
+            }
         }
         match self.nav_events {
             ToctouNavEvents::None => {}
@@ -898,7 +904,15 @@ fn existing_deliver_event_first(cdp: &mut Cdp, state: &std::rc::Rc<std::cell::Re
     }
 }
 
-fn existing_classify(label: &str, out: &Result<Value, String>, learn: ExistingLearn, forwarded: bool, latched_before: bool) -> (&'static str, String) {
+fn existing_classify(
+    label: &str,
+    out: &Result<Value, String>,
+    learn: ExistingLearn,
+    forwarded: bool,
+    backend_ok: bool,
+    latched_before: bool,
+    latched_after: bool,
+) -> (&'static str, String) {
     let text = match out {
         Ok(value) => value.to_string(),
         Err(message) => message.clone(),
@@ -908,7 +922,12 @@ fn existing_classify(label: &str, out: &Result<Value, String>, learn: ExistingLe
             return ("LEAK", format!("LEAK(placeholder-url {text})"));
         }
         if text.starts_with("slicc: refused:") {
-            return ("REFUSED", format!("REFUSED({})", if latched_before || learn == ExistingLearn::EventFirst { "hidden/latch" } else { "document-gate" }));
+            let guard = if latched_before || latched_after && !latched_before {
+                "hidden/latch"
+            } else {
+                "document-gate"
+            };
+            return ("REFUSED", format!("REFUSED({guard})"));
         }
         return ("PLACEHOLDER-ONLY", "PLACEHOLDER-ONLY".into());
     }
@@ -917,7 +936,7 @@ fn existing_classify(label: &str, out: &Result<Value, String>, learn: ExistingLe
             return ("PLACEHOLDER-ONLY", "PLACEHOLDER-ONLY(empty-input)".into());
         }
         if text.starts_with("slicc: refused:") {
-            let guard = if learn == ExistingLearn::EventFirst || latched_before {
+            let guard = if latched_before || latched_after && !latched_before {
                 "hidden/latch"
             } else {
                 "document-gate"
@@ -932,12 +951,14 @@ fn existing_classify(label: &str, out: &Result<Value, String>, learn: ExistingLe
         return ("CONTEXT-DESTROYED", "CONTEXT-DESTROYED".into());
     }
     if text.starts_with("slicc: refused:") {
-        let guard = if learn == ExistingLearn::EventFirst || latched_before && !forwarded {
+        let guard = if latched_before {
             "hidden/latch"
+        } else if latched_after && !latched_before {
+            "hidden/latch"
+        } else if backend_ok {
+            "post-reply-recheck"
         } else if !forwarded {
             "document-gate"
-        } else if matches!(label, "Runtime.evaluate" | "Runtime.evaluate+contextId") && learn != ExistingLearn::NeverLearn {
-            "post-reply-recheck"
         } else {
             "document-gate"
         };
@@ -950,9 +971,24 @@ fn existing_classify(label: &str, out: &Result<Value, String>, learn: ExistingLe
 }
 
 fn existing_run_cell(live: &str, learn: ExistingLearn, label: &str, command: &str, params: Value) -> (String, bool, bool) {
+    existing_run_cell_opts(live, learn, label, command, params, false)
+}
+
+fn existing_run_cell_opts(
+    live: &str,
+    learn: ExistingLearn,
+    label: &str,
+    command: &str,
+    params: Value,
+    survive_contexts: bool,
+) -> (String, bool, bool) {
     let (mut cdp, state, session) = existing_client(live);
     existing_arm(&state, learn);
+    if survive_contexts {
+        state.borrow_mut().survive_contexts = true;
+    }
     let before_forwards = state.borrow().content_forwards;
+    let before_ok = state.borrow().content_backend_ok;
     if learn == ExistingLearn::EventFirst {
         existing_deliver_event_first(&mut cdp, &state, &session);
     }
@@ -971,29 +1007,39 @@ fn existing_run_cell(live: &str, learn: ExistingLearn, label: &str, command: &st
             Ok(value) => {
                 let handle = value.get("stream").and_then(Value::as_str).unwrap_or("pdf-1").to_string();
                 existing_arm(&state, learn);
+                if survive_contexts {
+                    state.borrow_mut().survive_contexts = true;
+                }
                 if learn == ExistingLearn::EventFirst {
                     existing_deliver_event_first(&mut cdp, &state, &session);
                 }
                 let latched_before = cdp.is_protected_target("T");
+                let before_ok = state.borrow().content_backend_ok;
                 let mut params = params;
                 params["handle"] = json!(handle);
                 let out = cdp.call(command, params, Some(&session));
                 let forwarded = state.borrow().content_forwards > before_forwards;
-                let (_, cell) = existing_classify(label, &out, learn, forwarded, latched_before);
-                return (cell, out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)), cdp.is_protected_target("T"));
+                let backend_ok = state.borrow().content_backend_ok > before_ok;
+                let latched_after = cdp.is_protected_target("T");
+                let (_, cell) = existing_classify(label, &out, learn, forwarded, backend_ok, latched_before, latched_after);
+                return (cell, out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)), latched_after);
             }
             Err(message) => {
                 let forwarded = state.borrow().content_forwards > before_forwards;
+                let backend_ok = state.borrow().content_backend_ok > before_ok;
+                let latched_after = cdp.is_protected_target("T");
                 let out: Result<Value, String> = Err(message);
-                let (_, cell) = existing_classify("Page.printToPDF+stream", &out, learn, forwarded, latched_before);
-                return (cell, false, cdp.is_protected_target("T"));
+                let (_, cell) = existing_classify("Page.printToPDF+stream", &out, learn, forwarded, backend_ok, latched_before, latched_after);
+                return (cell, false, latched_after);
             }
         }
     }
     let out = cdp.call(command, params, Some(&session));
-    let forwarded = state.borrow().content_forwards > before_forwards || state.borrow().content_backend_ok > 0;
-    let (_, cell) = existing_classify(label, &out, learn, forwarded, latched_before);
-    (cell, out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)), cdp.is_protected_target("T"))
+    let forwarded = state.borrow().content_forwards > before_forwards;
+    let backend_ok = state.borrow().content_backend_ok > before_ok;
+    let latched_after = cdp.is_protected_target("T");
+    let (_, cell) = existing_classify(label, &out, learn, forwarded, backend_ok, latched_before, latched_after);
+    (cell, out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)), latched_after)
 }
 
 #[test]
@@ -1172,9 +1218,47 @@ fn mutation_existing_survive_contexts_reply_before_learn_needs_did_recheck() {
 }
 
 #[test]
-fn mutation_existing_survive_contexts_learn_during_is_held_by_did_recheck() {
+fn mutation_existing_survive_contexts_learn_during_held_after_latch() {
     let live = toctou_vault();
     let (mut cdp, state, session) = existing_client(&live);
+    {
+        let mut state = state.borrow_mut();
+        state.survive_contexts = true;
+        state.commits_on_forward = true;
+        state.nav_events = ToctouNavEvents::All;
+        state.event_timing = ToctouEventTiming::AfterFirstRead;
+        state.committed = false;
+        state.content_forwards = 0;
+        state.content_backend_ok = 0;
+    }
+    let out = cdp.call(
+        &toctou_method("Runtime", "evaluate"),
+        json!({ "expression": "1", "returnByValue": true }),
+        Some(&session),
+    );
+    assert!(
+        state.borrow().content_backend_ok >= 1,
+        "backend must answer Ok(marker); Chrome-faithful would destroy the context instead"
+    );
+    assert!(
+        cdp.is_protected_target("T"),
+        "learn-during events must latch before reply admission"
+    );
+    assert!(
+        out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "learn-during with surviving contexts must refuse after latch (verify_execution before DiD): {out:?}"
+    );
+    if let Err(message) = out {
+        assert!(!message.contains(TOCTOU_MARK), "{message}");
+    }
+}
+
+#[test]
+fn mutation_existing_survive_learn_during_without_latch_held_by_did() {
+    let live = toctou_vault();
+    let (mut cdp, state, session) = existing_client(&live);
+    cdp.skip_protect = true;
+    cdp.skip_verify_execution = true;
     {
         let mut state = state.borrow_mut();
         state.survive_contexts = true;
@@ -1195,8 +1279,12 @@ fn mutation_existing_survive_contexts_learn_during_is_held_by_did_recheck() {
         "backend must answer Ok(marker) before DiD"
     );
     assert!(
+        !cdp.is_protected_target("T"),
+        "skip_protect isolates DiD from latch/block"
+    );
+    assert!(
         out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
-        "learn-during with surviving contexts must be held by post-reply DiD: {out:?}"
+        "without latch/verify_execution, LearnDuring+survive must be held by verify_execution_document_unchanged_or_ordinary: {out:?}"
     );
     if let Err(message) = out {
         assert!(!message.contains(TOCTOU_MARK), "{message}");
@@ -1204,10 +1292,31 @@ fn mutation_existing_survive_contexts_learn_during_is_held_by_did_recheck() {
 }
 
 #[test]
-fn mutation_existing_event_first_without_latch_would_need_document_gate() {
+fn mutation_existing_survive_never_learn_screenshot_held_by_verify_checks() {
+    let (cell, leaked, _) = existing_run_cell_opts(
+        &toctou_vault(),
+        ExistingLearn::NeverLearn,
+        "Page.captureScreenshot",
+        &toctou_method("Page", "captureScreenshot"),
+        json!({}),
+        true,
+    );
+    assert!(!leaked, "NeverLearn+survive screenshot must not return marker: {cell}");
+    assert!(
+        cell.starts_with("REFUSED("),
+        "NeverLearn+survive screenshot must be held by post-reply verify_checks: {cell}"
+    );
+}
+
+#[test]
+fn mutation_existing_event_first_latches_protected_target() {
     let live = toctou_vault();
     let (mut cdp, state, session) = existing_client(&live);
     existing_deliver_event_first(&mut cdp, &state, &session);
+    assert!(
+        cdp.is_protected_target("T"),
+        "EventFirst learn must latch protected_targets"
+    );
     let out = cdp.call(
         &toctou_method("Page", "captureScreenshot"),
         json!({}),
@@ -1215,8 +1324,126 @@ fn mutation_existing_event_first_without_latch_would_need_document_gate() {
     );
     assert!(
         out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
-        "event-first must refuse screenshot via latch/document-gate: {out:?}"
+        "event-first must refuse screenshot via latch: {out:?}"
     );
     assert!(!out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)));
 }
 
+
+#[test]
+fn existing_session_dump_matrix_for_mutation_harness() {
+    let path = match std::env::var("SLICC_MUTATION_DUMP") {
+        Ok(path) if !path.is_empty() => path,
+        _ => return,
+    };
+    let survive = std::env::var("SLICC_MUTATION_SURVIVE").ok().as_deref() == Some("1");
+    let vault = toctou_vault();
+    let mut table = String::from("class\\learn\tEventFirst\tReplyBeforeLearn\tNeverLearn\tLearnDuring\n");
+    let mut by_class: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
+    let mut leaks = Vec::new();
+    for learn in [
+        ExistingLearn::EventFirst,
+        ExistingLearn::ReplyBeforeLearn,
+        ExistingLearn::NeverLearn,
+        ExistingLearn::LearnDuring,
+    ] {
+        for (label, command, params) in existing_commands() {
+            let (cell, leaked, _) = existing_run_cell_opts(&vault, learn, label, &command, params, survive);
+            if leaked || cell.starts_with("LEAK") {
+                leaks.push(format!("{learn:?}\t{label}\t{cell}"));
+            }
+            by_class
+                .entry(label.to_string())
+                .or_default()
+                .insert(format!("{learn:?}"), cell);
+        }
+    }
+    for (class, cells) in &by_class {
+        table.push_str(class);
+        for learn in ["EventFirst", "ReplyBeforeLearn", "NeverLearn", "LearnDuring"] {
+            table.push('\t');
+            table.push_str(cells.get(learn).map(String::as_str).unwrap_or("?"));
+        }
+        table.push('\n');
+    }
+    if !leaks.is_empty() {
+        table.push_str("\nLEAK_ROWS\n");
+        table.push_str(&leaks.join("\n"));
+        table.push('\n');
+    }
+    std::fs::write(&path, &table).unwrap();
+    eprintln!("MUTATION_DUMP wrote {path} leaks={}", leaks.len());
+}
+
+#[test]
+fn lock_existing_event_first_screenshot_refuses_without_marker() {
+    let (cell, leaked, _) = existing_run_cell(
+        &toctou_vault(),
+        ExistingLearn::EventFirst,
+        "Page.captureScreenshot",
+        &toctou_method("Page", "captureScreenshot"),
+        json!({}),
+    );
+    assert!(!leaked, "EventFirst screenshot must not return marker: {cell}");
+    assert!(cell.starts_with("REFUSED("), "EventFirst screenshot must refuse: {cell}");
+}
+
+#[test]
+fn lock_existing_never_learn_screenshot_refuses_without_marker() {
+    let (cell, leaked, _) = existing_run_cell(
+        &toctou_vault(),
+        ExistingLearn::NeverLearn,
+        "Page.captureScreenshot",
+        &toctou_method("Page", "captureScreenshot"),
+        json!({}),
+    );
+    assert!(!leaked, "NeverLearn screenshot must not return marker: {cell}");
+    assert!(cell.starts_with("REFUSED("), "NeverLearn screenshot must refuse: {cell}");
+}
+
+#[test]
+fn lock_existing_learn_during_evaluate_refuses_without_marker() {
+    let (cell, leaked, _) = existing_run_cell(
+        &toctou_vault(),
+        ExistingLearn::LearnDuring,
+        "Runtime.evaluate",
+        &toctou_method("Runtime", "evaluate"),
+        json!({ "expression": "1", "returnByValue": true }),
+    );
+    assert!(!leaked, "LearnDuring evaluate must not return marker: {cell}");
+    assert!(
+        cell.starts_with("REFUSED(") || cell == "CONTEXT-DESTROYED",
+        "LearnDuring evaluate must refuse or context-destroy: {cell}"
+    );
+}
+
+#[test]
+fn lock_existing_chrome_faithful_evaluate_backend_is_not_ok_marker() {
+    let live = toctou_vault();
+    for learn in [
+        ExistingLearn::ReplyBeforeLearn,
+        ExistingLearn::NeverLearn,
+        ExistingLearn::LearnDuring,
+    ] {
+        let (mut cdp, state, session) = existing_client(&live);
+        existing_arm(&state, learn);
+        let before_ok = state.borrow().content_backend_ok;
+        let out = cdp.call(
+            &toctou_method("Runtime", "evaluate"),
+            json!({ "expression": "1", "returnByValue": true }),
+            Some(&session),
+        );
+        assert_eq!(
+            state.borrow().content_backend_ok, before_ok,
+            "Chrome-faithful evaluate under {learn:?} must not get Ok(marker) from the backend (got {out:?})"
+        );
+        assert!(
+            out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:") || message.contains("Cannot find context")),
+            "Chrome-faithful evaluate under {learn:?} must refuse or context-destroy: {out:?}"
+        );
+        if let Err(message) = &out {
+            assert!(!message.contains(TOCTOU_MARK), "{message}");
+        }
+    }
+}
