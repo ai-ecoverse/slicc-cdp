@@ -2021,3 +2021,25 @@ fn har_release_worker_detach_is_not_ok_while_chrome_holds_session() {
     assert!(browser.borrow().sessions.contains_key("S-HAR"));
     assert!(cdp.call("Network.enable", json!({}), Some("S-HAR")).is_err());
 }
+
+#[test]
+fn iframe_blank_soft_attach_refuses_when_reported_url_is_not_blank() {
+    let page = json!({"targetId":"PAGE","type":"page","url":"https://ordinary.test/","browserContextId":"CTX"});
+    let child = json!({"targetId":"IF","type":"iframe","url":"https://foreign.test/reported","parentFrameId":"FRAME","browserContextId":"CTX"});
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), child.clone()]);
+    browser.borrow_mut().trees.insert("PAGE".into(), json!({
+        "frameTree":{"frame":{"id":"FRAME","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test","loaderId":"L"}}
+    }));
+    let page_attach = cdp.call("Target.attachToTarget", json!({"targetId":"PAGE","flatten":true}), None).unwrap();
+    let page_session = page_attach["sessionId"].as_str().unwrap().to_string();
+    let _ = cdp.call("Page.getFrameTree", json!({}), Some(&page_session));
+    cdp.page_scope_owners.insert("FRAME".into(), "PAGE".into());
+    browser.borrow_mut().trees.insert("IF".into(), json!({
+        "frameTree":{"frame":{"id":"IF","parentId":"FRAME","url":"about:blank","securityOrigin":"://","loaderId":"LB"}}
+    }));
+    let attach = cdp.call("Target.attachToTarget", json!({"targetId":"IF","flatten":true}), None);
+    assert!(
+        attach.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "blank iframe soft-read must require a matching blank reported url (mutation would admit): {attach:?}"
+    );
+}

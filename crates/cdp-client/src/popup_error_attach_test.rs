@@ -476,6 +476,42 @@ fn an_own_tab_error_page_with_a_protected_failed_url_stays_attachable() {
 }
 
 #[test]
+fn a_fresh_process_reattach_admits_own_tab_whose_target_info_stays_on_the_blocked_url() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut first = own_client_from(state.clone(), &start);
+    assert!(first.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_ok());
+    let blocked = own_info(POPUP_SEVEN, "seven.sliccy.ai");
+    let frame = own_error_frame("L1", POPUP_SEVEN);
+    {
+        let mut state = state.borrow_mut();
+        state.popup = blocked.clone();
+        state.frame = PopupFrame::Frame(frame.clone());
+        state.sessions.clear();
+    }
+    let mut fresh = own_client_from(state, &blocked);
+    let reply = fresh
+        .call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None)
+        .expect("catalog R4 / #880: own-tab error document after protected navigation must attach on a fresh Cdp");
+    let session = reply["sessionId"].as_str().unwrap();
+    assert!(!fresh.is_protected_target("T"), "error recovery must not leave the reported-url latch set");
+    let info = fresh.call("Target.getTargetInfo", json!({"targetId":"T"}), None).unwrap();
+    assert_eq!(info["targetInfo"]["url"], "https://seven.sliccy.ai", "scrubbed origin: {info}");
+    assert!(!info.to_string().contains("SECRET"), "{info}");
+    assert!(fresh.call("Runtime.evaluate", json!({"expression":"document.body.innerHTML"}), Some(session)).is_err());
+    assert!(fresh.call("Page.navigate", json!({"url":"https://example.test/recovered"}), Some(session)).is_ok());
+}
+
+#[test]
+fn a_popup_error_page_whose_target_info_stays_on_the_blocked_url_stays_refused() {
+    let blocked = popup_info(POPUP_SEVEN, "seven.sliccy.ai");
+    let mut cdp = popup_client(blocked, PopupFrame::Frame(popup_error_frame(POPUP_SEVEN)));
+    popup_attach_refused(&mut cdp, "popup-reported-protected-url");
+}
+
+#[test]
 fn an_own_tab_error_page_with_an_empty_failed_url_stays_attachable_across_processes() {
     let start = own_info("https://example.test/start", "start");
     let state = own_state(start.clone(), PopupFrame::Frame(json!({

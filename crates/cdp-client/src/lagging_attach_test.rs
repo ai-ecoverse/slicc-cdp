@@ -501,6 +501,7 @@ fn mutation_rows_each_attach_gate_is_necessary() {
     );
 
     let (mut exclusive, _) = lag_client(&live, LagTreeMode::AlwaysBlank, LagInfoTiming::BeforeAttach);
+    exclusive.created_blanks.insert("T".into(), ("T".into(), "L0".into(), 0));
     let exclusive_reply = exclusive.call(
         &method("Target", "attachToTarget"),
         json!({ "targetId": "T", "flatten": true }),
@@ -508,7 +509,7 @@ fn mutation_rows_each_attach_gate_is_necessary() {
     );
     assert!(
         exclusive_reply.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
-        "drop reported-url latch would admit placeable-blank+protected-info: {exclusive_reply:?}"
+        "drop reported-url latch would admit owned-blank+protected-info: {exclusive_reply:?}"
     );
     assert!(exclusive.is_protected_target("T"));
     assert!(
@@ -516,8 +517,12 @@ fn mutation_rows_each_attach_gate_is_necessary() {
         "exclusive reported-url cell must still see the protected reported url"
     );
     assert!(
-        exclusive.documents.get("T").is_none_or(|doc| !doc.previous || exclusive.is_protected_target("T")),
-        "reported-url latch must be what keeps the placeable blank from proving"
+        exclusive.created_blanks.contains_key("T"),
+        "live tree is a placeable owned blank; without the reported-url latch attach would admit"
+    );
+    assert!(
+        exclusive.documents.get("T").is_some_and(|doc| doc.url == LAG_BLANK),
+        "owned blank must be the live document when the reported-url latch alone refuses"
     );
 
     let (mut ordinary, state) = lag_client(

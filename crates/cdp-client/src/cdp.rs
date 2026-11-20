@@ -1391,6 +1391,15 @@ impl Cdp {
                             }
                             None => {}
                         }
+                    } else if method == "Target.attachToTarget" {
+                        if self.protected_targets.contains(&target) {
+                            let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+                            return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                        }
+                        if !self.reported_url_protected(&target) && self.target_protected(&target, false)? {
+                            let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+                            return Err(format!("{}\n", self.guard.refusal_for_url(url)));
+                        }
                     } else if self.target_protected(&target, false)? {
                         let url = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
                         return Err(format!("{}\n", self.guard.refusal_for_url(url)));
@@ -1924,55 +1933,72 @@ impl Cdp {
                     .to_string();
                 if !session.is_empty() {
                     self.session_targets.insert(session.clone(), target.clone());
-                    if self.reported_url_protected(&target) {
-                        self.protect_target(&target);
-                    }
-                    if let Err(message) = self.touch(&target) {
-                        if transport_error(&message) {
-                            self.session_targets.remove(&session);
-                            return Err(message);
-                        }
-                        let detached = self.raw_call(
-                            "Target.detachFromTarget",
-                            json!({ "sessionId": session }),
-                            None,
-                            Duration::from_secs(5),
-                        );
-                        self.session_targets.remove(&session);
-                        if let Err(closed) = detached {
-                            if transport_error(&closed) {
-                                return Err(closed);
+                    if !self.guarding.contains(&target) {
+                        if let Err(message) = self.touch(&target) {
+                            if transport_error(&message) {
+                                self.session_targets.remove(&session);
+                                return Err(message);
                             }
-                        }
-                        return Err(message);
-                    }
-                    if self.reported_url_protected(&target) {
-                        self.protect_target(&target);
-                    }
-                    if self.protected_targets.contains(&target) {
-                        self.block(&session);
-                        return Err(self.refusal());
-                    }
-                    if !self.attach_document_proven(&target) {
-                        self.attach_content_ok.remove(&target);
-                        if let Some(guard) = self.guards.remove(&target) {
-                            self.guard_sessions.remove(&guard);
-                            let _ = self.raw_call(
+                            let detached = self.raw_call(
                                 "Target.detachFromTarget",
-                                json!({ "sessionId": guard }),
+                                json!({ "sessionId": session }),
                                 None,
                                 Duration::from_secs(5),
                             );
+                            self.session_targets.remove(&session);
+                            if let Err(closed) = detached {
+                                if transport_error(&closed) {
+                                    return Err(closed);
+                                }
+                            }
+                            return Err(message);
                         }
-                        self.cut_unresolved_session(&session);
-                        return Err(self.refusal());
-                    }
-                    if self.targets.get(&target).is_some_and(|info| self.error_popup_hold(info)) {
-                        self.cut_unresolved_session(&session);
-                        return Err(self.refusal());
-                    }
-                    if !self.targets.get(&target).is_some_and(Self::popup_shaped) {
-                        self.note_client_target(&target);
+                        if self.attach_error_recovery_for_reported(&target) {
+                            self.protected_targets.remove(&target);
+                            if let Some(doc) = self.documents.get_mut(&target) {
+                                doc.previous = false;
+                            }
+                            self.blocked.remove(&session);
+                            self.unresolved_cuts.remove(&session);
+                            self.release_ordinary_sessions(&target);
+                        } else if self.reported_url_protected(&target) {
+                            self.protect_target(&target);
+                        }
+                        if self.protected_targets.contains(&target) {
+                            self.block(&session);
+                            return Err(self.refusal());
+                        }
+                        if !self.attach_document_proven(&target) {
+                            if self.targets.get(&target).is_some_and(|info| {
+                                Self::popup_shaped(info)
+                                    && self.documents.get(&target).is_some_and(|doc| {
+                                        (self.guard.error_page_url(&doc.url) || Self::chrome_error(&doc.url))
+                                            && self.guard.url(&doc.unreachable_url)
+                                    })
+                            }) {
+                                self.protect_target(&target);
+                            }
+                            self.attach_content_ok.remove(&target);
+                            if let Some(guard) = self.guards.remove(&target) {
+                                self.guard_sessions.remove(&guard);
+                                let _ = self.raw_call(
+                                    "Target.detachFromTarget",
+                                    json!({ "sessionId": guard }),
+                                    None,
+                                    Duration::from_secs(5),
+                                );
+                            }
+                            self.cut_unresolved_session(&session);
+                            return Err(self.refusal());
+                        }
+                        if self.targets.get(&target).is_some_and(|info| self.error_popup_hold(info)) {
+                            self.protect_target(&target);
+                            self.cut_unresolved_session(&session);
+                            return Err(self.refusal());
+                        }
+                        if !self.targets.get(&target).is_some_and(Self::popup_shaped) {
+                            self.note_client_target(&target);
+                        }
                     }
                 }
             }
@@ -2925,12 +2951,45 @@ impl Cdp {
     }
 
     fn attach_document_url_ordinary(&self, url: &str) -> bool {
-        !url.is_empty()
-            && !self.guard.url(url)
-            && (self.ordinary_http_document_url(url)
-                || self.guard.data_document(url)
-                || self.guard.inheriting(url)
-                || self.guard.opaque_document(url, true))
+        !self.guard.url(url)
+            && (self.guard.inheriting(url)
+                || !url.is_empty()
+                    && (self.ordinary_http_document_url(url)
+                        || self.guard.data_document(url)
+                        || self.guard.opaque_document(url, true)))
+    }
+
+    fn attach_error_recovery_for_reported(&self, target: &str) -> bool {
+        let Some(doc) = self.documents.get(target) else {
+            return false;
+        };
+        if doc.navigating {
+            return false;
+        }
+        if !(self.guard.error_page_url(&doc.url) || Self::chrome_error(&doc.url)) {
+            return false;
+        }
+        if !self.guard.error_document(&doc.url, &doc.origin) {
+            return false;
+        }
+        let info = self.targets.get(target);
+        if info.is_some_and(Self::popup_shaped) && !self.client_targets.contains(target) {
+            return false;
+        }
+        let title = info.and_then(|info| info.get("title")).and_then(Value::as_str).unwrap_or("");
+        if self.client_targets.contains(target) || self.error_proof_applies(doc, title) {
+            return true;
+        }
+        let reported = info.and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
+        if Self::chrome_error(reported) || self.guard.error_page_url(reported) {
+            return info.is_none_or(|info| !Self::popup_shaped(info));
+        }
+        if !self.guard.url(reported) {
+            return false;
+        }
+        !doc.unreachable_url.is_empty()
+            && (self.reported_unreachable(&doc.unreachable_url, reported)
+                || doc.unreachable_url == reported)
     }
 
     fn root_frame_unplaceable(&self, frame: &Value) -> bool {
@@ -2974,9 +3033,6 @@ impl Cdp {
     }
 
     fn attach_document_proven(&self, target: &str) -> bool {
-        if self.protected_targets.contains(target) || self.reported_url_protected(target) {
-            return false;
-        }
         let kind = self.targets.get(target).and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or("page");
         if matches!(kind, "worker" | "service_worker" | "shared_worker") {
             return true;
@@ -2991,6 +3047,9 @@ impl Cdp {
             return false;
         }
         if self.guard.error_page_url(&doc.url) || Self::chrome_error(&doc.url) {
+            if self.attach_error_recovery_for_reported(target) {
+                return true;
+            }
             let info = self.targets.get(target);
             let title = info.and_then(|info| info.get("title")).and_then(Value::as_str).unwrap_or("");
             if self.client_targets.contains(target) || self.error_proof_applies(doc, title) {
@@ -2999,7 +3058,13 @@ impl Cdp {
             if doc.probed && self.ordinary_unreachable(&doc.unreachable_url) && !self.guard.url(&doc.unreachable_url) {
                 return true;
             }
+            if self.protected_targets.contains(target) || self.reported_url_protected(target) {
+                return false;
+            }
             return info.is_none_or(|info| !Self::popup_shaped(info));
+        }
+        if self.protected_targets.contains(target) || self.reported_url_protected(target) {
+            return false;
         }
         let content_ok = self.attach_content_ok.contains(target)
             || kind == "iframe" && self.iframe_attach_ordinary_under_clear_parent(target, doc);
@@ -3765,17 +3830,19 @@ impl Cdp {
         let origin = self.page_scope_origin(frame);
         let text = |key| if key == "securityOrigin" { origin.unwrap_or_else(|| frame.get(key).and_then(Value::as_str).unwrap_or("")) } else { frame.get(key).and_then(Value::as_str).unwrap_or("") };
         let root = parent.is_none();
-        if ["id", "url"].iter().any(|key| matches!(text(*key), "" | "null" | "://"))
+        let initial_empty = root && text("url").is_empty() && self.guard.inheriting(text("url"));
+        if matches!(text("id"), "" | "null" | "://")
+            || !initial_empty && matches!(text("url"), "" | "null" | "://")
             || frame.get("parentId").is_some_and(|id| id.as_str() != parent) { return false }
-        let initial_blank = text("url") == "about:blank" && frame.get("loaderId").and_then(Value::as_str) == Some("")
+        let initial_blank = (text("url") == "about:blank" || initial_empty) && frame.get("loaderId").and_then(Value::as_str) == Some("")
             && (root || parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2])));
         let parent_allowed = !root && parent.and_then(|id| frames.get(id)).is_some_and(|evidence| !self.guard.url(&evidence[1]) && !self.guard.url(&evidence[2]));
         let inherited = parent_allowed && self.guard.inheriting(text("url")) && !matches!(text("securityOrigin"), "" | "null" | "://") && self.frame_decisions.get(text("id")) != Some(&true);
         let allowed_error = !root && self.guard.error_document(text("url"), text("securityOrigin"))
             && !text("unreachableUrl").is_empty() && self.frame_decisions.get(text("id")) == Some(&false);
         let data = (root || parent_allowed) && self.guard.data_document(text("url"));
-        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error || data;
-        let unplaceable = matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque;
+        let opaque = self.guard.opaque_document(text("url"), root) || !root && initial_blank || inherited || allowed_error || data || initial_empty;
+        let unplaceable = !initial_empty && (matches!(text("securityOrigin"), "" | "null") || text("securityOrigin") == "://" && !opaque);
         if content && (text("loaderId") == "null" || text("loaderId").is_empty() && !initial_blank
             || unplaceable
             || !root && !allowed_error && (self.guard.url(text("url")) || self.guard.url(text("securityOrigin")))

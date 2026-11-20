@@ -54,6 +54,7 @@ struct ToctouState {
     attaches: usize,
     contexts: Vec<ToctouContext>,
     next_context: i64,
+    survive_contexts: bool,
 }
 
 struct ToctouBrowser {
@@ -91,13 +92,19 @@ fn toctou_frame(url: &str, loader: &str) -> Value {
 }
 
 fn toctou_same_origin_reuse(from: &str, to: &str) -> bool {
-    if from != "about:blank" {
-        return false;
-    }
-    let Ok(parsed) = url::Url::parse(to) else {
+    let Ok(from_url) = url::Url::parse(from) else {
         return false;
     };
-    matches!(parsed.scheme(), "http" | "https") && parsed.origin().ascii_serialization() != "null"
+    let Ok(to_url) = url::Url::parse(to) else {
+        return false;
+    };
+    if from_url.scheme() == "about" || to_url.scheme() == "about" {
+        return false;
+    }
+    from_url.origin() == to_url.origin()
+        && matches!(from_url.scheme(), "http" | "https")
+        && matches!(to_url.scheme(), "http" | "https")
+        && from_url.origin().ascii_serialization() != "null"
 }
 
 impl ToctouState {
@@ -119,7 +126,7 @@ impl ToctouState {
         }
         let from = self.tree["url"].as_str().unwrap_or("about:blank");
         let to = self.live["url"].as_str().unwrap();
-        let reuse = toctou_same_origin_reuse(from, to);
+        let reuse = self.survive_contexts || toctou_same_origin_reuse(from, to);
         self.tree = self.live.clone();
         self.info = toctou_info(to);
         self.committed = true;
@@ -161,6 +168,10 @@ impl ToctouState {
                 })
                 .to_string(),
             );
+        } else {
+            for context in &mut self.contexts {
+                context.post_commit = true;
+            }
         }
         if deliver_events {
             inbox.push_back(
@@ -451,6 +462,7 @@ fn toctou_client(live: &str, timing: ToctouEventTiming) -> (Cdp, std::rc::Rc<std
         attaches: 0,
         contexts: Vec::new(),
         next_context: 0,
+        survive_contexts: false,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ToctouBrowser {
         inbox: VecDeque::new(),
@@ -565,6 +577,7 @@ fn ordinary_to_ordinary_navigation_during_pinned_evaluate_is_not_over_blocked() 
         attaches: 0,
         contexts: Vec::new(),
         next_context: 0,
+        survive_contexts: false,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ToctouBrowser {
         inbox: VecDeque::new(),
@@ -620,6 +633,7 @@ fn mutation_post_reply_document_recheck_is_necessary_for_protected_commit() {
     {
         let mut state = state.borrow_mut();
         state.commits_on_forward = true;
+        state.survive_contexts = true;
     }
     let out = cdp.call(
         &toctou_method("Runtime", "evaluate"),
@@ -627,8 +641,8 @@ fn mutation_post_reply_document_recheck_is_necessary_for_protected_commit() {
         Some(&session),
     );
     assert!(
-        out.as_ref().is_err(),
-        "defence-in-depth / destroyed-context must close protected commit during pinned evaluate: {out:?}"
+        out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "DiD recheck must be the sole refusal when a surviving same-origin context answers Ok(marker): {out:?}"
     );
     if let Err(message) = out {
         assert!(!message.contains(TOCTOU_MARK), "{message}");
