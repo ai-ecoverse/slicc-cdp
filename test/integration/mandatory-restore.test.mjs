@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  containsMarkerToken,
+  bfcachePrivacy,
   mandatory,
   protectedBfcacheRows,
+  published,
   verdictProblems,
 } from './guard-set.mjs';
+import { syntheticReport } from './guard-test-evidence.mjs';
 
 const clean = (id) => ({
   id,
@@ -100,15 +102,91 @@ test('raw PASS cannot excuse missing privacy measurement or any protected conten
     );
 });
 
-test('marker identity is whole-token and survives encoded carriers without confusing ordinary B', () => {
-  const marker = 'bfcache-marker-protected-p';
-  for (const encode of [
-    (value) => value,
-    encodeURIComponent,
-    (value) => Buffer.from(value).toString('base64'),
-    (value) => JSON.stringify({ value }),
+const base = 'protected';
+const marker = `bfcache-marker-${base}-p`;
+const ordinary = `bfcache-marker-${base}-b`;
+const restored = (id = 'C8.protected-bfcache-restore') => ({
+  ...clean(id),
+  evidence: {
+    guarded: {
+      restore: {
+        seed: {
+          protectedURL: `https://vault.test:8443/bfcache?n=${encodeURIComponent(`${base}-p`)}`,
+        },
+      },
+    },
+  },
+});
+const scored = (messages, id) => {
+  const row = restored(id);
+  return { ...row, guardedPrivacy: bfcachePrivacy(row, messages) };
+};
+const carriers = [
+  (value) => value,
+  encodeURIComponent,
+  (value) => Buffer.from(value).toString('base64'),
+  (value) => JSON.stringify({ value }),
+  (value) => ({ method: 'Runtime.consoleAPICalled', params: { args: [{ value }] } }),
+];
+
+test('the P marker followed by a word character is exposed, as the vector scores it', () => {
+  for (const id of protectedBfcacheRows)
+    for (const suffix of ['2', 'b', '_', 'x9'])
+      for (const encode of carriers) {
+        const row = scored([encode(`${marker}${suffix}`)], id);
+        assert.equal(row.guardedPrivacy.markerExposed, true, `${id} ${suffix}`);
+        assert(verdictProblems([row]).length > 0, `${id} ${suffix}`);
+      }
+});
+
+test('the exact P marker is exposed in every carrier', () => {
+  for (const id of protectedBfcacheRows)
+    for (const encode of carriers) {
+      const row = scored([encode(marker)], id);
+      assert.equal(row.guardedPrivacy.markerExposed, true, id);
+      assert(verdictProblems([row]).length > 0, id);
+    }
+});
+
+test('the ordinary B marker and its path never count as P exposure', () => {
+  for (const id of protectedBfcacheRows)
+    for (const encode of carriers) {
+      const row = scored(
+        [encode(ordinary), encode(`https://ordinary.test/bfcache?n=${base}-b`)],
+        id
+      );
+      assert.equal(row.guardedPrivacy.markerExposed, false, id);
+      assert.equal(row.guardedPrivacy.protectedPathExposed, false, id);
+      assert.deepEqual(verdictProblems([row]), [], id);
+    }
+});
+
+test('the protected path and query count as exposure by substring', () => {
+  for (const value of [
+    `vault.test:8443/bfcache?x`,
+    `https://vault.test:8443/bfcache`,
+    `/bfcache?n=${base}-p2`,
   ]) {
-    assert(containsMarkerToken(encode(marker), marker));
-    assert(!containsMarkerToken(encode(`${marker}-b`), marker));
+    const row = scored([value]);
+    assert.equal(row.guardedPrivacy.protectedPathExposed, true, value);
+    assert(verdictProblems([row]).length > 0, value);
   }
+});
+
+test('scoring records only measurement and exposure, with no local audit fields', () => {
+  assert.deepEqual(Object.keys(scored([ordinary]).guardedPrivacy).sort(), [
+    'markerExposed',
+    'measured',
+    'protectedPathExposed',
+  ]);
+  assert.deepEqual(bfcachePrivacy(restored(), []), { measured: false });
+  assert.deepEqual(bfcachePrivacy(clean('C8.protected-bfcache-restore'), [marker]), {
+    measured: false,
+  });
+});
+
+test('the synthetic report still scores clean restore rows without problems', () => {
+  const rows = syntheticReport(published).results.filter((row) => protectedBfcacheRows.has(row.id));
+  assert(rows.length > 0);
+  assert.deepEqual(verdictProblems(rows), []);
 });
