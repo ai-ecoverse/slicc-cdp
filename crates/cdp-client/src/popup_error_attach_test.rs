@@ -177,6 +177,19 @@ impl Transport for PopupBrowser {
                 };
                 json!({"node":{"nodeId":2,"backendNodeId":2,"nodeName":"IFRAME","localName":"iframe","attributes":["name", name]}})
             }
+            "Accessibility.getFullAXTree" => json!({
+                "nodes": [{
+                    "nodeId": "1",
+                    "ignored": false,
+                    "role": {"type": "role", "value": "link"},
+                    "name": {"type": "stringifiable", "value": "Seven"},
+                    "properties": [{"name": "url", "value": {"type": "stringifiable", "value": "https://seven.sliccy.ai/path/SECRET"}}]
+                }, {
+                    "name": "Seven",
+                    "url": "https://seven.sliccy.ai/path/SECRET",
+                    "role": "link"
+                }]
+            }),
             "Runtime.callFunctionOn" => json!({"result":{"type":"string","value":"document-read"}}),
             "Runtime.evaluate" => {
                 let expr = call["params"]["expression"].as_str().unwrap_or("");
@@ -187,6 +200,8 @@ impl Transport for PopupBrowser {
                 };
                 if expr.contains("window.name") {
                     json!({"result":{"type":"string","value":name}})
+                } else if expr.contains("nameAndUrl") {
+                    json!({"result":{"type":"object","value":{"name":"Seven","url":"https://seven.sliccy.ai/path/SECRET"}}})
                 } else {
                     json!({"result":{"type":"string","value":"document-read"}})
                 }
@@ -1443,4 +1458,189 @@ fn window_name_and_dom_frame_name_on_an_ordinary_page_are_not_blanked() {
     let described = cdp.call("DOM.describeNode", json!({"nodeId":2}), Some(&live)).unwrap();
     let attrs = described.pointer("/node/attributes").and_then(Value::as_array).expect("attrs");
     assert!(attrs.windows(2).any(|pair| pair[0] == "name" && pair[1] == host_name), "{described}");
+}
+
+#[test]
+fn page_window_open_blanks_window_name_on_a_protected_failed_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Page.windowOpen","sessionId":live,
+        "params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"noopener","userGesture":true}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
+    assert_no_failed_host("windowOpen-protected", opened, host, STALE_MARKER);
+    let url = opened.pointer("/params/url").and_then(Value::as_str).unwrap_or("");
+    assert!(url.is_empty() || url == "https://seven.sliccy.ai" || url == "about:blank", "url={url}");
+}
+
+#[test]
+fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Silent);
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, host);
+        state.frame = PopupFrame::Silent;
+    }
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, host)}}));
+    assert!(cdp.error_unproven(&own_info(POPUP_ERROR, host)));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Page.windowOpen","sessionId":live,
+        "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
+    assert!(!opened.to_string().eq_ignore_ascii_case(&host) && !opened.pointer("/params/windowName").and_then(Value::as_str).unwrap_or("").eq_ignore_ascii_case(host), "{opened}");
+}
+
+#[test]
+fn page_window_open_keeps_an_ordinary_window_name() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Page.windowOpen","sessionId":live,
+        "params":{"url":"https://example.test/opened","windowName":"my-window","windowFeatures":"noopener","userGesture":true}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some("my-window"));
+    assert_eq!(opened.pointer("/params/url").and_then(Value::as_str), Some("https://example.test/opened"));
+}
+
+#[test]
+fn an_accessibility_link_node_keeps_ordinary_text_next_to_a_protected_href() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let tree = cdp.call("Accessibility.getFullAXTree", json!({}), Some(&live)).unwrap();
+    assert_eq!(tree.pointer("/nodes/0/name/value").and_then(Value::as_str), Some("Seven"));
+    assert_eq!(tree.pointer("/nodes/1/name").and_then(Value::as_str), Some("Seven"));
+    assert!(!tree.to_string().contains("SECRET"), "{tree}");
+}
+
+#[test]
+fn a_runtime_remote_object_with_name_and_protected_url_keeps_its_name() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let evaluated = cdp.call("Runtime.evaluate", json!({"expression":"nameAndUrl"}), Some(&live)).unwrap();
+    assert_eq!(evaluated.pointer("/result/value/name").and_then(Value::as_str), Some("Seven"));
+    assert!(!evaluated.to_string().contains("SECRET"), "{evaluated}");
+}
+
+#[test]
+fn a_network_request_like_object_with_name_and_protected_url_keeps_its_name() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Network.requestWillBeSent","sessionId":live,
+        "params":{
+            "requestId":"R-NAME","type":"Other","documentURL":"https://example.test/start",
+            "request":{"url":"https://seven.sliccy.ai/path/SECRET","method":"GET","name":"Seven"},
+            "frameId":"T"
+        }
+    }));
+    let delivered = cdp.events()[mark..].iter().find(|event| event["method"] == "Network.requestWillBeSent");
+    if let Some(event) = delivered {
+        assert_eq!(event.pointer("/params/request/name").and_then(Value::as_str), Some("Seven"));
+        assert!(!event.to_string().contains("SECRET"), "{event}");
+    }
+}
+
+#[test]
+fn name_label_carrier_sweep_on_a_protected_failed_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, &format!("{host}/path/{STALE_MARKER}"));
+        state.frame = PopupFrame::Frame(own_error_frame_named("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    let mark = cdp.events().len();
+    let carriers = [
+        json!({"method":"Page.windowOpen","sessionId":live,"params":{"url":STALE_PROTECTED,"windowName":host,"windowFeatures":"","userGesture":true}}),
+        json!({"method":"Page.frameRequestedNavigation","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED,"reason":"scriptInitiated","disposition":"currentTab"}}),
+        json!({"method":"Page.navigatedWithinDocument","sessionId":live,"params":{"frameId":"T","url":STALE_PROTECTED}}),
+        json!({"method":"Page.fileChooserOpened","sessionId":live,"params":{"mode":"selectSingle","frameId":"T","backendNodeId":1}}),
+        json!({"method":"Page.downloadWillBegin","sessionId":live,"params":{"frameId":"T","guid":"G1","url":STALE_PROTECTED,"suggestedFilename":host}}),
+        json!({"method":"Page.downloadProgress","sessionId":live,"params":{"guid":"G1","totalBytes":1,"receivedBytes":0,"state":"inProgress"}}),
+        json!({"method":"Page.screencastFrame","sessionId":live,"params":{"sessionId":1,"data":"AAAA","metadata":{"offsetTop":0,"pageScaleFactor":1,"deviceWidth":800,"deviceHeight":600,"scrollOffsetX":0,"scrollOffsetY":0,"timestamp":1.0}}}),
+        json!({"method":"Page.lifecycleEvent","sessionId":live,"params":{"frameId":"T","loaderId":"LP","name":"DOMContentLoaded","timestamp":1.0}}),
+        json!({"method":"Page.interstitialShown","sessionId":live,"params":{}}),
+        json!({"method":"Page.interstitialHidden","sessionId":live,"params":{}}),
+        json!({"method":"DOM.documentUpdated","sessionId":live,"params":{}}),
+        json!({"method":"Network.requestWillBeSentExtraInfo","sessionId":live,"params":{"requestId":"R1","headers":{":authority":host,":path":format!("/path/{STALE_MARKER}")}}}),
+        json!({"method":"Runtime.executionContextCreated","sessionId":live,"params":{"context":{"id":2,"uniqueId":"ctx2","origin":format!("https://{host}"),"name":host,"auxData":{"frameId":"T","isDefault":true,"name":host}}}}),
+        json!({"method":"Emulation.virtualTimeBudgetExpired","sessionId":live,"params":{}}),
+        json!({"method":"Overlay.inspectNodeRequested","sessionId":live,"params":{"backendNodeId":1}}),
+        json!({"method":"Performance.metrics","sessionId":live,"params":{"title":host,"metrics":[{"name":"Nodes","value":1.0}]}}),
+        json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, host)}}),
+    ];
+    for carrier in carriers {
+        cdp.absorb(carrier);
+    }
+    for event in &cdp.events()[mark..] {
+        let method = event["method"].as_str().unwrap_or("");
+        if method == "Page.lifecycleEvent" {
+            assert_eq!(event.pointer("/params/name").and_then(Value::as_str), Some("DOMContentLoaded"));
+            continue;
+        }
+        if method == "Page.screencastFrame" {
+            continue;
+        }
+        assert_no_failed_host(&format!("sweep:{method}"), event, host, STALE_MARKER);
+        if let Some(name) = event.pointer("/params/windowName").and_then(Value::as_str) {
+            assert!(name.is_empty(), "windowName={name}");
+        }
+        if let Some(name) = event.pointer("/params/suggestedFilename").and_then(Value::as_str) {
+            assert!(name.is_empty(), "suggestedFilename={name}");
+        }
+        if let Some(title) = event.pointer("/params/targetInfo/title").and_then(Value::as_str) {
+            assert!(!title.eq_ignore_ascii_case(host), "title={title}");
+        }
+        if let Some(title) = event.pointer("/params/title").and_then(Value::as_str) {
+            assert!(!title.eq_ignore_ascii_case(host) && !title.contains(STALE_MARKER), "perf title={title}");
+        }
+    }
 }

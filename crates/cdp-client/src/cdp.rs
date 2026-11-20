@@ -770,25 +770,46 @@ impl Cdp {
             Value::Object(map) => {
                 let url = map.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                 let unreachable = map.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
+                let frame = map.contains_key("loaderId")
+                    && map.contains_key("securityOrigin")
+                    && map.contains_key("mimeType");
                 let history = map.contains_key("userTypedURL") || map.contains_key("transitionType");
+                let window_open = map.contains_key("windowName");
+                let download = map.contains_key("suggestedFilename");
+                let target_info = map.contains_key("targetId")
+                    && map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                        matches!(kind, "page" | "iframe" | "background_page" | "webview" | "app" | "other")
+                    });
+                let hide = self.failed_load_host_hidden(target, &url, &unreachable);
                 let error = Self::chrome_error(&url) || self.guard.error_page_url(&url) || !unreachable.is_empty() || history && target.is_some_and(|id| {
                     self.documents.get(id).is_some_and(|doc| Self::chrome_error(&doc.url) || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty())
                 });
-                if error && self.failed_load_host_hidden(target, &url, &unreachable) {
-                    if map.contains_key("name") {
-                        map.insert("name".into(), Value::String(String::new()));
+                let protected_url = self.guard.url(&url) || self.guard.url(&unreachable);
+                if hide && (frame || history || window_open || download || target_info) {
+                    if (frame || history || target_info) && (error || protected_url) {
+                        if map.contains_key("name") {
+                            map.insert("name".into(), Value::String(String::new()));
+                        }
                     }
-                    if map.contains_key("title") {
-                        let failed = if !unreachable.is_empty() { unreachable.as_str() } else { url.as_str() };
-                        let title = if self.guard.url(failed) || self.guard.url(&unreachable) {
-                            url::Url::parse(failed).ok()
-                                .map(|parsed| parsed.origin().ascii_serialization())
-                                .filter(|origin| origin != "null")
-                                .unwrap_or_else(|| "about:blank".into())
-                        } else {
-                            "about:blank".into()
-                        };
-                        map.insert("title".into(), Value::String(title));
+                    if window_open {
+                        map.insert("windowName".into(), Value::String(String::new()));
+                    }
+                    if download {
+                        map.insert("suggestedFilename".into(), Value::String(String::new()));
+                    }
+                    if (history || target_info) && (error || protected_url) {
+                        if map.contains_key("title") {
+                            let failed = if !unreachable.is_empty() { unreachable.as_str() } else { url.as_str() };
+                            let title = if self.guard.url(failed) || self.guard.url(&unreachable) {
+                                url::Url::parse(failed).ok()
+                                    .map(|parsed| parsed.origin().ascii_serialization())
+                                    .filter(|origin| origin != "null")
+                                    .unwrap_or_else(|| "about:blank".into())
+                            } else {
+                                "about:blank".into()
+                            };
+                            map.insert("title".into(), Value::String(title));
+                        }
                     }
                 }
                 for item in map.values_mut() {
@@ -4930,12 +4951,17 @@ impl Cdp {
             return;
         }
         if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Debugger.")) { return; }
-        if guarded && !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") {
+        let scrub_through = value.get("method").and_then(Value::as_str).is_some_and(|method| {
+            method.starts_with("Target.") || method == "Page.windowOpen"
+        });
+        if guarded && !scrub_through {
             self.fail_seen_network(&value);
             return;
         }
         self.adopt_guard_attach(&value);
-        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") && shield::loaded_urls_protected(&self.guard, &value["params"]) {
+        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or(""))
+            || !scrub_through && shield::loaded_urls_protected(&self.guard, &value["params"])
+        {
             self.fail_seen_network(&value);
             return;
         }
@@ -4948,7 +4974,9 @@ impl Cdp {
         let settle_guard = self.settling_attach
             && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
             && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
-        if self.hidden(&value) && !settle_guard {
+        if self.hidden(&value) && !settle_guard
+            && value.get("method").and_then(Value::as_str) != Some("Page.windowOpen")
+        {
             self.fail_seen_network(&value);
             return;
         }
