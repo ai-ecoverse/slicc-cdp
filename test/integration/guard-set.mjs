@@ -163,6 +163,8 @@ export const runCapabilities = {
   forwardAudit: true,
   closeProtected: true,
   errorFrameClass: true,
+  requestInterception: true,
+  fetchInterception: true,
 };
 
 export function declaredCapabilityNames(capabilities = runCapabilities) {
