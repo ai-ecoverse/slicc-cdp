@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import path from 'node:path';
 import { fixtureServer } from '@ai-ecoverse/slicc-browsers/fixture';
 import { launchBrowser } from './browser.mjs';
 import { chromeTest as test } from './chrome-policy.mjs';
@@ -8,11 +10,15 @@ import { browserArgs, origins } from './guard-fixture.mjs';
 import './watchdog.mjs';
 
 const MARKER = 'PROTECTED-BODY-MARKER-IW-UA';
+const OPEN_MARKER = 'OPEN-CROSS-ORIGIN-MARKER-IW-UA';
 const HEADER = 'x-protected-marker';
 const HEADER_VALUE = 'PROTECTED-HEADER-MARKER-IW-UA';
+const OPEN_HEADER = 'x-open-marker';
+const OPEN_HEADER_VALUE = 'OPEN-HEADER-MARKER-IW-UA';
 const COOKIE_NAME = 'iw_ua_session';
 const COOKIE_VALUE = 'IW-UA-COOKIE-SECRET';
-const SAME_ORIGIN_EXPR = 'location.origin + "|" + document.title';
+const SAME_ORIGIN_EXPR =
+  '({ kind: "sameOrigin", titleDoc: document.title === "doc", originPlain: location.origin.includes("plain.guard.test") })';
 
 async function navigate(raw, session, url) {
   const loaded = raw.waitEvent(
@@ -23,16 +29,26 @@ async function navigate(raw, session, url) {
   await loaded;
 }
 
-function protectedSite() {
+function hitRecord(req, tag) {
+  return {
+    tag,
+    method: req.method,
+    path: new URL(req.url || '/', 'http://127.0.0.1').pathname,
+    cookiePresent: String(req.headers.cookie || '').includes(`${COOKIE_NAME}=${COOKIE_VALUE}`),
+    originPresent: Boolean(req.headers.origin),
+    refererPresent: Boolean(req.headers.referer),
+    origin: req.headers.origin ? 'set' : 'absent',
+    referer: req.headers.referer ? 'set' : 'absent',
+  };
+}
+
+function dualSite() {
   const hits = [];
   const server = createServer((req, res) => {
+    const host = String(req.headers.host || '').split(':')[0];
     const url = new URL(req.url || '/', 'http://127.0.0.1');
-    hits.push({
-      path: url.pathname,
-      cookie: String(req.headers.cookie || ''),
-      origin: String(req.headers.origin || ''),
-    });
-    if (url.pathname === '/secret') {
+    if (host === 'seven.sliccy.ai' && url.pathname === '/secret') {
+      hits.push(hitRecord(req, 'protected'));
       res.writeHead(200, {
         'content-type': 'text/plain; charset=utf-8',
         [HEADER]: HEADER_VALUE,
@@ -40,6 +56,16 @@ function protectedSite() {
       res.end(`${MARKER}\n`);
       return;
     }
+    if (host === 'open.other.test' && url.pathname === '/open') {
+      hits.push(hitRecord(req, 'open'));
+      res.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        [OPEN_HEADER]: OPEN_HEADER_VALUE,
+      });
+      res.end(`${OPEN_MARKER}\n`);
+      return;
+    }
+    hits.push(hitRecord(req, 'other'));
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('missing');
   });
@@ -49,7 +75,8 @@ function protectedSite() {
       resolve({
         port,
         hits,
-        url: `http://seven.sliccy.ai:${port}/secret`,
+        protectedUrl: `http://seven.sliccy.ai:${port}/secret`,
+        openUrl: `http://open.other.test:${port}/open`,
         close: () =>
           new Promise((done) => {
             server.closeAllConnections();
@@ -60,7 +87,7 @@ function protectedSite() {
   });
 }
 
-function probeExpression(url, kind) {
+function probeExpression(url, kind, marker, headerName, headerValue) {
   if (kind === 'fetch') {
     return `(() => fetch(${JSON.stringify(url)}, { credentials: 'include', cache: 'no-store' })
       .then(async (response) => {
@@ -70,9 +97,8 @@ function probeExpression(url, kind) {
           status: response.status,
           ok: response.ok,
           bodyLen: body.length,
-          bodyHasMarker: body.includes(${JSON.stringify(MARKER)}),
-          headerHasMarker: response.headers.get(${JSON.stringify(HEADER)}) === ${JSON.stringify(HEADER_VALUE)},
-          bodyPrefix: body.slice(0, 64),
+          hasMarker: body.includes(${JSON.stringify(marker)}),
+          headerHasMarker: response.headers.get(${JSON.stringify(headerName)}) === ${JSON.stringify(headerValue)},
           error: null
         };
       })
@@ -81,10 +107,9 @@ function probeExpression(url, kind) {
         status: 0,
         ok: false,
         bodyLen: 0,
-        bodyHasMarker: false,
+        hasMarker: false,
         headerHasMarker: false,
-        bodyPrefix: '',
-        error: String(error && error.message ? error.message : error)
+        error: String(error && error.name ? error.name : 'Error')
       })))()`;
   }
   return `(() => new Promise((resolve) => {
@@ -95,16 +120,15 @@ function probeExpression(url, kind) {
       const body = String(xhr.responseText || '');
       let headerHasMarker = false;
       try {
-        headerHasMarker = xhr.getResponseHeader(${JSON.stringify(HEADER)}) === ${JSON.stringify(HEADER_VALUE)};
+        headerHasMarker = xhr.getResponseHeader(${JSON.stringify(headerName)}) === ${JSON.stringify(headerValue)};
       } catch (_) {}
       resolve({
         kind: 'xhr',
         status: xhr.status,
         ok: xhr.status >= 200 && xhr.status < 300,
         bodyLen: body.length,
-        bodyHasMarker: body.includes(${JSON.stringify(MARKER)}),
+        hasMarker: body.includes(${JSON.stringify(marker)}),
         headerHasMarker,
-        bodyPrefix: body.slice(0, 64),
         error: null
       });
     };
@@ -113,10 +137,9 @@ function probeExpression(url, kind) {
       status: xhr.status || 0,
       ok: false,
       bodyLen: 0,
-      bodyHasMarker: false,
+      hasMarker: false,
       headerHasMarker: false,
-      bodyPrefix: '',
-      error: 'xhr-error'
+      error: 'NetworkError'
     });
     xhr.send();
   }))()`;
@@ -136,26 +159,75 @@ function valueOf(reply) {
   return reply?.result?.value;
 }
 
-async function createWorld(client, sessionId, frameId, worldName, universal) {
-  const params = { frameId, worldName };
-  if (universal) {
-    params.grantUniveralAccess = true;
-    params.contentSecurityPolicy = "default-src 'none'";
-  }
+async function createWorld(client, sessionId, frameId, options = {}) {
+  const params = { frameId };
+  if (options.worldName !== undefined) params.worldName = options.worldName;
+  if (options.universal) params.grantUniveralAccess = true;
+  if (options.csp !== undefined) params.contentSecurityPolicy = options.csp;
   const world = await client.send('Page.createIsolatedWorld', params, sessionId);
   const contextId = world.executionContextId;
   assert.equal(typeof contextId, 'number');
   assert.ok(contextId > 0);
-  return { world, contextId };
+  return { world, contextId, params };
 }
 
 function readable(probe) {
   return Boolean(
-    probe?.fetch?.bodyHasMarker ||
-      probe?.xhr?.bodyHasMarker ||
+    probe?.fetch?.hasMarker ||
+      probe?.xhr?.hasMarker ||
       probe?.fetch?.headerHasMarker ||
       probe?.xhr?.headerHasMarker
   );
+}
+
+async function worldReads(client, sessionId, contextId, protectedUrl, openUrl) {
+  const sameOrigin = valueOf(await evaluateRaw(client, sessionId, SAME_ORIGIN_EXPR, contextId));
+  const fetch = valueOf(
+    await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedUrl, 'fetch', MARKER, HEADER, HEADER_VALUE),
+      contextId
+    )
+  );
+  const xhr = valueOf(
+    await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedUrl, 'xhr', MARKER, HEADER, HEADER_VALUE),
+      contextId
+    )
+  );
+  const openFetch = valueOf(
+    await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(openUrl, 'fetch', OPEN_MARKER, OPEN_HEADER, OPEN_HEADER_VALUE),
+      contextId
+    )
+  );
+  const openXhr = valueOf(
+    await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(openUrl, 'xhr', OPEN_MARKER, OPEN_HEADER, OPEN_HEADER_VALUE),
+      contextId
+    )
+  );
+  return { sameOrigin, fetch, xhr, openFetch, openXhr };
+}
+
+function publishReport(report) {
+  const text = JSON.stringify(report);
+  console.log(`IW-UA-PROBE ${text}`);
+  const dir = process.env.SLICC_CHROME_REPORT_DIR;
+  if (dir) writeFileSync(path.join(dir, `iw-ua-probe-${process.pid}.json`), text);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    appendFileSync(
+      process.env.GITHUB_STEP_SUMMARY,
+      `\n### isolated-world probe\n\n\`\`\`json\n${text}\n\`\`\`\n`
+    );
+  }
 }
 
 test('Chrome: isolated world without universal access cannot read a protected cross-origin body', {
@@ -163,12 +235,16 @@ test('Chrome: isolated world without universal access cannot read a protected cr
 }, async () => {
   const fixture = await fixtureServer();
   const sites = origins(fixture);
-  const protectedFixture = await protectedSite();
+  const cross = await dualSite();
   let browser;
   let raw;
   let client;
   try {
-    browser = await launchBrowser(browserArgs());
+    const args = browserArgs();
+    const resolver = args.findIndex((arg) => arg.startsWith('--host-resolver-rules='));
+    if (resolver >= 0) args[resolver] = `${args[resolver]}, MAP open.other.test 127.0.0.1`;
+    else args.push('--host-resolver-rules=MAP open.other.test 127.0.0.1');
+    browser = await launchBrowser(args);
     raw = await observer(browser.wsUrl);
     const version = await raw.send('Browser.getVersion', {});
     await raw.send('Storage.setCookies', {
@@ -201,20 +277,19 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     await raw.send('Runtime.enable', {}, rawSession);
     const ordinaryUrl = `${sites.ordinary}/doc?n=iw-ua`;
     await navigate(raw, rawSession, ordinaryUrl);
-    const pageState = await raw.send(
-      'Runtime.evaluate',
-      {
-        expression: '({ href: location.href, title: document.title, ready: document.readyState })',
-        returnByValue: true,
-      },
-      rawSession
+    const pageState = valueOf(
+      await evaluateRaw(
+        raw,
+        rawSession,
+        '({ hrefPlain: location.href.includes("plain.guard.test") && location.href.includes("/doc"), titleDoc: document.title === "doc", ready: document.readyState })'
+      )
     );
     assert.equal(
-      pageState.result?.value?.href,
-      ordinaryUrl,
-      `unguarded page URL before world create; state=${JSON.stringify(pageState.result?.value)}`
+      pageState?.hrefPlain,
+      true,
+      `unguarded page URL; state=${JSON.stringify(pageState)}`
     );
-    assert.equal(pageState.result?.value?.title, 'doc');
+    assert.equal(pageState?.titleDoc, true);
 
     const rawTree = await raw.send('Page.getFrameTree', {}, rawSession);
     const frameId = rawTree.frameTree.frame.id;
@@ -227,174 +302,140 @@ test('Chrome: isolated world without universal access cannot read a protected cr
       await client.send(method, {}, sessionId);
     }
 
-    const withUa = await createWorld(client, sessionId, frameId, 'slicc-ua-probe', true);
-    const withoutUa = await createWorld(client, sessionId, frameId, 'slicc-plain-probe', false);
+    const attackNamed = await createWorld(client, sessionId, frameId, {
+      worldName: 'slicc-ua-attack',
+      universal: true,
+    });
+    const attackAnon = await createWorld(client, sessionId, frameId, {
+      universal: true,
+    });
+    const cspControl = await createWorld(client, sessionId, frameId, {
+      worldName: 'slicc-ua-csp',
+      universal: true,
+      csp: "default-src 'none'",
+    });
+    const plain = await createWorld(client, sessionId, frameId, {
+      worldName: 'slicc-plain',
+    });
 
-    const expectedOrigin = `${sites.ordinary}|doc`;
-    const sameOriginGuardedUa = await evaluateRaw(
-      client,
-      sessionId,
-      SAME_ORIGIN_EXPR,
-      withUa.contextId
-    );
-    const sameOriginGuardedPlain = await evaluateRaw(
-      client,
-      sessionId,
-      SAME_ORIGIN_EXPR,
-      withoutUa.contextId
-    );
-    const sameOriginGuardedMain = await evaluateRaw(client, sessionId, SAME_ORIGIN_EXPR);
-    const sameOriginUnguardedUa = await evaluateRaw(
-      raw,
-      rawSession,
-      SAME_ORIGIN_EXPR,
-      withUa.contextId
-    );
-    const sameOriginUnguardedPlain = await evaluateRaw(
-      raw,
-      rawSession,
-      SAME_ORIGIN_EXPR,
-      withoutUa.contextId
-    );
-    const sameOriginUnguardedMain = await evaluateRaw(raw, rawSession, SAME_ORIGIN_EXPR);
-
-    assert.equal(
-      valueOf(sameOriginUnguardedUa),
-      expectedOrigin,
-      `unguarded UA world sameOrigin; guardedUa=${JSON.stringify(sameOriginGuardedUa)} unguardedUa=${JSON.stringify(sameOriginUnguardedUa)} guardedMain=${JSON.stringify(sameOriginGuardedMain)} unguardedMain=${JSON.stringify(sameOriginUnguardedMain)}`
+    const unguardedSameOriginAttack = valueOf(
+      await evaluateRaw(raw, rawSession, SAME_ORIGIN_EXPR, attackNamed.contextId)
     );
     assert.equal(
-      valueOf(sameOriginUnguardedPlain),
-      expectedOrigin,
-      `unguarded plain world sameOrigin; guardedPlain=${JSON.stringify(sameOriginGuardedPlain)} unguardedPlain=${JSON.stringify(sameOriginUnguardedPlain)}`
+      unguardedSameOriginAttack?.titleDoc,
+      true,
+      `unguarded attack world; state=${JSON.stringify(unguardedSameOriginAttack)}`
     );
+    assert.equal(unguardedSameOriginAttack?.originPlain, true);
 
-    const fetchGuardedUa = await evaluateRaw(
+    const hitsBefore = cross.hits.length;
+    const attackNamedReads = await worldReads(
       client,
       sessionId,
-      probeExpression(protectedFixture.url, 'fetch'),
-      withUa.contextId
+      attackNamed.contextId,
+      cross.protectedUrl,
+      cross.openUrl
     );
-    const xhrGuardedUa = await evaluateRaw(
+    const attackAnonReads = await worldReads(
       client,
       sessionId,
-      probeExpression(protectedFixture.url, 'xhr'),
-      withUa.contextId
+      attackAnon.contextId,
+      cross.protectedUrl,
+      cross.openUrl
     );
-    const fetchGuardedPlain = await evaluateRaw(
+    const cspReads = await worldReads(
       client,
       sessionId,
-      probeExpression(protectedFixture.url, 'fetch'),
-      withoutUa.contextId
+      cspControl.contextId,
+      cross.protectedUrl,
+      cross.openUrl
     );
-    const xhrGuardedPlain = await evaluateRaw(
+    const plainReads = await worldReads(
       client,
       sessionId,
-      probeExpression(protectedFixture.url, 'xhr'),
-      withoutUa.contextId
+      plain.contextId,
+      cross.protectedUrl,
+      cross.openUrl
     );
-    const fetchGuardedMain = await evaluateRaw(
-      client,
-      sessionId,
-      probeExpression(protectedFixture.url, 'fetch')
+    const mainFetch = valueOf(
+      await evaluateRaw(
+        client,
+        sessionId,
+        probeExpression(cross.protectedUrl, 'fetch', MARKER, HEADER, HEADER_VALUE)
+      )
     );
-    const xhrGuardedMain = await evaluateRaw(
-      client,
-      sessionId,
-      probeExpression(protectedFixture.url, 'xhr')
+    const mainXhr = valueOf(
+      await evaluateRaw(
+        client,
+        sessionId,
+        probeExpression(cross.protectedUrl, 'xhr', MARKER, HEADER, HEADER_VALUE)
+      )
     );
-    const fetchUnguardedUa = await evaluateRaw(
-      raw,
-      rawSession,
-      probeExpression(protectedFixture.url, 'fetch'),
-      withUa.contextId
+    const mainOpenFetch = valueOf(
+      await evaluateRaw(
+        client,
+        sessionId,
+        probeExpression(cross.openUrl, 'fetch', OPEN_MARKER, OPEN_HEADER, OPEN_HEADER_VALUE)
+      )
     );
-    const xhrUnguardedUa = await evaluateRaw(
-      raw,
-      rawSession,
-      probeExpression(protectedFixture.url, 'xhr'),
-      withUa.contextId
-    );
-
-    const withUaProbe = {
-      sameOriginGuarded: valueOf(sameOriginGuardedUa),
-      sameOriginUnguarded: valueOf(sameOriginUnguardedUa),
-      fetch: valueOf(fetchGuardedUa),
-      xhr: valueOf(xhrGuardedUa),
-      fetchUnguarded: valueOf(fetchUnguardedUa),
-      xhrUnguarded: valueOf(xhrUnguardedUa),
-    };
-    const withoutUaProbe = {
-      sameOriginGuarded: valueOf(sameOriginGuardedPlain),
-      sameOriginUnguarded: valueOf(sameOriginUnguardedPlain),
-      fetch: valueOf(fetchGuardedPlain),
-      xhr: valueOf(xhrGuardedPlain),
-    };
-    const mainWorld = {
-      sameOriginGuarded: valueOf(sameOriginGuardedMain),
-      sameOriginUnguarded: valueOf(sameOriginUnguardedMain),
-      fetch: valueOf(fetchGuardedMain),
-      xhr: valueOf(xhrGuardedMain),
-    };
 
     const report = {
       chromeVersion: version.product || version.userAgent || version,
       ordinaryUrl,
-      protectedUrl: protectedFixture.url,
+      protectedUrl: cross.protectedUrl,
+      openUrl: cross.openUrl,
       cookie: `${COOKIE_NAME}=${COOKIE_VALUE}`,
-      hits: protectedFixture.hits,
-      worldCreate: { withUa: withUa.world, withoutUa: withoutUa.world },
-      rawReplies: {
-        sameOriginGuardedUa,
-        sameOriginGuardedPlain,
-        sameOriginGuardedMain,
-        sameOriginUnguardedUa,
-        sameOriginUnguardedPlain,
-        sameOriginUnguardedMain,
-        fetchGuardedUa,
-        xhrGuardedUa,
-        fetchGuardedPlain,
-        xhrGuardedPlain,
-        fetchGuardedMain,
-        xhrGuardedMain,
-        fetchUnguardedUa,
-        xhrUnguardedUa,
+      worldParams: {
+        attackNamed: attackNamed.params,
+        attackAnon: attackAnon.params,
+        cspControl: cspControl.params,
+        plain: plain.params,
       },
-      withGrantUniveralAccess: withUaProbe,
-      withoutGrantUniveralAccess: withoutUaProbe,
-      mainWorld,
+      hitsAfter: cross.hits.slice(hitsBefore),
+      attackNamed: attackNamedReads,
+      attackAnon: attackAnonReads,
+      cspControl: cspReads,
+      withoutGrantUniveralAccess: plainReads,
+      mainWorld: { fetch: mainFetch, xhr: mainXhr, openFetch: mainOpenFetch },
+      positiveControlReadable: readable({
+        fetch: attackNamedReads.openFetch,
+        xhr: attackNamedReads.openXhr,
+      }),
+      protectedReadableAttackNamed: readable(attackNamedReads),
+      protectedReadableAttackAnon: readable(attackAnonReads),
     };
+    publishReport(report);
 
     assert.equal(
-      readable(withUaProbe),
-      false,
-      `protected content must stay unreadable from the isolated world; probe=${JSON.stringify(report)}`
+      report.positiveControlReadable,
+      true,
+      `universal-access world must read an unprotected no-CORS cross-origin body; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUaProbe.fetch?.bodyHasMarker,
+      report.protectedReadableAttackNamed,
       false,
-      `fetch body marker; probe=${JSON.stringify(report)}`
+      `protected content must stay unreadable from the attack isolated world; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUaProbe.xhr?.bodyHasMarker,
+      report.protectedReadableAttackAnon,
       false,
-      `xhr body marker; probe=${JSON.stringify(report)}`
+      `protected content must stay unreadable from the anonymous attack world; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUaProbe.fetch?.headerHasMarker,
+      attackNamedReads.fetch?.hasMarker,
       false,
-      `fetch header marker; probe=${JSON.stringify(report)}`
+      `fetch hasMarker; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUaProbe.xhr?.headerHasMarker,
+      attackNamedReads.xhr?.hasMarker,
       false,
-      `xhr header marker; probe=${JSON.stringify(report)}`
+      `xhr hasMarker; probe=${JSON.stringify(report)}`
     );
   } finally {
     await client?.close();
     await raw?.close();
     await browser?.close();
-    await protectedFixture.close();
+    await cross.close();
     await fixture.close();
   }
 });
