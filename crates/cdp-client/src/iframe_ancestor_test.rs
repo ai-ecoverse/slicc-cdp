@@ -52,7 +52,7 @@ impl Transport for AncestorBackend {
             | "Runtime.disable" | "Target.activateTarget" | "Target.setDiscoverTargets" => json!({}),
             "Page.getFrameTree" => {
                 let owner = browser.sessions.get(session).cloned().unwrap_or_else(|| target.to_string());
-                browser.trees.get(&owner).cloned().unwrap_or_else(|| json!({ "frameTree": { "frame": { "id": owner, "url": "about:blank", "securityOrigin": "://", "loaderId": "L" } } }))
+                browser.trees.get(&owner).cloned().unwrap_or_else(|| default_frame_tree(&browser.infos, &owner))
             }
             _ => json!({}),
         };
@@ -63,6 +63,19 @@ impl Transport for AncestorBackend {
     fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
         Ok(self.inbox.pop_front())
     }
+}
+
+fn default_frame_tree(infos: &[Value], owner: &str) -> Value {
+    let info = infos.iter().find(|info| info["targetId"] == owner);
+    let url = info.and_then(|info| info["url"].as_str()).unwrap_or("about:blank");
+    let origin = url::Url::parse(url).ok().map(|parsed| parsed.origin().ascii_serialization()).unwrap_or_else(|| {
+        if url.starts_with("about:") { "://".into() } else { url.to_string() }
+    });
+    let mut frame = json!({ "id": owner, "url": url, "securityOrigin": origin, "loaderId": "L" });
+    if let Some(parent) = info.and_then(|info| info["parentFrameId"].as_str()) {
+        frame["parentId"] = json!(parent);
+    }
+    json!({ "frameTree": { "frame": frame } })
 }
 
 #[derive(Clone, Copy)]
@@ -334,7 +347,7 @@ fn logging_browser(infos: Vec<Value>) -> (Cdp, Rc<RefCell<AncestorBrowser>>, Rc<
                 | "Fetch.fulfillRequest" | "Fetch.failRequest" | "Fetch.continueRequest" => json!({}),
                 "Page.getFrameTree" => {
                     let owner = browser.sessions.get(session).cloned().unwrap_or_else(|| target.to_string());
-                    browser.trees.get(&owner).cloned().unwrap_or_else(|| json!({ "frameTree": { "frame": { "id": owner, "url": "about:blank", "securityOrigin": "://", "loaderId": "L" } } }))
+                    browser.trees.get(&owner).cloned().unwrap_or_else(|| default_frame_tree(&browser.infos, &owner))
                 }
                 _ => json!({}),
             };
@@ -1494,6 +1507,9 @@ fn unresolved_cut_keeps_live_session_blocked_but_admits_fresh_attach() {
     assert!(cdp.session_targets.contains_key("S-OLD") || browser.borrow().sessions.contains_key("S-OLD"));
     assert!(!cdp.is_protected_target("OOPIF"), "unresolved cut must not latch the target");
     assert!(cdp.call("Network.enable", json!({}), Some("S-OLD")).is_err());
+    browser.borrow_mut().trees.insert("OOPIF".into(), json!({
+        "frameTree":{"frame":{"id":"OOPIF","parentId":"NESTED","url":"https://foreign.test/excel","securityOrigin":"https://foreign.test","loaderId":"F"}}
+    }));
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
     assert!(attach.is_ok(), "fresh attach of ordinary target must be admitted: {attach:?}");
 }
@@ -1545,7 +1561,7 @@ fn refused_auto_attach_does_not_remap_blocked_session() {
         "parentFrameId":"NESTED",
         "browserContextId":"CTX"
     });
-    let (mut cdp, _, _) = logging_browser(vec![page.clone(), child.clone()]);
+    let (mut cdp, browser, _) = logging_browser(vec![page.clone(), child.clone()]);
     cdp.targets.insert("PAGE".into(), page.clone());
     cdp.documents.insert("PAGE".into(), super::MainDocument {
         frame_id: "FRAME".into(),
@@ -1576,6 +1592,9 @@ fn refused_auto_attach_does_not_remap_blocked_session() {
         "params":{"targetInfo":page}
     }));
     assert!(!cdp.is_protected_target("OOPIF"));
+    browser.borrow_mut().trees.insert("OOPIF".into(), json!({
+        "frameTree":{"frame":{"id":"OOPIF","parentId":"NESTED","url":"https://foreign.test/excel","securityOrigin":"https://foreign.test","loaderId":"F"}}
+    }));
     let attach = cdp.call("Target.attachToTarget", json!({"targetId":"OOPIF","flatten":true}), None);
     assert!(attach.is_ok(), "cleared ordinary OOPIF must attach: {attach:?}");
 }

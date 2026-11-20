@@ -3010,10 +3010,19 @@ impl Cdp {
     }
 
     fn iframe_attach_ordinary_under_clear_parent(&self, target: &str, doc: &MainDocument) -> bool {
-        if !self.attach_document_url_ordinary(&doc.url)
-            && !self.guard.inheriting(&doc.url)
-            && !self.guard.data_document(&doc.url)
-            && !self.guard.opaque_document(&doc.url, false)
+        let reported = self
+            .targets
+            .get(target)
+            .and_then(|info| info.get("url"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if self.guard.inheriting(&doc.url) {
+            if !self.guard.inheriting(reported) || self.guard.url(reported) {
+                return false;
+            }
+        } else if !(self.ordinary_http_document_url(&doc.url)
+            || self.guard.data_document(&doc.url)
+            || self.guard.opaque_document(&doc.url, false))
         {
             return false;
         }
