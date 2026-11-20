@@ -1598,16 +1598,28 @@ fn settle_guard_never_delivers_guard_blocked_or_own_protected_attach() {
         }
     }
     assert!(cdp.events().iter().any(|event| event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == live));
-    cdp.settling_attach = true;
+    cdp.settling_attach.set(true);
     let mark = cdp.events().len();
-    cdp.absorb(json!({
-        "method":name("Page", "windowOpen"),"sessionId":guard,
-        "params":{"url":"https://idp.example/authorize?code=SETTLESECRET","windowName":"settle-leak","windowFeatures":"","userGesture":true}
-    }));
+    let settle_leaks = [
+        json!({"method":name("Page", "windowOpen"),"sessionId":guard,"params":{"url":"https://idp.example/authorize?code=SETTLESECRET","windowName":"settle-leak","windowFeatures":"","userGesture":true}}),
+        json!({"method":"Page.loadEventFired","sessionId":guard,"params":{"timestamp":1.0}}),
+        json!({"method":"Network.requestWillBeSent","sessionId":guard,"params":{"requestId":"NR1","loaderId":"L0","documentURL":"https://idp.example/","request":{"url":"https://idp.example/authorize?code=SETTLESECRET","method":"GET","headers":{},"initialPriority":"VeryHigh","referrerPolicy":"no-referrer"},"timestamp":1.0,"wallTime":1.0,"initiator":{"type":"other"},"redirectHasExtraInfo":false,"type":"Document","hasExtraInfo":false}}),
+        json!({"method":"Fetch.requestPaused","sessionId":guard,"params":{"requestId":"FR1","request":{"url":"https://idp.example/authorize?code=SETTLESECRET","method":"GET","headers":{},"initialPriority":"VeryHigh","referrerPolicy":"no-referrer"},"frameId":"T","resourceType":"Document"}}),
+        json!({"method":"Runtime.consoleAPICalled","sessionId":guard,"params":{"type":"log","args":[{"type":"string","value":"SETTLESECRET"}],"executionContextId":1,"timestamp":1.0,"stackTrace":{"callFrames":[]}}}),
+        json!({"method":"Target.targetCreated","sessionId":guard,"params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}}),
+        json!({"method":"Target.targetInfoChanged","sessionId":guard,"params":{"targetInfo":own_info(STALE_PROTECTED, "seven.sliccy.ai")}}),
+    ];
+    for event in settle_leaks {
+        cdp.absorb(event);
+    }
     assert!(!cdp.events()[mark..].iter().any(|event| {
-        event["method"].as_str() == Some(name("Page", "windowOpen").as_str())
+        let method = event["method"].as_str().unwrap_or("");
+        event.get("sessionId").and_then(Value::as_str) == Some(guard.as_str())
+            || method == "Target.targetCreated" && event.get("sessionId").and_then(Value::as_str) == Some(guard.as_str())
+            || method == "Target.targetInfoChanged" && event.get("sessionId").and_then(Value::as_str) == Some(guard.as_str())
             || event.to_string().contains("SETTLESECRET")
             || event.to_string().contains("settle-leak")
+            || event.to_string().contains(STALE_MARKER)
     }), "settle_guard must not widen past attach/detach: {:?}", &cdp.events()[mark..]);
     cdp.blocked.insert(live.clone());
     let mark = cdp.events().len();
@@ -1630,7 +1642,76 @@ fn settle_guard_never_delivers_guard_blocked_or_own_protected_attach() {
             assert!(!url.contains(STALE_MARKER) && !url.contains("/path/"), "own protected attach must scrub path secrets: {event}");
         }
     }
-    cdp.settling_attach = false;
+    cdp.settling_attach.set(false);
+}
+
+#[test]
+fn settling_attach_clears_on_error_nested_attach_and_panic() {
+    let mut refused = popup_client(popup_info(POPUP_ERROR, "seven.sliccy.ai"), PopupFrame::Frame(popup_error_frame(POPUP_SEVEN)));
+    assert!(refused.call("Target.attachToTarget", json!({"targetId":"P","flatten":true}), None).is_err());
+    assert!(!refused.settling_attach.get(), "error path must clear settling_attach");
+
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    cdp.settling_attach.set(true);
+    let nested = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None);
+    assert!(nested.is_ok(), "{nested:?}");
+    assert!(!cdp.settling_attach.get(), "nested attach inside a settle window must clear settling_attach");
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Target.attachedToTarget","params":{"sessionId":guard,"targetInfo":own_info("https://example.test/start", "start"),"waitingForDebugger":false}
+    }));
+    assert!(!cdp.events()[mark..].iter().any(|event| {
+        event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == guard
+    }), "cleared settle must not leave settle_guard sticky: {:?}", &cdp.events()[mark..]);
+
+    cdp.settling_attach.set(true);
+    let cell = std::ptr::from_ref(&cdp.settling_attach);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _clear = SettlingAttachClear(cell);
+        panic!("settling-attach-panic");
+    }));
+    assert!(panicked.is_err());
+    assert!(!cdp.settling_attach.get(), "SettlingAttachClear must clear on unwind");
+}
+
+#[test]
+fn watch_scrub_error_alone_hides_unproven_chrome_error_when_redact_does_not() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let _ = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let info = json!({
+        "targetId":"E","type":"page","url":POPUP_ERROR,"title":"ordinary.invalid","attached":false,"canAccessOpener":false
+    });
+    assert!(cdp.error_unproven(&info), "chrome-error without proof must be unproven");
+    assert!(!cdp.info_protected(&info, &[]), "own chrome-error without protected url must not be info_protected (scrub_error-only lock)");
+    assert!(!cdp.discovery_redacted(&info), "discovery redact must not already mask this shape");
+    let mark = cdp.events().len();
+    cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":info.clone()}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":info.clone()}}));
+    cdp.absorb(json!({"method":"Target.attachedToTarget","params":{"sessionId":"E1","targetInfo":info,"waitingForDebugger":false}}));
+    let mut seen = 0;
+    for event in &cdp.events()[mark..] {
+        if !matches!(event["method"].as_str(), Some("Target.targetCreated") | Some("Target.targetInfoChanged") | Some("Target.attachedToTarget")) {
+            continue;
+        }
+        if event.pointer("/params/targetInfo/targetId").and_then(Value::as_str) != Some("E")
+            && event["params"]["sessionId"] != "E1"
+        {
+            continue;
+        }
+        seen += 1;
+        assert_eq!(event.pointer("/params/targetInfo/url").and_then(Value::as_str), Some("about:blank"), "watch scrub_error alone must placeholder: {event}");
+        assert!(!event.to_string().contains("ordinary.invalid"), "{event}");
+    }
+    assert!(seen >= 2, "expected created/changed/attached deliveries, saw {seen}: {:?}", &cdp.events()[mark..]);
 }
 
 #[test]

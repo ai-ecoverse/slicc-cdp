@@ -164,7 +164,7 @@ pub struct Cdp {
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
     checking_page_events: bool,
-    settling_attach: bool,
+    settling_attach: std::cell::Cell<bool>,
     pending_page_events: VecDeque<Value>,
     runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
@@ -246,6 +246,16 @@ impl Drop for Cdp {
     }
 }
 
+struct SettlingAttachClear(*const std::cell::Cell<bool>);
+
+impl Drop for SettlingAttachClear {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.0).set(false);
+        }
+    }
+}
+
 impl Cdp {
     fn retire_private_sessions(&mut self, deadline: Instant) {
         self.waiter = None;
@@ -300,7 +310,7 @@ impl Cdp {
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
             checking_page_events: false,
-            settling_attach: false,
+            settling_attach: std::cell::Cell::new(false),
             pending_page_events: VecDeque::new(),
             runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
@@ -622,10 +632,10 @@ impl Cdp {
         }
         let mark = self.events.len();
         let target = params.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
-        self.settling_attach = true;
+        self.settling_attach.set(true);
+        let _clear = SettlingAttachClear(std::ptr::from_ref(&self.settling_attach));
         let result = self.guarded_call(method, params, session_id, timeout, holder_debugger, retry_opt_in);
         self.settle_attach_events(mark, &target, &result);
-        self.settling_attach = false;
         result
     }
 
@@ -4993,7 +5003,7 @@ impl Cdp {
         if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
         let event_target = value.get("sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session));
         self.scrub_failed_load_carriers(&mut value, event_target.as_deref());
-        let settle_guard = self.settling_attach
+        let settle_guard = self.settling_attach.get()
             && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
             && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
         if self.hidden(&value) && !settle_guard {
@@ -6195,7 +6205,7 @@ include!("window.rs");
 
 #[cfg(test)]
 mod tests {
-    use super::{first_stderr_line, probe_is_settled, ActionNote, Cdp, Transport};
+    use super::{first_stderr_line, probe_is_settled, ActionNote, Cdp, SettlingAttachClear, Transport};
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
