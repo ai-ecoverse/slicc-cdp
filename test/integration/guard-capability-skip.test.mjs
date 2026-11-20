@@ -121,6 +121,39 @@ test('the run does not declare autoAttach because the route refuses auto-attach'
   assert.notEqual(runCapabilities.autoAttach, true);
 });
 
+test('the run declares Fetch interception and not legacy Network interception', () => {
+  const declared = declaredCapabilityNames(runCapabilities);
+  assert.equal(declared.has('requestInterception'), true);
+  assert.equal(declared.has('fetchInterception'), true);
+  assert.equal(declared.has('legacyInterception'), false);
+  assert.notEqual(runCapabilities.legacyInterception, true);
+});
+
+test('a not-supported:legacyInterception skip is accepted only when the vector requires it', () => {
+  const plant = published.vectors.find((vector) => vector.id === 'C10.cookie-plant');
+  assert.ok(plant);
+  assert.equal(requiredCapabilities(plant).has('requestInterception'), true);
+  const legacyOnly = published.vectors.find(
+    (vector) =>
+      requiredCapabilities(vector).has('legacyInterception') &&
+      !requiredCapabilities(vector).has('fetchInterception') &&
+      !mandatory(vector.id)
+  );
+  if (legacyOnly) {
+    const skipped = row(
+      legacyOnly,
+      legacyOnly.targets[0],
+      'skip',
+      'not-supported:legacyInterception'
+    );
+    assert.equal(validCapabilitySkip(legacyOnly, skipped), true);
+    assert.deepEqual(verdictProblems([skipped]), []);
+  }
+  const skipped = row(plain, plain.targets[0], 'skip', 'not-supported:legacyInterception');
+  assert.equal(validCapabilitySkip(plain, skipped), false);
+  assert.equal(verdictProblems([skipped]).length, 1);
+});
+
 test('a not-supported:autoAttach skip is accepted only for vectors that require autoAttach', () => {
   const gated = [
     'C3.popup',
