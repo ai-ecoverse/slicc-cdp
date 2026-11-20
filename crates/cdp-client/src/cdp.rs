@@ -111,6 +111,9 @@ struct Navigation {
 #[derive(Clone)]
 struct MainDocument {
     frame_id: String,
+    loader_id: String,
+    proof_frame_id: String,
+    proof_loader_id: String,
     url: String,
     origin: String,
     unreachable_url: String,
@@ -156,10 +159,12 @@ pub struct Cdp {
     crashed_targets: BTreeSet<String>,
     session_targets: BTreeMap<String, String>,
     protected_targets: BTreeSet<String>,
+    client_targets: BTreeSet<String>,
     kept_url_latch: BTreeSet<String>,
     guards: BTreeMap<String, String>,
     page_scope_sessions: BTreeMap<String, String>,
     checking_page_events: bool,
+    settling_attach: std::cell::Cell<bool>,
     pending_page_events: VecDeque<Value>,
     runtime_scope_epochs: BTreeMap<String, u64>,
     page_scope_owners: BTreeMap<String, String>,
@@ -241,6 +246,16 @@ impl Drop for Cdp {
     }
 }
 
+struct SettlingAttachClear(*const std::cell::Cell<bool>);
+
+impl Drop for SettlingAttachClear {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.0).set(false);
+        }
+    }
+}
+
 impl Cdp {
     fn retire_private_sessions(&mut self, deadline: Instant) {
         self.waiter = None;
@@ -290,10 +305,12 @@ impl Cdp {
             crashed_targets: BTreeSet::new(),
             session_targets: BTreeMap::new(),
             protected_targets: BTreeSet::new(),
+            client_targets: BTreeSet::new(),
             kept_url_latch: BTreeSet::new(),
             guards: BTreeMap::new(),
             page_scope_sessions: BTreeMap::new(),
             checking_page_events: false,
+            settling_attach: std::cell::Cell::new(false),
             pending_page_events: VecDeque::new(),
             runtime_scope_epochs: BTreeMap::new(),
             page_scope_owners: BTreeMap::new(),
@@ -602,6 +619,242 @@ impl Cdp {
     }
 
     fn call_guarded_for(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+        holder_debugger: bool,
+        retry_opt_in: bool,
+    ) -> Result<Value, String> {
+        if method != "Target.attachToTarget" {
+            return self.guarded_call(method, params, session_id, timeout, holder_debugger, retry_opt_in);
+        }
+        let mark = self.events.len();
+        let target = params.get("targetId").and_then(Value::as_str).unwrap_or("").to_string();
+        self.settling_attach.set(true);
+        let _clear = SettlingAttachClear(std::ptr::from_ref(&self.settling_attach));
+        let result = self.guarded_call(method, params, session_id, timeout, holder_debugger, retry_opt_in);
+        self.settle_attach_events(mark, &target, &result);
+        result
+    }
+
+    fn settle_attach_events(&mut self, mark: usize, target: &str, result: &Result<Value, String>) {
+        let admitted = result.as_ref().ok().and_then(|value| value.get("sessionId")).and_then(Value::as_str)
+            .filter(|session| !self.blocked.contains(*session)).map(str::to_string);
+        let mark = mark.min(self.events.len());
+        let dropped: BTreeSet<String> = self.events[mark..].iter()
+            .filter(|event| event["method"] == "Target.attachedToTarget" && event["params"]["targetInfo"]["targetId"] == target)
+            .filter_map(|event| event["params"]["sessionId"].as_str())
+            .filter(|session| admitted.as_deref() != Some(*session) && !self.guard_sessions.contains(*session))
+            .map(str::to_string)
+            .collect();
+        for session in &dropped {
+            if !self.blocked.contains(session) {
+                self.cut_unresolved_session(session);
+            }
+        }
+        let announced = self.targets.get(target).cloned().map(|info| {
+            let mut info = self.redact(&info, &Listing::NONE);
+            info = self.scrub_error(info);
+            shield::redact_strings(&self.guard, &mut info);
+            info
+        });
+        let mut held = self.events.split_off(mark);
+        held.retain_mut(|event| {
+            let session = event["params"]["sessionId"].as_str().unwrap_or("");
+            let method = event["method"].as_str().unwrap_or("");
+            if matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget")
+                && (dropped.contains(session) || self.guard_sessions.contains(session))
+            {
+                return false;
+            }
+            if method == "Target.attachedToTarget" && admitted.as_deref() == Some(session) {
+                if let Some(info) = &announced {
+                    event["params"]["targetInfo"] = info.clone();
+                }
+            }
+            true
+        });
+        self.events.extend(held);
+    }
+
+    fn chrome_error(url: &str) -> bool {
+        url.get(..13).is_some_and(|scheme| scheme.eq_ignore_ascii_case("chrome-error:"))
+    }
+
+    fn ordinary_unreachable(&self, unreachable: &str) -> bool {
+        !unreachable.is_empty() && url::Url::parse(unreachable).is_ok() && !Self::chrome_error(unreachable)
+            && !self.guard.url(unreachable) && !self.guard.unparseable(unreachable)
+    }
+
+    fn proof_host_matches(&self, title: &str, unreachable: &str) -> bool {
+        if title.is_empty() || unreachable.is_empty() {
+            return false;
+        }
+        if self.reported_unreachable(unreachable, title) {
+            return true;
+        }
+        let Ok(parsed) = url::Url::parse(unreachable) else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        let title = title.trim_end_matches('.').to_ascii_lowercase();
+        title == host
+            || title.starts_with(&format!("{host}/"))
+            || title.starts_with(&format!("{host}?"))
+            || title.starts_with(&format!("{host}#"))
+            || url::Url::parse(&title).ok().is_some_and(|url| url.host_str().is_some_and(|have| have.eq_ignore_ascii_case(&host)))
+    }
+
+    fn proof_document_matches(&self, doc: &MainDocument) -> bool {
+        !doc.proof_frame_id.is_empty()
+            && !doc.proof_loader_id.is_empty()
+            && doc.proof_frame_id == doc.frame_id
+            && doc.proof_loader_id == doc.loader_id
+    }
+
+    fn error_proof_applies(&self, doc: &MainDocument, title: &str) -> bool {
+        if !self.proof_document_matches(doc) {
+            return false;
+        }
+        (self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() || Self::chrome_error(&doc.url))
+            && self.ordinary_unreachable(&doc.unreachable_url)
+            && self.proof_host_matches(title, &doc.unreachable_url)
+    }
+
+    fn note_client_target(&mut self, target: &str) {
+        if !target.is_empty() {
+            self.client_targets.insert(target.to_string());
+        }
+    }
+
+    fn popup_shaped(info: &Value) -> bool {
+        info.get("type").and_then(Value::as_str) == Some("page")
+            && info.get("openerId").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
+    }
+
+    fn error_unproven(&self, info: &Value) -> bool {
+        let url = info.get("url").and_then(Value::as_str).unwrap_or("");
+        if !Self::chrome_error(url) && !self.guard.error_page_url(url) {
+            return false;
+        }
+        let id = info.get("targetId").and_then(Value::as_str).unwrap_or("");
+        let title = info.get("title").and_then(Value::as_str).unwrap_or("");
+        !self.documents.get(id).is_some_and(|doc| self.error_proof_applies(doc, title))
+    }
+
+    fn error_popup_hold(&self, info: &Value) -> bool {
+        Self::popup_shaped(info)
+            && !info.get("targetId").and_then(Value::as_str).is_some_and(|id| self.client_targets.contains(id))
+            && self.error_unproven(info)
+    }
+
+    fn scrub_error(&self, info: Value) -> Value {
+        if self.error_unproven(&info) { shield::redacted(&info) } else { info }
+    }
+
+    fn failed_load_host_hidden(&self, target: Option<&str>, url: &str, unreachable: &str) -> bool {
+        let failed = if !unreachable.is_empty() { unreachable } else { url };
+        if self.guard.url(failed) || self.guard.url(unreachable) {
+            return true;
+        }
+        let error = Self::chrome_error(url) || self.guard.error_page_url(url) || !unreachable.is_empty();
+        if !error {
+            return false;
+        }
+        if !unreachable.is_empty() && !self.ordinary_unreachable(unreachable) {
+            return true;
+        }
+        if let Some(id) = target {
+            if let Some(doc) = self.documents.get(id) {
+                if self.guard.url(&doc.unreachable_url)
+                    || (!doc.unreachable_url.is_empty() && !self.ordinary_unreachable(&doc.unreachable_url))
+                {
+                    return true;
+                }
+                let title = self.targets.get(id).and_then(|info| info.get("title")).and_then(Value::as_str).unwrap_or("");
+                if self.error_proof_applies(doc, title) {
+                    return false;
+                }
+                if Self::chrome_error(&doc.url) || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() {
+                    return true;
+                }
+            }
+            if self.targets.get(id).is_some_and(|info| self.error_unproven(info)) {
+                return true;
+            }
+            if Self::chrome_error(url) || self.guard.error_page_url(url) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn scrub_failed_load_carriers(&self, value: &mut Value, target: Option<&str>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.scrub_failed_load_carriers(item, target);
+                }
+            }
+            Value::Object(map) => {
+                let url = map.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                let unreachable = map.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
+                let frame = map.contains_key("loaderId")
+                    && map.contains_key("securityOrigin")
+                    && map.contains_key("mimeType");
+                let history = map.contains_key("userTypedURL") || map.contains_key("transitionType");
+                let window_open = map.contains_key("windowName");
+                let download = map.contains_key("suggestedFilename");
+                let target_info = map.contains_key("targetId")
+                    && map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                        matches!(kind, "page" | "iframe" | "background_page" | "webview" | "app" | "other")
+                    });
+                let hide = self.failed_load_host_hidden(target, &url, &unreachable);
+                let error = Self::chrome_error(&url) || self.guard.error_page_url(&url) || !unreachable.is_empty() || history && target.is_some_and(|id| {
+                    self.documents.get(id).is_some_and(|doc| Self::chrome_error(&doc.url) || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty())
+                });
+                let protected_url = self.guard.url(&url) || self.guard.url(&unreachable);
+                if hide && (frame || history || window_open || download || target_info) {
+                    if (frame || history || target_info) && (error || protected_url) {
+                        if map.contains_key("name") {
+                            map.insert("name".into(), Value::String(String::new()));
+                        }
+                    }
+                    if window_open {
+                        map.insert("windowName".into(), Value::String(String::new()));
+                    }
+                    if download {
+                        map.insert("suggestedFilename".into(), Value::String(String::new()));
+                    }
+                    if (history || target_info) && (error || protected_url) {
+                        if map.contains_key("title") {
+                            let failed = if !unreachable.is_empty() { unreachable.as_str() } else { url.as_str() };
+                            let title = if self.guard.url(failed) || self.guard.url(&unreachable) {
+                                url::Url::parse(failed).ok()
+                                    .map(|parsed| parsed.origin().ascii_serialization())
+                                    .filter(|origin| origin != "null")
+                                    .unwrap_or_else(|| "about:blank".into())
+                            } else {
+                                "about:blank".into()
+                            };
+                            map.insert("title".into(), Value::String(title));
+                        }
+                    }
+                }
+                for item in map.values_mut() {
+                    self.scrub_failed_load_carriers(item, target);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn guarded_call(
         &mut self,
         method: &str,
         params: Value,
@@ -1666,6 +1919,13 @@ impl Cdp {
                         self.block(&session);
                         return Err(self.refusal());
                     }
+                    if self.targets.get(&target).is_some_and(|info| self.error_popup_hold(info)) {
+                        self.cut_unresolved_session(&session);
+                        return Err(self.refusal());
+                    }
+                    if !self.targets.get(&target).is_some_and(Self::popup_shaped) {
+                        self.note_client_target(&target);
+                    }
                 }
             }
             "Target.createBrowserContext" => {
@@ -1697,7 +1957,7 @@ impl Cdp {
                     let verdicts = self.targets.verdicts(info, &self.guard);
                     if !(self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))
                         || verdicts.unparseable && verdicts.protected) {
-                        out.push(redacted);
+                        out.push(self.scrub_error(redacted));
                     }
                 }
                 result["targetInfos"] = Value::Array(out);
@@ -1719,9 +1979,7 @@ impl Cdp {
                             self.protect_target(&target);
                         }
                     }
-                    if protected || self.discovery_redacted(&info) {
-                        result["targetInfo"] = shield::redacted(&info);
-                    }
+                    result["targetInfo"] = if protected || self.discovery_redacted(&info) { shield::redacted(&info) } else { self.scrub_error(info) };
                 }
             }
             _ if shield::cookie_reader(method) => {
@@ -1733,6 +1991,8 @@ impl Cdp {
             _ => {}
         }
         shield::redact_strings(&self.guard, &mut result);
+        let target = session_id.and_then(|session| self.session_target(session));
+        self.scrub_failed_load_carriers(&mut result, target.as_deref());
         Ok(result)
     }
 
@@ -2289,8 +2549,14 @@ impl Cdp {
         let navigating = self.documents.get(target_id).map(|doc| doc.navigating).unwrap_or(false);
         let navigation_url = self.documents.get(target_id).map(|doc| doc.navigation_url.clone()).unwrap_or_default();
         let probed = self.documents.get(target_id).map(|doc| doc.probed).unwrap_or(false);
+        let loader_id = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
+        let proof_frame_id = self.documents.get(target_id).map(|doc| doc.proof_frame_id.clone()).unwrap_or_default();
+        let proof_loader_id = self.documents.get(target_id).map(|doc| doc.proof_loader_id.clone()).unwrap_or_default();
         let doc = MainDocument {
             frame_id: frame_id.clone(),
+            loader_id,
+            proof_frame_id,
+            proof_loader_id,
             url: frame_url,
             origin,
             unreachable_url,
@@ -2332,6 +2598,9 @@ impl Cdp {
         let known = self.documents.get(target_id);
         MainDocument {
             frame_id: String::new(),
+            loader_id: String::new(),
+            proof_frame_id: String::new(),
+            proof_loader_id: String::new(),
             url: String::new(),
             origin: known.map(|doc| doc.origin.clone()).unwrap_or_default(),
             unreachable_url: String::new(),
@@ -2558,6 +2827,7 @@ impl Cdp {
             });
         }
         self.record_initial_blank(&target);
+        self.note_client_target(&target);
         if !url.eq_ignore_ascii_case("about:blank") {
             let guard = self.guards.get(&target).cloned();
             self.send("Page.navigate", json!({ "url": url }), guard.as_deref())?;
@@ -2906,8 +3176,9 @@ impl Cdp {
             return;
         }
         let Some(frame_id) = frame.get("id").and_then(Value::as_str) else { return };
-        if let Some(loader) = frame.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()) {
-            self.document_versions.insert((target.clone(), frame_id.to_string()), loader.to_string());
+        let loader_id = frame.get("loaderId").and_then(Value::as_str).unwrap_or("").to_string();
+        if !loader_id.is_empty() {
+            self.document_versions.insert((target.clone(), frame_id.to_string()), loader_id.clone());
         }
         let url = format!("{}{}", frame.get("url").and_then(Value::as_str).unwrap_or(""), frame.get("urlFragment").and_then(Value::as_str).unwrap_or(""));
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
@@ -2918,20 +3189,45 @@ impl Cdp {
             self.protected_targets.contains(&target) || unknown || self.guard.url(&unreachable_url)
         });
         let error = self.guard.error_page_url(&url) || !unreachable_url.is_empty();
-        let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if error {
+        let ordinary = error && self.ordinary_unreachable(&unreachable_url);
+        let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if ordinary {
+            false
+        } else if error {
             previous || unknown || !self.guard.error_document(&url, &origin)
         } else {
             self.guard.target(&url, self.protected_targets.contains(&target), Opener::None) || self.guard.url(&origin)
         };
+        let (proof_frame_id, proof_loader_id) = if ordinary {
+            (frame_id.to_string(), loader_id.clone())
+        } else {
+            (String::new(), String::new())
+        };
         self.documents.insert(target.clone(), MainDocument {
-            frame_id: frame_id.to_string(), url: url.clone(), origin: origin.clone(), unreachable_url, navigating: false, navigation_url: String::new(), previous: protected, probed: false,
+            frame_id: frame_id.to_string(), loader_id, proof_frame_id, proof_loader_id, url: url.clone(), origin: origin.clone(), unreachable_url, navigating: false, navigation_url: String::new(), previous: protected, probed: false,
         });
         self.note_iframe_own_frame(&target, &frame_id);
         if protected {
             self.protect_target(&target);
         } else if !self.abandoned.contains(&target) {
             self.protected_targets.remove(&target);
+            self.release_ordinary_sessions(&target);
             self.rejudge_descendants_after_ordinary(&target);
+        }
+    }
+
+    fn release_ordinary_sessions(&mut self, target: &str) {
+        let sessions: Vec<String> = self
+            .session_targets
+            .iter()
+            .filter(|(session, have)| have.as_str() == target && self.blocked.contains(*session))
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in sessions {
+            if self.guards.values().any(|guard| guard == &session) {
+                continue;
+            }
+            self.blocked.remove(&session);
+            self.unresolved_cuts.remove(&session);
         }
     }
 
@@ -3229,8 +3525,19 @@ impl Cdp {
         if self.documents.contains_key(&target) || !self.ordinary_history(&history, &unreachable_url) {
             return Ok(());
         }
+        let frame_id = text(&frame, "id");
+        let loader_id = text(&frame, "loaderId");
+        if !loader_id.is_empty() && !frame_id.is_empty() {
+            self.document_versions.insert((target.clone(), frame_id.clone()), loader_id.clone());
+        }
+        let ordinary = self.ordinary_unreachable(&unreachable_url);
+        let (proof_frame_id, proof_loader_id) = if ordinary {
+            (frame_id.clone(), loader_id.clone())
+        } else {
+            (String::new(), String::new())
+        };
         self.documents.insert(target, MainDocument {
-            frame_id: text(&frame, "id"), url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
+            frame_id, loader_id, proof_frame_id, proof_loader_id, url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
             navigating: false, navigation_url: String::new(), previous: false, probed: true,
         });
         Ok(())
@@ -3916,10 +4223,22 @@ impl Cdp {
                     if self.guards.get(&target).is_some_and(|guard| Some(guard) != session.as_ref()) && !self.unobserved.contains(&target) {
                         return;
                     }
-                    if let Some(doc) = self.documents.get_mut(&target) {
-                        if params.get("frameId").and_then(Value::as_str) == Some(&doc.frame_id) {
+                    let frame_id = params.get("frameId").and_then(Value::as_str).unwrap_or("");
+                    let loader = params.get("loaderId").and_then(Value::as_str).filter(|loader| !loader.is_empty()).map(str::to_string);
+                    let navigation_url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                    let matched = self.documents.get(&target).is_some_and(|doc| doc.frame_id == frame_id);
+                    if matched {
+                        if let Some(doc) = self.documents.get_mut(&target) {
                             doc.navigating = true;
-                            doc.navigation_url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                            doc.navigation_url = navigation_url;
+                            doc.unreachable_url.clear();
+                            doc.probed = false;
+                            if let Some(loader) = loader.clone() {
+                                doc.loader_id = loader;
+                            }
+                        }
+                        if let Some(loader) = loader {
+                            self.document_versions.insert((target, frame_id.to_string()), loader);
                         }
                     }
                 }
@@ -3995,8 +4314,12 @@ impl Cdp {
                     value["params"]["targetInfo"] = shield::redacted(&info);
                 } else if !self.documents.contains_key(&target) && !verdicts.target(false, Opener::Unknown)
                     && !self.abandoned.contains(&target)
+                    && !self.error_unproven(&info)
                 {
                     self.protected_targets.remove(&target);
+                }
+                if value.pointer("/params/targetInfo").is_some_and(Value::is_object) {
+                    value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
                 }
             }
             "Target.attachedToTarget" => {
@@ -4082,11 +4405,12 @@ impl Cdp {
                         let _ = self.redact(info, &Listing::NONE);
                         value.as_object_mut().map(|object| object.insert("sliccHide".into(), json!(true)));
                     } else {
-                        value["params"]["targetInfo"] = if info.get("targetId").and_then(Value::as_str).is_some_and(|target| self.probing.contains(target)) {
+                        let shown = if info.get("targetId").and_then(Value::as_str).is_some_and(|target| self.probing.contains(target)) {
                             shield::redacted(info)
                         } else {
                             self.redact(info, &Listing::NONE)
                         };
+                        value["params"]["targetInfo"] = self.scrub_error(shown);
                     }
                 }
             }
@@ -4117,6 +4441,8 @@ impl Cdp {
                     self.guards.remove(target);
                     self.targets.remove(target);
                     self.kept_url_latch.remove(target);
+                    self.client_targets.remove(target);
+                    self.probing.remove(target);
                     self.created_blanks.remove(target);
                     self.navigated_blanks.remove(target);
                     self.documents.remove(target);
@@ -4149,6 +4475,7 @@ impl Cdp {
                         self.deciders.remove(&session);
                         self.block(&session);
                     }
+                    self.session_targets.retain(|_, owner| owner != target);
                 }
             }
             "Target.detachedFromTarget" => {
@@ -4257,8 +4584,17 @@ impl Cdp {
     }
 
     fn remember_navigation(&mut self, params: &Value, session: Option<&str>) {
-        if let Some((session, url)) = session.zip(params["url"].as_str()).filter(|(_, url)| self.ordinary_redirect_url(url)) {
-            self.client_navigation_urls.insert(session.to_string(), url.to_string());
+        if let Some(session) = session {
+            if let Some(target) = self.session_target(session) {
+                let owned = self.client_targets.contains(&target);
+                let popup = self.targets.get(&target).is_some_and(Self::popup_shaped);
+                if owned || !popup {
+                    self.note_client_target(&target);
+                }
+            }
+            if let Some(url) = params["url"].as_str().filter(|url| self.ordinary_redirect_url(url)) {
+                self.client_navigation_urls.insert(session.to_string(), url.to_string());
+            }
         }
     }
 
@@ -4593,6 +4929,12 @@ impl Cdp {
 
     fn deliver_event(&mut self, mut value: Value) {
         self.watch(&mut value);
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        if value.pointer("/params/targetInfo").is_some_and(Value::is_object)
+            && !matches!(method, "Target.targetCreated" | "Target.targetInfoChanged" | "Target.attachedToTarget")
+        {
+            value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
+        }
         if value.get("sliccHide").and_then(Value::as_bool) == Some(true) {
             return;
         }
@@ -4648,7 +4990,10 @@ impl Cdp {
             return;
         }
         self.adopt_guard_attach(&value);
-        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")) || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") && shield::loaded_urls_protected(&self.guard, &value["params"]) {
+        if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or(""))
+            || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.")
+                && shield::loaded_urls_protected(&self.guard, &value["params"])
+        {
             self.fail_seen_network(&value);
             return;
         }
@@ -4656,7 +5001,12 @@ impl Cdp {
             && !self.protected_body_requests.contains(&key.1) && self.client_navigation_urls.get(&key.0).is_some_and(|url| value.pointer("/params/request/url").and_then(Value::as_str) == Some(url.as_str()))).then(|| value["params"]["request"]["url"].clone());
         shield::redact_strings(&self.guard, &mut value);
         if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
-        if self.hidden(&value) {
+        let event_target = value.get("sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session));
+        self.scrub_failed_load_carriers(&mut value, event_target.as_deref());
+        let settle_guard = self.settling_attach.get()
+            && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
+            && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
+        if self.hidden(&value) && !settle_guard {
             self.fail_seen_network(&value);
             return;
         }
@@ -5855,7 +6205,7 @@ include!("window.rs");
 
 #[cfg(test)]
 mod tests {
-    use super::{first_stderr_line, probe_is_settled, ActionNote, Cdp, Transport};
+    use super::{first_stderr_line, probe_is_settled, ActionNote, Cdp, SettlingAttachClear, Transport};
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
@@ -5897,6 +6247,7 @@ mod tests {
     include!("nested_oopif_test.rs");
     include!("response_cookie_test.rs");
     include!("credential_origins_test.rs");
+    include!("popup_error_attach_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

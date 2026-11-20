@@ -135,6 +135,9 @@ fn seal(cdp: &mut Cdp) {
     cdp.session_targets.insert("S".into(), "PAGE".into());
     cdp.documents.insert("PAGE".into(), super::super::MainDocument {
         frame_id: "ROOT".into(),
+        loader_id: String::new(),
+        proof_frame_id: String::new(),
+        proof_loader_id: String::new(),
         url: "chrome-error://chromewebdata/".into(),
         origin: "://".into(),
         unreachable_url: "https://vault.sliccy.ai/".into(),
