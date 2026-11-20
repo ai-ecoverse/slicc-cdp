@@ -1208,6 +1208,17 @@ mod tests {
                 "Target.attachToTarget" => {
                     vec![json!({ "id": message["id"], "result": { "sessionId": format!("S{}", message["id"]) } })]
                 }
+                "Page.getFrameTree" => vec![json!({
+                    "id": message["id"],
+                    "sessionId": message["sessionId"],
+                    "result": { "frameTree": { "frame": {
+                        "id": "P",
+                        "loaderId": "L",
+                        "url": "https://app.example/",
+                        "securityOrigin": "https://app.example",
+                        "mimeType": "text/html"
+                    } } }
+                })],
                 "Page.enable" | "Runtime.enable" => vec![json!({ "id": message["id"], "error": { "message": "'Page.enable' wasn't found" } })],
                 _ => vec![ok(message)],
             }),

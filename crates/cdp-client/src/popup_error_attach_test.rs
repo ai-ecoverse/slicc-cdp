@@ -891,7 +891,9 @@ fn a_protected_then_ordinary_failed_load_clears_own_latch_and_keeps_popup_latch(
 #[test]
 fn a_second_failed_load_arriving_before_the_first_proof_stays_scrubbed() {
     let start = own_info("https://example.test/start", "start");
-    let state = own_state(start.clone(), PopupFrame::Silent);
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
     let mut cdp = own_client_from(state.clone(), &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
@@ -1540,7 +1542,9 @@ fn a_protected_url_page_window_open_on_an_own_session_is_never_delivered() {
 fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
     let host = "seven.sliccy.ai";
     let start = own_info("https://example.test/start", "start");
-    let state = own_state(start.clone(), PopupFrame::Silent);
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
     let mut cdp = own_client_from(state.clone(), &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
@@ -1549,6 +1553,7 @@ fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
         state.popup = own_info(POPUP_ERROR, host);
         state.frame = PopupFrame::Silent;
     }
+    cdp.documents.remove("T");
     cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, host)}}));
     assert!(cdp.error_unproven(&own_info(POPUP_ERROR, host)));
     let mark = cdp.events().len();
@@ -2012,11 +2017,14 @@ fn document_unreachable_alone_hides_chrome_error_shaped_window_open_with_ordinar
 fn chrome_error_catch_all_hides_window_open_when_the_target_has_no_document() {
     let host = "seven.sliccy.ai";
     let start = own_info("https://example.test/start", "start");
-    let state = own_state(start.clone(), PopupFrame::Silent);
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
     let mut cdp = own_client_from(state, &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
     assert!(!cdp.error_unproven(&start));
+    cdp.documents.remove("T");
     assert!(cdp.documents.get("T").is_none());
     let mark = cdp.events().len();
     cdp.absorb(json!({

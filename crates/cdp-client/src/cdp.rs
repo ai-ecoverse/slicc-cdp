@@ -1896,6 +1896,9 @@ impl Cdp {
                     .to_string();
                 if !session.is_empty() {
                     self.session_targets.insert(session.clone(), target.clone());
+                    if self.reported_url_protected(&target) {
+                        self.protect_target(&target);
+                    }
                     if let Err(message) = self.touch(&target) {
                         if transport_error(&message) {
                             self.session_targets.remove(&session);
@@ -1915,7 +1918,13 @@ impl Cdp {
                         }
                         return Err(message);
                     }
-                    if self.protected_targets.contains(&target) {
+                    if self.reported_url_protected(&target) {
+                        self.protect_target(&target);
+                    }
+                    if self.protected_targets.contains(&target) || !self.attach_document_proven(&target) {
+                        if !self.protected_targets.contains(&target) {
+                            self.protect_target(&target);
+                        }
                         self.block(&session);
                         return Err(self.refusal());
                     }
@@ -2861,6 +2870,101 @@ impl Cdp {
             || self.navigated_blanks.get(target).is_some_and(|(guard, id, version)| self.guards.get(target) == Some(guard) && id == frame && version == loader)
     }
 
+    fn reported_url_protected(&self, target: &str) -> bool {
+        self.targets
+            .get(target)
+            .and_then(|info| info.get("url"))
+            .and_then(Value::as_str)
+            .is_some_and(|url| self.guard.url(url))
+    }
+
+    fn ordinary_http_document_url(&self, url: &str) -> bool {
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+        matches!(parsed.scheme(), "http" | "https") && !self.guard.url(url)
+    }
+
+    fn root_frame_unplaceable(&self, frame: &Value) -> bool {
+        let url = format!(
+            "{}{}",
+            frame.get("url").and_then(Value::as_str).unwrap_or(""),
+            frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")
+        );
+        let origin = self.page_scope_origin(frame).unwrap_or_else(|| frame.get("securityOrigin").and_then(Value::as_str).unwrap_or(""));
+        let opaque = self.guard.opaque_document(&url, true) || self.guard.data_document(&url);
+        matches!(origin, "" | "null") || origin == "://" && !opaque
+    }
+
+    fn latch_unplaceable_root(&mut self, session: &str, target: &str, frame: &Value) {
+        let url = format!(
+            "{}{}",
+            frame.get("url").and_then(Value::as_str).unwrap_or(""),
+            frame.get("urlFragment").and_then(Value::as_str).unwrap_or("")
+        );
+        let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("");
+        if self.guard.error_page_url(&url) || Self::chrome_error(&url) || self.guard.error_document(&url, origin) {
+            return;
+        }
+        if self.documents.get(target).is_some_and(|doc| {
+            self.guard.error_page_url(&doc.url) || Self::chrome_error(&doc.url)
+        }) {
+            return;
+        }
+        let opaque_ordinary = self.guard.opaque_document(&url, true) || self.guard.data_document(&url);
+        let bad = self.guard.url(&url)
+            || self.guard.url(origin)
+            || self.reported_url_protected(target)
+            || self.root_frame_unplaceable(frame) && !opaque_ordinary;
+        if !bad {
+            return;
+        }
+        self.main_commit(session, frame);
+        if !self.protected_targets.contains(target) {
+            self.protect_target(target);
+        }
+    }
+
+    fn attach_document_proven(&self, target: &str) -> bool {
+        if self.protected_targets.contains(target) || self.reported_url_protected(target) {
+            return false;
+        }
+        let kind = self.targets.get(target).and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or("page");
+        if matches!(kind, "worker" | "service_worker" | "shared_worker") {
+            return true;
+        }
+        let Some(doc) = self.documents.get(target) else {
+            return false;
+        };
+        if doc.previous {
+            return false;
+        }
+        if doc.navigating && (doc.navigation_url.is_empty() || self.guard.url(&doc.navigation_url)) {
+            return false;
+        }
+        if self.ordinary_http_document_url(&doc.url) {
+            return true;
+        }
+        if self.guard.data_document(&doc.url) {
+            return true;
+        }
+        if self.guard.inheriting(&doc.url) {
+            return true;
+        }
+        if self.guard.error_page_url(&doc.url) || Self::chrome_error(&doc.url) {
+            let info = self.targets.get(target);
+            let title = info.and_then(|info| info.get("title")).and_then(Value::as_str).unwrap_or("");
+            if self.client_targets.contains(target) || self.error_proof_applies(doc, title) {
+                return true;
+            }
+            if doc.probed && self.ordinary_unreachable(&doc.unreachable_url) && !self.guard.url(&doc.unreachable_url) {
+                return true;
+            }
+            return info.is_none_or(|info| !Self::popup_shaped(info));
+        }
+        false
+    }
+
     fn initial_blank_evidence(&mut self, target: &str, empty: bool) -> Option<(String, String, i64)> {
         let guard = self.guards.get(target)?.clone();
         let result = self.raw_call("Target.getTargetInfo", json!({"targetId":target}), None, DOCUMENT_CHECK).ok()?;
@@ -3389,6 +3493,9 @@ impl Cdp {
         if !self.placed_frames(node, &mut frames, content, parent) {
             #[cfg(test)]
             self.runtime_prepare_frames(node, &frames);
+            if content && parent.is_none() {
+                self.latch_unplaceable_root(&guard, target, frame);
+            }
             return None;
         }
         #[cfg(test)]
@@ -6249,6 +6356,7 @@ mod tests {
     include!("credential_origins_test.rs");
     include!("popup_error_attach_test.rs");
     include!("interim_lock_test.rs");
+    include!("lagging_attach_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
