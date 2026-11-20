@@ -3121,7 +3121,7 @@ impl Cdp {
             return true;
         }
         if doc.url.is_empty() {
-            return true;
+            return false;
         }
         if self.guard.inheriting(&doc.url) {
             if kind == "iframe" {
@@ -3371,17 +3371,6 @@ impl Cdp {
             if let Some(message) = failed {
                 return Err(self.guard_failure(target_id, &session, message));
             }
-        }
-        if self.attach_content_ok.contains(target_id)
-            && self.documents.get(target_id).is_some_and(|doc| {
-                self.guard.inheriting(&doc.url)
-                    && doc.origin == "://"
-                    && !self.owns_blank(target_id, &doc.frame_id, &doc.loader_id)
-                    && !self.client_targets.contains(target_id)
-                    && !self.created_blanks.contains_key(target_id)
-            })
-        {
-            self.attach_content_ok.remove(target_id);
         }
         if self.documents.get(target_id).is_none_or(|doc| doc.probed) || !self.attach_content_ok.contains(target_id) {
             let left = budget.saturating_duration_since(Instant::now());

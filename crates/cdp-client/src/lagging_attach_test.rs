@@ -500,8 +500,34 @@ fn mutation_rows_each_attach_gate_is_necessary() {
         "SecondRead+Never must not depend on reported-url latch alone"
     );
 
-    let (mut exclusive, _) = lag_client(&live, LagTreeMode::AlwaysBlank, LagInfoTiming::BeforeAttach);
+    let (mut exclusive, _) = lag_client(&live, LagTreeMode::AlwaysBlank, LagInfoTiming::AfterAttachReply);
     exclusive.created_blanks.insert("T".into(), ("T".into(), "L0".into(), 0));
+    exclusive.documents.insert(
+        "T".into(),
+        super::MainDocument {
+            frame_id: "T".into(),
+            loader_id: "L0".into(),
+            proof_frame_id: String::new(),
+            proof_loader_id: String::new(),
+            url: LAG_BLANK.into(),
+            origin: "://".into(),
+            unreachable_url: String::new(),
+            navigating: false,
+            navigation_url: String::new(),
+            previous: false,
+            probed: false,
+        },
+    );
+    exclusive.attach_content_ok.insert("T".into());
+    exclusive.protected_targets.remove("T");
+    assert!(
+        !exclusive.is_protected_target("T"),
+        "exclusive cell must start without a prior protected_targets latch"
+    );
+    assert!(
+        !exclusive.reported_url_protected("T"),
+        "exclusive cell must learn the protected reported url only at attach"
+    );
     let exclusive_reply = exclusive.call(
         &method("Target", "attachToTarget"),
         json!({ "targetId": "T", "flatten": true }),
@@ -511,10 +537,13 @@ fn mutation_rows_each_attach_gate_is_necessary() {
         exclusive_reply.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
         "drop reported-url latch would admit owned-blank+protected-info: {exclusive_reply:?}"
     );
-    assert!(exclusive.is_protected_target("T"));
+    assert!(
+        exclusive.is_protected_target("T"),
+        "reported-url latch alone must protect: {exclusive_reply:?}"
+    );
     assert!(
         exclusive.reported_url_protected("T"),
-        "exclusive reported-url cell must still see the protected reported url"
+        "exclusive reported-url cell must see the protected reported url at attach"
     );
     assert!(
         exclusive.created_blanks.contains_key("T"),
@@ -720,6 +749,40 @@ fn positive_proof_requirement_refuses_absence_of_protected_shapes() {
     empty.attach_content_ok.clear();
     empty.documents.remove("T");
     assert!(!empty.attach_document_proven("T"), "empty documents is not positive proof");
+}
+
+#[test]
+fn empty_document_url_is_not_positive_attach_proof() {
+    let (mut cdp, _) = lag_client(LAG_BLANK, LagTreeMode::AlwaysBlank, LagInfoTiming::Never);
+    cdp.targets.insert(
+        "T".into(),
+        json!({"targetId":"T","type":"page","url":"","title":""}),
+    );
+    cdp.documents.insert(
+        "T".into(),
+        super::MainDocument {
+            frame_id: "T".into(),
+            loader_id: "L0".into(),
+            proof_frame_id: String::new(),
+            proof_loader_id: String::new(),
+            url: String::new(),
+            origin: String::new(),
+            unreachable_url: String::new(),
+            navigating: false,
+            navigation_url: String::new(),
+            previous: false,
+            probed: false,
+        },
+    );
+    cdp.attach_content_ok.clear();
+    cdp.client_targets.remove("T");
+    cdp.created_blanks.remove("T");
+    cdp.protected_targets.remove("T");
+    assert!(
+        !cdp.attach_document_proven("T"),
+        "empty document URL must not count as positive attach proof"
+    );
+    assert!(!cdp.is_protected_target("T"));
 }
 
 #[test]
