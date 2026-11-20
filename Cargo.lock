@@ -771,9 +771,9 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "wasix-net"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1311fb9b98884283b9909b6821bf3f3dd570ab9a8f466c3d1bd36f4a7a0c3069"
+checksum = "c2f61698ea49afa3b3ae85856448dfcb91d11db37ea8c153142b492ede95ed89"
 
 [[package]]
 name = "windows-link"
