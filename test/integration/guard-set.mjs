@@ -36,51 +36,6 @@ export const protectedBfcacheRows = new Set([
   'C8.protected-bfcache-restore.history',
 ]);
 
-export function containsMarkerToken(value, marker) {
-  const pattern = new RegExp(
-    `(^|[^A-Za-z0-9_-])${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[^A-Za-z0-9_-])`
-  );
-  const seen = new Set();
-  const objects = new Set();
-  const visit = (item, depth = 0) => {
-    if (item && typeof item === 'object') {
-      if (objects.has(item)) return false;
-      objects.add(item);
-      return Object.values(item).some((field) => visit(field, depth));
-    }
-    if (typeof item !== 'string') return false;
-    let logical = item;
-    for (let pass = 0; pass < 8; pass++) {
-      const decoded = logical.replace(/%([0-9a-f]{2})|\\u([0-9a-f]{4})/gi, (_, percent, unicode) =>
-        String.fromCharCode(parseInt(percent ?? unicode, 16))
-      );
-      if (decoded === logical) break;
-      logical = decoded;
-    }
-    if (pattern.test(logical)) return true;
-    const key = `${depth}:${item}`;
-    if (depth >= 8 || seen.has(key)) return false;
-    seen.add(key);
-    const decoded = [];
-    try {
-      decoded.push(decodeURIComponent(item));
-    } catch {}
-    try {
-      decoded.push(JSON.parse(item));
-    } catch {}
-    try {
-      decoded.push(JSON.parse(`"${item}"`));
-    } catch {}
-    for (const [chunk] of item.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g)) {
-      const normalized = chunk.replaceAll('-', '+').replaceAll('_', '/').replace(/=+$/, '');
-      for (let offset = 0; offset < 4; offset++)
-        decoded.push(Buffer.from(normalized.slice(offset), 'base64').toString('utf8'));
-    }
-    return decoded.some((candidate) => candidate !== item && visit(candidate, depth + 1));
-  };
-  return visit(value);
-}
-
 export function bfcachePrivacy(row, messages) {
   const url = row.evidence?.guarded?.restore?.seed?.protectedURL;
   if (typeof url !== 'string' || !Array.isArray(messages) || !messages.length)
@@ -95,20 +50,11 @@ export function bfcachePrivacy(row, messages) {
   if (!tag) return { measured: false };
   return {
     measured: true,
-    markerExposed: containsMarkerToken(messages, `bfcache-marker-${tag}`),
-    ordinaryBMarkerObserved: containsMarkerToken(messages, `bfcache-marker-${tag}-b`),
-    upstreamMarkerSubstring: containsSecret(messages, `bfcache-marker-${tag}`),
-    markerIdentity: 'whole-token',
-    auditDifference:
-      !containsMarkerToken(messages, `bfcache-marker-${tag}`) &&
-      containsSecret(messages, `bfcache-marker-${tag}`) &&
-      containsMarkerToken(messages, `bfcache-marker-${tag}-b`)
-        ? 'upstream substring matches the public ordinary-B marker; no whole P marker token delivered'
-        : null,
+    markerExposed: containsSecret(messages, `bfcache-marker-${tag}`),
     protectedPathExposed:
       containsSecret(messages, `${parsed.origin}${parsed.pathname}`) ||
       containsSecret(messages, `${parsed.host}${parsed.pathname}`) ||
-      containsMarkerToken(messages, `${parsed.pathname}${parsed.search}`),
+      containsSecret(messages, `${parsed.pathname}${parsed.search}`),
   };
 }
 
