@@ -50,6 +50,7 @@ struct ToctouState {
     committed: bool,
     event_timing: ToctouEventTiming,
     content_forwards: usize,
+    content_backend_ok: usize,
     sessions: std::collections::BTreeMap<String, String>,
     attaches: usize,
     contexts: Vec<ToctouContext>,
@@ -173,19 +174,19 @@ impl ToctouState {
                 context.post_commit = true;
             }
         }
+        inbox.push_back(
+            json!({
+                "method": toctou_method("Target", "targetInfoChanged"),
+                "params": { "targetInfo": self.info.clone() },
+            })
+            .to_string(),
+        );
         if deliver_events {
             inbox.push_back(
                 json!({
                     "method": toctou_method("Page", "frameNavigated"),
                     "sessionId": session,
                     "params": { "frame": self.live.clone(), "type": "Navigation" },
-                })
-                .to_string(),
-            );
-            inbox.push_back(
-                json!({
-                    "method": toctou_method("Target", "targetInfoChanged"),
-                    "params": { "targetInfo": self.info.clone() },
                 })
                 .to_string(),
             );
@@ -348,9 +349,15 @@ impl Transport for ToctouBrowser {
             match context {
                 None if id.is_some() || unique.is_some() => self.inbox.push_back(reply_err(missing)),
                 None => self.inbox.push_back(reply_err(missing)),
-                Some(context) if context.post_commit && protected_doc => self.inbox.push_back(reply_ok(marker())),
+                Some(context) if context.post_commit && protected_doc => {
+                    state.content_backend_ok += 1;
+                    self.inbox.push_back(reply_ok(marker()));
+                }
                 Some(_) if protected_doc && state.committed => self.inbox.push_back(reply_err(missing)),
-                Some(_) => self.inbox.push_back(reply_ok(json!({ "result": { "type": "string", "value": "ordinary" } }))),
+                Some(_) => {
+                    state.content_backend_ok += 1;
+                    self.inbox.push_back(reply_ok(json!({ "result": { "type": "string", "value": "ordinary" } })));
+                }
             }
         } else if called == call_fn {
             let object_id = call["params"].get("objectId").and_then(Value::as_str);
@@ -458,6 +465,7 @@ fn toctou_client(live: &str, timing: ToctouEventTiming) -> (Cdp, std::rc::Rc<std
         committed: false,
         event_timing: timing,
         content_forwards: 0,
+        content_backend_ok: 0,
         sessions: std::collections::BTreeMap::new(),
         attaches: 0,
         contexts: Vec::new(),
@@ -573,6 +581,7 @@ fn ordinary_to_ordinary_navigation_during_pinned_evaluate_is_not_over_blocked() 
         committed: false,
         event_timing: ToctouEventTiming::Never,
         content_forwards: 0,
+        content_backend_ok: 0,
         sessions: std::collections::BTreeMap::new(),
         attaches: 0,
         contexts: Vec::new(),
@@ -621,19 +630,32 @@ fn ordinary_to_ordinary_navigation_during_pinned_evaluate_is_not_over_blocked() 
 #[test]
 fn mutation_post_reply_document_recheck_is_necessary_for_protected_commit() {
     let live = toctou_vault();
+    let ordinary = "https://ordinary.example/";
     let (mut cdp, state) = toctou_client(&live, ToctouEventTiming::Never);
+    {
+        let mut state = state.borrow_mut();
+        state.tree = toctou_frame(ordinary, "L0");
+        state.info = toctou_info(ordinary);
+    }
+    cdp.absorb(json!({
+        "method": toctou_method("Target", "targetInfoChanged"),
+        "params": { "targetInfo": toctou_info(ordinary) },
+    }));
     let attach = cdp
         .call(
             &toctou_method("Target", "attachToTarget"),
             json!({ "targetId": "T", "flatten": true }),
             None,
         )
-        .expect("blank attach");
+        .expect("ordinary attach");
     let session = attach["sessionId"].as_str().unwrap().to_string();
     {
         let mut state = state.borrow_mut();
         state.commits_on_forward = true;
         state.survive_contexts = true;
+        state.content_forwards = 0;
+        state.content_backend_ok = 0;
+        state.committed = false;
     }
     let out = cdp.call(
         &toctou_method("Runtime", "evaluate"),
@@ -641,8 +663,18 @@ fn mutation_post_reply_document_recheck_is_necessary_for_protected_commit() {
         Some(&session),
     );
     assert!(
+        state.borrow().content_forwards >= 1,
+        "evaluate must be forwarded to the backend so DiD is the sole refusal (got forwards={})",
+        state.borrow().content_forwards
+    );
+    assert!(
+        state.borrow().content_backend_ok >= 1,
+        "backend must answer Ok before DiD refuses (got backend_ok={})",
+        state.borrow().content_backend_ok
+    );
+    assert!(
         out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
-        "DiD recheck must be the sole refusal when a surviving same-origin context answers Ok(marker): {out:?}"
+        "DiD recheck must refuse after a surviving context answers Ok(marker): {out:?}"
     );
     if let Err(message) = out {
         assert!(!message.contains(TOCTOU_MARK), "{message}");

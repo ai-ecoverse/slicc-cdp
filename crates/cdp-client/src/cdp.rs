@@ -1832,17 +1832,22 @@ impl Cdp {
             if self.protected_targets.contains(target) || self.reported_url_protected(target) {
                 return Err(self.refusal());
             }
-            let Some(current) = self.document_state_for(target, true, expected.scope.as_deref()) else {
+            if self.documents.get(target).is_some_and(|doc| {
+                doc.previous
+                    || self.guard.url(&doc.url)
+                    || self.guard.url(&doc.unreachable_url)
+                    || self.guard.url(&doc.navigation_url)
+            }) {
                 return Err(self.refusal());
-            };
-            if &current == expected {
-                continue;
             }
-            let ordinary = !self.protected_targets.contains(target)
-                && !self.reported_url_protected(target)
-                && current.frames.values().all(|evidence| self.attach_document_url_ordinary(&evidence[1]));
-            if !ordinary {
-                return Err(self.refusal());
+            let root = expected.frames.values().find(|evidence| evidence[4].is_empty());
+            if let Some(evidence) = root {
+                if !self.attach_document_url_ordinary(&evidence[1])
+                    && !self.guard.inheriting(&evidence[1])
+                    && !evidence[1].is_empty()
+                {
+                    return Err(self.refusal());
+                }
             }
         }
         Ok(())
@@ -1934,7 +1939,10 @@ impl Cdp {
                 if !session.is_empty() {
                     self.session_targets.insert(session.clone(), target.clone());
                     if !self.guarding.contains(&target) {
-                        if let Err(message) = self.touch(&target) {
+                        self.executing_sessions.insert(session.clone());
+                        let touched = self.touch(&target);
+                        self.executing_sessions.remove(&session);
+                        if let Err(message) = touched {
                             if transport_error(&message) {
                                 self.session_targets.remove(&session);
                                 return Err(message);
@@ -1994,8 +2002,7 @@ impl Cdp {
                                 || self.protected_targets.contains(&target)
                                 || self.reported_url_protected(&target)
                                 || self.documents.get(&target).is_some_and(|doc| {
-                                    doc.previous
-                                        || self.guard.url(&doc.url)
+                                    self.guard.url(&doc.url)
                                         || self.guard.url(&doc.unreachable_url)
                                         || self.guard.url(&doc.navigation_url)
                                 });
@@ -3062,13 +3069,27 @@ impl Cdp {
         }
     }
 
+    fn attach_has_provenance(&self, target: &str) -> bool {
+        self.client_targets.contains(target)
+            || self.created_blanks.contains_key(target)
+            || self.documents.get(target).is_some_and(|doc| {
+                self.owns_blank(target, &doc.frame_id, &doc.loader_id)
+                    || Self::attach_hard_ordinary_document(&doc.url, &self.guard)
+                    || self.attach_content_ok.contains(target)
+                        && self.attach_document_url_ordinary(&doc.url)
+            })
+    }
+
     fn attach_document_proven(&self, target: &str) -> bool {
         let kind = self.targets.get(target).and_then(|info| info.get("type")).and_then(Value::as_str).unwrap_or("page");
         if matches!(kind, "worker" | "service_worker" | "shared_worker") {
             return true;
         }
+        if self.attach_error_recovery_for_reported(target) {
+            return true;
+        }
         let Some(doc) = self.documents.get(target) else {
-            return false;
+            return self.client_targets.contains(target) || self.created_blanks.contains_key(target);
         };
         if doc.previous {
             return false;
@@ -3077,9 +3098,6 @@ impl Cdp {
             return false;
         }
         if self.guard.error_page_url(&doc.url) || Self::chrome_error(&doc.url) {
-            if self.attach_error_recovery_for_reported(target) {
-                return true;
-            }
             let info = self.targets.get(target);
             let title = info.and_then(|info| info.get("title")).and_then(Value::as_str).unwrap_or("");
             if self.client_targets.contains(target) || self.error_proof_applies(doc, title) {
@@ -3088,10 +3106,16 @@ impl Cdp {
             if doc.probed && self.ordinary_unreachable(&doc.unreachable_url) && !self.guard.url(&doc.unreachable_url) {
                 return true;
             }
-            return false;
+            if self.protected_targets.contains(target) || self.reported_url_protected(target) {
+                return false;
+            }
+            return info.is_none_or(|info| !Self::popup_shaped(info));
         }
         if self.protected_targets.contains(target) || self.reported_url_protected(target) {
             return false;
+        }
+        if self.attach_has_provenance(target) {
+            return true;
         }
         if Self::attach_hard_ordinary_document(&doc.url, &self.guard) {
             return true;
@@ -3100,12 +3124,6 @@ impl Cdp {
             return true;
         }
         if self.guard.inheriting(&doc.url) {
-            if self.client_targets.contains(target)
-                || self.created_blanks.contains_key(target)
-                || self.owns_blank(target, &doc.frame_id, &doc.loader_id)
-            {
-                return true;
-            }
             if kind == "iframe" {
                 return self.iframe_attach_ordinary_under_clear_parent(target, doc);
             }
@@ -3430,9 +3448,16 @@ impl Cdp {
         if frame.get("parentId").and_then(Value::as_str).is_some() {
             return false;
         }
+        let frame_url = frame.get("url").and_then(Value::as_str).unwrap_or("");
+        let frame_origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("");
+        let null_soft_blank = self.guard.inheriting(frame_url)
+            && frame_url == "about:blank"
+            && matches!(frame_origin, "" | "null");
         let mut frames = BTreeMap::new();
-        if !self.placed_frames(node, &mut frames, true, None) {
-            self.latch_unplaceable_root(session, target, frame);
+        if !self.placed_frames(node, &mut frames, !null_soft_blank, None) {
+            if !null_soft_blank {
+                self.latch_unplaceable_root(session, target, frame);
+            }
             return false;
         }
         if frames.iter().any(|(id, evidence)| {
@@ -3440,8 +3465,8 @@ impl Cdp {
         }) {
             return false;
         }
-        if self.guard.inheriting(frame.get("url").and_then(Value::as_str).unwrap_or(""))
-            && frame.get("securityOrigin").and_then(Value::as_str) == Some("://")
+        if self.guard.inheriting(frame_url)
+            && (frame_origin == "://" || matches!(frame_origin, "" | "null"))
         {
             let Some(id) = frame.get("id").and_then(Value::as_str) else {
                 return false;
@@ -3449,7 +3474,7 @@ impl Cdp {
             let Some(loader) = frame.get("loaderId").and_then(Value::as_str) else {
                 return false;
             };
-            if frame.get("url").and_then(Value::as_str) != Some("about:blank") {
+            if frame_url != "about:blank" {
                 return false;
             }
             let reported = self.targets.get(target).and_then(|info| info.get("url")).and_then(Value::as_str).unwrap_or("");
@@ -3618,11 +3643,13 @@ impl Cdp {
         let origin = frame.get("securityOrigin").and_then(Value::as_str).unwrap_or("").to_string();
         let unreachable_url = frame.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
         let reported = self.targets.get(&target).and_then(|info| info.get("url")).and_then(Value::as_str);
+        let error = self.guard.error_page_url(&url) || !unreachable_url.is_empty() || Self::chrome_error(&url);
         let unknown = unreachable_url.is_empty() && reported.is_none_or(|reported| self.guard.url(reported));
         let previous = self.documents.get(&target).map(|doc| doc.previous).unwrap_or_else(|| {
-            self.protected_targets.contains(&target) || unknown || self.guard.url(&unreachable_url)
+            self.protected_targets.contains(&target)
+                || self.guard.url(&unreachable_url)
+                || !error && self.guard.url(&url)
         });
-        let error = self.guard.error_page_url(&url) || !unreachable_url.is_empty();
         let ordinary = error && self.ordinary_unreachable(&unreachable_url);
         let protected = self.targets.get(&target).is_some_and(|info| self.guard.target_type(info.get("type").and_then(Value::as_str).unwrap_or(""))) || if ordinary {
             false
