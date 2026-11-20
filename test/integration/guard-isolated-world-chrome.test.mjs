@@ -26,21 +26,22 @@ function site() {
   const server = createServer((req, res) => {
     const host = String(req.headers.host || '').split(':')[0];
     const url = new URL(req.url || '/', 'http://127.0.0.1');
-    hits.push({
-      host,
-      path: url.pathname,
-      method: req.method,
-    });
+    hits.push({ host, path: url.pathname, method: req.method });
     const html = (title, body) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(`<!doctype html><meta charset="utf-8"><title>${title}</title>${body}`);
     };
-    if (host === 'plain.guard.test' && url.pathname === '/parent') {
-      const openSrc = `http://open.other.test:${server.address().port}/open-frame`;
-      const protSrc = `http://seven.sliccy.ai:${server.address().port}/prot-frame`;
+    const port = server.address().port;
+    if (host === 'plain.guard.test' && url.pathname === '/open-parent') {
       return html(
         'doc',
-        `<p>parent</p><iframe id="open" src="${openSrc}"></iframe><iframe id="prot" src="${protSrc}"></iframe>`
+        `<p>open-parent</p><iframe id="open" src="http://open.other.test:${port}/open-frame"></iframe>`
+      );
+    }
+    if (host === 'plain.guard.test' && url.pathname === '/prot-parent') {
+      return html(
+        'doc',
+        `<p>prot-parent</p><iframe id="prot" src="http://seven.sliccy.ai:${port}/prot-frame"></iframe>`
       );
     }
     if (host === 'open.other.test' && url.pathname === '/open-frame') {
@@ -58,7 +59,8 @@ function site() {
       resolve({
         port,
         hits,
-        parentUrl: `http://plain.guard.test:${port}/parent`,
+        openParentUrl: `http://plain.guard.test:${port}/open-parent`,
+        protParentUrl: `http://plain.guard.test:${port}/prot-parent`,
         openFrameUrl: `http://open.other.test:${port}/open-frame`,
         protFrameUrl: `http://seven.sliccy.ai:${port}/prot-frame`,
         close: () =>
@@ -131,6 +133,42 @@ function valueOf(reply) {
   return reply?.result?.value;
 }
 
+function childUrls(tree, urls = []) {
+  const frame = tree?.frame;
+  if (frame?.url) urls.push(String(frame.url));
+  for (const child of tree?.childFrames || []) childUrls(child, urls);
+  return urls;
+}
+
+async function waitChild(raw, sessionId, needle) {
+  const deadline = Date.now() + 20000;
+  let last = null;
+  do {
+    const tree = await raw.send('Page.getFrameTree', {}, sessionId);
+    const urls = childUrls(tree.frameTree);
+    last = { urls };
+    if (urls.some((url) => url.includes(needle))) return { tree, urls };
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
+  throw new Error(`iframe settle timeout for ${needle}; last=${JSON.stringify(last)}`);
+}
+
+async function openTab(raw, url, needle) {
+  const { targetId } = await raw.send('Target.createTarget', {
+    url: 'about:blank',
+    background: true,
+  });
+  const { sessionId } = await raw.send('Target.attachToTarget', {
+    targetId,
+    flatten: true,
+  });
+  await raw.send('Page.enable', {}, sessionId);
+  await raw.send('Runtime.enable', {}, sessionId);
+  await navigate(raw, sessionId, url);
+  const settled = await waitChild(raw, sessionId, needle);
+  return { targetId, sessionId, frameId: settled.tree.frameTree.frame.id, urls: settled.urls };
+}
+
 async function createWorld(client, sessionId, frameId, options = {}) {
   const params = { frameId };
   if (options.worldName !== undefined) params.worldName = options.worldName;
@@ -143,43 +181,21 @@ async function createWorld(client, sessionId, frameId, options = {}) {
   return { world, contextId, params };
 }
 
-function childUrls(tree, urls = []) {
-  const frame = tree?.frame;
-  if (frame?.url) urls.push(String(frame.url));
-  for (const child of tree?.childFrames || []) childUrls(child, urls);
-  return urls;
+async function tryStep(label, run) {
+  try {
+    const result = await run();
+    return { label, ok: true, result };
+  } catch (error) {
+    return {
+      label,
+      ok: false,
+      refusal: String(error?.message || error),
+    };
+  }
 }
 
-async function waitFrames(raw, sessionId, openUrl, protUrl) {
-  const deadline = Date.now() + 20000;
-  let last = null;
-  do {
-    const tree = await raw.send('Page.getFrameTree', {}, sessionId);
-    const urls = childUrls(tree.frameTree);
-    const openLoaded = urls.some((url) => url.startsWith(openUrl) || url.includes('/open-frame'));
-    const protLoaded = urls.some((url) => url.startsWith(protUrl) || url.includes('/prot-frame'));
-    const mainProbe = valueOf(
-      await evaluateRaw(
-        raw,
-        sessionId,
-        `({
-          openCrossOriginBlocked: (() => { try { return document.getElementById('open').contentDocument == null; } catch (e) { return String(e && e.name ? e.name : 'Error'); } })(),
-          protCrossOriginBlocked: (() => { try { return document.getElementById('prot').contentDocument == null; } catch (e) { return String(e && e.name ? e.name : 'Error'); } })(),
-          protHrefKind: (() => { try { const href=String(document.getElementById('prot').contentWindow.location.href||''); if(href==='about:blank') return 'blank'; if(href.includes('seven.sliccy.ai')) return 'prot'; if(href) return 'other'; return 'none'; } catch (e) { return 'error:' + (e && e.name ? e.name : 'Error'); } })(),
-          openHrefKind: (() => { try { const href=String(document.getElementById('open').contentWindow.location.href||''); if(href==='about:blank') return 'blank'; if(href.includes('open.other.test')) return 'open'; if(href) return 'other'; return 'none'; } catch (e) { return 'error:' + (e && e.name ? e.name : 'Error'); } })()
-        })`
-      )
-    );
-    last = {
-      urls,
-      openLoaded,
-      protLoaded,
-      ...mainProbe,
-    };
-    if (openLoaded && protLoaded) return last;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  } while (Date.now() < deadline);
-  throw new Error(`iframe settle timeout; last=${JSON.stringify(last)}`);
+function readable(probe) {
+  return Boolean(probe?.hasContentDocument && (probe?.hasMarker || probe?.textLen > 0));
 }
 
 function publishReport(report) {
@@ -193,10 +209,6 @@ function publishReport(report) {
       `\n### isolated-world DOM probe\n\n\`\`\`json\n${text}\n\`\`\`\n`
     );
   }
-}
-
-function protectedReadable(probe) {
-  return Boolean(probe?.hasContentDocument && (probe?.hasMarker || probe?.textLen > 0));
 }
 
 test('Chrome: isolated world without universal access cannot read a protected cross-origin iframe DOM', {
@@ -216,120 +228,189 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     browser = await launchBrowser(args);
     raw = await observer(browser.wsUrl);
     const version = await raw.send('Browser.getVersion', {});
-
     client = await guarded(browser.wsUrl, sites.client, {
       variant: 'prompt',
       detachDelay: 2000,
     });
 
-    const { targetId } = await raw.send('Target.createTarget', {
-      url: 'about:blank',
-      background: true,
-    });
-    const { sessionId: rawSession } = await raw.send('Target.attachToTarget', {
-      targetId,
-      flatten: true,
-    });
-    await raw.send('Page.enable', {}, rawSession);
-    await raw.send('Runtime.enable', {}, rawSession);
-    await navigate(raw, rawSession, pages.parentUrl);
-    const pageState = valueOf(
-      await evaluateRaw(
-        raw,
-        rawSession,
-        '({ titleDoc: document.title === "doc", hasOpen: Boolean(document.getElementById("open")), hasProt: Boolean(document.getElementById("prot")) })'
-      )
-    );
-    assert.equal(pageState?.titleDoc, true, JSON.stringify(pageState));
-    assert.equal(pageState?.hasOpen, true);
-    assert.equal(pageState?.hasProt, true);
+    const tabA = await openTab(raw, pages.openParentUrl, '/open-frame');
+    const tabB = await openTab(raw, pages.protParentUrl, '/prot-frame');
 
-    const unguardedIframes = await waitFrames(
-      raw,
-      rawSession,
-      pages.openFrameUrl,
-      pages.protFrameUrl
-    );
-    const rawTree = await raw.send('Page.getFrameTree', {}, rawSession);
-    const frameId = rawTree.frameTree.frame.id;
-
-    const { sessionId } = await client.send('Target.attachToTarget', {
-      targetId,
+    const { sessionId: guardedA } = await client.send('Target.attachToTarget', {
+      targetId: tabA.targetId,
       flatten: true,
     });
     for (const method of ['Page.enable', 'Runtime.enable']) {
-      await client.send(method, {}, sessionId);
+      await client.send(method, {}, guardedA);
     }
-
-    const attackNamed = await createWorld(client, sessionId, frameId, {
+    const attackNamed = await createWorld(client, guardedA, tabA.frameId, {
       worldName: 'slicc-ua-dom',
       universal: true,
     });
-    const attackAnon = await createWorld(client, sessionId, frameId, { universal: true });
-    const plain = await createWorld(client, sessionId, frameId, {
+    const attackAnon = await createWorld(client, guardedA, tabA.frameId, { universal: true });
+    const plain = await createWorld(client, guardedA, tabA.frameId, {
       worldName: 'slicc-plain-dom',
     });
-
-    const worlds = [
+    const tabAWorlds = {};
+    for (const [name, contextId] of [
       ['attackNamed', attackNamed.contextId],
       ['attackAnon', attackAnon.contextId],
       ['withoutGrantUniveralAccess', plain.contextId],
       ['mainWorld', undefined],
-    ];
-    const perWorld = {};
-    for (const [name, contextId] of worlds) {
-      perWorld[name] = {
-        open: valueOf(
-          await evaluateRaw(client, sessionId, domProbeExpression('open', OPEN_MARKER), contextId)
-        ),
-        protected: valueOf(
-          await evaluateRaw(client, sessionId, domProbeExpression('prot', PROT_MARKER), contextId)
-        ),
-      };
+    ]) {
+      tabAWorlds[name] = valueOf(
+        await evaluateRaw(client, guardedA, domProbeExpression('open', OPEN_MARKER), contextId)
+      );
     }
+
+    const tabBGuarded = {};
+    const attachB = await tryStep('attach', () =>
+      client.send('Target.attachToTarget', { targetId: tabB.targetId, flatten: true })
+    );
+    tabBGuarded.attach = {
+      ok: attachB.ok,
+      refusal: attachB.refusal || null,
+      sessionId: attachB.result?.sessionId || null,
+    };
+    if (attachB.ok) {
+      const guardedB = attachB.result.sessionId;
+      tabBGuarded.pageEnable = await tryStep('Page.enable', () =>
+        client.send('Page.enable', {}, guardedB)
+      );
+      tabBGuarded.runtimeEnable = await tryStep('Runtime.enable', () =>
+        client.send('Runtime.enable', {}, guardedB)
+      );
+      tabBGuarded.getFrameTree = await tryStep('Page.getFrameTree', () =>
+        client.send('Page.getFrameTree', {}, guardedB)
+      );
+      const frameId = tabBGuarded.getFrameTree.result?.frameTree?.frame?.id || tabB.frameId;
+      tabBGuarded.createIsolatedWorldUa = await tryStep('Page.createIsolatedWorld.ua', () =>
+        client.send(
+          'Page.createIsolatedWorld',
+          {
+            frameId,
+            worldName: 'slicc-ua-prot',
+            grantUniveralAccess: true,
+          },
+          guardedB
+        )
+      );
+      const uaContext = tabBGuarded.createIsolatedWorldUa.result?.executionContextId;
+      tabBGuarded.evaluateUa = await tryStep('Runtime.evaluate.ua', () =>
+        evaluateRaw(client, guardedB, domProbeExpression('prot', PROT_MARKER), uaContext)
+      );
+      tabBGuarded.createIsolatedWorldPlain = await tryStep('Page.createIsolatedWorld.plain', () =>
+        client.send(
+          'Page.createIsolatedWorld',
+          { frameId, worldName: 'slicc-plain-prot' },
+          guardedB
+        )
+      );
+      const plainContext = tabBGuarded.createIsolatedWorldPlain.result?.executionContextId;
+      tabBGuarded.evaluatePlain = await tryStep('Runtime.evaluate.plain', () =>
+        evaluateRaw(client, guardedB, domProbeExpression('prot', PROT_MARKER), plainContext)
+      );
+      tabBGuarded.evaluateMain = await tryStep('Runtime.evaluate.main', () =>
+        evaluateRaw(client, guardedB, domProbeExpression('prot', PROT_MARKER))
+      );
+    }
+
+    const uaRaw = await createWorld(raw, tabB.sessionId, tabB.frameId, {
+      worldName: 'slicc-ua-raw',
+      universal: true,
+    });
+    const plainRaw = await createWorld(raw, tabB.sessionId, tabB.frameId, {
+      worldName: 'slicc-plain-raw',
+    });
+    const tabBUnguarded = {
+      attackNamed: valueOf(
+        await evaluateRaw(
+          raw,
+          tabB.sessionId,
+          domProbeExpression('prot', PROT_MARKER),
+          uaRaw.contextId
+        )
+      ),
+      withoutGrantUniveralAccess: valueOf(
+        await evaluateRaw(
+          raw,
+          tabB.sessionId,
+          domProbeExpression('prot', PROT_MARKER),
+          plainRaw.contextId
+        )
+      ),
+      mainWorld: valueOf(
+        await evaluateRaw(raw, tabB.sessionId, domProbeExpression('prot', PROT_MARKER))
+      ),
+    };
 
     const report = {
       chromeVersion: version.product || version.userAgent || version,
       siteIsolationOff: true,
       sameSiteParentGap:
         'catalog protectedOrigins.domains includes sliccy.ai, so no ordinary same-site parent with a protected iframe exists in this harness',
-      parentUrl: pages.parentUrl,
-      openFrameUrl: pages.openFrameUrl,
-      protFrameUrl: pages.protFrameUrl,
-      unguardedIframes,
-      protectedIframeLoadedInUnguardedBrowser: Boolean(unguardedIframes?.protLoaded),
-      openIframeLoadedInUnguardedBrowser: Boolean(unguardedIframes?.openLoaded),
-      worldParams: {
-        attackNamed: attackNamed.params,
-        attackAnon: attackAnon.params,
-        plain: plain.params,
+      tabA: {
+        url: pages.openParentUrl,
+        childUrls: tabA.urls,
+        worldParams: {
+          attackNamed: attackNamed.params,
+          attackAnon: attackAnon.params,
+          plain: plain.params,
+        },
+        perWorld: tabAWorlds,
+        positiveControlReadable: {
+          attackNamed: readable(tabAWorlds.attackNamed),
+          attackAnon: readable(tabAWorlds.attackAnon),
+          withoutGrantUniveralAccess: readable(tabAWorlds.withoutGrantUniveralAccess),
+          mainWorld: readable(tabAWorlds.mainWorld),
+        },
       },
-      perWorld,
-      positiveControl: {
-        attackNamedOpenReadable: protectedReadable(perWorld.attackNamed.open),
-        attackAnonOpenReadable: protectedReadable(perWorld.attackAnon.open),
-        plainOpenReadable: protectedReadable(perWorld.withoutGrantUniveralAccess.open),
-        mainOpenReadable: protectedReadable(perWorld.mainWorld.open),
+      tabB: {
+        url: pages.protParentUrl,
+        childUrls: tabB.urls,
+        guardedRefusals: tabBGuarded,
       },
-      protectedReadable: {
-        attackNamed: protectedReadable(perWorld.attackNamed.protected),
-        attackAnon: protectedReadable(perWorld.attackAnon.protected),
-        withoutGrantUniveralAccess: protectedReadable(
-          perWorld.withoutGrantUniveralAccess.protected
+      tabBUnguarded: {
+        perWorld: tabBUnguarded,
+        protectedReadable: {
+          attackNamed: readable(tabBUnguarded.attackNamed),
+          withoutGrantUniveralAccess: readable(tabBUnguarded.withoutGrantUniveralAccess),
+          mainWorld: readable(tabBUnguarded.mainWorld),
+        },
+      },
+      summary: {
+        positiveControlReadableInUa:
+          readable(tabAWorlds.attackNamed) || readable(tabAWorlds.attackAnon),
+        protectedReadableUnguardedUa: readable(tabBUnguarded.attackNamed),
+        protectedReadableUnguardedPlain: readable(tabBUnguarded.withoutGrantUniveralAccess),
+        protectedReadableUnguardedMain: readable(tabBUnguarded.mainWorld),
+        guardedTabBRefused: Object.values(tabBGuarded).some(
+          (step) => step && step.ok === false && /seven|refused/i.test(String(step.refusal || ''))
         ),
-        mainWorld: protectedReadable(perWorld.mainWorld.protected),
       },
-      hits: pages.hits,
     };
     publishReport(report);
 
-    for (const [name, readable] of Object.entries(report.protectedReadable)) {
+    const guardedProtectedContent = [
+      tabBGuarded.evaluateUa,
+      tabBGuarded.evaluatePlain,
+      tabBGuarded.evaluateMain,
+    ]
+      .filter(Boolean)
+      .map((step) => (step.ok ? valueOf(step.result) : null));
+    for (const probe of guardedProtectedContent) {
       assert.equal(
-        readable,
+        readable(probe),
         false,
-        `protected iframe DOM must stay unreadable in ${name}; probe=${JSON.stringify(report)}`
+        `guarded tab B must not return protected iframe content; probe=${JSON.stringify(report)}`
       );
     }
+    assert.equal(
+      report.summary.guardedTabBRefused ||
+        guardedProtectedContent.every((probe) => !readable(probe)),
+      true,
+      `guarded tab B must refuse or keep protected iframe unreadable; probe=${JSON.stringify(report)}`
+    );
   } finally {
     await client?.close();
     await raw?.close();
