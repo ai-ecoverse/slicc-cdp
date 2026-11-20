@@ -756,8 +756,32 @@ impl Cdp {
         if !error {
             return false;
         }
-        target.is_some_and(|id| self.targets.get(id).is_some_and(|info| self.error_unproven(info)))
-            || (!unreachable.is_empty() && !self.ordinary_unreachable(unreachable))
+        if !unreachable.is_empty() && !self.ordinary_unreachable(unreachable) {
+            return true;
+        }
+        if let Some(id) = target {
+            if let Some(doc) = self.documents.get(id) {
+                if self.guard.url(&doc.unreachable_url)
+                    || (!doc.unreachable_url.is_empty() && !self.ordinary_unreachable(&doc.unreachable_url))
+                {
+                    return true;
+                }
+                let title = self.targets.get(id).and_then(|info| info.get("title")).and_then(Value::as_str).unwrap_or("");
+                if self.error_proof_applies(doc, title) {
+                    return false;
+                }
+                if Self::chrome_error(&doc.url) || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty() {
+                    return true;
+                }
+            }
+            if self.targets.get(id).is_some_and(|info| self.error_unproven(info)) {
+                return true;
+            }
+            if Self::chrome_error(url) || self.guard.error_page_url(url) {
+                return true;
+            }
+        }
+        false
     }
 
     fn scrub_failed_load_carriers(&self, value: &mut Value, target: Option<&str>) {

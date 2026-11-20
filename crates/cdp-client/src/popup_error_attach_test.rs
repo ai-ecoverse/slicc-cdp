@@ -202,6 +202,8 @@ impl Transport for PopupBrowser {
                     json!({"result":{"type":"string","value":name}})
                 } else if expr.contains("nameAndUrl") {
                     json!({"result":{"type":"object","value":{"name":"Seven","url":"https://seven.sliccy.ai/path/SECRET"}}})
+                } else if expr.contains("networkRequestLike") {
+                    json!({"result":{"type":"object","value":{"name":"Seven","url":"https://seven.sliccy.ai/path/SECRET","method":"GET","headers":{}}}})
                 } else {
                     json!({"result":{"type":"string","value":"document-read"}})
                 }
@@ -1564,20 +1566,108 @@ fn a_network_request_like_object_with_name_and_protected_url_keeps_its_name() {
     let mut cdp = own_client_from(state, &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
+    let evaluated = cdp.call("Runtime.evaluate", json!({"expression":"networkRequestLike"}), Some(&live)).unwrap();
+    assert_eq!(evaluated.pointer("/result/value/name").and_then(Value::as_str), Some("Seven"));
+    assert_eq!(evaluated.pointer("/result/value/method").and_then(Value::as_str), Some("GET"));
+    assert!(!evaluated.to_string().contains("SECRET"), "{evaluated}");
+}
+
+#[test]
+fn chrome_error_window_open_and_download_hide_after_a_protected_frame_while_target_info_stays_ordinary() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.frame = PopupFrame::Frame(own_error_frame_named("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&start), "targetInfo still ordinary");
     let mark = cdp.events().len();
     cdp.absorb(json!({
-        "method":"Network.requestWillBeSent","sessionId":live,
-        "params":{
-            "requestId":"R-NAME","type":"Other","documentURL":"https://example.test/start",
-            "request":{"url":"https://seven.sliccy.ai/path/SECRET","method":"GET","name":"Seven"},
-            "frameId":"T"
-        }
+        "method":"Page.windowOpen","sessionId":live,
+        "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
     }));
-    let delivered = cdp.events()[mark..].iter().find(|event| event["method"] == "Network.requestWillBeSent");
-    if let Some(event) = delivered {
-        assert_eq!(event.pointer("/params/request/name").and_then(Value::as_str), Some("Seven"));
-        assert!(!event.to_string().contains("SECRET"), "{event}");
+    cdp.absorb(json!({
+        "method":"Page.downloadWillBegin","sessionId":live,
+        "params":{"frameId":"T","guid":"G-ERR","url":POPUP_ERROR,"suggestedFilename":host}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    let download = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.downloadWillBegin").expect("downloadWillBegin");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
+    assert_eq!(download.pointer("/params/suggestedFilename").and_then(Value::as_str), Some(""));
+    assert_no_failed_host("chrome-error-windowOpen", opened, host, STALE_MARKER);
+    assert_no_failed_host("chrome-error-download", download, host, STALE_MARKER);
+}
+
+#[test]
+fn chrome_error_window_open_and_download_hide_after_ordinary_proof_then_protected_load() {
+    let host = "seven.sliccy.ai";
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state.clone(), &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let guard = cdp.guards.get("T").cloned().expect("guard");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame_named("LO", STALE_ORDINARY));
     }
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, "ordinary.invalid")}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LO", STALE_ORDINARY),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info("https://example.test/start", "start");
+        state.frame = PopupFrame::Frame(own_error_frame_named("LP", STALE_PROTECTED));
+    }
+    cdp.absorb(json!({"method":"Page.frameStartedNavigating","sessionId":guard,"params":{"frameId":"T","url":STALE_PROTECTED,"loaderId":"LP","navigationType":"differentDocument"}}));
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame_named("LP", STALE_PROTECTED),"type":"Navigation"}}));
+    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info("https://example.test/start", "start")}}));
+    assert!(!cdp.error_unproven(&own_info("https://example.test/start", "start")));
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Page.windowOpen","sessionId":live,
+        "params":{"url":POPUP_ERROR,"windowName":host,"windowFeatures":"","userGesture":true}
+    }));
+    cdp.absorb(json!({
+        "method":"Page.downloadWillBegin","sessionId":live,
+        "params":{"frameId":"T","guid":"G-RESTART","url":POPUP_ERROR,"suggestedFilename":host}
+    }));
+    let opened = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.windowOpen").expect("windowOpen");
+    let download = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.downloadWillBegin").expect("downloadWillBegin");
+    assert_eq!(opened.pointer("/params/windowName").and_then(Value::as_str), Some(""));
+    assert_eq!(download.pointer("/params/suggestedFilename").and_then(Value::as_str), Some(""));
+    assert_no_failed_host("restart-windowOpen", opened, host, STALE_MARKER);
+    assert_no_failed_host("restart-download", download, host, STALE_MARKER);
+}
+
+#[test]
+fn an_ordinary_download_keeps_its_suggested_filename() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    let live = first["sessionId"].as_str().unwrap().to_string();
+    let mark = cdp.events().len();
+    cdp.absorb(json!({
+        "method":"Page.downloadWillBegin","sessionId":live,
+        "params":{"frameId":"T","guid":"G-ORD","url":"https://example.test/file.bin","suggestedFilename":"report.bin"}
+    }));
+    let download = cdp.events()[mark..].iter().find(|event| event["method"] == "Page.downloadWillBegin").expect("downloadWillBegin");
+    assert_eq!(download.pointer("/params/suggestedFilename").and_then(Value::as_str), Some("report.bin"));
+    assert_eq!(download.pointer("/params/url").and_then(Value::as_str), Some("https://example.test/file.bin"));
 }
 
 #[test]
