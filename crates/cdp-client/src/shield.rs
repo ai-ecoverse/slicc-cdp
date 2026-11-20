@@ -1400,10 +1400,33 @@ mod tests {
         ));
     }
 
-    use crate::cdp::{self as client, Cdp, COOKIES, STREAM, UNSEEN};
+    use crate::cdp::{self as client, Cdp, COOKIES, STREAM, UNANSWERED, UNSEEN, UNVERIFIED};
     use crate::fetch::{Decision, Fulfill, Interception, Pattern};
     use crate::raw::Raw;
     use std::time::{Duration, Instant};
+
+    enum PendingAttachOutcome {
+        Admitted(String),
+        PreconditionMiss(&'static str),
+        OtherError(String),
+        NotAttempted,
+    }
+
+    fn classify_pending_attach(attached: &Option<Result<String, String>>) -> PendingAttachOutcome {
+        match attached {
+            Some(Ok(session)) => PendingAttachOutcome::Admitted(session.clone()),
+            Some(Err(error))
+                if error.starts_with(UNANSWERED) && error.ends_with(" timed out\n") =>
+            {
+                PendingAttachOutcome::PreconditionMiss("unanswered-timeout")
+            }
+            Some(Err(error)) if error.contains("could not finish checking this target") => {
+                PendingAttachOutcome::PreconditionMiss("no-proof-unverified")
+            }
+            Some(Err(error)) => PendingAttachOutcome::OtherError(error.clone()),
+            None => PendingAttachOutcome::NotAttempted,
+        }
+    }
 
     const REFUSED: &str = "slicc: refused: target is on seven's origin\n";
 
@@ -2302,6 +2325,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_attach_no_proof_refusal_is_a_precondition_miss() {
+        let unanswered = format!("{UNANSWERED}: Network.setBypassServiceWorker timed out\n");
+        assert!(matches!(
+            classify_pending_attach(&Some(Err(unanswered))),
+            PendingAttachOutcome::PreconditionMiss("unanswered-timeout")
+        ));
+        assert!(matches!(
+            classify_pending_attach(&Some(Err(UNVERIFIED.to_string()))),
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified")
+        ));
+        assert!(
+            !matches!(
+                classify_pending_attach(&Some(Err(UNVERIFIED.to_string()))),
+                PendingAttachOutcome::Admitted(_)
+            ),
+            "no-proof refusal must not count as an admitted session"
+        );
+        assert!(matches!(
+            classify_pending_attach(&Some(Err(REFUSED.to_string()))),
+            PendingAttachOutcome::OtherError(_)
+        ));
+        assert!(matches!(
+            classify_pending_attach(&Some(Ok("S".into()))),
+            PendingAttachOutcome::Admitted(_)
+        ));
+        assert!(matches!(
+            classify_pending_attach(&None),
+            PendingAttachOutcome::NotAttempted
+        ));
+    }
+
+    #[test]
+    fn guard_window_retries_no_proof_attach_refusal() {
+        let mut attempts = Vec::new();
+        let result = produce_guard_window(|number| {
+            attempts.push(number);
+            let attached = if number < 3 {
+                Some(Err(UNVERIFIED.to_string()))
+            } else {
+                Some(Ok("S".into()))
+            };
+            match classify_pending_attach(&attached) {
+                PendingAttachOutcome::Admitted(session) => {
+                    (GuardWindow::Produced(session), "attach=admitted".into())
+                }
+                PendingAttachOutcome::PreconditionMiss(label) => {
+                    (GuardWindow::Miss, format!("attach={label}"))
+                }
+                PendingAttachOutcome::OtherError(error) => panic!("{error}"),
+                PendingAttachOutcome::NotAttempted => {
+                    (GuardWindow::Miss, "attach=not-attempted".into())
+                }
+            }
+        });
+        assert_eq!(result.unwrap(), "S");
+        assert_eq!(attempts, [1, 2, 3]);
+    }
+
     fn until_history(
         raw: &mut Raw,
         session: &str,
@@ -2392,8 +2474,20 @@ mod tests {
                     |current| current.is_none(),
                 );
             let attached = pending.then(|| client::attach(&mut cdp, &tab));
-            let unanswered = matches!(&attached, Some(Err(error)) if error.starts_with(client::UNANSWERED) && error.ends_with(" timed out\n"));
-            let session = if unanswered { None } else { attached.map(Result::unwrap) };
+            let attach_outcome = classify_pending_attach(&attached);
+            let session = match &attach_outcome {
+                PendingAttachOutcome::Admitted(session) => Some(session.clone()),
+                PendingAttachOutcome::PreconditionMiss(_) | PendingAttachOutcome::NotAttempted => {
+                    None
+                }
+                PendingAttachOutcome::OtherError(error) => panic!("{error}"),
+            };
+            let attach_outcome_label = match &attach_outcome {
+                PendingAttachOutcome::Admitted(_) => "admitted",
+                PendingAttachOutcome::PreconditionMiss(label) => *label,
+                PendingAttachOutcome::OtherError(_) => "other-error",
+                PendingAttachOutcome::NotAttempted => "not-attempted",
+            };
             let proxy_evidence: Value = serde_json::from_slice(
                 &crate::net::http_probe(&evidence_url, "application/json")
                     .unwrap_or_else(|error| panic!("guard evidence unavailable: {error}"))
@@ -2427,7 +2521,7 @@ mod tests {
                 || !seven_commits.is_empty()
                 || !proxy_evidence["seven_commits"].as_array().unwrap().is_empty();
             let evidence = format!(
-                "pending_window_produced={produced}; pending_before_attach={pending}; js_redirect_committed={committed}; attach_unanswered={unanswered}; tab={tab}; trigger={trigger:?}; fixture_hits(/code,/dump)={hits:?}; seven_commits={seven_commits:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+                "pending_window_produced={produced}; pending_before_attach={pending}; js_redirect_committed={committed}; attach_outcome={attach_outcome_label}; tab={tab}; trigger={trigger:?}; fixture_hits(/code,/dump)={hits:?}; seven_commits={seven_commits:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
                 cdp.events(), cdp.paused_trail
             );
             if bypass || !produced {
