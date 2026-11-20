@@ -12,6 +12,7 @@ const HEADER = 'x-protected-marker';
 const HEADER_VALUE = 'PROTECTED-HEADER-MARKER-IW-UA';
 const COOKIE_NAME = 'iw_ua_session';
 const COOKIE_VALUE = 'IW-UA-COOKIE-SECRET';
+const SAME_ORIGIN_EXPR = 'location.origin + "|" + document.title';
 
 async function navigate(raw, session, url) {
   const loaded = raw.waitEvent(
@@ -71,6 +72,7 @@ function probeExpression(url, kind) {
           bodyLen: body.length,
           bodyHasMarker: body.includes(${JSON.stringify(MARKER)}),
           headerHasMarker: response.headers.get(${JSON.stringify(HEADER)}) === ${JSON.stringify(HEADER_VALUE)},
+          bodyPrefix: body.slice(0, 64),
           error: null
         };
       })
@@ -81,6 +83,7 @@ function probeExpression(url, kind) {
         bodyLen: 0,
         bodyHasMarker: false,
         headerHasMarker: false,
+        bodyPrefix: '',
         error: String(error && error.message ? error.message : error)
       })))()`;
   }
@@ -101,6 +104,7 @@ function probeExpression(url, kind) {
         bodyLen: body.length,
         bodyHasMarker: body.includes(${JSON.stringify(MARKER)}),
         headerHasMarker,
+        bodyPrefix: body.slice(0, 64),
         error: null
       });
     };
@@ -111,24 +115,25 @@ function probeExpression(url, kind) {
       bodyLen: 0,
       bodyHasMarker: false,
       headerHasMarker: false,
+      bodyPrefix: '',
       error: 'xhr-error'
     });
     xhr.send();
   }))()`;
 }
 
-async function evaluate(client, sessionId, expression, contextId) {
+async function evaluateRaw(client, sessionId, expression, contextId) {
   const params = {
     expression,
     awaitPromise: true,
     returnByValue: true,
   };
   if (contextId !== undefined) params.contextId = contextId;
-  const reply = await client.send('Runtime.evaluate', params, sessionId);
-  if (reply.exceptionDetails) {
-    throw new Error(JSON.stringify(reply.exceptionDetails));
-  }
-  return reply.result?.value;
+  return client.send('Runtime.evaluate', params, sessionId);
+}
+
+function valueOf(reply) {
+  return reply?.result?.value;
 }
 
 async function createWorld(client, sessionId, frameId, worldName, universal) {
@@ -141,29 +146,7 @@ async function createWorld(client, sessionId, frameId, worldName, universal) {
   const contextId = world.executionContextId;
   assert.equal(typeof contextId, 'number');
   assert.ok(contextId > 0);
-  return contextId;
-}
-
-async function worldProbe(client, sessionId, contextId, protectedUrl) {
-  const sameOrigin = await evaluate(
-    client,
-    sessionId,
-    'location.origin + "|" + document.title',
-    contextId
-  );
-  const fetchProbe = await evaluate(
-    client,
-    sessionId,
-    probeExpression(protectedUrl, 'fetch'),
-    contextId
-  );
-  const xhrProbe = await evaluate(
-    client,
-    sessionId,
-    probeExpression(protectedUrl, 'xhr'),
-    contextId
-  );
-  return { sameOrigin, fetch: fetchProbe, xhr: xhrProbe };
+  return { world, contextId };
 }
 
 function readable(probe) {
@@ -215,6 +198,7 @@ test('Chrome: isolated world without universal access cannot read a protected cr
       flatten: true,
     });
     await raw.send('Page.enable', {}, rawSession);
+    await raw.send('Runtime.enable', {}, rawSession);
     const ordinaryUrl = `${sites.ordinary}/doc?n=iw-ua`;
     await navigate(raw, rawSession, ordinaryUrl);
     const pageState = await raw.send(
@@ -232,6 +216,9 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     );
     assert.equal(pageState.result?.value?.title, 'doc');
 
+    const rawTree = await raw.send('Page.getFrameTree', {}, rawSession);
+    const frameId = rawTree.frameTree.frame.id;
+
     const { sessionId } = await client.send('Target.attachToTarget', {
       targetId,
       flatten: true,
@@ -239,24 +226,116 @@ test('Chrome: isolated world without universal access cannot read a protected cr
     for (const method of ['Page.enable', 'Runtime.enable', 'Network.enable']) {
       await client.send(method, {}, sessionId);
     }
-    const tree = await client.send('Page.getFrameTree', {}, sessionId);
-    const frameId = tree.frameTree.frame.id;
 
-    const withUaId = await createWorld(client, sessionId, frameId, 'slicc-ua-probe', true);
-    const withoutUaId = await createWorld(client, sessionId, frameId, 'slicc-plain-probe', false);
+    const withUa = await createWorld(client, sessionId, frameId, 'slicc-ua-probe', true);
+    const withoutUa = await createWorld(client, sessionId, frameId, 'slicc-plain-probe', false);
 
-    const withUa = await worldProbe(client, sessionId, withUaId, protectedFixture.url);
-    const withoutUa = await worldProbe(client, sessionId, withoutUaId, protectedFixture.url);
-    const mainFetch = await evaluate(
+    const expectedOrigin = `${sites.ordinary}|doc`;
+    const sameOriginGuardedUa = await evaluateRaw(
+      client,
+      sessionId,
+      SAME_ORIGIN_EXPR,
+      withUa.contextId
+    );
+    const sameOriginGuardedPlain = await evaluateRaw(
+      client,
+      sessionId,
+      SAME_ORIGIN_EXPR,
+      withoutUa.contextId
+    );
+    const sameOriginGuardedMain = await evaluateRaw(client, sessionId, SAME_ORIGIN_EXPR);
+    const sameOriginUnguardedUa = await evaluateRaw(
+      raw,
+      rawSession,
+      SAME_ORIGIN_EXPR,
+      withUa.contextId
+    );
+    const sameOriginUnguardedPlain = await evaluateRaw(
+      raw,
+      rawSession,
+      SAME_ORIGIN_EXPR,
+      withoutUa.contextId
+    );
+    const sameOriginUnguardedMain = await evaluateRaw(raw, rawSession, SAME_ORIGIN_EXPR);
+
+    assert.equal(
+      valueOf(sameOriginUnguardedUa),
+      expectedOrigin,
+      `unguarded UA world sameOrigin; guardedUa=${JSON.stringify(sameOriginGuardedUa)} unguardedUa=${JSON.stringify(sameOriginUnguardedUa)} guardedMain=${JSON.stringify(sameOriginGuardedMain)} unguardedMain=${JSON.stringify(sameOriginUnguardedMain)}`
+    );
+    assert.equal(
+      valueOf(sameOriginUnguardedPlain),
+      expectedOrigin,
+      `unguarded plain world sameOrigin; guardedPlain=${JSON.stringify(sameOriginGuardedPlain)} unguardedPlain=${JSON.stringify(sameOriginUnguardedPlain)}`
+    );
+
+    const fetchGuardedUa = await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedFixture.url, 'fetch'),
+      withUa.contextId
+    );
+    const xhrGuardedUa = await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedFixture.url, 'xhr'),
+      withUa.contextId
+    );
+    const fetchGuardedPlain = await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedFixture.url, 'fetch'),
+      withoutUa.contextId
+    );
+    const xhrGuardedPlain = await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedFixture.url, 'xhr'),
+      withoutUa.contextId
+    );
+    const fetchGuardedMain = await evaluateRaw(
       client,
       sessionId,
       probeExpression(protectedFixture.url, 'fetch')
     );
-    const mainXhr = await evaluate(client, sessionId, probeExpression(protectedFixture.url, 'xhr'));
+    const xhrGuardedMain = await evaluateRaw(
+      client,
+      sessionId,
+      probeExpression(protectedFixture.url, 'xhr')
+    );
+    const fetchUnguardedUa = await evaluateRaw(
+      raw,
+      rawSession,
+      probeExpression(protectedFixture.url, 'fetch'),
+      withUa.contextId
+    );
+    const xhrUnguardedUa = await evaluateRaw(
+      raw,
+      rawSession,
+      probeExpression(protectedFixture.url, 'xhr'),
+      withUa.contextId
+    );
 
-    const expectedOrigin = `${sites.ordinary}|doc`;
-    assert.equal(withUa.sameOrigin, expectedOrigin);
-    assert.equal(withoutUa.sameOrigin, expectedOrigin);
+    const withUaProbe = {
+      sameOriginGuarded: valueOf(sameOriginGuardedUa),
+      sameOriginUnguarded: valueOf(sameOriginUnguardedUa),
+      fetch: valueOf(fetchGuardedUa),
+      xhr: valueOf(xhrGuardedUa),
+      fetchUnguarded: valueOf(fetchUnguardedUa),
+      xhrUnguarded: valueOf(xhrUnguardedUa),
+    };
+    const withoutUaProbe = {
+      sameOriginGuarded: valueOf(sameOriginGuardedPlain),
+      sameOriginUnguarded: valueOf(sameOriginUnguardedPlain),
+      fetch: valueOf(fetchGuardedPlain),
+      xhr: valueOf(xhrGuardedPlain),
+    };
+    const mainWorld = {
+      sameOriginGuarded: valueOf(sameOriginGuardedMain),
+      sameOriginUnguarded: valueOf(sameOriginUnguardedMain),
+      fetch: valueOf(fetchGuardedMain),
+      xhr: valueOf(xhrGuardedMain),
+    };
 
     const report = {
       chromeVersion: version.product || version.userAgent || version,
@@ -264,33 +343,50 @@ test('Chrome: isolated world without universal access cannot read a protected cr
       protectedUrl: protectedFixture.url,
       cookie: `${COOKIE_NAME}=${COOKIE_VALUE}`,
       hits: protectedFixture.hits,
-      withGrantUniveralAccess: withUa,
-      withoutGrantUniveralAccess: withoutUa,
-      mainWorld: { fetch: mainFetch, xhr: mainXhr },
+      worldCreate: { withUa: withUa.world, withoutUa: withoutUa.world },
+      rawReplies: {
+        sameOriginGuardedUa,
+        sameOriginGuardedPlain,
+        sameOriginGuardedMain,
+        sameOriginUnguardedUa,
+        sameOriginUnguardedPlain,
+        sameOriginUnguardedMain,
+        fetchGuardedUa,
+        xhrGuardedUa,
+        fetchGuardedPlain,
+        xhrGuardedPlain,
+        fetchGuardedMain,
+        xhrGuardedMain,
+        fetchUnguardedUa,
+        xhrUnguardedUa,
+      },
+      withGrantUniveralAccess: withUaProbe,
+      withoutGrantUniveralAccess: withoutUaProbe,
+      mainWorld,
     };
 
     assert.equal(
-      readable(withUa),
+      readable(withUaProbe),
       false,
       `protected content must stay unreadable from the isolated world; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUa.fetch?.bodyHasMarker,
+      withUaProbe.fetch?.bodyHasMarker,
       false,
       `fetch body marker; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUa.xhr?.bodyHasMarker,
+      withUaProbe.xhr?.bodyHasMarker,
       false,
       `xhr body marker; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUa.fetch?.headerHasMarker,
+      withUaProbe.fetch?.headerHasMarker,
       false,
       `fetch header marker; probe=${JSON.stringify(report)}`
     );
     assert.equal(
-      withUa.xhr?.headerHasMarker,
+      withUaProbe.xhr?.headerHasMarker,
       false,
       `xhr header marker; probe=${JSON.stringify(report)}`
     );
