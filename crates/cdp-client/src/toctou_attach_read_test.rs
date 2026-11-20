@@ -34,6 +34,21 @@ enum ToctouEventTiming {
     AfterSecondRead,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ExistingLearn {
+    EventFirst,
+    ReplyBeforeLearn,
+    NeverLearn,
+    LearnDuring,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ToctouNavEvents {
+    All,
+    None,
+    AfterReply,
+}
+
 struct ToctouContext {
     id: i64,
     unique: String,
@@ -56,6 +71,11 @@ struct ToctouState {
     contexts: Vec<ToctouContext>,
     next_context: i64,
     survive_contexts: bool,
+    nav_events: ToctouNavEvents,
+    pending_nav_events: VecDeque<String>,
+    node_epoch: u64,
+    live_nodes: std::collections::BTreeSet<i64>,
+    pdf_stream: Option<String>,
 }
 
 struct ToctouBrowser {
@@ -119,7 +139,7 @@ impl ToctouState {
         self.contexts.iter().find(|context| context.objects.contains(object_id) || context.promises.contains(object_id))
     }
 
-    fn commit(&mut self, inbox: &mut VecDeque<String>, session: &str, deliver_events: bool) {
+    fn commit(&mut self, inbox: &mut VecDeque<String>, session: &str, deliver_frame: bool) {
         if self.committed {
             self.tree = self.live.clone();
             self.info = toctou_info(self.live["url"].as_str().unwrap());
@@ -132,6 +152,8 @@ impl ToctouState {
         self.info = toctou_info(to);
         self.committed = true;
         if !reuse {
+            self.node_epoch += 1;
+            self.live_nodes.clear();
             let destroyed: Vec<ToctouContext> = self.contexts.drain(..).collect();
             for context in destroyed {
                 inbox.push_back(
@@ -174,15 +196,16 @@ impl ToctouState {
                 context.post_commit = true;
             }
         }
-        inbox.push_back(
+        let mut nav = VecDeque::new();
+        nav.push_back(
             json!({
                 "method": toctou_method("Target", "targetInfoChanged"),
                 "params": { "targetInfo": self.info.clone() },
             })
             .to_string(),
         );
-        if deliver_events {
-            inbox.push_back(
+        if deliver_frame {
+            nav.push_back(
                 json!({
                     "method": toctou_method("Page", "frameNavigated"),
                     "sessionId": session,
@@ -190,6 +213,17 @@ impl ToctouState {
                 })
                 .to_string(),
             );
+        }
+        match self.nav_events {
+            ToctouNavEvents::None => {}
+            ToctouNavEvents::AfterReply => self.pending_nav_events.append(&mut nav),
+            ToctouNavEvents::All => inbox.append(&mut nav),
+        }
+    }
+
+    fn flush_nav_events(&mut self, inbox: &mut VecDeque<String>) {
+        while let Some(event) = self.pending_nav_events.pop_front() {
+            inbox.push_back(event);
         }
     }
 }
@@ -250,6 +284,10 @@ impl Transport for ToctouBrowser {
         let key = toctou_method("Input", "dispatchKeyEvent");
         let insert = toctou_method("Input", "insertText");
         let net_body = toctou_method("Network", "getResponseBody");
+        let get_props = toctou_method("Runtime", "getProperties");
+        let nav_history = toctou_method("Page", "getNavigationHistory");
+        let ax_query = toctou_method("Accessibility", "queryAXTree");
+        let io_read = toctou_method("IO", "read");
         let content_like = [
             evaluate.as_str(),
             call_fn.as_str(),
@@ -268,11 +306,14 @@ impl Transport for ToctouBrowser {
             resource.as_str(),
             resource_tree.as_str(),
             ax.as_str(),
+            ax_query.as_str(),
             css.as_str(),
             mouse.as_str(),
             key.as_str(),
             insert.as_str(),
             net_body.as_str(),
+            get_props.as_str(),
+            io_read.as_str(),
         ]
         .contains(&called);
         if content_like && state.commits_on_forward {
@@ -288,6 +329,7 @@ impl Transport for ToctouBrowser {
         let protected_doc = state.committed && state.tree["url"].as_str().is_some_and(|url| url.contains(TOCTOU_MARK) || url.contains("vault.sliccy.ai") || url.contains("seven.sliccy.ai"));
         let marker = || json!({ "result": { "type": "string", "value": format!("leaked-{TOCTOU_MARK}") } });
         let missing = "Cannot find context with specified id";
+        let missing_node = "Could not find node with given id";
         if called == get_info {
             self.inbox.push_back(reply_ok(json!({ "targetInfo": state.info.clone() })));
         } else if called == get_targets {
@@ -318,10 +360,11 @@ impl Transport for ToctouBrowser {
             let session = call["sessionId"].as_str().unwrap_or("");
             state.next_context = 1;
             state.contexts.clear();
+            state.live_nodes = [1].into_iter().collect();
             state.contexts.push(ToctouContext {
                 id: 1,
                 unique: format!("ctx-{session}"),
-                objects: ["1".into()].into_iter().collect(),
+                objects: ["1".into(), "handle-1".into()].into_iter().collect(),
                 promises: ["promise-1".into()].into_iter().collect(),
                 post_commit: false,
             });
@@ -333,7 +376,7 @@ impl Transport for ToctouBrowser {
                         "context": {
                             "id": 1,
                             "uniqueId": format!("ctx-{session}"),
-                            "origin": "https://ordinary.example",
+                            "origin": state.tree["securityOrigin"].clone(),
                             "name": "",
                             "auxData": { "frameId": "T", "isDefault": true },
                         }
@@ -380,18 +423,24 @@ impl Transport for ToctouBrowser {
             }
         } else if called == get_document {
             let url = state.tree["url"].clone();
+            state.live_nodes.insert(1);
             self.inbox.push_back(reply_ok(json!({ "root": { "nodeId": 1, "nodeName": "HTML", "documentURL": url } })));
-        } else if called == query || called == describe || called == resolve {
-            if protected_doc {
+        } else if called == query || called == describe || called == resolve || called == outer {
+            let node = call["params"].get("nodeId").and_then(Value::as_i64).unwrap_or(1);
+            if !state.survive_contexts && state.committed && !state.live_nodes.contains(&node) {
+                self.inbox.push_back(reply_err(missing_node));
+            } else if called == outer {
+                if protected_doc {
+                    self.inbox.push_back(reply_ok(json!({ "outerHTML": format!("<html>{TOCTOU_MARK}</html>") })));
+                } else {
+                    self.inbox.push_back(reply_ok(json!({ "outerHTML": "<html></html>" })));
+                }
+            } else if protected_doc {
+                state.live_nodes.insert(2);
                 self.inbox.push_back(reply_ok(json!({ "nodeId": 2, "node": { "nodeId": 2, "nodeName": "BODY", "documentURL": format!("body {TOCTOU_MARK}") } })));
             } else {
+                state.live_nodes.insert(2);
                 self.inbox.push_back(reply_ok(json!({ "nodeId": 2, "node": { "nodeId": 2, "nodeName": "BODY" } })));
-            }
-        } else if called == outer {
-            if protected_doc {
-                self.inbox.push_back(reply_ok(json!({ "outerHTML": format!("<html>{TOCTOU_MARK}</html>") })));
-            } else {
-                self.inbox.push_back(reply_ok(json!({ "outerHTML": "<html></html>" })));
             }
         } else if called == snap {
             if protected_doc {
@@ -399,8 +448,27 @@ impl Transport for ToctouBrowser {
             } else {
                 self.inbox.push_back(reply_ok(json!({ "documents": [], "strings": [] })));
             }
-        } else if called == screenshot || called == pdf {
+        } else if called == screenshot {
             self.inbox.push_back(reply_ok(json!({ "data": if protected_doc { format!("marker-{TOCTOU_MARK}") } else { "iVBORw0KGgo=".into() } })));
+        } else if called == pdf {
+            if call["params"].get("transferMode").and_then(Value::as_str) == Some("ReturnAsStream") {
+                let handle = format!("pdf-{}", state.content_forwards);
+                state.pdf_stream = Some(handle.clone());
+                self.inbox.push_back(reply_ok(json!({ "stream": handle })));
+            } else {
+                self.inbox.push_back(reply_ok(json!({ "data": if protected_doc { format!("marker-{TOCTOU_MARK}") } else { "iVBORw0KGgo=".into() } })));
+            }
+        } else if called == io_read {
+            let handle = call["params"].get("handle").and_then(Value::as_str).unwrap_or("");
+            if state.pdf_stream.as_deref() == Some(handle) {
+                self.inbox.push_back(reply_ok(json!({
+                    "data": if protected_doc { format!("pdf-{TOCTOU_MARK}") } else { "pdf-ordinary".into() },
+                    "eof": true,
+                    "base64Encoded": false,
+                })));
+            } else {
+                self.inbox.push_back(reply_err("Invalid stream handle"));
+            }
         } else if called == page_snap {
             if protected_doc {
                 self.inbox.push_back(reply_ok(json!({ "document": format!("snapshot {TOCTOU_MARK}") })));
@@ -415,7 +483,12 @@ impl Transport for ToctouBrowser {
             }
         } else if called == resource_tree {
             self.inbox.push_back(reply_ok(json!({ "frameTree": { "frame": state.tree.clone(), "resources": [] } })));
-        } else if called == ax {
+        } else if called == nav_history {
+            self.inbox.push_back(reply_ok(json!({
+                "currentIndex": 0,
+                "entries": [{ "id": 1, "url": state.tree["url"].clone(), "userTypedURL": state.tree["url"].clone(), "title": "", "transitionType": "typed" }],
+            })));
+        } else if called == ax || called == ax_query {
             if protected_doc {
                 self.inbox.push_back(reply_ok(json!({ "nodes": [{ "name": { "value": format!("ax {TOCTOU_MARK}") } }] })));
             } else {
@@ -426,6 +499,16 @@ impl Transport for ToctouBrowser {
                 self.inbox.push_back(reply_ok(json!({ "text": format!("css {TOCTOU_MARK}") })));
             } else {
                 self.inbox.push_back(reply_ok(json!({ "text": "css" })));
+            }
+        } else if called == get_props {
+            let object = call["params"].get("objectId").and_then(Value::as_str).unwrap_or("");
+            match state.live_object(object) {
+                None => self.inbox.push_back(reply_err(missing)),
+                Some(context) if context.post_commit && protected_doc => {
+                    self.inbox.push_back(reply_ok(json!({ "result": [{ "name": "secret", "value": { "type": "string", "value": format!("prop-{TOCTOU_MARK}") } }] })));
+                }
+                Some(_) if protected_doc && state.committed => self.inbox.push_back(reply_err(missing)),
+                Some(_) => self.inbox.push_back(reply_ok(json!({ "result": [{ "name": "ok", "value": { "type": "string", "value": "ordinary" } }] }))),
             }
         } else if called == mouse || called == key || called == insert {
             self.inbox.push_back(reply_ok(json!({})));
@@ -444,6 +527,9 @@ impl Transport for ToctouBrowser {
             self.inbox.push_back(reply_ok(json!({})));
         } else {
             self.inbox.push_back(reply_ok(json!({})));
+        }
+        if state.nav_events == ToctouNavEvents::AfterReply && content_like {
+            state.flush_nav_events(&mut self.inbox);
         }
         Ok(())
     }
@@ -471,6 +557,11 @@ fn toctou_client(live: &str, timing: ToctouEventTiming) -> (Cdp, std::rc::Rc<std
         contexts: Vec::new(),
         next_context: 0,
         survive_contexts: false,
+        nav_events: ToctouNavEvents::All,
+        pending_nav_events: VecDeque::new(),
+        node_epoch: 0,
+        live_nodes: std::collections::BTreeSet::new(),
+        pdf_stream: None,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ToctouBrowser {
         inbox: VecDeque::new(),
@@ -587,6 +678,11 @@ fn ordinary_to_ordinary_navigation_during_pinned_evaluate_is_not_over_blocked() 
         contexts: Vec::new(),
         next_context: 0,
         survive_contexts: false,
+        nav_events: ToctouNavEvents::All,
+        pending_nav_events: VecDeque::new(),
+        node_epoch: 0,
+        live_nodes: std::collections::BTreeSet::new(),
+        pdf_stream: None,
     }));
     let mut cdp = Cdp::from_transport(Box::new(ToctouBrowser {
         inbox: VecDeque::new(),
@@ -680,3 +776,447 @@ fn mutation_post_reply_document_recheck_is_necessary_for_protected_commit() {
         assert!(!message.contains(TOCTOU_MARK), "{message}");
     }
 }
+
+const EXISTING_ORDINARY: &str = "https://ordinary.example/existing";
+
+fn existing_commands() -> Vec<(&'static str, String, Value)> {
+    let mut commands = toctou_commands();
+    commands.push(("Runtime.evaluate+awaitPromise", toctou_method("Runtime", "awaitPromise"), json!({ "promiseObjectId": "promise-1", "returnByValue": true })));
+    commands.push(("Runtime.getProperties", toctou_method("Runtime", "getProperties"), json!({ "objectId": "handle-1" })));
+    commands.push(("Page.printToPDF+stream", toctou_method("Page", "printToPDF"), json!({ "transferMode": "ReturnAsStream" })));
+    commands.push(("IO.read+pdf", toctou_method("IO", "read"), json!({ "handle": "pdf-1" })));
+    commands.push(("Accessibility.queryAXTree", toctou_method("Accessibility", "queryAXTree"), json!({ "nodeId": 1 })));
+    commands.push(("Page.getFrameTree", toctou_method("Page", "getFrameTree"), json!({})));
+    commands.push(("Page.getNavigationHistory", toctou_method("Page", "getNavigationHistory"), json!({})));
+    commands
+}
+
+fn existing_client(live: &str) -> (Cdp, std::rc::Rc<std::cell::RefCell<ToctouState>>, String) {
+    let ordinary = toctou_frame(EXISTING_ORDINARY, "L0");
+    let live_frame = toctou_frame(live, "L1");
+    let announced = toctou_info(EXISTING_ORDINARY);
+    let state = std::rc::Rc::new(std::cell::RefCell::new(ToctouState {
+        info: announced.clone(),
+        live: live_frame,
+        tree: ordinary.clone(),
+        commits_on_forward: false,
+        committed: false,
+        event_timing: ToctouEventTiming::AfterFirstRead,
+        content_forwards: 0,
+        content_backend_ok: 0,
+        sessions: std::collections::BTreeMap::new(),
+        attaches: 0,
+        contexts: Vec::new(),
+        next_context: 0,
+        survive_contexts: false,
+        nav_events: ToctouNavEvents::All,
+        pending_nav_events: VecDeque::new(),
+        node_epoch: 0,
+        live_nodes: std::collections::BTreeSet::new(),
+        pdf_stream: None,
+    }));
+    let mut cdp = Cdp::from_transport(Box::new(ToctouBrowser {
+        inbox: VecDeque::new(),
+        state: state.clone(),
+    }));
+    cdp.absorb(json!({
+        "method": toctou_method("Target", "targetCreated"),
+        "params": { "targetInfo": announced },
+    }));
+    let attach = cdp
+        .call(
+            &toctou_method("Target", "attachToTarget"),
+            json!({ "targetId": "T", "flatten": true }),
+            None,
+        )
+        .unwrap_or_else(|err| panic!("ordinary existing attach must succeed: {err}"));
+    let session = attach["sessionId"].as_str().unwrap().to_string();
+    {
+        let mut state = state.borrow_mut();
+        state.live_nodes = [1].into_iter().collect();
+        if let Some(context) = state.contexts.first_mut() {
+            context.objects.insert("1".into());
+            context.objects.insert("handle-1".into());
+            context.promises.insert("promise-1".into());
+        }
+    }
+    let proof = cdp
+        .call(
+            &toctou_method("Runtime", "evaluate"),
+            json!({ "expression": "document.body.innerText", "returnByValue": true }),
+            Some(&session),
+        )
+        .unwrap_or_else(|err| panic!("ordinary existing read must work: {err}"));
+    assert!(
+        !proof.to_string().contains(TOCTOU_MARK),
+        "ordinary proof must not carry the marker: {proof}"
+    );
+    (cdp, state, session)
+}
+
+fn existing_arm(state: &std::rc::Rc<std::cell::RefCell<ToctouState>>, learn: ExistingLearn) {
+    let mut state = state.borrow_mut();
+    state.committed = false;
+    state.content_forwards = 0;
+    state.content_backend_ok = 0;
+    state.pending_nav_events.clear();
+    match learn {
+        ExistingLearn::EventFirst => {
+            state.commits_on_forward = false;
+            state.nav_events = ToctouNavEvents::All;
+            state.event_timing = ToctouEventTiming::AfterFirstRead;
+        }
+        ExistingLearn::ReplyBeforeLearn => {
+            state.commits_on_forward = true;
+            state.nav_events = ToctouNavEvents::AfterReply;
+            state.event_timing = ToctouEventTiming::AfterFirstRead;
+        }
+        ExistingLearn::NeverLearn => {
+            state.commits_on_forward = true;
+            state.nav_events = ToctouNavEvents::None;
+            state.event_timing = ToctouEventTiming::Never;
+        }
+        ExistingLearn::LearnDuring => {
+            state.commits_on_forward = true;
+            state.nav_events = ToctouNavEvents::All;
+            state.event_timing = ToctouEventTiming::AfterFirstRead;
+        }
+    }
+}
+
+fn existing_deliver_event_first(cdp: &mut Cdp, state: &std::rc::Rc<std::cell::RefCell<ToctouState>>, session: &str) {
+    let events = {
+        let mut state = state.borrow_mut();
+        let mut inbox = VecDeque::new();
+        state.commit(&mut inbox, session, true);
+        inbox
+    };
+    for event in events {
+        if let Ok(value) = serde_json::from_str::<Value>(&event) {
+            cdp.absorb(value);
+        }
+    }
+}
+
+fn existing_classify(label: &str, out: &Result<Value, String>, learn: ExistingLearn, forwarded: bool, latched_before: bool) -> (&'static str, String) {
+    let text = match out {
+        Ok(value) => value.to_string(),
+        Err(message) => message.clone(),
+    };
+    if matches!(label, "Page.getFrameTree" | "Page.getNavigationHistory" | "Page.getResourceTree") {
+        if learn != ExistingLearn::EventFirst && text.contains(TOCTOU_MARK) {
+            return ("LEAK", format!("LEAK(placeholder-url {text})"));
+        }
+        if text.starts_with("slicc: refused:") {
+            return ("REFUSED", format!("REFUSED({})", if latched_before || learn == ExistingLearn::EventFirst { "hidden/latch" } else { "document-gate" }));
+        }
+        return ("PLACEHOLDER-ONLY", "PLACEHOLDER-ONLY".into());
+    }
+    if matches!(label, "Input.dispatchMouseEvent" | "Input.dispatchKeyEvent" | "Input.insertText") {
+        if out.is_ok() {
+            return ("PLACEHOLDER-ONLY", "PLACEHOLDER-ONLY(empty-input)".into());
+        }
+        if text.starts_with("slicc: refused:") {
+            let guard = if learn == ExistingLearn::EventFirst || latched_before {
+                "hidden/latch"
+            } else {
+                "document-gate"
+            };
+            return ("REFUSED", format!("REFUSED({guard})"));
+        }
+    }
+    if text.contains(TOCTOU_MARK) {
+        return ("LEAK", format!("LEAK({text})"));
+    }
+    if text.contains("Cannot find context") || text.contains("Could not find node") || text.contains("context was destroyed") {
+        return ("CONTEXT-DESTROYED", "CONTEXT-DESTROYED".into());
+    }
+    if text.starts_with("slicc: refused:") {
+        let guard = if learn == ExistingLearn::EventFirst || latched_before && !forwarded {
+            "hidden/latch"
+        } else if !forwarded {
+            "document-gate"
+        } else if matches!(label, "Runtime.evaluate" | "Runtime.evaluate+contextId") && learn != ExistingLearn::NeverLearn {
+            "post-reply-recheck"
+        } else {
+            "document-gate"
+        };
+        return ("REFUSED", format!("REFUSED({guard})"));
+    }
+    if out.is_ok() {
+        return ("PLACEHOLDER-ONLY", "PLACEHOLDER-ONLY(ordinary-or-empty)".into());
+    }
+    ("REFUSED", format!("REFUSED(other:{})", first_stderr_line(&text).unwrap_or(text.as_str())))
+}
+
+fn existing_run_cell(live: &str, learn: ExistingLearn, label: &str, command: &str, params: Value) -> (String, bool, bool) {
+    let (mut cdp, state, session) = existing_client(live);
+    existing_arm(&state, learn);
+    let before_forwards = state.borrow().content_forwards;
+    if learn == ExistingLearn::EventFirst {
+        existing_deliver_event_first(&mut cdp, &state, &session);
+    }
+    let latched_before = cdp.is_protected_target("T");
+    if label == "IO.read+pdf" {
+        {
+            let mut state = state.borrow_mut();
+            state.commits_on_forward = false;
+        }
+        let stream = cdp.call(
+            &toctou_method("Page", "printToPDF"),
+            json!({ "transferMode": "ReturnAsStream" }),
+            Some(&session),
+        );
+        match stream {
+            Ok(value) => {
+                let handle = value.get("stream").and_then(Value::as_str).unwrap_or("pdf-1").to_string();
+                existing_arm(&state, learn);
+                if learn == ExistingLearn::EventFirst {
+                    existing_deliver_event_first(&mut cdp, &state, &session);
+                }
+                let latched_before = cdp.is_protected_target("T");
+                let mut params = params;
+                params["handle"] = json!(handle);
+                let out = cdp.call(command, params, Some(&session));
+                let forwarded = state.borrow().content_forwards > before_forwards;
+                let (_, cell) = existing_classify(label, &out, learn, forwarded, latched_before);
+                return (cell, out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)), cdp.is_protected_target("T"));
+            }
+            Err(message) => {
+                let forwarded = state.borrow().content_forwards > before_forwards;
+                let out: Result<Value, String> = Err(message);
+                let (_, cell) = existing_classify("Page.printToPDF+stream", &out, learn, forwarded, latched_before);
+                return (cell, false, cdp.is_protected_target("T"));
+            }
+        }
+    }
+    let out = cdp.call(command, params, Some(&session));
+    let forwarded = state.borrow().content_forwards > before_forwards || state.borrow().content_backend_ok > 0;
+    let (_, cell) = existing_classify(label, &out, learn, forwarded, latched_before);
+    (cell, out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)), cdp.is_protected_target("T"))
+}
+
+#[test]
+fn existing_session_toctou_matrix_never_leaks_protected_marker() {
+    let mut rows = Vec::new();
+    let mut leaks = Vec::new();
+    for live in toctou_lives() {
+        for learn in [
+            ExistingLearn::EventFirst,
+            ExistingLearn::ReplyBeforeLearn,
+            ExistingLearn::NeverLearn,
+            ExistingLearn::LearnDuring,
+        ] {
+            for (label, command, params) in existing_commands() {
+                let (cell, leaked, _) = existing_run_cell(&live, learn, label, &command, params);
+                let row = format!("{learn:?}\t{label}\t{live}\t{cell}");
+                if leaked || cell.starts_with("LEAK") {
+                    leaks.push(row.clone());
+                }
+                rows.push(row);
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "existing-session TOCTOU LEAK cells:\n{}\n\nfull matrix ({} rows):\n{}",
+        leaks.join("\n"),
+        rows.len(),
+        rows.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn existing_session_toctou_matrix_summary_table() {
+    let mut by_class: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
+    let vault = toctou_vault();
+    for learn in [
+        ExistingLearn::EventFirst,
+        ExistingLearn::ReplyBeforeLearn,
+        ExistingLearn::NeverLearn,
+        ExistingLearn::LearnDuring,
+    ] {
+        for (label, command, params) in existing_commands() {
+            let (cell, _, _) = existing_run_cell(&vault, learn, label, &command, params);
+            by_class
+                .entry(label.to_string())
+                .or_default()
+                .insert(format!("{learn:?}"), cell);
+        }
+    }
+    let mut table = String::from("class\\learn\tEventFirst\tReplyBeforeLearn\tNeverLearn\tLearnDuring\n");
+    for (class, cells) in &by_class {
+        table.push_str(class);
+        for learn in ["EventFirst", "ReplyBeforeLearn", "NeverLearn", "LearnDuring"] {
+            table.push('\t');
+            table.push_str(cells.get(learn).map(String::as_str).unwrap_or("?"));
+        }
+        table.push('\n');
+    }
+    for live in toctou_lives() {
+        if live == vault {
+            continue;
+        }
+        for learn in [
+            ExistingLearn::EventFirst,
+            ExistingLearn::NeverLearn,
+            ExistingLearn::LearnDuring,
+        ] {
+            let (cell, leaked, _) = existing_run_cell(
+                &live,
+                learn,
+                "Runtime.evaluate",
+                &toctou_method("Runtime", "evaluate"),
+                json!({ "expression": "document.body.innerText", "returnByValue": true }),
+            );
+            assert!(!leaked, "wrapper live={live} learn={learn:?} leaked: {cell}");
+            let (shot, leaked_shot, _) = existing_run_cell(
+                &live,
+                learn,
+                "Page.captureScreenshot",
+                &toctou_method("Page", "captureScreenshot"),
+                json!({}),
+            );
+            assert!(!leaked_shot, "wrapper screenshot live={live} learn={learn:?} leaked: {shot}");
+        }
+    }
+    assert!(
+        table.contains("Runtime.evaluate"),
+        "summary table must include Runtime.evaluate rows:\n{table}"
+    );
+    eprintln!("EXISTING_SESSION_TOCTOU_TABLE\n{table}");
+}
+
+#[test]
+fn existing_session_ordinary_commit_reply_stays_allowed() {
+    let ordinary_b = "https://ordinary.example/other";
+    let (mut cdp, state, session) = existing_client(ordinary_b);
+    {
+        let mut state = state.borrow_mut();
+        state.live = toctou_frame(ordinary_b, "L2");
+        state.commits_on_forward = true;
+        state.nav_events = ToctouNavEvents::All;
+        state.event_timing = ToctouEventTiming::AfterFirstRead;
+        state.committed = false;
+    }
+    let out = cdp.call(
+        &toctou_method("Runtime", "evaluate"),
+        json!({ "expression": "1", "returnByValue": true }),
+        Some(&session),
+    );
+    assert!(
+        out.as_ref().is_err_and(|message| message.contains("Cannot find context"))
+            || out.as_ref().is_ok_and(|value| !value.to_string().contains(TOCTOU_MARK)),
+        "ordinary→ordinary reply must stay allowed or context-destroyed, not marker: {out:?}"
+    );
+    assert!(!cdp.is_protected_target("T"));
+}
+
+#[test]
+fn mutation_existing_survive_contexts_never_learn_evaluate_leaks_without_fresh_gate() {
+    let live = toctou_vault();
+    let (mut cdp, state, session) = existing_client(&live);
+    {
+        let mut state = state.borrow_mut();
+        state.survive_contexts = true;
+        state.commits_on_forward = true;
+        state.nav_events = ToctouNavEvents::None;
+        state.event_timing = ToctouEventTiming::Never;
+        state.committed = false;
+        state.content_forwards = 0;
+        state.content_backend_ok = 0;
+    }
+    let out = cdp.call(
+        &toctou_method("Runtime", "evaluate"),
+        json!({ "expression": "1", "returnByValue": true }),
+        Some(&session),
+    );
+    assert!(
+        state.borrow().content_backend_ok >= 1,
+        "mutation must reach the backend with a surviving context"
+    );
+    assert!(
+        out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)),
+        "never-learn + survive_contexts must LEAK under cached-only DiD (no nav event): {out:?}"
+    );
+}
+
+#[test]
+fn mutation_existing_survive_contexts_reply_before_learn_needs_did_recheck() {
+    let live = toctou_vault();
+    let (mut cdp, state, session) = existing_client(&live);
+    {
+        let mut state = state.borrow_mut();
+        state.survive_contexts = true;
+        state.commits_on_forward = true;
+        state.nav_events = ToctouNavEvents::AfterReply;
+        state.event_timing = ToctouEventTiming::AfterFirstRead;
+        state.committed = false;
+        state.content_forwards = 0;
+        state.content_backend_ok = 0;
+    }
+    let out = cdp.call(
+        &toctou_method("Runtime", "evaluate"),
+        json!({ "expression": "1", "returnByValue": true }),
+        Some(&session),
+    );
+    assert!(
+        state.borrow().content_backend_ok >= 1,
+        "backend must answer before DiD"
+    );
+    assert!(
+        out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)),
+        "reply-before-learn + survive_contexts must LEAK because DiD is cached-state only and events land after the reply: {out:?}"
+    );
+}
+
+#[test]
+fn mutation_existing_survive_contexts_learn_during_is_held_by_did_recheck() {
+    let live = toctou_vault();
+    let (mut cdp, state, session) = existing_client(&live);
+    {
+        let mut state = state.borrow_mut();
+        state.survive_contexts = true;
+        state.commits_on_forward = true;
+        state.nav_events = ToctouNavEvents::All;
+        state.event_timing = ToctouEventTiming::AfterFirstRead;
+        state.committed = false;
+        state.content_forwards = 0;
+        state.content_backend_ok = 0;
+    }
+    let out = cdp.call(
+        &toctou_method("Runtime", "evaluate"),
+        json!({ "expression": "1", "returnByValue": true }),
+        Some(&session),
+    );
+    assert!(
+        state.borrow().content_backend_ok >= 1,
+        "backend must answer Ok(marker) before DiD"
+    );
+    assert!(
+        out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "learn-during with surviving contexts must be held by post-reply DiD: {out:?}"
+    );
+    if let Err(message) = out {
+        assert!(!message.contains(TOCTOU_MARK), "{message}");
+    }
+}
+
+#[test]
+fn mutation_existing_event_first_without_latch_would_need_document_gate() {
+    let live = toctou_vault();
+    let (mut cdp, state, session) = existing_client(&live);
+    existing_deliver_event_first(&mut cdp, &state, &session);
+    let out = cdp.call(
+        &toctou_method("Page", "captureScreenshot"),
+        json!({}),
+        Some(&session),
+    );
+    assert!(
+        out.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "event-first must refuse screenshot via latch/document-gate: {out:?}"
+    );
+    assert!(!out.as_ref().is_ok_and(|value| value.to_string().contains(TOCTOU_MARK)));
+}
+
