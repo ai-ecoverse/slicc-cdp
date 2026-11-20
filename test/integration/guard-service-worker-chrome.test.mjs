@@ -175,9 +175,10 @@ test('Chrome: guarded client never sees a protected-origin service worker target
   const guardedProtected = (guardedListed.targetInfos || []).filter(
     (target) => target.targetId === protectedSw.targetId
   );
+  const protectedOrigin = new URL(protectedUrl).origin;
   for (const target of guardedProtected) {
-    assert.equal(target.url, 'https://seven.sliccy.ai');
-    assert.equal(target.title, 'https://seven.sliccy.ai');
+    assert.equal(target.url, protectedOrigin);
+    assert.equal(target.title, protectedOrigin);
   }
   await assert.rejects(
     () =>
