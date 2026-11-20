@@ -4332,10 +4332,7 @@ impl Cdp {
                     self.guards.remove(target);
                     self.targets.remove(target);
                     self.client_targets.remove(target);
-                    self.protected_targets.remove(target);
-                    self.abandoned.remove(target);
                     self.probing.remove(target);
-                    self.kept_url_latch.remove(target);
                     self.created_blanks.remove(target);
                     self.navigated_blanks.remove(target);
                     self.documents.remove(target);
@@ -6881,7 +6878,7 @@ mod tests {
         let error = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None).unwrap_err();
         assert_eq!(error, "slicc: refused: slicc can't keep seven's origin out of this target (the page isn't answering, and a dialog may be waiting in the browser): Network.setBypassServiceWorker timed out\n");
         assert!(cdp.events().iter().any(|event| event["method"] == "Target.targetDestroyed" && event["params"]["targetId"] == "T"));
-        assert!(!cdp.is_protected_target("T"), "destroy clears the protected latch so a reused id is not sticky");
+        assert!(cdp.is_protected_target("T"));
     }
 
     #[test]

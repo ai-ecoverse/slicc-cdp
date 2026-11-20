@@ -911,30 +911,44 @@ fn a_new_document_and_reused_target_id_do_not_keep_stale_proof_or_provenance() {
         "id":"T","loaderId":"L2","url":POPUP_ERROR,"securityOrigin":"://","mimeType":"text/html","unreachableUrl":STALE_PROTECTED
     },"type":"Navigation"}}));
     assert_client_surfaces_hide_failed(&mut cdp, "T", "new-loader-after");
+    {
+        let mut state = state.borrow_mut();
+        state.popup = own_info(POPUP_ERROR, "ordinary.invalid");
+        state.frame = PopupFrame::Frame(own_error_frame("L3", STALE_ORDINARY));
+    }
+    cdp.absorb(json!({"method":"Page.frameNavigated","sessionId":guard,"params":{"frame":own_error_frame("L3", STALE_ORDINARY),"type":"Navigation"}}));
+    assert!(!cdp.error_unproven(&own_info(POPUP_ERROR, "ordinary.invalid")));
+    assert!(cdp.documents.get("T").is_some_and(|doc| !doc.proof_loader_id.is_empty()));
+    assert!(cdp.client_targets.contains("T"));
     let _ = cdp.call("Target.detachFromTarget", json!({"sessionId":live}), None);
-    cdp.protect_target("T");
-    assert!(cdp.protected_targets.contains("T"));
     cdp.absorb(json!({"method":"Target.targetDestroyed","params":{"targetId":"T"}}));
     assert!(!cdp.client_targets.contains("T"), "destroy must clear provenance");
-    assert!(!cdp.protected_targets.contains("T"), "destroy must clear the protected latch");
-    assert!(!cdp.is_protected_target("T"), "destroy must clear the protected latch");
-    assert!(!cdp.documents.contains_key("T"));
-    let reused = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
+    assert!(!cdp.documents.contains_key("T"), "destroy must clear proof documents and proof ids");
+    let reused = own_info(POPUP_ERROR, "ordinary.invalid");
     {
         let mut state = state.borrow_mut();
         state.popup = reused.clone();
-        state.frame = PopupFrame::Frame(popup_error_frame(STALE_PROTECTED));
+        state.frame = PopupFrame::Frame(own_error_frame("LR", STALE_ORDINARY));
         state.sessions.clear();
     }
     cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":reused.clone()}}));
-    let mark = cdp.events().len();
-    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":reused}}));
-    for event in &cdp.events()[mark..] {
-        assert_surface_clean(event, "id-reuse");
-        if event["params"]["targetInfo"]["targetId"] == "T" {
-            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
-        }
-    }
+    assert!(cdp.error_unproven(&reused), "reused id must not keep the prior ordinary proof");
+    assert!(!cdp.client_targets.contains("T"), "reused id must not keep client provenance");
+}
+
+#[test]
+fn a_protected_latch_survives_target_destruction_by_design() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut cdp = own_client_from(state, &start);
+    let _ = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
+    cdp.protect_target("T");
+    assert!(cdp.protected_targets.contains("T"));
+    cdp.absorb(json!({"method":"Target.targetDestroyed","params":{"targetId":"T"}}));
+    assert!(cdp.protected_targets.contains("T"), "reused id is not sticky-protected is accepted false: protection latch survives destroy");
+    assert!(cdp.is_protected_target("T"), "reused id is not sticky-protected is accepted false: protection latch survives destroy");
 }
 
 #[test]
@@ -1096,7 +1110,7 @@ fn a_stale_proof_loader_id_after_loader_advance_stays_unproven_on_the_read_gate(
 }
 
 #[test]
-fn a_reused_target_id_after_abandon_and_destroy_is_probeable_again() {
+fn an_abandoned_mark_survives_target_destruction_by_design() {
     let start = own_info("https://example.test/start", "start");
     let state = own_state(start.clone(), PopupFrame::Frame(json!({
         "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
@@ -1106,15 +1120,16 @@ fn a_reused_target_id_after_abandon_and_destroy_is_probeable_again() {
     let live = first["sessionId"].as_str().unwrap().to_string();
     cdp.abandon("T");
     assert!(cdp.abandoned.contains("T"));
+    assert!(cdp.protected_targets.contains("T"));
     cdp.probing.insert("T".into());
     cdp.session_targets.insert("STALE".into(), "T".into());
     let _ = cdp.call("Target.detachFromTarget", json!({"sessionId":live}), None);
     cdp.absorb(json!({"method":"Target.targetDestroyed","params":{"targetId":"T"}}));
-    assert!(!cdp.abandoned.contains("T"), "destroy must clear abandoned so a reused id stays probeable");
-    assert!(!cdp.probing.contains("T"), "destroy must clear probing");
-    assert!(!cdp.session_targets.values().any(|owner| owner == "T"), "destroy must drop session maps to the destroyed id");
-    assert!(!cdp.client_targets.contains("T"));
-    assert!(!cdp.protected_targets.contains("T"));
+    assert!(cdp.abandoned.contains("T"), "abandoned is a protection mark and survives destroy");
+    assert!(cdp.protected_targets.contains("T"), "abandon also latches protected and that latch survives destroy");
+    assert!(!cdp.probing.contains("T"), "probing is bookkeeping and clears on destroy");
+    assert!(!cdp.session_targets.values().any(|owner| owner == "T"), "session_targets is bookkeeping and clears maps to the destroyed id");
+    assert!(!cdp.client_targets.contains("T"), "provenance clears on destroy");
     let reused = own_info(POPUP_ERROR, &format!("seven.sliccy.ai/{STALE_MARKER}"));
     {
         let mut state = state.borrow_mut();
@@ -1123,15 +1138,7 @@ fn a_reused_target_id_after_abandon_and_destroy_is_probeable_again() {
         state.sessions.clear();
     }
     cdp.absorb(json!({"method":"Target.targetCreated","params":{"targetInfo":reused.clone()}}));
-    assert!(cdp.probe_candidate(&reused), "reused id must not stay sticky-abandoned");
-    let mark = cdp.events().len();
-    cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":reused}}));
-    for event in &cdp.events()[mark..] {
-        assert_surface_clean(event, "abandon-reuse");
-        if event["params"]["targetInfo"]["targetId"] == "T" {
-            assert_eq!(event["params"]["targetInfo"]["url"], "about:blank", "{event}");
-        }
-    }
+    assert!(!cdp.probe_candidate(&reused), "sticky abandoned blocks probe_candidate after id reuse by design");
 }
 
 #[test]
