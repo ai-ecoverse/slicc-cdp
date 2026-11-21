@@ -66,7 +66,7 @@ test('interception waits until the browser has committed a navigation the render
 
 test('pending-commit attach refuses without proof and without latching seven', {
   timeout: 180_000,
-}, async () => {
+}, async (t) => {
   const proxy = await throughProxy(
     {
       before: [
@@ -77,7 +77,8 @@ test('pending-commit attach refuses without proof and without latching seven', {
         },
       ],
     },
-    'shield::tests::live_pending_commit_attach_refuses_without_proof_or_latch'
+    'shield::tests::live_pending_commit_attach_refuses_without_proof_or_latch',
+    t
   );
   assert.equal(
     proxy.evidence.includes('(a) protected fixture hit or commit: guard bypass'),
@@ -113,7 +114,7 @@ function sevenCommits(events) {
   );
 }
 
-async function throughProxy(options, name = 'fetch::tests::live_chromium_interception') {
+async function throughProxy(options, name = 'fetch::tests::live_chromium_interception', t) {
   const guardRace =
     name === 'shield::tests::live_pending_commit_attach_refuses_without_proof_or_latch';
   const site = await startServer();
@@ -160,6 +161,7 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
         '--exact',
         name,
         '--test-threads=1',
+        ...(guardRace ? ['--nocapture'] : []),
       ],
       {
         SLICC_FETCH_LIVE_WS: proxy.url,
@@ -176,6 +178,7 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
       Object.entries(hits).map(([path, count]) => [path, count - initialHits[path]])
     );
     const commits = sevenCommits(events);
+    const cargoOutput = `${result.stdout}\n${result.stderr}`;
     const classification = !guardRace
       ? 'interception diagnostics'
       : Object.values(delta).some((count) => count > 0) || commits.length
@@ -183,11 +186,9 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
         : 'no protected hit or commit observed; inspect timer and pending-window evidence';
     const pendingWindow = !guardRace
       ? 'not applicable'
-      : /attach_outcome=admitted/.test(`${result.stdout}\n${result.stderr}`)
+      : /attach_outcome=admitted/.test(cargoOutput)
         ? 'admitted-window'
-        : /attach_outcome=(no-proof-unverified|unanswered-timeout)/.test(
-              `${result.stdout}\n${result.stderr}`
-            )
+        : /attach_outcome=(no-proof-unverified|unanswered-timeout)/.test(cargoOutput)
           ? 'no-proof-refusal'
           : 'unknown';
     proxy.evidence = `${classification}\npending_window=${pendingWindow}\nfixture_hits=${JSON.stringify({ initialHits, hits, delta })}\nseven_commits=${JSON.stringify(commits)}\nwindow_replies=${JSON.stringify(proxy.replies)}\nbrowser_events=${JSON.stringify(events)}\nstdout=${result.stdout}\nstderr=${result.stderr}`;
@@ -198,11 +199,18 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
         Object.values(delta).every((count) => count === 0),
         proxy.evidence
       );
+      const counts = cargoOutput.match(
+        /attempt_counts not_attempted=\d+ no_proof=\d+ admitted=\d+/
+      );
       assert.match(
-        `${result.stdout}\n${result.stderr}`,
+        cargoOutput,
         /attempt_counts not_attempted=\d+ no_proof=\d+ admitted=\d+/,
         proxy.evidence
       );
+      if (counts) {
+        if (t) t.diagnostic(counts[0]);
+        else console.log(counts[0]);
+      }
     }
     assert.match(result.stdout, /1 passed/);
     return proxy;
