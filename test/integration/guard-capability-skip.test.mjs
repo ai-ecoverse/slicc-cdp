@@ -154,6 +154,44 @@ test('a not-supported:legacyInterception skip is accepted only when the vector r
   assert.equal(verdictProblems([skipped]).length, 1);
 });
 
+test('the run declares explicit attach without stock setup or synthetic auto-attach', () => {
+  const declared = declaredCapabilityNames(runCapabilities);
+  assert.equal(declared.has('explicitAttach'), true);
+  assert.equal(declared.has('autoAttach'), false);
+  assert.equal(declared.has('stockSetup'), false);
+  assert.equal(declared.has('syntheticAutoAttach'), false);
+});
+
+test('a not-supported:explicitAttach skip is valid only when the vector requires it', () => {
+  const ids = ['C3.tab-attach.explicit', 'C3.tab-protected.explicit'];
+  const undeclared = { ...runCapabilities, explicitAttach: false };
+  for (const id of ids) {
+    const vector = published.vectors.find((entry) => entry.id === id);
+    assert.ok(vector, id);
+    assert.ok(vector.requires.includes('explicitAttach'), id);
+    assert.equal(mandatory(id), false, id);
+    for (const target of vector.targets) {
+      const skipped = row(vector, target, 'skip', 'not-supported:explicitAttach');
+      assert.equal(validCapabilitySkip(vector, skipped, undeclared), true, `${id} ${target}`);
+      assert.equal(validCapabilitySkip(vector, skipped), false, `${id} ${target}`);
+      assert.equal(verdictProblems([skipped]).length, 1, `${id} ${target}`);
+      const auto = row(vector, target, 'skip', 'not-supported:autoAttach');
+      assert.equal(validCapabilitySkip(vector, auto), false, `${id} ${target}`);
+      assert.equal(verdictProblems([auto]).length, 1, `${id} ${target}`);
+    }
+  }
+  assert.deepEqual(
+    published.vectors
+      .filter((vector) => requiredCapabilities(vector).has('explicitAttach'))
+      .map((vector) => vector.id)
+      .sort(),
+    ids
+  );
+  const skipped = row(plain, plain.targets[0], 'skip', 'not-supported:explicitAttach');
+  assert.equal(validCapabilitySkip(plain, skipped, undeclared), false);
+  assert.equal(verdictProblems([skipped]).length, 1);
+});
+
 test('a not-supported:autoAttach skip is accepted only for vectors that require autoAttach', () => {
   const gated = [
     'C3.popup',
