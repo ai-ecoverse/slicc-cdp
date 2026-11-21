@@ -898,3 +898,93 @@ fn frame_carrier_event_history_shaped_non_url_cleared_only_when_original_protect
             || !serde_json::to_string(event).unwrap().contains(CARRIER_MARK)
     }));
 }
+
+
+#[test]
+fn frame_carrier_blank_root_of_ordinary_tracked_doc_skips_verify_read_and_blanks_name() {
+    let tree = json!({
+        "frame": frame("MAIN", "about:blank", "://", "blank-root-name", "L0"),
+    });
+    let (mut cdp, state) = carrier_cdp(tree);
+    state.borrow_mut().tree_serves = 0;
+    let first = cdp.call("Page.getFrameTree", json!({}), Some("S")).unwrap();
+    let second = cdp.call("Page.getFrameTree", json!({}), Some("S")).unwrap();
+    assert_eq!(cdp.frame_carrier_tree_reads, 0, "blank root of ordinary tracked doc needs no nested verify");
+    assert_eq!(state.borrow().tree_serves, 2);
+    assert_eq!(first["frameTree"]["frame"]["name"], "");
+    assert_eq!(second["frameTree"]["frame"]["name"], "");
+}
+
+#[test]
+fn frame_carrier_blank_root_plus_opaque_child_still_verifies_child_only() {
+    let tree = json!({
+        "frame": frame("MAIN", "about:blank", "://", "blank-root-name", "L0"),
+        "childFrames": [{
+            "frame": frame("CHILD", "https://ordinary.example/embed", "://", "opaque-name", "L1"),
+        }],
+    });
+    let (mut cdp, state) = carrier_cdp(tree);
+    state.borrow_mut().tree_serves = 0;
+    let result = cdp.call("Page.getFrameTree", json!({}), Some("S")).unwrap();
+    assert_eq!(cdp.frame_carrier_tree_reads, 1, "opaque child still needs one nested verify");
+    assert_eq!(state.borrow().tree_serves, 2);
+    assert_eq!(result["frameTree"]["frame"]["name"], "");
+    assert_eq!(result["frameTree"]["childFrames"][0]["frame"]["name"], "");
+}
+
+#[test]
+fn frame_carrier_blank_root_plus_opaque_child_cache_hit_keeps_both_names_blank() {
+    let tree = json!({
+        "frame": frame("MAIN", "about:blank", "://", "blank-root-name", "L0"),
+        "childFrames": [{
+            "frame": frame("CHILD", "https://ordinary.example/embed", "://", "opaque-name", "L1"),
+        }],
+    });
+    let (mut cdp, state) = carrier_cdp(tree);
+    state.borrow_mut().tree_serves = 0;
+    for round in 1..=3 {
+        let listed = cdp.call("Page.getFrameTree", json!({}), Some("S")).unwrap();
+        assert_eq!(
+            listed["frameTree"]["frame"]["name"],
+            "",
+            "root blank on call {round}"
+        );
+        assert_eq!(
+            listed["frameTree"]["childFrames"][0]["frame"]["name"],
+            "",
+            "child blank on call {round}"
+        );
+    }
+    assert_eq!(cdp.frame_carrier_tree_reads, 1);
+    assert_eq!(state.borrow().tree_serves, 4);
+}
+
+#[test]
+fn frame_carrier_blank_root_plus_opaque_child_failed_verify_cache_keeps_both_names_blank() {
+    let tree = json!({
+        "frame": frame("MAIN", "about:blank", "://", "blank-root-name", "L0"),
+        "childFrames": [{
+            "frame": frame("CHILD", "https://ordinary.example/embed", "://", "opaque-name", "L1"),
+        }],
+    });
+    let (mut cdp, state) = carrier_cdp(tree);
+    state.borrow_mut().tree_serves = 0;
+    state.borrow_mut().fail_tree_after = Some(2);
+    for round in 1..=3 {
+        let listed = cdp.call("Page.getFrameTree", json!({}), Some("S")).unwrap();
+        assert_eq!(
+            listed["frameTree"]["frame"]["name"],
+            "",
+            "root blank on call {round} after failed verify"
+        );
+        assert_eq!(
+            listed["frameTree"]["childFrames"][0]["frame"]["name"],
+            "",
+            "child blank on call {round} after failed verify"
+        );
+        assert!(!cdp.is_protected_target("T"));
+        assert!(!cdp.session_blocked("S"));
+    }
+    assert_eq!(cdp.frame_carrier_tree_reads, 1);
+}
+
