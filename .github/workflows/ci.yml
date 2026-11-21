@@ -34,6 +34,7 @@ jobs:
         **/catalog-*.test.*
         **/cdp-proxy.test.*
         **/chrome-attribution.test.*
+        **/chrome-context-destruction.test.*
         **/chrome-policy.test.*
         **/chrome-proof.test.*
         **/chromium.test.*

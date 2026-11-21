@@ -16,6 +16,7 @@ export const CHROME_FILES = new Set(
   [
     'browser-message',
     'catalog-ports',
+    'chrome-context-destruction',
     'chrome-exit',
     'chromium-kernel-basics',
     'chromium-kernel-guards',
