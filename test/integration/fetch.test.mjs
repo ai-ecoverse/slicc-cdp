@@ -85,11 +85,7 @@ test('pending-commit attach refuses without proof and without latching seven', {
     false,
     proxy.evidence
   );
-  assert.match(
-    proxy.evidence,
-    /attach_outcome=(no-proof-unverified|unanswered-timeout|admitted)/,
-    proxy.evidence
-  );
+  assert.match(proxy.evidence, /attach_outcome=(no-proof-unverified|admitted)/, proxy.evidence);
 });
 
 async function fixtureHits(site) {
@@ -188,7 +184,7 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
       ? 'not applicable'
       : /attach_outcome=admitted/.test(cargoOutput)
         ? 'admitted-window'
-        : /attach_outcome=(no-proof-unverified|unanswered-timeout)/.test(cargoOutput)
+        : /attach_outcome=no-proof-unverified/.test(cargoOutput)
           ? 'no-proof-refusal'
           : 'unknown';
     proxy.evidence = `${classification}\npending_window=${pendingWindow}\nfixture_hits=${JSON.stringify({ initialHits, hits, delta })}\nseven_commits=${JSON.stringify(commits)}\nwindow_replies=${JSON.stringify(proxy.replies)}\nbrowser_events=${JSON.stringify(events)}\nstdout=${result.stdout}\nstderr=${result.stderr}`;

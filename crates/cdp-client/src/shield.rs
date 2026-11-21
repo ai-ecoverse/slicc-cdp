@@ -2367,6 +2367,13 @@ mod tests {
         )
         .is_ok());
         assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::PreconditionMiss("unanswered-timeout"),
+            false,
+            false,
+            false
+        )
+        .is_err_and(|message| message.contains("unanswered-timeout")));
+        assert!(no_proof_refusal_is_clean(
             &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
             true,
             false,
@@ -2396,19 +2403,52 @@ mod tests {
         .is_err_and(|message| message.contains("admitted")));
         assert!(post_settle_attach_is_allowed(
             &PendingAttachOutcome::Admitted("S".into()),
+            SettledClass::Ordinary,
             false
         )
         .is_ok());
         assert!(post_settle_attach_is_allowed(
             &PendingAttachOutcome::OtherError(REFUSED.to_string()),
+            SettledClass::Ordinary,
+            false
+        )
+        .is_err_and(|message| message.contains("ordinary settle must admit")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::OtherError(REFUSED.to_string()),
+            SettledClass::Seven,
             false
         )
         .is_ok());
         assert!(post_settle_attach_is_allowed(
             &PendingAttachOutcome::Admitted("S".into()),
+            SettledClass::Seven,
+            false
+        )
+        .is_err_and(|message| message.contains("must not admit seven")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::Admitted("S".into()),
+            SettledClass::Ordinary,
             true
         )
         .is_err_and(|message| message.contains("seven")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
+            SettledClass::Ordinary,
+            false
+        )
+        .is_err());
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::NotAttempted,
+            SettledClass::Seven,
+            false
+        )
+        .is_err());
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::OtherError("boom\n".into()),
+            SettledClass::Seven,
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -2447,6 +2487,11 @@ mod tests {
         }
     }
 
+    enum SettledClass {
+        Ordinary,
+        Seven,
+    }
+
     fn no_proof_refusal_is_clean(
         outcome: &PendingAttachOutcome,
         latched: bool,
@@ -2454,7 +2499,13 @@ mod tests {
         client_attached_event: bool,
     ) -> Result<(), String> {
         match outcome {
-            PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {}
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified") => {}
+            PendingAttachOutcome::PreconditionMiss("unanswered-timeout") => {
+                return Err(
+                    "unanswered-timeout is an availability defect, not a clean no-proof refusal"
+                        .into(),
+                );
+            }
             PendingAttachOutcome::PreconditionMiss(label) => {
                 return Err(format!("unexpected precondition miss: {label}"));
             }
@@ -2482,21 +2533,44 @@ mod tests {
 
     fn post_settle_attach_is_allowed(
         outcome: &PendingAttachOutcome,
+        class: SettledClass,
         admitted_seven: bool,
     ) -> Result<(), String> {
         if admitted_seven {
             return Err("post-settle attach admitted seven".into());
         }
-        match outcome {
-            PendingAttachOutcome::Admitted(_) => Ok(()),
-            PendingAttachOutcome::OtherError(error) if error.starts_with("slicc: refused:") => Ok(()),
-            PendingAttachOutcome::OtherError(error) => {
-                Err(format!("post-settle attach other error: {error}"))
-            }
-            PendingAttachOutcome::PreconditionMiss(label) => {
-                Err(format!("post-settle attach still precondition miss: {label}"))
-            }
-            PendingAttachOutcome::NotAttempted => Err("post-settle attach not attempted".into()),
+        match class {
+            SettledClass::Ordinary => match outcome {
+                PendingAttachOutcome::Admitted(_) => Ok(()),
+                PendingAttachOutcome::OtherError(error) => Err(format!(
+                    "ordinary settle must admit, got other error: {error}"
+                )),
+                PendingAttachOutcome::PreconditionMiss(label) => Err(format!(
+                    "ordinary settle must admit, got precondition miss: {label}"
+                )),
+                PendingAttachOutcome::NotAttempted => {
+                    Err("ordinary settle must admit, attach not attempted".into())
+                }
+            },
+            SettledClass::Seven => match outcome {
+                PendingAttachOutcome::OtherError(error)
+                    if error.starts_with("slicc: refused:") =>
+                {
+                    Ok(())
+                }
+                PendingAttachOutcome::Admitted(_) => {
+                    Err("post-settle must not admit seven".into())
+                }
+                PendingAttachOutcome::OtherError(error) => {
+                    Err(format!("post-settle seven other error: {error}"))
+                }
+                PendingAttachOutcome::PreconditionMiss(label) => Err(format!(
+                    "post-settle seven still precondition miss: {label}"
+                )),
+                PendingAttachOutcome::NotAttempted => {
+                    Err("post-settle seven attach not attempted".into())
+                }
+            },
         }
     }
 
@@ -2773,10 +2847,19 @@ mod tests {
                 );
                 panic!("attach not-attempted while landing response is server-held");
             }
-            PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified") => {
                 counts.1 += 1;
             }
             PendingAttachOutcome::Admitted(_) => counts.2 += 1,
+            PendingAttachOutcome::PreconditionMiss("unanswered-timeout") => {
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
+                panic!(
+                    "unanswered-timeout during pending hold is an availability defect, not a clean no-proof refusal; attach_outcome={label}"
+                );
+            }
             PendingAttachOutcome::PreconditionMiss(other) => {
                 eprintln!(
                     "attempt_counts not_attempted={} no_proof={} admitted={}",
@@ -2806,7 +2889,7 @@ mod tests {
         eprintln!("attempt 1: {evidence}");
         assert_no_seven_bypass(&app, &seven, &history_replies, &proxy_evidence, &evidence);
         let held_session = match &attach_outcome {
-            PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified") => {
                 no_proof_refusal_is_clean(
                     &attach_outcome,
                     cdp.is_protected_target(&tab),
@@ -2846,22 +2929,23 @@ mod tests {
                 client_attached_to_target(&cdp, settle_mark, &tab)
             );
             eprintln!("post-settle: {settle_evidence}");
-            post_settle_attach_is_allowed(&settled_outcome, admitted_seven)
-                .unwrap_or_else(|message| panic!("{message}; {settle_evidence}"));
+            post_settle_attach_is_allowed(
+                &settled_outcome,
+                SettledClass::Ordinary,
+                admitted_seven,
+            )
+            .unwrap_or_else(|message| panic!("{message}; {settle_evidence}"));
             match settled_outcome {
                 PendingAttachOutcome::Admitted(session) => session,
-                _ => {
+                other => {
                     eprintln!(
                         "attempt_counts not_attempted={} no_proof={} admitted={}",
                         counts.0, counts.1, counts.2
                     );
-                    assert!(
-                        test_started.elapsed() < Duration::from_secs(120),
-                        "live pending-commit test exceeded 120s: {:?}",
-                        test_started.elapsed()
+                    panic!(
+                        "ordinary settle must admit after release: {:?}; {settle_evidence}",
+                        attach_outcome_label(&other)
                     );
-                    cleanup.finish();
-                    return;
                 }
             }
         };
