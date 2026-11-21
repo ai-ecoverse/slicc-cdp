@@ -669,19 +669,33 @@ fn protected_chrome_settings_extension_and_file_roots_refuse_and_latch() {
 fn blank_then_timeout_content_read_refuses_without_latching_and_retry_can_prove() {
     let live = lag_wrap("view-source", &lag_vault_https());
     let (mut cdp, state) = lag_client(&live, LagTreeMode::BlankThenTimeout, LagInfoTiming::Never);
+    let mark = cdp.events().len();
     let first = cdp.call(
         &method("Target", "attachToTarget"),
         json!({ "targetId": "T", "flatten": true }),
         None,
     );
     assert!(
-        first.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
-        "S1 blank-then-timeout must refuse: {first:?}"
+        first.as_ref().is_err_and(|message| message.contains("could not finish checking this target")),
+        "S1 blank-then-timeout must no-proof refuse: {first:?}"
+    );
+    assert!(
+        first.as_ref().is_err(),
+        "m1/m3: no-proof must not admit a sessionId: {first:?}"
     );
     assert!(
         !cdp.is_protected_target("T"),
-        "O2: no-proof timeout must not latch protected"
+        "m2: no-proof timeout must not latch protected"
     );
+    for event in &cdp.events()[mark..] {
+        if event["method"] == method("Target", "attachedToTarget") {
+            let session = event["params"]["sessionId"].as_str().unwrap_or("");
+            assert!(
+                cdp.guard_sessions.contains(session),
+                "m3: no-proof must not leave client-visible attachedToTarget: {event}"
+            );
+        }
+    }
     {
         let mut state = state.borrow_mut();
         state.tree_mode = LagTreeMode::AlwaysLive;
@@ -704,6 +718,104 @@ fn blank_then_timeout_content_read_refuses_without_latching_and_retry_can_prove(
         .expect("retry after no-proof refuse must admit a healthy ordinary tree");
     assert!(!cdp.is_protected_target("T"));
     assert!(!cdp.session_blocked(second["sessionId"].as_str().unwrap()));
+}
+
+#[test]
+fn pending_no_proof_never_admits_seven_document() {
+    let live = lag_seven_https();
+    let (mut cdp, _) = lag_client(&live, LagTreeMode::BlankThenTimeout, LagInfoTiming::Never);
+    let first = cdp.call(
+        &method("Target", "attachToTarget"),
+        json!({ "targetId": "T", "flatten": true }),
+        None,
+    );
+    assert!(
+        first.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
+        "m1: pending no-proof must not admit seven: {first:?}"
+    );
+    assert!(
+        first.as_ref().is_err(),
+        "m1: no sessionId on seven no-proof path: {first:?}"
+    );
+    assert!(
+        !cdp.is_protected_target("T"),
+        "m2: no-proof refusal must not latch protected"
+    );
+}
+
+#[test]
+fn ordinary_admit_then_seven_navigation_is_cut_without_content_leak() {
+    let blank = lag_frame(LAG_BLANK, "L0");
+    let announced = lag_info(LAG_BLANK);
+    let state = std::rc::Rc::new(std::cell::RefCell::new(LagState {
+        info: announced.clone(),
+        live: blank.clone(),
+        blank: blank.clone(),
+        tree_mode: LagTreeMode::AlwaysBlank,
+        tree_reads: 0,
+        sessions: std::collections::BTreeMap::new(),
+        attaches: 0,
+        client_attaches: 0,
+        pending_info: None,
+        deliver_info_after_command: false,
+    }));
+    let mut cdp = Cdp::from_transport(Box::new(LagBrowser {
+        inbox: VecDeque::new(),
+        state: state.clone(),
+    }));
+    cdp.absorb(json!({
+        "method": method("Target", "targetCreated"),
+        "params": { "targetInfo": announced },
+    }));
+    let admitted = cdp
+        .call(
+            &method("Target", "attachToTarget"),
+            json!({ "targetId": "T", "flatten": true }),
+            None,
+        )
+        .expect("ordinary blank admit is the window property baseline");
+    let session = admitted["sessionId"].as_str().unwrap().to_string();
+    assert!(!cdp.is_protected_target("T"));
+    let seven = lag_seven_https();
+    let protected_info = lag_info(&seven);
+    let protected_frame = lag_frame(&seven, "L2");
+    {
+        let mut state = state.borrow_mut();
+        state.info = protected_info.clone();
+        state.live = protected_frame.clone();
+        state.blank = protected_frame.clone();
+        state.tree_mode = LagTreeMode::AlwaysLive;
+    }
+    cdp.absorb(json!({
+        "method": method("Page", "frameNavigated"),
+        "sessionId": session,
+        "params": { "frame": protected_frame, "type": "Navigation" },
+    }));
+    cdp.absorb(json!({
+        "method": method("Target", "targetInfoChanged"),
+        "params": { "targetInfo": protected_info },
+    }));
+    assert!(
+        cdp.is_protected_target("T"),
+        "window property: guard must latch across the ordinary→seven commit"
+    );
+    assert!(
+        cdp.session_blocked(&session),
+        "window property: admitted session must be cut when seven commits"
+    );
+    for (command, params) in lag_read_commands() {
+        let reply = cdp.call(&command, params, Some(&session));
+        assert!(
+            reply.as_ref().is_err_and(|message| message.starts_with("slicc: refused:") || message.contains("Not attached")),
+            "window property: post-commit read must not return seven bytes: {command} {reply:?}"
+        );
+        if let Ok(body) = &reply {
+            assert!(
+                !body.to_string().contains(LAG_MARK),
+                "window property: leaked seven mark via {command}: {body}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 
 const documents = new Set(['/', '/one', '/two', '/page', '/other']);
 const hits = new Map();
+const landingHolds = new Map();
 
 export function startServer() {
   const server = createServer((req, res) => {
@@ -21,6 +22,13 @@ export function startServer() {
         origin: `http://127.0.0.1:${port}`,
         close: () =>
           new Promise((done) => {
+            for (const held of landingHolds.values()) {
+              clearTimeout(held.timer);
+              try {
+                held.res.destroy();
+              } catch {}
+            }
+            landingHolds.clear();
             server.closeAllConnections();
             server.close(() => done());
           }),
@@ -39,6 +47,8 @@ function answer(req, res, pathname, body) {
     return text(res, 200, 'leaked', { 'access-control-allow-origin': '*' });
   if (pathname === '/landing' && query.get('leak')) return html(res, leakPage(query.get('leak')));
   if (pathname === '/cb' || pathname === '/landing') return html(res, fixture('Callback'));
+  if (pathname === '/landing-hold') return landingHold(req, res, query);
+  if (pathname === '/landing-hold/release') return releaseLandingHold(res, query);
   if (pathname === '/ping') return text(res, 200, 'pong', { 'access-control-allow-origin': '*' });
   if (pathname === '/blocked') return text(res, 200, 'not-blocked');
   if (pathname === '/api/headers') return headerEcho(req, res);
@@ -59,6 +69,51 @@ function answer(req, res, pathname, body) {
   if (documents.has(pathname))
     return html(res, fixture(pathname === '/other' ? 'Other' : 'Fixture'));
   return text(res, 404, 'missing');
+}
+
+function holdToken(query) {
+  return query.get('hold') || 'default';
+}
+
+function finishLandingHold(token, held) {
+  if (landingHolds.get(token) !== held) return;
+  clearTimeout(held.timer);
+  landingHolds.delete(token);
+  html(held.res, fixture('Callback'));
+}
+
+function landingHold(req, res, query) {
+  const token = holdToken(query);
+  const previous = landingHolds.get(token);
+  if (previous) {
+    clearTimeout(previous.timer);
+    try {
+      previous.res.destroy();
+    } catch {}
+    landingHolds.delete(token);
+  }
+  const held = {
+    res,
+    timer: setTimeout(() => finishLandingHold(token, held), 25000),
+  };
+  landingHolds.set(token, held);
+  res.on('close', () => {
+    if (!res.writableEnded && landingHolds.get(token) === held) {
+      clearTimeout(held.timer);
+      landingHolds.delete(token);
+    }
+  });
+}
+
+function releaseLandingHold(res, query) {
+  const token = holdToken(query);
+  const held = landingHolds.get(token);
+  if (!held) {
+    text(res, 200, 'idle');
+    return;
+  }
+  finishLandingHold(token, held);
+  text(res, 200, 'released');
 }
 
 function redirect(res, to) {

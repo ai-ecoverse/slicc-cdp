@@ -2358,6 +2358,100 @@ mod tests {
     }
 
     #[test]
+    fn no_proof_refusal_contract_rejects_latch_session_and_seven_admit() {
+        assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
+            false,
+            false,
+            false
+        )
+        .is_ok());
+        assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::PreconditionMiss("unanswered-timeout"),
+            false,
+            false,
+            false
+        )
+        .is_err_and(|message| message.contains("unanswered-timeout")));
+        assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
+            true,
+            false,
+            false
+        )
+        .is_err_and(|message| message.contains("latched")));
+        assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
+            false,
+            true,
+            false
+        )
+        .is_err_and(|message| message.contains("client-visible session")));
+        assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
+            false,
+            false,
+            true
+        )
+        .is_err_and(|message| message.contains("attachedToTarget")));
+        assert!(no_proof_refusal_is_clean(
+            &PendingAttachOutcome::Admitted("S".into()),
+            false,
+            true,
+            true
+        )
+        .is_err_and(|message| message.contains("admitted")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::Admitted("S".into()),
+            SettledClass::Ordinary,
+            false
+        )
+        .is_ok());
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::OtherError(REFUSED.to_string()),
+            SettledClass::Ordinary,
+            false
+        )
+        .is_err_and(|message| message.contains("ordinary settle must admit")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::OtherError(REFUSED.to_string()),
+            SettledClass::Seven,
+            false
+        )
+        .is_ok());
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::Admitted("S".into()),
+            SettledClass::Seven,
+            false
+        )
+        .is_err_and(|message| message.contains("must not admit seven")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::Admitted("S".into()),
+            SettledClass::Ordinary,
+            true
+        )
+        .is_err_and(|message| message.contains("seven")));
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::PreconditionMiss("no-proof-unverified"),
+            SettledClass::Ordinary,
+            false
+        )
+        .is_err());
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::NotAttempted,
+            SettledClass::Seven,
+            false
+        )
+        .is_err());
+        assert!(post_settle_attach_is_allowed(
+            &PendingAttachOutcome::OtherError("boom\n".into()),
+            SettledClass::Seven,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
     fn guard_window_retries_no_proof_attach_refusal() {
         let mut attempts = Vec::new();
         let result = produce_guard_window(|number| {
@@ -2384,175 +2478,161 @@ mod tests {
         assert_eq!(attempts, [1, 2, 3]);
     }
 
-    fn until_history(
-        raw: &mut Raw,
-        session: &str,
-        history_replies: &mut Vec<Result<Value, String>>,
-        seven: &str,
-        done: impl Fn(Option<&str>) -> bool,
-    ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let reply = raw.call("Page.getNavigationHistory", json!({}), Some(session));
-            if history_replies.last() != Some(&reply) {
-                history_replies.push(reply.clone());
-            }
-            if reply.as_ref().is_ok_and(|history| {
-                history["entries"].as_array().is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        entry["url"]
-                            .as_str()
-                            .is_some_and(|url| url.starts_with(seven))
-                    })
-                })
-            }) {
-                return false;
-            }
-            let current = match reply {
-                Ok(history) => {
-                    let index = history["currentIndex"].as_u64().unwrap_or(0) as usize;
-                    Ok(history["entries"][index]["url"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string())
-                }
-                Err(error) if error.contains("Not attached to an active page") => Err(error),
-                Err(error) => panic!("Page.getNavigationHistory failed: {error}"),
-            };
-            if done(current.as_deref().ok()) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
+    fn attach_outcome_label(outcome: &PendingAttachOutcome) -> &'static str {
+        match outcome {
+            PendingAttachOutcome::Admitted(_) => "admitted",
+            PendingAttachOutcome::PreconditionMiss(label) => *label,
+            PendingAttachOutcome::OtherError(_) => "other-error",
+            PendingAttachOutcome::NotAttempted => "not-attempted",
         }
     }
 
-    #[test]
-    #[ignore = "needs SLICC_FETCH_LIVE_WS from test/integration/fetch.test.mjs"]
-    fn live_guard_armed_while_a_navigation_commits() {
-        let ws = live("SLICC_FETCH_LIVE_WS");
-        let app = live("SLICC_FETCH_LIVE_APP");
-        let idp = live("SLICC_FETCH_LIVE_IDP");
-        let seven = live("SLICC_FETCH_LIVE_SEVEN");
-        let evidence_url = live("SLICC_FETCH_LIVE_GUARD_EVIDENCE");
-        let mut window_reply_count = 0;
-        let (mut raw, mut cdp, tab, slow, landing, session) = produce_guard_window(|_| {
-            let mut raw = Raw::open(&ws);
-            let mut cdp = Cdp::connect(&ws).unwrap();
-            let tab = raw.create("about:blank");
-            let slow = raw.session(&tab);
-            raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
-            raw.call(
-                "Emulation.setCPUThrottlingRate",
-                json!({ "rate": 200 }),
-                Some(&slow),
-            )
-            .unwrap();
-            let landing = format!("{app}/landing?n=window");
-            let to: String = url::form_urlencoded::byte_serialize(landing.as_bytes()).collect();
-            let trigger = raw.call(
-                "Page.navigate",
-                json!({ "url": format!("{idp}/js-redirect?to={to}") }),
-                Some(&slow),
-            );
-            trigger.as_ref().unwrap();
-            let mut history_replies = Vec::new();
-            let committed = until_history(
-                &mut raw,
-                &slow,
-                &mut history_replies,
-                &seven,
-                |current| current.is_some_and(|url| url.contains("/js-redirect")),
-            );
-            let pending = committed
-                && until_history(
-                    &mut raw,
-                    &slow,
-                    &mut history_replies,
-                    &seven,
-                    |current| current.is_none(),
-                );
-            let attached = pending.then(|| client::attach(&mut cdp, &tab));
-            let attach_outcome = classify_pending_attach(&attached);
-            let session = match &attach_outcome {
-                PendingAttachOutcome::Admitted(session) => Some(session.clone()),
-                PendingAttachOutcome::PreconditionMiss(_) | PendingAttachOutcome::NotAttempted => {
-                    None
-                }
-                PendingAttachOutcome::OtherError(error) => panic!("{error}"),
-            };
-            let attach_outcome_label = match &attach_outcome {
-                PendingAttachOutcome::Admitted(_) => "admitted",
-                PendingAttachOutcome::PreconditionMiss(label) => *label,
-                PendingAttachOutcome::OtherError(_) => "other-error",
-                PendingAttachOutcome::NotAttempted => "not-attempted",
-            };
-            let proxy_evidence: Value = serde_json::from_slice(
-                &crate::net::http_probe(&evidence_url, "application/json")
-                    .unwrap_or_else(|error| panic!("guard evidence unavailable: {error}"))
-                    .body,
-            )
-            .unwrap();
-            let replies = proxy_evidence["window_replies"].as_array().unwrap();
-            let produced = pending
-                && session.is_some()
-                && replies.len() == window_reply_count + 1
-                && replies.last().is_some_and(|reply| {
-                    reply["error"]["message"]
-                        .as_str()
-                        .is_some_and(|error| error.contains("Not attached to an active page"))
-                });
-            window_reply_count = replies.len();
-            let hits = [fixture_hits(&app, "/code"), fixture_hits(&app, "/dump")];
-            let seven_commits: Vec<_> = history_replies
-                .iter()
-                .filter_map(|reply| reply.as_ref().ok()?.get("entries")?.as_array())
-                .flatten()
-                .filter(|entry| {
-                    entry["url"]
-                        .as_str()
-                        .is_some_and(|url| url.starts_with(&seven))
-                })
-                .collect();
-            let bypass = hits
-                .iter()
-                .any(|hits| hits.parse::<u64>().is_ok_and(|count| count > 0))
-                || !seven_commits.is_empty()
-                || !proxy_evidence["seven_commits"].as_array().unwrap().is_empty();
-            let evidence = format!(
-                "pending_window_produced={produced}; pending_before_attach={pending}; js_redirect_committed={committed}; attach_outcome={attach_outcome_label}; tab={tab}; trigger={trigger:?}; fixture_hits(/code,/dump)={hits:?}; seven_commits={seven_commits:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
-                cdp.events(), cdp.paused_trail
-            );
-            if bypass || !produced {
-                raw.close(&tab);
-                assert!(
-                    hits.iter().all(|hits| hits.parse::<u64>().is_ok()),
-                    "fixture hits unavailable: {evidence}"
-                );
-                return (
-                    if bypass {
-                        GuardWindow::Bypass
-                    } else {
-                        GuardWindow::Miss
-                    },
-                    evidence,
+    enum SettledClass {
+        Ordinary,
+        Seven,
+    }
+
+    fn no_proof_refusal_is_clean(
+        outcome: &PendingAttachOutcome,
+        latched: bool,
+        client_session: bool,
+        client_attached_event: bool,
+    ) -> Result<(), String> {
+        match outcome {
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified") => {}
+            PendingAttachOutcome::PreconditionMiss("unanswered-timeout") => {
+                return Err(
+                    "unanswered-timeout is an availability defect, not a clean no-proof refusal"
+                        .into(),
                 );
             }
-            assert!(
-                hits.iter().all(|hits| hits.parse::<u64>().is_ok()),
-                "fixture hits unavailable: {evidence}"
-            );
-            (
-                GuardWindow::Produced((raw, cdp, tab, slow, landing, session.unwrap())),
-                evidence,
-            )
+            PendingAttachOutcome::PreconditionMiss(label) => {
+                return Err(format!("unexpected precondition miss: {label}"));
+            }
+            PendingAttachOutcome::Admitted(_) => {
+                return Err("no-proof path admitted a session".into());
+            }
+            PendingAttachOutcome::OtherError(error) => {
+                return Err(format!("no-proof path returned other error: {error}"));
+            }
+            PendingAttachOutcome::NotAttempted => {
+                return Err("no-proof path did not attempt attach".into());
+            }
+        }
+        if latched {
+            return Err("no-proof refusal latched/protected the target".into());
+        }
+        if client_session {
+            return Err("no-proof refusal left a client-visible session".into());
+        }
+        if client_attached_event {
+            return Err("no-proof refusal delivered client attachedToTarget".into());
+        }
+        Ok(())
+    }
+
+    fn post_settle_attach_is_allowed(
+        outcome: &PendingAttachOutcome,
+        class: SettledClass,
+        admitted_seven: bool,
+    ) -> Result<(), String> {
+        if admitted_seven {
+            return Err("post-settle attach admitted seven".into());
+        }
+        match class {
+            SettledClass::Ordinary => match outcome {
+                PendingAttachOutcome::Admitted(_) => Ok(()),
+                PendingAttachOutcome::OtherError(error) => Err(format!(
+                    "ordinary settle must admit, got other error: {error}"
+                )),
+                PendingAttachOutcome::PreconditionMiss(label) => Err(format!(
+                    "ordinary settle must admit, got precondition miss: {label}"
+                )),
+                PendingAttachOutcome::NotAttempted => {
+                    Err("ordinary settle must admit, attach not attempted".into())
+                }
+            },
+            SettledClass::Seven => match outcome {
+                PendingAttachOutcome::OtherError(error)
+                    if error.starts_with("slicc: refused:") =>
+                {
+                    Ok(())
+                }
+                PendingAttachOutcome::Admitted(_) => {
+                    Err("post-settle must not admit seven".into())
+                }
+                PendingAttachOutcome::OtherError(error) => {
+                    Err(format!("post-settle seven other error: {error}"))
+                }
+                PendingAttachOutcome::PreconditionMiss(label) => Err(format!(
+                    "post-settle seven still precondition miss: {label}"
+                )),
+                PendingAttachOutcome::NotAttempted => {
+                    Err("post-settle seven attach not attempted".into())
+                }
+            },
+        }
+    }
+
+    fn client_attached_to_target(cdp: &Cdp, mark: usize, tab: &str) -> bool {
+        cdp.events()[mark..].iter().any(|event| {
+            event["method"] == "Target.attachedToTarget"
+                && event["params"]["targetInfo"]["targetId"] == tab
         })
-        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn assert_no_seven_bypass(
+        app: &str,
+        seven: &str,
+        history_replies: &[Result<Value, String>],
+        proxy_evidence: &Value,
+        evidence: &str,
+    ) {
+        let hits = [fixture_hits(app, "/code"), fixture_hits(app, "/dump")];
+        assert!(
+            hits.iter().all(|hits| hits.parse::<u64>().is_ok()),
+            "fixture hits unavailable: {evidence}"
+        );
+        assert!(
+            hits.iter().all(|hits| hits.parse::<u64>() == Ok(0)),
+            "seven fixture hit: {evidence}"
+        );
+        let seven_commits: Vec<_> = history_replies
+            .iter()
+            .filter_map(|reply| reply.as_ref().ok()?.get("entries")?.as_array())
+            .flatten()
+            .filter(|entry| {
+                entry["url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with(seven))
+            })
+            .collect();
+        assert!(
+            seven_commits.is_empty(),
+            "seven history commit: {evidence}"
+        );
+        assert!(
+            proxy_evidence["seven_commits"]
+                .as_array()
+                .is_some_and(|commits| commits.is_empty()),
+            "seven proxy commit: {evidence}"
+        );
+    }
+
+    fn run_admitted_window_assertions(
+        raw: &mut Raw,
+        cdp: &mut Cdp,
+        tab: &str,
+        slow: &str,
+        landing: &str,
+        session: &str,
+        app: &str,
+        seven: &str,
+    ) {
         raw.call(
             "Emulation.setCPUThrottlingRate",
             json!({ "rate": 1 }),
-            Some(&slow),
+            Some(slow),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2561,7 +2641,7 @@ mod tests {
                 .call(
                     "Runtime.evaluate",
                     json!({ "expression": "document.readyState === 'complete' ? location.href : ''", "returnByValue": true }),
-                    Some(&session),
+                    Some(session),
                 )
                 .map(|result| result["result"]["value"].clone());
             if href.as_ref().is_ok_and(|href| href == &json!(landing)) {
@@ -2578,45 +2658,316 @@ mod tests {
         let frame_trigger = cdp.call(
             "Runtime.evaluate",
             json!({ "expression": format!("const f = document.createElement('iframe'); f.id = 'guard-window-frame'; f.src = {}; document.body.appendChild(f); true", json!(frame)) }),
-            Some(&session),
+            Some(session),
         );
-        let frame_seen = guard_failed(&mut cdp, &frame);
+        let frame_seen = guard_failed(cdp, &frame);
         assert!(
             frame_seen,
             "seven iframe not intercepted: {}",
-            guard_evidence(&cdp, &mut raw, &app, &slow, "/code", &frame_trigger)
+            guard_evidence(cdp, raw, app, slow, "/code", &frame_trigger)
         );
         assert!(frame_trigger.as_ref().is_err_and(|error| error.starts_with("slicc: refused:")));
         assert_eq!(
-            fixture_hits(&app, "/code"),
+            fixture_hits(app, "/code"),
             "0",
             "seven iframe reached the network: {}",
-            guard_evidence(&cdp, &mut raw, &app, &slow, "/code", &frame_trigger)
+            guard_evidence(cdp, raw, app, slow, "/code", &frame_trigger)
         );
 
-        assert_eq!(raw.eval(&slow, "document.getElementById('guard-window-frame').remove(); true"), json!(true));
+        assert_eq!(
+            raw.eval(slow, "document.getElementById('guard-window-frame').remove(); true"),
+            json!(true)
+        );
         let main = format!("{seven}/dump?n=main");
         let main_trigger = cdp.call(
             "Runtime.evaluate",
             json!({ "expression": format!("globalThis.guardWindowTrigger = {{ scheduled: true, fired: false }}; setTimeout(() => {{ globalThis.guardWindowTrigger.fired = true; location.href = {}; }}, 50); true", json!(main)) }),
-            Some(&session),
+            Some(session),
         );
-        let main_seen = guard_failed(&mut cdp, &main);
+        let main_seen = guard_failed(cdp, &main);
         assert!(
             main_seen,
             "seven navigation not intercepted: {}",
-            guard_evidence(&cdp, &mut raw, &app, &slow, "/dump", &main_trigger)
+            guard_evidence(cdp, raw, app, slow, "/dump", &main_trigger)
         );
         main_trigger.as_ref().unwrap();
-        until_allowed_error(&mut cdp, &mut raw, &tab, &session, &main);
+        until_allowed_error(cdp, raw, tab, session, &main);
         assert_eq!(
-            fixture_hits(&app, "/dump"),
+            fixture_hits(app, "/dump"),
             "0",
             "seven navigation reached the network: {}",
-            guard_evidence(&cdp, &mut raw, &app, &slow, "/dump", &main_trigger)
+            guard_evidence(cdp, raw, app, slow, "/dump", &main_trigger)
         );
-        nothing_mentions(&cdp, "n=main");
-        nothing_mentions(&cdp, "n=frame");
-        raw.close(&tab);
+        nothing_mentions(cdp, "n=main");
+        nothing_mentions(cdp, "n=frame");
+    }
+
+    struct PendingLiveCleanup {
+        ws: String,
+        tab: String,
+        release_url: String,
+        released: bool,
+        closed: bool,
+    }
+
+    impl PendingLiveCleanup {
+        fn release_hold(&mut self) {
+            if self.released {
+                return;
+            }
+            let _ = crate::net::http_probe(&self.release_url, "text/plain");
+            self.released = true;
+        }
+
+        fn close_tab(&mut self) {
+            if self.closed {
+                return;
+            }
+            self.closed = true;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut raw = Raw::open(&self.ws);
+                raw.close(&self.tab);
+            }));
+        }
+
+        fn finish(mut self) {
+            self.release_hold();
+            self.close_tab();
+            self.released = true;
+            self.closed = true;
+            std::mem::forget(self);
+        }
+    }
+
+    impl Drop for PendingLiveCleanup {
+        fn drop(&mut self) {
+            self.release_hold();
+            self.close_tab();
+        }
+    }
+
+    fn wait_fixture_hits(app: &str, path: &str, min: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last = fixture_hits(app, path);
+            if let Ok(count) = last.trim().parse::<u64>() {
+                if count >= min {
+                    return count;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture {path} never reached {min} hits (last={last})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn attach_with_deadline(cdp: &mut Cdp, tab: &str, timeout: Duration) -> Result<String, String> {
+        let started = Instant::now();
+        let result = client::attach(cdp, tab);
+        assert!(
+            started.elapsed() <= timeout,
+            "attach exceeded {:?}: elapsed={:?} result={result:?}",
+            timeout,
+            started.elapsed()
+        );
+        result
+    }
+
+    #[test]
+    #[ignore = "needs SLICC_FETCH_LIVE_WS from test/integration/fetch.test.mjs"]
+    fn live_pending_commit_attach_refuses_without_proof_or_latch() {
+        let test_started = Instant::now();
+        let ws = live("SLICC_FETCH_LIVE_WS");
+        let app = live("SLICC_FETCH_LIVE_APP");
+        let seven = live("SLICC_FETCH_LIVE_SEVEN");
+        let evidence_url = live("SLICC_FETCH_LIVE_GUARD_EVIDENCE");
+        let mut counts = (0usize, 0usize, 0usize);
+        let mut raw = Raw::open(&ws);
+        let mut cdp = Cdp::connect(&ws).unwrap();
+        let tab = raw.create("about:blank");
+        let hold_token = format!("pending-{}", &tab[..tab.len().min(12)]);
+        let mut cleanup = PendingLiveCleanup {
+            ws: ws.clone(),
+            tab: tab.clone(),
+            release_url: format!("{app}/landing-hold/release?hold={hold_token}"),
+            released: false,
+            closed: false,
+        };
+        let slow = raw.session(&tab);
+        raw.call("Page.enable", json!({}), Some(&slow))
+            .unwrap_or_else(|error| panic!("Page.enable failed: {error}"));
+        let landing = format!("{app}/landing-hold?hold={hold_token}&n=window");
+        let before_hits = fixture_hits(&app, "/landing-hold");
+        let before = before_hits.trim().parse::<u64>().unwrap_or(0);
+        let trigger = raw.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("location.href = {}; true", json!(landing)),
+                "returnByValue": true
+            }),
+            Some(&slow),
+        );
+        trigger
+            .as_ref()
+            .unwrap_or_else(|error| panic!("fire-and-forget navigate to landing-hold failed: {error}"));
+        let started = raw
+            .wait_event(Duration::from_secs(30), |event| {
+                event.get("method").and_then(Value::as_str) == Some("Page.frameStartedNavigating")
+                    && event.get("sessionId").and_then(Value::as_str) == Some(slow.as_str())
+                    && event
+                        .pointer("/params/url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| url.starts_with(&landing))
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "landing-hold never reached frameStartedNavigating (pending state unreachable): {error}; trigger={trigger:?}"
+                )
+            });
+        let held_hits = wait_fixture_hits(&app, "/landing-hold", before + 1, Duration::from_secs(30));
+        let mut history_replies = Vec::new();
+        let history = raw.call("Page.getNavigationHistory", json!({}), Some(&slow));
+        history_replies.push(history);
+        let mark = cdp.events().len();
+        let attached = Some(attach_with_deadline(
+            &mut cdp,
+            &tab,
+            Duration::from_secs(30),
+        ));
+        let attach_outcome = classify_pending_attach(&attached);
+        let label = attach_outcome_label(&attach_outcome);
+        match &attach_outcome {
+            PendingAttachOutcome::NotAttempted => {
+                counts.0 += 1;
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
+                panic!("attach not-attempted while landing response is server-held");
+            }
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified") => {
+                counts.1 += 1;
+            }
+            PendingAttachOutcome::Admitted(_) => counts.2 += 1,
+            PendingAttachOutcome::PreconditionMiss("unanswered-timeout") => {
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
+                panic!(
+                    "unanswered-timeout during pending hold is an availability defect, not a clean no-proof refusal; attach_outcome={label}"
+                );
+            }
+            PendingAttachOutcome::PreconditionMiss(other) => {
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
+                panic!("unexpected precondition miss: {other}")
+            }
+            PendingAttachOutcome::OtherError(error) => {
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
+                panic!("{error}")
+            }
+        }
+        let proxy_evidence: Value = serde_json::from_slice(
+            &crate::net::http_probe(&evidence_url, "application/json")
+                .unwrap_or_else(|error| panic!("guard evidence unavailable: {error}"))
+                .body,
+        )
+        .unwrap();
+        let evidence = format!(
+            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; held_hits={held_hits}; tab={tab}; trigger={trigger:?}; started={started}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+            cdp.events(),
+            cdp.paused_trail
+        );
+        eprintln!("attempt 1: {evidence}");
+        assert_no_seven_bypass(&app, &seven, &history_replies, &proxy_evidence, &evidence);
+        let held_session = match &attach_outcome {
+            PendingAttachOutcome::PreconditionMiss("no-proof-unverified") => {
+                no_proof_refusal_is_clean(
+                    &attach_outcome,
+                    cdp.is_protected_target(&tab),
+                    attached.as_ref().is_some_and(|reply| reply.is_ok()),
+                    client_attached_to_target(&cdp, mark, &tab),
+                )
+                .unwrap_or_else(|message| panic!("{message}; {evidence}"));
+                None
+            }
+            PendingAttachOutcome::Admitted(session) => {
+                assert!(
+                    !cdp.is_protected_target(&tab),
+                    "admitted attach while landing is held must not latch seven: {evidence}"
+                );
+                Some(session.clone())
+            }
+            _ => unreachable!(),
+        };
+        cleanup.release_hold();
+        raw.wait_href(&slow, &landing);
+        let window_session = if let Some(session) = held_session {
+            session
+        } else {
+            let settle_mark = cdp.events().len();
+            let settled = Some(attach_with_deadline(
+                &mut cdp,
+                &tab,
+                Duration::from_secs(30),
+            ));
+            let settled_outcome = classify_pending_attach(&settled);
+            let settled_label = attach_outcome_label(&settled_outcome);
+            let admitted_seven = matches!(&settled_outcome, PendingAttachOutcome::Admitted(_))
+                && cdp.is_protected_target(&tab);
+            let settle_evidence = format!(
+                "post_settle_attach={settled_label}; protected={}; client_attached={}; {evidence}",
+                cdp.is_protected_target(&tab),
+                client_attached_to_target(&cdp, settle_mark, &tab)
+            );
+            eprintln!("post-settle: {settle_evidence}");
+            post_settle_attach_is_allowed(
+                &settled_outcome,
+                SettledClass::Ordinary,
+                admitted_seven,
+            )
+            .unwrap_or_else(|message| panic!("{message}; {settle_evidence}"));
+            match settled_outcome {
+                PendingAttachOutcome::Admitted(session) => session,
+                other => {
+                    eprintln!(
+                        "attempt_counts not_attempted={} no_proof={} admitted={}",
+                        counts.0, counts.1, counts.2
+                    );
+                    panic!(
+                        "ordinary settle must admit after release: {:?}; {settle_evidence}",
+                        attach_outcome_label(&other)
+                    );
+                }
+            }
+        };
+        run_admitted_window_assertions(
+            &mut raw,
+            &mut cdp,
+            &tab,
+            &slow,
+            &landing,
+            &window_session,
+            &app,
+            &seven,
+        );
+        eprintln!(
+            "attempt_counts not_attempted={} no_proof={} admitted={}",
+            counts.0, counts.1, counts.2
+        );
+        assert!(
+            test_started.elapsed() < Duration::from_secs(120),
+            "live pending-commit test exceeded 120s: {:?}",
+            test_started.elapsed()
+        );
+        cleanup.finish();
     }
 }
