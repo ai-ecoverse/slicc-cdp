@@ -2728,13 +2728,30 @@ mod tests {
         let before_hits = fixture_hits(&app, "/landing-hold");
         let before = before_hits.trim().parse::<u64>().unwrap_or(0);
         let trigger = raw.call(
-            "Page.navigate",
-            json!({ "url": landing.clone() }),
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("location.href = {}; true", json!(landing)),
+                "returnByValue": true
+            }),
             Some(&slow),
         );
         trigger
             .as_ref()
-            .unwrap_or_else(|error| panic!("navigate to landing-hold failed: {error}"));
+            .unwrap_or_else(|error| panic!("fire-and-forget navigate to landing-hold failed: {error}"));
+        let started = raw
+            .wait_event(Duration::from_secs(30), |event| {
+                event.get("method").and_then(Value::as_str) == Some("Page.frameStartedNavigating")
+                    && event.get("sessionId").and_then(Value::as_str) == Some(slow.as_str())
+                    && event
+                        .pointer("/params/url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| url.starts_with(&landing))
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "landing-hold never reached frameStartedNavigating (pending state unreachable): {error}; trigger={trigger:?}"
+                )
+            });
         let held_hits = wait_fixture_hits(&app, "/landing-hold", before + 1, Duration::from_secs(30));
         let mut history_replies = Vec::new();
         let history = raw.call("Page.getNavigationHistory", json!({}), Some(&slow));
@@ -2750,6 +2767,10 @@ mod tests {
         match &attach_outcome {
             PendingAttachOutcome::NotAttempted => {
                 counts.0 += 1;
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
                 panic!("attach not-attempted while landing response is server-held");
             }
             PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {
@@ -2757,9 +2778,19 @@ mod tests {
             }
             PendingAttachOutcome::Admitted(_) => counts.2 += 1,
             PendingAttachOutcome::PreconditionMiss(other) => {
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
                 panic!("unexpected precondition miss: {other}")
             }
-            PendingAttachOutcome::OtherError(error) => panic!("{error}"),
+            PendingAttachOutcome::OtherError(error) => {
+                eprintln!(
+                    "attempt_counts not_attempted={} no_proof={} admitted={}",
+                    counts.0, counts.1, counts.2
+                );
+                panic!("{error}")
+            }
         }
         let proxy_evidence: Value = serde_json::from_slice(
             &crate::net::http_probe(&evidence_url, "application/json")
@@ -2768,7 +2799,7 @@ mod tests {
         )
         .unwrap();
         let evidence = format!(
-            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; held_hits={held_hits}; tab={tab}; trigger={trigger:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; held_hits={held_hits}; tab={tab}; trigger={trigger:?}; started={started}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
             cdp.events(),
             cdp.paused_trail
         );

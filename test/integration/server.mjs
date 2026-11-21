@@ -97,8 +97,8 @@ function landingHold(req, res, query) {
     timer: setTimeout(() => finishLandingHold(token, held), 25000),
   };
   landingHolds.set(token, held);
-  req.on('close', () => {
-    if (landingHolds.get(token) === held) {
+  res.on('close', () => {
+    if (!res.writableEnded && landingHolds.get(token) === held) {
       clearTimeout(held.timer);
       landingHolds.delete(token);
     }
