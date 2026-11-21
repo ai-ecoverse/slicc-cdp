@@ -151,16 +151,16 @@ impl ToctouState {
         self.tree = self.live.clone();
         self.info = toctou_info(to);
         self.committed = true;
-        if !reuse {
+        let created = if !reuse {
             self.node_epoch += 1;
             self.live_nodes.clear();
-            let destroyed: Vec<ToctouContext> = self.contexts.drain(..).collect();
-            for context in destroyed {
+            self.contexts.clear();
+            for _ in 0..2 {
                 inbox.push_back(
                     json!({
-                        "method": toctou_method("Runtime", "executionContextDestroyed"),
+                        "method": toctou_method("Runtime", "executionContextsCleared"),
                         "sessionId": session,
-                        "params": { "executionContextId": context.id, "executionContextUniqueId": context.unique },
+                        "params": {},
                     })
                     .to_string(),
                 );
@@ -175,7 +175,7 @@ impl ToctouState {
                 promises: std::collections::BTreeSet::new(),
                 post_commit: true,
             });
-            inbox.push_back(
+            Some(
                 json!({
                     "method": toctou_method("Runtime", "executionContextCreated"),
                     "sessionId": session,
@@ -190,20 +190,14 @@ impl ToctouState {
                     },
                 })
                 .to_string(),
-            );
+            )
         } else {
             for context in &mut self.contexts {
                 context.post_commit = true;
             }
-        }
+            None
+        };
         let mut nav = VecDeque::new();
-        nav.push_back(
-            json!({
-                "method": toctou_method("Target", "targetInfoChanged"),
-                "params": { "targetInfo": self.info.clone() },
-            })
-            .to_string(),
-        );
         if deliver_frame {
             let mut sessions: Vec<String> = self.sessions.keys().cloned().collect();
             if !sessions.iter().any(|have| have == session) {
@@ -220,10 +214,31 @@ impl ToctouState {
                 );
             }
         }
+        nav.push_back(
+            json!({
+                "method": toctou_method("Target", "targetInfoChanged"),
+                "params": { "targetInfo": self.info.clone() },
+            })
+            .to_string(),
+        );
         match self.nav_events {
-            ToctouNavEvents::None => {}
-            ToctouNavEvents::AfterReply => self.pending_nav_events.append(&mut nav),
-            ToctouNavEvents::All => inbox.append(&mut nav),
+            ToctouNavEvents::None => {
+                if let Some(created) = created {
+                    inbox.push_back(created);
+                }
+            }
+            ToctouNavEvents::AfterReply => {
+                self.pending_nav_events.append(&mut nav);
+                if let Some(created) = created {
+                    self.pending_nav_events.push_back(created);
+                }
+            }
+            ToctouNavEvents::All => {
+                inbox.append(&mut nav);
+                if let Some(created) = created {
+                    inbox.push_back(created);
+                }
+            }
         }
     }
 
@@ -335,6 +350,7 @@ impl Transport for ToctouBrowser {
         let protected_doc = state.committed && state.tree["url"].as_str().is_some_and(|url| url.contains(TOCTOU_MARK) || url.contains("vault.sliccy.ai") || url.contains("seven.sliccy.ai"));
         let marker = || json!({ "result": { "type": "string", "value": format!("leaked-{TOCTOU_MARK}") } });
         let missing = "Cannot find context with specified id";
+        let missing_unique = "uniqueContextId not found";
         let missing_node = "Could not find node with given id";
         if called == get_info {
             self.inbox.push_back(reply_ok(json!({ "targetInfo": state.info.clone() })));
@@ -396,6 +412,7 @@ impl Transport for ToctouBrowser {
             let unique = call["params"].get("uniqueContextId").or_else(|| call["params"].get("executionContextUniqueId")).and_then(Value::as_str);
             let context = state.live_context(id, unique);
             match context {
+                None if unique.is_some() && id.is_none() => self.inbox.push_back(reply_err(missing_unique)),
                 None if id.is_some() || unique.is_some() => self.inbox.push_back(reply_err(missing)),
                 None => self.inbox.push_back(reply_err(missing)),
                 Some(context) if context.post_commit && protected_doc => {
@@ -414,6 +431,7 @@ impl Transport for ToctouBrowser {
             let unique = call["params"].get("uniqueContextId").or_else(|| call["params"].get("executionContextUniqueId")).and_then(Value::as_str);
             let context = object_id.and_then(|object| state.live_object(object)).or_else(|| state.live_context(id, unique));
             match context {
+                None if object_id.is_none() && unique.is_some() && id.is_none() => self.inbox.push_back(reply_err(missing_unique)),
                 None => self.inbox.push_back(reply_err(missing)),
                 Some(context) if context.post_commit && protected_doc => self.inbox.push_back(reply_ok(marker())),
                 Some(_) if protected_doc && state.committed => self.inbox.push_back(reply_err(missing)),
@@ -947,7 +965,11 @@ fn existing_classify(
     if text.contains(TOCTOU_MARK) {
         return ("LEAK", format!("LEAK({text})"));
     }
-    if text.contains("Cannot find context") || text.contains("Could not find node") || text.contains("context was destroyed") {
+    if text.contains("Cannot find context")
+        || text.contains("uniqueContextId not found")
+        || text.contains("Could not find node")
+        || text.contains("context was destroyed")
+    {
         return ("CONTEXT-DESTROYED", "CONTEXT-DESTROYED".into());
     }
     if text.starts_with("slicc: refused:") {
