@@ -733,13 +733,14 @@ fn pending_no_proof_never_admits_seven_document() {
         first.as_ref().is_err_and(|message| message.starts_with("slicc: refused:")),
         "m1: pending no-proof must not admit seven: {first:?}"
     );
-    if let Ok(value) = &first {
-        assert!(
-            value.get("sessionId").and_then(Value::as_str).is_none(),
-            "m1: no sessionId on seven no-proof path: {value}"
-        );
-    }
-    assert!(!cdp.is_protected_target("T") || first.as_ref().is_err_and(|message| message.contains("seven") || message.contains("could not finish")));
+    assert!(
+        first.as_ref().is_err(),
+        "m1: no sessionId on seven no-proof path: {first:?}"
+    );
+    assert!(
+        !cdp.is_protected_target("T"),
+        "m2: no-proof refusal must not latch protected"
+    );
 }
 
 #[test]

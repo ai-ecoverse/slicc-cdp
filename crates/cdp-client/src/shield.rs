@@ -2507,64 +2507,6 @@ mod tests {
         })
     }
 
-    fn until_history(
-        raw: &mut Raw,
-        session: &str,
-        history_replies: &mut Vec<Result<Value, String>>,
-        seven: &str,
-        done: impl Fn(Option<&str>) -> bool,
-    ) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let reply = raw.call("Page.getNavigationHistory", json!({}), Some(session));
-            if history_replies.last() != Some(&reply) {
-                history_replies.push(reply.clone());
-            }
-            if reply.as_ref().is_ok_and(|history| {
-                history["entries"].as_array().is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        entry["url"]
-                            .as_str()
-                            .is_some_and(|url| url.starts_with(seven))
-                    })
-                })
-            }) {
-                return false;
-            }
-            let current = match reply {
-                Ok(history) => {
-                    let index = history["currentIndex"].as_u64().unwrap_or(0) as usize;
-                    Ok(history["entries"][index]["url"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string())
-                }
-                Err(error) if error.contains("Not attached to an active page") => Err(error),
-                Err(error) => panic!("Page.getNavigationHistory failed: {error}"),
-            };
-            if done(current.as_deref().ok()) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-        }
-    }
-
-    fn wait_history(
-        raw: &mut Raw,
-        session: &str,
-        history_replies: &mut Vec<Result<Value, String>>,
-        seven: &str,
-        what: &str,
-        done: impl Fn(Option<&str>) -> bool,
-    ) {
-        assert!(
-            until_history(raw, session, history_replies, seven, done),
-            "{what}; history_replies={history_replies:?}"
-        );
-    }
-
     fn assert_no_seven_bypass(
         app: &str,
         seven: &str,
@@ -2691,7 +2633,6 @@ mod tests {
     fn live_pending_commit_attach_refuses_without_proof_or_latch() {
         let ws = live("SLICC_FETCH_LIVE_WS");
         let app = live("SLICC_FETCH_LIVE_APP");
-        let idp = live("SLICC_FETCH_LIVE_IDP");
         let seven = live("SLICC_FETCH_LIVE_SEVEN");
         let evidence_url = live("SLICC_FETCH_LIVE_GUARD_EVIDENCE");
         let mut counts = (0usize, 0usize, 0usize);
@@ -2700,37 +2641,52 @@ mod tests {
         let tab = raw.create("about:blank");
         let slow = raw.session(&tab);
         raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
+        let landing = format!("{app}/landing?n=window");
         raw.call(
-            "Emulation.setCPUThrottlingRate",
-            json!({ "rate": 200 }),
+            "Fetch.enable",
+            json!({
+                "patterns": [{
+                    "urlPattern": format!("{landing}*"),
+                    "resourceType": "Document",
+                    "requestStage": "Request"
+                }],
+                "handleAuthRequests": false
+            }),
             Some(&slow),
         )
-        .unwrap();
-        let landing = format!("{app}/landing?n=window");
-        let to: String = url::form_urlencoded::byte_serialize(landing.as_bytes()).collect();
+        .unwrap_or_else(|error| panic!("Fetch.enable for landing hold failed: {error}"));
         let trigger = raw.call(
             "Page.navigate",
-            json!({ "url": format!("{idp}/js-redirect?to={to}") }),
+            json!({ "url": landing.clone() }),
             Some(&slow),
         );
-        trigger.as_ref().unwrap();
+        trigger
+            .as_ref()
+            .unwrap_or_else(|error| panic!("navigate to landing failed: {error}"));
+        let paused = raw
+            .wait_event(Duration::from_secs(30), |event| {
+                event.get("method").and_then(Value::as_str) == Some("Fetch.requestPaused")
+                    && event.get("sessionId").and_then(Value::as_str) == Some(slow.as_str())
+                    && event
+                        .pointer("/params/request/url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| url.starts_with(&landing))
+                    && event
+                        .pointer("/params/resourceType")
+                        .and_then(Value::as_str)
+                        == Some("Document")
+            })
+            .unwrap_or_else(|error| {
+                panic!("landing Document was never Fetch-held (pending state unreachable): {error}; trigger={trigger:?}")
+            });
+        let request_id = paused
+            .pointer("/params/requestId")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("held Fetch.requestPaused missing requestId: {paused}"))
+            .to_string();
         let mut history_replies = Vec::new();
-        wait_history(
-            &mut raw,
-            &slow,
-            &mut history_replies,
-            &seven,
-            "js-redirect never committed before attach",
-            |current| current.is_some_and(|url| url.contains("/js-redirect")),
-        );
-        wait_history(
-            &mut raw,
-            &slow,
-            &mut history_replies,
-            &seven,
-            "pending-commit window (history current unset) never appeared after js-redirect",
-            |current| current.is_none(),
-        );
+        let history = raw.call("Page.getNavigationHistory", json!({}), Some(&slow));
+        history_replies.push(history);
         let mark = cdp.events().len();
         let attached = Some(client::attach(&mut cdp, &tab));
         let attach_outcome = classify_pending_attach(&attached);
@@ -2738,7 +2694,7 @@ mod tests {
         match &attach_outcome {
             PendingAttachOutcome::NotAttempted => {
                 counts.0 += 1;
-                panic!("attach not-attempted after redirect wait; harness ordering defect");
+                panic!("attach not-attempted while landing Document is Fetch-held");
             }
             PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {
                 counts.1 += 1;
@@ -2756,13 +2712,13 @@ mod tests {
         )
         .unwrap();
         let evidence = format!(
-            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; tab={tab}; trigger={trigger:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; held_request={request_id}; tab={tab}; trigger={trigger:?}; paused={paused}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
             cdp.events(),
             cdp.paused_trail
         );
         eprintln!("attempt 1: {evidence}");
         assert_no_seven_bypass(&app, &seven, &history_replies, &proxy_evidence, &evidence);
-        match &attach_outcome {
+        let held_session = match &attach_outcome {
             PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {
                 no_proof_refusal_is_clean(
                     &attach_outcome,
@@ -2771,55 +2727,64 @@ mod tests {
                     client_attached_to_target(&cdp, mark, &tab),
                 )
                 .unwrap_or_else(|message| panic!("{message}; {evidence}"));
-                wait_history(
-                    &mut raw,
-                    &slow,
-                    &mut history_replies,
-                    &seven,
-                    "landing never settled after no-proof attach",
-                    |current| current.is_some_and(|url| url == landing),
-                );
-                let settle_mark = cdp.events().len();
-                let settled = Some(client::attach(&mut cdp, &tab));
-                let settled_outcome = classify_pending_attach(&settled);
-                let settled_label = attach_outcome_label(&settled_outcome);
-                let admitted_seven = matches!(&settled_outcome, PendingAttachOutcome::Admitted(_))
-                    && cdp.is_protected_target(&tab);
-                let settle_evidence = format!(
-                    "post_settle_attach={settled_label}; protected={}; client_attached={}; {evidence}",
-                    cdp.is_protected_target(&tab),
-                    client_attached_to_target(&cdp, settle_mark, &tab)
-                );
-                eprintln!("post-settle: {settle_evidence}");
-                post_settle_attach_is_allowed(&settled_outcome, admitted_seven)
-                    .unwrap_or_else(|message| panic!("{message}; {settle_evidence}"));
-                if let PendingAttachOutcome::Admitted(session) = settled_outcome {
-                    run_admitted_window_assertions(
-                        &mut raw,
-                        &mut cdp,
-                        &tab,
-                        &slow,
-                        &landing,
-                        &session,
-                        &app,
-                        &seven,
-                    );
-                }
+                None
             }
             PendingAttachOutcome::Admitted(session) => {
-                run_admitted_window_assertions(
-                    &mut raw,
-                    &mut cdp,
-                    &tab,
-                    &slow,
-                    &landing,
-                    session,
-                    &app,
-                    &seven,
+                assert!(
+                    !cdp.is_protected_target(&tab),
+                    "admitted attach while landing is held must not latch seven: {evidence}"
                 );
+                Some(session.clone())
             }
             _ => unreachable!(),
-        }
+        };
+        raw.call(
+            "Fetch.continueRequest",
+            json!({ "requestId": request_id }),
+            Some(&slow),
+        )
+        .unwrap_or_else(|error| panic!("release held landing failed: {error}; {evidence}"));
+        let _ = raw.call("Fetch.disable", json!({}), Some(&slow));
+        raw.wait_href(&slow, &landing);
+        let window_session = if let Some(session) = held_session {
+            session
+        } else {
+            let settle_mark = cdp.events().len();
+            let settled = Some(client::attach(&mut cdp, &tab));
+            let settled_outcome = classify_pending_attach(&settled);
+            let settled_label = attach_outcome_label(&settled_outcome);
+            let admitted_seven = matches!(&settled_outcome, PendingAttachOutcome::Admitted(_))
+                && cdp.is_protected_target(&tab);
+            let settle_evidence = format!(
+                "post_settle_attach={settled_label}; protected={}; client_attached={}; {evidence}",
+                cdp.is_protected_target(&tab),
+                client_attached_to_target(&cdp, settle_mark, &tab)
+            );
+            eprintln!("post-settle: {settle_evidence}");
+            post_settle_attach_is_allowed(&settled_outcome, admitted_seven)
+                .unwrap_or_else(|message| panic!("{message}; {settle_evidence}"));
+            match settled_outcome {
+                PendingAttachOutcome::Admitted(session) => session,
+                _ => {
+                    eprintln!(
+                        "attempt_counts not_attempted={} no_proof={} admitted={}",
+                        counts.0, counts.1, counts.2
+                    );
+                    raw.close(&tab);
+                    return;
+                }
+            }
+        };
+        run_admitted_window_assertions(
+            &mut raw,
+            &mut cdp,
+            &tab,
+            &slow,
+            &landing,
+            &window_session,
+            &app,
+            &seven,
+        );
         eprintln!(
             "attempt_counts not_attempted={} no_proof={} admitted={}",
             counts.0, counts.1, counts.2

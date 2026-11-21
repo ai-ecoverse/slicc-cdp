@@ -1,10 +1,12 @@
 use crate::net::{ws_connect, Ws};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub struct Raw {
     ws: Ws,
     next: i64,
+    pending: VecDeque<Value>,
 }
 
 impl Raw {
@@ -12,7 +14,20 @@ impl Raw {
         Self {
             ws: ws_connect(url).unwrap(),
             next: 0,
+            pending: VecDeque::new(),
         }
+    }
+
+    fn recv_value(&mut self, deadline: Instant) -> Result<Option<Value>, String> {
+        if let Some(value) = self.pending.pop_front() {
+            return Ok(Some(value));
+        }
+        let Some(text) = self.ws.recv_text(deadline)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|err| err.to_string())
     }
 
     pub fn call(
@@ -30,15 +45,33 @@ impl Raw {
         self.ws.send_text(&message.to_string())?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let Some(text) = self.ws.recv_text(deadline)? else {
+            let Some(value) = self.recv_value(deadline)? else {
                 return Err(format!("{method} timed out"));
             };
-            let value: Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
             if value.get("id").and_then(|v| v.as_i64()) == Some(id) {
                 if let Some(error) = value.get("error") {
                     return Err(error.to_string());
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+            }
+            if value.get("method").is_some() {
+                self.pending.push_back(value);
+            }
+        }
+    }
+
+    pub fn wait_event(
+        &mut self,
+        timeout: Duration,
+        mut matched: impl FnMut(&Value) -> bool,
+    ) -> Result<Value, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(value) = self.recv_value(deadline)? else {
+                return Err("wait_event timed out".into());
+            };
+            if value.get("method").is_some() && matched(&value) {
+                return Ok(value);
             }
         }
     }
