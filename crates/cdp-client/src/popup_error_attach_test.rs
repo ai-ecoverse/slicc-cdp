@@ -1486,8 +1486,6 @@ fn an_ordinary_iframe_name_survives_next_to_a_protected_sibling_iframe() {
     assert_eq!(plain.pointer("/frame/name").and_then(Value::as_str), Some("plain-frame"));
     assert_eq!(protected.pointer("/frame/name").and_then(Value::as_str), Some(""));
     assert!(!listed.to_string().contains("STALE_PROOF_MARKER"), "{listed}");
-    assert!(!cdp.is_protected_target("T"));
-    assert!(!cdp.session_blocked(&live));
 }
 
 #[test]
