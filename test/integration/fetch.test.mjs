@@ -64,7 +64,7 @@ test('interception waits until the browser has committed a navigation the render
   });
 });
 
-test('a guard armed while the browser has not committed a navigation still fails seven', async () => {
+test('pending-commit attach refuses without proof and without latching seven', async () => {
   const proxy = await throughProxy(
     {
       before: [
@@ -75,11 +75,18 @@ test('a guard armed while the browser has not committed a navigation still fails
         },
       ],
     },
-    'shield::tests::live_guard_armed_while_a_navigation_commits'
+    'shield::tests::live_pending_commit_attach_refuses_without_proof_or_latch'
   );
-  const evidence = `pending-commit window not produced; ${proxy.evidence}`;
-  assert(proxy.replies.length >= 1 && proxy.replies.length <= 3, evidence);
-  assert.match(JSON.stringify(proxy.replies.at(-1)), /Not attached to an active page/, evidence);
+  assert.equal(
+    proxy.evidence.includes('(a) protected fixture hit or commit: guard bypass'),
+    false,
+    proxy.evidence
+  );
+  assert.match(
+    proxy.evidence,
+    /attach_outcome=(no-proof-unverified|unanswered-timeout|admitted)/,
+    proxy.evidence
+  );
 });
 
 async function fixtureHits(site) {
@@ -105,7 +112,8 @@ function sevenCommits(events) {
 }
 
 async function throughProxy(options, name = 'fetch::tests::live_chromium_interception') {
-  const guardRace = name === 'shield::tests::live_guard_armed_while_a_navigation_commits';
+  const guardRace =
+    name === 'shield::tests::live_pending_commit_attach_refuses_without_proof_or_latch';
   const site = await startServer();
   const initialHits = await fixtureHits(site);
   let browser;
@@ -172,17 +180,24 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
         : 'no protected hit or commit observed; inspect timer and pending-window evidence';
     const pendingWindow = !guardRace
       ? 'not applicable'
-      : proxy.replies.length >= 1 &&
-          proxy.replies.length <= 3 &&
-          JSON.stringify(proxy.replies.at(-1)).includes('Not attached to an active page')
-        ? 'produced'
-        : 'pending-commit window not produced';
-    proxy.evidence = `${classification}\npending_window=${pendingWindow}\nfixture_hits=${JSON.stringify({ initialHits, hits, delta })}\nseven_commits=${JSON.stringify(commits)}\nwindow_replies=${JSON.stringify(proxy.replies)}\nbrowser_events=${JSON.stringify(events)}`;
+      : /attach_outcome=admitted/.test(`${result.stdout}\n${result.stderr}`)
+        ? 'admitted-window'
+        : /attach_outcome=(no-proof-unverified|unanswered-timeout)/.test(
+              `${result.stdout}\n${result.stderr}`
+            )
+          ? 'no-proof-refusal'
+          : 'unknown';
+    proxy.evidence = `${classification}\npending_window=${pendingWindow}\nfixture_hits=${JSON.stringify({ initialHits, hits, delta })}\nseven_commits=${JSON.stringify(commits)}\nwindow_replies=${JSON.stringify(proxy.replies)}\nbrowser_events=${JSON.stringify(events)}\nstdout=${result.stdout}\nstderr=${result.stderr}`;
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}\n${proxy.evidence}`);
     if (guardRace) {
       assert.equal(commits.length, 0, proxy.evidence);
       assert(
         Object.values(delta).every((count) => count === 0),
+        proxy.evidence
+      );
+      assert.match(
+        `${result.stdout}\n${result.stderr}`,
+        /attempt_counts not_attempted=\d+ no_proof=\d+ admitted=\d+/,
         proxy.evidence
       );
     }
