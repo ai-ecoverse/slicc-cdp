@@ -2628,9 +2628,83 @@ mod tests {
         nothing_mentions(cdp, "n=frame");
     }
 
+    struct PendingLiveCleanup {
+        ws: String,
+        tab: String,
+        release_url: String,
+        released: bool,
+        closed: bool,
+    }
+
+    impl PendingLiveCleanup {
+        fn release_hold(&mut self) {
+            if self.released {
+                return;
+            }
+            let _ = crate::net::http_probe(&self.release_url, "text/plain");
+            self.released = true;
+        }
+
+        fn close_tab(&mut self) {
+            if self.closed {
+                return;
+            }
+            self.closed = true;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut raw = Raw::open(&self.ws);
+                raw.close(&self.tab);
+            }));
+        }
+
+        fn finish(mut self) {
+            self.release_hold();
+            self.close_tab();
+            self.released = true;
+            self.closed = true;
+            std::mem::forget(self);
+        }
+    }
+
+    impl Drop for PendingLiveCleanup {
+        fn drop(&mut self) {
+            self.release_hold();
+            self.close_tab();
+        }
+    }
+
+    fn wait_fixture_hits(app: &str, path: &str, min: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last = fixture_hits(app, path);
+            if let Ok(count) = last.trim().parse::<u64>() {
+                if count >= min {
+                    return count;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture {path} never reached {min} hits (last={last})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn attach_with_deadline(cdp: &mut Cdp, tab: &str, timeout: Duration) -> Result<String, String> {
+        let started = Instant::now();
+        let result = client::attach(cdp, tab);
+        assert!(
+            started.elapsed() <= timeout,
+            "attach exceeded {:?}: elapsed={:?} result={result:?}",
+            timeout,
+            started.elapsed()
+        );
+        result
+    }
+
     #[test]
     #[ignore = "needs SLICC_FETCH_LIVE_WS from test/integration/fetch.test.mjs"]
     fn live_pending_commit_attach_refuses_without_proof_or_latch() {
+        let test_started = Instant::now();
         let ws = live("SLICC_FETCH_LIVE_WS");
         let app = live("SLICC_FETCH_LIVE_APP");
         let seven = live("SLICC_FETCH_LIVE_SEVEN");
@@ -2639,22 +2713,20 @@ mod tests {
         let mut raw = Raw::open(&ws);
         let mut cdp = Cdp::connect(&ws).unwrap();
         let tab = raw.create("about:blank");
+        let hold_token = format!("pending-{}", &tab[..tab.len().min(12)]);
+        let mut cleanup = PendingLiveCleanup {
+            ws: ws.clone(),
+            tab: tab.clone(),
+            release_url: format!("{app}/landing-hold/release?hold={hold_token}"),
+            released: false,
+            closed: false,
+        };
         let slow = raw.session(&tab);
-        raw.call("Page.enable", json!({}), Some(&slow)).unwrap();
-        let landing = format!("{app}/landing?n=window");
-        raw.call(
-            "Fetch.enable",
-            json!({
-                "patterns": [{
-                    "urlPattern": format!("{landing}*"),
-                    "resourceType": "Document",
-                    "requestStage": "Request"
-                }],
-                "handleAuthRequests": false
-            }),
-            Some(&slow),
-        )
-        .unwrap_or_else(|error| panic!("Fetch.enable for landing hold failed: {error}"));
+        raw.call("Page.enable", json!({}), Some(&slow))
+            .unwrap_or_else(|error| panic!("Page.enable failed: {error}"));
+        let landing = format!("{app}/landing-hold?hold={hold_token}&n=window");
+        let before_hits = fixture_hits(&app, "/landing-hold");
+        let before = before_hits.trim().parse::<u64>().unwrap_or(0);
         let trigger = raw.call(
             "Page.navigate",
             json!({ "url": landing.clone() }),
@@ -2662,39 +2734,23 @@ mod tests {
         );
         trigger
             .as_ref()
-            .unwrap_or_else(|error| panic!("navigate to landing failed: {error}"));
-        let paused = raw
-            .wait_event(Duration::from_secs(30), |event| {
-                event.get("method").and_then(Value::as_str) == Some("Fetch.requestPaused")
-                    && event.get("sessionId").and_then(Value::as_str) == Some(slow.as_str())
-                    && event
-                        .pointer("/params/request/url")
-                        .and_then(Value::as_str)
-                        .is_some_and(|url| url.starts_with(&landing))
-                    && event
-                        .pointer("/params/resourceType")
-                        .and_then(Value::as_str)
-                        == Some("Document")
-            })
-            .unwrap_or_else(|error| {
-                panic!("landing Document was never Fetch-held (pending state unreachable): {error}; trigger={trigger:?}")
-            });
-        let request_id = paused
-            .pointer("/params/requestId")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("held Fetch.requestPaused missing requestId: {paused}"))
-            .to_string();
+            .unwrap_or_else(|error| panic!("navigate to landing-hold failed: {error}"));
+        let held_hits = wait_fixture_hits(&app, "/landing-hold", before + 1, Duration::from_secs(30));
         let mut history_replies = Vec::new();
         let history = raw.call("Page.getNavigationHistory", json!({}), Some(&slow));
         history_replies.push(history);
         let mark = cdp.events().len();
-        let attached = Some(client::attach(&mut cdp, &tab));
+        let attached = Some(attach_with_deadline(
+            &mut cdp,
+            &tab,
+            Duration::from_secs(30),
+        ));
         let attach_outcome = classify_pending_attach(&attached);
         let label = attach_outcome_label(&attach_outcome);
         match &attach_outcome {
             PendingAttachOutcome::NotAttempted => {
                 counts.0 += 1;
-                panic!("attach not-attempted while landing Document is Fetch-held");
+                panic!("attach not-attempted while landing response is server-held");
             }
             PendingAttachOutcome::PreconditionMiss("no-proof-unverified" | "unanswered-timeout") => {
                 counts.1 += 1;
@@ -2712,7 +2768,7 @@ mod tests {
         )
         .unwrap();
         let evidence = format!(
-            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; held_request={request_id}; tab={tab}; trigger={trigger:?}; paused={paused}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
+            "attach_outcome={label}; counts(not_attempted,no_proof,admitted)={counts:?}; held_hits={held_hits}; tab={tab}; trigger={trigger:?}; history_replies={history_replies:?}; proxy_evidence={proxy_evidence}; client_events={:?}; guard_trail={:?}",
             cdp.events(),
             cdp.paused_trail
         );
@@ -2738,19 +2794,17 @@ mod tests {
             }
             _ => unreachable!(),
         };
-        raw.call(
-            "Fetch.continueRequest",
-            json!({ "requestId": request_id }),
-            Some(&slow),
-        )
-        .unwrap_or_else(|error| panic!("release held landing failed: {error}; {evidence}"));
-        let _ = raw.call("Fetch.disable", json!({}), Some(&slow));
+        cleanup.release_hold();
         raw.wait_href(&slow, &landing);
         let window_session = if let Some(session) = held_session {
             session
         } else {
             let settle_mark = cdp.events().len();
-            let settled = Some(client::attach(&mut cdp, &tab));
+            let settled = Some(attach_with_deadline(
+                &mut cdp,
+                &tab,
+                Duration::from_secs(30),
+            ));
             let settled_outcome = classify_pending_attach(&settled);
             let settled_label = attach_outcome_label(&settled_outcome);
             let admitted_seven = matches!(&settled_outcome, PendingAttachOutcome::Admitted(_))
@@ -2770,7 +2824,12 @@ mod tests {
                         "attempt_counts not_attempted={} no_proof={} admitted={}",
                         counts.0, counts.1, counts.2
                     );
-                    raw.close(&tab);
+                    assert!(
+                        test_started.elapsed() < Duration::from_secs(120),
+                        "live pending-commit test exceeded 120s: {:?}",
+                        test_started.elapsed()
+                    );
+                    cleanup.finish();
                     return;
                 }
             }
@@ -2789,6 +2848,11 @@ mod tests {
             "attempt_counts not_attempted={} no_proof={} admitted={}",
             counts.0, counts.1, counts.2
         );
-        raw.close(&tab);
+        assert!(
+            test_started.elapsed() < Duration::from_secs(120),
+            "live pending-commit test exceeded 120s: {:?}",
+            test_started.elapsed()
+        );
+        cleanup.finish();
     }
 }

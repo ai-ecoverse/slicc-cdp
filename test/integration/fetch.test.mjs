@@ -64,7 +64,9 @@ test('interception waits until the browser has committed a navigation the render
   });
 });
 
-test('pending-commit attach refuses without proof and without latching seven', async () => {
+test('pending-commit attach refuses without proof and without latching seven', {
+  timeout: 180_000,
+}, async () => {
   const proxy = await throughProxy(
     {
       before: [
@@ -166,7 +168,8 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
         SLICC_FETCH_LIVE_IDP: `http://localhost:${site.port}`,
         SLICC_FETCH_LIVE_SEVEN: 'http://seven.sliccy.ai',
         SLICC_FETCH_LIVE_VAULT: 'http://vault.sliccy.ai',
-      }
+      },
+      guardRace ? 120_000 : 600_000
     );
     const hits = await fixtureHits(site);
     const delta = Object.fromEntries(
@@ -214,7 +217,7 @@ async function throughProxy(options, name = 'fetch::tests::live_chromium_interce
   }
 }
 
-function cargo(args, extra) {
+function cargo(args, extra, timeoutMs = 600_000) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, ...extra };
     delete env.SLICC_CDP_URL;
@@ -229,8 +232,8 @@ function cargo(args, extra) {
     child.stderr.on('data', (chunk) => err.push(chunk));
     const timer = setTimeout(() => {
       killTree(child);
-      reject(new Error('cargo test timed out'));
-    }, 600000);
+      reject(new Error(`cargo test timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
     child.on('error', (error) => {
       clearTimeout(timer);
       reject(error);
