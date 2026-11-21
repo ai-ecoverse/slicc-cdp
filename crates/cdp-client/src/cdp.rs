@@ -239,6 +239,10 @@ pub struct Cdp {
     admit_probe: Vec<Value>,
     #[cfg(test)]
     pub(crate) paused_trail: Vec<(String, String, &'static str)>,
+    #[cfg(test)]
+    pub(crate) skip_protect: bool,
+    #[cfg(test)]
+    pub(crate) skip_verify_execution: bool,
 }
 
 impl Drop for Cdp {
@@ -386,6 +390,10 @@ impl Cdp {
             admit_probe: Vec::new(),
             #[cfg(test)]
             paused_trail: Vec::new(),
+            #[cfg(test)]
+            skip_protect: false,
+            #[cfg(test)]
+            skip_verify_execution: false,
         }
     }
 
@@ -950,7 +958,13 @@ impl Cdp {
             }
         }
         if executed {
-            self.verify_execution(&checks)?;
+            #[cfg(test)]
+            let skip_ve = self.skip_verify_execution;
+            #[cfg(not(test))]
+            let skip_ve = false;
+            if !skip_ve {
+                self.verify_execution(&checks)?;
+            }
             if content_command(method, &params) == Some(true) {
                 self.verify_execution_document_unchanged_or_ordinary(&checks)?;
             }
@@ -4029,6 +4043,10 @@ impl Cdp {
     }
 
     fn committed_protected(&mut self, session_id: &str) {
+        #[cfg(test)]
+        if self.skip_protect {
+            return;
+        }
         match self.session_target(session_id) {
             Some(target) => self.protect_target(&target),
             None => self.block(session_id),
@@ -4267,6 +4285,11 @@ impl Cdp {
 
     #[track_caller]
     fn protect_target(&mut self, target_id: &str) {
+        #[cfg(test)]
+        if self.skip_protect {
+            let _ = target_id;
+            return;
+        }
         let mut pending = vec![target_id.to_string()];
         let mut seen = BTreeSet::new();
         while let Some(current) = pending.pop() {
