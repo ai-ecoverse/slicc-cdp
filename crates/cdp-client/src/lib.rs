@@ -20,6 +20,7 @@ pub mod resolve;
 pub mod sanitize;
 pub mod shield;
 pub mod state;
+pub mod trace;
 pub mod upgrade;
 mod worlds;
 #[cfg(test)]

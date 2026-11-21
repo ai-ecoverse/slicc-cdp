@@ -308,6 +308,7 @@ impl Holder {
             self.watch(cdp, state, endpoint, &mut input)
         })();
         let reason = watched.as_deref().unwrap_or("error");
+        cdp_client::trace_har!("holder end reason={reason} entries={} pending={} pending_worker={} failed={} held={} paused={}", self.entries.len(), self.pending.len(), self.pending.values().filter(|pending| pending.worker).count(), self.failed.len(), self.held.len(), self.paused);
         let saved = self.checkpoint(cdp);
         let mut stopped = self.status("stopped");
         stopped["reason"] = json!(reason);
@@ -320,12 +321,15 @@ impl Holder {
 
     fn verify(&mut self, cdp: &mut Cdp) -> Option<String> {
         let session = self.session.as_deref()?;
+        if cdp_client::trace::on() && (cdp.content_blocked(session) || cdp.is_protected_target(&self.target)) { cdp_client::trace::line(format_args!("holder verify none content_blocked={} protected_target={}", cdp.content_blocked(session), cdp.is_protected_target(&self.target))); }
         if cdp.content_blocked(session) || cdp.is_protected_target(&self.target) { return None }
         let tree = cdp.call("Page.getFrameTree", json!({}), Some(session)).ok()?;
+        if cdp_client::trace::on() && tree.pointer("/frameTree/frame").is_none() { cdp_client::trace::line(format_args!("holder verify none no_root_frame")); }
         let frame = tree.pointer("/frameTree/frame")?;
         self.main_frame = text(frame, "id").to_string();
         let known = ordinary(cdp.guard(), text(frame, "url")) && ordinary(cdp.guard(), text(frame, "securityOrigin"))
             && !text(frame, "id").is_empty() && !text(frame, "loaderId").is_empty() && text(frame, "unreachableUrl").is_empty();
+        cdp_client::trace_har!("holder verify known={known} url_ordinary={} origin_ordinary={} id={} loader={} unreachable={} paused={}", ordinary(cdp.guard(), text(frame, "url")), ordinary(cdp.guard(), text(frame, "securityOrigin")), !text(frame, "id").is_empty(), !text(frame, "loaderId").is_empty(), !text(frame, "unreachableUrl").is_empty(), self.paused);
         known.then(|| text(frame, "loaderId").to_string())
     }
 
@@ -428,10 +432,13 @@ impl Holder {
                 return Ok(true);
             }
             let session = event["sessionId"].as_str();
+            let trace_net = cdp_client::trace::on() && matches!(text(&event, "method"), "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFinished" | "Network.loadingFailed");
+            if trace_net && !self.owns(cdp, session) && session.is_some_and(|session| cdp.trace_session_kind(session) == "worker") { cdp_client::trace::line(format_args!("holder ev unowned m={} s={} rid={}", text(&event, "method"), cdp_client::trace::short(session.unwrap_or("")), text(&event["params"], "requestId"))); }
             if !self.owns(cdp, session) { continue }
             let worker = session.is_some_and(|session| cdp.har_owns(session));
             let params = &event["params"];
             let id = text(params, "requestId");
+            if trace_net { cdp_client::trace::line(format_args!("holder ev m={} s={} worker={worker} rid={id} type={} url={} paused={} pending={} denied={}", text(&event, "method"), cdp_client::trace::short(session.unwrap_or("")), text(params, "type"), cdp_client::trace::path(params["request"]["url"].as_str().or(params["response"]["url"].as_str()).unwrap_or("")), self.paused, self.pending.contains_key(id), self.denied.contains(id))); }
             match text(&event, "method") {
                 "Page.frameNavigated" if !worker && params["frame"].get("parentId").is_none() => {
                     self.checkpoint(cdp)?;
@@ -459,11 +466,15 @@ impl Holder {
                         } else { self.pending.remove(id); self.denied.insert(id.to_string()); }
                     }
                     let request = &params["request"];
+                    if trace_net && !ordinary(cdp.guard(), text(request, "url")) { cdp_client::trace::line(format_args!("holder drop rid={id} reason=url_not_ordinary")); }
                     if !ordinary(cdp.guard(), text(request, "url")) { self.pending.remove(id); self.denied.insert(id.to_string()); continue }
+                    if trace_net && self.denied.contains(id) { cdp_client::trace::line(format_args!("holder drop rid={id} reason=denied")); }
                     if self.denied.contains(id) { continue }
                     let resource = text(params, "type");
                     let recovering_document = !worker && self.paused && resource == "Document" && !self.main_frame.is_empty() && text(params, "frameId") == self.main_frame;
+                    if trace_net && self.paused && !recovering_document && !worker { cdp_client::trace::line(format_args!("holder drop rid={id} reason=paused_page")); }
                     if self.paused && !recovering_document && !worker { continue }
+                    if trace_net && worker && self.paused { cdp_client::trace::line(format_args!("holder drop rid={id} reason=paused_worker")); }
                     if worker && self.paused { continue }
                     let document_url = if worker {
                         cdp.har_worker_url(session.unwrap_or("")).unwrap_or(text(params, "documentURL"))
@@ -471,9 +482,13 @@ impl Holder {
                         text(params, "documentURL")
                     };
                     let loader = text(params, "loaderId");
+                    if trace_net && resource == "Document" && loader.is_empty() { cdp_client::trace::line(format_args!("holder drop rid={id} reason=document_without_loader")); }
                     if resource == "Document" && loader.is_empty() { continue }
+                    if trace_net && !document_context(cdp.guard(), document_url, loader) { cdp_client::trace::line(format_args!("holder drop rid={id} reason=document_context document={}", cdp_client::trace::path(document_url))); }
                     if !document_context(cdp.guard(), document_url, loader) { continue }
+                    if trace_net && self.filter.as_ref().is_some_and(|filter| !filter.matches(text(request, "url"))) { cdp_client::trace::line(format_args!("holder drop rid={id} reason=filter")); }
                     if self.filter.as_ref().is_some_and(|filter| !filter.matches(text(request, "url"))) { continue }
+                    if trace_net { cdp_client::trace::line(format_args!("holder pending rid={id} worker={worker} ordinary_document={}", !self.paused || worker)); }
                     self.pending.insert(id.to_string(), Pending {
                         request: request.clone(),
                         response: None,
@@ -491,6 +506,7 @@ impl Holder {
                 }
                 "Network.responseReceived" => {
                     let response = &params["response"];
+                    if trace_net && !ordinary(cdp.guard(), text(response, "url")) { cdp_client::trace::line(format_args!("holder drop rid={id} reason=response_url_not_ordinary")); }
                     if !ordinary(cdp.guard(), text(response, "url")) { self.pending.remove(id); self.denied.insert(id.to_string()); continue }
                     if let Some(pending) = self.pending.get_mut(id) {
                         let mut response = response.clone();
@@ -566,11 +582,13 @@ impl Holder {
     }
 
     fn admit(&mut self, cdp: &mut Cdp, id: &str, pending: Pending, body: bool) -> Result<(), String> {
+        if cdp_client::trace::on() && pending.response.is_none() { cdp_client::trace::line(format_args!("holder admit rid={id} worker={} reason=no_response", pending.worker)); }
         let Some(response) = &pending.response else { return Ok(()) };
         if !document_context(cdp.guard(), &pending.document_url, &pending.loader)
             || !ordinary(cdp.guard(), text(&pending.request, "url"))
             || !ordinary(cdp.guard(), text(response, "url"))
         {
+            cdp_client::trace_har!("holder admit rid={id} worker={} reason=not_ordinary", pending.worker);
             return Ok(());
         }
         if !body && !response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308)) { return Ok(()) }
@@ -586,12 +604,14 @@ impl Holder {
         let redirect = response["status"].as_u64().is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308));
         if self.paused && !pending.ordinary_document && !redirect { return Ok(()) }
         let body_session = if pending.worker { pending.session.as_str() } else { self.session.as_deref().unwrap_or("") };
+        cdp_client::trace_har!("holder admit rid={id} worker={} body={body} verified={verified} paused={} ordinary_document={} embed={} body_state={}", pending.worker, self.paused, pending.ordinary_document, self.embed, cdp.trace_body_state(body_session, id));
         let can_embed = self.embed && verified && !self.paused && !body_session.is_empty() && cdp.ordinary_response_body(body_session, id);
         let content = if can_embed && body {
             cdp.call_for("Network.getResponseBody", json!({"requestId":id}), Some(body_session), Duration::from_secs(2))
                 .ok()
                 .filter(|_| !self.paused && cdp.ordinary_response_body(body_session, id))
         } else { None };
+        cdp_client::trace_har!("holder entry rid={id} worker={} can_embed={can_embed} content={} body_len={} entries={}", pending.worker, content.is_some(), content.as_ref().map_or(0, |value| text(value, "body").len()), self.entries.len() + 1);
         self.entries.push(entry(cdp, &pending, content.as_ref(), self.credentials, can_embed && pending.ordinary_document, self.minimal));
         self.walls.push((pending.wall > 0.0).then_some((pending.wall * 1000.0) as u64));
         Ok(())
@@ -756,6 +776,7 @@ fn date(seconds: f64) -> String {
 }
 
 fn emit(event: Value) -> Result<(), String> {
+    cdp_client::trace_har!("holder emit event={} entries={}", event["event"].as_str().unwrap_or(""), event["entries"]);
     let mut stdout = io::stdout();
     writeln!(stdout, "{event}").and_then(|_| stdout.flush()).map_err(|err| format!("har-start: {err}\n"))
 }

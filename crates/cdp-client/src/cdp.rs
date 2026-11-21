@@ -23,6 +23,8 @@ mod navigation_away;
 mod issued;
 #[path = "targets.rs"]
 mod targets;
+#[path = "trace_points.rs"]
+mod trace_points;
 #[cfg(test)]
 #[path = "unplaceable_test.rs"]
 mod unplaceable_test;
@@ -624,6 +626,11 @@ impl Cdp {
         session_id: Option<&str>,
     ) -> Result<Value, String> {
         let result = self.call_guarded_for(method, params, session_id, Duration::from_secs(30), false, true);
+        if let Err(message) = &result {
+            if crate::trace::on() && (matches!(method, "Page.getFrameTree" | "Page.getResourceTree") || self.trace_worker(session_id.unwrap_or(""))) {
+                crate::trace::line(format_args!("guard call err m={method} s={} kind={} err={}", crate::trace::short(session_id.unwrap_or("")), self.trace_kind(session_id.unwrap_or("")), message.trim()));
+            }
+        }
         #[cfg(test)]
         if result.is_err() && method == "Runtime.evaluate" && std::env::var_os("CI").is_some() {
             eprintln!("document call refused: stages={:?}", self.runtime_diagnostics().iter().filter_map(|probe| probe.get("stage").and_then(Value::as_str)).collect::<Vec<_>>());
@@ -1358,6 +1365,7 @@ impl Cdp {
     ) -> Result<(), String> {
         let root = result.pointer("/frameTree/frame");
         let root_protected = root.is_some_and(|frame| Self::frame_carrier_protected(&self.guard, frame));
+        crate::trace_har!("admit s={} root_protected={root_protected}", crate::trace::short(session_id.unwrap_or("")));
         if root_protected {
             return Err(self.latch_frame_carrier_session(session_id));
         }
@@ -1370,6 +1378,7 @@ impl Cdp {
             Self::walk_frames_with_parent(tree, None, &mut with_parent);
         }
         let target = session_id.and_then(|session| self.session_target(session));
+        let trace_nodes = with_parent.len();
         let doc_ok = target
             .as_ref()
             .is_some_and(|id| self.document_carrier_ordinary(id));
@@ -1383,6 +1392,7 @@ impl Cdp {
             }
             let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
             if id.is_empty() {
+                crate::trace_har!("admit s={} nodes={trace_nodes} empty_id=true blanked=all", crate::trace::short(session_id.unwrap_or("")));
                 self.blank_unclassified_frame_names(result);
                 return Ok(());
             }
@@ -1393,6 +1403,7 @@ impl Cdp {
             verify_ids.insert(id.to_string());
         }
         if verify_ids.is_empty() {
+            crate::trace_har!("admit s={} nodes={trace_nodes} doc_ok={doc_ok} needs_verify=0 nested=false blanked={}", crate::trace::short(session_id.unwrap_or("")), !classified_blank_root_ids.is_empty());
             if !classified_blank_root_ids.is_empty() {
                 Self::blank_frame_names_by_ids(result, &classified_blank_root_ids);
             }
@@ -1403,6 +1414,7 @@ impl Cdp {
             return Ok(());
         };
         let Some(target) = target else {
+            crate::trace_har!("admit s={} nodes={trace_nodes} needs_verify={} no_target nested=false blanked=all", crate::trace::short(session), verify_ids.len());
             self.blank_unclassified_frame_names(result);
             return Ok(());
         };
@@ -1419,6 +1431,7 @@ impl Cdp {
             .unwrap_or(root_loader.clone());
         if let Some(cached) = self.frame_carrier_verify.get(&target) {
             if cached.root_loader_id == cache_loader && cached.unclassified == verify_ids {
+                crate::trace_har!("admit s={} nodes={trace_nodes} needs_verify={} cached nested=false blanked={} scrubbed={}", crate::trace::short(session), verify_ids.len(), !cached.blank_ids.is_empty(), !cached.scrub_ids.is_empty());
                 if !cached.scrub_ids.is_empty() {
                     Self::scrub_frame_by_ids(result, &cached.scrub_ids);
                 }
@@ -1432,6 +1445,7 @@ impl Cdp {
         {
             self.frame_carrier_tree_reads += 1;
         }
+        let trace_nested = Instant::now();
         let fresh = match self.raw_call(
             "Page.getFrameTree",
             json!({}),
@@ -1440,6 +1454,7 @@ impl Cdp {
         ) {
             Ok(tree) => tree,
             Err(_) => {
+                crate::trace_har!("admit s={} nodes={trace_nodes} needs_verify={} nested=err nested_ms={} blanked=all", crate::trace::short(session), verify_ids.len(), trace_nested.elapsed().as_millis());
                 self.blank_unclassified_frame_names(result);
                 let mut blank_ids = verify_ids.clone();
                 blank_ids.extend(classified_blank_root_ids);
@@ -1459,6 +1474,7 @@ impl Cdp {
             .pointer("/frameTree/frame")
             .is_some_and(|frame| Self::frame_carrier_protected(&self.guard, frame))
         {
+            crate::trace_har!("admit s={} nested=ok fresh_root_protected=true nested_ms={}", crate::trace::short(session), trace_nested.elapsed().as_millis());
             self.clear_frame_carrier_verify(&target);
             return Err(self.latch_frame_carrier_session(Some(session)));
         }
@@ -1471,6 +1487,7 @@ impl Cdp {
             Self::blank_frame_names_by_ids(result, &classified_blank_root_ids);
             blank_ids.extend(classified_blank_root_ids);
         }
+        crate::trace_har!("admit s={} nodes={trace_nodes} needs_verify={} nested=ok nested_ms={} blanked={} scrubbed={}", crate::trace::short(session), verify_ids.len(), trace_nested.elapsed().as_millis(), !blank_ids.is_empty(), !scrub_ids.is_empty());
         self.frame_carrier_verify.insert(
             target,
             FrameCarrierVerifyCache {
@@ -2801,8 +2818,13 @@ impl Cdp {
             None
         };
         let target = session_id.and_then(|session| self.session_target(session));
+        let trace_reply = (crate::trace::on() && (matches!(method, "Page.getFrameTree" | "Page.getResourceTree") || self.trace_worker(session_id.unwrap_or("")))).then(|| (crate::trace::fingerprint(&result), self.trace_terms(&result, target.as_deref()), Self::params_carrier_protected(&self.guard, &result)));
         self.scrub_failed_load_carriers(&mut result, target.as_deref());
+        let trace_scrubbed = trace_reply.as_ref().map(|_| crate::trace::fingerprint(&result));
         shield::redact_strings(&self.guard, &mut result);
+        if let (Some((before, terms, carrier)), Some(scrubbed)) = (&trace_reply, trace_scrubbed) {
+            crate::trace::line(format_args!("guard reply m={method} s={} kind={} carrier_protected={carrier} {terms} len_before={} scrub_changed={} redact_changed={} len_after={}", crate::trace::short(session_id.unwrap_or("")), self.trace_kind(session_id.unwrap_or("")), before.0, *before != scrubbed, scrubbed != crate::trace::fingerprint(&result), crate::trace::fingerprint(&result).0));
+        }
         if let Some(flags) = history_flags.as_deref() {
             Self::clear_protected_history_non_urls(&mut result, flags);
         }
@@ -6113,6 +6135,7 @@ impl Cdp {
     }
 
     fn deliver_event(&mut self, mut value: Value) {
+        let trace_on = self.trace_event_on(&value);
         self.watch(&mut value);
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if value.pointer("/params/targetInfo").is_some_and(Value::is_object)
@@ -6120,9 +6143,11 @@ impl Cdp {
         {
             value["params"]["targetInfo"] = self.scrub_error(value["params"]["targetInfo"].take());
         }
+        if trace_on && value.get("sliccHide").and_then(Value::as_bool) == Some(true) { self.trace_event(&value, "drop reason=slicc_hide"); }
         if value.get("sliccHide").and_then(Value::as_bool) == Some(true) {
             return;
         }
+        if trace_on && (shield::credential_storage_event(&self.guard, &value) || shield::audit_cookie_hidden(&self.guard, &value)) { self.trace_event(&value, "drop reason=credential"); }
         if shield::credential_storage_event(&self.guard, &value) || shield::audit_cookie_hidden(&self.guard, &value) {
             return;
         }
@@ -6133,6 +6158,7 @@ impl Cdp {
             && !session.is_empty()
             && self.session_descendant_not_clear(session)
         {
+            if trace_on { self.trace_event(&value, "drop reason=descendant_not_clear"); }
             self.fail_seen_network(&value);
             return;
         }
@@ -6154,9 +6180,11 @@ impl Cdp {
         let key = (value.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string(), value.pointer("/params/requestId").and_then(Value::as_str).unwrap_or("").to_string());
         let terminal = self.terminal_network.contains(&key);
         let late_ordinary = terminal && matches!(value["method"].as_str(), Some("Network.responseReceivedExtraInfo" | "Network.requestWillBeSentExtraInfo")) && self.ordinary_late_extra_info(&value);
+        if trace_on && terminal && !late_ordinary { self.trace_event(&value, "drop reason=terminal"); }
         if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Network.") && method != "Network.responseReceivedExtraInfo") && terminal && !late_ordinary { return }
         let guarded = self.blocked.contains(&key.0) || Self::params_carrier_protected(&self.guard, &value["params"]) || self.hidden(&value) || self.redirects.contains(&key.1);
         if guarded && self.visible_redirect(&mut value) {
+            if trace_on { self.trace_event(&value, "delivered reason=visible_redirect"); }
             let hop = value.get("method").and_then(Value::as_str) == Some("Network.requestWillBeSent");
             self.events.push(value.clone());
             if hop { self.fail_seen_network(&value); }
@@ -6164,6 +6192,7 @@ impl Cdp {
         }
         if terminal && !late_ordinary { return }
         if self.worlds.event(&value, &self.guard) {
+            if trace_on { self.trace_event(&value, "drop reason=worlds"); }
             if value.get("method").and_then(Value::as_str) == Some("Debugger.paused") {
                 let _ = self.send("Debugger.resume", json!({}), value.get("sessionId").and_then(Value::as_str));
             }
@@ -6171,6 +6200,7 @@ impl Cdp {
         }
         if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Debugger.")) { return; }
         if guarded && !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.") {
+            if trace_on { self.trace_event(&value, &format!("drop reason=guarded blocked={} carrier_protected={} hidden={} redirect={}", self.blocked.contains(&key.0), Self::params_carrier_protected(&self.guard, &value["params"]), self.hidden(&value), self.redirects.contains(&key.1))); }
             self.fail_seen_network(&value);
             return;
         }
@@ -6179,19 +6209,24 @@ impl Cdp {
             || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.")
                 && Self::params_carrier_protected(&self.guard, &value["params"])
         {
+            if trace_on { self.trace_event(&value, &format!("drop reason=blocked_or_carrier blocked={}", self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or("")))); }
             self.fail_seen_network(&value);
             return;
         }
         let echoed_url = (value["method"] == "Network.requestWillBeSent" && value["params"]["type"] == "Document" && !guarded
             && !self.protected_body_requests.contains(&key.1) && self.client_navigation_urls.get(&key.0).is_some_and(|url| value.pointer("/params/request/url").and_then(Value::as_str) == Some(url.as_str()))).then(|| value["params"]["request"]["url"].clone());
         let event_target = value.get("sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session));
+        let trace_before = trace_on.then(|| (crate::trace::fingerprint(&value), self.trace_terms(&value, event_target.as_deref()), Self::params_carrier_protected(&self.guard, &value["params"])));
         self.scrub_failed_load_carriers(&mut value, event_target.as_deref());
+        let trace_scrubbed = trace_before.as_ref().map(|_| crate::trace::fingerprint(&value));
         shield::redact_strings(&self.guard, &mut value);
+        if let (Some((before, terms, carrier)), Some(scrubbed)) = (&trace_before, trace_scrubbed) { self.trace_event(&value, &format!("scrub carrier_protected={carrier} {terms} scrub_changed={} redact_changed={}", *before != scrubbed, scrubbed != crate::trace::fingerprint(&value))); }
         if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
         let settle_guard = self.settling_attach.get()
             && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
             && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
         if self.hidden(&value) && !settle_guard {
+            if trace_on { self.trace_event(&value, "drop reason=hidden_after_scrub"); }
             self.fail_seen_network(&value);
             return;
         }
@@ -6224,6 +6259,7 @@ impl Cdp {
                     shield::strip_credential_cookies(&self.guard, &mut value["params"], true);
                 }
                 if self.requests.get(&id) != Some(&false) {
+                    if trace_on { self.trace_event(&value, "held reason=extra_info"); }
                     self.held.entry(id).or_default().push(value);
                     return;
                 }
@@ -6233,6 +6269,7 @@ impl Cdp {
             shield::strip_credential_cookies(&self.guard, &mut value["params"], true);
         }
         if !terminal { self.visible_network(&value); }
+        if trace_on { self.trace_event(&value, &format!("delivered queue={}", self.events.len())); }
         self.events.push(value);
         if let Some(id) = id {
             if self.requests.get(&id) == Some(&false) {
@@ -6343,9 +6380,13 @@ impl Cdp {
     ) -> Result<Value, String> {
         if self.renderer_crashed(session_id, None) { return Err(RENDERER_CRASHED.to_string()) }
         self.eval_attach_early_admit_execution(method, session_id)?;
+        let trace_start = Instant::now();
         let id = self.send(method, params, session_id)?;
         self.waiting_calls.insert(id);
         let result = self.raw_reply(method, id, session_id, timeout, pinned);
+        if crate::trace::on() && self.trace_worker(session_id.unwrap_or("")) {
+            crate::trace::line(format_args!("guard raw m={method} s={} kind={} ms={} result={}", crate::trace::short(session_id.unwrap_or("")), self.trace_kind(session_id.unwrap_or("")), trace_start.elapsed().as_millis(), result.as_ref().map_or_else(|error| format!("err:{}", error.trim()), |value| format!("ok:len={}", crate::trace::fingerprint(value).0))));
+        }
         self.waiting_calls.remove(&id);
         self.call_replies.remove(&id);
         if method == "Page.getFrameTree" && session_id.is_some_and(|session| self.guard_sessions.contains(session)) {
@@ -6635,6 +6676,7 @@ impl Cdp {
             return;
         }
         self.observe_renderer_crash(&value);
+        if self.trace_event_on(&value) { self.trace_event(&value, "absorb"); }
         if self.away_event(&value) { return }
         self.observe_dialog(&value);
         if value.get("method").and_then(Value::as_str) == Some("Target.detachedFromTarget") {

@@ -8,6 +8,14 @@ import { chromeTest as test } from './chrome-policy.mjs';
 import { harCommand, harHolder } from './har-support.mjs';
 import './watchdog.mjs';
 
+process.env.SLICC_TRACE_HAR = '1';
+const traceNames = {
+  'worker.har': 'HAR records dedicated worker fetches and excludes workers of protected pages',
+  'post-stop.har': 'after har-stop a new dedicated worker runs without staying paused',
+  'worker-body.har': 'HAR --content embed includes dedicated-worker response bodies',
+  'existing-worker.har': 'HAR records fetches from a worker that already existed before har-start',
+};
+
 async function withWorkerServer(body) {
   const home = await mkdtemp(path.join(tmpdir(), 'slicc-har-worker-chrome-'));
   const server = createServer((req, res) => {
@@ -102,6 +110,12 @@ async function withWorkerServer(body) {
       ].join('\n')
     );
   } finally {
+    if (held) {
+      const traceFile = path.basename(held.child.spawnargs.at(-1) ?? '');
+      process.stderr.write(
+        `HOLDER-STDERR ${traceNames[traceFile] ?? traceFile} run_attempt=${process.env.GITHUB_RUN_ATTEMPT ?? 'local'} job=${process.env.GITHUB_JOB ?? ''}\n${held.output().stderr}\nHOLDER-STDERR-END\n`
+      );
+    }
     held?.child.kill('SIGKILL');
     raw?.close?.();
     await browser?.close?.();

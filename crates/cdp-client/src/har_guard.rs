@@ -94,6 +94,7 @@ impl Cdp {
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
         if method == "Target.detachedFromTarget" {
             if let Some(child) = value.pointer("/params/sessionId").and_then(Value::as_str) {
+                if crate::trace::on() && self.har.workers.contains_key(child) { crate::trace::line(format_args!("har detached child={}", crate::trace::short(child))); }
                 self.har.workers.remove(child);
                 self.har.urls.remove(child);
             }
@@ -113,6 +114,7 @@ impl Cdp {
             return false;
         };
         let kind = info.get("type").and_then(Value::as_str).unwrap_or("");
+        if crate::trace::on() && kind == "worker" { crate::trace::line(format_args!("har attach child={} owner={} armed={} waiting={} url={}", crate::trace::short(&child), crate::trace::short(owner), self.har.armed.contains(owner), value.pointer("/params/waitingForDebugger").and_then(Value::as_bool) == Some(true), crate::trace::path(info.get("url").and_then(Value::as_str).unwrap_or("")))); }
         if kind != "worker" || owner.is_empty() || !self.har.armed.contains(owner) {
             return false;
         }
@@ -121,6 +123,7 @@ impl Cdp {
             || self.blocked.contains(&child)
             || self.har_refused_info(owner, info)
         {
+            crate::trace_har!("har refuse child={} blocked_owner={} guard_child={} blocked_child={} refused_info={}", crate::trace::short(&child), self.blocked.contains(owner), self.guard_sessions.contains(&child), self.blocked.contains(&child), self.har_refused_info(owner, info));
             self.har_release_worker(&child);
             return true;
         }
@@ -139,6 +142,7 @@ impl Cdp {
                 .raw_call("Network.enable", json!({}), Some(&child), left)
                 .is_err()
         {
+            crate::trace_har!("har network_enable failed child={} left_zero={}", crate::trace::short(&child), left.is_zero());
             self.har_release_worker(&child);
             return true;
         }
@@ -154,10 +158,12 @@ impl Cdp {
                     )
                     .is_err()
             {
+                crate::trace_har!("har run_if_waiting failed child={}", crate::trace::short(&child));
                 self.har_release_worker(&child);
                 return true;
             }
         }
+        crate::trace_har!("har owns child={} owner={} owner_content_blocked={}", crate::trace::short(&child), crate::trace::short(owner), self.content_blocked(owner));
         self.har.workers.insert(child.clone(), owner.to_string());
         self.har.urls.insert(child, url);
         true
@@ -205,6 +211,7 @@ impl Cdp {
     }
 
     pub(super) fn har_release_worker(&mut self, child: &str) {
+        crate::trace_har!("har release child={} owned={}", crate::trace::short(child), self.har.workers.contains_key(child));
         self.har.workers.remove(child);
         self.har.urls.remove(child);
         self.blocked.insert(child.to_string());
