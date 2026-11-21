@@ -33,7 +33,7 @@ path = "../../test/integration/browsers-discovery-cache.rs"
 
 [dependencies]
 serde_json = "1"
-slicc-browsers = { version = "=1.28.5", features = ["serde"] }
+slicc-browsers = { version = "=1.29.0", features = ["serde"] }
 url = "2.5"
 wasix-net = "0.1.2"
 
@@ -45,4 +45,4 @@ native-tls = "0.2"
 openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
-slicc-browsers = { version = "=1.28.5", features = ["corpus"] }
+slicc-browsers = { version = "=1.29.0", features = ["corpus"] }

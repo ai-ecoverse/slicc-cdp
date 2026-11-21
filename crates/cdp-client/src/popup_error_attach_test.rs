@@ -476,6 +476,42 @@ fn an_own_tab_error_page_with_a_protected_failed_url_stays_attachable() {
 }
 
 #[test]
+fn a_fresh_process_reattach_admits_own_tab_whose_target_info_stays_on_the_blocked_url() {
+    let start = own_info("https://example.test/start", "start");
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
+    let mut first = own_client_from(state.clone(), &start);
+    assert!(first.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).is_ok());
+    let blocked = own_info(POPUP_SEVEN, "seven.sliccy.ai");
+    let frame = own_error_frame("L1", POPUP_SEVEN);
+    {
+        let mut state = state.borrow_mut();
+        state.popup = blocked.clone();
+        state.frame = PopupFrame::Frame(frame.clone());
+        state.sessions.clear();
+    }
+    let mut fresh = own_client_from(state, &blocked);
+    let reply = fresh
+        .call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None)
+        .expect("catalog R4 / #880: own-tab error document after protected navigation must attach on a fresh Cdp");
+    let session = reply["sessionId"].as_str().unwrap();
+    assert!(!fresh.is_protected_target("T"), "error recovery must not leave the reported-url latch set");
+    let info = fresh.call("Target.getTargetInfo", json!({"targetId":"T"}), None).unwrap();
+    assert_eq!(info["targetInfo"]["url"], "https://seven.sliccy.ai", "scrubbed origin: {info}");
+    assert!(!info.to_string().contains("SECRET"), "{info}");
+    assert!(fresh.call("Runtime.evaluate", json!({"expression":"document.body.innerHTML"}), Some(session)).is_err());
+    assert!(fresh.call("Page.navigate", json!({"url":"https://example.test/recovered"}), Some(session)).is_ok());
+}
+
+#[test]
+fn a_popup_error_page_whose_target_info_stays_on_the_blocked_url_stays_refused() {
+    let blocked = popup_info(POPUP_SEVEN, "seven.sliccy.ai");
+    let mut cdp = popup_client(blocked, PopupFrame::Frame(popup_error_frame(POPUP_SEVEN)));
+    popup_attach_refused(&mut cdp, "popup-reported-protected-url");
+}
+
+#[test]
 fn an_own_tab_error_page_with_an_empty_failed_url_stays_attachable_across_processes() {
     let start = own_info("https://example.test/start", "start");
     let state = own_state(start.clone(), PopupFrame::Frame(json!({
@@ -891,7 +927,9 @@ fn a_protected_then_ordinary_failed_load_clears_own_latch_and_keeps_popup_latch(
 #[test]
 fn a_second_failed_load_arriving_before_the_first_proof_stays_scrubbed() {
     let start = own_info("https://example.test/start", "start");
-    let state = own_state(start.clone(), PopupFrame::Silent);
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
     let mut cdp = own_client_from(state.clone(), &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
@@ -1540,7 +1578,9 @@ fn a_protected_url_page_window_open_on_an_own_session_is_never_delivered() {
 fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
     let host = "seven.sliccy.ai";
     let start = own_info("https://example.test/start", "start");
-    let state = own_state(start.clone(), PopupFrame::Silent);
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
     let mut cdp = own_client_from(state.clone(), &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
@@ -1549,6 +1589,7 @@ fn page_window_open_blanks_window_name_on_an_unproven_failed_load() {
         state.popup = own_info(POPUP_ERROR, host);
         state.frame = PopupFrame::Silent;
     }
+    cdp.documents.remove("T");
     cdp.absorb(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":own_info(POPUP_ERROR, host)}}));
     assert!(cdp.error_unproven(&own_info(POPUP_ERROR, host)));
     let mark = cdp.events().len();
@@ -2012,11 +2053,14 @@ fn document_unreachable_alone_hides_chrome_error_shaped_window_open_with_ordinar
 fn chrome_error_catch_all_hides_window_open_when_the_target_has_no_document() {
     let host = "seven.sliccy.ai";
     let start = own_info("https://example.test/start", "start");
-    let state = own_state(start.clone(), PopupFrame::Silent);
+    let state = own_state(start.clone(), PopupFrame::Frame(json!({
+        "id":"T","loaderId":"L0","url":"https://example.test/start","securityOrigin":"https://example.test","mimeType":"text/html"
+    })));
     let mut cdp = own_client_from(state, &start);
     let first = cdp.call("Target.attachToTarget", json!({"targetId":"T","flatten":true}), None).unwrap();
     let live = first["sessionId"].as_str().unwrap().to_string();
     assert!(!cdp.error_unproven(&start));
+    cdp.documents.remove("T");
     assert!(cdp.documents.get("T").is_none());
     let mark = cdp.events().len();
     cdp.absorb(json!({

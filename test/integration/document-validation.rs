@@ -319,7 +319,11 @@ fn guard_created_blank_documents_have_creation_and_history_evidence() {
             "unknown-history" => None,
             _ => Some(json!({"currentIndex":0,"entries":[{"id":1,"url":"about:blank"}]})),
         };
-        if shape == "opener" { attach(&mut cdp, "OWNER"); backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":"about:blank","openerId":"OWNER"})); }
+        if shape == "opener" {
+            backend.borrow_mut().owner_tree = Some(tree("L1"));
+            attach(&mut cdp, "OWNER");
+            backend.borrow_mut().worker = Some(json!({"targetId":"T","type":"page","url":"about:blank","openerId":"OWNER"}));
+        }
         match cdp.call("Target.createTarget", json!({"url":"about:blank"}), None) {
             Ok(_) => {},
             Err(message) => { assert_eq!(shape, "opener"); assert!(message.starts_with("slicc: refused:")); continue; }
