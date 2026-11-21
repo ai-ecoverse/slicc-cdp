@@ -165,6 +165,7 @@ export const runCapabilities = {
   errorFrameClass: true,
   requestInterception: true,
   fetchInterception: true,
+  explicitAttach: true,
 };
 
 export function declaredCapabilityNames(capabilities = runCapabilities) {
