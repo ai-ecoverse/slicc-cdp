@@ -1374,6 +1374,7 @@ impl Cdp {
             .as_ref()
             .is_some_and(|id| self.document_carrier_ordinary(id));
         let mut verify_ids = BTreeSet::new();
+        let mut classified_blank_root_ids = BTreeSet::new();
         for (frame, parent) in &with_parent {
             if self.frame_is_ordinary(frame, *parent, doc_ok)
                 || Self::frame_carrier_protected(&self.guard, frame)
@@ -1385,9 +1386,16 @@ impl Cdp {
                 self.blank_unclassified_frame_names(result);
                 return Ok(());
             }
+            if parent.is_none() && doc_ok && Self::inherit_blank_frame(frame) {
+                classified_blank_root_ids.insert(id.to_string());
+                continue;
+            }
             verify_ids.insert(id.to_string());
         }
         if verify_ids.is_empty() {
+            if !classified_blank_root_ids.is_empty() {
+                Self::blank_frame_names_by_ids(result, &classified_blank_root_ids);
+            }
             return Ok(());
         }
         let Some(session) = session_id else {
@@ -1433,12 +1441,14 @@ impl Cdp {
             Ok(tree) => tree,
             Err(_) => {
                 self.blank_unclassified_frame_names(result);
+                let mut blank_ids = verify_ids.clone();
+                blank_ids.extend(classified_blank_root_ids);
                 self.frame_carrier_verify.insert(
                     target,
                     FrameCarrierVerifyCache {
                         root_loader_id: cache_loader,
-                        unclassified: verify_ids.clone(),
-                        blank_ids: verify_ids,
+                        unclassified: verify_ids,
+                        blank_ids,
                         scrub_ids: BTreeSet::new(),
                     },
                 );
@@ -1456,7 +1466,11 @@ impl Cdp {
             Self::scrub_protected_child_frames(&self.guard, tree);
             Self::scrub_protected_resources(&self.guard, tree);
         }
-        let (blank_ids, scrub_ids) = self.apply_verify_frame_names(result, &fresh, &target);
+        let (mut blank_ids, scrub_ids) = self.apply_verify_frame_names(result, &fresh, &target);
+        if !classified_blank_root_ids.is_empty() {
+            Self::blank_frame_names_by_ids(result, &classified_blank_root_ids);
+            blank_ids.extend(classified_blank_root_ids);
+        }
         self.frame_carrier_verify.insert(
             target,
             FrameCarrierVerifyCache {

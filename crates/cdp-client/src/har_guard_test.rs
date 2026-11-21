@@ -920,3 +920,215 @@ fn worker_extra_info_after_loading_finished_still_blocks_body() {
         .unwrap_err()
         .starts_with("slicc: refused:"));
 }
+
+
+#[derive(Default)]
+struct NestedVerifyState {
+    inbox: VecDeque<String>,
+    sent: Vec<Value>,
+    tree_serves: usize,
+    inject_worker_on_nested: bool,
+    fail_network_enable: bool,
+    tree: Value,
+}
+
+struct NestedVerifyBackend(Rc<RefCell<NestedVerifyState>>);
+
+impl Transport for NestedVerifyBackend {
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        let command: Value = serde_json::from_str(text).map_err(|err| err.to_string())?;
+        let mut state = self.0.borrow_mut();
+        state.sent.push(command.clone());
+        let method = command["method"].as_str().unwrap_or("");
+        match method {
+            "Page.getFrameTree" => {
+                state.tree_serves += 1;
+                if state.tree_serves > 1 && state.inject_worker_on_nested {
+                    state.inbox.push_back(
+                        worker_attach("H", "NESTED-W", "https://ordinary.test/worker.js", false).to_string(),
+                    );
+                    state.inbox.push_back(
+                        json!({
+                            "method": "Network.requestWillBeSent",
+                            "sessionId": "NESTED-W",
+                            "params": {
+                                "requestId": "NW1",
+                                "loaderId": "",
+                                "documentURL": "https://ordinary.test/worker.js",
+                                "type": "Fetch",
+                                "request": {"url": "https://ordinary.test/body", "method": "GET", "headers": {}}
+                            }
+                        })
+                        .to_string(),
+                    );
+                }
+                let tree = state.tree.clone();
+                state.inbox.push_back(
+                    json!({
+                        "id": command["id"],
+                        "sessionId": command.get("sessionId"),
+                        "result": {"frameTree": tree},
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
+            "Network.enable" => {
+                if state.fail_network_enable {
+                    state.inbox.push_back(
+                        json!({"id":command["id"],"error":{"message":"Network.enable failed"}})
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+            }
+            "Target.setAutoAttach" | "Runtime.runIfWaitingForDebugger" | "Target.detachFromTarget" => {}
+            _ => {}
+        }
+        state.inbox.push_back(json!({"id":command["id"],"result":{}}).to_string());
+        Ok(())
+    }
+
+    fn recv_text(&mut self, _deadline: Instant) -> Result<Option<String>, String> {
+        Ok(self.0.borrow_mut().inbox.pop_front())
+    }
+}
+
+fn nested_verify_cdp(inject_worker: bool, fail_network: bool) -> (Cdp, Rc<RefCell<NestedVerifyState>>) {
+    let tree = json!({
+        "frame": {
+            "id": "F",
+            "loaderId": "L",
+            "url": "https://ordinary.test/",
+            "securityOrigin": "https://ordinary.test",
+            "mimeType": "text/html",
+            "name": "main",
+        },
+        "childFrames": [{
+            "frame": {
+                "id": "C",
+                "loaderId": "Lc",
+                "url": "https://ordinary.test/embed",
+                "securityOrigin": "://",
+                "mimeType": "text/html",
+                "name": "opaque-child",
+            }
+        }],
+    });
+    let state = Rc::new(RefCell::new(NestedVerifyState {
+        inbox: VecDeque::new(),
+        sent: Vec::new(),
+        tree_serves: 0,
+        inject_worker_on_nested: inject_worker,
+        fail_network_enable: fail_network,
+        tree,
+    }));
+    let mut cdp = Cdp::from_transport(Box::new(NestedVerifyBackend(state.clone())));
+    cdp.protect_origins(&["https://catalog.test"]);
+    cdp.session_targets.insert("H".into(), "T".into());
+    cdp.targets.insert(
+        "T".into(),
+        json!({"targetId":"T","type":"page","url":"https://ordinary.test/"}),
+    );
+    cdp.main_commit(
+        "H",
+        &json!({"id":"F","loaderId":"L","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test"}),
+    );
+    cdp.har_auto_attach("H").unwrap();
+    (cdp, state)
+}
+
+#[test]
+fn worker_attach_during_nested_frame_verify_read_is_admitted_and_network_event_queued() {
+    let (mut cdp, state) = nested_verify_cdp(true, false);
+    state.borrow_mut().tree_serves = 0;
+    let before_events = cdp.events().len();
+    let result = cdp.call("Page.getFrameTree", json!({}), Some("H")).unwrap();
+    assert_eq!(cdp.frame_carrier_tree_reads, 1, "opaque child still forces one nested verify");
+    assert!(cdp.har_owns("NESTED-W"), "har_event must admit worker during nested raw_reply wait");
+    assert!(
+        !cdp.events()[before_events..].iter().any(|event| {
+            event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == "NESTED-W"
+        }),
+        "armed worker attach is consumed by har_event (never in events) by design"
+    );
+    assert!(
+        cdp.events()[before_events..].iter().any(|event| {
+            event["method"] == "Network.requestWillBeSent"
+                && event["sessionId"] == "NESTED-W"
+                && event["params"]["requestId"] == "NW1"
+        }),
+        "Network.* absorbed during nested wait must still reach the event queue: {:?}",
+        &cdp.events()[before_events..]
+    );
+    assert_eq!(result["frameTree"]["childFrames"][0]["frame"]["name"], "");
+}
+
+#[test]
+fn worker_attach_during_nested_verify_with_failed_network_enable_is_consumed_without_har_owns() {
+    let (mut cdp, state) = nested_verify_cdp(true, true);
+    state.borrow_mut().tree_serves = 0;
+    let before_events = cdp.events().len();
+    let _ = cdp.call("Page.getFrameTree", json!({}), Some("H")).unwrap();
+    assert_eq!(cdp.frame_carrier_tree_reads, 1);
+    assert!(
+        !cdp.har_owns("NESTED-W"),
+        "failed Network.enable must release the worker"
+    );
+    assert!(
+        !cdp.events()[before_events..].iter().any(|event| {
+            event["method"] == "Target.attachedToTarget" && event["params"]["sessionId"] == "NESTED-W"
+        }),
+        "failed admit still consumes attachedToTarget: attach cannot be retried from events"
+    );
+}
+
+#[test]
+fn blank_root_of_ordinary_doc_nav_clear_keeps_zero_nested_reads_with_root_skip() {
+    let tree = json!({
+        "frame": {
+            "id": "F",
+            "loaderId": "L",
+            "url": "about:blank",
+            "securityOrigin": "://",
+            "mimeType": "text/html",
+            "name": "blank-root",
+        }
+    });
+    let state = Rc::new(RefCell::new(NestedVerifyState {
+        inbox: VecDeque::new(),
+        sent: Vec::new(),
+        tree_serves: 0,
+        inject_worker_on_nested: false,
+        fail_network_enable: false,
+        tree: tree.clone(),
+    }));
+    let mut cdp = Cdp::from_transport(Box::new(NestedVerifyBackend(state.clone())));
+    cdp.session_targets.insert("H".into(), "T".into());
+    cdp.targets.insert(
+        "T".into(),
+        json!({"targetId":"T","type":"page","url":"https://ordinary.test/"}),
+    );
+    cdp.main_commit(
+        "H",
+        &json!({"id":"F","loaderId":"L","url":"https://ordinary.test/","securityOrigin":"https://ordinary.test"}),
+    );
+    let _ = cdp.call("Page.getFrameTree", json!({}), Some("H")).unwrap();
+    assert_eq!(cdp.frame_carrier_tree_reads, 0);
+    cdp.absorb(json!({
+        "method": "Page.frameStartedNavigating",
+        "sessionId": "H",
+        "params": {
+            "frameId": "F",
+            "url": "https://ordinary.test/next",
+            "loaderId": "L9",
+            "navigationType": "differentDocument",
+        }
+    }));
+    state.borrow_mut().tree = tree;
+    let _ = cdp.call("Page.getFrameTree", json!({}), Some("H")).unwrap();
+    assert_eq!(
+        cdp.frame_carrier_tree_reads, 0,
+        "root skip must keep blank-root polls at zero nested reads after cache clear"
+    );
+}
