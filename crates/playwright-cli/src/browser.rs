@@ -696,7 +696,7 @@ pub fn click_ref(
     if !rec.selector.is_empty() {
         let selector = first_selector(&rec.selector);
         let expression = format!(
-            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x+r.width/2,y:r.y+r.height/2,width:r.width,height:r.height}}; }})()",
+            "(function() {{ var el = document.querySelector({}); if (!el) throw new Error('Element not found'); el.scrollIntoView({{block:'center'}}); var r = el.getBoundingClientRect(); return {{x:r.x,y:r.y,width:r.width,height:r.height}}; }})()",
             serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
         );
         let value = evaluate(cdp, session, &expression, false)?;
