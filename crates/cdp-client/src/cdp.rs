@@ -243,16 +243,6 @@ pub struct Cdp {
     pub(crate) skip_protect: bool,
     #[cfg(test)]
     pub(crate) skip_verify_execution: bool,
-    #[cfg(test)]
-    pub(crate) frame_carrier_tree_reads: usize,
-    frame_carrier_verify: BTreeMap<String, FrameCarrierVerifyCache>,
-}
-
-struct FrameCarrierVerifyCache {
-    root_loader_id: String,
-    unclassified: BTreeSet<String>,
-    blank_ids: BTreeSet<String>,
-    scrub_ids: BTreeSet<String>,
 }
 
 impl Drop for Cdp {
@@ -404,9 +394,6 @@ impl Cdp {
             skip_protect: false,
             #[cfg(test)]
             skip_verify_execution: false,
-            #[cfg(test)]
-            frame_carrier_tree_reads: 0,
-            frame_carrier_verify: BTreeMap::new(),
         }
     }
 
@@ -817,658 +804,6 @@ impl Cdp {
         false
     }
 
-    fn frame_field_ambiguous(text: &str) -> bool {
-        let text = text.trim();
-        text.is_empty()
-            || text == "://"
-            || text == "null"
-            || text.eq_ignore_ascii_case("about:blank")
-            || text.eq_ignore_ascii_case("about:srcdoc")
-            || url::Url::parse(text).is_ok_and(|url| matches!(url.scheme(), "about" | "data"))
-    }
-
-    fn carrier_data_payload_protected(guard: &Protected, text: &str) -> bool {
-        let Ok(url) = url::Url::parse(text) else {
-            return false;
-        };
-        if url.scheme() != "data" {
-            return false;
-        }
-        let rest = &url.as_str()[url.scheme().len() + 1..];
-        let payload = rest.split_once(',').map(|(_, data)| data).unwrap_or(rest).trim();
-        let Ok(embedded) = url::Url::parse(payload) else {
-            return false;
-        };
-        if matches!(embedded.scheme(), "data" | "about") {
-            return false;
-        }
-        guard.url(payload) || guard.url(&shield::web_socket_as_http(payload))
-    }
-
-    fn carrier_text_protected(guard: &Protected, text: &str) -> bool {
-        guard.url(text) || guard.url(&shield::web_socket_as_http(text)) || Self::carrier_data_payload_protected(guard, text)
-    }
-
-    fn frame_carrier_protected(guard: &Protected, frame: &Value) -> bool {
-        if shield::loaded_urls_protected(guard, frame) {
-            return true;
-        }
-        ["url", "securityOrigin", "origin"].iter().any(|key| {
-            frame
-                .get(*key)
-                .and_then(Value::as_str)
-                .is_some_and(|text| Self::carrier_data_payload_protected(guard, text))
-        })
-    }
-
-    fn params_carrier_protected(guard: &Protected, value: &Value) -> bool {
-        shield::loaded_urls_protected(guard, value)
-    }
-
-    fn frame_carrier_fields_ordinary(guard: &Protected, frame: &Value) -> bool {
-        let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
-        let origin = frame
-            .get("securityOrigin")
-            .or_else(|| frame.get("origin"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        !Self::frame_field_ambiguous(url)
-            && !Self::frame_field_ambiguous(origin)
-            && !Self::carrier_text_protected(guard, url)
-            && !Self::carrier_text_protected(guard, origin)
-    }
-
-    fn frame_carrier_ordinary(&self, frame: &Value) -> bool {
-        if Self::frame_carrier_fields_ordinary(&self.guard, frame) {
-            return true;
-        }
-        let url = frame.get("url").and_then(Value::as_str).unwrap_or("");
-        let unreachable = frame
-            .get("unreachableUrl")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let name = frame.get("name").and_then(Value::as_str).unwrap_or("");
-        (Self::chrome_error(url) || self.guard.error_page_url(url) || !unreachable.is_empty())
-            && self.ordinary_unreachable(unreachable)
-            && self.proof_host_matches(name, unreachable)
-    }
-
-    fn frame_shaped(value: &Value) -> bool {
-        value.get("loaderId").is_some() && value.get("securityOrigin").is_some()
-    }
-
-    fn walk_frame_shaped<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    Self::walk_frame_shaped(item, out);
-                }
-            }
-            Value::Object(map) => {
-                if let Some(frame) = map.get("frame") {
-                    if Self::frame_shaped(frame) {
-                        out.push(frame);
-                    }
-                } else if Self::frame_shaped(value) {
-                    out.push(value);
-                }
-                for (key, item) in map {
-                    if key == "frame" {
-                        continue;
-                    }
-                    Self::walk_frame_shaped(item, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn scrub_protected_child_frames(guard: &Protected, node: &mut Value) {
-        let Some(children) = node.get_mut("childFrames").and_then(Value::as_array_mut) else {
-            return;
-        };
-        for child in children {
-            let protected = child
-                .get("frame")
-                .is_some_and(|frame| Self::frame_carrier_protected(guard, frame));
-            if protected {
-                Self::drop_non_url_strings(child);
-                continue;
-            }
-            Self::scrub_protected_child_frames(guard, child);
-            Self::scrub_protected_resources(guard, child);
-        }
-    }
-
-    fn scrub_protected_resources(guard: &Protected, node: &mut Value) {
-        if let Some(resources) = node.get_mut("resources").and_then(Value::as_array_mut) {
-            for resource in resources {
-                let protected = shield::loaded_urls_protected(guard, resource)
-                    || resource
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| Self::carrier_data_payload_protected(guard, text));
-                if protected {
-                    Self::drop_non_url_strings(resource);
-                }
-            }
-        }
-        if let Some(children) = node.get_mut("childFrames").and_then(Value::as_array_mut) {
-            for child in children {
-                Self::scrub_protected_resources(guard, child);
-            }
-        }
-    }
-
-    fn drop_non_url_strings(value: &mut Value) {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    Self::drop_non_url_strings(item);
-                }
-            }
-            Value::Object(map) => {
-                let keys: Vec<String> = map.keys().cloned().collect();
-                for key in keys {
-                    let urlish = key.to_ascii_lowercase().ends_with("url")
-                        || matches!(
-                            key.as_str(),
-                            "origin"
-                                | "securityOrigin"
-                                | "ownerOrigin"
-                                | "topLevelSite"
-                                | "scopeURL"
-                                | "scriptURL"
-                        );
-                    if urlish {
-                        if let Some(item) = map.get_mut(&key) {
-                            Self::drop_non_url_strings(item);
-                        }
-                        continue;
-                    }
-                    if matches!(
-                        key.as_str(),
-                        "id" | "loaderId"
-                            | "parentId"
-                            | "frameId"
-                            | "parentFrameId"
-                            | "childFrames"
-                            | "frame"
-                            | "resources"
-                            | "entries"
-                    ) {
-                        if let Some(item) = map.get_mut(&key) {
-                            Self::drop_non_url_strings(item);
-                        }
-                        continue;
-                    }
-                    match map.get_mut(&key) {
-                        Some(Value::String(text)) => *text = String::new(),
-                        Some(item) => Self::drop_non_url_strings(item),
-                        None => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn map_frame_shaped(map: &serde_json::Map<String, Value>) -> bool {
-        map.contains_key("loaderId") && map.contains_key("securityOrigin")
-    }
-
-    fn blank_frame_names_by_ids(value: &mut Value, ids: &BTreeSet<String>) {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    Self::blank_frame_names_by_ids(item, ids);
-                }
-            }
-            Value::Object(map) => {
-                if Self::map_frame_shaped(map) {
-                    let id = map.get("id").and_then(Value::as_str).unwrap_or("");
-                    if ids.contains(id) {
-                        if map.contains_key("name") {
-                            map.insert("name".into(), Value::String(String::new()));
-                        }
-                    }
-                }
-                for item in map.values_mut() {
-                    Self::blank_frame_names_by_ids(item, ids);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn scrub_frame_by_ids(value: &mut Value, ids: &BTreeSet<String>) {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    Self::scrub_frame_by_ids(item, ids);
-                }
-            }
-            Value::Object(map) => {
-                if Self::map_frame_shaped(map) {
-                    let id = map.get("id").and_then(Value::as_str).unwrap_or("");
-                    if ids.contains(id) {
-                        let mut owned = Value::Object(std::mem::take(map));
-                        Self::drop_non_url_strings(&mut owned);
-                        if let Value::Object(replaced) = owned {
-                            *map = replaced;
-                        }
-                        return;
-                    }
-                }
-                for item in map.values_mut() {
-                    Self::scrub_frame_by_ids(item, ids);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn history_entry_protected(guard: &Protected, entry: &Value) -> bool {
-        if shield::loaded_urls_protected(guard, entry) {
-            return true;
-        }
-        ["url", "userTypedURL"].iter().any(|key| {
-            entry
-                .get(*key)
-                .and_then(Value::as_str)
-                .is_some_and(|text| Self::carrier_text_protected(guard, text))
-        })
-    }
-
-    fn sanitize_history_entry_urls(guard: &Protected, entry: &mut Value) {
-        for key in ["url", "userTypedURL"] {
-            let Some(Value::String(text)) = entry.get_mut(key) else {
-                continue;
-            };
-            if Self::carrier_data_payload_protected(guard, text) {
-                *text = "about:blank".into();
-                continue;
-            }
-            if guard.url(text) || guard.url(&shield::web_socket_as_http(text)) {
-                let (redacted, _) = shield::redact_text(guard, text);
-                *text = redacted;
-            }
-        }
-    }
-
-    fn history_protected_flags(&self, result: &Value) -> Vec<bool> {
-        result
-            .get("entries")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| Self::history_entry_protected(&self.guard, entry))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn strip_protected_history_carriers(&self, result: &mut Value, protected: &[bool]) {
-        let Some(entries) = result.get_mut("entries").and_then(Value::as_array_mut) else {
-            return;
-        };
-        for (entry, is_protected) in entries.iter_mut().zip(protected.iter().copied()) {
-            if !is_protected {
-                continue;
-            }
-            Self::drop_non_url_strings(entry);
-            Self::sanitize_history_entry_urls(&self.guard, entry);
-        }
-    }
-
-    fn clear_protected_history_non_urls(result: &mut Value, protected: &[bool]) {
-        let Some(entries) = result.get_mut("entries").and_then(Value::as_array_mut) else {
-            return;
-        };
-        for (entry, is_protected) in entries.iter_mut().zip(protected.iter().copied()) {
-            if is_protected {
-                Self::drop_non_url_strings(entry);
-            }
-        }
-    }
-
-    fn latch_frame_carrier_session(&mut self, session_id: Option<&str>) -> String {
-        if let Some(target) = session_id.and_then(|session| self.session_target(session)) {
-            self.protect_target(&target);
-        }
-        if let Some(session) = session_id {
-            self.block(session);
-        }
-        self.refusal()
-    }
-
-    fn document_carrier_ordinary(&self, target: &str) -> bool {
-        self.documents.get(target).is_some_and(|doc| {
-            !Self::frame_field_ambiguous(&doc.url)
-                && !Self::frame_field_ambiguous(&doc.origin)
-                && !Self::carrier_text_protected(&self.guard, &doc.url)
-                && !Self::carrier_text_protected(&self.guard, &doc.origin)
-        })
-    }
-
-    fn frame_map_fields_ordinary(guard: &Protected, map: &serde_json::Map<String, Value>) -> bool {
-        let url = map.get("url").and_then(Value::as_str).unwrap_or("");
-        let origin = map
-            .get("securityOrigin")
-            .or_else(|| map.get("origin"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        !Self::frame_field_ambiguous(url)
-            && !Self::frame_field_ambiguous(origin)
-            && !Self::carrier_text_protected(guard, url)
-            && !Self::carrier_text_protected(guard, origin)
-    }
-
-    fn frame_map_protected(guard: &Protected, map: &serde_json::Map<String, Value>) -> bool {
-        for key in ["url", "securityOrigin", "origin"] {
-            if let Some(text) = map.get(key).and_then(Value::as_str) {
-                if guard.url(text)
-                    || guard.url(&shield::web_socket_as_http(text))
-                    || Self::carrier_data_payload_protected(guard, text)
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn frame_map_ordinary(&self, map: &serde_json::Map<String, Value>) -> bool {
-        if Self::frame_map_fields_ordinary(&self.guard, map) {
-            return true;
-        }
-        let url = map.get("url").and_then(Value::as_str).unwrap_or("");
-        let unreachable = map.get("unreachableUrl").and_then(Value::as_str).unwrap_or("");
-        let name = map.get("name").and_then(Value::as_str).unwrap_or("");
-        (Self::chrome_error(url) || self.guard.error_page_url(url) || !unreachable.is_empty())
-            && self.ordinary_unreachable(unreachable)
-            && self.proof_host_matches(name, unreachable)
-    }
-
-    fn blank_unclassified_frame_names(&self, value: &mut Value) {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    self.blank_unclassified_frame_names(item);
-                }
-            }
-            Value::Object(map) => {
-                if Self::map_frame_shaped(map)
-                    && !self.frame_map_ordinary(map)
-                    && !Self::frame_map_protected(&self.guard, map)
-                {
-                    if map.contains_key("name") {
-                        map.insert("name".into(), Value::String(String::new()));
-                    }
-                }
-                for item in map.values_mut() {
-                    self.blank_unclassified_frame_names(item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn inherit_blank_frame(frame: &Value) -> bool {
-        let url = frame.get("url").and_then(Value::as_str).unwrap_or("").trim();
-        url.is_empty()
-            || url.eq_ignore_ascii_case("about:blank")
-            || url.eq_ignore_ascii_case("about:srcdoc")
-    }
-
-    fn frame_security_origin(frame: &Value) -> &str {
-        frame
-            .get("securityOrigin")
-            .or_else(|| frame.get("origin"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    }
-
-    fn ordinary_by_inheritance(
-        &self,
-        frame: &Value,
-        parent: Option<&Value>,
-        doc_ok: bool,
-    ) -> bool {
-        if !doc_ok || !Self::inherit_blank_frame(frame) {
-            return false;
-        }
-        let origin = Self::frame_security_origin(frame);
-        if Self::frame_field_ambiguous(origin) || Self::carrier_text_protected(&self.guard, origin) {
-            return false;
-        }
-        let Some(parent) = parent else {
-            return false;
-        };
-        if !self.frame_carrier_ordinary(parent)
-            && !Self::frame_carrier_fields_ordinary(&self.guard, parent)
-        {
-            return false;
-        }
-        origin == Self::frame_security_origin(parent)
-    }
-
-    fn frame_is_ordinary(&self, frame: &Value, parent: Option<&Value>, doc_ok: bool) -> bool {
-        self.frame_carrier_ordinary(frame)
-            || self.ordinary_by_inheritance(frame, parent, doc_ok)
-    }
-
-    fn walk_frames_with_parent<'a>(
-        node: &'a Value,
-        parent: Option<&'a Value>,
-        out: &mut Vec<(&'a Value, Option<&'a Value>)>,
-    ) {
-        let frame = node.get("frame").filter(|frame| Self::frame_shaped(frame));
-        if let Some(frame) = frame {
-            out.push((frame, parent));
-            if let Some(children) = node.get("childFrames").and_then(Value::as_array) {
-                for child in children {
-                    Self::walk_frames_with_parent(child, Some(frame), out);
-                }
-            }
-            return;
-        }
-        if let Some(tree) = node.get("frameTree") {
-            Self::walk_frames_with_parent(tree, None, out);
-        }
-    }
-
-    fn clear_frame_carrier_verify(&mut self, target: &str) {
-        self.frame_carrier_verify.remove(target);
-    }
-
-    fn apply_verify_frame_names(
-        &self,
-        result: &mut Value,
-        fresh: &Value,
-        target: &str,
-    ) -> (BTreeSet<String>, BTreeSet<String>) {
-        let mut blank_ids = BTreeSet::new();
-        let mut scrub_ids = BTreeSet::new();
-        let Some(fresh_tree) = fresh.get("frameTree") else {
-            self.blank_unclassified_frame_names(result);
-            return (blank_ids, scrub_ids);
-        };
-        if fresh_tree.get("frame").is_none() {
-            self.blank_unclassified_frame_names(result);
-            return (blank_ids, scrub_ids);
-        }
-        let mut fresh_frames = Vec::new();
-        Self::walk_frame_shaped(fresh_tree, &mut fresh_frames);
-        let mut fresh_by_id = BTreeMap::new();
-        for frame in &fresh_frames {
-            if let Some(id) = frame.get("id").and_then(Value::as_str) {
-                fresh_by_id.insert(id.to_string(), *frame);
-            }
-        }
-        let any_fresh_protected = fresh_frames
-            .iter()
-            .any(|frame| Self::frame_carrier_protected(&self.guard, frame));
-        for (id, frame) in &fresh_by_id {
-            if Self::frame_carrier_protected(&self.guard, frame) {
-                scrub_ids.insert(id.clone());
-            }
-        }
-        if !scrub_ids.is_empty() {
-            Self::scrub_frame_by_ids(result, &scrub_ids);
-        }
-        let mut with_parent = Vec::new();
-        if let Some(tree) = result.get("frameTree") {
-            Self::walk_frames_with_parent(tree, None, &mut with_parent);
-        }
-        let doc_ok = self.document_carrier_ordinary(target);
-        for (frame, parent) in &with_parent {
-            if self.frame_is_ordinary(frame, *parent, doc_ok)
-                || Self::frame_carrier_protected(&self.guard, frame)
-            {
-                continue;
-            }
-            let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
-            let keep = doc_ok
-                && !any_fresh_protected
-                && !id.is_empty()
-                && fresh_by_id.get(id).is_some_and(|fresh_frame| {
-                    Self::frame_carrier_fields_ordinary(&self.guard, fresh_frame)
-                });
-            if !keep {
-                if id.is_empty() {
-                    self.blank_unclassified_frame_names(result);
-                    blank_ids.clear();
-                    return (blank_ids, scrub_ids);
-                }
-                blank_ids.insert(id.to_string());
-            }
-        }
-        if !blank_ids.is_empty() {
-            Self::blank_frame_names_by_ids(result, &blank_ids);
-        }
-        (blank_ids, scrub_ids)
-    }
-
-    fn admit_frame_carrier_reply(
-        &mut self,
-        session_id: Option<&str>,
-        result: &mut Value,
-    ) -> Result<(), String> {
-        let root = result.pointer("/frameTree/frame");
-        let root_protected = root.is_some_and(|frame| Self::frame_carrier_protected(&self.guard, frame));
-        if root_protected {
-            return Err(self.latch_frame_carrier_session(session_id));
-        }
-        if let Some(tree) = result.get_mut("frameTree") {
-            Self::scrub_protected_child_frames(&self.guard, tree);
-            Self::scrub_protected_resources(&self.guard, tree);
-        }
-        let mut with_parent = Vec::new();
-        if let Some(tree) = result.get("frameTree") {
-            Self::walk_frames_with_parent(tree, None, &mut with_parent);
-        }
-        let target = session_id.and_then(|session| self.session_target(session));
-        let doc_ok = target
-            .as_ref()
-            .is_some_and(|id| self.document_carrier_ordinary(id));
-        let mut verify_ids = BTreeSet::new();
-        for (frame, parent) in &with_parent {
-            if self.frame_is_ordinary(frame, *parent, doc_ok)
-                || Self::frame_carrier_protected(&self.guard, frame)
-            {
-                continue;
-            }
-            let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
-            if id.is_empty() {
-                self.blank_unclassified_frame_names(result);
-                return Ok(());
-            }
-            verify_ids.insert(id.to_string());
-        }
-        if verify_ids.is_empty() {
-            return Ok(());
-        }
-        let Some(session) = session_id else {
-            self.blank_unclassified_frame_names(result);
-            return Ok(());
-        };
-        let Some(target) = target else {
-            self.blank_unclassified_frame_names(result);
-            return Ok(());
-        };
-        let root_loader = result
-            .pointer("/frameTree/frame/loaderId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let cache_loader = self
-            .documents
-            .get(&target)
-            .map(|doc| doc.loader_id.clone())
-            .filter(|id| !id.is_empty())
-            .unwrap_or(root_loader.clone());
-        if let Some(cached) = self.frame_carrier_verify.get(&target) {
-            if cached.root_loader_id == cache_loader && cached.unclassified == verify_ids {
-                if !cached.scrub_ids.is_empty() {
-                    Self::scrub_frame_by_ids(result, &cached.scrub_ids);
-                }
-                if !cached.blank_ids.is_empty() {
-                    Self::blank_frame_names_by_ids(result, &cached.blank_ids);
-                }
-                return Ok(());
-            }
-        }
-        #[cfg(test)]
-        {
-            self.frame_carrier_tree_reads += 1;
-        }
-        let fresh = match self.raw_call(
-            "Page.getFrameTree",
-            json!({}),
-            Some(session),
-            DOCUMENT_CHECK,
-        ) {
-            Ok(tree) => tree,
-            Err(_) => {
-                self.blank_unclassified_frame_names(result);
-                self.frame_carrier_verify.insert(
-                    target,
-                    FrameCarrierVerifyCache {
-                        root_loader_id: cache_loader,
-                        unclassified: verify_ids.clone(),
-                        blank_ids: verify_ids,
-                        scrub_ids: BTreeSet::new(),
-                    },
-                );
-                return Ok(());
-            }
-        };
-        if fresh
-            .pointer("/frameTree/frame")
-            .is_some_and(|frame| Self::frame_carrier_protected(&self.guard, frame))
-        {
-            self.clear_frame_carrier_verify(&target);
-            return Err(self.latch_frame_carrier_session(Some(session)));
-        }
-        if let Some(tree) = result.get_mut("frameTree") {
-            Self::scrub_protected_child_frames(&self.guard, tree);
-            Self::scrub_protected_resources(&self.guard, tree);
-        }
-        let (blank_ids, scrub_ids) = self.apply_verify_frame_names(result, &fresh, &target);
-        self.frame_carrier_verify.insert(
-            target,
-            FrameCarrierVerifyCache {
-                root_loader_id: cache_loader,
-                unclassified: verify_ids,
-                blank_ids,
-                scrub_ids,
-            },
-        );
-        Ok(())
-    }
-
     fn scrub_failed_load_carriers(&self, value: &mut Value, target: Option<&str>) {
         match value {
             Value::Array(items) => {
@@ -1478,14 +813,10 @@ impl Cdp {
             }
             Value::Object(map) => {
                 let url = map.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-                let origin = map
-                    .get("securityOrigin")
-                    .or_else(|| map.get("origin"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
                 let unreachable = map.get("unreachableUrl").and_then(Value::as_str).unwrap_or("").to_string();
-                let frame = map.contains_key("loaderId") && map.contains_key("securityOrigin");
+                let frame = map.contains_key("loaderId")
+                    && map.contains_key("securityOrigin")
+                    && map.contains_key("mimeType");
                 let history = map.contains_key("userTypedURL") || map.contains_key("transitionType");
                 let window_open = map.contains_key("windowName");
                 let download = map.contains_key("suggestedFilename");
@@ -1493,22 +824,14 @@ impl Cdp {
                     && map.get("type").and_then(Value::as_str).is_some_and(|kind| {
                         matches!(kind, "page" | "iframe" | "background_page" | "webview" | "app" | "other")
                     });
-                let hide = self.failed_load_host_hidden(target, &url, &unreachable)
-                    || self.guard.url(&origin)
-                    || shield::loaded_urls_protected(&self.guard, &Value::Object(map.clone()));
+                let hide = self.failed_load_host_hidden(target, &url, &unreachable);
                 let error = Self::chrome_error(&url) || self.guard.error_page_url(&url) || !unreachable.is_empty() || history && target.is_some_and(|id| {
                     self.documents.get(id).is_some_and(|doc| Self::chrome_error(&doc.url) || self.guard.error_page_url(&doc.url) || !doc.unreachable_url.is_empty())
                 });
-                let protected_url = self.guard.url(&url) || self.guard.url(&unreachable) || self.guard.url(&origin);
+                let protected_url = self.guard.url(&url) || self.guard.url(&unreachable);
                 if hide && (frame || history || window_open || download || target_info) {
                     if (frame || history || target_info) && (error || protected_url) {
-                        if frame {
-                            let mut owned = Value::Object(std::mem::take(map));
-                            Self::drop_non_url_strings(&mut owned);
-                            if let Value::Object(replaced) = owned {
-                                *map = replaced;
-                            }
-                        } else if map.contains_key("name") {
+                        if map.contains_key("name") {
                             map.insert("name".into(), Value::String(String::new()));
                         }
                     }
@@ -2776,22 +2099,9 @@ impl Cdp {
             }
             _ => {}
         }
-        if matches!(method, "Page.getFrameTree" | "Page.getResourceTree") {
-            self.admit_frame_carrier_reply(session_id, &mut result)?;
-        }
-        let history_flags = if method == "Page.getNavigationHistory" {
-            let flags = self.history_protected_flags(&result);
-            self.strip_protected_history_carriers(&mut result, &flags);
-            Some(flags)
-        } else {
-            None
-        };
+        shield::redact_strings(&self.guard, &mut result);
         let target = session_id.and_then(|session| self.session_target(session));
         self.scrub_failed_load_carriers(&mut result, target.as_deref());
-        shield::redact_strings(&self.guard, &mut result);
-        if let Some(flags) = history_flags.as_deref() {
-            Self::clear_protected_history_non_urls(&mut result, flags);
-        }
         Ok(result)
     }
 
@@ -3369,7 +2679,6 @@ impl Cdp {
         }
         self.clear_kept_url_latch_if_fresh_unkept(target_id, &url, &doc);
         self.documents.insert(target_id.to_string(), doc.clone());
-        self.clear_frame_carrier_verify(target_id);
         self.note_iframe_own_frame(target_id, &frame_id);
         Some(Some((url, doc)))
     }
@@ -4360,7 +3669,6 @@ impl Cdp {
         self.documents.insert(target.clone(), MainDocument {
             frame_id: frame_id.to_string(), loader_id, proof_frame_id, proof_loader_id, url: url.clone(), origin: origin.clone(), unreachable_url, navigating: false, navigation_url: String::new(), previous: protected, probed: false,
         });
-        self.clear_frame_carrier_verify(&target);
         self.note_iframe_own_frame(&target, &frame_id);
         if protected {
             self.protect_target(&target);
@@ -4695,7 +4003,6 @@ impl Cdp {
         } else {
             (String::new(), String::new())
         };
-        self.clear_frame_carrier_verify(&target);
         self.documents.insert(target, MainDocument {
             frame_id, loader_id, proof_frame_id, proof_loader_id, url: text(&frame, "url"), origin: text(&frame, "securityOrigin"), unreachable_url,
             navigating: false, navigation_url: String::new(), previous: false, probed: true,
@@ -5397,7 +4704,6 @@ impl Cdp {
                     let navigation_url = params.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                     let matched = self.documents.get(&target).is_some_and(|doc| doc.frame_id == frame_id);
                     if matched {
-                        self.clear_frame_carrier_verify(&target);
                         if let Some(doc) = self.documents.get_mut(&target) {
                             doc.navigating = true;
                             doc.navigation_url = navigation_url;
@@ -6141,7 +5447,7 @@ impl Cdp {
         let terminal = self.terminal_network.contains(&key);
         let late_ordinary = terminal && matches!(value["method"].as_str(), Some("Network.responseReceivedExtraInfo" | "Network.requestWillBeSentExtraInfo")) && self.ordinary_late_extra_info(&value);
         if value.get("method").and_then(Value::as_str).is_some_and(|method| method.starts_with("Network.") && method != "Network.responseReceivedExtraInfo") && terminal && !late_ordinary { return }
-        let guarded = self.blocked.contains(&key.0) || Self::params_carrier_protected(&self.guard, &value["params"]) || self.hidden(&value) || self.redirects.contains(&key.1);
+        let guarded = self.blocked.contains(&key.0) || shield::loaded_urls_protected(&self.guard, &value["params"]) || self.hidden(&value) || self.redirects.contains(&key.1);
         if guarded && self.visible_redirect(&mut value) {
             let hop = value.get("method").and_then(Value::as_str) == Some("Network.requestWillBeSent");
             self.events.push(value.clone());
@@ -6163,17 +5469,17 @@ impl Cdp {
         self.adopt_guard_attach(&value);
         if self.blocked.contains(value.get("sessionId").and_then(Value::as_str).unwrap_or(""))
             || !value.get("method").and_then(Value::as_str).unwrap_or("").starts_with("Target.")
-                && Self::params_carrier_protected(&self.guard, &value["params"])
+                && shield::loaded_urls_protected(&self.guard, &value["params"])
         {
             self.fail_seen_network(&value);
             return;
         }
         let echoed_url = (value["method"] == "Network.requestWillBeSent" && value["params"]["type"] == "Document" && !guarded
             && !self.protected_body_requests.contains(&key.1) && self.client_navigation_urls.get(&key.0).is_some_and(|url| value.pointer("/params/request/url").and_then(Value::as_str) == Some(url.as_str()))).then(|| value["params"]["request"]["url"].clone());
-        let event_target = value.get("sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session));
-        self.scrub_failed_load_carriers(&mut value, event_target.as_deref());
         shield::redact_strings(&self.guard, &mut value);
         if let Some(url) = echoed_url { value["params"]["request"]["url"] = url; }
+        let event_target = value.get("sessionId").and_then(Value::as_str).and_then(|session| self.session_target(session));
+        self.scrub_failed_load_carriers(&mut value, event_target.as_deref());
         let settle_guard = self.settling_attach.get()
             && matches!(value.get("method").and_then(Value::as_str), Some("Target.attachedToTarget") | Some("Target.detachedFromTarget"))
             && value.pointer("/params/sessionId").and_then(Value::as_str).is_some_and(|session| self.guard_sessions.contains(session));
@@ -7422,7 +6728,6 @@ mod tests {
     include!("interim_lock_test.rs");
     include!("lagging_attach_test.rs");
     include!("toctou_attach_read_test.rs");
-    include!("frame_carrier_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
@@ -7886,9 +7191,9 @@ mod tests {
             assert_eq!(history["entries"][0]["url"], "https://ordinary.example/ready");
             assert_eq!(history["entries"][0]["title"], "ordinary control");
             assert_eq!(history["entries"][1]["id"], 702);
-            assert_eq!(history["entries"][1]["url"], origin, "url");
-            assert_eq!(history["entries"][1]["userTypedURL"], origin, "userTypedURL");
-            assert_eq!(history["entries"][1]["title"], "", "title");
+            for key in ["url", "title", "userTypedURL"] {
+                assert_eq!(history["entries"][1][key], origin, "{key}");
+            }
             assert!(!history.to_string().contains("HISTORY_MARK"));
             let sent = cdp.next_id;
             for expression in ["location.href", "Array.from(document.documentElement.innerHTML, c => c.codePointAt(0))"] {
