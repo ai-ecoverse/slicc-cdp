@@ -747,3 +747,278 @@ test('HAR --content embed drops a worker body if the creator flips during getRes
     }
   );
 });
+
+const BLANK = { id: 'TAB', loaderId: 'BLANK', url: 'about:blank', securityOrigin: '://' };
+const PAGE = ['https://example.test/page', 'NEXT'];
+
+function frameOf(url, loaderId) {
+  return { id: 'TAB', loaderId, url, securityOrigin: new URL(url).origin };
+}
+
+async function settle(predicate, ms) {
+  const deadline = Date.now() + ms;
+  while (!predicate() && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 5));
+}
+
+function pageDocument(event, url, loaderId) {
+  return {
+    start() {
+      event('Network.requestWillBeSent', {
+        requestId: 'DOC',
+        loaderId,
+        frameId: 'TAB',
+        timestamp: 1,
+        wallTime: 1700000000,
+        documentURL: url,
+        type: 'Document',
+        request: { url, method: 'GET', headers: {} },
+      });
+      event('Network.responseReceived', {
+        requestId: 'DOC',
+        timestamp: 1.1,
+        type: 'Document',
+        response: { url, headers: {}, status: 200, statusText: 'OK', mimeType: 'text/html' },
+      });
+    },
+    finish() {
+      event('Network.loadingFinished', { requestId: 'DOC', timestamp: 1.2 });
+    },
+  };
+}
+
+function staleCheck(plan) {
+  const state = { stage: 'idle', trees: [], injected: false, storm: false, checks: 0 };
+  const at = plan.at ?? {};
+  const inject = (emitters) => {
+    if (state.injected) return;
+    state.injected = true;
+    workerNetwork(emitters.get('WORKER'), 'BODY', 'https://example.test/body');
+  };
+  const intercept = (message, send, close, { backend, emitters }) => {
+    if (
+      state.stage === 'drained' &&
+      at.body === 'inject' &&
+      message.method === 'Network.getResponseBody' &&
+      message.params?.requestId === 'DOC'
+    )
+      inject(emitters);
+    if (message.method !== 'Page.getFrameTree') return false;
+    const tab = backend.targets.find((item) => item.targetId === 'TAB');
+    const event = (method, params) => send({ method, sessionId: message.sessionId, params });
+    const reply = (frame, delay = 0) =>
+      setTimeout(
+        () =>
+          send({ id: message.id, sessionId: message.sessionId, result: { frameTree: { frame } } }),
+        delay
+      );
+    if (state.storm) {
+      if (state.trees.length % 2 === 0) {
+        state.checks += 1;
+        state.trees.push('stale');
+        event('Page.frameNavigated', { frame: frameOf(...PAGE), type: 'Navigation' });
+        reply(BLANK, 25);
+      } else {
+        const frame = plan.storm === 'verified' ? frameOf(...PAGE) : BLANK;
+        state.trees.push(frame.url);
+        reply(frame);
+      }
+      return true;
+    }
+    if (state.stage === 'armed') {
+      state.stage = 'drained';
+      state.trees.push('stale');
+      if (plan.commit) {
+        tab.url = plan.commit[0];
+        tab.loaderId = plan.commit[1];
+      }
+      const document = plan.document && pageDocument(event, tab.url, tab.loaderId);
+      document?.start();
+      if (plan.navigate)
+        event('Page.frameNavigated', { frame: frameOf(tab.url, tab.loaderId), type: 'Navigation' });
+      document?.finish();
+      reply(BLANK, 25);
+      return true;
+    }
+    if (state.stage !== 'drained') return false;
+    const step = at[state.trees.length] ?? {};
+    if (step.flip) {
+      tab.url = step.flip[0];
+      tab.loaderId = step.flip[1];
+    }
+    if (step.inject) inject(emitters);
+    if (step.reply) {
+      state.trees.push(step.reply.url);
+      reply(step.reply);
+      return true;
+    }
+    state.trees.push(tab.url);
+    return false;
+  };
+  return { state, intercept, inject };
+}
+
+async function staleRow(plan, check) {
+  const { state, intercept, inject } = staleCheck(plan);
+  await workerFixture(
+    async ({ home, backend, tab, file, held, emitters }) => {
+      const { pageEmit } = await admitWorker(backend, emitters, held);
+      tab.url = 'about:blank';
+      tab.loaderId = 'BLANK';
+      let armedAt = held.events().length;
+      let rounds;
+      let early;
+      if (plan.storm) {
+        state.storm = true;
+        await settle(
+          () =>
+            held
+              .events()
+              .slice(armedAt)
+              .some((item) => item.event === 'paused'),
+          1500
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        rounds = state.checks;
+        state.storm = false;
+        inject(emitters);
+      } else {
+        pageEmit('Page.frameNavigated', { frame: BLANK, type: 'Navigation' });
+        await held.event('paused');
+        armedAt = held.events().length;
+        state.stage = 'armed';
+        await waitFor(() => state.stage === 'drained', 'stale page check');
+        if (plan.late) {
+          if (plan.resumes) await held.event('resumed');
+          await settle(() => state.trees.length >= 3, 100);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          early = state.trees.length;
+          inject(emitters);
+        }
+      }
+      await waitFor(() => state.injected, 'worker request');
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const stopped = await harCommand(backend.url, ['har-stop'], home);
+      assert.equal(stopped.code, 0, stopped.stderr);
+      assert.equal((await held.ended).code, 0);
+      const har = JSON.parse(await readFile(file, 'utf8'));
+      const states = held
+        .events()
+        .slice(armedAt)
+        .filter((event) => event.event === 'paused' || event.event === 'resumed')
+        .map((event) => event.event);
+      const bodies = backend.calls
+        .filter((call) => call.method === 'Network.getResponseBody')
+        .map((call) => call.params.requestId);
+      const urls = har.log.entries.map((entry) => entry.request.url);
+      const body = har.log.entries.find(
+        (entry) => entry.request.url === 'https://example.test/body'
+      );
+      const detail = JSON.stringify({ states, rounds, trees: state.trees.slice(0, 40), har });
+      check({ states, bodies, body, urls, rounds, early, detail });
+    },
+    { flags: plan.flags ?? ['--content', 'embed'], intercept }
+  );
+}
+
+test('a stale failed page check does not pause the holder or drop the worker fetch that follows the resume', async () => {
+  await staleRow(
+    { commit: PAGE, document: true, navigate: true, at: { 2: { inject: true } }, flags: [] },
+    ({ states, bodies, body, urls, detail }) => {
+      assert.deepEqual(states, ['resumed'], detail);
+      assert.deepEqual(urls, ['https://example.test/page', 'https://example.test/body'], detail);
+      assert.equal(body.response.content.text, undefined, detail);
+      assert.deepEqual(bodies, [], detail);
+    }
+  );
+});
+
+test('a stale failed page check does not pause the holder or drop the worker body that follows the resume', async () => {
+  await staleRow(
+    { commit: PAGE, document: true, navigate: true, at: { body: 'inject' } },
+    ({ states, bodies, body, urls, detail }) => {
+      assert.deepEqual(states, ['resumed'], detail);
+      assert.deepEqual(urls, ['https://example.test/page', 'https://example.test/body'], detail);
+      assert.equal(body.response.content.text, 'ordinary-body', detail);
+      assert.deepEqual(bodies, ['DOC', 'BODY'], detail);
+    }
+  );
+});
+
+test('a check made stale only by a verified main document is checked again before any pause', async () => {
+  await staleRow(
+    { commit: PAGE, document: true, navigate: false, at: { 1: { inject: true } } },
+    ({ states, bodies, body, urls, detail }) => {
+      assert.deepEqual(states, ['resumed'], detail);
+      assert.deepEqual(urls, ['https://example.test/page', 'https://example.test/body'], detail);
+      assert.equal(body.response.content.text, 'ordinary-body', detail);
+      assert.deepEqual(bodies, ['BODY'], detail);
+    }
+  );
+});
+
+test('a check made stale only by a handled navigation is checked again before any pause', async () => {
+  await staleRow(
+    { commit: PAGE, navigate: true, at: { 1: { inject: true, reply: BLANK } } },
+    ({ states, bodies, body, detail }) => {
+      assert.deepEqual(states, ['resumed'], detail);
+      assert.equal(body?.response.content.text, 'ordinary-body', detail);
+      assert.deepEqual(bodies, ['BODY'], detail);
+    }
+  );
+});
+
+test('a check that is stale in every round pauses the holder after the last round', async () => {
+  await staleRow({ storm: 'verified' }, ({ states, bodies, body, rounds, detail }) => {
+    assert.equal(rounds, 4, detail);
+    assert.deepEqual(states, ['paused'], detail);
+    assert.equal(body, undefined, detail);
+    assert.deepEqual(bodies, [], detail);
+  });
+});
+
+test('a check kept stale by navigations that never verify stops after the last round and stays paused', async () => {
+  await staleRow({ storm: 'unverified' }, ({ states, bodies, body, rounds, detail }) => {
+    assert.equal(rounds, 4, detail);
+    assert.deepEqual(states, ['paused'], detail);
+    assert.equal(body, undefined, detail);
+    assert.deepEqual(bodies, [], detail);
+  });
+});
+
+test('a stale failed page check still pauses when the drain shows a protected page', async () => {
+  await staleRow(
+    { commit: ['https://seven.sliccy.ai/private', 'P'], navigate: true, late: true },
+    ({ states, bodies, body, detail }) => {
+      assert.ok(!states.includes('resumed'), detail);
+      assert.equal(body, undefined, detail);
+      assert.ok(!bodies.includes('BODY'), detail);
+    }
+  );
+});
+
+test('a page that turns protected between the drain and the re-check pauses the holder', async () => {
+  await staleRow(
+    {
+      commit: PAGE,
+      navigate: true,
+      at: { 2: { flip: ['https://seven.sliccy.ai/private', 'P'] } },
+      late: true,
+      resumes: true,
+    },
+    ({ states, bodies, body, detail }) => {
+      assert.deepEqual(states, ['resumed', 'paused'], detail);
+      assert.equal(body, undefined, detail);
+      assert.ok(!bodies.includes('BODY'), detail);
+    }
+  );
+});
+
+test('a failed page check with no state change keeps the holder paused and drops worker requests', async () => {
+  await staleRow({ late: true }, ({ states, bodies, body, early, detail }) => {
+    assert.deepEqual(states, [], detail);
+    assert.equal(early, 1, detail);
+    assert.equal(body, undefined, detail);
+    assert.ok(!bodies.includes('BODY'), detail);
+  });
+});

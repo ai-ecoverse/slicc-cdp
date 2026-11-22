@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const NONE: &str = "har-stop: no HAR recording in progress\n";
 const ALREADY: &str = "har-start: a HAR recording is already in progress\n";
+const RECHECKS: usize = 4;
 
 pub fn precheck(invocation: &Invocation) -> Option<String> {
     let command = invocation.command.as_deref()?;
@@ -170,7 +171,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
         if path.is_absolute() { path } else { invocation.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default().join(path) }
     };
     let mut holder = Holder {
-        files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true,
+        files, id, target: target.clone(), session: Some(session), path, main_frame: String::new(), seen: cdp.events().len(), paused: true, generation: 0,
         entries: Vec::new(), walls: Vec::new(), pending: BTreeMap::new(), failed: BTreeMap::new(), held: Vec::new(), denied: BTreeSet::new(),
         embed: invocation.flags.get("content").is_some_and(|value| value == "embed"),
         minimal: invocation.flags.get("mode").is_some_and(|value| value == "minimal"),
@@ -256,6 +257,7 @@ struct Holder {
     main_frame: String,
     seen: usize,
     paused: bool,
+    generation: u64,
     entries: Vec<Value>,
     walls: Vec<Option<u64>>,
     pending: BTreeMap<String, Pending>,
@@ -326,7 +328,31 @@ impl Holder {
         self.main_frame = text(frame, "id").to_string();
         let known = ordinary(cdp.guard(), text(frame, "url")) && ordinary(cdp.guard(), text(frame, "securityOrigin"))
             && !text(frame, "id").is_empty() && !text(frame, "loaderId").is_empty() && text(frame, "unreachableUrl").is_empty();
+        if known { self.generation += 1; }
         known.then(|| text(frame, "loaderId").to_string())
+    }
+
+    fn recheck(&mut self, cdp: &mut Cdp) -> Result<bool, String> {
+        for _ in 0..RECHECKS {
+            let started = self.generation;
+            if let Some(loader) = self.verify(cdp) {
+                if self.paused { self.paused = false; emit(self.status("resumed"))?; }
+                self.release(cdp, &loader, false)?;
+                return Ok(false);
+            }
+            if self.absorb(cdp)? { return Ok(true) }
+            if self.generation == started { break }
+        }
+        let protected = self.session.as_deref().is_some_and(|session| cdp.content_blocked(session))
+            || cdp.is_protected_target(&self.target);
+        if protected {
+            self.pending.retain(|_, pending| pending.recovering_document);
+            self.failed.retain(|_, pending| pending.recovering_document);
+            self.held.clear();
+        }
+        self.checkpoint(cdp)?;
+        self.pause()?;
+        Ok(false)
     }
 
     fn watch(&mut self, cdp: &mut Cdp, state: &Session, endpoint: &str, input: &mut crate::holder_input::Input) -> Result<String, String> {
@@ -353,21 +379,7 @@ impl Holder {
             }
             if Instant::now() >= retry {
                 if self.session.is_none() { self.reattach(cdp, state, endpoint)?; }
-                if let Some(loader) = self.verify(cdp) {
-                    if self.paused { self.paused = false; emit(self.status("resumed"))?; }
-                    self.release(cdp, &loader, false)?;
-                } else {
-                    if self.absorb(cdp)? { return Ok("closed".into()) }
-                    let protected = self.session.as_deref().is_some_and(|session| cdp.content_blocked(session))
-                        || cdp.is_protected_target(&self.target);
-                    if protected {
-                        self.pending.retain(|_, pending| pending.recovering_document);
-                        self.failed.retain(|_, pending| pending.recovering_document);
-                        self.held.clear();
-                    }
-                    self.checkpoint(cdp)?;
-                    self.pause()?;
-                }
+                if self.recheck(cdp)? { return Ok("closed".into()) }
                 retry = Instant::now() + Duration::from_millis(250);
             }
             for notice in cdp.take_notices() { eprint!("{notice}"); }
@@ -434,6 +446,7 @@ impl Holder {
             let id = text(params, "requestId");
             match text(&event, "method") {
                 "Page.frameNavigated" if !worker && params["frame"].get("parentId").is_none() => {
+                    self.generation += 1;
                     self.checkpoint(cdp)?;
                     emit(self.status("checkpoint"))?;
                     if let Some(loader) = self.verify(cdp) {
