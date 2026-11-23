@@ -147,7 +147,7 @@ pub fn hold(cdp: &mut Cdp, state: &mut Session, invocation: &Invocation, endpoin
     if read(&files.record).is_some_and(|value| recent(&files, &value)) { return Output::err(ALREADY) }
     let alias = invocation.command.as_deref() == Some("record");
     let target = if alias {
-        browser::create_target(cdp, state, "about:blank", true)
+        browser::create_target(cdp, state, "about:blank", true).map(|opened| opened.id)
     } else {
         browser::list_pages(cdp).and_then(|pages| resolve_target(cdp, invocation, state, &pages, false))
     };

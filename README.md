@@ -42,6 +42,8 @@ curlwright -i https://example.com/
 
 `open` attaches to a running Chrome or launches one; `curlwright` and every other `playwright-cli` command only attach. Both pick the browser the same way, described in [Finding a browser](#finding-a-browser). Run `playwright-cli --help` for all commands.
 
+If `open` or `tab-new` observes the requested HTTP(S) document commit in the new tab but cannot save its console and request trace, it reports the completed navigation with a warning and saves no partial trace. This does not grant access to the page: `snapshot`, `screenshot` and other reads still need their own frame checks.
+
 The client tries every address a `--cdp` host resolves to, and `localhost`, `127.0.0.1`, `::1` (`[::1]`) and `0.0.0.0` all mean this machine: both `::1` and `127.0.0.1` are tried. Every address but the last gets two seconds to connect.
 
 A `wss://` or `https://` endpoint on this machine with a self-signed certificate takes a pin: set `SLICC_CDP_CERT_SHA256` to the certificate's SHA-256 fingerprint, as 64 hex digits, with or without colons (`openssl x509 -noout -fingerprint -sha256`). The certificate must then match exactly, and it is checked before anything is sent, so a wrong certificate never sees the token in a URL. The pin replaces certificate verification only for names of this machine (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0` and `::`); any other host is verified as usual, and a value that isn't a fingerprint is an error. The wasm build has no TLS: in the kernel, a program reaches the browser through the `ws://` URL in `SLICC_CDP_URL`, and the page that hosts the kernel holds any `wss://` socket.

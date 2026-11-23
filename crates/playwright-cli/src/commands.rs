@@ -341,13 +341,17 @@ fn cmd_open(
     report.url(url);
     report.begin(cdp);
     match browser::create_target(cdp, state, url, foreground) {
-        Ok(target_id) => {
+        Ok(browser::OpenedTab { id: target_id, trace_missing }) => {
             if let Some(started) = started.as_mut() {
                 started.disarm();
             }
             report.tab(&target_id);
             state.current = Some(target_id.clone());
-            Output::ok(format!("Opened {} in new tab [targetId: {target_id}]\n", sanitize::display_url(url)))
+            let mut result = Output::ok(format!("Opened {} in new tab [targetId: {target_id}]\n", sanitize::display_url(url)));
+            if trace_missing {
+                result.stderr.push_str("The tab opened, but its console and request trace was not saved.\n");
+            }
+            result
         }
         Err(message) => Output::err(message),
     }
@@ -1168,7 +1172,7 @@ pub(crate) fn resolve_target(
     }
     if create_for_goto && pages.is_empty() {
         if let Some(url) = invocation.positionals.first() {
-            return browser::create_target(cdp, state, url, false);
+            return browser::create_target(cdp, state, url, false).map(|opened| opened.id);
         }
     }
     Err(
