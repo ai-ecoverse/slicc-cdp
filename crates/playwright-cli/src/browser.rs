@@ -61,12 +61,37 @@ pub fn is_internal(url: &str, title: &str) -> bool {
         || (url.is_empty() && title.to_ascii_lowercase().ends_with("popup"))
 }
 
+pub struct OpenedTab {
+    pub id: String,
+    pub trace_missing: bool,
+}
+
+fn opened_destination(events: &[Value], session: &str, navigation: &Value, url: &str) -> bool {
+    let (Some(id), Some(loader)) = (navigation["frameId"].as_str(), navigation["loaderId"].as_str()) else {
+        return false;
+    };
+    let Ok(destination) = url::Url::parse(url) else { return false };
+    if id.is_empty() || loader.is_empty() || !matches!(destination.scheme(), "http" | "https") {
+        return false;
+    }
+    let root = events.iter().rev()
+        .filter(|event| event["sessionId"] == session && event["method"] == "Page.frameNavigated")
+        .filter_map(|event| event.pointer("/params/frame"))
+        .find(|frame| frame.get("parentId").is_none());
+    root.is_some_and(|frame| {
+        let fragment = frame["urlFragment"].as_str().unwrap_or("");
+        frame["id"] == id && frame["loaderId"] == loader
+            && frame["unreachableUrl"].as_str().unwrap_or("").is_empty()
+            && frame["url"].as_str().is_some_and(|href| format!("{href}{fragment}") == destination.as_str())
+    })
+}
+
 pub fn create_target(
     cdp: &mut Cdp,
     state: &mut Session,
     url: &str,
     foreground: bool,
-) -> Result<String, String> {
+) -> Result<OpenedTab, String> {
     let blank = url.eq_ignore_ascii_case("about:blank");
     let result = cdp.call(
         "Target.createTarget",
@@ -100,10 +125,11 @@ pub fn create_target(
         return Err(message);
     }
     let mut abandon = false;
+    let mut navigation = None;
+    let mark = cdp.events().len();
     let loaded = if blank {
         cdp.wait_load(&session)
     } else {
-        let mark = cdp.events().len();
         match cdp.call("Page.navigate", json!({ "url": url }), Some(&session)) {
             Ok(result) => {
                 if let Some(error) = result
@@ -114,6 +140,7 @@ pub fn create_target(
                     abandon = true;
                     Err(format!("navigate: {error}\n"))
                 } else if navigation_commits(&result) {
+                    navigation = Some(result);
                     cdp.wait_load_since(&session, mark)
                 } else {
                     Ok(())
@@ -135,11 +162,19 @@ pub fn create_target(
         }
         return Err(message);
     }
-    let (console, requests) = traced?;
-    session::push_trace(state, &target_id, console, requests);
+    let trace_missing = match traced {
+        Ok((console, requests)) => {
+            session::push_trace(state, &target_id, console, requests);
+            false
+        }
+        Err(err) if err != cdp::RENDERER_CRASHED && !cdp::transport_error(&err)
+            && !cdp.guard().url(url) && navigation.as_ref().is_some_and(|nav|
+                opened_destination(cdp.events().get(mark..).unwrap_or_default(), &session, nav, url)) => true,
+        Err(err) => return Err(err),
+    };
     session::note_owned(state, &target_id);
     if let Some(proof) = cdp.created_blank(&target_id) { state.created_blanks.insert(target_id.clone(), proof); }
-    Ok(target_id)
+    Ok(OpenedTab { id: target_id, trace_missing })
 }
 
 pub fn watch_attach(cdp: &mut Cdp, state: &Session, target_id: &str) -> Result<String, String> {
@@ -1933,6 +1968,29 @@ mod tests {
         assert_eq!(committed_frame_url(&navigated("T", "C", "http://a/x"), "S", "C"), None);
         assert_eq!(committed_frame_url(&json!({ "method": "Page.loadEventFired", "sessionId": "S" }), "S", "C"), None);
         assert_eq!(committed_frame_url(&json!({ "method": "Page.frameNavigated", "sessionId": "S" }), "S", "C"), None);
+    }
+
+    #[test]
+    fn a_trace_failure_needs_the_matching_top_document_commit() {
+        let nav = json!({"frameId": "F", "loaderId": "L"});
+        let url = "https://ordinary.test/page";
+        let mut committed = navigated("S", "F", url);
+        committed["params"]["frame"]["loaderId"] = json!("L");
+        let matches = |events: &[Value], url| super::opened_destination(events, "S", &nav, url);
+        assert!(matches(std::slice::from_ref(&committed), url));
+        for (key, wrong) in [("loaderId", "old"), ("id", "other"), ("url", "about:blank"), ("unreachableUrl", url)] {
+            let mut later = committed.clone();
+            later["params"]["frame"][key] = json!(wrong);
+            assert!(!matches(&[committed.clone(), later], url));
+        }
+        let mut child = committed.clone();
+        child["params"]["frame"]["parentId"] = json!("parent");
+        assert!(!matches(&[child], url));
+        let mut other = committed.clone();
+        other["sessionId"] = json!("other");
+        assert!(!matches(&[other], url));
+        committed["params"]["frame"]["urlFragment"] = json!("#section");
+        assert!(matches(&[committed], "https://ordinary.test/page#section"));
     }
 
     #[test]

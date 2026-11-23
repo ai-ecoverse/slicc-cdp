@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
 import { fakeCdp } from './fake-cdp.mjs';
-import { nativeRunner } from './runners.mjs';
+import { kernelRunner, nativeRunner } from './runners.mjs';
 import './watchdog.mjs';
 
 const exe = (name) =>
@@ -11,9 +11,15 @@ const SEVEN = "slicc: refused: target is on seven's origin\n";
 const UNVERIFIED =
   'slicc: refused: slicc could not finish checking this target, so it left it alone; the browser may not answer the check\n';
 
-async function withFake(options, body) {
+const wasm = (name) => path.resolve('target/wasm32-wasip1/debug', `${name}.wasm`);
+const runners = {
+  native: (url) => nativeRunner(exe('playwright-cli'), exe('curlwright'), url),
+  wasi: (url) => kernelRunner(wasm('playwright-cli'), wasm('curlwright'), url),
+};
+
+async function withFake(options, body, runner = runners.native) {
   const fake = await fakeCdp(options);
-  const pw = nativeRunner(exe('playwright-cli'), exe('curlwright'), fake.url);
+  const pw = await runner(fake.url);
   try {
     const cwd = await pw.fresh();
     await body((args) => pw.playwright(args, cwd), fake);
@@ -22,6 +28,44 @@ async function withFake(options, body) {
     await fake.close();
   }
 }
+
+const url = 'https://ordinary.test/article';
+const deniedTrace = {
+  refuse: ['Network.getAllCookies'],
+  refusalMessage: 'slicc: refused: trace read',
+  traffic: [{ url: 'https://ordinary.test/unsaved' }],
+};
+
+for (const [kind, runner] of Object.entries(runners)) {
+  test(`${kind}: tab-new reports the opened tab, not a failed trace read`, async () => {
+    await withFake(
+      deniedTrace,
+      async (run, fake) => {
+        const opened = await run(['tab-new', url]);
+        assert.equal(opened.code, 0, opened.stderr);
+        assert.equal(opened.stdout, `Opened ${url} in new tab [targetId: TAB1]\n`);
+        assert.match(opened.stderr, /console and request trace was not saved/);
+        assert.equal(fake.targets.length, 1);
+        assert.equal(fake.calls.filter(({ method }) => method === 'Page.navigate').length, 1);
+        const listed = await run(['tab-list']);
+        assert.match(listed.stdout, /TAB1.*\(active\)/);
+        const requests = await run(['requests']);
+        assert.match(requests.stderr, /No network requests/);
+      },
+      runner
+    );
+  });
+}
+
+test('open does not mistake an accepted navigation without a document commit for an opened page', async () => {
+  const options = { ...deniedTrace, answers: { 'Page.navigate': { frameId: 'TAB1' } } };
+  await withFake(options, async (run) => {
+    const opened = await run(['open', url]);
+    assert.equal(opened.code, 1);
+    assert.match(opened.stderr, /slicc: refused: trace read/);
+    assert.equal(opened.stdout, '');
+  });
+});
 
 test('a check the browser never answers is not called seven', async () => {
   await withFake({ refuse: ['Page.getFrameTree'] }, async (run, fake) => {
