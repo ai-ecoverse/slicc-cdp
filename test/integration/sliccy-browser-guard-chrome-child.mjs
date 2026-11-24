@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import browser, { REFUSAL } from '../../packages/sliccy-browser/src/browser.js';
+import browser, { REFUSAL, resolveCdpEndpoint } from '../../packages/sliccy-browser/src/browser.js';
+import { connect } from '../../packages/sliccy-browser/src/connect.js';
 
 const site = process.env.GUARD_SITE;
 const seven = process.env.GUARD_SEVEN;
@@ -36,6 +37,29 @@ async function waitFor(predicate, label, ms = 8000) {
 async function expectRefuse(label, work) {
   await assert.rejects(work, { message: REFUSAL }, label);
   await log(`refuse:${label}`);
+}
+
+async function reportedTarget(targetId) {
+  const client = await connect({ url: (await resolveCdpEndpoint()).url });
+  try {
+    const { targetInfos } = await client.send('Target.getTargets');
+    return (targetInfos ?? []).find((info) => info?.targetId === targetId) ?? null;
+  } finally {
+    client.close();
+  }
+}
+
+async function reportRefusal(step, targetId, work) {
+  try {
+    return await work();
+  } catch (error) {
+    if (String(error?.message).includes(REFUSAL)) {
+      const at = new Date().toISOString();
+      const target = await reportedTarget(targetId).catch((cause) => ({ error: String(cause) }));
+      process.stderr.write(`${JSON.stringify({ step, targetId, at, target })}\n`);
+    }
+    throw error;
+  }
 }
 
 async function main() {
@@ -135,10 +159,15 @@ async function main() {
     assert.ok(earlyAllowedHandle.dropped > 0);
     await log('websocket:early-allowed-dropped');
 
-    await browser.eval(earlyAllowedTargetId, 'location.reload()');
+    await reportRefusal('early-allowed-reload', earlyAllowedTargetId, () =>
+      browser.eval(earlyAllowedTargetId, 'location.reload()')
+    );
     await delay(500);
     await waitFor(
-      async () => (await browser.eval(earlyAllowedTargetId, 'document.readyState')) === 'complete',
+      async () =>
+        (await reportRefusal('early-allowed-ready-state', earlyAllowedTargetId, () =>
+          browser.eval(earlyAllowedTargetId, 'document.readyState')
+        )) === 'complete',
       'early allowed reload never completed'
     );
     earlyAllowedLogged.length = 0;
