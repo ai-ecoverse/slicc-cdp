@@ -68,6 +68,11 @@ export function protectedOrigins(rules, extraOrigins = []) {
     );
   };
 
+  const lookalike = (origin) =>
+    typeof origin === 'string' &&
+    origin.toLowerCase().startsWith('about:') &&
+    origin !== 'about://';
+
   const target = ({
     url: text,
     previous = false,
@@ -76,6 +81,7 @@ export function protectedOrigins(rules, extraOrigins = []) {
     documentURL,
     unreachableURL,
     navigating = false,
+    contextOrigin,
   }) => {
     if (type && (rules.targetTypes ?? []).includes(type)) return true;
     if (
@@ -85,7 +91,8 @@ export function protectedOrigins(rules, extraOrigins = []) {
       !navigating
     )
       return previous;
-    if (inheriting(text)) return previous || opener === 'protected' || opener === 'unknown';
+    if (inheriting(text))
+      return previous || opener === 'protected' || opener === 'unknown' || lookalike(contextOrigin);
     return url(text);
   };
 

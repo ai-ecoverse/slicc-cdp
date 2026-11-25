@@ -280,12 +280,15 @@ impl Protected {
         url()
     }
 
-    pub fn target_with_document(&self, text: &str, previous: bool, opener: Opener, document_url: Option<&str>, unreachable_url: Option<&str>, navigating: bool) -> bool {
+    pub fn target_with_document(&self, text: &str, previous: bool, opener: Opener, document_url: Option<&str>, unreachable_url: Option<&str>, navigating: bool, context_origin: Option<&str>) -> bool {
         if document_url.is_some_and(|url| self.error_page_url(url))
             && unreachable_url == Some(text)
             && !navigating
         {
             return previous;
+        }
+        if context_origin.is_some_and(about_lookalike) && self.inheriting(text) {
+            return true;
         }
         self.target(text, previous, opener)
     }
@@ -539,6 +542,10 @@ pub fn canonical_cookie_domain(domain: &str) -> Option<String> {
     Some(host)
 }
 
+pub(crate) fn about_lookalike(origin: &str) -> bool {
+    origin.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("about:")) && origin != "about://"
+}
+
 fn parse(text: &str) -> Option<Url> {
     Url::parse(text).ok()
 }
@@ -676,7 +683,7 @@ mod tests {
             };
             assert_eq!(
                 guard.target_type(vector.kind.as_deref().unwrap_or(""))
-                    || guard.target_with_document(&vector.url, vector.previous, opener, vector.document_url.as_deref(), vector.unreachable_url.as_deref(), vector.navigating),
+                    || guard.target_with_document(&vector.url, vector.previous, opener, vector.document_url.as_deref(), vector.unreachable_url.as_deref(), vector.navigating, vector.context_origin.as_deref()),
                 vector.protected,
                 "{vector:?}"
             );
