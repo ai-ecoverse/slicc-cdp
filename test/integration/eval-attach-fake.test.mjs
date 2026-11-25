@@ -444,9 +444,19 @@ for (const [site, setup] of Object.entries(sites)) {
       assert.equal(refused.reason, 'unverified-context');
       assert.equal(refused.site, site, trace(backend.calls, frameId));
       assert.equal(refused.frameId, frameId);
+      const diagnosed = site === 'create-world-failed' || site === 'tree-read-failed';
+      if (diagnosed) {
+        assert.equal(refused.cause, 'other');
+        assert.equal(refused.frame, 'equal');
+      } else {
+        assert.equal(refused.cause, undefined);
+        assert.equal(refused.frame, undefined);
+      }
       assert.deepEqual(Object.keys(refused).sort(), [
         'attachmentId',
+        ...(diagnosed ? ['cause'] : []),
         'event',
+        ...(diagnosed ? ['frame'] : []),
         'frameId',
         ...(chained ? ['origin', 'parentFrameId'] : []),
         'reason',
@@ -492,6 +502,8 @@ test('eval-attach fake isolated: a refusal with another reason names no site', a
   try {
     const refused = await held.event('refused');
     assert.equal(refused.reason, 'installation');
+    assert.equal(refused.cause, undefined);
+    assert.equal(refused.frame, undefined);
     assert.deepEqual(Object.keys(refused).sort(), [
       'attachmentId',
       'event',
@@ -499,6 +511,236 @@ test('eval-attach fake isolated: a refusal with another reason names no site', a
       'reason',
       'tab',
     ]);
+    held.child.stdin.end();
+    assert.equal((await held.ended).code, 0);
+  } finally {
+    held.child.kill('SIGKILL');
+    await backend.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+const diagnosedKeys = [
+  'attachmentId',
+  'cause',
+  'event',
+  'frame',
+  'frameId',
+  'reason',
+  'site',
+  'tab',
+];
+
+const causeRows = {
+  'guard-refused': {
+    site: 'create-world-failed',
+    setup: () => ({
+      refuse: ['Page.createIsolatedWorld'],
+      refusalMessage: 'slicc: refused: that execution context belongs to a browser extension',
+    }),
+  },
+  'nested-read-timeout': {
+    site: 'create-world-failed',
+    setup: () => ({
+      refuse: ['Page.createIsolatedWorld'],
+      refusalMessage: 'Page.createIsolatedWorld timed out',
+    }),
+  },
+  transport: {
+    site: 'create-world-failed',
+    setup: () => ({
+      intercept(message, send, close) {
+        if (message.method !== 'Page.createIsolatedWorld') return false;
+        close(1006, 'gone');
+        return true;
+      },
+    }),
+  },
+  other: {
+    site: 'create-world-failed',
+    setup: () => ({ refuse: ['Page.createIsolatedWorld'] }),
+  },
+};
+
+for (const [cause, { site, setup }] of Object.entries(causeRows)) {
+  test(`eval-attach fake isolated: create-world-failed cause is ${cause}`, async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-cause-'));
+    const backend = await evalBackend(setup());
+    backend.targets.push({ targetId: 'TAB', url: 'https://example.test/top', loaderId: 'L' });
+    await writeFile(path.join(home, 'shim.js'), 'send("installed");');
+    const held = holder(
+      backend.url,
+      ['eval-attach', 'shim.js', '--tab', 'TAB', '--world', 'isolated'],
+      home
+    );
+    try {
+      const refused = await held.event('refused');
+      assert.equal(refused.reason, 'unverified-context');
+      assert.equal(refused.site, site);
+      assert.equal(refused.cause, cause, trace(backend.calls, 'TAB'));
+      assert.equal(refused.frame, 'equal');
+      assert.deepEqual(Object.keys(refused).sort(), diagnosedKeys);
+      assert.ok(
+        !backend.calls.some((call) => installs(call)),
+        'refused create-world must not install'
+      );
+    } finally {
+      held.child.kill('SIGKILL');
+      await backend.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
+
+test('eval-attach fake isolated: tree-read-failed carries cause and frame', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-tree-cause-'));
+  const backend = await evalBackend({
+    refuseWhen: holderTreeRead('TAB', 1),
+    refusalMessage:
+      'slicc: refused: the page changed while slicc was checking it; try again once it settles',
+  });
+  backend.targets.push({ targetId: 'TAB', url: 'https://example.test/top', loaderId: 'L' });
+  await writeFile(path.join(home, 'shim.js'), 'send("installed");');
+  const held = holder(
+    backend.url,
+    ['eval-attach', 'shim.js', '--tab', 'TAB', '--world', 'isolated'],
+    home
+  );
+  try {
+    const refused = await held.event('refused');
+    assert.equal(refused.reason, 'unverified-context');
+    assert.equal(refused.site, 'tree-read-failed');
+    assert.equal(refused.cause, 'guard-refused');
+    assert.equal(refused.frame, 'equal');
+    assert.deepEqual(Object.keys(refused).sort(), diagnosedKeys);
+  } finally {
+    held.child.kill('SIGKILL');
+    await backend.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+const frameRows = {
+  equal: {
+    onWorld(message, send) {
+      send({
+        id: message.id,
+        sessionId: message.sessionId,
+        error: { code: -32000, message: 'Page.createIsolatedWorld refused' },
+      });
+    },
+  },
+  changed: {
+    onWorld(message, send) {
+      send({
+        method: 'Page.frameNavigated',
+        sessionId: message.sessionId,
+        params: {
+          frame: {
+            id: 'TAB',
+            loaderId: 'MOVED',
+            url: 'https://example.test/moved',
+            securityOrigin: 'https://example.test',
+          },
+        },
+      });
+      send({
+        id: message.id,
+        sessionId: message.sessionId,
+        error: { code: -32000, message: 'Page.createIsolatedWorld refused' },
+      });
+    },
+  },
+  sibling: {
+    onWorld(message, send) {
+      send({
+        method: 'Page.frameAttached',
+        sessionId: message.sessionId,
+        params: { frameId: 'CHILD', parentFrameId: 'TAB' },
+      });
+      send({
+        id: message.id,
+        sessionId: message.sessionId,
+        error: { code: -32000, message: 'Page.createIsolatedWorld refused' },
+      });
+    },
+  },
+  absent: {
+    onWorld(message, send) {
+      send({
+        method: 'Target.targetDestroyed',
+        params: { targetId: 'TAB' },
+      });
+      send({
+        id: message.id,
+        sessionId: message.sessionId,
+        error: { code: -32000, message: 'Page.createIsolatedWorld refused' },
+      });
+    },
+  },
+};
+
+for (const [relation, { onWorld }] of Object.entries(frameRows)) {
+  test(`eval-attach fake isolated: create-world-failed frame is ${relation}`, async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-frame-'));
+    const backend = await evalBackend({
+      intercept(message, send) {
+        if (message.method !== 'Page.createIsolatedWorld') return false;
+        onWorld(message, send);
+        return true;
+      },
+    });
+    backend.targets.push({ targetId: 'TAB', url: 'https://example.test/top', loaderId: 'L' });
+    await writeFile(path.join(home, 'shim.js'), 'send("installed");');
+    const held = holder(
+      backend.url,
+      ['eval-attach', 'shim.js', '--tab', 'TAB', '--world', 'isolated'],
+      home
+    );
+    try {
+      const refused = await held.event('refused');
+      assert.equal(refused.reason, 'unverified-context');
+      assert.equal(refused.site, 'create-world-failed');
+      if (relation !== 'absent') assert.equal(refused.cause, 'other');
+      else assert.ok(typeof refused.cause === 'string' && refused.cause.length > 0);
+      assert.equal(refused.frame, relation, trace(backend.calls, 'TAB'));
+      assert.deepEqual(Object.keys(refused).sort(), diagnosedKeys);
+    } finally {
+      held.child.kill('SIGKILL');
+      await backend.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
+
+test('eval-attach fake isolated: refused create-world CDP sequence stays counting-identical', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-count-'));
+  const backend = await evalBackend({ refuse: ['Page.createIsolatedWorld'] });
+  backend.targets.push({ targetId: 'TAB', url: 'https://example.test/top', loaderId: 'L' });
+  await writeFile(path.join(home, 'shim.js'), 'send("installed");');
+  const held = holder(
+    backend.url,
+    ['eval-attach', 'shim.js', '--tab', 'TAB', '--world', 'isolated'],
+    home
+  );
+  try {
+    await held.event('refused');
+    const start = worldIndex(backend.calls, 'TAB');
+    assert.ok(start >= 0);
+    assert.equal(backend.calls[start].method, 'Page.createIsolatedWorld');
+    const untilTick = backend.calls
+      .slice(start + 1)
+      .findIndex((call) => call.method === 'Page.getFrameTree');
+    const pass =
+      untilTick < 0
+        ? backend.calls.slice(start + 1)
+        : backend.calls.slice(start + 1, start + 1 + untilTick);
+    assert.deepEqual(
+      pass.map((call) => call.method),
+      [],
+      'refused create-world pass must not add CDP calls before the next tick tree read'
+    );
+    assert.ok(!backend.calls.some((call) => installs(call)));
     held.child.stdin.end();
     assert.equal((await held.ended).code, 0);
   } finally {

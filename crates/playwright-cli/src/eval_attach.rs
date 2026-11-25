@@ -262,20 +262,26 @@ impl Holder<'_> {
     }
 
     fn refuse_document(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, reason: &str) -> Result<(), String> {
-        self.refuse_site(target, frame, chain, document, reason, None)
+        self.refuse_site(target, frame, chain, document, reason, None, None, None)
     }
 
     fn unverified(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, site: &str) -> Result<(), String> {
-        self.refuse_site(target, frame, chain, document, "unverified-context", Some(site))
+        self.refuse_site(target, frame, chain, document, "unverified-context", Some(site), None, None)
     }
 
-    fn refuse_site(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, reason: &str, site: Option<&str>) -> Result<(), String> {
+    fn unverified_diag(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, site: &str, cause: &str, relation: &str) -> Result<(), String> {
+        self.refuse_site(target, frame, chain, document, "unverified-context", Some(site), Some(cause), Some(relation))
+    }
+
+    fn refuse_site(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, reason: &str, site: Option<&str>, cause: Option<&str>, relation: Option<&str>) -> Result<(), String> {
         let frame_id = text(frame, "id");
         let key = if chain.len() == 1 && frame.get("parentId").is_none() { target.to_string() } else { format!("{target}:{frame_id}") };
         if self.refused.get(&key).is_some_and(|known| known == document) { return Ok(()) }
         self.refused.insert(key, document.to_string());
         let mut event = json!({"event":"refused","attachmentId":self.id,"tab":target,"frameId":frame_id,"reason":reason});
         if let Some(site) = site { event["site"] = json!(site); }
+        if let Some(cause) = cause { event["cause"] = json!(cause); }
+        if let Some(relation) = relation { event["frame"] = json!(relation); }
         if chain.len() > 1 || frame.get("parentId").is_some() {
             event["parentFrameId"] = frame["parentId"].clone();
             event["origin"] = if reason == "guard" { Value::Null } else { frame["securityOrigin"].clone() };
@@ -316,10 +322,14 @@ impl Holder<'_> {
             }
             tab.attempted.insert(unique.to_string(), None);
             let context = if self.world == "isolated" {
+                let mark = cdp.events().len();
+                let prior = tab.contexts.clone();
                 let created = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame_id,"worldName":self.key}), Some(&tab.session));
                 absorb(cdp, tab);
                 match created {
-                    Err(_) => Err("create-world-failed"),
+                    Err(err) => {
+                        return self.unverified_diag(target, frame, chain, unique, "create-world-failed", classify_cause(&err), frame_relation(cdp, target, &tab.session, frame_id, mark, &prior));
+                    }
                     Ok(created) => created["executionContextId"].as_i64().and_then(|id| tab.contexts.get(&id).cloned()).ok_or("context-not-absorbed"),
                 }
             } else { Ok(default.clone()) };
@@ -327,8 +337,12 @@ impl Holder<'_> {
             let context = text(&context, "uniqueId");
             if context.is_empty() { return self.unverified(target, frame, chain, unique, "isolated-no-uniqueId") }
             if self.world == "isolated" {
+                let mark = cdp.events().len();
+                let prior = tab.contexts.clone();
                 let site = match cdp.call("Page.getFrameTree", json!({}), Some(&tab.session)) {
-                    Err(_) => Some("tree-read-failed"),
+                    Err(err) => {
+                        return self.unverified_diag(target, frame, chain, unique, "tree-read-failed", classify_cause(&err), frame_relation(cdp, target, &tab.session, frame_id, mark, &prior));
+                    }
                     Ok(tree) if !find_frame(&tree["frameTree"], frame_id).is_some_and(|current| ["id", "loaderId", "url"].iter().all(|key| current[*key] == frame[*key])) => Some("tree-mismatch"),
                     Ok(_) if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() => Some("chain-check-failed"),
                     Ok(_) => None,
@@ -450,4 +464,56 @@ fn prune_children(cdp: &mut Cdp, tab: &mut Tab, infos: &[Value]) {
 fn find_frame<'a>(node: &'a Value, id: &str) -> Option<&'a Value> {
     if node["frame"]["id"] == id { return node.get("frame"); }
     node["childFrames"].as_array()?.iter().find_map(|node| find_frame(node, id))
+}
+
+fn classify_cause(message: &str) -> &'static str {
+    if cdp::transport_error(message) { "transport" }
+    else if message.contains(" timed out") { "nested-read-timeout" }
+    else if message.contains("slicc: refused:") { "guard-refused" }
+    else { "other" }
+}
+
+fn frame_relation(cdp: &Cdp, target: &str, session: &str, frame_id: &str, mark: usize, contexts: &BTreeMap<i64, Value>) -> &'static str {
+    let mut ours = false;
+    let mut sibling = false;
+    let mut gone = false;
+    for event in &cdp.events()[mark..] {
+        let method = text(event, "method");
+        if method == "Target.targetDestroyed" && event["params"]["targetId"] == target {
+            gone = true;
+            continue;
+        }
+        if method == "Target.detachedFromTarget" && event["params"]["sessionId"].as_str() == Some(session) {
+            gone = true;
+            continue;
+        }
+        if event.get("sessionId").and_then(Value::as_str).is_some_and(|id| id != session) {
+            continue;
+        }
+        match method {
+            "Runtime.executionContextsCleared" => { ours = true; }
+            "Runtime.executionContextDestroyed" => {
+                let named = event["params"]["executionContextId"].as_i64()
+                    .and_then(|id| contexts.get(&id))
+                    .and_then(|context| context["auxData"]["frameId"].as_str());
+                match named {
+                    Some(id) if id == frame_id => ours = true,
+                    Some(_) => sibling = true,
+                    None => {}
+                }
+            }
+            "Page.frameNavigated" => match event["params"]["frame"]["id"].as_str() {
+                Some(id) if id == frame_id => ours = true,
+                Some(_) => sibling = true,
+                None => {}
+            }
+            "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument" => match event["params"]["frameId"].as_str() {
+                Some(id) if id == frame_id => ours = true,
+                Some(_) => sibling = true,
+                None => {}
+            }
+            _ => {}
+        }
+    }
+    if gone { "absent" } else if ours { "changed" } else if sibling { "sibling" } else { "equal" }
 }
