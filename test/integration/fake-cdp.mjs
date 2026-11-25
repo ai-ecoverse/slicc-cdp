@@ -148,6 +148,7 @@ export async function fakeCdp({
   product = 'Chrome/140.0.0.0',
   tls,
   version = false,
+  blankOrigin = '://',
 } = {}) {
   let lastAria = defaultAria;
   const calls = [];
@@ -498,7 +499,7 @@ export async function fakeCdp({
             securityOrigin:
               target?.url && new URL(target.url).origin !== 'null'
                 ? new URL(target.url).origin
-                : '://',
+                : blankOrigin,
           };
           event('Runtime.executionContextCreated', {
             context: {
@@ -561,7 +562,7 @@ export async function fakeCdp({
             origin:
               target?.url && new URL(target.url).origin !== 'null'
                 ? new URL(target.url).origin
-                : '://',
+                : blankOrigin,
             name: params.worldName ?? '',
             auxData: { frameId: params.frameId, isDefault: false },
           };
