@@ -56,6 +56,9 @@ struct Tab {
     finish_early: bool,
     contexts: BTreeMap<i64, Value>,
     attempted: BTreeMap<String, Option<Installed>>,
+    retries: BTreeMap<String, u8>,
+    moved: bool,
+    ended: BTreeSet<String>,
     installed: Option<Installed>,
 }
 
@@ -157,7 +160,7 @@ impl Holder<'_> {
                 Ok(session)
             });
             match attached {
-                Ok(session) => { self.tabs.insert(target.clone(), Tab { target: target.clone(), children: BTreeMap::new(), session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None }); }
+                Ok(session) => { self.tabs.insert(target.clone(), Tab { target: target.clone(), children: BTreeMap::new(), session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), retries: BTreeMap::new(), moved: false, ended: BTreeSet::new(), installed: None }); }
                 Err(_) => self.refuse(&target, "blocked", "guard")?,
             }
         }
@@ -170,7 +173,7 @@ impl Holder<'_> {
             Ok(tree) => tree,
             Err(_) => { tab.installed = None; tab.finish_early = true; return self.refuse(target, "blocked", "guard") }
         };
-        absorb(cdp, tab);
+        snapshot(cdp, tab);
         let frame = &tree["frameTree"]["frame"];
         let frame_id = text(frame, "id");
         let loader = text(frame, "loaderId");
@@ -243,12 +246,13 @@ impl Holder<'_> {
                 cdp::attach(cdp, id).and_then(|session| {
                     let enabled = ["Page.enable", "Runtime.enable", "Network.enable"].iter().try_for_each(|method| cdp.call(method, json!({}), Some(&session)).map(|_| ()));
                     if let Err(message) = enabled { cdp::detach(cdp, &session); return Err(message) }
-                    Ok(Tab { target: id.to_string(), children: BTreeMap::new(), session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), installed: None })
+                    Ok(Tab { target: id.to_string(), children: BTreeMap::new(), session, seen, finish_early: false, contexts: BTreeMap::new(), attempted: BTreeMap::new(), retries: BTreeMap::new(), moved: false, ended: BTreeSet::new(), installed: None })
                 })
             };
             match opened {
                 Ok(mut child) => {
                     if let Ok(tree) = cdp.call("Page.getFrameTree", json!({}), Some(&child.session)) {
+                        snapshot(cdp, &mut child);
                         if tree["frameTree"]["frame"]["id"] == id && tree["frameTree"]["frame"]["parentId"] == frame["id"] {
                             self.visit(cdp, target, &mut child, &tree["frameTree"], &chain, infos)?;
                         } else { self.refuse_document(target, &seed, &chain, "blocked", "guard")?; }
@@ -320,19 +324,21 @@ impl Holder<'_> {
                     return self.refuse_document(target, frame, chain, unique, "late");
                 }
             }
-            tab.attempted.insert(unique.to_string(), None);
             let context = if self.world == "isolated" {
                 let mark = cdp.events().len();
                 let prior = tab.contexts.clone();
                 let created = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame_id,"worldName":self.key}), Some(&tab.session));
                 absorb(cdp, tab);
                 match created {
+                    Err(message) if !early && retry(tab, frame_id, unique, &message) => return Ok(()),
                     Err(err) => {
+                        tab.attempted.insert(unique.to_string(), None);
                         return self.unverified_diag(target, frame, chain, unique, "create-world-failed", classify_cause(&err), frame_relation(cdp, target, &tab.session, frame_id, mark, &prior));
                     }
                     Ok(created) => created["executionContextId"].as_i64().and_then(|id| tab.contexts.get(&id).cloned()).ok_or("context-not-absorbed"),
                 }
             } else { Ok(default.clone()) };
+            tab.attempted.insert(unique.to_string(), None);
             let context = match context { Ok(context) => context, Err(site) => return self.unverified(target, frame, chain, unique, site) };
             let context = text(&context, "uniqueId");
             if context.is_empty() { return self.unverified(target, frame, chain, unique, "isolated-no-uniqueId") }
@@ -423,23 +429,42 @@ fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
 
+fn retry(tab: &mut Tab, frame_id: &str, unique: &str, message: &str) -> bool {
+    let failed = tab.retries.remove(unique).unwrap_or(0) + 1;
+    let live = tab.contexts.values().any(|context| context["uniqueId"] == unique);
+    let moving = tab.moved || tab.ended.contains(frame_id);
+    if !message.starts_with("slicc: refused:") || !moving || !live || failed >= 3 { return false }
+    tab.retries.insert(unique.to_string(), failed);
+    true
+}
+
+fn snapshot(cdp: &Cdp, tab: &mut Tab) {
+    absorb(cdp, tab);
+    tab.moved = false;
+    tab.ended.clear();
+}
+
 fn absorb(cdp: &Cdp, tab: &mut Tab) {
     for event in &cdp.events()[tab.seen..] {
         if event["sessionId"] != tab.session { continue }
         match text(event, "method") {
+            "Page.frameNavigated" | "Page.frameAttached" | "Page.frameDetached" | "Page.navigatedWithinDocument" => tab.moved = true,
             "Runtime.executionContextCreated" => {
                 let context = &event["params"]["context"];
                 if let Some(id) = context["id"].as_i64() { tab.contexts.insert(id, context.clone()); }
             }
-            "Runtime.executionContextsCleared" => { tab.contexts.clear(); tab.installed = None; }
+            "Runtime.executionContextsCleared" => { tab.contexts.clear(); tab.installed = None; tab.moved = true; }
             "Runtime.executionContextDestroyed" => {
-                if let Some(id) = event["params"]["executionContextId"].as_i64() { tab.contexts.remove(&id); }
+                if let Some(context) = event["params"]["executionContextId"].as_i64().and_then(|id| tab.contexts.remove(&id)) {
+                    tab.ended.insert(text(&context["auxData"], "frameId").to_string());
+                }
             }
             _ => {}
         }
     }
     let live: BTreeSet<_> = tab.contexts.values().filter_map(|context| context["uniqueId"].as_str()).collect();
     tab.attempted.retain(|unique, _| live.contains(unique.as_str()));
+    tab.retries.retain(|unique, _| live.contains(unique.as_str()));
     tab.seen = cdp.events().len();
 }
 
