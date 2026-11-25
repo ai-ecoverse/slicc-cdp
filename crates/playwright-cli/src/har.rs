@@ -243,6 +243,7 @@ struct Pending {
     timestamp: f64,
     wall: f64,
     end: f64,
+    size: Option<f64>,
     loader: String,
     session: String,
     worker: bool,
@@ -497,6 +498,7 @@ impl Holder {
                         timestamp: number(params, "timestamp"),
                         wall: number(params, "wallTime"),
                         end: number(params, "timestamp"),
+                        size: None,
                         loader: loader.to_string(),
                         session: session.unwrap_or("").to_string(),
                         worker,
@@ -549,7 +551,10 @@ impl Holder {
                     self.finish(cdp, network, false)?;
                 }
                 "Network.loadingFinished" => {
-                    if let Some(pending) = self.pending.get_mut(id) { pending.end = number(params, "timestamp"); }
+                    if let Some(pending) = self.pending.get_mut(id) {
+                        pending.end = number(params, "timestamp");
+                        pending.size = params["encodedDataLength"].as_f64().filter(|size| size.is_finite());
+                    }
                     self.finish(cdp, id, true)?;
                 }
                 "Network.loadingFailed" => {
@@ -722,7 +727,7 @@ fn entry(cdp: &Cdp, pending: &Pending, body: Option<&Value>, credentials: bool, 
     let response_headers = headers(cdp, &response["headers"], text(response, "url"), credentials);
     let location = response_headers.iter().find(|header| text(header, "name").eq_ignore_ascii_case("location")).map(|header| text(header, "value")).unwrap_or("");
     let duration = ((pending.end - pending.timestamp) * 1000.0).max(0.0);
-    let size = number(response, "encodedDataLength").max(0.0);
+    let size = pending.size.unwrap_or_else(|| number(response, "encodedDataLength")).max(0.0);
     let query: Vec<Value> = url::Url::parse(url).ok().into_iter().flat_map(|url| url.query_pairs().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>()).collect();
     let mut content = json!({"size":size,"mimeType":response["mimeType"].as_str().unwrap_or("application/octet-stream")});
     if let Some(body) = body { content["text"] = json!(text(body, "body")); if body["base64Encoded"] == true { content["encoding"] = json!("base64"); } }

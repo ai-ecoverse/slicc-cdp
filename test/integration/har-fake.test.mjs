@@ -195,6 +195,69 @@ test('in-flight ordinary fetches survive a soft verify pause without a protected
   });
 });
 
+test('HAR sizes come from the finished load and protected responses still carry no body', async () => {
+  await harFixture(async ({ backend, tab, start, send, checkpoint }) => {
+    await start(['--content', 'embed']);
+    const load = (id, url, finished, documentURL = tab.url) => {
+      send('Network.requestWillBeSent', {
+        requestId: id,
+        loaderId: 'L',
+        timestamp: 1,
+        wallTime: 1700000000,
+        documentURL,
+        type: 'Fetch',
+        request: { url, method: 'GET', headers: {} },
+      });
+      send('Network.responseReceived', {
+        requestId: id,
+        timestamp: 1.1,
+        response: {
+          url,
+          headers: {},
+          status: 200,
+          statusText: 'OK',
+          mimeType: 'application/json',
+          encodedDataLength: 0,
+        },
+      });
+      send('Network.loadingFinished', { requestId: id, timestamp: 1.2, ...finished });
+    };
+    load('SIZED', 'https://example.test/api/sized', { encodedDataLength: 4090 });
+    load('UNSIZED', 'https://example.test/api/unsized', {});
+    load('PROTECTED', 'https://seven.sliccy.ai/private?secret=seven-secret', {
+      encodedDataLength: 4090,
+    });
+    load(
+      'PROTECTED_DOCUMENT',
+      'https://example.test/api/from-vault',
+      {
+        encodedDataLength: 4090,
+      },
+      'https://vault.sliccy.ai/'
+    );
+    const har = await checkpoint(2);
+    const sized = har.log.entries.find((entry) => entry.request.url.endsWith('/sized'));
+    const unsized = har.log.entries.find((entry) => entry.request.url.endsWith('/unsized'));
+    assert.equal(sized.response.content.size, 4090);
+    assert.equal(sized.response.bodySize, 4090);
+    assert.equal(sized.response.content.text, 'ordinary-body');
+    assert.equal(unsized.response.content.size, 0);
+    assert.equal(unsized.response.content.text, 'ordinary-body');
+    assert.deepEqual(
+      har.log.entries.map((entry) => entry.request.url),
+      ['https://example.test/api/sized', 'https://example.test/api/unsized']
+    );
+    assert.ok(!JSON.stringify(har).includes('seven-secret'));
+    assert.ok(!JSON.stringify(har).includes('from-vault'));
+    assert.deepEqual(
+      backend.calls
+        .filter((call) => call.method === 'Network.getResponseBody')
+        .map((call) => call.params.requestId),
+      ['SIZED', 'UNSIZED']
+    );
+  });
+});
+
 test('HAR captures ordinary traffic, atomically checkpoints, strips credentials and omits bodies', async () => {
   await harFixture(async ({ home, backend, file, start, request, response, checkpoint }) => {
     const held = await start();
