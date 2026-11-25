@@ -79,10 +79,21 @@ result="$work/notarize.json"
 printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$key"
 zip -q -j "$zip" "${bins[@]}"
 echo "notarizing the darwin binaries"
-xcrun notarytool submit "$zip" --key "$key" --key-id "$APPLE_API_KEY_ID" \
-  --issuer "$APPLE_API_KEY_ISSUER_ID" --wait --timeout 30m --output-format json > "$result" || true
-status="$(node -p "JSON.parse(require('fs').readFileSync('$result','utf8')).status" 2>/dev/null || echo unknown)"
-id="$(node -p "JSON.parse(require('fs').readFileSync('$result','utf8')).id" 2>/dev/null || echo)"
+delays=(30 90)
+attempt=1
+while :; do
+  xcrun notarytool submit "$zip" --key "$key" --key-id "$APPLE_API_KEY_ID" \
+    --issuer "$APPLE_API_KEY_ISSUER_ID" --wait --timeout 30m --output-format json > "$result" || true
+  status="$(node -p "JSON.parse(require('fs').readFileSync('$result','utf8')).status" 2>/dev/null || echo unknown)"
+  id="$(node -p "JSON.parse(require('fs').readFileSync('$result','utf8')).id" 2>/dev/null || echo)"
+  echo "notarization attempt $attempt/3: submission ${id:-unknown}, status $status"
+  if [ "$status" = "Accepted" ] || [ "$status" = "Invalid" ] || [ "$status" = "Rejected" ] || [ "$attempt" -ge 3 ]; then
+    break
+  fi
+  echo "retrying notarization in ${delays[$((attempt - 1))]}s"
+  sleep "${delays[$((attempt - 1))]}"
+  attempt=$((attempt + 1))
+done
 if [ "$status" != "Accepted" ]; then
   echo "::error::notarization ended with status $status"
   cat "$result" >&2 || true
