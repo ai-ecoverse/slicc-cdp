@@ -71,6 +71,7 @@ export const CHROME_FILES = new Set(
     'runtime-page-scope-chrome',
     'session',
     'sliccy-browser',
+    'sliccy-browser-dialogs-chrome',
     'sliccy-browser-guard-chrome',
     'sliccy-browser-install',
     'snapshot-batch-chrome',

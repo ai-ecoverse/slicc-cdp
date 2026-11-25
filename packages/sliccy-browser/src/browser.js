@@ -1,6 +1,15 @@
 import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { connect } from './connect.js';
+import {
+  blocked,
+  clearHandler,
+  dialogs as dialogRecords,
+  refusal as dialogRefusal,
+  hold,
+  report,
+  setHandler,
+} from './dialogs.js';
 import { resolveCdpEndpoint } from './discover.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
 import {
@@ -39,6 +48,7 @@ const RECORDER = `(() => {
 
 let opening;
 let guarded = false;
+let endpoint;
 const sessions = new Map();
 const tabsBySession = new Map();
 const sockets = new Map();
@@ -66,10 +76,12 @@ async function openResolved() {
   const explicit = process.env.SLICC_CDP_URL;
   if (typeof explicit === 'string' && explicit.trim().length > 0) {
     guarded = false;
+    endpoint = explicit.trim();
     return connect();
   }
   const { url } = await resolveCdpEndpoint();
   guarded = true;
+  endpoint = url;
   return connect({ url });
 }
 
@@ -92,11 +104,22 @@ async function urlOf(tab) {
 
 async function withGuardedTab(tab, work) {
   await openClient();
-  if (!guarded) return work();
+  if (!guarded) return targeting(tab, work);
   refuseProtected(await urlOf(tab));
-  const result = await work();
+  const result = await targeting(tab, work);
   refuseProtected(await urlOf(tab));
   return result;
+}
+
+async function targeting(tab, work) {
+  const targetId = targetIdOf(tab);
+  report(targetId);
+  if (await blocked(targetId, () => urlOf(tab))) throw new Error(dialogRefusal(targetId));
+  try {
+    return await work();
+  } finally {
+    report(targetId);
+  }
 }
 
 async function using(work) {
@@ -146,7 +169,10 @@ function ignoreMethod(prefix) {
 async function sessionFor(targetId) {
   const client = await openClient();
   const cached = sessions.get(targetId);
-  if (cached) return { client, sessionId: cached };
+  if (cached) {
+    await hold(endpoint, targetId);
+    return { client, sessionId: cached };
+  }
   listen(client);
   const sessionId = await client.attach(targetId);
   tabsBySession.set(sessionId, targetId);
@@ -157,6 +183,7 @@ async function sessionFor(targetId) {
     networkless.set(sessionId, error.message);
   });
   sessions.set(targetId, sessionId);
+  await hold(endpoint, targetId);
   return { client, sessionId };
 }
 
@@ -551,7 +578,7 @@ export async function fetch(tab, url, opts = {}) {
     await openClient();
     if (!guarded) {
       const script = await buildBrowserFetchScript(url, opts);
-      return evaluateFetchScript(tab, script);
+      return targeting(tab, () => evaluateFetchScript(tab, script));
     }
     return withGuardedTab(tab, async () => {
       const baseURI = await baseUriOf(tab);
@@ -773,6 +800,36 @@ function deliver(sub, payload) {
   }
 }
 
+export async function onDialog(tab, handler) {
+  const targetId = targetIdOf(tab);
+  if (handler !== null && typeof handler !== 'function') {
+    throw new TypeError('browser.onDialog: handler must be a function or null');
+  }
+  if (handler === null) {
+    clearHandler(targetId);
+    return null;
+  }
+  return using(() =>
+    withGuardedTab(tab, async () => {
+      await sessionFor(targetId);
+      if (!(await hold(endpoint, targetId))) {
+        throw new Error(`browser.onDialog: could not watch the dialogs of tab ${targetId}`);
+      }
+      setHandler(targetId, handler);
+      return {
+        targetId,
+        async close() {
+          return clearHandler(targetId, handler);
+        },
+      };
+    })
+  );
+}
+
+export function dialogs(tab) {
+  return dialogRecords(tab === undefined ? undefined : targetIdOf(tab));
+}
+
 export const websocket = {
   on(tab, opts = {}) {
     const targetId = targetIdOf(tab);
@@ -790,7 +847,7 @@ export const websocket = {
       },
       async forward(sink) {
         validateSink(sink);
-        return using(() => subscribe(sink));
+        return using(() => targeting(tab, () => subscribe(sink)));
       },
     };
     async function subscribe(sink) {
@@ -838,6 +895,8 @@ const browser = {
   localStorage,
   fetch,
   websocket,
+  onDialog,
+  dialogs,
 };
 
 export default browser;

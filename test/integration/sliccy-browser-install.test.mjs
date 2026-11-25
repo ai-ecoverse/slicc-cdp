@@ -11,6 +11,7 @@ import { chromeTest } from './chrome-policy.mjs';
 import { fakeCdp } from './fake-cdp.mjs';
 import { kernelRunner } from './runners.mjs';
 import { startServer } from './server.mjs';
+import { dialogFake, FORM, until } from './sliccy-dialog-fake.mjs';
 import './watchdog.mjs';
 
 const PACKAGE = path.resolve('packages/sliccy-browser');
@@ -224,6 +225,42 @@ test(`on a real kernel and pnpm, updating from the published ${PUBLISHED}, whose
   assert.deepEqual(after.commands, BASE);
   assert.notEqual(after.version, 'playwright-cli 1.30.18');
   assert.deepEqual(await work(user, 'https://example.test/', FAKE_STEPS), FAKE_WORK);
+});
+
+test('in a kernel’s jsh, the holder answers a dialog between two evals and the script ends by itself', async (t) => {
+  const world = await dialogFake();
+  t.after(() => world.fake.close());
+  const user = await cone(t, world.fake.url);
+  await added(user, TARBALL);
+  await user.kernel.writeFile(
+    '/srv/hold.jsh',
+    `const browser = require('sliccy:browser');
+const tab = await browser.ensureTab(process.argv[2]);
+await browser.eval(tab, '1');
+await new Promise((resolve) => setTimeout(resolve, 3000));
+console.log(JSON.stringify({ value: await browser.eval(tab, '2'), dialogs: browser.dialogs(tab) }));
+`
+  );
+  const running = user.sh(`jsh /srv/hold.jsh ${FORM}`);
+  await until(
+    () =>
+      world.fake.calls.some(
+        (call) => call.method === 'Runtime.evaluate' && call.target === 'TAB1'
+      ) && world.fake.calls.filter((call) => call.method === 'Page.enable').length === 2,
+    'the first eval and the dialog session',
+    30000
+  );
+  world.openDialog('TAB1', { message: 'from the kernel' });
+  await until(() => world.handled().length === 1, 'the answer', 30000);
+  const run = await running;
+  assert.equal(run.code, 0, `${run.stdout}${run.stderr}`);
+  const result = JSON.parse(run.stdout);
+  assert.equal(result.value, 'fake-eval');
+  assert.deepEqual(
+    result.dialogs.map(({ type, message, accepted }) => [type, message, accepted]),
+    [['alert', 'from the kernel', true]]
+  );
+  assert.match(run.stderr, /alert dialog nobody answered, so it was accepted: "from the kernel"/);
 });
 
 chromeTest(
