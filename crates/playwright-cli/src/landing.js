@@ -27,7 +27,7 @@
     metaKey: !!(mask & 4),
     shiftKey: !!(mask & 8),
   });
-  const untrusted = () => navigator.vendor.startsWith('Apple');
+  const untrusted = () => String(navigator.vendor ?? '').startsWith('Apple');
   const arm = () => {
     if (untrusted()) return 'untrusted';
     globalThis[key]?.stop();
