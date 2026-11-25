@@ -306,6 +306,63 @@ async function flow(runner, raw, port) {
   await until(sevenGone, Boolean, 'protected tab gone');
 }
 
+async function backgroundResize(runner, raw, port, [wide, tall]) {
+  const cwd = await runner.fresh();
+  const run = async (args, expected) => {
+    const result = await runner.playwright(args, cwd);
+    assert.equal(result.code, 0, `${args.join(' ')}: ${result.stderr}\n${result.stdout}`);
+    if (expected !== undefined) assert.equal(result.stdout, code(expected), args.join(' '));
+    return result;
+  };
+  const value = async (expression) =>
+    JSON.parse((await run(['eval', `JSON.stringify(${expression})`])).stdout);
+  const opened = await run(['open', `http://127.0.0.1:${port}/input`]);
+  const tab = opened.stdout.match(/targetId: (\S+)\]/)[1];
+  try {
+    assert.equal(await value('document.visibilityState'), 'hidden');
+    await run(
+      ['resize', String(wide), String(tall)],
+      `await page.setViewportSize({ width: ${wide}, height: ${tall} });`
+    );
+    const [width, height, ratio, shown] = await value(
+      '[innerWidth, innerHeight, devicePixelRatio, document.visibilityState]'
+    );
+    assert.deepEqual([width, height, shown], [wide, tall, 'hidden']);
+    await run(['screenshot', '--filename=shot.png']);
+    const png = Buffer.from(await runner.read(cwd, 'shot.png'));
+    assert.deepEqual(
+      [png.readUInt32BE(16), png.readUInt32BE(20)],
+      [Math.round(wide * ratio), Math.round(tall * ratio)]
+    );
+  } finally {
+    await raw.send('Target.closeTarget', { targetId: tab });
+  }
+}
+
+test('resize sizes a background tab that open made, and screenshot captures that size', async (t) => {
+  const server = await site();
+  let browser;
+  let raw;
+  let kernel;
+  try {
+    browser = await launchBrowser();
+    raw = await rawSocket(browser.wsUrl);
+    const native = nativeRunner(exe('playwright-cli'), exe('curlwright'), browser.wsUrl);
+    await t.test('native', () => backgroundResize(native, raw, server.port, [600, 844]));
+    kernel = await kernelRunner(
+      path.join(wasmDir, 'playwright-cli.wasm'),
+      path.join(wasmDir, 'curlwright.wasm'),
+      browser.wsUrl
+    );
+    await t.test('kernel', () => backgroundResize(kernel, raw, server.port, [720, 780]));
+  } finally {
+    raw?.close();
+    await settle(kernel?.close());
+    await settle(browser?.close());
+    await settle(server.close());
+  }
+});
+
 test('input commands drive Chrome like Playwright and refuse protected frames and tabs', async (t) => {
   const server = await site();
   let browser;

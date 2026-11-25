@@ -601,6 +601,7 @@ fn implemented_page(name: &str) -> Option<String> {
                 "Sets the window bounds so the viewport becomes <w> by <h> CSS pixels and stays that size after the command exits.",
                 "Width and height are whole numbers from 1 to 16384, and the window, with the browser's frame, stays within 16384 by 16384.",
                 "Other tabs in the window, seven's included, do not stop it; they get the new layout size and resize events too.",
+                "A background tab keeps its old viewport until it is in front, so resize brings it to the front, waits for the new size, and switches back to the tab that was in front.",
                 "Refused when the tab itself is protected or holds a protected, unverified or unplaceable frame.",
             ],
             &[("<w>", "width of the browser window"), ("<h>", "height of the browser window")],

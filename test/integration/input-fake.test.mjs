@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -20,7 +20,7 @@ const code = (text) => `### Ran Playwright code\n\`\`\`js\n${text}\n\`\`\`\n`;
 const notAccepted =
   'Error: Drop target did not accept the drop \u2014 its dragover handler did not call preventDefault()\n';
 
-function run(args, home) {
+function run(args, home, limit = 20000) {
   return new Promise((resolve, reject) => {
     const env = {
       ...process.env,
@@ -44,7 +44,7 @@ function run(args, home) {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`input command timed out: ${args.join(' ')}`));
-    }, 20000);
+    }, limit);
     child.on('error', (error) => {
       clearTimeout(timer);
       reject(error);
@@ -145,7 +145,7 @@ async function withFake(script, body) {
   });
   fake.targets.push({ targetId: 'TAB', url: 'https://example.test/' });
   try {
-    await body(fake, (args) => run(['--cdp', fake.url, ...args], home), home);
+    await body(fake, (args, limit) => run(['--cdp', fake.url, ...args], home, limit), home);
   } finally {
     await fake.close();
     await rm(home, { recursive: true, force: true });
@@ -1077,6 +1077,325 @@ test('resize reaches an about:blank tab that open made beside seven', async () =
     assert.equal(sized[0].target, tab);
     assert.deepEqual(sized[0].params, { windowId: 3, bounds: { width: 2068, height: 1616 } });
   });
+});
+
+const touched = (calls) =>
+  calls
+    .filter((call) => call.target === 'SEVEN' || call.params?.targetId === 'SEVEN')
+    .map((call) => [call.method, call.target ?? '']);
+
+test('resize brings a hidden tab forward past seven and switches back to seven without touching it', async () => {
+  const resizeFront =
+    'Error: the tab was resized, but the tab that was in front could not be brought back to the front.\n';
+  for (const refuse of [false, true]) {
+    const state = { front: 'SEVEN', bounds: { width: 900, height: 700 }, shown: [800, 600] };
+    const intercept = (message, reply, fail) => {
+      const { method, params = {} } = message;
+      if (method === 'Target.activateTarget') {
+        if (refuse && params.targetId === 'SEVEN') fail('refused');
+        else {
+          state.front = params.targetId;
+          reply({});
+        }
+        return true;
+      }
+      if (method === 'Runtime.evaluate' && params.expression === 'document.visibilityState') {
+        reply({ result: { type: 'string', value: state.front === 'TAB' ? 'visible' : 'hidden' } });
+        return true;
+      }
+      if (method === 'Browser.setWindowBounds') {
+        state.bounds = params.bounds;
+        reply({});
+        return true;
+      }
+      if (method === 'Browser.getWindowForTarget') {
+        reply({ windowId: 3, bounds: { left: 0, top: 0, ...state.bounds, windowState: 'normal' } });
+        return true;
+      }
+      if (method === 'Runtime.evaluate' && params.expression === '[innerWidth, innerHeight]') {
+        if (state.front === 'TAB')
+          state.shown = [state.bounds.width - 100, state.bounds.height - 100];
+        reply({ result: { type: 'object', subtype: 'array', value: state.shown } });
+        return true;
+      }
+      return false;
+    };
+    await withFake({ intercept }, async (fake, pw) => {
+      fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+      assert.equal((await pw(['eval', '1', '--tab', 'TAB'])).code, 0);
+      const baseline = touched(fake.calls);
+      fake.calls.length = 0;
+      const result = await pw(['resize', '390', '844', '--tab', 'TAB']);
+      if (refuse) {
+        assert.equal(result.code, 1);
+        assert.equal(result.stderr, resizeFront);
+      } else {
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(
+          result.stdout,
+          code('await page.setViewportSize({ width: 390, height: 844 });')
+        );
+      }
+      assert.deepEqual(state.shown, [390, 844]);
+      assert.deepEqual(params(fake, 'Target.activateTarget'), [
+        { targetId: 'TAB' },
+        { targetId: 'SEVEN' },
+      ]);
+      assert.deepEqual(params(fake, 'Browser.setWindowBounds'), [
+        { windowId: 3, bounds: { width: 490, height: 944 } },
+      ]);
+      const resized = fake.calls.findIndex(
+        (call) => call.method === 'Browser.getWindowForTarget' && call.target === 'TAB'
+      );
+      assert.ok(resized > 0);
+      assert.deepEqual(touched(fake.calls.slice(0, resized)), baseline);
+      assert.deepEqual(touched(fake.calls.slice(resized)), [
+        ['Browser.getWindowForTarget', ''],
+        ['Browser.getWindowForTarget', ''],
+        ['Target.activateTarget', ''],
+      ]);
+    });
+  }
+});
+
+test('resize behind a front tab it may not switch back to says so only when the viewport stayed', async () => {
+  const background =
+    'Error: resize sized the window, but the background tab keeps its old viewport until it is in front, and resize brings it to the front only when the tab that was in front can be switched back to. Run "playwright-cli tab-select <index> --foreground" first.\n';
+  for (const clamped of [false, true]) {
+    const state = { shown: [800, 600] };
+    const intercept = (message, reply) => {
+      const { method, params = {} } = message;
+      if (method === 'Runtime.evaluate' && params.expression === 'document.visibilityState') {
+        reply({ result: { type: 'string', value: 'hidden' } });
+        return true;
+      }
+      if (method === 'Browser.setWindowBounds') {
+        if (clamped) state.shown = [500, params.bounds.height - 100];
+        reply({});
+        return true;
+      }
+      if (method === 'Runtime.evaluate' && params.expression === '[innerWidth, innerHeight]') {
+        reply({ result: { type: 'object', subtype: 'array', value: state.shown } });
+        return true;
+      }
+      return false;
+    };
+    await withFake({ intercept }, async (fake, pw) => {
+      fake.targets.push({ targetId: 'VAULT', url: 'https://vault.sliccy.ai/' });
+      const result = await pw(['resize', '390', '844', '--tab', 'TAB']);
+      if (clamped) {
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(
+          result.stdout,
+          code('await page.setViewportSize({ width: 390, height: 844 });')
+        );
+      } else {
+        assert.equal(result.code, 1);
+        assert.equal(result.stderr, background);
+      }
+      assert.equal(sent(fake, 'Browser.setWindowBounds').length, 1);
+      assert.equal(sent(fake, 'Target.activateTarget').length, 0);
+    });
+  }
+});
+
+function screenshotFake(state) {
+  return (message, reply, fail) => {
+    const { method, params = {} } = message;
+    if (method === 'Target.activateTarget') {
+      if (state.refuse === params.targetId) fail('refused');
+      else {
+        state.front = params.targetId;
+        reply({});
+      }
+      return true;
+    }
+    if (method === 'Runtime.evaluate' && params.expression === 'document.visibilityState') {
+      reply({ result: { type: 'string', value: state.front === 'TAB' ? 'visible' : 'hidden' } });
+      return true;
+    }
+    if (method === 'Page.captureScreenshot') {
+      state.captures += 1;
+      if (state.error) fail(state.error);
+      else if (!state.hangs && (!state.stalls || state.front === 'TAB'))
+        reply({ data: Buffer.from(`shot-${state.front}`).toString('base64') });
+      return true;
+    }
+    return false;
+  };
+}
+
+const screenshotBackground =
+  'Error: the background tab did not draw a screenshot in place, and screenshot brings it to the front only when the tab that was in front can be switched back to. Run "playwright-cli tab-select <index> --foreground" first.\n';
+const screenshotFront =
+  'Error: the screenshot was taken, but the tab that was in front could not be brought back to the front.\n';
+
+const SCREENSHOT_CALLS = [
+  'Target.getTargets',
+  'Target.attachToTarget',
+  'Page.getFrameTree',
+  'Target.detachFromTarget',
+  'Slicc.action',
+  'Target.getTargetInfo',
+  'Target.attachToTarget',
+  'Target.setDiscoverTargets',
+  'Target.attachToTarget',
+  'Inspector.enable',
+  'Fetch.enable',
+  'Network.enable',
+  'Network.setBypassServiceWorker',
+  'Page.enable',
+  'Page.getFrameTree',
+  'Page.getFrameTree',
+  'Runtime.enable',
+  'Runtime.enable',
+  'Network.enable',
+  'Target.getTargets',
+  'Page.getFrameTree',
+  'Page.captureScreenshot',
+  'Target.getTargets',
+  'Page.getFrameTree',
+  'Runtime.evaluate',
+  'Network.getAllCookies',
+  'Target.detachFromTarget',
+  'Slicc.action',
+  'Fetch.disable',
+  'Target.detachFromTarget',
+];
+const probes = (fake) =>
+  fake.calls.filter((call) => call.params?.expression === 'document.visibilityState');
+
+test('screenshot that draws sends the same calls as before and switches no tab', async () => {
+  for (const front of ['TAB', 'SEVEN']) {
+    const state = { front, captures: 0 };
+    await withFake({ intercept: screenshotFake(state) }, async (fake, pw, home) => {
+      fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+      const result = await pw(['screenshot', '--filename=s.png', '--tab', 'TAB']);
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(await readFile(path.join(home, 's.png'), 'utf8'), `shot-${front}`);
+      assert.deepEqual(
+        fake.calls.map((call) => call.method),
+        SCREENSHOT_CALLS
+      );
+      assert.deepEqual(probes(fake), []);
+    });
+  }
+});
+
+test('screenshot of a stalled background tab goes past seven and back without touching it', async () => {
+  for (const refuse of [undefined, 'SEVEN']) {
+    const state = { front: 'SEVEN', captures: 0, stalls: true, refuse };
+    await withFake({ intercept: screenshotFake(state) }, async (fake, pw, home) => {
+      fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+      assert.equal((await pw(['eval', '1', '--tab', 'TAB'])).code, 0);
+      const baseline = touched(fake.calls);
+      fake.calls.length = 0;
+      const result = await pw(['screenshot', '--filename=s.png', '--tab', 'TAB'], 60000);
+      const shots = fake.calls.filter((call) => call.method === 'Page.captureScreenshot');
+      assert.equal(shots.length, 2);
+      assert.ok(shots.every((call) => call.target === 'TAB'));
+      const first = fake.calls.indexOf(shots[0]);
+      assert.deepEqual(
+        probes(fake).map((call) => [fake.calls.indexOf(call) > first, call.target]),
+        [
+          [true, 'TAB'],
+          [true, 'TAB'],
+        ]
+      );
+      assert.deepEqual(touched(fake.calls.slice(0, first)), baseline);
+      assert.deepEqual(touched(fake.calls.slice(first)), [
+        ['Browser.getWindowForTarget', ''],
+        ['Browser.getWindowForTarget', ''],
+        ['Target.activateTarget', ''],
+      ]);
+      assert.deepEqual(params(fake, 'Target.activateTarget'), [
+        { targetId: 'TAB' },
+        { targetId: 'SEVEN' },
+      ]);
+      if (refuse) {
+        assert.equal(result.code, 1);
+        assert.equal(result.stderr, screenshotFront);
+        await assert.rejects(readFile(path.join(home, 's.png')), { code: 'ENOENT' });
+      } else {
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(await readFile(path.join(home, 's.png'), 'utf8'), 'shot-TAB');
+      }
+    });
+  }
+});
+
+test('screenshot of a stalled tab that is in front keeps the timeout and switches no tab', async () => {
+  const state = { front: 'TAB', captures: 0, hangs: true };
+  await withFake({ intercept: screenshotFake(state) }, async (fake, pw, home) => {
+    fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+    const result = await pw(['screenshot', '--filename=s.png', '--tab', 'TAB'], 60000);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, 'Page.captureScreenshot timed out\n');
+    assert.equal(state.captures, 1);
+    assert.equal(probes(fake).length, 1);
+    assert.deepEqual(sent(fake, 'Target.activateTarget'), []);
+    await assert.rejects(readFile(path.join(home, 's.png')), { code: 'ENOENT' });
+  });
+});
+
+test('screenshot of a stalled background tab behind the vault says so and switches no tab', async () => {
+  const state = { front: 'VAULT', captures: 0, stalls: true };
+  await withFake({ intercept: screenshotFake(state) }, async (fake, pw, home) => {
+    fake.targets.push({ targetId: 'VAULT', url: 'https://vault.sliccy.ai/' });
+    const result = await pw(['screenshot', '--filename=s.png', '--tab', 'TAB'], 60000);
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, screenshotBackground);
+    assert.equal(state.captures, 1);
+    assert.deepEqual(sent(fake, 'Target.activateTarget'), []);
+    await assert.rejects(readFile(path.join(home, 's.png')), { code: 'ENOENT' });
+  });
+});
+
+test('screenshot passes any other capture error through unchanged, hidden or not', async () => {
+  const outputs = [];
+  for (const front of ['TAB', 'SEVEN']) {
+    const state = { front, captures: 0, error: 'Unable to capture screenshot' };
+    await withFake({ intercept: screenshotFake(state) }, async (fake, pw) => {
+      fake.targets.push({ targetId: 'SEVEN', url: 'https://seven.sliccy.ai/' });
+      const result = await pw(['screenshot', '--filename=s.png', '--tab', 'TAB']);
+      assert.equal(result.code, 1);
+      assert.equal(state.captures, 1);
+      assert.deepEqual(sent(fake, 'Target.activateTarget'), []);
+      assert.deepEqual(probes(fake), []);
+      outputs.push([result.stdout, result.stderr]);
+    });
+  }
+  assert.match(outputs[0][1], /Unable to capture screenshot/);
+  assert.deepEqual(outputs[1], outputs[0]);
+});
+
+test('screenshot of a protected or unverified tab or frame is refused as before, with no tab switch', async () => {
+  const seven = "slicc: refused: target is on seven's origin\n";
+  const unchecked =
+    'slicc: refused: slicc could not finish checking this target, so it left it alone; the browser may not answer the check\n';
+  const frame = (url) => [
+    { frame: { id: 'CHILD', loaderId: 'L2', url, securityOrigin: new URL(url).origin } },
+  ];
+  for (const [tab, url, childFrames, stderr] of [
+    ['OTHER', 'https://seven.sliccy.ai/?secret=hidden', [], seven],
+    ['OTHER', 'https://www.sliccy.ai/os/', [], seven],
+    ['OTHER', 'http://vault.sliccy.ai/', [], seven],
+    ['OTHER', 'chrome://settings/', [], seven],
+    ['OTHER', '', [], unchecked],
+    ['TAB', '', frame('https://seven.sliccy.ai/frame'), seven],
+    ['TAB', '', frame('http://vault.sliccy.ai/'), seven],
+  ]) {
+    const state = { front: 'NONE', captures: 0, stalls: true };
+    await withFake({ intercept: screenshotFake(state), childFrames }, async (fake, pw) => {
+      if (tab === 'OTHER') fake.targets.push({ targetId: 'OTHER', url });
+      const result = await pw(['screenshot', '--filename=s.png', '--tab', tab]);
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, stderr);
+      assert.equal(state.captures, 0);
+      assert.deepEqual(sent(fake, 'Target.activateTarget'), []);
+      assert.deepEqual(probes(fake), []);
+    });
+  }
 });
 
 test('drop reads only the named files and dispatches synthetic drag events like Microsoft', async () => {
