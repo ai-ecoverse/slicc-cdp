@@ -1,6 +1,6 @@
 use crate::fetch::{self, Decision, Paused};
 use crate::net::Ws;
-use crate::protected::{Opener, Protected};
+use crate::protected::{about_lookalike, Opener, Protected};
 use crate::shield;
 use crate::worlds::Worlds;
 use serde_json::{json, Value};
@@ -5445,7 +5445,9 @@ impl Cdp {
                             .push(origin.to_string());
                     }
                 }
-                if default && self.guard.url(origin) {
+                if default && self.guard.url(origin)
+                    || default_frame_context(params.get("context")) && about_lookalike(origin)
+                {
                     self.committed_protected(&session);
                 }
             }
@@ -6892,6 +6894,11 @@ fn unguarded(message: String) -> String {
 
 fn frame_text_known(text: &str) -> bool {
     !matches!(text, "" | "null" | "://")
+}
+
+fn default_frame_context(context: Option<&Value>) -> bool {
+    context.and_then(|context| context.pointer("/auxData/isDefault")).and_then(Value::as_bool) == Some(true)
+        && context.and_then(|context| context.pointer("/auxData/frameId")).and_then(Value::as_str).is_some_and(|frame| !frame.is_empty())
 }
 
 fn opaque_blank_origin(text: String) -> String {

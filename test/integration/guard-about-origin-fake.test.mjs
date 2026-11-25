@@ -203,3 +203,85 @@ for (const [transport, runner] of Object.entries(runners)) {
     }
   });
 }
+
+const refused = (result, label) => {
+  assert.equal(result.code, 1, `${label}: ${result.stdout}${result.stderr}`);
+  assert.match(result.stderr, /slicc: refused/, label);
+};
+const admitted = (result, label) => assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+const STEPS = [['eval', '1'], ['snapshot'], ['goto', 'http://example.test/next']];
+
+for (const [transport, runner] of Object.entries(runners)) {
+  for (const blankOrigin of ['ABOUT://', 'about://x', 'about:blank', 'ABOUT:BLANK']) {
+    test(`${transport}: a created blank tab whose default context origin reads ${blankOrigin} is refused`, async () => {
+      await withBrowser(runner, { blankOrigin }, async (run, fake) => {
+        refused(await run(['open', 'http://example.test/page']), `${blankOrigin} open`);
+        assert.ok(
+          !fake.calls.some((call) => call.method === 'Page.navigate'),
+          `${blankOrigin} navigated`
+        );
+        for (const args of STEPS) refused(await run(args), `${blankOrigin} ${args[0]}`);
+      });
+    });
+  }
+
+  for (const blankOrigin of ['://', 'about://', 'https://example.test', 'xabout:blank']) {
+    test(`${transport}: a created blank tab whose default context origin reads ${blankOrigin} is admitted`, async () => {
+      await withBrowser(runner, { blankOrigin }, async (run) => {
+        admitted(await run(['open', 'http://example.test/page']), `${blankOrigin} open`);
+        for (const args of STEPS) admitted(await run(args), `${blankOrigin} ${args[0]}`);
+      });
+    });
+  }
+}
+
+const contexts = {
+  'an isolated world': (frameId) => ({ frameId, isDefault: false }),
+  'a frameless context': () => ({ isDefault: true }),
+  'a context with an empty frameId': () => ({ isDefault: true, frameId: '' }),
+  'a context whose isDefault is not a boolean': (frameId) => ({ frameId, isDefault: 'true' }),
+};
+const kept = {
+  'about:blank': () => [0, 0, 0, 0],
+  'ABOUT://': (name) => (name === 'an isolated world' ? [0, 0, 1, 0] : [1, 1, 1, 1]),
+};
+
+for (const [transport, runner] of Object.entries(runners)) {
+  for (const [name, auxData] of Object.entries(contexts)) {
+    for (const [origin, expected] of Object.entries(kept)) {
+      test(`${transport}: ${name} reading ${origin} on a created blank tab answers as before the about: rule`, async () => {
+        let fake;
+        fake = await fakeCdp({
+          onCommand: (message) => {
+            if (message.method !== 'Runtime.enable') return;
+            for (const target of fake.targets)
+              if (!target.worlds)
+                target.worlds = [
+                  {
+                    id: 3,
+                    uniqueId: `extra:${target.targetId}`,
+                    origin,
+                    name: 'extra',
+                    auxData: auxData(target.targetId),
+                  },
+                ];
+          },
+        });
+        const pw = await runner(fake.url);
+        try {
+          const cwd = await pw.fresh();
+          const codes = [];
+          for (const args of [['open', 'http://example.test/page'], ...STEPS]) {
+            const result = await pw.playwright(args, cwd);
+            codes.push(result.code);
+            if (result.code !== 0) assert.match(result.stderr, /slicc: refused/, args[0]);
+          }
+          assert.deepEqual(codes, expected(name), `${name} ${origin}`);
+        } finally {
+          await pw.close();
+          await fake.close();
+        }
+      });
+    }
+  }
+}
