@@ -1012,12 +1012,27 @@ pub fn screenshot(
     if let Some(clip) = clip {
         params["clip"] = clip;
     }
-    let result = cdp.call("Page.captureScreenshot", params, Some(session))?;
+    let result = match cdp.call("Page.captureScreenshot", params.clone(), Some(session)) {
+        Err(message) if message == CAPTURE_TIMEOUT => stalled_capture(cdp, session, params, message)?,
+        other => other?,
+    };
     let data = result
         .get("data")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "screenshot returned no data\n".to_string())?;
     base64_decode(data)
+}
+
+fn stalled_capture(cdp: &mut Cdp, session: &str, params: Value, timed_out: String) -> Result<Value, String> {
+    if crate::input::visible(cdp, session, std::time::Duration::ZERO).unwrap_or(true) {
+        return Err(timed_out);
+    }
+    let front = cdp.bring_forward(session).map_err(|_| SCREENSHOT_BACKGROUND.to_string())?;
+    let shot = cdp.call("Page.captureScreenshot", params, Some(session));
+    let restored = cdp.restore_front(front).map_err(|_| SCREENSHOT_FRONT.to_string());
+    let shot = shot?;
+    restored?;
+    Ok(shot)
 }
 
 pub fn element_clip(cdp: &mut Cdp, session: &str, rec: &RefRec) -> Result<Value, String> {
@@ -1133,6 +1148,9 @@ const READ_INPUT: &str = "function() { if (this.isContentEditable) return this.t
 const REACT_FILL: &str = "function(value) { const proto = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const desc = Object.getOwnPropertyDescriptor(proto, 'value'); if (desc && desc.set) desc.set.call(this, value); else this.value = value; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }";
 
 const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const CAPTURE_TIMEOUT: &str = "Page.captureScreenshot timed out\n";
+const SCREENSHOT_BACKGROUND: &str = "Error: the background tab did not draw a screenshot in place, and screenshot brings it to the front only when the tab that was in front can be switched back to. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const SCREENSHOT_FRONT: &str = "Error: the screenshot was taken, but the tab that was in front could not be brought back to the front.\n";
 
 pub fn handle_dialog(
     cdp: &mut Cdp,

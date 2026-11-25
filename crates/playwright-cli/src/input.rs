@@ -27,6 +27,8 @@ const SYNTHETIC_WHEEL: &str = "function(x, y, dx, dy, alt, ctrl, meta, shift, bu
 const FOREGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const WHEEL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const UNSIZED: &str = "Error: this browser sets its own window size, so resize can't change it\n";
+const RESIZE_BACKGROUND: &str = "Error: resize sized the window, but the background tab keeps its old viewport until it is in front, and resize brings it to the front only when the tab that was in front can be switched back to. Run \"playwright-cli tab-select <index> --foreground\" first.\n";
+const RESIZE_FRONT: &str = "Error: the tab was resized, but the tab that was in front could not be brought back to the front.\n";
 const NO_PAYLOAD: &str = "Error: At least one of \"paths\" or \"data\" must be provided.\n";
 
 pub fn is_command(command: &str) -> bool {
@@ -309,7 +311,7 @@ fn act(cdp: &mut Cdp, session: &str, invocation: &Invocation, command: &str, poi
     }
 }
 
-fn visible(cdp: &mut Cdp, session: &str, waited: std::time::Duration) -> Result<bool, String> {
+pub(crate) fn visible(cdp: &mut Cdp, session: &str, waited: std::time::Duration) -> Result<bool, String> {
     let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
     let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| BACKGROUND.to_string())?;
     let world = cdp.call("Page.createIsolatedWorld", json!({ "frameId": frame }), Some(session))?;
@@ -465,22 +467,74 @@ fn dispatch_key(cdp: &mut Cdp, session: &str, params: &Value) -> Result<(), Stri
 }
 
 fn resize(cdp: &mut Cdp, session: &str, width: u64, height: u64) -> Result<(), String> {
-    let window = cdp.call("Browser.getWindowForTarget", json!({}), Some(session))?;
-    let id = window.get("windowId").and_then(Value::as_i64).ok_or("Error: Browser.getWindowForTarget returned no windowId\n".to_string())?;
-    let outer = |key: &str| window.pointer(&format!("/bounds/{key}")).and_then(Value::as_f64);
+    let (planned, before) = plan(cdp, session, width, height)?;
+    apply(cdp, session, &planned)?;
+    if visible(cdp, session, std::time::Duration::ZERO).unwrap_or(true) || sized(cdp, session, (width, height), std::time::Duration::ZERO)? {
+        return Ok(());
+    }
+    let Ok(front) = cdp.bring_forward(session) else {
+        return if sized(cdp, session, (width, height), FOREGROUND_WAIT)? || inner(cdp, session)? != before { Ok(()) } else { Err(RESIZE_BACKGROUND.to_string()) };
+    };
+    let result = visible(cdp, session, FOREGROUND_WAIT).and_then(|shown| if shown { fit_shown(cdp, session, (width, height), planned) } else { Err(RESIZE_BACKGROUND.to_string()) });
+    let restored = cdp.restore_front(front).map_err(|_| RESIZE_FRONT.to_string());
+    result.and(restored)
+}
+
+fn fit_shown(cdp: &mut Cdp, session: &str, wanted: (u64, u64), mut applied: (i64, u64, u64)) -> Result<(), String> {
+    for _ in 0..2 {
+        if sized(cdp, session, wanted, FOREGROUND_WAIT)? {
+            return Ok(());
+        }
+        let (planned, _) = plan(cdp, session, wanted.0, wanted.1)?;
+        if planned == applied {
+            return Ok(());
+        }
+        apply(cdp, session, &planned)?;
+        applied = planned;
+    }
+    sized(cdp, session, wanted, FOREGROUND_WAIT).map(|_| ())
+}
+
+fn sized(cdp: &mut Cdp, session: &str, wanted: (u64, u64), waited: std::time::Duration) -> Result<bool, String> {
+    let deadline = std::time::Instant::now() + waited;
+    loop {
+        let (width, height) = inner(cdp, session)?;
+        if width == Some(wanted.0 as f64) && height == Some(wanted.1 as f64) {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn inner(cdp: &mut Cdp, session: &str) -> Result<(Option<f64>, Option<f64>), String> {
     let tree = cdp.call("Page.getFrameTree", json!({}), Some(session))?;
     let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| cdp.unverified())?;
     let inner = browser::evaluate_in_frame(cdp, session, frame, INNER)?;
-    let viewport = |index: usize| inner.value.get(index).and_then(Value::as_f64);
+    let side = |index: usize| inner.value.get(index).and_then(Value::as_f64);
+    Ok((side(0), side(1)))
+}
+
+fn plan(cdp: &mut Cdp, session: &str, width: u64, height: u64) -> Result<((i64, u64, u64), (Option<f64>, Option<f64>)), String> {
+    let window = cdp.call("Browser.getWindowForTarget", json!({}), Some(session))?;
+    let id = window.get("windowId").and_then(Value::as_i64).ok_or("Error: Browser.getWindowForTarget returned no windowId\n".to_string())?;
+    let outer = |key: &str| window.pointer(&format!("/bounds/{key}")).and_then(Value::as_f64);
+    let viewport = inner(cdp, session)?;
     let inset = |outer: Option<f64>, inner: Option<f64>| match (outer, inner) {
         (Some(outer), Some(inner)) if outer.is_finite() && inner.is_finite() && outer > inner => (outer - inner).round() as u64,
         _ => 0,
     };
-    let (outer_width, outer_height) = (width + inset(outer("width"), viewport(0)), height + inset(outer("height"), viewport(1)));
+    let (outer_width, outer_height) = (width + inset(outer("width"), viewport.0), height + inset(outer("height"), viewport.1));
     if outer_width > MAX_SIZE as u64 || outer_height > MAX_SIZE as u64 {
         return Err(format!("Error: resize needs a window of at most 16384 by 16384, and this one would be {outer_width} by {outer_height} with the browser's frame\n"));
     }
-    let bounds = json!({ "width": outer_width, "height": outer_height });
+    Ok(((id, outer_width, outer_height), viewport))
+}
+
+fn apply(cdp: &mut Cdp, session: &str, &(id, width, height): &(i64, u64, u64)) -> Result<(), String> {
+    let bounds = json!({ "width": width, "height": height });
     cdp.call("Browser.setWindowBounds", json!({ "windowId": id, "bounds": bounds }), Some(session)).map_err(|message| {
         if message.ends_with("wasn't found\n") { UNSIZED.to_string() } else { message }
     })?;
