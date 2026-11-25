@@ -177,7 +177,7 @@ test("sliccy-browser's credentialOrigins rules match the installed catalog", asy
   assert.deepEqual(
     catalog.credentialOrigins.origins,
     CREDENTIAL_ORIGIN_FLOOR,
-    '1.35.0 catalog list must equal the IMS floor today'
+    '1.36.0 catalog list must equal the IMS floor today'
   );
   for (const origin of CREDENTIAL_ORIGIN_FLOOR) {
     assert.ok(CREDENTIAL_ORIGINS.origins.includes(origin), `union lost floor host ${origin}`);
