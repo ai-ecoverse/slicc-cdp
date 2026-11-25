@@ -6436,7 +6436,7 @@ impl Cdp {
     }
 
     fn recv(&mut self, deadline: Instant) -> Result<Option<String>, String> {
-        let received = self.receive(deadline);
+        let received = self.receive(deadline).map(|text| text.map(opaque_blank_origin));
         received.map_err(|error| self.closing(error))
     }
 
@@ -6892,6 +6892,19 @@ fn unguarded(message: String) -> String {
 
 fn frame_text_known(text: &str) -> bool {
     !matches!(text, "" | "null" | "://")
+}
+
+fn opaque_blank_origin(text: String) -> String {
+    if !text.contains("Runtime.executionContextCreated") || !text.contains("about://") { return text }
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else { return text };
+    if value.get("method").and_then(Value::as_str) != Some("Runtime.executionContextCreated")
+        || value.pointer("/params/context/auxData/isDefault").and_then(Value::as_bool) != Some(true)
+        || value.pointer("/params/context/auxData/frameId").and_then(Value::as_str).is_none_or(str::is_empty) { return text }
+    match value.pointer_mut("/params/context/origin") {
+        Some(origin) if origin.as_str() == Some("about://") => *origin = Value::String("://".into()),
+        _ => return text,
+    }
+    value.to_string()
 }
 
 fn same_proof(first: &[(String, DocumentState)], next: &[(String, DocumentState)]) -> bool {
@@ -7437,6 +7450,7 @@ mod tests {
     include!("lagging_attach_test.rs");
     include!("toctou_attach_read_test.rs");
     include!("frame_carrier_test.rs");
+    include!("about_origin_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
