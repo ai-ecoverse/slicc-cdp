@@ -152,6 +152,7 @@ export const runCapabilities = {
   scope: 'slicc-cdp',
   iframeAutoAttach: true,
   browserSession: true,
+  browserStorage: true,
   chromeUrlsAttach: true,
   extensionWorld: true,
   extensionFrame: true,
