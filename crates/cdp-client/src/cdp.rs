@@ -2935,7 +2935,7 @@ impl Cdp {
                     return true;
                 }
                 return self.guard.target_with_document(&doc.unreachable_url, doc.previous, Opener::None,
-                    Some(&doc.url), Some(&doc.unreachable_url), doc.navigating);
+                    Some(&doc.url), Some(&doc.unreachable_url), doc.navigating, None);
             }
             if doc.previous {
                 return true;

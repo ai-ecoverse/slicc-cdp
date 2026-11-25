@@ -49,3 +49,21 @@ fn received_contexts_keep_worker_and_isolated_about_origins_and_map_only_the_def
     assert_eq!(origin(&cdp, "W", "worker").as_deref(), Some("about://"));
     assert!(cdp.guard.url("about://"));
 }
+
+#[test]
+fn the_target_classifier_reads_only_an_about_context_origin_on_an_inheriting_document() {
+    use crate::protected::Opener;
+    let guard = crate::protected::Protected::default();
+    let judged = |url: &str, opener: Opener, origin: Option<&str>| guard.target_with_document(url, false, opener, None, None, false, origin);
+    for origin in ["ABOUT://", "about://x", "about:blank", "About:Srcdoc", "about:"] {
+        assert!(judged("about:blank", Opener::None, Some(origin)), "{origin}");
+        assert!(judged("", Opener::Unprotected, Some(origin)), "{origin}");
+        assert!(!judged("https://example.test/", Opener::None, Some(origin)), "{origin}");
+    }
+    for origin in [None, Some("://"), Some("about://"), Some("https://example.test"), Some("xabout:blank"), Some("https://about.example")] {
+        assert!(!judged("about:blank", Opener::None, origin), "{origin:?}");
+        assert!(!judged("about:blank", Opener::Unprotected, origin), "{origin:?}");
+        assert!(judged("about:blank", Opener::Protected, origin), "{origin:?}");
+        assert!(judged("about:blank", Opener::Unknown, origin), "{origin:?}");
+    }
+}
