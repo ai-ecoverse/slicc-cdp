@@ -123,7 +123,10 @@ test('the crates, binaries and release assets follow only a release on main', ()
   assert.match(job('crates'), /id-token: write/);
   assert.match(job('crates'), /run: cargo fetch --locked\n[\s\S]*scripts\/publish-crates\.sh/);
   assert.match(job('binaries'), /scripts\/sign-macos\.sh/);
-  assert.match(job('binaries'), /source=Notarized Developer ID/);
+  assert.match(
+    job('binaries'),
+    /\n {10}scripts\/check-gatekeeper\.sh "dist\/playwright-cli-\$LABEL" "dist\/curlwright-\$LABEL"\n/
+  );
   assert.doesNotMatch(
     job('binaries'),
     /\| *(tee|grep -q)\b/,
