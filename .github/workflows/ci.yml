@@ -59,6 +59,7 @@ jobs:
         **/har-chrome.test.*
         **/har-fake.test.*
         **/har-kernel.test.*
+        **/har-tls-chrome.test.*
         **/harness-ports.test.*
         **/headed-*.test.*
         **/inbound-gate.test.*
