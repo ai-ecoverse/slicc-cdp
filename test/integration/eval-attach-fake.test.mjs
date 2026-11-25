@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { evalBackend } from './eval-backend.mjs';
 import { evalCommand as command, evalHolder as holder } from './eval-support.mjs';
+import { kernelRunner } from './runners.mjs';
 import './watchdog.mjs';
 
 for (const world of ['main', 'isolated']) {
@@ -749,3 +750,226 @@ test('eval-attach fake isolated: refused create-world CDP sequence stays countin
     await rm(home, { recursive: true, force: true });
   }
 });
+
+const worldCalls = (calls) => calls.filter((call) => call.method === 'Page.createIsolatedWorld');
+const moveFrames = (message, send) => {
+  for (const [method, params] of [
+    ['Page.frameAttached', { frameId: 'KID', parentFrameId: 'TAB' }],
+    ['Page.frameDetached', { frameId: 'KID', reason: 'remove' }],
+  ])
+    send({ method, params, sessionId: message.sessionId });
+  return false;
+};
+const retryRows = {
+  'a refusal while a child frame moves is retried and installs once': {
+    options: () => ({
+      intercept: (message, send, _close, calls) =>
+        message.method === 'Page.createIsolatedWorld' &&
+        worldCalls(calls).length === 1 &&
+        moveFrames(message, send),
+    }),
+    worlds: 2,
+    installed: ['world:TAB:L'],
+  },
+  'a refusal that persists while the frame moves stops after three attempts': {
+    options: () => ({
+      intercept: (message, send) =>
+        message.method === 'Page.createIsolatedWorld' && moveFrames(message, send),
+    }),
+    worlds: 3,
+    cause: 'guard-refused',
+    frame: 'sibling',
+    installed: [],
+  },
+  'a backend error while the frame moves is final on the first attempt': {
+    options: () => ({
+      intercept(message, send) {
+        if (message.method !== 'Page.createIsolatedWorld') return false;
+        moveFrames(message, send);
+        send({
+          id: message.id,
+          sessionId: message.sessionId,
+          error: { code: -32000, message: 'Cannot create world' },
+        });
+        return true;
+      },
+    }),
+    worlds: 1,
+    cause: 'other',
+    frame: 'sibling',
+    installed: [],
+  },
+  'a retry stops when the document context ends while the frame moves': {
+    options: () => ({
+      intercept(message, send, _close, calls) {
+        if (message.method !== 'Page.createIsolatedWorld') return false;
+        moveFrames(message, send);
+        if (worldCalls(calls).length === 2)
+          send({
+            method: 'Runtime.executionContextDestroyed',
+            params: { executionContextId: 1 },
+            sessionId: message.sessionId,
+          });
+        return false;
+      },
+    }),
+    worlds: 2,
+    cause: 'guard-refused',
+    frame: 'changed',
+    installed: [],
+  },
+  'a refusal on a stable frame is final on the first attempt': {
+    options: () => ({ refuseWhen: holderTreeRead('TAB', 0) }),
+    worlds: 1,
+    cause: 'guard-refused',
+    frame: 'equal',
+    installed: [],
+  },
+  'a navigation while a retry is pending gives the next document a fresh budget': {
+    options: (tab, navigate) => {
+      let navigated = false;
+      return {
+        intercept(message, send, _close, calls) {
+          if (message.method === 'Page.createIsolatedWorld' && worldCalls(calls).length === 1)
+            return moveFrames(message, send);
+          if (
+            !navigated &&
+            worldCalls(calls).length === 1 &&
+            holderTreeRead('TAB', 1)(message, calls)
+          ) {
+            navigated = true;
+            navigate(tab, 'https://example.test/next', 'NEXT');
+          }
+          return false;
+        },
+      };
+    },
+    worlds: 2,
+    installed: ['world:TAB:NEXT'],
+  },
+};
+const runtimes = {
+  async native(backend, args) {
+    const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-retry-'));
+    await writeFile(path.join(home, 'shim.js'), 'send("installed");');
+    const held = holder(backend.url, ['eval-attach', 'shim.js', ...args], home);
+    return {
+      events: async () => held.events(),
+      async stop() {
+        held.child.stdin.end();
+        assert.equal((await held.ended).code, 0);
+      },
+      async close() {
+        held.child.kill('SIGKILL');
+        await rm(home, { recursive: true, force: true });
+      },
+    };
+  },
+  async wasi(backend, args) {
+    const runner = await kernelRunner(
+      path.resolve(process.env.SLICC_EVAL_WASM || 'target/wasm32-wasip1/debug/playwright-cli.wasm'),
+      path.resolve('target/wasm32-wasip1/debug/curlwright.wasm'),
+      backend.url
+    );
+    try {
+      await runner.install('@ai-ecoverse/wasm-bash');
+      await runner.install('@ai-ecoverse/wasm-coreutils');
+      const cwd = await runner.fresh();
+      await runner.write(cwd, 'shim.js', 'send("installed");');
+      const started = await runner.run(
+        [
+          'bash',
+          '-c',
+          `(while sleep 1; do echo || break; done) | playwright-cli -s retry eval-attach shim.js ${args.join(' ')} > eval.log 2> eval.err &`,
+        ],
+        cwd
+      );
+      assert.equal(started.code, 0, started.stderr);
+      const events = async () => {
+        const data = await runner.read(cwd, 'eval.log').catch(() => new Uint8Array());
+        return new TextDecoder()
+          .decode(data)
+          .split('\n')
+          .filter((line) => line.startsWith('{'))
+          .map(JSON.parse);
+      };
+      return {
+        events,
+        async stop() {
+          const ready = (await events()).find((event) => event.event === 'ready');
+          const detached = await runner.playwright(
+            ['-s', 'retry', 'eval-detach', ready.attachmentId],
+            cwd
+          );
+          assert.equal(detached.code, 0, detached.stderr);
+          await until(async () => (await events()).some((event) => event.event === 'stopped'));
+        },
+        async close() {
+          runner.close();
+        },
+      };
+    } catch (error) {
+      runner.close();
+      throw error;
+    }
+  },
+};
+const until = async (check, ms = 30000) => {
+  const end = Date.now() + ms;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() >= end) throw new Error('eval holder timed out');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+};
+
+for (const [runtime, start] of Object.entries(runtimes)) {
+  for (const [name, row] of Object.entries(retryRows)) {
+    test(`eval-attach fake isolated ${runtime}: ${name}`, async () => {
+      const tab = { targetId: 'TAB', url: 'https://example.test/top', loaderId: 'L' };
+      let backend;
+      const options = row.options(tab, (...args) => backend.navigate(...args));
+      const intercept = options.intercept;
+      backend = await evalBackend({
+        ...options,
+        ...(intercept
+          ? { intercept: (message, send, close) => intercept(message, send, close, backend.calls) }
+          : {}),
+      });
+      backend.targets.push(tab);
+      let held;
+      try {
+        held = await start(backend, ['--tab', 'TAB', '--world', 'isolated']);
+        const refusals = async () =>
+          (await held.events()).filter((event) => event.event === 'refused');
+        if (row.installed.length) {
+          await until(async () => (await held.events()).some((event) => event.event === 'message'));
+        } else {
+          const refused = await until(async () => (await refusals())[0]);
+          assert.equal(refused.reason, 'unverified-context');
+          assert.equal(refused.site, 'create-world-failed', trace(backend.calls, 'TAB'));
+          assert.equal(refused.cause, row.cause, trace(backend.calls, 'TAB'));
+          assert.equal(refused.frame, row.frame, trace(backend.calls, 'TAB'));
+          assert.deepEqual(Object.keys(refused).sort(), diagnosedKeys);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await held.stop();
+        assert.equal(worldCalls(backend.calls).length, row.worlds, trace(backend.calls, 'TAB'));
+        assert.deepEqual(
+          backend.calls.filter(installs).map((call) => call.params.uniqueContextId),
+          row.installed
+        );
+        assert.equal((await refusals()).length, row.installed.length ? 0 : 1);
+        const ready = (await held.events()).filter((event) => event.event === 'document-ready');
+        assert.deepEqual(
+          ready.map((event) => event.loaderId),
+          row.installed.map((unique) => unique.split(':').at(-1))
+        );
+      } finally {
+        await held?.close();
+        await backend.close();
+      }
+    });
+  }
+}
