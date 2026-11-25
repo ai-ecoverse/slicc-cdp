@@ -262,11 +262,20 @@ impl Holder<'_> {
     }
 
     fn refuse_document(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, reason: &str) -> Result<(), String> {
+        self.refuse_site(target, frame, chain, document, reason, None)
+    }
+
+    fn unverified(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, site: &str) -> Result<(), String> {
+        self.refuse_site(target, frame, chain, document, "unverified-context", Some(site))
+    }
+
+    fn refuse_site(&mut self, target: &str, frame: &Value, chain: &[crate::eval_frames::Document], document: &str, reason: &str, site: Option<&str>) -> Result<(), String> {
         let frame_id = text(frame, "id");
         let key = if chain.len() == 1 && frame.get("parentId").is_none() { target.to_string() } else { format!("{target}:{frame_id}") };
         if self.refused.get(&key).is_some_and(|known| known == document) { return Ok(()) }
         self.refused.insert(key, document.to_string());
         let mut event = json!({"event":"refused","attachmentId":self.id,"tab":target,"frameId":frame_id,"reason":reason});
+        if let Some(site) = site { event["site"] = json!(site); }
         if chain.len() > 1 || frame.get("parentId").is_some() {
             event["parentFrameId"] = frame["parentId"].clone();
             event["origin"] = if reason == "guard" { Value::Null } else { frame["securityOrigin"].clone() };
@@ -294,7 +303,7 @@ impl Holder<'_> {
         let default = tab.contexts.values().find(|context| context["auxData"]["isDefault"] == true && context["auxData"]["frameId"] == frame_id).cloned();
         let Some(default) = default else { return Ok(()) };
         let unique = text(&default, "uniqueId");
-        if unique.is_empty() { return self.refuse_document(target, frame, chain, loader, "unverified-context") }
+        if unique.is_empty() { return self.unverified(target, frame, chain, loader, "default-no-uniqueId") }
         if tab.installed.as_ref().is_some_and(|installed| installed.default != unique || installed.loader != loader) { tab.installed = None; }
         if !tab.attempted.contains_key(unique) {
             if early {
@@ -309,16 +318,22 @@ impl Holder<'_> {
             let context = if self.world == "isolated" {
                 let created = cdp.call("Page.createIsolatedWorld", json!({"frameId":frame_id,"worldName":self.key}), Some(&tab.session));
                 absorb(cdp, tab);
-                created.ok().and_then(|created| tab.contexts.get(&created["executionContextId"].as_i64()?).cloned())
-            } else { Some(default.clone()) };
-            let Some(context) = context else { return self.refuse_document(target, frame, chain, unique, "unverified-context") };
-            let context = text(&context, "uniqueId");
-            if context.is_empty() { return self.refuse_document(target, frame, chain, unique, "unverified-context") }
-            if self.world == "isolated" {
-                let verified = cdp.call("Page.getFrameTree", json!({}), Some(&tab.session));
-                if !verified.is_ok_and(|tree| find_frame(&tree["frameTree"], frame_id).is_some_and(|current| ["id", "loaderId", "url"].iter().all(|key| current[*key] == frame[*key]))) || chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() {
-                    return self.refuse_document(target, frame, chain, unique, "unverified-context");
+                match created {
+                    Err(_) => Err("create-world-failed"),
+                    Ok(created) => created["executionContextId"].as_i64().and_then(|id| tab.contexts.get(&id).cloned()).ok_or("context-not-absorbed"),
                 }
+            } else { Ok(default.clone()) };
+            let context = match context { Ok(context) => context, Err(site) => return self.unverified(target, frame, chain, unique, site) };
+            let context = text(&context, "uniqueId");
+            if context.is_empty() { return self.unverified(target, frame, chain, unique, "isolated-no-uniqueId") }
+            if self.world == "isolated" {
+                let site = match cdp.call("Page.getFrameTree", json!({}), Some(&tab.session)) {
+                    Err(_) => Some("tree-read-failed"),
+                    Ok(tree) if !find_frame(&tree["frameTree"], frame_id).is_some_and(|current| ["id", "loaderId", "url"].iter().all(|key| current[*key] == frame[*key])) => Some("tree-mismatch"),
+                    Ok(_) if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() => Some("chain-check-failed"),
+                    Ok(_) => None,
+                };
+                if let Some(site) = site { return self.unverified(target, frame, chain, unique, site) }
             }
             if early && !cdp.eval_attach_early_paused(&tab.session, unique) { return self.refuse_document(target, frame, chain, unique, "late") }
             if chain.len() > 1 && crate::eval_frames::verify(cdp, chain).is_err() { return self.refuse_document(target, frame, chain, unique, "guard") }

@@ -337,3 +337,173 @@ test('eval-attach fake main: same-document URL races cannot execute the body out
     await rm(home, { recursive: true, force: true });
   }
 });
+
+const installs = (call) => call.params?.expression?.startsWith('(() => { const queue = [];');
+const worldIndex = (calls, frameId) =>
+  calls.findLastIndex(
+    (call) => call.method === 'Page.createIsolatedWorld' && call.params.frameId === frameId
+  );
+const admissionReads = 1;
+const holderTreeRead = (frameId, nth) => (message, calls) => {
+  const start = worldIndex(calls, frameId);
+  if (start < 0 || message.method !== 'Page.getFrameTree') return false;
+  if (message.sessionId !== calls[start].sessionId) return false;
+  const reads = calls
+    .slice(start)
+    .filter((call) => call.method === 'Page.getFrameTree' && call.sessionId === message.sessionId);
+  return reads.length === admissionReads + nth;
+};
+const trace = (calls, frameId) =>
+  calls
+    .slice(Math.max(0, worldIndex(calls, frameId)))
+    .slice(0, 40)
+    .map((call) => `${call.method}@${call.sessionId ?? 'browser'}`)
+    .join(' ');
+const contextWithoutUnique = (message, send, isDefault) => {
+  send({
+    method: 'Runtime.executionContextCreated',
+    sessionId: message.sessionId,
+    params: {
+      context: {
+        id: isDefault ? 1 : 999,
+        origin: 'https://example.test',
+        name: '',
+        auxData: { frameId: 'TAB', isDefault },
+      },
+    },
+  });
+  send({
+    id: message.id,
+    sessionId: message.sessionId,
+    result: isDefault ? {} : { executionContextId: 999 },
+  });
+  return true;
+};
+const sites = {
+  'default-no-uniqueId': () => ({
+    intercept: (message, send) =>
+      message.method === 'Runtime.enable' && contextWithoutUnique(message, send, true),
+  }),
+  'create-world-failed': () => ({ refuse: ['Page.createIsolatedWorld'] }),
+  'context-not-absorbed': () => ({
+    intercept(message, send) {
+      if (message.method !== 'Page.createIsolatedWorld') return false;
+      send({ id: message.id, sessionId: message.sessionId, result: { executionContextId: 999 } });
+      return true;
+    },
+  }),
+  'isolated-no-uniqueId': () => ({
+    intercept: (message, send) =>
+      message.method === 'Page.createIsolatedWorld' && contextWithoutUnique(message, send, false),
+  }),
+  'tree-read-failed': () => ({ refuseWhen: holderTreeRead('TAB', 1) }),
+  'tree-mismatch': (tab) => ({
+    onCommand(message) {
+      if (message.method === 'Page.createIsolatedWorld') tab.url = 'https://example.test/moved';
+    },
+  }),
+  'chain-check-failed': () => ({ refuseWhen: holderTreeRead('SAME', 2) }),
+};
+
+for (const [site, setup] of Object.entries(sites)) {
+  test(`eval-attach fake isolated: unverified-context refusal names ${site}`, async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-site-'));
+    const chained = site === 'chain-check-failed';
+    const frameId = chained ? 'SAME' : 'TAB';
+    const same = {
+      id: 'SAME',
+      parentId: 'TAB',
+      loaderId: 'SAME-L',
+      securityOrigin: 'https://example.test',
+      url: 'https://example.test/same',
+    };
+    const tab = {
+      targetId: 'TAB',
+      url: 'https://example.test/top',
+      loaderId: 'L',
+      ...(chained ? { childFrames: [{ frame: same }] } : {}),
+    };
+    const backend = await evalBackend(setup(tab));
+    backend.targets.push(tab);
+    await writeFile(path.join(home, 'shim.js'), 'send("installed");');
+    const held = holder(
+      backend.url,
+      [
+        'eval-attach',
+        'shim.js',
+        '--tab',
+        'TAB',
+        '--world',
+        'isolated',
+        ...(chained ? ['--frames', 'same-origin'] : []),
+      ],
+      home
+    );
+    try {
+      const refused = await held.event('refused');
+      assert.equal(refused.reason, 'unverified-context');
+      assert.equal(refused.site, site, trace(backend.calls, frameId));
+      assert.equal(refused.frameId, frameId);
+      assert.deepEqual(Object.keys(refused).sort(), [
+        'attachmentId',
+        'event',
+        'frameId',
+        ...(chained ? ['origin', 'parentFrameId'] : []),
+        'reason',
+        'site',
+        'tab',
+      ]);
+      assert.ok(held.output().stdout.includes(`"reason":"unverified-context","site":"${site}"`));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      held.child.stdin.end();
+      assert.equal((await held.ended).code, 0);
+      assert.equal(held.events().filter((event) => event.event === 'refused').length, 1);
+      assert.ok(
+        !held
+          .events()
+          .some(
+            (event) =>
+              ['document-ready', 'message'].includes(event.event) && event.frameId === frameId
+          )
+      );
+      assert.ok(
+        !backend.calls.some(
+          (call) => installs(call) && (!chained || call.params.uniqueContextId?.includes(':SAME:'))
+        )
+      );
+    } finally {
+      held.child.kill('SIGKILL');
+      await backend.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+}
+
+test('eval-attach fake isolated: a refusal with another reason names no site', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'slicc-eval-site-'));
+  const backend = await evalBackend();
+  backend.targets.push({ targetId: 'TAB', url: 'https://example.test/top', loaderId: 'L' });
+  await writeFile(path.join(home, 'shim.js'), 'throw new Error("body");');
+  const held = holder(
+    backend.url,
+    ['eval-attach', 'shim.js', '--tab', 'TAB', '--world', 'isolated'],
+    home
+  );
+  try {
+    const refused = await held.event('refused');
+    assert.equal(refused.reason, 'installation');
+    assert.deepEqual(Object.keys(refused).sort(), [
+      'attachmentId',
+      'event',
+      'frameId',
+      'reason',
+      'tab',
+    ]);
+    held.child.stdin.end();
+    assert.equal((await held.ended).code, 0);
+  } finally {
+    held.child.kill('SIGKILL');
+    await backend.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
