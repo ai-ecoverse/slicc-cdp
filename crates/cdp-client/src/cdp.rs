@@ -7458,6 +7458,7 @@ mod tests {
     include!("toctou_attach_read_test.rs");
     include!("frame_carrier_test.rs");
     include!("about_origin_test.rs");
+    include!("security_details_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {

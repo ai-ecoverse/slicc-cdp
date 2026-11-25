@@ -49,6 +49,7 @@ export const CHROME_FILES = new Set(
     'guard-service-worker-chrome',
     'guard-setup-budget',
     'har-chrome',
+    'har-tls-chrome',
     'har-worker-chrome',
     'headed-input',
     'input',

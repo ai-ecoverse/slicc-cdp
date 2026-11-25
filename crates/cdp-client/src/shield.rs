@@ -616,11 +616,31 @@ pub fn command_url_refusal<'a>(guard: &'a Protected, params: &Value, method: &st
         .find_map(|cookie| command_url_refusal(guard, cookie, method))
 }
 
+const SCT_ORIGINS: &[&str] = &["Embedded in certificate", "TLS extension", "OCSP response"];
+
+#[derive(Clone, Copy)]
+enum LoadedScope {
+    Any,
+    SecurityDetails,
+    Timestamps,
+    Timestamp,
+}
+
 pub fn loaded_urls_protected(guard: &Protected, value: &Value) -> bool {
+    loaded_urls_in(guard, value, LoadedScope::Any)
+}
+
+fn loaded_urls_in(guard: &Protected, value: &Value, scope: LoadedScope) -> bool {
     match value {
-        Value::Array(items) => items.iter().any(|item| loaded_urls_protected(guard, item)),
+        Value::Array(items) => {
+            let next = if matches!(scope, LoadedScope::Timestamps) { LoadedScope::Timestamp } else { LoadedScope::Any };
+            items.iter().any(|item| loaded_urls_in(guard, item, next))
+        }
         Value::Object(items) => items.iter().any(|(key, item)| {
             if FREE_FORM.contains(&key.as_str()) {
+                return false;
+            }
+            if matches!(scope, LoadedScope::Timestamp) && key == "origin" && item.as_str().is_some_and(|text| SCT_ORIGINS.contains(&text)) {
                 return false;
             }
             if matches!(key.as_str(), "url" | "scriptURL" | "scopeURL" | "origin" | "securityOrigin") {
@@ -628,7 +648,12 @@ pub fn loaded_urls_protected(guard: &Protected, value: &Value) -> bool {
                     return guard.url(url) || guard.url(&web_socket_as_http(url));
                 }
             }
-            loaded_urls_protected(guard, item)
+            let next = match (scope, key.as_str()) {
+                (_, "securityDetails") => LoadedScope::SecurityDetails,
+                (LoadedScope::SecurityDetails, "signedCertificateTimestampList") => LoadedScope::Timestamps,
+                _ => LoadedScope::Any,
+            };
+            loaded_urls_in(guard, item, next)
         }),
         _ => false,
     }
