@@ -627,9 +627,9 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "slicc-browsers"
-version = "1.36.0"
+version = "1.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c5c65398191c3bbe008d77c17453d4707a5540313bc3a125896d03af87e8405"
+checksum = "fae3b78881c5c4fa3a37fbccb609362688a3b24567094bbabcd93c96d3afe01f"
 dependencies = [
  "serde",
  "serde_json",
