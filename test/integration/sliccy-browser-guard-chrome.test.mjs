@@ -90,6 +90,7 @@ test('discovered-mode Chrome regressions for every prior guard bypass', async ()
       })`,
       true
     );
+    const earlyAllowedOpenedAt = Date.now();
 
     const slackTarget = await openAndWait(raw, `${slackOrigin}/client/T1/C1`);
     await pageEval(raw, slackTarget, `localStorage.setItem('localConfig_v2', '{"ok":true}')`);
@@ -111,6 +112,7 @@ test('discovered-mode Chrome regressions for every prior guard bypass', async ()
     env.GUARD_SECRET_FILE = secretFile;
     env.GUARD_EARLY_TARGET = earlyTarget;
     env.GUARD_EARLY_ALLOWED_TARGET = earlyAllowedTarget;
+    env.GUARD_EARLY_ALLOWED_OPENED_AT = String(earlyAllowedOpenedAt);
     env.GUARD_SEVEN_TARGET = sevenTarget;
     env.GUARD_LOG = logPath;
 

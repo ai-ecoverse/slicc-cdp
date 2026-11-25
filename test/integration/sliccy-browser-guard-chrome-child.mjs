@@ -16,6 +16,20 @@ const earlyTargetId = process.env.GUARD_EARLY_TARGET;
 const earlyAllowedTargetId = process.env.GUARD_EARLY_ALLOWED_TARGET;
 const sevenTargetId = process.env.GUARD_SEVEN_TARGET;
 const logPath = process.env.GUARD_LOG;
+const started = Date.now();
+const trace = [];
+
+function mark(step, extra = {}, at = Date.now()) {
+  trace.push({ t: at - started, step, ...extra });
+}
+
+function capture(lines) {
+  return (...args) => {
+    const entry = { t: Date.now() - started, line: args.map(String).join(' ') };
+    lines.push(entry);
+    trace.push(entry);
+  };
+}
 
 async function log(line) {
   await appendFile(logPath, `${line}\n`);
@@ -111,12 +125,11 @@ async function main() {
 
   const earlyLogged = [];
   const write = console.log;
-  console.log = (...args) => {
-    earlyLogged.push(args.map(String).join(' '));
-  };
+  console.log = capture(earlyLogged);
   let bare;
   let matched;
   try {
+    mark('early-attach-start');
     bare = await browser.websocket
       .on(earlyTargetId)
       .filter({ parseAs: 'json' })
@@ -125,13 +138,20 @@ async function main() {
       .on(earlyTargetId, { urlMatch: /sliccy\.ai/u })
       .filter({ parseAs: 'json' })
       .forward({ sink: 'log' });
+    mark('early-attach-done');
     await browser.eval(earlyTargetId, 'window.__guardEarly.send("ping")');
+    mark('early-ping-sent');
     await delay(800);
+    mark('early-assert', { dropped: { bare: bare.dropped, matched: matched.dropped } });
     assert.equal(
-      earlyLogged.some((line) => line.includes('canary') || line.includes('"n":42')),
-      false
+      earlyLogged.some(({ line }) => line.includes('canary') || line.includes('"n":42')),
+      false,
+      JSON.stringify({ lines: earlyLogged, trace })
     );
     await log('websocket:early-dropped');
+  } catch (error) {
+    process.stderr.write(`${JSON.stringify({ step: 'early', trace })}\n`);
+    throw error;
   } finally {
     console.log = write;
     await bare?.close();
@@ -139,24 +159,31 @@ async function main() {
   }
 
   const earlyAllowedLogged = [];
-  console.log = (...args) => {
-    earlyAllowedLogged.push(args.map(String).join(' '));
-  };
+  console.log = capture(earlyAllowedLogged);
   let earlyAllowedHandle;
+  let tracing = true;
   try {
+    mark('early-allowed-socket-open', {}, Number(process.env.GUARD_EARLY_ALLOWED_OPENED_AT));
+    mark('early-allowed-attach-start');
     earlyAllowedHandle = await browser.websocket
       .on(earlyAllowedTargetId, {
         urlMatch: new RegExp(allowedWs.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')),
       })
       .filter({ parseAs: 'json', where: { kind: 'tick' } })
       .forward({ sink: 'log' });
+    mark('early-allowed-attach-done');
     await browser.eval(earlyAllowedTargetId, 'window.__guardEarlyAllowed.send("ping")');
+    mark('early-allowed-ping-sent');
     await delay(800);
+    mark('early-allowed-assert', { dropped: { earlyAllowedHandle: earlyAllowedHandle.dropped } });
+    const detail = JSON.stringify({ lines: earlyAllowedLogged, trace });
     assert.equal(
-      earlyAllowedLogged.some((line) => line.includes('"n":1') || line.includes('"n": 1')),
-      false
+      earlyAllowedLogged.some(({ line }) => line.includes('"n":1') || line.includes('"n": 1')),
+      false,
+      detail
     );
-    assert.ok(earlyAllowedHandle.dropped > 0);
+    assert.ok(earlyAllowedHandle.dropped > 0, detail);
+    tracing = false;
     await log('websocket:early-allowed-dropped');
 
     await reportRefusal('early-allowed-reload', earlyAllowedTargetId, () =>
@@ -181,7 +208,8 @@ async function main() {
       })`
     );
     await waitFor(
-      () => earlyAllowedLogged.some((line) => line.includes('"n":1') || line.includes('"n": 1')),
+      () =>
+        earlyAllowedLogged.some(({ line }) => line.includes('"n":1') || line.includes('"n": 1')),
       `reload allowed ws missed ${JSON.stringify(earlyAllowedLogged)}`
     );
     await log('websocket:reload-allowed');
@@ -205,6 +233,9 @@ async function main() {
     } finally {
       await protectedHandle.close();
     }
+  } catch (error) {
+    if (tracing) process.stderr.write(`${JSON.stringify({ step: 'early-allowed', trace })}\n`);
+    throw error;
   } finally {
     console.log = write;
     await earlyAllowedHandle?.close();
