@@ -7458,6 +7458,7 @@ mod tests {
     include!("toctou_attach_read_test.rs");
     include!("frame_carrier_test.rs");
     include!("about_origin_test.rs");
+    include!("context_origin_spelling_test.rs");
     include!("security_details_test.rs");
 
     #[test]
