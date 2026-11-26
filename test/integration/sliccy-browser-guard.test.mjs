@@ -1550,6 +1550,56 @@ function emitMainFrame(send, sessionId, targetId, url) {
   });
 }
 
+function emitChildFrame(send, sessionId, frameId, parentId, url) {
+  let origin = '';
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    origin = '';
+  }
+  send({
+    method: 'Page.frameNavigated',
+    params: {
+      frame: {
+        id: frameId,
+        parentId,
+        url,
+        loaderId: `L-${frameId}`,
+        securityOrigin: origin,
+      },
+    },
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
+function emitFrameAttached(send, sessionId, frameId, parentId) {
+  send({
+    method: 'Page.frameAttached',
+    params: { frameId, parentFrameId: parentId },
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
+function emitFrameDetached(send, sessionId, frameId, reason) {
+  const params = { frameId };
+  if (reason !== undefined) params.reason = reason;
+  send({
+    method: 'Page.frameDetached',
+    params,
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
+function announceSocketCreated(send, sessionId, requestId, url, initiator) {
+  const params = { requestId, url };
+  if (initiator !== undefined) params.initiator = initiator;
+  send({
+    method: 'Network.webSocketCreated',
+    params,
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
 function emitTargetInfo(send, method, targetId, url) {
   send({
     method,
@@ -3281,3 +3331,2352 @@ sessionEndRow(
     });
   }
 );
+
+const CHILD_PROTECTED = 'https://lars.sliccy.ai/';
+const CHILD_ORDINARY = 'https://child.example.test/';
+const SIBLING = { targetId: 'TWO', url: 'https://other.test/', title: 'two' };
+
+function stackAt(url) {
+  return {
+    type: 'script',
+    stack: {
+      callFrames: [{ url, lineNumber: 1, columnNumber: 1, functionName: '' }],
+    },
+  };
+}
+
+function wsAnswersWithSibling(page) {
+  return {
+    'Target.getTargets': { targetInfos: [info(page), info(SIBLING)] },
+    'Page.enable': {},
+    'Runtime.enable': {},
+    'Network.enable': {},
+  };
+}
+
+function attachByTarget(message, send, counts) {
+  if (message.method !== 'Target.attachToTarget') return false;
+  counts.n += 1;
+  send({ id: message.id, result: { sessionId: `S${counts.n}` } });
+  return true;
+}
+
+async function holdSecondTab() {
+  const sibling = await browser.findTab({ domain: 'other.test' });
+  return browser.websocket
+    .on(sibling, { urlMatch: /./u })
+    .filter({ parseAs: 'json' })
+    .forward({ sink: 'log' });
+}
+
+function attachPair(message, send, counts, pending) {
+  if (message.method !== 'Target.attachToTarget') return false;
+  counts.n += 1;
+  const sessionId = `S${counts.n}`;
+  if (pending && counts.n <= 2) {
+    pending.push({ id: message.id, sessionId });
+    if (pending.length === 2) {
+      for (const item of pending) {
+        send({ id: item.id, result: { sessionId: item.sessionId } });
+      }
+      pending.length = 0;
+    }
+    return true;
+  }
+  send({ id: message.id, result: { sessionId } });
+  return true;
+}
+
+test('a child frame that is not ordinary stops websocket routing for the tab', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R1a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitChildFrame(send, sessionId, 'CHILD', page.targetId, CHILD_PROTECTED);
+        announceSocketCreated(send, sessionId, 'CF1', ALLOWED_WS, stackAt(CHILD_PROTECTED));
+        emitFrame(
+          send,
+          sessionId,
+          'CF1',
+          '{"kind":"tick","n":201}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R1b"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocketCreated(send, sessionId, 'CF2', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'CF2',
+          '{"kind":"tick","n":202}',
+          'Network.webSocketFrameReceived'
+        );
+        emitChildFrame(send, sessionId, 'CHILD2', page.targetId, CHILD_PROTECTED);
+        announceSocketCreated(send, sessionId, 'CF3', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'CF3',
+          '{"kind":"tick","n":203}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R1c"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitChildFrame(send, sessionId, 'CHILD3', page.targetId, CHILD_PROTECTED);
+        announceSocketCreated(send, sessionId, 'CF4', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'CF4',
+          '{"kind":"tick","n":204}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    {
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, '"R1a"'), 'ok');
+        await settle();
+        assert.equal(
+          logged.some((line) => line.includes('"n":201')),
+          false
+        );
+        assert.equal(
+          (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+          false
+        );
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    }
+    await settle();
+    {
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, '"R1b"'), 'ok');
+        await settle();
+        assert.equal(
+          logged.some((line) => line.includes('"n":202')),
+          true
+        );
+        assert.equal(
+          logged.some((line) => line.includes('"n":203')),
+          false
+        );
+        assert.equal(
+          (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+          false
+        );
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    }
+    await settle();
+    {
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, '"R1c"'), 'ok');
+        await settle();
+        assert.equal(
+          logged.some((line) => line.includes('"n":204')),
+          false
+        );
+        assert.equal(
+          (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+          false
+        );
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    }
+  });
+});
+
+test('an ordinary child frame keeps websocket routing for the tab', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R2"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitChildFrame(send, sessionId, 'ORD', page.targetId, CHILD_ORDINARY);
+        announceSocketCreated(send, sessionId, 'OC1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'OC1',
+          '{"kind":"tick","n":211}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R2"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":211')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a child frame returning to ordinary does not revive a dropped subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R3"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocketCreated(send, sessionId, 'RV1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'RV1',
+          '{"kind":"tick","n":221}',
+          'Network.webSocketFrameReceived'
+        );
+        emitChildFrame(send, sessionId, 'RVCHILD', page.targetId, CHILD_PROTECTED);
+        emitFrame(
+          send,
+          sessionId,
+          'RV1',
+          '{"kind":"tick","n":222}',
+          'Network.webSocketFrameReceived'
+        );
+        emitChildFrame(send, sessionId, 'RVCHILD', page.targetId, CHILD_ORDINARY);
+        emitFrame(
+          send,
+          sessionId,
+          'RV1',
+          '{"kind":"tick","n":223}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R3"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":221')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":222')),
+        false
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":223')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('an attached child frame without a navigation closes the tab for routing', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: page.url,
+                loaderId: 'L-OK',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R4"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitFrameAttached(send, sessionId, 'ATT', page.targetId);
+        announceSocketCreated(send, sessionId, 'ATT1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'ATT1',
+          '{"kind":"tick","n":231}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R4"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":231')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('an unknown child that becomes ordinary resumes routing for a surviving subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: page.url,
+                loaderId: 'L-OK',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R5"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitFrameAttached(send, sessionId, 'U1', page.targetId);
+        announceSocketCreated(send, sessionId, 'UR1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'UR1',
+          '{"kind":"tick","n":281}',
+          'Network.webSocketFrameReceived'
+        );
+        emitChildFrame(send, sessionId, 'U1', page.targetId, CHILD_ORDINARY);
+        announceSocketCreated(send, sessionId, 'UR2', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'UR2',
+          '{"kind":"tick","n":282}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R5"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":281')),
+        false
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":282')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('an ordinary child resolved after attach keeps the same subscription routing', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let tree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { frameTree: tree },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R6a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitFrameAttached(send, sessionId, 'R7', page.targetId);
+        tree = {
+          frame: tree.frame,
+          childFrames: [
+            {
+              frame: {
+                id: 'R7',
+                parentId: page.targetId,
+                url: CHILD_ORDINARY,
+                loaderId: 'L-R7',
+                securityOrigin: 'https://child.example.test',
+              },
+              childFrames: [],
+            },
+          ],
+        };
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R6b"') {
+        announceSocketCreated(send, sessionId, 'TR1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'TR1',
+          '{"kind":"tick","n":291}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R6a"'), 'ok');
+      await settle();
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+      assert.equal(await browser.eval(tab, '"R6b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":291')),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a child the tree cannot resolve keeps the tab closed without dropping the subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let includeEmpty = false;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: page.url,
+                loaderId: 'L-OK',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: includeEmpty
+                ? [
+                    {
+                      frame: {
+                        id: 'EMPTY',
+                        parentId: page.targetId,
+                        url: '',
+                        loaderId: 'L-EMPTY',
+                        securityOrigin: '://',
+                      },
+                      childFrames: [],
+                    },
+                  ]
+                : [],
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R7"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        includeEmpty = true;
+        emitFrameAttached(send, sessionId, 'EMPTY', page.targetId);
+        announceSocketCreated(send, sessionId, 'TU1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'TU1',
+          '{"kind":"tick","n":301}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R7"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":301')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a child resolved as protected by the tree read drops the subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let tree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { frameTree: tree },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R8"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitFrameAttached(send, sessionId, 'BAD', page.targetId);
+        tree = {
+          frame: tree.frame,
+          childFrames: [
+            {
+              frame: {
+                id: 'BAD',
+                parentId: page.targetId,
+                url: CHILD_PROTECTED,
+                loaderId: 'L-BAD',
+                securityOrigin: 'https://lars.sliccy.ai',
+              },
+              childFrames: [],
+            },
+          ],
+        };
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R8"'), 'ok');
+      await settle();
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      await handle?.close();
+    }
+  });
+});
+
+test('a late child-frame listing does not overwrite a newer child frame class', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let releaseTree;
+  let delayTree = false;
+  const treeWait = new Promise((resolve) => {
+    releaseTree = resolve;
+  });
+  const emptyTree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        const sessionId = message.sessionId;
+        if (!delayTree) {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: { frameTree: emptyTree },
+          });
+          return true;
+        }
+        void treeWait.then(() => {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: {
+              frameTree: {
+                frame: emptyTree.frame,
+                childFrames: [
+                  {
+                    frame: {
+                      id: 'LATE',
+                      parentId: page.targetId,
+                      url: CHILD_PROTECTED,
+                      loaderId: 'L-LATE',
+                      securityOrigin: 'https://lars.sliccy.ai',
+                    },
+                    childFrames: [],
+                  },
+                ],
+              },
+            },
+          });
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R9a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        delayTree = true;
+        emitFrameAttached(send, sessionId, 'LATE', page.targetId);
+        emitChildFrame(send, sessionId, 'LATE', page.targetId, CHILD_ORDINARY);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R9b"') {
+        announceSocketCreated(send, sessionId, 'LT1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'LT1',
+          '{"kind":"tick","n":311}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R9a"'), 'ok');
+      await settle();
+      releaseTree();
+      await settle();
+      assert.equal(await browser.eval(tab, '"R9b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":311')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a failed child-frame listing still allows a later listing', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let treeCalls = 0;
+  let boom = false;
+  let listed = [];
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        treeCalls += 1;
+        const sessionId = message.sessionId;
+        if (boom) {
+          boom = false;
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            error: { code: -32000, message: 'frame tree failed' },
+          });
+          return true;
+        }
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: page.url,
+                loaderId: 'L-OK',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: listed.map((id) => ({
+                frame: {
+                  id,
+                  parentId: page.targetId,
+                  url: CHILD_ORDINARY,
+                  loaderId: `L-${id}`,
+                  securityOrigin: 'https://child.example.test',
+                },
+                childFrames: [],
+              })),
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R10a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        boom = true;
+        listed = ['CF'];
+        emitFrameAttached(send, sessionId, 'CF', page.targetId);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R10b"') {
+        listed = ['CF'];
+        emitFrameAttached(send, sessionId, 'CF', page.targetId);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R10c"') {
+        announceSocketCreated(send, sessionId, 'TT1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'TT1',
+          '{"kind":"tick","n":321}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      const afterSeed = treeCalls;
+      assert.equal(await browser.eval(tab, '"R10a"'), 'ok');
+      await settle();
+      assert.equal(treeCalls > afterSeed, true);
+      const afterBoom = treeCalls;
+      assert.equal(await browser.eval(tab, '"R10b"'), 'ok');
+      await settle();
+      assert.equal(treeCalls > afterBoom, true);
+      assert.equal(await browser.eval(tab, '"R10c"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":321')),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('child-frame listings coalesce across a burst of child frame events', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let treeCalls = 0;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        treeCalls += 1;
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: page.url,
+                loaderId: 'L-OK',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R11"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitFrameAttached(send, sessionId, 'A', page.targetId);
+        emitFrameAttached(send, sessionId, 'B', page.targetId);
+        emitFrameAttached(send, sessionId, 'C', page.targetId);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      const afterSeed = treeCalls;
+      assert.equal(await browser.eval(tab, '"R11"'), 'ok');
+      await settle();
+      const added = treeCalls - afterSeed;
+      assert.equal(added >= 1, true);
+      assert.equal(added <= 2, true);
+    } finally {
+      await handle?.close();
+    }
+  });
+});
+
+test('a nested child frame that is not ordinary stops websocket routing for the tab', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R12"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitChildFrame(send, sessionId, 'MID', page.targetId, CHILD_ORDINARY);
+        emitChildFrame(send, sessionId, 'GRAND', 'MID', CHILD_PROTECTED);
+        announceSocketCreated(send, sessionId, 'GC1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'GC1',
+          '{"kind":"tick","n":241}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R12"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":241')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('detaching a non-ordinary child allows a new subscription only', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const attaches = { n: 0 };
+  const fake = await fakeCdp({
+    answers: wsAnswersWithSibling(page),
+    intercept: (message, send) => {
+      if (attachByTarget(message, send, attaches)) return true;
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R13a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocketCreated(send, sessionId, 'DT1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'DT1',
+          '{"kind":"tick","n":251}',
+          'Network.webSocketFrameReceived'
+        );
+        emitChildFrame(send, sessionId, 'DTCHILD', page.targetId, CHILD_PROTECTED);
+        emitFrame(
+          send,
+          sessionId,
+          'DT1',
+          '{"kind":"tick","n":252}',
+          'Network.webSocketFrameReceived'
+        );
+        emitFrameDetached(send, sessionId, 'DTCHILD', 'remove');
+        emitFrame(
+          send,
+          sessionId,
+          'DT1',
+          '{"kind":"tick","n":253}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R13b"') {
+        announceSocketCreated(send, sessionId, 'DT2', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'DT2',
+          '{"kind":"tick","n":254}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let keep;
+    let handle;
+    let next;
+    try {
+      keep = await holdSecondTab();
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R13a"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":251')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":252')),
+        false
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":253')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      logged.length = 0;
+      next = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R13b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":254')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === next.id),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === keep.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+      await next?.close();
+      await keep?.close();
+    }
+  });
+});
+
+test('attach seeds child frames from the browser frame listing', async () => {
+  const page = {
+    targetId: 'OK',
+    url: 'https://example.test/',
+    title: 'ok',
+    childFrames: [
+      {
+        frame: {
+          id: 'SEEDED',
+          parentId: 'OK',
+          url: CHILD_PROTECTED,
+          loaderId: 'L-SEEDED',
+          securityOrigin: 'https://lars.sliccy.ai',
+        },
+        childFrames: [],
+      },
+    ],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    childFrames: page.childFrames,
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R14"') {
+        announceSocketCreated(send, sessionId, 'SD1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'SD1',
+          '{"kind":"tick","n":261}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await assert.rejects(
+      () =>
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+      { message: REFUSAL }
+    );
+  });
+});
+
+test('a child frame event without a main frameNavigated still closes the tab for routing', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R15"') {
+        emitChildFrame(send, sessionId, 'EARLY', page.targetId, CHILD_PROTECTED);
+        announceSocketCreated(send, sessionId, 'EF1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'EF1',
+          '{"kind":"tick","n":271}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R15"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":271')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test("a frame in another process is outside the tab's frame set", async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let tree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { frameTree: tree },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R20"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitFrameAttached(send, sessionId, 'CHILD', page.targetId);
+        tree = {
+          frame: tree.frame,
+          childFrames: [
+            {
+              frame: {
+                id: 'CHILD',
+                parentId: page.targetId,
+                url: CHILD_PROTECTED,
+                loaderId: 'L-CHILD',
+                securityOrigin: 'https://lars.sliccy.ai',
+              },
+              childFrames: [],
+            },
+          ],
+        };
+        emitFrameDetached(send, sessionId, 'CHILD', 'swap');
+        announceSocketCreated(send, sessionId, 'SW1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'SW1',
+          '{"kind":"tick","n":401}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R20"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":401')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a frame that moved to another process does not keep the tab closed', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let tree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        send({
+          id: message.id,
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+          result: { frameTree: tree },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R21"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitChildFrame(send, sessionId, 'CHILD', page.targetId, CHILD_ORDINARY);
+        tree = {
+          frame: tree.frame,
+          childFrames: [
+            {
+              frame: {
+                id: 'CHILD',
+                parentId: page.targetId,
+                url: CHILD_ORDINARY,
+                loaderId: 'L-CHILD',
+                securityOrigin: 'https://child.example.test',
+              },
+              childFrames: [],
+            },
+          ],
+        };
+        emitFrameDetached(send, sessionId, 'CHILD', 'swap');
+        announceSocketCreated(send, sessionId, 'SW2', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'SW2',
+          '{"kind":"tick","n":402}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R21"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":402')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a frame id that reappears on the page session after leaving is classified fresh', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R22a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        emitChildFrame(send, sessionId, 'CHILD', page.targetId, CHILD_ORDINARY);
+        announceSocketCreated(send, sessionId, 'RF1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'RF1',
+          '{"kind":"tick","n":403}',
+          'Network.webSocketFrameReceived'
+        );
+        emitFrameDetached(send, sessionId, 'CHILD', 'swap');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R22b"') {
+        emitFrameAttached(send, sessionId, 'CHILD', page.targetId);
+        emitChildFrame(send, sessionId, 'CHILD', page.targetId, CHILD_PROTECTED);
+        announceSocketCreated(send, sessionId, 'RF2', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'RF2',
+          '{"kind":"tick","n":404}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R22a"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":403')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+      logged.length = 0;
+      assert.equal(await browser.eval(tab, '"R22b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":404')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a protected grandchild under an unknown parent is not overwritten by a stale ordinary tree', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let releaseTree;
+  const treeWait = new Promise((resolve) => {
+    releaseTree = resolve;
+  });
+  let hold = false;
+  const emptyTree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        const sessionId = message.sessionId;
+        if (!hold) {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: { frameTree: emptyTree },
+          });
+          return true;
+        }
+        void treeWait.then(() => {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: {
+              frameTree: {
+                frame: emptyTree.frame,
+                childFrames: [
+                  {
+                    frame: {
+                      id: 'MID',
+                      parentId: page.targetId,
+                      url: CHILD_ORDINARY,
+                      loaderId: 'L-MID',
+                      securityOrigin: 'https://child.example.test',
+                    },
+                    childFrames: [
+                      {
+                        frame: {
+                          id: 'GRAND',
+                          parentId: 'MID',
+                          url: CHILD_ORDINARY,
+                          loaderId: 'L-GRAND',
+                          securityOrigin: 'https://child.example.test',
+                        },
+                        childFrames: [],
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          });
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R22"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        hold = true;
+        emitFrameAttached(send, sessionId, 'MID', page.targetId);
+        emitChildFrame(send, sessionId, 'GRAND', 'MID', CHILD_PROTECTED);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R22b"') {
+        announceSocketCreated(send, sessionId, 'NG1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'NG1',
+          '{"kind":"tick","n":411}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R22"'), 'ok');
+      await settle();
+      releaseTree();
+      await settle();
+      assert.equal(await browser.eval(tab, '"R22b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":411')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a child frameNavigated with a missing, non-string, or empty url does not change its class', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const cases = [
+    { id: 'R23a', frameId: 'M1', url: undefined, n: 421 },
+    { id: 'R23b', frameId: 'M2', url: 42, n: 422 },
+    { id: 'R23c', frameId: 'M3', url: '', n: 423 },
+  ];
+  for (const entry of cases) {
+    const fake = await fakeCdp({
+      answers: wsAnswers(page),
+      intercept: (message, send) => {
+        if (message.method !== 'Runtime.evaluate') return false;
+        const expression =
+          typeof message.params?.expression === 'string' ? message.params.expression : '';
+        const sessionId = message.sessionId;
+        if (expression === `"${entry.id}"`) {
+          emitMainFrame(send, sessionId, page.targetId, page.url);
+          emitFrameAttached(send, sessionId, entry.frameId, page.targetId);
+          const frame = {
+            id: entry.frameId,
+            parentId: page.targetId,
+            loaderId: `L-${entry.frameId}`,
+            securityOrigin: '://',
+          };
+          if (entry.url !== undefined) frame.url = entry.url;
+          send({
+            method: 'Page.frameNavigated',
+            params: { frame },
+            ...(sessionId ? { sessionId } : {}),
+          });
+          announceSocketCreated(send, sessionId, entry.frameId, ALLOWED_WS);
+          emitFrame(
+            send,
+            sessionId,
+            entry.frameId,
+            `{"kind":"tick","n":${entry.n}}`,
+            'Network.webSocketFrameReceived'
+          );
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        return guardedIntercept(message, send);
+      },
+    });
+    after(() => fake.close());
+    await withDiscovered(fake, async () => {
+      const tab = await browser.findTab({ domain: 'example.test' });
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, `"${entry.id}"`), 'ok');
+        await settle();
+        assert.equal(
+          logged.some((line) => line.includes(`"n":${entry.n}`)),
+          false
+        );
+        assert.equal(
+          (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+          true
+        );
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    });
+  }
+});
+
+test('a same-document protected url on an unknown child is recorded and kept against a stale tree', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let releaseTree;
+  const treeWait = new Promise((resolve) => {
+    releaseTree = resolve;
+  });
+  let hold = false;
+  const emptyTree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        const sessionId = message.sessionId;
+        if (!hold) {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: { frameTree: emptyTree },
+          });
+          return true;
+        }
+        void treeWait.then(() => {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: {
+              frameTree: {
+                frame: emptyTree.frame,
+                childFrames: [
+                  {
+                    frame: {
+                      id: 'SD',
+                      parentId: page.targetId,
+                      url: CHILD_ORDINARY,
+                      loaderId: 'L-SD',
+                      securityOrigin: 'https://child.example.test',
+                    },
+                    childFrames: [],
+                  },
+                ],
+              },
+            },
+          });
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R24"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        hold = true;
+        emitFrameAttached(send, sessionId, 'SD', page.targetId);
+        send({
+          method: 'Page.navigatedWithinDocument',
+          params: { frameId: 'SD', url: CHILD_PROTECTED },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R24b"') {
+        announceSocketCreated(send, sessionId, 'SD1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'SD1',
+          '{"kind":"tick","n":431}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R24"'), 'ok');
+      await settle();
+      releaseTree();
+      await settle();
+      assert.equal(await browser.eval(tab, '"R24b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":431')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a seed frame tree answer does not apply after a main-frame document change', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let seeds = 0;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        const sessionId = message.sessionId;
+        seeds += 1;
+        if (seeds === 1) {
+          emitMainFrame(send, sessionId, page.targetId, 'https://example.test/next');
+          emitFrameAttached(send, sessionId, 'REUSED', page.targetId);
+          void Promise.resolve().then(() => {
+            send({
+              id: message.id,
+              ...(sessionId ? { sessionId } : {}),
+              result: {
+                frameTree: {
+                  frame: {
+                    id: page.targetId,
+                    url: page.url,
+                    loaderId: 'L-OK',
+                    securityOrigin: 'https://example.test',
+                  },
+                  childFrames: [
+                    {
+                      frame: {
+                        id: 'REUSED',
+                        parentId: page.targetId,
+                        url: CHILD_ORDINARY,
+                        loaderId: 'L-OLD',
+                        securityOrigin: 'https://child.example.test',
+                      },
+                      childFrames: [],
+                    },
+                  ],
+                },
+              },
+            });
+          });
+          return true;
+        }
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: 'https://example.test/next',
+                loaderId: 'L-NEXT',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: [],
+            },
+          },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await assert.rejects(
+      () =>
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+      { message: REFUSAL }
+    );
+  });
+});
+
+test('a held child-frame listing does not apply after a main-frame document change', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let releaseTree;
+  const treeWait = new Promise((resolve) => {
+    releaseTree = resolve;
+  });
+  let hold = false;
+  let trees = 0;
+  const emptyTree = {
+    frame: {
+      id: page.targetId,
+      url: page.url,
+      loaderId: 'L-OK',
+      securityOrigin: 'https://example.test',
+    },
+    childFrames: [],
+  };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Page.getFrameTree') {
+        const sessionId = message.sessionId;
+        trees += 1;
+        if (!hold || trees === 1) {
+          send({
+            id: message.id,
+            ...(sessionId ? { sessionId } : {}),
+            result: { frameTree: emptyTree },
+          });
+          return true;
+        }
+        if (hold && trees === 2) {
+          void treeWait.then(() => {
+            send({
+              id: message.id,
+              ...(sessionId ? { sessionId } : {}),
+              result: {
+                frameTree: {
+                  frame: {
+                    id: page.targetId,
+                    url: 'https://example.test/next',
+                    loaderId: 'L-NEXT',
+                    securityOrigin: 'https://example.test',
+                  },
+                  childFrames: [
+                    {
+                      frame: {
+                        id: 'REUSED',
+                        parentId: page.targetId,
+                        url: CHILD_ORDINARY,
+                        loaderId: 'L-OLD',
+                        securityOrigin: 'https://child.example.test',
+                      },
+                      childFrames: [],
+                    },
+                  ],
+                },
+              },
+            });
+          });
+          return true;
+        }
+        send({
+          id: message.id,
+          ...(sessionId ? { sessionId } : {}),
+          result: {
+            frameTree: {
+              frame: {
+                id: page.targetId,
+                url: 'https://example.test/next',
+                loaderId: 'L-NEXT',
+                securityOrigin: 'https://example.test',
+              },
+              childFrames: [],
+            },
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"C26"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        hold = true;
+        emitFrameAttached(send, sessionId, 'OLD', page.targetId);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"C26b"') {
+        emitMainFrame(send, sessionId, page.targetId, 'https://example.test/next');
+        emitFrameAttached(send, sessionId, 'REUSED', page.targetId);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"C26c"') {
+        announceSocketCreated(send, sessionId, 'HR1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'HR1',
+          '{"kind":"tick","n":451}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"C26"'), 'ok');
+      await settle();
+      assert.equal(await browser.eval(tab, '"C26b"'), 'ok');
+      await settle();
+      releaseTree();
+      await settle();
+      assert.equal(await browser.eval(tab, '"C26c"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":451')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('frames of a socket announced before a child frame changed class do not route for a later subscriber', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const closedChild = CHILD_PROTECTED;
+  const attaches = { n: 0 };
+  const fake = await fakeCdp({
+    answers: wsAnswersWithSibling(page),
+    intercept: (message, send) => {
+      if (attachByTarget(message, send, attaches)) return true;
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"A30a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocketCreated(send, sessionId, 'CL1', ALLOWED_WS);
+        emitFrame(
+          send,
+          sessionId,
+          'CL1',
+          '{"kind":"tick","n":501}',
+          'Network.webSocketFrameReceived'
+        );
+        emitChildFrame(send, sessionId, 'CF1', page.targetId, closedChild);
+        emitFrameDetached(send, sessionId, 'CF1', 'remove');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"A30b"') {
+        emitFrame(
+          send,
+          sessionId,
+          'CL1',
+          '{"kind":"tick","n":502}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let keep;
+    let handle;
+    let next;
+    try {
+      keep = await holdSecondTab();
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"A30a"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":501')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      logged.length = 0;
+      next = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"A30b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":502')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === next.id),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === keep.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+      await next?.close();
+      await keep?.close();
+    }
+  });
+});
+
+test('frames of a socket from an earlier session do not route for a later subscriber after a child frame changed class', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const closedChild = CHILD_PROTECTED;
+  const attaches = { n: 0 };
+  const pending = [];
+  const fake = await fakeCdp({
+    answers: wsAnswersWithSibling(page),
+    intercept: (message, send) => {
+      if (attachPair(message, send, attaches, pending)) return true;
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"A32a"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocketCreated(send, 'S1', 'CL2', ALLOWED_WS);
+        emitFrame(send, 'S1', 'CL2', '{"kind":"tick","n":521}', 'Network.webSocketFrameReceived');
+        emitChildFrame(send, sessionId, 'CF2', page.targetId, closedChild);
+        emitFrameDetached(send, sessionId, 'CF2', 'remove');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"A32b"') {
+        emitFrame(send, 'S1', 'CL2', '{"kind":"tick","n":522}', 'Network.webSocketFrameReceived');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let keep;
+    let handle;
+    let next;
+    try {
+      [handle] = await Promise.all([
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+        browser.eval(tab, '1'),
+      ]);
+      assert.equal(attaches.n >= 2, true);
+      keep = await holdSecondTab();
+      assert.equal(await browser.eval(tab, '"A32a"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":521')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      logged.length = 0;
+      next = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"A32b"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":522')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === next.id),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === keep.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+      await next?.close();
+      await keep?.close();
+    }
+  });
+});
+
+test('a child same-document navigation without a usable url leaves routing unchanged', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const openChild = CHILD_ORDINARY;
+  const cases = [
+    { id: 'A1', frameId: 'F1', listed: false, url: undefined, n: 511, routes: false },
+    { id: 'A2', frameId: 'F2', listed: false, url: 42, n: 512, routes: false },
+    { id: 'A3', frameId: 'F3', listed: false, url: '', n: 513, routes: false },
+    { id: 'A4', frameId: 'F4', listed: true, url: undefined, n: 514, routes: true },
+    { id: 'A5', frameId: 'F5', listed: true, url: 42, n: 515, routes: true },
+    { id: 'A6', frameId: 'F6', listed: true, url: '', n: 516, routes: true },
+  ];
+  for (const entry of cases) {
+    let listingCount = 0;
+    const noListing = {
+      frame: {
+        id: page.targetId,
+        url: page.url,
+        loaderId: 'L-OK',
+        securityOrigin: 'https://example.test',
+      },
+      childFrames: [],
+    };
+    const fake = await fakeCdp({
+      answers: wsAnswers(page),
+      intercept: (message, send) => {
+        if (message.method === 'Page.getFrameTree') {
+          listingCount += 1;
+          send({
+            id: message.id,
+            ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+            result: { frameTree: noListing },
+          });
+          return true;
+        }
+        if (message.method !== 'Runtime.evaluate') return false;
+        const expression =
+          typeof message.params?.expression === 'string' ? message.params.expression : '';
+        const sessionId = message.sessionId;
+        if (expression === `"${entry.id}a"`) {
+          emitMainFrame(send, sessionId, page.targetId, page.url);
+          if (entry.listed) {
+            emitChildFrame(send, sessionId, entry.frameId, page.targetId, openChild);
+          } else {
+            emitFrameAttached(send, sessionId, entry.frameId, page.targetId);
+          }
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        if (expression === `"${entry.id}b"`) {
+          const params = { frameId: entry.frameId };
+          if (entry.url !== undefined) params.url = entry.url;
+          send({
+            method: 'Page.navigatedWithinDocument',
+            params,
+            ...(sessionId ? { sessionId } : {}),
+          });
+          announceSocketCreated(send, sessionId, entry.frameId, ALLOWED_WS);
+          emitFrame(
+            send,
+            sessionId,
+            entry.frameId,
+            `{"kind":"tick","n":${entry.n}}`,
+            'Network.webSocketFrameReceived'
+          );
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        return guardedIntercept(message, send);
+      },
+    });
+    after(() => fake.close());
+    await withDiscovered(fake, async () => {
+      const tab = await browser.findTab({ domain: 'example.test' });
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, `"${entry.id}a"`), 'ok');
+        await settle();
+        const before = listingCount;
+        assert.equal(await browser.eval(tab, `"${entry.id}b"`), 'ok');
+        await settle();
+        assert.equal(listingCount > before, true);
+        assert.equal(
+          logged.some((line) => line.includes(`"n":${entry.n}`)),
+          entry.routes
+        );
+        assert.equal(
+          (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+          true
+        );
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    });
+  }
+});

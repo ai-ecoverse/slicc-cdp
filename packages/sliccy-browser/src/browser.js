@@ -60,6 +60,9 @@ const networkless = new Map();
 const subscribers = new Map();
 const documents = new Map();
 const mainFrames = new Map();
+const childFrames = new Map();
+const frameTreeReads = new Map();
+const documentGens = new Map();
 let seq = 1;
 let listening = false;
 let active = 0;
@@ -157,6 +160,9 @@ function closeIdle() {
   networkless.clear();
   documents.clear();
   mainFrames.clear();
+  childFrames.clear();
+  frameTreeReads.clear();
+  documentGens.clear();
   listening = false;
   closing.then(
     (client) => client.close(),
@@ -191,6 +197,7 @@ async function sessionFor(targetId) {
   });
   sessions.set(targetId, sessionId);
   if (guarded) await seedDocumentClass(client, targetId, sessionId);
+  if (guarded) await seedFrameTree(client, targetId, sessionId);
   await hold(endpoint, targetId);
   return { client, sessionId };
 }
@@ -203,7 +210,7 @@ function listen(client) {
     if (typeof requestId !== 'string' || typeof url !== 'string') return;
     if (guarded) {
       const targetId = tabsBySession.get(message.sessionId);
-      if (targetId === undefined || documents.get(targetId) !== 'ordinary') return;
+      if (targetId === undefined || !tabOrdinary(targetId)) return;
     }
     sockets.set(socketKey(message.sessionId, requestId), url);
   });
@@ -216,6 +223,8 @@ function listen(client) {
   client.on('Network.webSocketFrameSent', (message) => void learnUrl(client, message));
   if (guarded) {
     client.on('Page.frameNavigated', (message) => onFrameNavigated(message));
+    client.on('Page.frameAttached', (message) => onFrameAttached(message));
+    client.on('Page.frameDetached', (message) => onFrameDetached(message));
     client.on('Page.navigatedWithinDocument', (message) => onNavigatedWithinDocument(message));
     client.on('Target.targetInfoChanged', (message) => onTargetInfo(message?.params?.targetInfo));
     client.on('Target.targetCreated', (message) => onTargetInfo(message?.params?.targetInfo));
@@ -264,7 +273,7 @@ function noteUnknownDrop(targetId) {
 
 function route(targetId, url, raw, which) {
   if (guarded && (typeof url !== 'string' || isProtectedUrl(url))) return;
-  if (guarded && documents.get(targetId) !== 'ordinary') return;
+  if (guarded && !tabOrdinary(targetId)) return;
   for (const sub of subscribers.values()) {
     if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
     const body = parseFrame(raw, sub.filter?.parseAs);
@@ -306,9 +315,146 @@ function setDocumentClass(targetId, protectedDocument) {
   });
 }
 
+function bumpDocumentGen(targetId) {
+  documentGens.set(targetId, (documentGens.get(targetId) ?? 0) + 1);
+}
+
 function forgetDocument(targetId) {
   documents.delete(targetId);
   mainFrames.delete(targetId);
+  childFrames.delete(targetId);
+  frameTreeReads.delete(targetId);
+  bumpDocumentGen(targetId);
+}
+
+function tabOrdinary(targetId) {
+  if (documents.get(targetId) !== 'ordinary') return false;
+  const kids = childFrames.get(targetId);
+  if (!kids) return true;
+  for (const cls of kids.values()) {
+    if (cls !== 'ordinary') return false;
+  }
+  return true;
+}
+
+function clearChildFrames(targetId) {
+  childFrames.delete(targetId);
+}
+
+function setChildFrameClass(targetId, frameId, next) {
+  if (!guarded || typeof frameId !== 'string') return;
+  let kids = childFrames.get(targetId);
+  if (!kids) {
+    kids = new Map();
+    childFrames.set(targetId, kids);
+  }
+  kids.set(frameId, next);
+  if (next !== 'protected') return;
+  clearTabSockets(targetId);
+  dropSubscribers(targetId);
+}
+
+function scheduleFrameTreeRead(targetId) {
+  if (!guarded) return;
+  let state = frameTreeReads.get(targetId);
+  if (!state) {
+    state = { dirty: false, running: false };
+    frameTreeReads.set(targetId, state);
+  }
+  state.dirty = true;
+  if (state.running) return;
+  state.running = true;
+  queueMicrotask(() => {
+    void runFrameTreeReads(targetId);
+  });
+}
+
+async function runFrameTreeReads(targetId) {
+  const state = frameTreeReads.get(targetId);
+  if (!state) return;
+  try {
+    while (guarded && state.dirty) {
+      state.dirty = false;
+      const sessionId = sessions.get(targetId);
+      if (typeof sessionId !== 'string') break;
+      const gen = documentGens.get(targetId) ?? 0;
+      const client = await openClient().catch(() => undefined);
+      if (!client || !guarded || sessions.get(targetId) !== sessionId) break;
+      const result = await client.send('Page.getFrameTree', {}, sessionId);
+      if (!guarded || sessions.get(targetId) !== sessionId) break;
+      if ((documentGens.get(targetId) ?? 0) !== gen) continue;
+      const tree = result?.frameTree;
+      if (!tree || typeof tree !== 'object') continue;
+      applyFrameTree(targetId, tree, { onlyUnknown: true });
+    }
+  } catch {
+    undefined;
+  } finally {
+    state.running = false;
+  }
+}
+
+function applyFrameTree(targetId, tree, { onlyUnknown = false } = {}) {
+  const root = tree.frame;
+  if (root && typeof root.id === 'string' && !mainFrames.has(targetId)) {
+    mainFrames.set(targetId, root.id);
+  }
+  walkFrameTree(targetId, tree.childFrames, root?.id, onlyUnknown);
+}
+
+function resolveTreeFrame(targetId, frame, parentId, onlyUnknown) {
+  const current = childFrames.get(targetId)?.get(frame.id);
+  if (onlyUnknown && current !== 'unknown') return;
+  if (!onlyUnknown && current !== undefined && current !== 'unknown') return;
+  const url = typeof frame.url === 'string' ? frame.url : '';
+  if (url.length === 0) {
+    if (current === undefined) setChildFrameClass(targetId, frame.id, 'unknown');
+    return;
+  }
+  const pid = typeof frame.parentId === 'string' ? frame.parentId : parentId;
+  setChildFrameClass(
+    targetId,
+    frame.id,
+    classifyChildFrame(targetId, pid, frameUrl(frame), {
+      documentURL: frame.url,
+      unreachableURL: frame.unreachableUrl,
+    })
+  );
+}
+
+function walkFrameTree(targetId, list, parentId, onlyUnknown) {
+  if (!Array.isArray(list)) return;
+  for (const node of list) {
+    if (!node || typeof node !== 'object') continue;
+    const frame = node.frame;
+    if (!frame || typeof frame.id !== 'string') continue;
+    resolveTreeFrame(targetId, frame, parentId, onlyUnknown);
+    walkFrameTree(targetId, node.childFrames, frame.id, onlyUnknown);
+  }
+}
+
+function parentFrameClass(targetId, parentId) {
+  const main = mainFrames.get(targetId);
+  if (parentId === undefined || parentId === main || parentId === targetId) {
+    return documents.get(targetId);
+  }
+  return childFrames.get(targetId)?.get(parentId);
+}
+
+function childUrlProtected(url, extra = {}) {
+  if (typeof url !== 'string' || url.length === 0) return false;
+  if (url.startsWith('chrome-error:')) return true;
+  if (url.startsWith('data:') || inheritingDocumentUrl(url)) return false;
+  return isProtectedDocument({ url, previous: false, ...extra });
+}
+
+function classifyChildFrame(targetId, parentId, url, extra = {}) {
+  if (childUrlProtected(url, extra)) return 'protected';
+  const parentCls = parentFrameClass(targetId, parentId);
+  if (parentCls === undefined || parentCls === 'unknown') return 'unknown';
+  if (typeof url === 'string' && url.startsWith('data:')) return parentCls;
+  const previous = parentCls === 'protected';
+  return isProtectedDocument({ url, previous, ...extra }) ? 'protected' : 'ordinary';
 }
 
 function dropSubscribers(targetId) {
@@ -383,16 +529,59 @@ async function seedDocumentClass(client, targetId, sessionId) {
 
 function onFrameNavigated(message) {
   const frame = message?.params?.frame;
-  if (!frame || typeof frame !== 'object' || frame.parentId !== undefined) return;
+  if (!frame || typeof frame !== 'object') return;
   const targetId = tabsBySession.get(message.sessionId);
   if (targetId === undefined) return;
-  clearTabSockets(targetId);
-  if (typeof frame.id === 'string') mainFrames.set(targetId, frame.id);
-  applyDocumentUrl(targetId, {
-    url: frameUrl(frame),
-    documentURL: typeof frame.url === 'string' ? frame.url : undefined,
-    unreachableURL: frame.unreachableUrl,
-  });
+  if (frame.parentId === undefined) {
+    bumpDocumentGen(targetId);
+    clearChildFrames(targetId);
+    clearTabSockets(targetId);
+    if (typeof frame.id === 'string') mainFrames.set(targetId, frame.id);
+    applyDocumentUrl(targetId, {
+      url: frameUrl(frame),
+      documentURL: typeof frame.url === 'string' ? frame.url : undefined,
+      unreachableURL: frame.unreachableUrl,
+    });
+    return;
+  }
+  if (typeof frame.id !== 'string') return;
+  if (typeof frame.url !== 'string' || frame.url.length === 0) {
+    scheduleFrameTreeRead(targetId);
+    return;
+  }
+  const parentId = typeof frame.parentId === 'string' ? frame.parentId : undefined;
+  setChildFrameClass(
+    targetId,
+    frame.id,
+    classifyChildFrame(targetId, parentId, frameUrl(frame), {
+      documentURL: frame.url,
+      unreachableURL: frame.unreachableUrl,
+    })
+  );
+  scheduleFrameTreeRead(targetId);
+}
+
+function onFrameAttached(message) {
+  const params = message?.params ?? {};
+  const targetId = tabsBySession.get(message.sessionId);
+  if (targetId === undefined) return;
+  const frameId = typeof params.frameId === 'string' ? params.frameId : undefined;
+  if (frameId === undefined) return;
+  setChildFrameClass(targetId, frameId, 'unknown');
+  scheduleFrameTreeRead(targetId);
+}
+
+function onFrameDetached(message) {
+  const params = message?.params ?? {};
+  const targetId = tabsBySession.get(message.sessionId);
+  if (targetId === undefined) return;
+  const frameId = typeof params.frameId === 'string' ? params.frameId : undefined;
+  if (frameId === undefined) return;
+  const kids = childFrames.get(targetId);
+  if (!kids) return;
+  kids.delete(frameId);
+  if (kids.size === 0) childFrames.delete(targetId);
+  scheduleFrameTreeRead(targetId);
 }
 
 function onNavigatedWithinDocument(message) {
@@ -401,9 +590,53 @@ function onNavigatedWithinDocument(message) {
   if (targetId === undefined) return;
   const frameId = typeof params.frameId === 'string' ? params.frameId : undefined;
   const main = mainFrames.get(targetId);
-  if (frameId !== undefined && frameId !== main && frameId !== targetId) return;
+  if (frameId !== undefined && frameId !== main && frameId !== targetId) {
+    if (typeof params.url !== 'string' || params.url.length === 0) {
+      scheduleFrameTreeRead(targetId);
+      return;
+    }
+    const url = params.url;
+    const current = childFrames.get(targetId)?.get(frameId);
+    if (current === undefined || current === 'unknown') {
+      if (childUrlProtected(url)) {
+        setChildFrameClass(targetId, frameId, 'protected');
+      } else if (current === undefined) {
+        setChildFrameClass(targetId, frameId, 'unknown');
+      }
+      scheduleFrameTreeRead(targetId);
+      return;
+    }
+    if (url.startsWith('chrome-error:')) {
+      setChildFrameClass(targetId, frameId, 'protected');
+      scheduleFrameTreeRead(targetId);
+      return;
+    }
+    if (url.startsWith('data:')) {
+      setChildFrameClass(targetId, frameId, current);
+      return;
+    }
+    const previous = current === 'protected';
+    setChildFrameClass(
+      targetId,
+      frameId,
+      isProtectedDocument({ url, previous }) ? 'protected' : 'ordinary'
+    );
+    scheduleFrameTreeRead(targetId);
+    return;
+  }
   if (typeof params.url !== 'string') return;
   applyDocumentUrl(targetId, { url: params.url });
+}
+
+async function seedFrameTree(client, targetId, sessionId) {
+  if (!guarded) return;
+  const gen = documentGens.get(targetId) ?? 0;
+  const result = await client.send('Page.getFrameTree', {}, sessionId).catch(() => undefined);
+  if (!guarded || sessions.get(targetId) !== sessionId) return;
+  if ((documentGens.get(targetId) ?? 0) !== gen) return;
+  const tree = result?.frameTree;
+  if (!tree || typeof tree !== 'object') return;
+  applyFrameTree(targetId, tree, { onlyUnknown: false });
 }
 
 function onTargetInfo(info) {
@@ -1021,7 +1254,7 @@ export const websocket = {
       const urlMatchRe =
         urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
       const { sessionId } = await sessionFor(targetId);
-      if (guarded && documents.get(targetId) !== 'ordinary') throw new Error(REFUSAL);
+      if (guarded && !tabOrdinary(targetId)) throw new Error(REFUSAL);
       if (networkless.has(sessionId)) {
         throw new Error(`browser.websocket: ${networkless.get(sessionId)}`);
       }

@@ -74,6 +74,7 @@ export const CHROME_FILES = new Set(
     'sliccy-browser',
     'sliccy-browser-dialogs-chrome',
     'sliccy-browser-guard-chrome',
+    'sliccy-browser-guard-chrome-frames',
     'sliccy-browser-install',
     'snapshot-batch-chrome',
     'snapshot-golden',
