@@ -272,6 +272,7 @@ function record(sessionId) {
 }
 
 async function learnUrl(client, message) {
+  if (guarded) return;
   const sessionId = message?.sessionId;
   const { requestId, response } = message?.params ?? {};
   const key = socketKey(sessionId, requestId);
@@ -859,7 +860,7 @@ export const websocket = {
       if (networkless.has(sessionId)) {
         throw new Error(`browser.websocket: ${networkless.get(sessionId)}`);
       }
-      if (urlMatch !== undefined) await record(sessionId);
+      if (urlMatch !== undefined && !guarded) await record(sessionId);
       const id = `wssub-${seq++}-${Date.now().toString(36)}`;
       const sub = {
         id,

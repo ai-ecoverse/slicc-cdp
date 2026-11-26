@@ -880,8 +880,9 @@ test('websocket refuses a protected tab and drops protected socket frames', asyn
   });
 });
 
-test('discovered websocket learnUrl keeps a protected learned URL dropped', async () => {
+test('a guarded subscription drops frames of a socket the browser did not announce', async () => {
   const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let productEvaluates = 0;
   const fake = await fakeCdp({
     answers: {
       'Target.getTargets': { targetInfos: [info(page)] },
@@ -895,36 +896,20 @@ test('discovered websocket learnUrl keeps a protected learned URL dropped', asyn
       const expression =
         typeof message.params?.expression === 'string' ? message.params.expression : '';
       const sessionId = message.sessionId;
-      if (expression.includes('.take(')) {
-        send({
-          id: message.id,
-          ...(sessionId ? { sessionId } : {}),
-          result: { result: { type: 'string', value: 'wss://seven.sliccy.ai/ws' } },
-        });
-        return true;
-      }
-      if (expression.includes('__sliccWsSent')) {
-        send({
-          id: message.id,
-          ...(sessionId ? { sessionId } : {}),
-          result: { result: { type: 'boolean', value: true } },
-        });
-        return true;
-      }
-      if (expression === '"learn-protected-ws"') {
+      if (expression === '"unannounced-socket"') {
         send({
           method: 'Network.webSocketFrameSent',
           params: {
-            requestId: 'LEARN1',
-            response: { opcode: 1, payloadData: 'ping-protected' },
+            requestId: 'R9',
+            response: { opcode: 1, payloadData: 'ping' },
           },
           ...(sessionId ? { sessionId } : {}),
         });
         send({
           method: 'Network.webSocketFrameReceived',
           params: {
-            requestId: 'LEARN1',
-            response: { opcode: 1, payloadData: '{"kind":"after-learn","n":3}' },
+            requestId: 'R9',
+            response: { opcode: 1, payloadData: '{"kind":"tick","n":3}' },
           },
           ...(sessionId ? { sessionId } : {}),
         });
@@ -935,7 +920,18 @@ test('discovered websocket learnUrl keeps a protected learned URL dropped', asyn
         });
         return true;
       }
-      return guardedIntercept(message, send);
+      productEvaluates += 1;
+      send({
+        id: message.id,
+        ...(sessionId ? { sessionId } : {}),
+        result: {
+          result:
+            productEvaluates === 1
+              ? { type: 'boolean', value: true }
+              : { type: 'string', value: 'wss://seven.sliccy.ai/ws' },
+        },
+      });
+      return true;
     },
   });
   after(() => fake.close());
@@ -952,10 +948,10 @@ test('discovered websocket learnUrl keeps a protected learned URL dropped', asyn
         .on(tab, { urlMatch: /example\.test|sliccy\.ai/u })
         .filter({ parseAs: 'json' })
         .forward({ sink: 'log' });
-      assert.equal(await browser.eval(tab, '"learn-protected-ws"'), 'ok');
+      assert.equal(await browser.eval(tab, '"unannounced-socket"'), 'ok');
       await settle();
       assert.equal(
-        logged.some((line) => line.includes('after-learn')),
+        logged.some((line) => line.includes('"n":3')),
         false
       );
     } finally {
@@ -1480,6 +1476,449 @@ test('explicit SLICC_CDP_URL fetch passes the original string and skips baseURI'
     assert.ok(seenFetch.some((arg) => arg.includes(JSON.stringify('/plain'))));
     assert.ok(!seenFetch.some((arg) => arg.includes('https://example.test/plain')));
   } finally {
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
+});
+
+const ALLOWED_WS = 'ws://127.0.0.1:9/ws';
+const PROTECTED_WS = 'wss://seven.sliccy.ai/ws';
+
+function captureLog() {
+  const logged = [];
+  const write = console.log;
+  console.log = (...args) => {
+    logged.push(args.map(String).join(' '));
+  };
+  return {
+    logged,
+    restore() {
+      console.log = write;
+    },
+  };
+}
+
+function wsAnswers(page) {
+  return {
+    'Target.getTargets': { targetInfos: [info(page)] },
+    'Target.attachToTarget': { sessionId: 'S1' },
+    'Page.enable': {},
+    'Runtime.enable': {},
+    'Network.enable': {},
+  };
+}
+
+function replyEvaluate(message, send, value) {
+  send({
+    id: message.id,
+    ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+    result: { result: { type: typeof value === 'boolean' ? 'boolean' : 'string', value } },
+  });
+}
+
+function emitFrame(send, sessionId, requestId, payloadData, kind) {
+  send({
+    method: kind,
+    params: {
+      requestId,
+      response: { opcode: 1, payloadData },
+    },
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
+function answerProductEvaluate(message, send, evaluations, valueForLater, delayLaterMs = 0) {
+  evaluations.push(1);
+  const value = evaluations.length === 1 ? true : valueForLater;
+  if (evaluations.length > 1 && delayLaterMs > 0) {
+    setTimeout(() => replyEvaluate(message, send, value), delayLaterMs);
+    return;
+  }
+  replyEvaluate(message, send, value);
+}
+
+test('a socket opened before the first attach is not routed in guarded mode', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const orderings = ['early', 'middle', 'late'];
+  for (const ordering of orderings) {
+    const evaluations = [];
+    const fake = await fakeCdp({
+      answers: wsAnswers(page),
+      intercept: (message, send) => {
+        if (message.method !== 'Runtime.evaluate') return false;
+        const expression =
+          typeof message.params?.expression === 'string' ? message.params.expression : '';
+        const sessionId = message.sessionId;
+        if (expression === '"preattach-ping"') {
+          if (ordering === 'early') {
+            emitFrame(
+              send,
+              sessionId,
+              'R1',
+              '{"kind":"tick","n":1}',
+              'Network.webSocketFrameReceived'
+            );
+            emitFrame(send, sessionId, 'R1', 'ping', 'Network.webSocketFrameSent');
+          } else if (ordering === 'middle') {
+            emitFrame(send, sessionId, 'R1', 'ping', 'Network.webSocketFrameSent');
+            emitFrame(
+              send,
+              sessionId,
+              'R1',
+              '{"kind":"tick","n":1}',
+              'Network.webSocketFrameReceived'
+            );
+          } else {
+            emitFrame(send, sessionId, 'R1', 'ping', 'Network.webSocketFrameSent');
+            setTimeout(() => {
+              emitFrame(
+                send,
+                sessionId,
+                'R1',
+                '{"kind":"tick","n":1}',
+                'Network.webSocketFrameReceived'
+              );
+            }, 40);
+          }
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        answerProductEvaluate(
+          message,
+          send,
+          evaluations,
+          ALLOWED_WS,
+          ordering === 'middle' ? 40 : 0
+        );
+        return true;
+      },
+    });
+    after(() => fake.close());
+    await withDiscovered(fake, async () => {
+      const tab = await browser.findTab({ domain: 'example.test' });
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /127\.0\.0\.1/u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, '"preattach-ping"'), 'ok');
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal(
+          logged.some((line) => line.includes('"n":1') || line.includes('tick')),
+          false,
+          ordering
+        );
+        assert.ok(handle.dropped > 0, ordering);
+        assert.equal(evaluations.length, 0, ordering);
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    });
+  }
+});
+
+test('sockets the browser has not announced are not routed in guarded mode', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  for (const first of ['allowed', 'protected']) {
+    const second = first === 'allowed' ? 'protected' : 'allowed';
+    const order = [first, second];
+    const evaluations = [];
+    const fake = await fakeCdp({
+      answers: wsAnswers(page),
+      intercept: (message, send) => {
+        if (message.method !== 'Runtime.evaluate') return false;
+        const expression =
+          typeof message.params?.expression === 'string' ? message.params.expression : '';
+        const sessionId = message.sessionId;
+        if (expression === '"two-sockets"') {
+          for (const which of order) {
+            const requestId = which === 'allowed' ? 'A1' : 'P1';
+            emitFrame(send, sessionId, requestId, 'body-1', 'Network.webSocketFrameSent');
+          }
+          setTimeout(() => {
+            for (const which of order) {
+              const requestId = which === 'allowed' ? 'A1' : 'P1';
+              emitFrame(
+                send,
+                sessionId,
+                requestId,
+                `{"kind":"tick","from":"${which}"}`,
+                'Network.webSocketFrameReceived'
+              );
+            }
+          }, 40);
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        answerProductEvaluate(message, send, evaluations, ALLOWED_WS);
+        return true;
+      },
+    });
+    after(() => fake.close());
+    await withDiscovered(fake, async () => {
+      const tab = await browser.findTab({ domain: 'example.test' });
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, '"two-sockets"'), 'ok');
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        assert.equal(
+          logged.some(
+            (line) => line.includes('"from":"protected"') || line.includes('from":"protected')
+          ),
+          false,
+          first
+        );
+        assert.equal(
+          logged.some(
+            (line) => line.includes('"from":"allowed"') || line.includes('from":"allowed')
+          ),
+          false,
+          first
+        );
+        assert.ok(handle.dropped > 0, first);
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    });
+  }
+});
+
+test("the url of a socket comes from the browser's event", async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const evaluations = [];
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"preattach-r3"') {
+        emitFrame(send, sessionId, 'R3', 'ping', 'Network.webSocketFrameSent');
+        setTimeout(() => {
+          emitFrame(
+            send,
+            sessionId,
+            'R3',
+            '{"kind":"tick","n":11}',
+            'Network.webSocketFrameReceived'
+          );
+        }, 40);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      answerProductEvaluate(message, send, evaluations, ALLOWED_WS);
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /127\.0\.0\.1/u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"preattach-r3"'), 'ok');
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(
+        logged.some((line) => line.includes('"n":11')),
+        false
+      );
+      assert.ok(handle.dropped > 0);
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a guarded urlMatch subscription routes only sockets the browser announced', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const evaluations = [];
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"preattach-r4"') {
+        emitFrame(send, sessionId, 'R4', 'ping', 'Network.webSocketFrameSent');
+        setTimeout(() => {
+          emitFrame(
+            send,
+            sessionId,
+            'R4',
+            '{"kind":"tick","n":12}',
+            'Network.webSocketFrameReceived'
+          );
+        }, 40);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      answerProductEvaluate(message, send, evaluations, ALLOWED_WS);
+      return true;
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /127\.0\.0\.1/u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(evaluations.length, 0);
+      assert.equal(await browser.eval(tab, '"preattach-r4"'), 'ok');
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(
+        logged.some((line) => line.includes('"n":12')),
+        false
+      );
+      assert.ok(handle.dropped > 0);
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a socket announced after attach routes by the url the browser announced', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"announce-allowed"') {
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'R5', url: ALLOWED_WS },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        emitFrame(
+          send,
+          sessionId,
+          'R5',
+          '{"kind":"tick","n":21}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"announce-protected"') {
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'R6', url: PROTECTED_WS },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        emitFrame(
+          send,
+          sessionId,
+          'R6',
+          '{"kind":"tick","n":22}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"announce-allowed"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":21')),
+        true
+      );
+      assert.equal(handle.dropped, 0);
+      logged.length = 0;
+      assert.equal(await browser.eval(tab, '"announce-protected"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":22')),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('an explicit endpoint routes sockets as before', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const evaluations = [];
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"explicit-next"') {
+        emitFrame(send, sessionId, 'R7', 'ping', 'Network.webSocketFrameSent');
+        emitFrame(
+          send,
+          sessionId,
+          'R7',
+          '{"kind":"tick","n":31}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      answerProductEvaluate(message, send, evaluations, ALLOWED_WS);
+      return true;
+    },
+  });
+  after(() => fake.close());
+  const previous = process.env.SLICC_CDP_URL;
+  process.env.SLICC_CDP_URL = fake.url;
+  await settle();
+  const { logged, restore } = captureLog();
+  let handle;
+  try {
+    handle = await browser.websocket
+      .on(page, { urlMatch: /127\.0\.0\.1/u })
+      .filter({ parseAs: 'json' })
+      .forward({ sink: 'log' });
+    assert.equal(await browser.eval(page, '"explicit-next"'), 'ok');
+    await settle();
+    assert.equal(
+      logged.some((line) => line.includes('"n":31')),
+      true
+    );
+  } finally {
+    restore();
+    await handle?.close();
     if (previous === undefined) delete process.env.SLICC_CDP_URL;
     else process.env.SLICC_CDP_URL = previous;
     await settle();
