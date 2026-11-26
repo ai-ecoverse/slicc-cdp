@@ -1499,9 +1499,10 @@ function captureLog() {
   };
 }
 
-function wsAnswers(page) {
+function wsAnswers(...pages) {
+  const list = pages.flat();
   return {
-    'Target.getTargets': { targetInfos: [info(page)] },
+    'Target.getTargets': { targetInfos: list.map(info) },
     'Target.attachToTarget': { sessionId: 'S1' },
     'Page.enable': {},
     'Runtime.enable': {},
@@ -1526,6 +1527,50 @@ function emitFrame(send, sessionId, requestId, payloadData, kind) {
     },
     ...(sessionId ? { sessionId } : {}),
   });
+}
+
+function emitMainFrame(send, sessionId, targetId, url) {
+  let origin = '';
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    origin = '';
+  }
+  send({
+    method: 'Page.frameNavigated',
+    params: {
+      frame: {
+        id: targetId,
+        url,
+        loaderId: `L-${targetId}`,
+        securityOrigin: origin,
+      },
+    },
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
+function emitTargetInfo(send, method, targetId, url) {
+  send({
+    method,
+    params: {
+      targetInfo: {
+        targetId,
+        type: 'page',
+        url,
+        title: url,
+      },
+    },
+  });
+}
+
+function announceSocket(send, sessionId, requestId, url, frame) {
+  send({
+    method: 'Network.webSocketCreated',
+    params: { requestId, url },
+    ...(sessionId ? { sessionId } : {}),
+  });
+  emitFrame(send, sessionId, requestId, frame, 'Network.webSocketFrameReceived');
 }
 
 function answerProductEvaluate(message, send, evaluations, valueForLater, delayLaterMs = 0) {
@@ -1808,34 +1853,14 @@ test('a socket announced after attach routes by the url the browser announced', 
         typeof message.params?.expression === 'string' ? message.params.expression : '';
       const sessionId = message.sessionId;
       if (expression === '"announce-allowed"') {
-        send({
-          method: 'Network.webSocketCreated',
-          params: { requestId: 'R5', url: ALLOWED_WS },
-          ...(sessionId ? { sessionId } : {}),
-        });
-        emitFrame(
-          send,
-          sessionId,
-          'R5',
-          '{"kind":"tick","n":21}',
-          'Network.webSocketFrameReceived'
-        );
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'R5', ALLOWED_WS, '{"kind":"tick","n":21}');
         replyEvaluate(message, send, 'ok');
         return true;
       }
       if (expression === '"announce-protected"') {
-        send({
-          method: 'Network.webSocketCreated',
-          params: { requestId: 'R6', url: PROTECTED_WS },
-          ...(sessionId ? { sessionId } : {}),
-        });
-        emitFrame(
-          send,
-          sessionId,
-          'R6',
-          '{"kind":"tick","n":22}',
-          'Network.webSocketFrameReceived'
-        );
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'R6', PROTECTED_WS, '{"kind":"tick","n":22}');
         replyEvaluate(message, send, 'ok');
         return true;
       }
@@ -1924,3 +1949,1335 @@ test('an explicit endpoint routes sockets as before', async () => {
     await settle();
   }
 });
+
+test('subscription frames follow the tab document across navigations', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const docB = 'https://lars.sliccy.ai/';
+  const docABack = 'https://example.test/back';
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R1"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'N1', ALLOWED_WS, '{"kind":"tick","n":41}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R2"') {
+        emitMainFrame(send, sessionId, page.targetId, docB);
+        announceSocket(send, sessionId, 'N2', ALLOWED_WS, '{"kind":"tick","n":42}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R3"') {
+        emitMainFrame(send, sessionId, page.targetId, docABack);
+        announceSocket(send, sessionId, 'N3', ALLOWED_WS, '{"kind":"tick","n":43}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R1"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":41')),
+        true
+      );
+      logged.length = 0;
+      assert.equal(await browser.eval(tab, '"R2"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":42')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      logged.length = 0;
+      assert.equal(await browser.eval(tab, '"R3"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":43')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('an open socket stops delivering after the tab document changes', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const docB = 'https://lars.sliccy.ai/';
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R4"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'OPEN1', url: ALLOWED_WS },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        emitFrame(
+          send,
+          sessionId,
+          'OPEN1',
+          '{"kind":"tick","n":51}',
+          'Network.webSocketFrameReceived'
+        );
+        emitMainFrame(send, sessionId, page.targetId, docB);
+        emitFrame(
+          send,
+          sessionId,
+          'OPEN1',
+          '{"kind":"tick","n":52}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R4"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":51')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":52')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('unknown tab document class does not route; ordinary class does', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let attached = false;
+  let seedEmpty = true;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Target.attachToTarget') {
+        attached = true;
+        send({ id: message.id, result: { sessionId: 'S1' } });
+        return true;
+      }
+      if (message.method === 'Target.getTargets') {
+        if (attached && seedEmpty) {
+          seedEmpty = false;
+          send({
+            id: message.id,
+            result: {
+              targetInfos: [
+                {
+                  targetId: page.targetId,
+                  type: 'page',
+                  url: '',
+                  title: '',
+                  attached: false,
+                  canAccessOpener: false,
+                  browserContextId: 'CTX',
+                },
+              ],
+            },
+          });
+          return true;
+        }
+        send({
+          id: message.id,
+          result: { targetInfos: [info(page)] },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R5"') {
+        emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, page.url);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R6"') {
+        announceSocket(send, sessionId, 'OCLASS', ALLOWED_WS, '{"kind":"tick","n":62}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await assert.rejects(
+      () =>
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+      { message: REFUSAL }
+    );
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      assert.equal(await browser.eval(tab, '"R5"'), 'ok');
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R6"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":62')),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('ordinary navigations keep an ordinary subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const next = 'https://example.test/next';
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R22"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'O1', ALLOWED_WS, '{"kind":"tick","n":71}');
+        emitMainFrame(send, sessionId, page.targetId, next);
+        announceSocket(send, sessionId, 'O2', ALLOWED_WS, '{"kind":"tick","n":72}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R22"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":71')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":72')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('targetInfoChanged and targetCreated update the tab document class', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const docB = 'https://lars.sliccy.ai/';
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R7"') {
+        emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, page.url);
+        announceSocket(send, sessionId, 'TIC1', ALLOWED_WS, '{"kind":"tick","n":81}');
+        emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, docB);
+        announceSocket(send, sessionId, 'TIC2', ALLOWED_WS, '{"kind":"tick","n":82}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R8"') {
+        emitTargetInfo(send, 'Target.targetCreated', page.targetId, page.url);
+        announceSocket(send, sessionId, 'TC1', ALLOWED_WS, '{"kind":"tick","n":83}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R7"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":81')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":82')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      logged.length = 0;
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R8"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":83')),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a same-document navigation keeps the subscription when the document stays ordinary', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R23"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'W1', ALLOWED_WS, '{"kind":"tick","n":91}');
+        send({
+          method: 'Page.navigatedWithinDocument',
+          params: { frameId: page.targetId, url: `${page.url}#section` },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        announceSocket(send, sessionId, 'W2', ALLOWED_WS, '{"kind":"tick","n":92}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R23"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":91')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":92')),
+        true
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('an explicit endpoint does not send Target.setDiscoverTargets', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const discover = [];
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Target.setDiscoverTargets') {
+        discover.push(message.params);
+        send({ id: message.id, result: {} });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R24"') {
+        announceSocket(send, sessionId, 'UD1', ALLOWED_WS, '{"kind":"tick","n":101}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  const previous = process.env.SLICC_CDP_URL;
+  process.env.SLICC_CDP_URL = fake.url;
+  await settle();
+  const { logged, restore } = captureLog();
+  let handle;
+  try {
+    handle = await browser.websocket
+      .on(page, { urlMatch: /./u })
+      .filter({ parseAs: 'json' })
+      .forward({ sink: 'log' });
+    assert.equal(await browser.eval(page, '"R24"'), 'ok');
+    await settle();
+    assert.equal(discover.length, 0);
+    assert.equal(
+      logged.some((line) => line.includes('"n":101')),
+      true
+    );
+  } finally {
+    restore();
+    await handle?.close();
+    if (previous === undefined) delete process.env.SLICC_CDP_URL;
+    else process.env.SLICC_CDP_URL = previous;
+    await settle();
+  }
+});
+
+test('a detached session drops its subscriptions and forgets the tab document', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let attaches = 0;
+  const fake = await fakeCdp({
+    answers: {
+      ...wsAnswers(page),
+      'Target.attachToTarget': () => {
+        attaches += 1;
+        return { sessionId: attaches === 1 ? 'S1' : 'S2' };
+      },
+    },
+    intercept: (message, send) => {
+      if (message.method === 'Target.attachToTarget') {
+        attaches += 1;
+        send({
+          id: message.id,
+          result: { sessionId: attaches === 1 ? 'S1' : 'S2' },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R9"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'D1', ALLOWED_WS, '{"kind":"tick","n":111}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R10"') {
+        send({
+          method: 'Target.detachedFromTarget',
+          params: { sessionId: 'S1', targetId: page.targetId },
+        });
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R11"') {
+        announceSocket(send, sessionId, 'D2', ALLOWED_WS, '{"kind":"tick","n":112}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R9"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":111')),
+        true
+      );
+      logged.length = 0;
+      assert.equal(await browser.eval(tab, '"R10"'), 'ok');
+      await settle();
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      assert.equal(await browser.eval(tab, '"R11"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":112')),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a destroyed target drops its subscriptions and forgets the tab document', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R12"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'X1', ALLOWED_WS, '{"kind":"tick","n":121}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R13"') {
+        send({
+          method: 'Target.targetDestroyed',
+          params: { targetId: page.targetId },
+        });
+        announceSocket(send, sessionId, 'X2', ALLOWED_WS, '{"kind":"tick","n":122}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R12"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":121')),
+        true
+      );
+      logged.length = 0;
+      assert.equal(await browser.eval(tab, '"R13"'), 'ok');
+      await settle();
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":122')),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('attach sets the tab document from Target.getTargets when unknown', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R14"') {
+        announceSocket(send, sessionId, 'SEED1', ALLOWED_WS, '{"kind":"tick","n":131}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      await settle();
+      assert.equal(await browser.eval(tab, '"R14"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":131')),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a late Target.getTargets answer does not overwrite a newer document event', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let attached = false;
+  let seedSeen = false;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Target.attachToTarget') {
+        attached = true;
+        send({ id: message.id, result: { sessionId: 'S1' } });
+        return true;
+      }
+      if (message.method === 'Target.getTargets') {
+        if (attached && !seedSeen) {
+          seedSeen = true;
+          send({
+            method: 'Target.targetInfoChanged',
+            params: {
+              targetInfo: {
+                targetId: page.targetId,
+                type: 'page',
+                url: 'https://lars.sliccy.ai/',
+                title: 'seven',
+              },
+            },
+          });
+          setTimeout(() => {
+            send({
+              id: message.id,
+              result: { targetInfos: [info(page)] },
+            });
+          }, 40);
+          return true;
+        }
+        send({
+          id: message.id,
+          result: { targetInfos: [info(page)] },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await assert.rejects(
+      () =>
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+      { message: REFUSAL }
+    );
+  });
+});
+
+test('a new session for a tab starts with an unknown document class', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let listing = page.url;
+  let seedUrl = page.url;
+  let attaches = 0;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Target.attachToTarget') {
+        attaches += 1;
+        if (seedUrl !== page.url) {
+          emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, page.url);
+        }
+        listing = seedUrl;
+        send({
+          id: message.id,
+          result: { sessionId: `S${attaches}` },
+        });
+        return true;
+      }
+      if (message.method === 'Target.getTargets') {
+        send({
+          id: message.id,
+          result: {
+            targetInfos: [info({ ...page, url: listing, title: listing })],
+          },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R15"') {
+        announceSocket(send, sessionId, 'N1', ALLOWED_WS, '{"kind":"tick","n":141}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    let handle = await browser.websocket
+      .on(tab, { urlMatch: /./u })
+      .filter({ parseAs: 'json' })
+      .forward({ sink: 'log' });
+    await handle.close();
+    await settle();
+    listing = page.url;
+    seedUrl = 'https://lars.sliccy.ai/';
+    await assert.rejects(
+      () =>
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+      { message: REFUSAL }
+    );
+    await settle();
+    listing = page.url;
+    seedUrl = page.url;
+    const { logged, restore } = captureLog();
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R15"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":141')),
+        true
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a chrome-error document drops the subscription and does not route', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R16"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'CE1', ALLOWED_WS, '{"kind":"tick","n":151}');
+        send({
+          method: 'Page.frameNavigated',
+          params: {
+            frame: {
+              id: page.targetId,
+              url: 'chrome-error://chromewebdata/',
+              unreachableUrl: 'https://example.test/missing',
+              loaderId: 'Lerr',
+              securityOrigin: '://',
+            },
+          },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        announceSocket(send, sessionId, 'CE2', ALLOWED_WS, '{"kind":"tick","n":152}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R16"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":151')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":152')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a socket announced while the tab document is protected does not route after return', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const other = { targetId: 'TWO', url: 'https://other.test/', title: 'other' };
+  const docB = 'https://lars.sliccy.ai/';
+  const docABack = 'https://example.test/back';
+  const sessions = { OK: 'S-OK', TWO: 'S-TWO' };
+  let attaches = 0;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page, other),
+    intercept: (message, send) => {
+      if (message.method === 'Target.attachToTarget') {
+        attaches += 1;
+        const targetId = message.params?.targetId;
+        send({
+          id: message.id,
+          result: { sessionId: sessions[targetId] ?? `S-${attaches}` },
+        });
+        return true;
+      }
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R17"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'PS1', url: ALLOWED_WS },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        emitMainFrame(send, sessionId, page.targetId, docB);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R18"') {
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'PS2', url: ALLOWED_WS },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R29"') {
+        emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, docABack);
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      if (expression === '"R30"') {
+        emitFrame(
+          send,
+          sessionId,
+          'PS1',
+          '{"kind":"tick","n":161}',
+          'Network.webSocketFrameReceived'
+        );
+        emitFrame(
+          send,
+          sessionId,
+          'PS2',
+          '{"kind":"tick","n":162}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const otherTab = await browser.findTab({ domain: 'other.test' });
+    const hold = await browser.websocket
+      .on(otherTab, { urlMatch: /./u })
+      .filter({ parseAs: 'json' })
+      .forward({ sink: 'log' });
+    let handle = await browser.websocket
+      .on(tab, { urlMatch: /./u })
+      .filter({ parseAs: 'json' })
+      .forward({ sink: 'log' });
+    const attachesBefore = attaches;
+    assert.equal(await browser.eval(tab, '"R17"'), 'ok');
+    await settle();
+    assert.equal(
+      (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+      false
+    );
+    assert.equal(
+      (await browser.websocket.list()).some((sub) => sub.id === hold.id),
+      true
+    );
+    assert.equal(attaches, attachesBefore);
+    assert.equal(await browser.eval(tab, '"R18"'), 'ok');
+    await settle();
+    assert.equal(await browser.eval(tab, '"R29"'), 'ok');
+    await settle();
+    const { logged, restore } = captureLog();
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R30"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":161')),
+        false
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":162')),
+        false
+      );
+      assert.equal(attaches, attachesBefore);
+    } finally {
+      restore();
+      await handle?.close();
+      await hold.close();
+    }
+  });
+});
+
+test('an inheriting or malformed document event leaves an unknown tab document unknown', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  let attached = false;
+  let seedEmpty = true;
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method === 'Target.attachToTarget') {
+        attached = true;
+        send({ id: message.id, result: { sessionId: 'S1' } });
+        return true;
+      }
+      if (message.method === 'Target.getTargets') {
+        if (attached && seedEmpty) {
+          seedEmpty = false;
+          send({
+            id: message.id,
+            result: {
+              targetInfos: [
+                {
+                  targetId: page.targetId,
+                  type: 'page',
+                  url: '',
+                  title: '',
+                  attached: false,
+                  canAccessOpener: false,
+                  browserContextId: 'CTX',
+                },
+              ],
+            },
+          });
+          const sessionId = 'S1';
+          emitMainFrame(send, sessionId, page.targetId, 'about:blank');
+          emitMainFrame(send, sessionId, page.targetId, 'about:srcdoc');
+          send({
+            method: 'Page.navigatedWithinDocument',
+            params: { frameId: page.targetId, url: 'about:blank' },
+            sessionId,
+          });
+          emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, 'about:blank');
+          emitTargetInfo(send, 'Target.targetCreated', page.targetId, 'about:blank');
+          send({
+            method: 'Page.frameNavigated',
+            params: {
+              frame: {
+                id: page.targetId,
+                loaderId: 'Lbad',
+                securityOrigin: '',
+              },
+            },
+            sessionId,
+          });
+          send({
+            method: 'Page.frameNavigated',
+            params: {
+              frame: {
+                id: page.targetId,
+                url: 42,
+                loaderId: 'Lnum',
+                securityOrigin: '',
+              },
+            },
+            sessionId,
+          });
+          send({
+            method: 'Page.navigatedWithinDocument',
+            params: { frameId: page.targetId },
+            sessionId,
+          });
+          return true;
+        }
+        send({
+          id: message.id,
+          result: { targetInfos: [info(page)] },
+        });
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    await assert.rejects(
+      () =>
+        browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' }),
+      { message: REFUSAL }
+    );
+  });
+});
+
+test('frames are not routed after the tab document class leaves ordinary', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const docB = 'https://lars.sliccy.ai/';
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R19"') {
+        emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, page.url);
+        send({
+          method: 'Network.webSocketCreated',
+          params: { requestId: 'RG1', url: ALLOWED_WS },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        emitFrame(
+          send,
+          sessionId,
+          'RG1',
+          '{"kind":"tick","n":171}',
+          'Network.webSocketFrameReceived'
+        );
+        emitTargetInfo(send, 'Target.targetInfoChanged', page.targetId, docB);
+        emitFrame(
+          send,
+          sessionId,
+          'RG1',
+          '{"kind":"tick","n":172}',
+          'Network.webSocketFrameReceived'
+        );
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R19"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":171')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":172')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a same-document navigation to a protected url drops the subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R20"') {
+        emitMainFrame(send, sessionId, page.targetId, page.url);
+        announceSocket(send, sessionId, 'WP1', ALLOWED_WS, '{"kind":"tick","n":181}');
+        send({
+          method: 'Page.navigatedWithinDocument',
+          params: { frameId: page.targetId, url: 'https://lars.sliccy.ai/#x' },
+          ...(sessionId ? { sessionId } : {}),
+        });
+        announceSocket(send, sessionId, 'WP2', ALLOWED_WS, '{"kind":"tick","n":182}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R20"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":181')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":182')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+test('a protected targetCreated drops the subscription', async () => {
+  const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+  const fake = await fakeCdp({
+    answers: wsAnswers(page),
+    intercept: (message, send) => {
+      if (message.method !== 'Runtime.evaluate') return false;
+      const expression =
+        typeof message.params?.expression === 'string' ? message.params.expression : '';
+      const sessionId = message.sessionId;
+      if (expression === '"R21"') {
+        emitTargetInfo(send, 'Target.targetCreated', page.targetId, page.url);
+        announceSocket(send, sessionId, 'TCP1', ALLOWED_WS, '{"kind":"tick","n":191}');
+        emitTargetInfo(send, 'Target.targetCreated', page.targetId, 'https://lars.sliccy.ai/');
+        announceSocket(send, sessionId, 'TCP2', ALLOWED_WS, '{"kind":"tick","n":192}');
+        replyEvaluate(message, send, 'ok');
+        return true;
+      }
+      return guardedIntercept(message, send);
+    },
+  });
+  after(() => fake.close());
+  await withDiscovered(fake, async () => {
+    const tab = await browser.findTab({ domain: 'example.test' });
+    const { logged, restore } = captureLog();
+    let handle;
+    try {
+      handle = await browser.websocket
+        .on(tab, { urlMatch: /./u })
+        .filter({ parseAs: 'json' })
+        .forward({ sink: 'log' });
+      assert.equal(await browser.eval(tab, '"R21"'), 'ok');
+      await settle();
+      assert.equal(
+        logged.some((line) => line.includes('"n":191')),
+        true
+      );
+      assert.equal(
+        logged.some((line) => line.includes('"n":192')),
+        false
+      );
+      assert.equal(
+        (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+        false
+      );
+    } finally {
+      restore();
+      await handle?.close();
+    }
+  });
+});
+
+function sessionEndRow(title, expression, emitEnd) {
+  test(title, async () => {
+    const page = { targetId: 'OK', url: 'https://example.test/', title: 'ok' };
+    const fake = await fakeCdp({
+      answers: wsAnswers(page),
+      intercept: (message, send) => {
+        if (message.method !== 'Runtime.evaluate') return false;
+        const text =
+          typeof message.params?.expression === 'string' ? message.params.expression : '';
+        const sessionId = message.sessionId;
+        if (text === `"${expression}-before"`) {
+          emitMainFrame(send, sessionId, page.targetId, page.url);
+          announceSocket(send, sessionId, 'SE1', ALLOWED_WS, '{"kind":"tick","n":201}');
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        if (text === `"${expression}-end"`) {
+          emitEnd(send, sessionId, page.targetId);
+          announceSocket(send, sessionId, 'SE2', ALLOWED_WS, '{"kind":"tick","n":202}');
+          replyEvaluate(message, send, 'ok');
+          return true;
+        }
+        return guardedIntercept(message, send);
+      },
+    });
+    after(() => fake.close());
+    await withDiscovered(fake, async () => {
+      const tab = await browser.findTab({ domain: 'example.test' });
+      const { logged, restore } = captureLog();
+      let handle;
+      try {
+        handle = await browser.websocket
+          .on(tab, { urlMatch: /./u })
+          .filter({ parseAs: 'json' })
+          .forward({ sink: 'log' });
+        assert.equal(await browser.eval(tab, `"${expression}-before"`), 'ok');
+        await settle();
+        assert.equal(
+          logged.some((line) => line.includes('"n":201')),
+          true
+        );
+        logged.length = 0;
+        assert.equal(await browser.eval(tab, `"${expression}-end"`), 'ok');
+        await settle();
+        assert.equal(
+          (await browser.websocket.list()).some((sub) => sub.id === handle.id),
+          false
+        );
+        assert.equal(
+          logged.some((line) => line.includes('"n":202')),
+          false
+        );
+      } finally {
+        restore();
+        await handle?.close();
+      }
+    });
+  });
+}
+
+sessionEndRow(
+  'an Inspector.detached session drops its subscriptions and forgets the tab document',
+  'R26',
+  (send, sessionId) => {
+    send({
+      method: 'Inspector.detached',
+      params: { reason: 'target_closed', sessionId },
+      sessionId,
+    });
+  }
+);
+
+sessionEndRow(
+  'an Inspector.targetCrashed session drops its subscriptions and forgets the tab document',
+  'R27',
+  (send, sessionId) => {
+    send({
+      method: 'Inspector.targetCrashed',
+      params: {},
+      sessionId,
+    });
+  }
+);
+
+sessionEndRow(
+  'a Target.targetCrashed target drops its subscriptions and forgets the tab document',
+  'R28',
+  (send, _sessionId, targetId) => {
+    send({
+      method: 'Target.targetCrashed',
+      params: { targetId, status: 'crashed', errorCode: 1 },
+    });
+  }
+);

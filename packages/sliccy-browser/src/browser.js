@@ -14,6 +14,8 @@ import { resolveCdpEndpoint } from './discover.js';
 import { buildBrowserFetchScript } from './fetch-script.js';
 import {
   dropProtectedCookies,
+  inheritingDocumentUrl,
+  isProtectedDocument,
   isProtectedHost,
   isProtectedUrl,
   REFUSAL,
@@ -56,6 +58,8 @@ const held = new Map();
 const recorders = new Map();
 const networkless = new Map();
 const subscribers = new Map();
+const documents = new Map();
+const mainFrames = new Map();
 let seq = 1;
 let listening = false;
 let active = 0;
@@ -151,6 +155,8 @@ function closeIdle() {
   held.clear();
   recorders.clear();
   networkless.clear();
+  documents.clear();
+  mainFrames.clear();
   listening = false;
   closing.then(
     (client) => client.close(),
@@ -176,6 +182,7 @@ async function sessionFor(targetId) {
   listen(client);
   const sessionId = await client.attach(targetId);
   tabsBySession.set(sessionId, targetId);
+  if (guarded) forgetDocument(targetId);
   await client.send('Page.enable', {}, sessionId).catch(ignoreMethod('Page.enable:'));
   await client.send('Runtime.enable', {}, sessionId).catch(ignoreMethod('Runtime.enable:'));
   await client.send('Network.enable', {}, sessionId).catch((error) => {
@@ -183,6 +190,7 @@ async function sessionFor(targetId) {
     networkless.set(sessionId, error.message);
   });
   sessions.set(targetId, sessionId);
+  if (guarded) await seedDocumentClass(client, targetId, sessionId);
   await hold(endpoint, targetId);
   return { client, sessionId };
 }
@@ -193,6 +201,10 @@ function listen(client) {
   client.on('Network.webSocketCreated', (message) => {
     const { requestId, url } = message?.params ?? {};
     if (typeof requestId !== 'string' || typeof url !== 'string') return;
+    if (guarded) {
+      const targetId = tabsBySession.get(message.sessionId);
+      if (targetId === undefined || documents.get(targetId) !== 'ordinary') return;
+    }
     sockets.set(socketKey(message.sessionId, requestId), url);
   });
   client.on('Network.webSocketClosed', (message) => {
@@ -202,6 +214,18 @@ function listen(client) {
   });
   client.on('Network.webSocketFrameReceived', (message) => dispatchFrame(message));
   client.on('Network.webSocketFrameSent', (message) => void learnUrl(client, message));
+  if (guarded) {
+    client.on('Page.frameNavigated', (message) => onFrameNavigated(message));
+    client.on('Page.navigatedWithinDocument', (message) => onNavigatedWithinDocument(message));
+    client.on('Target.targetInfoChanged', (message) => onTargetInfo(message?.params?.targetInfo));
+    client.on('Target.targetCreated', (message) => onTargetInfo(message?.params?.targetInfo));
+    client.on('Target.detachedFromTarget', (message) => onSessionEnded(message));
+    client.on('Target.targetDestroyed', (message) => onTargetGone(message?.params?.targetId));
+    client.on('Target.targetCrashed', (message) => onTargetGone(message?.params?.targetId));
+    client.on('Inspector.targetCrashed', (message) => onSessionEnded(message));
+    client.on('Inspector.detached', (message) => onSessionEnded(message));
+    void client.send('Target.setDiscoverTargets', { discover: true }).catch(() => undefined);
+  }
 }
 
 function socketKey(sessionId, requestId) {
@@ -240,12 +264,152 @@ function noteUnknownDrop(targetId) {
 
 function route(targetId, url, raw, which) {
   if (guarded && (typeof url !== 'string' || isProtectedUrl(url))) return;
+  if (guarded && documents.get(targetId) !== 'ordinary') return;
   for (const sub of subscribers.values()) {
     if (sub.targetId !== targetId || !which(sub) || !urlMatches(sub, url)) continue;
     const body = parseFrame(raw, sub.filter?.parseAs);
     if (body === undefined || !whereMatches(sub.filter?.where, body)) continue;
     deliver(sub, project(body, sub.filter?.project));
   }
+}
+
+function frameUrl(frame) {
+  const base = typeof frame?.url === 'string' ? frame.url : '';
+  const fragment = typeof frame?.urlFragment === 'string' ? frame.urlFragment : '';
+  return `${base}${fragment}`;
+}
+
+function clearTabSockets(targetId) {
+  const sessionIds = new Set();
+  for (const [sessionId, tab] of tabsBySession) {
+    if (tab === targetId) sessionIds.add(sessionId);
+  }
+  const current = sessions.get(targetId);
+  if (typeof current === 'string') sessionIds.add(current);
+  for (const key of [...sockets.keys()]) {
+    const at = key.indexOf(' ');
+    const sessionId = at === -1 ? key : key.slice(0, at);
+    if (!sessionIds.has(sessionId)) continue;
+    sockets.delete(key);
+    held.delete(key);
+  }
+}
+
+function setDocumentClass(targetId, protectedDocument) {
+  if (!guarded) return;
+  const next = protectedDocument ? 'protected' : 'ordinary';
+  documents.set(targetId, next);
+  if (next !== 'protected') return;
+  queueMicrotask(() => {
+    clearTabSockets(targetId);
+    dropSubscribers(targetId);
+  });
+}
+
+function forgetDocument(targetId) {
+  documents.delete(targetId);
+  mainFrames.delete(targetId);
+}
+
+function dropSubscribers(targetId) {
+  let removed = false;
+  for (const [id, sub] of subscribers) {
+    if (sub.targetId !== targetId) continue;
+    subscribers.delete(id);
+    removed = true;
+  }
+  if (removed) release();
+}
+
+function applyDocumentUrl(targetId, fields) {
+  if (!guarded) return;
+  const url = fields.url;
+  if (typeof url !== 'string' || url.length === 0) return;
+  if (!documents.has(targetId) && inheritingDocumentUrl(url)) return;
+  const previous = documents.get(targetId) === 'protected';
+  setDocumentClass(
+    targetId,
+    isProtectedDocument({
+      ...fields,
+      url,
+      previous,
+    })
+  );
+}
+
+function endTabSession(targetId, sessionId) {
+  if (typeof sessionId === 'string') {
+    tabsBySession.delete(sessionId);
+    networkless.delete(sessionId);
+    recorders.delete(sessionId);
+  }
+  if (sessions.get(targetId) === sessionId || sessionId === undefined) {
+    sessions.delete(targetId);
+  }
+  forgetDocument(targetId);
+  dropSubscribers(targetId);
+}
+
+function onSessionEnded(message) {
+  if (!guarded) return;
+  const sessionId = message?.params?.sessionId ?? message?.sessionId;
+  if (typeof sessionId !== 'string') return;
+  const targetId = tabsBySession.get(sessionId);
+  if (targetId === undefined) return;
+  endTabSession(targetId, sessionId);
+}
+
+function onTargetGone(targetId) {
+  if (!guarded || typeof targetId !== 'string') return;
+  const sessionId = sessions.get(targetId);
+  endTabSession(targetId, sessionId);
+}
+
+async function seedDocumentClass(client, targetId, sessionId) {
+  if (!guarded || documents.has(targetId)) return;
+  const result = await client.send('Target.getTargets').catch(() => undefined);
+  if (!guarded || documents.has(targetId)) return;
+  if (sessions.get(targetId) !== sessionId) return;
+  const infos = Array.isArray(result?.targetInfos) ? result.targetInfos : [];
+  const info = infos.find(
+    (entry) => entry && typeof entry.targetId === 'string' && entry.targetId === targetId
+  );
+  if (!info || typeof info.url !== 'string' || info.url.length === 0) return;
+  if (inheritingDocumentUrl(info.url)) return;
+  if (documents.has(targetId)) return;
+  if (sessions.get(targetId) !== sessionId) return;
+  applyDocumentUrl(targetId, { url: info.url, type: info.type });
+}
+
+function onFrameNavigated(message) {
+  const frame = message?.params?.frame;
+  if (!frame || typeof frame !== 'object' || frame.parentId !== undefined) return;
+  const targetId = tabsBySession.get(message.sessionId);
+  if (targetId === undefined) return;
+  clearTabSockets(targetId);
+  if (typeof frame.id === 'string') mainFrames.set(targetId, frame.id);
+  applyDocumentUrl(targetId, {
+    url: frameUrl(frame),
+    documentURL: typeof frame.url === 'string' ? frame.url : undefined,
+    unreachableURL: frame.unreachableUrl,
+  });
+}
+
+function onNavigatedWithinDocument(message) {
+  const params = message?.params ?? {};
+  const targetId = tabsBySession.get(message.sessionId);
+  if (targetId === undefined) return;
+  const frameId = typeof params.frameId === 'string' ? params.frameId : undefined;
+  const main = mainFrames.get(targetId);
+  if (frameId !== undefined && frameId !== main && frameId !== targetId) return;
+  if (typeof params.url !== 'string') return;
+  applyDocumentUrl(targetId, { url: params.url });
+}
+
+function onTargetInfo(info) {
+  if (!info || typeof info.targetId !== 'string' || typeof info.url !== 'string') return;
+  if (info.url.length === 0) return;
+  applyDocumentUrl(info.targetId, { url: info.url, type: info.type });
 }
 
 function holdFrame(sessionId, targetId, key, raw) {
@@ -857,6 +1021,7 @@ export const websocket = {
       const urlMatchRe =
         urlMatch === undefined ? undefined : compilePattern(urlMatch, 'browser.websocket');
       const { sessionId } = await sessionFor(targetId);
+      if (guarded && documents.get(targetId) !== 'ordinary') throw new Error(REFUSAL);
       if (networkless.has(sessionId)) {
         throw new Error(`browser.websocket: ${networkless.get(sessionId)}`);
       }
