@@ -127,3 +127,32 @@ export function dropProtectedCookies(cookies) {
 export function refuseProtected(text) {
   if (isProtectedUrl(text)) throw new Error(REFUSAL);
 }
+
+export function inheritingDocumentUrl(text) {
+  return inheritingAbout(text);
+}
+
+export function isProtectedDocument({
+  url,
+  type,
+  documentURL,
+  unreachableURL,
+  previous = false,
+  opener,
+  navigating = false,
+  contextOrigin,
+} = {}) {
+  const text = typeof url === 'string' ? url : '';
+  const documentText = typeof documentURL === 'string' ? documentURL : '';
+  if (text.startsWith('chrome-error:') || documentText.startsWith('chrome-error:')) return true;
+  return guard.target({
+    url: text,
+    type,
+    documentURL,
+    unreachableURL,
+    previous: Boolean(previous),
+    opener,
+    navigating: Boolean(navigating),
+    contextOrigin,
+  });
+}
