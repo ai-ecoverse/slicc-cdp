@@ -6982,7 +6982,8 @@ fn content_command(method: &str, params: &Value) -> Option<bool> {
         return Some(params.get("runImmediately").is_some_and(|value| value != &json!(false)));
     }
     match method {
-        "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
+        "Slicc.leaseRequest" | "Slicc.leaseAction"
+        | "Debugger.setInstrumentationBreakpoint" | "Emulation.setVirtualTimePolicy" | "Overlay.setShowPaintRects"
         | "Page.addScriptToEvaluateOnLoad" | "Security.setIgnoreCertificateErrors" | "Inspector.enable"
         | "Storage.getSharedStorageEntries" | "Storage.getSharedStorageMetadata" | "Storage.getInterestGroupDetails" | "Storage.getTrustTokens"
         | "Storage.getAffectedUrlsForThirdPartyCookieMetadata" | "Storage.trackCacheStorageForOrigin" | "Storage.trackIndexedDBForStorageKey" => None,

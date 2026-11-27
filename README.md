@@ -72,6 +72,55 @@ WebMCP and Browser Annotation API polyfills are owned by [mcpcat](https://github
 
 `dialog-accept [prompt]` and `dialog-dismiss` are bounded live waits: start one before triggering an alert, confirm or prompt. It waits up to five seconds, verifies an observed ordinary main-frame dialog against the browser's current target and navigation history, then answers it. The dialog-only flat session never enables Network or Runtime or reads a renderer frame tree, so it can answer while a click is in flight. Protected, unknown, stale and subframe ownership are refused. A dialog already open before attachment is not answered; the error names the [foreground dialog holder follow-up #529](https://github.com/ai-ecoverse/slicc-cdp/issues/529).
 
+## Signed leases (job adapter required)
+
+`playwright-cli lease request` asks for **one new tab**, not a browser endpoint. A request and its job-local handle are not an approval, a JWT, or proof of identity. The trusted job adapter holds the private key; the owner chooses a browser and paired lease-only link **locally**. Do not put key files, tokens, join URLs or private account data into these commands.
+
+In a job with the capability installed:
+
+```sh
+playwright-cli lease request --allow https://billing.example --for 1h
+```
+
+Example output (the thumbprint is illustrative):
+
+```text
+Request: R1
+Lease: L1
+Pending owner review.
+Copy this line into the owner's terminal to review, not grant:
+slicc lease review --to jkt:GcQ_AwlsJJaOnKknp1hXLIo08um7bX0k796qClT9C8s --allow https://billing.example --for 1h
+```
+
+Share **only the last line** with the owner in the task conversation. It is built locally from the full public-key thumbprint, requested origin and duration; no adapter-supplied shell text or free-text reason is printed. Pasting opens review, not a grant. The owner must check the holder, site, browser, return link and duration. An approved job can act as the signed-in user on that site. URL scope limits what the driver can see and do, not the site's own scripts or network traffic.
+
+```sh
+playwright-cli --lease L1 goto https://billing.example
+playwright-cli --lease L1 snapshot
+playwright-cli --lease L1 fill e12 '1042'
+playwright-cli --lease L1 click e13
+```
+
+These are the **only** four lease operations. No tab selection, screenshots, eval, storage, coordinates, raw CDP, or ordinary command options. Use `fill e12 -- --literal` for text starting with `-`. A scoped snapshot prints text to stdout; a successful mutation prints `OK`. Scope, time, tab, frame and ref checks belong at the broker, not in a guest process. Availability of each operation depends on broker support. An unavailable action is never sent through another route.
+
+When a known receipt URL is out of scope, skip it or ask explicitly to add **just that exact URL**:
+
+```sh
+playwright-cli lease request --from L1 --add https://receipts.example/r/1042 --reason 'Open receipt 1042'
+```
+
+The request sends the delta only, with **no** new duration. The original lease is not widened by this command. If the adapter and broker support replacement, use the returned handle (e.g. `L2`) after the owner's separate approval; denial leaves the old scope intact. Initial requests currently accept one canonical HTTPS origin **without a trailing slash** and a positive integer duration in `s`, `m` or `h`. An explicit `/` means exact root, not origin; `/`, other exact paths and `/**` prefixes on `--allow` are refused by this initial-request slice, never widened to origin. Expansions accept one canonical, unambiguous HTTPS URL; do not include sensitive query parameters. Path-prefix requests, multiple rules, duration changes and automatic renewal are not exposed here.
+
+Errors exit nonzero, with empty stdout and one JSON object on stderr, e.g. `{"lease":"L1","reason":"E_EXPIRED","message":"This lease expired. Request a new lease for owner review."}`. `E_PENDING` means wait for the owner; `E_SCOPE` is not a prompt or consent; `E_REVOKED` means stop. An expiry needs a fresh request. `E_OUTCOME_UNKNOWN` or `"outcome":"unknown"` means a mutation may already have taken effect: do not replay clicks or submissions. The CLI never retries site actions or prints transport error bodies, redirect destinations or backend stack traces.
+
+### Where the lease facade lives
+
+- **WASI:** requires a kernel booted specifically in lease-only mode for the job. Its launcher supplies `SLICC_CDP_LEASE_URL`, exactly `ws://127.0.0.1:9222/slicc/lease/v1/<lowercase-v4-uuid>` inside that kernel's virtual network. This selector is not a credential. The kernel must authenticate the stamped job and route only the two synthetic methods to its trusted adapter. No `/json/version`, `/devtools/browser/...`, runtime query, DNS, or alternate host. A pinned older kernel without the lease facade refuses the request. Do not use host-networked WASI as a substitute for a lease-only kernel.
+- **Native Unix:** requires a trusted launcher to pass a fresh connected Unix stream socketpair endpoint as inherited fd **3** and set `SLICC_LEASE_FD=3` for each invocation. The other endpoint belongs exclusively to the job's trusted adapter. The connected descriptor, not the environment variable or lease handle, identifies that channel. No native TCP listener, named/shared guest socket, key file, Windows relay, or launcher/adapter daemon is provided here. A plain native shell cannot use signed leases. The launcher must enforce job isolation and must not also expose unrestricted debugging sockets or ordinary browser credentials to the sandbox.
+- Neither mode uses `--cdp`, `SLICC_CDP_URL`, saved sessions, port probing or browser launch. When a lease selector is configured, ordinary commands are refused (except global help/version). This CLI guard is not a sandbox: the adapter and broker must independently validate every message and the job's authority.
+
+Each invocation makes one `{id:1,method,params}` call: one WS text message on WASI, one LF-terminated UTF-8 JSON record in each direction on native. `Slicc.leaseRequest` carries `allow:[{kind,url}]`, `ttlSeconds` initially or `lease` on expansion, and optional `reason`. The trusted result includes `request`, `lease` and bare RFC 7638 `jkt`. `Slicc.leaseAction` carries `{lease,op,args}`. Its result contains `{result:{}}` or `{result:{text}}` for `snapshot`. The facade wraps successes in `{id,result}` and errors in `{id,error:{code,message,data:{reason}}}`. No CDP events or multiplexing. Responses are bounded to 128 KiB. No grant, JWT or proof is exchanged with this CLI.
+
 ## Finding a browser
 
 `playwright-cli` and `curlwright` share one resolver, `cdp_client::resolve`, so the order, the `--cdp` forms and the messages below are the same for both. `jerk` (ai-ecoverse/slicc-jerk) follows the same contract.

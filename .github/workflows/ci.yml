@@ -86,6 +86,7 @@ jobs:
         **/same-document-order.test.*
         **/session-*.test.*
         **/session.test.*
+        **/signed-lease-*.test.*
         **/snapshot-error-pages.test.*
         **/snapshot-format.test.*
         **/snapshot-golden.test.*

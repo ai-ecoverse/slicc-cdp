@@ -11,6 +11,40 @@ before(() => {
 });
 
 for (const transport of ['native', 'wasi']) {
+  test(`ordinary CDP never forwards job lease methods (${transport})`, {
+    timeout: 60000,
+  }, async () => {
+    const backend = await fakeCdp({});
+    backend.targets.push({ targetId: 'T', url: 'https://ordinary.example/' });
+    let client;
+    try {
+      client = await guarded(backend.url, 'https://private.example.invalid', {
+        transport,
+        variant: 'prompt',
+        detachDelay: 0,
+      });
+      const { sessionId } = await client.send('Target.attachToTarget', {
+        targetId: 'T',
+        flatten: true,
+      });
+      for (const [method, params] of [
+        [
+          'Slicc.leaseRequest',
+          { allow: [{ kind: 'origin', url: 'https://ordinary.example' }], ttlSeconds: 60 },
+        ],
+        ['Slicc.leaseAction', { lease: 'fixture', op: 'snapshot', args: {} }],
+      ]) {
+        for (const session of [undefined, sessionId]) {
+          await assert.rejects(client.send(method, params, session), /slicc: refused:/);
+        }
+        assert.ok(!backend.calls.some((call) => call.method === method), method);
+      }
+    } finally {
+      await client?.close();
+      await backend.close();
+    }
+  });
+
   test(`ordinary controls do not probe an unavailable document (${transport})`, {
     timeout: 60000,
   }, async () => {
