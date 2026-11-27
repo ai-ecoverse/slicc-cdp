@@ -41,7 +41,12 @@ export function refused(result, why, lease) {
   assert.doesNotMatch(result.stderr, /secret redirect|NOT_SHELL|PRIVATE/);
 }
 
-export async function exercise(run, { jkt, calls }) {
+export const inputs = [
+  ['click', 'e12'],
+  ['fill', 'e13', '--', '--literal'],
+];
+
+export async function exercise(run, { jkt, calls }, { leaseKernel = false } = {}) {
   const pending = await run(request);
   assert.equal(pending.status, 0, pending.stderr);
   assert.equal(pending.stderr, '');
@@ -51,13 +56,10 @@ export async function exercise(run, { jkt, calls }) {
     `slicc lease review --to jkt:${jkt} --allow ${origin} --for 1h`
   );
   assert.doesNotMatch(pending.stdout, /NOT_SHELL|PRIVATE/);
-  for (const [op, ...args] of [
-    ['goto', origin],
-    ['click', 'e12'],
-    ['fill', 'e13', '--', '--literal'],
-  ]) {
+  for (const [op, ...args] of [['goto', origin], ...inputs]) {
     const r = await run(['--lease', 'L1', op, ...args]);
-    assert.deepEqual([r.status, r.stdout, r.stderr], [0, 'OK\n', '']);
+    if (leaseKernel && op !== 'goto') refused(r, 'E_UNSUPPORTED', 'L1');
+    else assert.deepEqual([r.status, r.stdout, r.stderr], [0, 'OK\n', '']);
   }
   const snap = await run(['--lease=L1', 'snapshot']);
   assert.deepEqual(
@@ -84,8 +86,12 @@ export async function exercise(run, { jkt, calls }) {
   assert.deepEqual(calls, [
     ['request', { allow: [{ kind: 'origin', url: origin }], ttlSeconds: 3600, reason }],
     ['action', { lease: 'L1', op: 'goto', args: { url: origin } }],
-    ['action', { lease: 'L1', op: 'click', args: { ref: 'e12' } }],
-    ['action', { lease: 'L1', op: 'fill', args: { ref: 'e13', value: '--literal' } }],
+    ...(leaseKernel
+      ? []
+      : [
+          ['action', { lease: 'L1', op: 'click', args: { ref: 'e12' } }],
+          ['action', { lease: 'L1', op: 'fill', args: { ref: 'e13', value: '--literal' } }],
+        ]),
     ['action', { lease: 'L1', op: 'snapshot', args: {} }],
     ['action', { lease: 'L1', op: 'goto', args: { url: receipt } }],
     ['request', { lease: 'L1', allow: [{ kind: 'exact', url: receipt }], reason }],

@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { exercise, fixture, refused, request } from './signed-lease-fixture.mjs';
+import { exercise, fixture, inputs, refused, request } from './signed-lease-fixture.mjs';
 
 const pkg = '/node_modules/@ai-ecoverse/slicc-cdp';
 const wasm = 'bin/playwright-cli.wasm';
@@ -58,9 +58,7 @@ test('the WASI client never reaches an ordinary host, even when its lease select
   }
 });
 
-test('the WASI command path uses a dedicated tagged lease kernel when one is available', {
-  timeout: 120000,
-}, async (t) => {
+async function leased(t, body) {
   const module = process.env.SLICC_TEST_LEASE_KERNEL_MODULE;
   const api = await import(
     module ? pathToFileURL(path.resolve(module)).href : '@ai-ecoverse/slicc-kernel/node'
@@ -79,9 +77,26 @@ test('the WASI command path uses a dedicated tagged lease kernel when one is ava
   try {
     await install(kernel);
     client = await api.attachKernel(await kernel.connect({ tag }));
-    await exercise((argv) => client.run(['playwright-cli', ...argv], { cwd: '/' }), job);
+    await body((argv) => client.run(['playwright-cli', ...argv], { cwd: '/' }), job);
   } finally {
     await client?.close();
     kernel.terminate();
   }
+}
+
+test('the WASI command path uses a dedicated tagged lease kernel when one is available', {
+  timeout: 120000,
+}, async (t) => {
+  await leased(t, (run, job) => exercise(run, job, { leaseKernel: true }));
+});
+
+test('the lease kernel refuses click and fill before the adapter is called', {
+  timeout: 120000,
+}, async (t) => {
+  await leased(t, async (run, job) => {
+    for (const [op, ...args] of inputs) {
+      refused(await run(['--lease', 'L1', op, ...args]), 'E_UNSUPPORTED', 'L1');
+    }
+    assert.deepEqual(job.calls, []);
+  });
 });
