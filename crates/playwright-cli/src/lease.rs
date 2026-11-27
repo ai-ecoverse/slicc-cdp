@@ -1,4 +1,6 @@
 mod transport;
+#[cfg(test)]
+mod corpus_test;
 
 use crate::args::Output;
 use serde_json::{json, Value};
