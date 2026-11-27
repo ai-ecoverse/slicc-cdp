@@ -242,3 +242,31 @@ fn seven_hosts_allow_any_http_scheme_and_port_without_userinfo() {
         assert!(!super::seven_host(url), "{url}");
     }
 }
+
+#[test]
+fn lease_pilot_is_neither_a_seven_host_nor_a_seven_page() {
+    for url in ["https://lease-pilot.sliccy.ai", "https://lease-pilot.sliccy.ai/", "https://lease-pilot.sliccy.ai/os/x", "https://LEASE-PILOT.SLICCY.AI/", "https://lease-pilot.sliccy.ai:443/"] {
+        assert!(!super::seven_host(url), "{url}");
+        assert!(!super::seven_page(url), "{url}");
+    }
+}
+
+#[test]
+fn seven_hosts_and_pages_next_to_lease_pilot() {
+    for url in ["https://seven.sliccy.ai/", "https://www.sliccy.ai/", "https://xlease-pilot.sliccy.ai/"] {
+        assert!(super::seven_host(url), "{url}");
+        assert!(super::seven_page(url), "{url}");
+    }
+    for url in ["https://vault.sliccy.ai/", "https://lease-pilot-sliccy.ai/", "https://lease-pilot.sliccy.aix/", "https://a.lease-pilot.sliccy.ai/"] {
+        assert!(!super::seven_host(url), "{url}");
+        assert!(!super::seven_page(url), "{url}");
+    }
+}
+
+#[test]
+fn lease_pilot_urls_are_protected() {
+    let guard = super::Protected::default();
+    for url in ["https://lease-pilot.sliccy.ai", "https://lease-pilot.sliccy.ai/", "https://lease-pilot.sliccy.ai/os/x", "https://LEASE-PILOT.SLICCY.AI/", "https://lease-pilot.sliccy.ai:443/"] {
+        assert!(guard.url(url), "{url}");
+    }
+}
