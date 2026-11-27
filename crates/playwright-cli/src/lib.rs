@@ -25,6 +25,7 @@ mod intent;
 mod keys;
 mod landing;
 mod launch;
+mod lease;
 mod net;
 mod page_tools;
 mod recording;
@@ -59,6 +60,7 @@ pub fn execute_in(
     session_env: Option<&str>,
     cwd: Option<&std::path::Path>,
 ) -> Output {
+    if let Some(output) = lease::dispatch(argv) { return output; }
     let invocation = match args::parse(argv) {
         Ok(mut invocation) => {
             invocation.cwd = cwd.map(std::path::Path::to_path_buf);
@@ -70,6 +72,7 @@ pub fn execute_in(
         }
         Err(output) => return output,
     };
+    if invocation.command.as_deref() == Some("lease") { return lease::unsupported(); }
     sanitize::set_full_urls(invocation.full_urls);
     if invocation.version {
         return Output::ok(format!(

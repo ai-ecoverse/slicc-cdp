@@ -266,17 +266,37 @@ pub fn ws_connect(url: &str) -> Result<Ws, String> {
     if parts.scheme != "ws" && parts.scheme != "wss" {
         return Err(format!("WebSocket URL must be ws or wss: {url}\n"));
     }
-    let mut stream = dial(&parts)?;
+    let stream = dial(&parts)?;
+    ws_upgrade(&parts, stream, None)
+}
+
+#[cfg(target_os = "wasi")]
+pub fn ws_connect_kernel_lease(selector: &str) -> Result<Ws, String> {
+    let prefix = "ws://127.0.0.1:9222/slicc/lease/v1/";
+    let uuid = selector.strip_prefix(prefix).ok_or("not a lease facade")?.as_bytes();
+    if uuid.len() != 36 || uuid[14] != b'4' || !b"89ab".contains(&uuid[19]) || !uuid.iter().enumerate().all(|(i, b)| {
+        if matches!(i, 8 | 13 | 18 | 23) { *b == b'-' } else { b.is_ascii_digit() || matches!(b, b'a'..=b'f') }
+    }) { return Err("not a lease facade".into()); }
+    let parts = parse_url(selector)?;
+    let address = SocketAddr::from(([127, 0, 0, 1], 9222));
+    let limit = Duration::from_secs(5);
+    let tcp = TcpStream::connect_timeout(&address, limit).map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(READ_SLICE)).map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(limit)).map_err(|e| e.to_string())?;
+    ws_upgrade(&parts, Box::new(tcp), Some(Instant::now() + limit))
+}
+
+fn ws_upgrade(parts: &Parts, mut stream: Box<dyn ReadWrite>, deadline: Option<Instant>) -> Result<Ws, String> {
     let key = ws_key();
-    let host_header = host_header(&parts);
+    let host_header = host_header(parts);
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
         parts.path, host_header, key
     );
     stream
         .write_all(request.as_bytes())
-        .map_err(|err| connect_error(&parts, &err.to_string()))?;
-    let (status, headers, body, rest) = read_http(stream.as_mut())?;
+        .map_err(|err| connect_error(parts, &err.to_string()))?;
+    let (status, headers, body, rest) = read_http_capped(stream.as_mut(), deadline.map(|_| 4096), deadline)?;
     if status != 101 {
         return Err(format_http_error(status, &body));
     }
@@ -285,6 +305,7 @@ pub fn ws_connect(url: &str) -> Result<Ws, String> {
         .find(|(name, _)| name.eq_ignore_ascii_case("upgrade"))
         .map(|(_, value)| value.clone())
         .unwrap_or_default();
+    if deadline.is_some() && !accept.eq_ignore_ascii_case("websocket") { return Err("expected a lease WebSocket".into()); }
     if !accept.to_ascii_lowercase().contains("websocket") && !accept.is_empty() {
         return Err(format_http_error(status, &body));
     }
@@ -388,16 +409,21 @@ impl Ws {
         Ok(())
     }
 
-    pub fn recv_text(&mut self, deadline: std::time::Instant) -> Result<Option<String>, String> {
+    pub fn recv_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+        self.recv_text_limited(deadline, usize::MAX)
+    }
+
+    pub fn recv_text_limited(&mut self, deadline: Instant, limit: usize) -> Result<Option<String>, String> {
         if let Some(closed) = &self.closed {
             return Err(closed.clone());
         }
-        let received = self.receive_text(deadline);
+        let received = self.receive_text(deadline, limit);
         received.map_err(|message| self.latch(message))
     }
 
-    fn receive_text(&mut self, deadline: Instant) -> Result<Option<String>, String> {
+    fn receive_text(&mut self, deadline: Instant, limit: usize) -> Result<Option<String>, String> {
         loop {
+            if self.buf.len().saturating_add(self.fragments.len()) > limit.saturating_add(14) { return Err("websocket reply exceeds limit".into()); }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
@@ -409,6 +435,7 @@ impl Ws {
                 Some(frame) => frame,
                 None => continue,
             };
+            if frame.payload.len().saturating_add(self.fragments.len()) > limit { return Err("websocket reply exceeds limit".into()); }
             match frame.opcode {
                 0x1 | 0x2 => {
                     self.kind = frame.opcode;
@@ -518,17 +545,18 @@ fn try_decode(buf: &[u8]) -> Result<Option<(usize, Frame)>, String> {
         None
     };
     let len_usize = usize::try_from(len).map_err(|_| "websocket frame too large\n".to_string())?;
-    if buf.len() < offset + len_usize {
+    let end = offset.checked_add(len_usize).ok_or("websocket frame too large")?;
+    if buf.len() < end {
         return Ok(None);
     }
-    let mut payload = buf[offset..offset + len_usize].to_vec();
+    let mut payload = buf[offset..end].to_vec();
     if let Some(mask) = mask {
         for (i, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[i % 4];
         }
     }
     Ok(Some((
-        offset + len_usize,
+        end,
         Frame {
             opcode,
             fin,
