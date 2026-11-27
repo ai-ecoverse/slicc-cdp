@@ -4029,4 +4029,39 @@ mod tests {
     fn seven_origin_case_insensitive() {
         assert!(seven_origin("HTTPS://SEVEN.SLICCY.AI/"));
     }
+
+    #[test]
+    fn seven_origin_lease_pilot_is_not_seven() {
+        for url in [
+            "https://lease-pilot.sliccy.ai",
+            "https://lease-pilot.sliccy.ai/",
+            "https://lease-pilot.sliccy.ai/os/x",
+            "https://lease-pilot.sliccy.ai:443/",
+            "https://LEASE-PILOT.SLICCY.AI/",
+            "https://lease-pilot.sliccy.ai:8443/",
+            "http://lease-pilot.sliccy.ai/",
+            "https://lease-pilot.sliccy.ai./",
+            "https://a.lease-pilot.sliccy.ai/",
+        ] {
+            assert!(!seven_origin(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn seven_origin_next_to_lease_pilot() {
+        for url in [
+            "https://seven.sliccy.ai/",
+            "https://www.sliccy.ai/",
+            "https://xlease-pilot.sliccy.ai/",
+        ] {
+            assert!(seven_origin(url), "{url}");
+        }
+        for url in [
+            "https://vault.sliccy.ai/",
+            "https://lease-pilot-sliccy.ai/",
+            "https://lease-pilot.sliccy.aix/",
+        ] {
+            assert!(!seven_origin(url), "{url}");
+        }
+    }
 }
