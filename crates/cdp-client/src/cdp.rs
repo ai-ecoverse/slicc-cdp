@@ -7060,6 +7060,7 @@ fn kept_parse_failure(text: &str) -> bool {
 fn kept_document(guard: &Protected, text: &str) -> bool {
     let Some(mut url) = guard.peel(text) else { return kept_parse_failure(text) };
     if !matches!(url.scheme(), "http" | "https") { return false }
+    if guard.kept_origin(url.as_str()) { return true }
     let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
     if url.set_host(Some(&host)).is_err() { return kept_parse_failure(text) }
     if url.set_username("").is_err() || url.set_password(None).is_err() { return kept_parse_failure(text) }
@@ -7461,6 +7462,7 @@ mod tests {
     include!("about_origin_test.rs");
     include!("security_details_test.rs");
     include!("blank_origin_judges_test.rs");
+    include!("kept_origins_test.rs");
 
     #[test]
     fn queued_raw_replies_keep_pinned_execution_and_guard_denial_semantics() {
