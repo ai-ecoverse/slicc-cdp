@@ -71,6 +71,7 @@ export const CHROME_FILES = new Set(
     'redirect-userinfo',
     'runtime-page-scope-chrome',
     'session',
+    'sessionless-page-close-chrome',
     'sliccy-browser',
     'sliccy-browser-dialogs-chrome',
     'sliccy-browser-guard-chrome',
