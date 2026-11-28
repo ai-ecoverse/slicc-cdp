@@ -15,6 +15,7 @@ pub struct Protected {
     rules: ProtectedOrigins,
     extra: Vec<String>,
     extra_hosts: Vec<String>,
+    kept: Vec<String>,
     credential: Vec<String>,
     credential_refusal: String,
 }
@@ -82,13 +83,36 @@ impl Protected {
             .map(host_of)
             .collect();
         let credential = credential_rules();
-        Self {
+        let kept: Vec<String> = rules
+            .kept_origins
+            .iter()
+            .filter_map(|text| parse(text))
+            .filter(|url| url.scheme() == "https" && url.port().is_none() && url.host_str().is_some_and(|host| !host.is_empty()))
+            .map(|url| format!("https://{}", host_of(&url)))
+            .collect();
+        let mut guard = Self {
             rules,
             extra,
             extra_hosts,
+            kept: Vec::new(),
             credential: credential_hosts(&credential.origins),
             credential_refusal: credential.refusal.clone(),
+        };
+        guard.kept = kept.into_iter().filter(|origin| guard.url(origin)).collect();
+        guard
+    }
+
+    pub fn kept_origin(&self, text: &str) -> bool {
+        parse(text).is_some_and(|url| {
+            url.scheme() == "https" && url.port().is_none() && self.kept.contains(&format!("https://{}", host_of(&url)))
+        })
+    }
+
+    pub fn kept_target(&self, url: &str, context_origin: Option<&str>) -> bool {
+        if self.inheriting(url) {
+            return context_origin.is_some_and(|origin| self.kept.iter().any(|kept| kept == origin));
         }
+        self.kept_origin(url)
     }
 
     pub fn with_credential_origins(mut self, origins: &[&str], refusal: &str) -> Self {
@@ -688,6 +712,122 @@ mod tests {
                 "{vector:?}"
             );
         }
+    }
+
+    #[test]
+    fn every_kept_vector_matches_slicc_browsers() {
+        let guard = guard();
+        let all = vectors().kept;
+        assert_eq!(all.len(), 33);
+        for vector in all {
+            assert_eq!(guard.kept_origin(&vector.url), vector.kept, "{vector:?}");
+        }
+    }
+
+    #[test]
+    fn every_kept_target_vector_matches_slicc_browsers() {
+        let guard = guard();
+        let all = vectors().kept_targets;
+        assert_eq!(all.len(), 21);
+        for vector in all {
+            assert_eq!(guard.kept_target(&vector.url, vector.context_origin.as_deref()), vector.kept, "{vector:?}");
+        }
+    }
+
+    #[test]
+    fn kept_target_holds_for_every_inheriting_url_with_the_exact_context_origin() {
+        let guard = guard();
+        for url in ["about:blank", "about:srcdoc", ""] {
+            assert!(guard.kept_target(url, Some("https://lease-pilot.sliccy.ai")), "{url:?}");
+            assert!(!guard.kept_target(url, None), "{url:?}");
+            assert!(!guard.kept_target(url, Some("https://seven.sliccy.ai")), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn every_kept_vector_is_protected_and_no_unprotected_vector_is_kept() {
+        let guard = guard();
+        let all = vectors();
+        for vector in &all.kept {
+            if vector.kept {
+                assert!(guard.url(&vector.url), "{vector:?}");
+            }
+        }
+        for vector in &all.urls {
+            if !vector.protected {
+                assert!(!guard.kept_origin(&vector.url), "{vector:?}");
+            }
+        }
+        for vector in &all.kept {
+            if !guard.url(&vector.url) {
+                assert!(!guard.kept_origin(&vector.url), "{vector:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn kept_origins_are_catalog_driven() {
+        let rules = slicc_browsers::catalog().protected_origins;
+        assert_eq!(rules.kept_origins, vec!["https://lease-pilot.sliccy.ai".to_string()]);
+        let pilot: Vec<String> = vectors().kept.into_iter().filter(|vector| vector.kept).map(|vector| vector.url).collect();
+        assert!(!pilot.is_empty());
+        let listed = Protected::with_rules(rules.clone(), &[]);
+        let mut cleared = rules.clone();
+        cleared.kept_origins.clear();
+        let cleared = Protected::with_rules(cleared, &[]);
+        for url in &pilot {
+            assert!(listed.kept_origin(url), "{url}");
+            assert!(!cleared.kept_origin(url), "{url}");
+            assert!(!cleared.kept_target(url, None), "{url}");
+        }
+        assert!(listed.kept_target("about:blank", Some("https://lease-pilot.sliccy.ai")));
+        assert!(!cleared.kept_target("about:blank", Some("https://lease-pilot.sliccy.ai")));
+        let mut invalid = rules.clone();
+        invalid.kept_origins = vec![
+            "http://lease-pilot.sliccy.ai".into(),
+            "https://lease-pilot.sliccy.ai:8443".into(),
+            "wss://lease-pilot.sliccy.ai".into(),
+            "not an origin".into(),
+            "".into(),
+            "https://".into(),
+        ];
+        let invalid = Protected::with_rules(invalid, &[]);
+        for url in ["https://lease-pilot.sliccy.ai/", "http://lease-pilot.sliccy.ai/", "https://lease-pilot.sliccy.ai:8443/", "wss://lease-pilot.sliccy.ai/"] {
+            assert!(!invalid.kept_origin(url), "{url}");
+        }
+        for origin in ["https://lease-pilot.sliccy.ai", "http://lease-pilot.sliccy.ai", "https://lease-pilot.sliccy.ai:8443", "not an origin", ""] {
+            assert!(!invalid.kept_target("about:blank", Some(origin)), "{origin}");
+        }
+        let mut written = rules.clone();
+        written.kept_origins = vec!["HTTPS://Lease-Pilot.SLICCY.AI./".into(), "https://vault.sliccy.ai:443".into()];
+        let written = Protected::with_rules(written, &[]);
+        assert!(written.kept_origin("https://lease-pilot.sliccy.ai/"));
+        assert!(written.kept_origin("https://vault.sliccy.ai/x"));
+        assert!(written.kept_target("about:blank", Some("https://lease-pilot.sliccy.ai")));
+        assert!(written.kept_target("about:srcdoc", Some("https://vault.sliccy.ai")));
+    }
+
+    #[test]
+    fn a_listed_origin_outside_the_protected_rules_is_not_kept() {
+        let mut rules = slicc_browsers::catalog().protected_origins;
+        rules.kept_origins = vec!["https://kept.example.test".into(), "https://lease-pilot.sliccy.ai".into()];
+        let guard = Protected::with_rules(rules, &[]);
+        assert!(!guard.url("https://kept.example.test/"));
+        assert!(!guard.kept_origin("https://kept.example.test/"));
+        assert!(!guard.kept_target("https://kept.example.test/", None));
+        assert!(!guard.kept_target("about:blank", Some("https://kept.example.test")));
+        assert!(guard.kept_origin("https://lease-pilot.sliccy.ai/"));
+        assert!(guard.kept_target("about:blank", Some("https://lease-pilot.sliccy.ai")));
+        let own = Protected::with_rules(
+            {
+                let mut rules = slicc_browsers::catalog().protected_origins;
+                rules.kept_origins = vec!["https://kept.example.test".into()];
+                rules
+            },
+            &["https://kept.example.test"],
+        );
+        assert!(own.url("https://kept.example.test/"));
+        assert!(own.kept_origin("https://kept.example.test/"));
     }
 
     #[test]
