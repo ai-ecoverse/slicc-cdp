@@ -1,6 +1,7 @@
 export const PROTECTED_ORIGINS = {
   domains: ['sliccy.ai'],
   hosts: ['vault.sliccy.ai'],
+  keptOrigins: ['https://lease-pilot.sliccy.ai'],
   schemes: ['https', 'http'],
   innerSchemes: ['blob', 'filesystem', 'view-source'],
   anySchemes: ['devtools'],

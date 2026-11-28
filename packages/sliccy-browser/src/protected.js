@@ -73,6 +73,20 @@ export function protectedOrigins(rules, extraOrigins = []) {
     origin.toLowerCase().startsWith('about:') &&
     origin !== 'about://';
 
+  const keptHosts = (rules.keptOrigins ?? [])
+    .map((o) => parse(o))
+    .filter((u) => u?.host && scheme(u) === 'https' && u.port === '')
+    .map(hostOf);
+  const keptOrigins = keptHosts.map((h) => `https://${h}`);
+
+  const kept = (text) => {
+    const u = parse(text);
+    return u !== null && scheme(u) === 'https' && u.port === '' && keptHosts.includes(hostOf(u));
+  };
+
+  const keptTarget = ({ url: text, contextOrigin }) =>
+    inheriting(text) ? keptOrigins.includes(contextOrigin) : kept(text);
+
   const target = ({
     url: text,
     previous = false,
@@ -118,7 +132,7 @@ export function protectedOrigins(rules, extraOrigins = []) {
     return !extra.includes(originOf(u));
   };
 
-  return { url, target, cookieDomain, storageKey, unparseable, extensionFrame };
+  return { url, target, kept, keptTarget, cookieDomain, storageKey, unparseable, extensionFrame };
 }
 
 export function credentialOrigins(rules) {
